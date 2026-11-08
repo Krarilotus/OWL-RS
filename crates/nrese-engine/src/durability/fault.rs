@@ -32,6 +32,10 @@ thread_local! {
     pub(crate) static FAIL_DIR_SYNC_OF: std::cell::RefCell<
         Option<(std::path::PathBuf, std::io::ErrorKind)>,
     > = const { std::cell::RefCell::new(None) };
+    /// Called with each directory `durability::place` syncs, before the sync: what a test
+    /// sees at that moment.
+    pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<Box<dyn FnMut(&std::path::Path)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// An error if `point` is set on this thread.

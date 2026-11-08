@@ -1059,6 +1059,49 @@ fn an_open_names_every_directory_it_creates() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// A directory is made only where its name can be made durable (sol-loop round 2 on review r1,
+/// S1): made first and its holder's sync then refused (`PermissionDenied`), it is in sight of
+/// another process opening the same path, which finds it, can't sync its holder either, takes
+/// it for one provisioned beforehand and commits into a name never made durable. Here the
+/// holder's sync is refused that way: when it is tried, the new directory must not exist yet,
+/// and the open refuses. Before the fix it was made first. Guard: once the sync works, it is
+/// made and opens.
+#[test]
+fn a_directory_is_made_only_where_its_name_can_be_made_durable() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("q");
+    let in_sight = Rc::new(Cell::new(false));
+    let (seen, holder, level) = (Rc::clone(&in_sight), base.path().to_path_buf(), dir.clone());
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |synced: &std::path::Path| {
+        if synced == holder && level.exists() {
+            seen.set(true);
+        }
+    })));
+    fault::FAIL_DIR_SYNC_OF.set(Some((
+        base.path().to_path_buf(),
+        std::io::ErrorKind::PermissionDenied,
+    )));
+    let opened = Engine::open(&dir, config());
+    fault::FAIL_DIR_SYNC_OF.set(None);
+    fault::ON_DIR_SYNC.set(None);
+    let mut wrong = Vec::new();
+    if opened.is_ok() {
+        wrong.push("opened though its holder can't be synced".to_owned());
+    }
+    drop(opened);
+    if in_sight.get() {
+        wrong.push("the new directory was in sight while its holder couldn't be synced".to_owned());
+    }
+    if let Err(error) = Engine::open(&dir, config()) {
+        wrong.push(format!(
+            "guard: once its holder syncs, the open fails: {error}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// What an open replayed is durable before it takes new commits (F5): the segments it
 /// replayed records from are synced. Before the fix nothing was, so under `OsBuffered` (or an
 /// `EveryCommit` record written but not synced when the process died) a power loss after the

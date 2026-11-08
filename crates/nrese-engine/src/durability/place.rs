@@ -29,6 +29,12 @@ pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Makes what was created, renamed or removed in `dir` durable.
 pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
+    super::fault::ON_DIR_SYNC.with_borrow_mut(|seen| {
+        if let Some(seen) = seen {
+            seen(dir);
+        }
+    });
+    #[cfg(test)]
     if let Some(kind) = super::fault::FAIL_DIR_SYNC_OF.with_borrow(|of| {
         of.as_ref()
             .filter(|(failing, _)| failing.as_path() == dir)
