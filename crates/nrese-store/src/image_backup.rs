@@ -69,7 +69,7 @@ pub(crate) fn backup_image(
             dir.display()
         )));
     }
-    fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
+    nrese_engine::place::create_dir_all(dir).map_err(|e| io(e, dir))?;
     let image = engine.write_image(dir)?;
     let (sha256, bytes) = sha256(&image.path)?;
     let manifest = ImageManifest {
