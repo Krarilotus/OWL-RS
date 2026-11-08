@@ -90,6 +90,13 @@ impl Stack {
 
     /// An upper bound on the facts matching `pattern`, zero only if none does. O(log n).
     pub fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
+        self.estimate_counted(pattern, &|| true)
+    }
+
+    /// [`Self::estimate`], each fact its search for a match passes over counted with
+    /// `visited` (false once the reader's poller has stopped: then 0, an answer that means
+    /// nothing; REAS-2, sol-loop r1 S3).
+    pub fn estimate_counted(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool) -> usize {
         let bound = match pattern[1] {
             Some(p) => self.per_predicate.get(&p).copied().unwrap_or(0),
             None => self.len(),
@@ -98,18 +105,29 @@ impl Stack {
             return 0;
         }
         let mut any = false;
-        self.first(pattern, &mut any);
+        self.first(pattern, visited, &mut any);
         if any { bound } else { 0 }
     }
 
-    /// Whether a fact matches `pattern`, by the index whose prefix it binds.
-    fn first(&self, pattern: [Option<u64>; 3], any: &mut bool) {
+    /// Whether a fact matches `pattern`, by the index whose prefix it binds, each fact it
+    /// passes over counted with `visited`.
+    fn first(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool, any: &mut bool) {
         let hit = |set: &BTreeSet<[u64; 3]>, prefix: &[u64], test: &dyn Fn(&[u64; 3]) -> bool| {
             let mut low = [0u64; 3];
             let mut high = [u64::MAX; 3];
             low[..prefix.len()].copy_from_slice(prefix);
             high[..prefix.len()].copy_from_slice(prefix);
-            set.range(low..=high).any(test)
+            let mut found = false;
+            for t in set.range(low..=high) {
+                if !visited() {
+                    return false;
+                }
+                if test(t) {
+                    found = true;
+                    break;
+                }
+            }
+            found
         };
         *any = match pattern {
             [Some(s), Some(p), o] => hit(&self.spo, &[s, p], &|t| o.is_none_or(|o| t[2] == o)),
@@ -123,39 +141,57 @@ impl Stack {
 
     /// The facts matching `pattern`, by the index whose prefix it binds. O(log n + k).
     pub fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        let range = |set: &BTreeSet<[u64; 3]>, prefix: &[u64]| {
+        self.visit(pattern, &mut |t| {
+            if let Some(t) = t {
+                f(t);
+            }
+            true
+        });
+    }
+
+    /// Hands each fact of the index range `pattern` binds to `f` as it reads it: `Some` for
+    /// a match, `None` for one it passes over; ends once `f` returns false (the reader's
+    /// poller stopped: REAS-2, sol-loop r1 S3).
+    pub fn visit(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Option<Triple>) -> bool) {
+        fn range<'s>(
+            set: &'s BTreeSet<[u64; 3]>,
+            prefix: &[u64],
+        ) -> impl Iterator<Item = [u64; 3]> + use<'s> {
             let mut low = [0u64; 3];
             let mut high = [u64::MAX; 3];
             low[..prefix.len()].copy_from_slice(prefix);
             high[..prefix.len()].copy_from_slice(prefix);
-            set.range(low..=high).copied().collect::<Vec<_>>()
-        };
+            set.range(low..=high).copied()
+        }
         let matches = |t: &Triple| {
             pattern
                 .iter()
                 .zip(t)
                 .all(|(bound, value)| bound.is_none_or(|b| b == *value))
         };
-        let found: Vec<Triple> = match pattern {
-            [Some(s), Some(p), _] => range(&self.spo, &[s, p]),
-            [Some(s), None, _] => range(&self.spo, &[s]),
-            [None, Some(p), Some(o)] => range(&self.pos, &[p, o])
-                .into_iter()
-                .map(|[p, o, s]| [s, p, o])
-                .collect(),
-            [None, Some(p), None] => range(&self.pos, &[p])
-                .into_iter()
-                .map(|[p, o, s]| [s, p, o])
-                .collect(),
-            [None, None, Some(o)] => range(&self.osp, &[o])
-                .into_iter()
-                .map(|[o, s, p]| [s, p, o])
-                .collect(),
-            [None, None, None] => self.spo.iter().copied().collect(),
+        let mut hand = |t: Triple| f(matches(&t).then_some(t));
+        let _ = match pattern {
+            [Some(s), Some(p), _] => range(&self.spo, &[s, p]).try_for_each(|t| go(hand(t))),
+            [Some(s), None, _] => range(&self.spo, &[s]).try_for_each(|t| go(hand(t))),
+            [None, Some(p), Some(o)] => {
+                range(&self.pos, &[p, o]).try_for_each(|[p, o, s]| go(hand([s, p, o])))
+            }
+            [None, Some(p), None] => {
+                range(&self.pos, &[p]).try_for_each(|[p, o, s]| go(hand([s, p, o])))
+            }
+            [None, None, Some(o)] => {
+                range(&self.osp, &[o]).try_for_each(|[o, s, p]| go(hand([s, p, o])))
+            }
+            [None, None, None] => self.spo.iter().try_for_each(|&t| go(hand(t))),
         };
-        for t in found.into_iter().filter(matches) {
-            f(t);
-        }
+    }
+}
+
+/// `try_for_each`'s step: go on while `true`.
+fn go(on: bool) -> std::ops::ControlFlow<()> {
+    match on {
+        true => std::ops::ControlFlow::Continue(()),
+        false => std::ops::ControlFlow::Break(()),
     }
 }
 
@@ -383,15 +419,14 @@ impl VisitsBase for UpperBase<'_> {
                 return;
             }
         }
-        let mut going = true;
-        self.stack.scan(bound, &mut |t| {
-            if going {
-                going = visit.fact(t);
-            }
+        // Each stack fact the index range holds is a position, the ones it passes over too.
+        self.stack.visit(bound, &mut |t| match t {
+            Some(t) => visit.fact(t),
+            None => visit.skip(),
         });
     }
 
-    fn size(&self, bound: [Option<u64>; 3], _: Probe<'_, '_>) -> usize {
+    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
         let view = self
             .view
             .count_in(ReadModel::Materialised, &pattern(bound))
@@ -400,7 +435,7 @@ impl VisitsBase for UpperBase<'_> {
         // saturates too, never wrapping to a smaller estimate.
         usize::try_from(view)
             .unwrap_or(usize::MAX)
-            .saturating_add(self.stack.estimate(bound))
+            .saturating_add(self.stack.estimate_counted(bound, &|| probe.units(1)))
             .saturating_add(self.facts.len())
     }
 
@@ -914,6 +949,49 @@ mod tests {
         assert!(
             poll.stopped(),
             "{n} facts passed over without the poller polling"
+        );
+    }
+
+    /// The same for U1's stack (sol-loop r1 S3): a scan of `x type B` reads the index range
+    /// of `x type`, three poll intervals of other types, and passes over each; uncounted,
+    /// the poller would never poll.
+    #[test]
+    fn the_upper_base_counts_the_stack_facts_it_passes_over() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let n = 3 * u64::from(nrese_exec::POLL_UNITS);
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..nrese_engine::EngineConfig::default()
+        })
+        .unwrap();
+        let view = engine.snapshot();
+        let facts = std::collections::HashSet::new();
+        let mut stack = Stack::default();
+        for c in 0..n {
+            stack.insert([1, 2, 1_000 + c]);
+        }
+        let values = super::Values::default();
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let mut delivered = 0;
+        base.scan([Some(1), Some(2), Some(7)], &poll, &mut |_| delivered += 1);
+        assert_eq!(delivered, 0, "no stack fact has the object");
+        assert!(
+            poll.stopped(),
+            "{n} stack facts passed over without the poller polling"
         );
     }
 

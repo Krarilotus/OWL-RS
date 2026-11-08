@@ -456,12 +456,14 @@ impl SupportSets {
         axioms.extend_from_slice(program.axioms())?;
         axioms.sort_unstable();
         let closure = Closure::of(snapshot, &graphs, &axioms, working)?;
-        // A lookup in the closure's list: one unit on the reading task's poller.
+        // A lookup in the closure's list, then each graph entry it reads: counted on the
+        // reading task's poller (sol-loop r1 S4).
         let graphs_of = |fact: Triple, poll: &Poller<'_>| -> Vec<u32> {
-            if poll.tick() {
+            let entries = closure.graphs_of(fact);
+            if poll.attempt(1 + entries.len()) {
                 return Vec::new();
             }
-            closure.graphs_of(fact).iter().map(|&(_, g)| g).collect()
+            entries.iter().map(|&(_, g)| g).collect()
         };
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
@@ -2565,13 +2567,11 @@ impl Supports {
         for &graph in graphs.iter() {
             readable.push(access.allows_id(snapshot, graph))?;
         }
-        // A lookup in the closure's list: one unit on the reading task's poller.
+        // A lookup in the closure's list, then each graph entry it reads: counted on the
+        // reading task's poller (sol-loop r1 S4).
         let reads = |fact: Triple, poll: &Poller<'_>| {
-            !poll.tick()
-                && closure
-                    .graphs_of(fact)
-                    .iter()
-                    .any(|&(_, g)| readable[g as usize])
+            let entries = closure.graphs_of(fact);
+            !poll.attempt(1 + entries.len()) && entries.iter().any(|&(_, g)| readable[g as usize])
         };
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
