@@ -36,7 +36,7 @@ from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, Proces
                       run_quiet, shell)
 from . import receipts
 from .datasets import Store
-from .manifest import Manifest, ManifestError, append_attempts, image_ids
+from .manifest import OPERATIONAL_SETTINGS, Manifest, ManifestError, append_attempts, image_ids
 from .manifest import git as checkout_state
 from .schema import FIELDS, Result, Writer, problems, read
 from .summary import adjudications, summarise
@@ -46,6 +46,8 @@ EXE = ".exe" if os.name == "nt" else ""
 # Systems a default run leaves out: AnzoGraph needs registration beyond 8 GB and takes
 # minutes to start; name it to run it.
 EXPLICIT_ONLY = {"anzograph"}
+IMAGE_LABEL = "owlrs.built-from"  # a suite-built image's context and its tree id (receipts: images)
+QUALIFIED_ANSWERS = {"ok", "deviates"}  # a cell's answers qualify when every query's verdict is one of these
 
 
 def arguments(argv: list[str]) -> argparse.Namespace:
@@ -224,6 +226,7 @@ class Suite:
         self.written: list[Result] = []
         self.hashed: dict[str, str | None] = {}  # /data input -> its SHA-256 (data_hashes)
         self.built: dict[str, dict] = {}  # program -> the checkout it was built from in this run
+        self.image_source: dict[str, object] = {}  # image -> where it came from (ensure_images)
         self.hash_s = 0.0
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
@@ -294,13 +297,30 @@ class Suite:
             return
         for image, context in needed.items():
             if self.runtime.image_present(image):
+                # Built here earlier: its label names the context it was built from (P2 design review F5).
+                label = run_quiet(["docker", "image", "inspect", "--format",
+                                   f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image])
+                found = (label.stdout.strip() if label.returncode == 0 else "").replace("<no value>", "")
+                self.image_source[image] = (f"built from {found}" if found else
+                                            receipts.unknown("present before this run, its build not recorded"))
                 continue
             if context:
+                # What it is built from: the context's git tree id in this run's commit, when that is clean.
+                state = checkout_state(self.root)
+                tree = (receipts.object_ids(self.root, state["commit"] or "", [f"benches/{context}"])[f"benches/{context}"]
+                        if state.get("dirty") == 0 else None)
+                made = f"benches/{context}@{tree}" if isinstance(tree, str) else ""
                 self.say(f"building {image}")
-                self.host_command(["docker", "build", "-q", "-t", image, str(self.root / "benches" / context)])
+                self.host_command(["docker", "build", "-q", "-t", image,
+                                   *(["--label", f"{IMAGE_LABEL}={made}"] if made else []),
+                                   str(self.root / "benches" / context)])
+                self.image_source[image] = (f"built from {made}" if made else
+                                            receipts.unknown("built from a checkout that wasn't a clean commit"))
             else:
                 self.say(f"pulling {image}")
                 self.host_command(["docker", "pull", "-q", image])
+                # A registry's tag names no content: unqualified until a digest-pin file exists.
+                self.image_source[image] = receipts.unknown("pulled: no digest pin to hold its id to")
             self.made_images.append(image)
 
     def build_nrese(self, nrese) -> bool:
@@ -309,7 +329,10 @@ class Suite:
             return True
         ctx = self.context_for_images()
         source = nrese.source(ctx)
-        self.built[nrese.key] = {k: v for k, v in checkout_state(Path(source)).items() if k in ("commit", "dirty")}
+        # What it is built from and with (P2 design review F4): its checkout when the build starts, and
+        # the build's own configuration, never an environment list taken for its defaults.
+        self.built[nrese.key] = {**{k: v for k, v in checkout_state(Path(source)).items() if k in ("commit", "dirty")},
+                                 **build_settings()}
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
         if self.args.runtime == "docker":
@@ -326,6 +349,7 @@ class Suite:
             # scripts/lib/target-cpu.sh reads it; `portable` for none).
             cpu = os.environ.get("NRESE_TARGET_CPU", "native")
             rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
+            self.built[nrese.key].update(rust_image=nrese.rust_image(ctx), rustflags=rustflags)
             rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
@@ -352,7 +376,8 @@ class Suite:
             self.say(f"--skip-build requires an existing harness: {self.harness()} (set HARNESS)")
             return False
         self.say("building the harness (release)")
-        self.built["harness"] = {k: v for k, v in checkout_state(self.root).items() if k in ("commit", "dirty")}
+        self.built["harness"] = {**{k: v for k, v in checkout_state(self.root).items() if k in ("commit", "dirty")},
+                                 **build_settings()}
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
         rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
                                 "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log)
@@ -926,10 +951,15 @@ class Suite:
                 **attempts[cell], "complete": True, "commit": commit, "dirty": entry["git"].get("dirty"),
                 "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
-                "images": mine if child else {i: pins.get(i) or receipts.unknown("not in the run's pin map")
-                                              for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
+                "images": mine if child else {
+                    i: {"id": pins.get(i) or receipts.unknown("not in the run's pin map"),
+                        "source": self.image_source.get(i) or receipts.unknown("not prepared by this run")}
+                    for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
                 "build": mine if child else self.build_receipt(system),
-                "settings": mine if child else dict(entry.get("settings") or {}),
+                # The settings that change a measurement; where a run keeps its files doesn't (F8).
+                "settings": mine if child else {k: v for k, v in (entry.get("settings") or {}).items()
+                                                if k not in OPERATIONAL_SETTINGS},
+                "protocol": dict(entry.get("protocol") or {}),  # the attempt's own (F3), not the record's
                 "data": mine if child else self.data_receipt(plan, key),
                 "outcome": pair.outcome() if pair else {"outcome": "skipped"},
                 "answers": "pending" if self.answers else "not captured"}
@@ -960,13 +990,23 @@ class Suite:
         if not self.manifest or not self.answers:
             return
         from .answers import PRECEDENCE
-        worst: dict[str, str] = {}
-        for v in self.answers.verdicts():
+        counts: dict[str, dict[str, int]] = {}
+        for v in self.answers.verdicts():  # one per query the cell was to answer (captured or not)
             cell = receipts.cell_key(v["workload"], str(v["tier"]), v["system"])
-            if cell not in worst or PRECEDENCE.index(v["verdict"]) < PRECEDENCE.index(worst[cell]):
-                worst[cell] = v["verdict"]
+            counts.setdefault(cell, {}).setdefault(v["verdict"], 0)
+            counts[cell][v["verdict"]] += 1
+
+        def of(cell: str):
+            # Not one worst verdict: `deviates` ranks above `incomplete` (PRECEDENCE, the reports'), so it
+            # could stand for a query never captured (P2 design review F2). Qualified: every query ok or
+            # deviating only across datatypes (rule.owl-rs-answer-comparison), none without its answer.
+            found = counts.get(cell)
+            if not found:
+                return "not captured"
+            return {"worst": min(found, key=PRECEDENCE.index), "verdicts": dict(sorted(found.items())),
+                    "qualified": set(found) <= QUALIFIED_ANSWERS}
         cells = self.manifest.entry.get("cells") or {}
-        done = {cell: {**r, "answers": worst.get(cell, "not captured")} for cell, r in cells.items() if r.get("complete")}
+        done = {cell: {**r, "answers": of(cell)} for cell, r in cells.items() if r.get("complete")}
         if done:
             self.manifest.update(cells=done)
 
@@ -1026,6 +1066,13 @@ class Suite:
                 for image in list(self.made_images):
                     if self.runtime.attempt(checked, ["docker", "image", "rm", image]):
                         self.made_images.remove(image)
+
+
+def build_settings() -> dict[str, str]:
+    """A build's configuration from the environment it runs in: the CPU it compiles for
+    (NRESE_TARGET_CPU, scripts/lib/target-cpu.sh's; `native` unset) and the RUSTFLAGS it inherits.
+    The toolchain is the checkout's (rust-toolchain.toml, in the receipt's code)."""
+    return {"target_cpu": os.environ.get("NRESE_TARGET_CPU", "native"), "rustflags_env": os.environ.get("RUSTFLAGS", "")}
 
 
 @contextlib.contextmanager
