@@ -265,7 +265,7 @@ impl Context<'_> {
                 &search,
                 found.kept.iter().map(|&(id, d, ())| (id, d)),
                 near_id,
-            );
+            )?;
         }
         self.produced(rows.into_solutions())
     }
@@ -333,7 +333,7 @@ impl Context<'_> {
             &search,
             found.kept.iter().map(|(id, d, _)| (*id, *d)),
             None,
-        );
+        )?;
         // Union consumes its inputs, also when it fails; the winners not yet handed to it
         // are released as they drop, then their room's charge.
         let Nearest { kept, held } = found;
@@ -598,21 +598,22 @@ impl Rows {
         search: &Search,
         found: impl IntoIterator<Item = (TermId, f32)>,
         near_id: Option<u64>,
-    ) {
+    ) -> NativeResult<()> {
         for (rank, (id, distance)) in found.into_iter().enumerate() {
             let mut row = vec![id.raw()];
             if search.score.is_some() {
                 let score = f64::from(search.metric.score(distance));
-                row.push(context.id(&Term::from(Literal::from(score))));
+                row.push(context.id(&Term::from(Literal::from(score)))?);
             }
             if search.rank.is_some() {
-                row.push(context.id(&Term::from(Literal::from(rank as i64 + 1))));
+                row.push(context.id(&Term::from(Literal::from(rank as i64 + 1)))?);
             }
             if self.near_column {
                 row.push(near_id.unwrap_or(UNDEF));
             }
             self.table.push_row(&row);
         }
+        Ok(())
     }
 
     fn into_solutions(self) -> Solutions {
@@ -1000,13 +1001,14 @@ mod tests {
         // its own.
         let unrelated = 128 + super::super::own_bytes(&snapshot);
         const UNRELATED: usize = 128;
-        // Beside the winners, the room the search keeps for its k candidates until the union
-        // has them (charged since SRCH r1): the limit leaves room for it, so that the fourth
-        // union is still the one past it.
+        // The six winners hold 64 rows of two ids each (6 KiB); a union of i of them makes
+        // its i * 1 KiB table while they are held: the third fits, the fourth doesn't.
+        // Beside them, the room the search keeps for its k candidates until the union has
+        // them (charged since SRCH r1): the limit leaves room for it too.
         let room = 6 * size_of::<(TermId, f32, Probed<'_>)>();
         let options = QueryOptions {
             resources: crate::Resources {
-                memory: nrese_exec::Envelope::new(Some(unrelated + room + 8192 - 1), None),
+                memory: nrese_exec::Envelope::new(Some(unrelated + room + 6144 + 4096 - 1), None),
                 ..Default::default()
             },
             ..Default::default()
@@ -1023,7 +1025,7 @@ mod tests {
         };
         assert_eq!(
             (error.used, error.requested),
-            (unrelated + 2048 + room, 6144)
+            (unrelated + room + 6144, 4096)
         );
         assert_eq!(
             ctx.budget.used(),
