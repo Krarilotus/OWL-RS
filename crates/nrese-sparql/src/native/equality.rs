@@ -16,7 +16,6 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, SharedState, Snapshot};
@@ -83,40 +82,48 @@ pub(super) fn kept_is_published() -> bool {
         .is_none_or(|(kept, _)| kept.shared_state().is_some())
 }
 
-/// `snapshot`'s representatives; `room` is told the most entries they can have before
-/// anything is made.
-fn build<E>(
-    snapshot: &Snapshot,
-    room: impl FnOnce(usize) -> Result<(), E>,
-) -> Result<Representatives, E> {
+/// The statements that state `sameAs`, where the dictionary has it.
+fn same_as(snapshot: &Snapshot) -> Option<QuadPattern> {
+    let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(SAME_AS).into())?;
+    Some(QuadPattern {
+        subject: None,
+        predicate: Some(same_as),
+        object: None,
+        graph: GraphSelector::Any,
+    })
+}
+
+/// The most entries [`build`] makes of `snapshot`: each class's members, or two per `sameAs`
+/// statement, counted exactly (without classes, reads don't expand).
+fn bound(snapshot: &Snapshot) -> usize {
+    if let Some(classes) = snapshot.equality_classes() {
+        return classes.iter().map(|(_, members)| members.len()).sum();
+    }
+    let Some(pattern) = same_as(snapshot) else {
+        return 0;
+    };
+    let statements = snapshot.count_in(ReadModel::Materialised, &pattern);
+    debug_assert!(statements.exact().is_some(), "a count without expansion");
+    usize::try_from(statements.at_least()).map_or(usize::MAX, |n| n.saturating_mul(2))
+}
+
+fn build(snapshot: &Snapshot) -> Representatives {
     #[cfg(test)]
     BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut out = HashMap::new();
     // A store kept over representatives knows its classes; its `sameAs` relation, read
     // expanded, would list every pair of each class.
     if let Some(classes) = snapshot.equality_classes() {
-        room(classes.iter().map(|(_, members)| members.len()).sum())?;
         for (representative, members) in classes.iter() {
             for &member in members {
                 out.insert(member, representative);
             }
         }
-        return Ok(out);
+        return out;
     }
-    let Some(same_as) = snapshot.lookup(NamedNodeRef::new_unchecked(SAME_AS).into()) else {
-        room(0)?;
-        return Ok(out);
+    let Some(pattern) = same_as(snapshot) else {
+        return out;
     };
-    let pattern = QuadPattern {
-        subject: None,
-        predicate: Some(same_as),
-        object: None,
-        graph: GraphSelector::Any,
-    };
-    // Two entries at most per statement read; without equality classes the count is exact.
-    let statements = snapshot.count_in(ReadModel::Materialised, &pattern);
-    debug_assert!(statements.exact().is_some(), "a count without expansion");
-    room(usize::try_from(statements.at_least()).map_or(usize::MAX, |n| n.saturating_mul(2)))?;
     for quad in snapshot.quads_for_pattern_in(ReadModel::Materialised, &pattern) {
         let (s, o) = (quad.subject.raw(), quad.object.raw());
         if s == o {
@@ -128,7 +135,7 @@ fn build<E>(
             *entry = (*entry).min(least);
         }
     }
-    Ok(out)
+    out
 }
 
 /// `state`'s representatives admitted to the process-wide entry, replacing what it held: the
@@ -139,10 +146,7 @@ fn admit(
     state: &SharedState<'_>,
 ) -> Arc<Representatives> {
     let snapshot = state.snapshot();
-    let representatives = match build(snapshot, |_| Ok::<(), Infallible>(())) {
-        Ok(representatives) => Arc::new(representatives),
-        Err(never) => match never {},
-    };
+    let representatives = Arc::new(build(snapshot));
     *cache = Some((snapshot.clone(), Arc::clone(&representatives)));
     representatives
 }
@@ -194,11 +198,10 @@ impl Context<'_> {
         // its bound, its last table beside the one it replaces; trimmed to what it holds.
         let mut held = Reservation::new(Arc::clone(&self.budget));
         let table = super::spatial::map_bytes::<u64, u64>;
-        let built = build(&self.snapshot, |entries| {
-            held.charge(SHARED.saturating_add(table(entries).saturating_mul(2)))
-        });
-        match built {
-            Ok(representatives) => {
+        let growing = table(bound(&self.snapshot)).saturating_mul(2);
+        match held.charge(SHARED.saturating_add(growing)) {
+            Ok(()) => {
+                let representatives = build(&self.snapshot);
                 let holds = SHARED + table(representatives.capacity());
                 held.release(held.bytes().saturating_sub(holds));
                 Some((Arc::new(representatives), Some(held)))
