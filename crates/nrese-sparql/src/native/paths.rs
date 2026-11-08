@@ -181,7 +181,7 @@ impl<'e, T: Copy> Bag<'e, T> {
         let mut values = Buf::with_capacity_in(pool, total)?;
         values.fill(total, |room| {
             for &(value, copies) in counted.iter() {
-                (0..copies).for_each(|_| room.push(value));
+                room.extend(std::iter::repeat_n(value, copies));
             }
         })?;
         Ok(values)
@@ -1265,11 +1265,11 @@ impl PathEvaluator<'_> {
             let added = match bag(node) {
                 Bag::Copies(values) => {
                     let pairs = values.iter().map(|&value| pair(node, value));
-                    copies.extend_bounded(values.len(), pairs)
+                    copies.fill(values.len(), |room| room.extend(pairs))
                 }
                 Bag::Counted(values) => {
                     let pairs = values.iter().map(|&(value, n)| (pair(node, value), n));
-                    counted.extend_bounded(values.len(), pairs)
+                    counted.fill(values.len(), |room| room.extend(pairs))
                 }
             };
             if !self.fits(added) {

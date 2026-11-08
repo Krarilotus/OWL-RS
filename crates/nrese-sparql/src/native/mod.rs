@@ -2472,7 +2472,7 @@ impl<'a> Context<'a> {
             let mut column = paths::Buf::with_capacity_in(pool, rows).map_err(refused)?;
             let filled = column.fill(rows, |room| {
                 for (pair, copies) in pairs.counted().filter(|(pair, _)| keep(pair)) {
-                    (0..copies).for_each(|_| room.push(end(pair)));
+                    room.extend(std::iter::repeat_n(end(pair), copies));
                 }
             });
             filled.map_err(refused)?;
