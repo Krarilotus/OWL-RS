@@ -45,6 +45,7 @@ import tempfile
 import time
 import threading
 import tomllib
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -844,6 +845,47 @@ def verdict(case: dict, record: dict) -> dict:
     return out
 
 
+SH = "<http://www.w3.org/ns/shacl#"
+# A record's subject (an IRI or a blank node: a triple term is only ever an object, RDF 1.2) and
+# predicate (an IRI), as N-Triples terms, its whitespace a space or a tab; nothing after them
+# (the object, a literal) is read.
+NT_HEAD = re.compile(r'[ \t]*(<[^\x00-\x20<>"{}|^`\\]*>|_:[^ \t]+)[ \t]+(<[^\x00-\x20<>"{}|^`\\]*>)[ \t]')
+
+
+def shacl_report_counts(text: str) -> dict[str, int] | None:
+    """A SHACL validation report's (N-Triples, as nrese-rdf-io writes it) sh:value and
+    sh:resultPath triples: its results' values and paths (SHACL 1.0 §5.3.2). Records end only at
+    a physical newline: the writer escapes every control character in a literal (ntriples.rs
+    `quoted`), but not U+2028, U+2029 or U+0085, at which str.splitlines() would also split (fix
+    check r1 W). None: a record that isn't N-Triples as written, counts unknown, never guessed."""
+    values = paths = 0
+    for record in text.split("\n"):
+        if not record.strip(" \t\r") or record.lstrip(" \t").startswith("#"):
+            continue
+        head = NT_HEAD.match(record)
+        if head is None:
+            return None
+        values += head.group(2) == f"{SH}value>"
+        paths += head.group(2) == f"{SH}resultPath>"
+    return {"values": values, "paths": paths}
+
+
+def shacl_report_reading(path: Path) -> tuple[dict[str, int] | None, str]:
+    """An invocation's SHACL report's counts (shacl_report_counts()), or None and why they're
+    unknown: every way of not getting them (none written, not UTF-8, a failed read, not N-Triples
+    as written) is the one unreadable state, never an exception out of measure() (fix check r3)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "the invocation wrote no SHACL report"
+    except UnicodeDecodeError as error:
+        return None, f"its SHACL report isn't UTF-8 (byte {error.start}: {error.reason})"
+    except OSError as error:
+        return None, f"its SHACL report couldn't be read ({error.strerror or error})"
+    counts = shacl_report_counts(text)
+    return counts, "" if counts is not None else "its SHACL report isn't N-Triples as written"
+
+
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """run_case's measurement, its data ready: the record."""
     name = case["name"]
@@ -877,6 +919,12 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             record["notes"].append(f"timed by its load: its metric ({case['metric']}) is the suite driver's")
         command = [*base, *loads, *(["--queries", queries] if queries else []),
                    *substitute(case.get("args", []), data, scratch)]
+        # A case with shapes writes each invocation's last validation's report (every perf lab of
+        # engine-v2 can) to a path of that invocation's own, so that what the results hold is counted,
+        # not only how many (shacl_report_counts()); removed however the invocation ends.
+        shapes = "--shapes" in case.get("args", [])
+        owner = uuid.uuid4().hex[:12]
+        made: list[Path] = []
         script = ""
         if "setup" in case:
             setup = ["/target/release/examples/perf_lab", *substitute(case["setup"], data, scratch)]
@@ -894,33 +942,55 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         record["page_cache"] = modes
         # Warm and cold alternate, so that drift over the case touches both alike.
         runs = invocation_plan(case, modes)
-        for index, identity in enumerate(runs):
-            entry, mode = sweep[identity["sweep"]], identity["cache"]
-            if mode == "cold" and index > 0 and not drop_page_cache(record):
-                break
-            # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
-            shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *entry])
-            code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
-            wall += w
-            path = SCRATCH / f"{case['name']}.json"
-            if not path.exists():
-                record["status"] = "failed"
-                record["notes"].append("invocation did not produce its JSON report")
-                break
-            result = json.loads(path.read_text(encoding="utf-8"))
-            path.unlink()
-            result["_sweep"] = " ".join(entry)
-            result["_page_cache"] = mode
-            if case.get("queries", "").startswith("@vectors") and code == 0:
-                result["recall"] = vector_recall(case, expect)
-            observation = invocation_observation(case, result, err, identity)
-            observation["exit"] = code
-            observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
-            observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
-            observations.append(observation)
-            samples_runs.append(result)
-            if code != 0:
-                break
+        try:
+            for index, identity in enumerate(runs):
+                entry, mode = sweep[identity["sweep"]], identity["cache"]
+                if mode == "cold" and index > 0 and not drop_page_cache(record):
+                    break
+                report_nt = SCRATCH / f"{case['name']}-{owner}-{index}.shacl.nt"
+                if shapes and report_nt.exists():  # not this invocation's: never counted, never removed
+                    record["status"] = "failed"
+                    record["notes"].append(f"a SHACL report was already at {report_nt.name}: not this run's")
+                    break
+                reporting = ["--shacl-report", f"/out/{report_nt.name}"] if shapes else []
+                if shapes:
+                    made.append(report_nt)
+                # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
+                shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *reporting, *entry])
+                code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
+                wall += w
+                path = SCRATCH / f"{case['name']}.json"
+                if not path.exists():
+                    record["status"] = "failed"
+                    record["notes"].append("invocation did not produce its JSON report")
+                    break
+                result = json.loads(path.read_text(encoding="utf-8"))
+                path.unlink()
+                if shapes and isinstance(result.get("shacl"), dict):
+                    counts, why = shacl_report_reading(report_nt)
+                    if counts is None:
+                        # Couldn't be read, not "not reported": its checks fail whatever --routes says
+                        # (fix check r2: check() left an absent value unchecked without routes).
+                        why += ": values and paths not counted"
+                        record["notes"].append(why)
+                        result["_unreadable"] = {"shacl.values": why, "shacl.paths": why}
+                    else:
+                        result["shacl"].update(counts)
+                result["_sweep"] = " ".join(entry)
+                result["_page_cache"] = mode
+                if case.get("queries", "").startswith("@vectors") and code == 0:
+                    result["recall"] = vector_recall(case, expect)
+                observation = invocation_observation(case, result, err, identity)
+                observation["exit"] = code
+                observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
+                observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
+                observations.append(observation)
+                samples_runs.append(result)
+                if code != 0:
+                    break
+        finally:
+            for report_nt in made:  # only the paths this measurement named, each its own invocation's
+                report_nt.unlink(missing_ok=True)
         if "setup" in case:
             container(name, 1, ["rm", "-rf", scratch])
         if samples_runs:
@@ -1088,7 +1158,7 @@ COUNTERS = ("reason.new_facts", "reason.inferred", "reason.rounds",
             "held.index_mib", "held.dictionary_terms", "held.inferred",
             "clauses", "nodes_created", "branch_points", "backjumps", "clashes", "merges", "facts", "clauses_fired",
             "concepts", "contexts", "subsumers", "links", "conclusions", "duplicates", "dl_clauses", "functions",
-            "shacl.results", "kernel.rows", "held.index_bytes",
+            "shacl.results", "shacl.values", "shacl.paths", "kernel.rows", "held.index_bytes",
             "reason.bindings", "reason.probes", "reason.passes", "cache.hits", "subset_checks", "clauses_generated", "clauses_kept",
             "redundant_forward", "redundant_backward", "contexts_created", "hyper", "pred")
 
@@ -1197,6 +1267,8 @@ def check(path: str, want, result: dict, expect: dict, alt_expect: dict) -> dict
     got = lookup(path, result)
     shown = (want if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks ")))
              else expected)
+    if got is None and path in (result.get("_unreadable") or {}):  # its source couldn't be read: fails
+        return {"path": path, "expected": shown, "got": None, "ok": False, "note": result["_unreadable"][path]}
     if got is None and not OPTIONS["routes"]:
         # A perf lab without --routes reports no query's value, status or operators: such a
         # check is unchecked (ok None), not a wrong answer; its rows still are checked.
