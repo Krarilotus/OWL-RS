@@ -540,13 +540,14 @@ pub(crate) fn hazards(
     // An uncovered axiom that equates named individuals: global, unless another hazard
     // already is (that one's reason is the more specific).
     let mut outside_global: Option<Hazard> = None;
+    let equating_properties = crate::profile::equating_properties(o);
     for (i, axiom) in o.axioms.iter().enumerate() {
         // Read whole, the rewriting answers it; in the closure's profile, its rules do.
         if !read.partial.contains(&i) || crate::profile::covered(o, axiom, rl) {
             continue;
         }
         let concluded = crate::profile::concluded_terms(o, axiom, rl);
-        let equality = crate::profile::concludes_equality(o, axiom);
+        let equality = crate::profile::concludes_equality(o, axiom, &equating_properties);
         // A conclusion that equates may name no term of its own (`∀R.{a}`, `C ⊑ {a}`): its
         // hazard is global, named by any term of the axiom (review r1, F1).
         let name = match concluded.first() {
