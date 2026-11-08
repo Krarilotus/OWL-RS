@@ -98,7 +98,7 @@ fn the_cached_ontology_is_charged_with_what_the_bounds_keep() {
     assert_eq!(report.unavailable, None, "{report:?}");
     let snapshot = store.engine().snapshot();
     let ontology = super::super::query::ontology_at(&store, &snapshot).unwrap();
-    let cached = nrese_dl::memory::ontology_bytes(&ontology);
+    let cached = nrese_dl::memory::ontology_bytes(ontology.value());
     let stack = report.upper_facts * 3 * std::mem::size_of::<[u64; 3]>();
     let kept = store.dl().bounds.kept().used();
     assert!(
@@ -124,8 +124,8 @@ fn a_cached_ontology_a_reader_holds_stays_charged_after_the_cache_moves_on() {
         .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :a0 :note \"more\" . }")
         .unwrap();
     let second = super::super::query::ontology_at(&store, &store.engine().snapshot()).unwrap();
-    let both = nrese_dl::memory::ontology_bytes(&first)
-        + nrese_dl::memory::ontology_bytes(&second);
+    let both = nrese_dl::memory::ontology_bytes(first.value())
+        + nrese_dl::memory::ontology_bytes(second.value());
     let kept = store.dl().bounds.kept().used();
     assert!(
         kept >= both,

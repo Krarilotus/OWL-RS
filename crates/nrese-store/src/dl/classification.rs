@@ -50,6 +50,7 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
             None => run(store, snapshot, classify::classify, |t, why| {
+                t.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
                 t.incomplete.push(why)
             }),
         },
@@ -65,6 +66,9 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
         complete,
         || {
             run(store, snapshot, classify::realise, |r, why| {
+                r.taxonomy.classification.consistency =
+                    nrese_dl::verdict::Verdict::Unknown(why.clone());
+                r.taxonomy.incomplete.push(why.clone());
                 r.incomplete.push(why)
             })
         },
@@ -103,8 +107,9 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
 /// `engine` over `snapshot`'s asserted ontology, within one timeout that includes
 /// reading the ontology.
 /// Its reading of the ontology draws on the run's envelope too (SYN-61); where that can't
-/// take it, the engine's result over no axioms, `incomplete` saying why (never kept: a
-/// result kept is complete).
+/// take it, the engine's result over no axioms with its consistency unknown, `incomplete`
+/// saying why (never kept: a result kept is complete). Over no axioms the engine would say
+/// consistent, which nothing read decided.
 fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,

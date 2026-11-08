@@ -74,6 +74,24 @@ fn interner<T>(len: usize) -> usize {
     len * size_of::<T>() + table(len, size_of::<T>() + size_of::<u32>())
 }
 
+/// What `taxonomy` holds besides itself: its lists by capacity and the text of its reasons.
+/// O(its reasons).
+pub fn taxonomy_bytes(taxonomy: &crate::classify::Taxonomy) -> usize {
+    let c = &taxonomy.classification;
+    let text = |s: &String| s.capacity();
+    let verdict = match &c.consistency {
+        crate::verdict::Verdict::Unknown(why) => why.capacity(),
+        _ => 0,
+    };
+    vec(&c.classes, c.classes.capacity())
+        + vec(&c.subsumptions, c.subsumptions.capacity())
+        + vec(&c.unsatisfiable, c.unsatisfiable.capacity())
+        + vec(&c.top, c.top.capacity())
+        + verdict
+        + vec(&taxonomy.incomplete, taxonomy.incomplete.capacity())
+        + taxonomy.incomplete.iter().map(text).sum::<usize>()
+}
+
 /// What a copy of `ontology` holds. O(axioms + sources).
 pub fn ontology_bytes(ontology: &Ontology) -> usize {
     let axioms = vec(&ontology.axioms, ontology.axioms.capacity())

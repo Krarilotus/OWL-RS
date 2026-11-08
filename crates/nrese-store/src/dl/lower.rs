@@ -42,9 +42,15 @@ pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxono
 }
 
 /// The memberships `taxonomy` adds to `snapshot`'s: `(a rdf:type D)` for each member `a`
-/// of `C` and superclass `D` of `C`, where `snapshot` doesn't have it. O(members of the
-/// subclasses × their superclasses).
-pub(crate) fn memberships(snapshot: &Snapshot, taxonomy: &Taxonomy, rdf_type: u64) -> Vec<Triple> {
+/// of `C` and superclass `D` of `C`, where `snapshot` doesn't have it; sorted, each once.
+/// Store-scale, so the list and each subclass's members are charged to `budget` as they grow
+/// (SYN-61); `Err` where it can't take them. O(members of the subclasses × their superclasses).
+pub(crate) fn memberships(
+    snapshot: &Snapshot,
+    taxonomy: &Taxonomy,
+    rdf_type: u64,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<nrese_exec::ChargedVec<Triple>, nrese_exec::BudgetExceeded> {
     let mut supers: HashMap<u64, Vec<u64>> = HashMap::new();
     for &(sub, sup) in &taxonomy.classification.subsumptions {
         supers.entry(sub).or_default().push(sup);
@@ -55,32 +61,31 @@ pub(crate) fn memberships(snapshot: &Snapshot, taxonomy: &Taxonomy, rdf_type: u6
             .next()
             .is_some()
     };
-    let mut out = Vec::new();
+    let mut out = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
     for (sub, sups) in &supers {
-        let members: Vec<u64> = snapshot
-            .quads_for_pattern_in(
-                ReadModel::Materialised,
-                &QuadPattern {
-                    subject: None,
-                    predicate: Some(TermId::from_raw(rdf_type)),
-                    object: Some(TermId::from_raw(*sub)),
-                    graph: GraphSelector::Any,
-                },
-            )
-            .map(|q| q.subject.raw())
-            .collect();
-        for a in members {
+        let mut members = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
+        for q in snapshot.quads_for_pattern_in(
+            ReadModel::Materialised,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(TermId::from_raw(rdf_type)),
+                object: Some(TermId::from_raw(*sub)),
+                graph: GraphSelector::Any,
+            },
+        ) {
+            members.push(q.subject.raw())?;
+        }
+        for &a in members.iter() {
             for &sup in sups {
                 let fact = [a, rdf_type, sup];
                 if !has(fact) {
-                    out.push(fact);
+                    out.push(fact)?;
                 }
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
-    out
+    super::upper::sort_dedup(&mut out);
+    Ok(out)
 }
 
 fn pattern([s, p, o]: Triple) -> QuadPattern {

@@ -272,8 +272,8 @@ impl crate::StoreService {
         // The request's envelope: its copy of the premise, and the tests' engines.
         let memory = self.envelope(None);
         let mut scratch = nrese_dl::memory::Scratch::new(Some(&memory));
-        scratch.charge(|| nrese_dl::memory::ontology_bytes(&base))?;
-        let mut ontology = (*base).clone();
+        scratch.charge(|| nrese_dl::memory::ontology_bytes(base.value()))?;
+        let mut ontology = (**base.value()).clone();
         let ids = super::query::Ids::of(&snapshot);
         let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids)
             .map_err(undecided)?;

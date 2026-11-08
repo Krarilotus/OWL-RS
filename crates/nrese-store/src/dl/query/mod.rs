@@ -55,17 +55,23 @@ mod gap;
 use analysis::*;
 pub(crate) use exact::{Ids, ground_axiom};
 
-/// The ontology of a revision, kept for the exact services of its queries.
+/// The ontology of a revision, kept for the exact services of its queries, charged to the
+/// bounds' budget while kept (SYN-61).
 #[derive(Debug, Default)]
-pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, Arc<Ontology>)>>);
+pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, KeptOntology)>>);
+
+/// An ontology with its charge: the charge goes with the last holder, the cache or a reader,
+/// never before (SYN-61). Readers hold this, not the bare ontology.
+pub(crate) type KeptOntology = Arc<nrese_exec::cell::Kept<Ontology>>;
 
 /// The asserted ontology at `snapshot`'s revision, read once per revision; its reading's
-/// scratch charged to the bounds' budget (the store's, within the queries' memory: SYN-61).
-/// `Err` where that can't take it, with nothing kept.
+/// scratch and the ontology itself charged to the bounds' budget (the store's, within the
+/// queries' memory: SYN-61), the ontology for as long as anyone holds it. `Err` where that
+/// can't take them, with nothing kept.
 pub(crate) fn ontology_at(
     store: &StoreService,
     snapshot: &Snapshot,
-) -> Result<Arc<Ontology>, nrese_exec::BudgetExceeded> {
+) -> Result<KeptOntology, nrese_exec::BudgetExceeded> {
     let mut cache = store
         .dl()
         .query_ontology
@@ -77,10 +83,19 @@ pub(crate) fn ontology_at(
     {
         return Ok(Arc::clone(ontology));
     }
-    let kept = Arc::clone(store.dl().bounds.kept());
-    let ontology = Arc::new(source::read_snapshot(snapshot, kept)?);
-    *cache = Some((snapshot.revision(), Arc::clone(&ontology)));
-    Ok(ontology)
+    // The previous revision's, let go by the cache before this one is read and charged (a
+    // reader still holding it keeps its charge).
+    drop(cache.take());
+    let kept = store.dl().bounds.kept();
+    let ontology = Arc::new(source::read_snapshot(snapshot, Arc::clone(kept))?);
+    let bytes = nrese_dl::memory::ontology_bytes(&ontology);
+    let held = Arc::new(nrese_exec::cell::Kept::charge(
+        ontology,
+        bytes,
+        Arc::clone(kept),
+    )?);
+    *cache = Some((snapshot.revision(), Arc::clone(&held)));
+    Ok(held)
 }
 
 /// The data's consistency at `snapshot`'s revision: recorded by its commit, proved by U1,
@@ -129,7 +144,7 @@ fn consistency_at(
     if let Some(stopped) = stopped() {
         return stopped;
     }
-    let checked = consistency::check(&ontology, &budget);
+    let checked = consistency::check(ontology.value(), &budget);
     // Request-local cancellation, expiry or memory must not replace shared revision
     // status.
     if let Some(stopped) = stopped() {
