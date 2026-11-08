@@ -224,10 +224,13 @@ fn a_stopped_materialisation_is_never_reported_complete() {
 
 /// An equality materialisation's expanded listing (every identity of a class) counts each
 /// fact's copies as it makes them: one class of 1000 identities lists about a million
-/// copies of its `sameAs` facts, a product far above `POLL_UNITS`, and the listing asks its
-/// stop at least once every `POLL_UNITS` copies. So a stop that fires while a product is
-/// made is seen within `POLL_UNITS` copies, and the materialisation ends `Interrupted`
-/// (REAS-2's invariant; a whole product counted at once was one ask for all its copies).
+/// copies of its `sameAs` facts, a product far above `POLL_UNITS`. REAS-2's invariant: once
+/// a stop fires, a task does at most `POLL_UNITS` more units plus the work in progress, here
+/// the run of copies counted at once, at most `POLL_UNITS` long (the listing's runs,
+/// `mo.chunks(POLL_UNITS)` in `batch::list`). So the listing asks its stop at least once
+/// every `POLL_UNITS` plus one run's worth of copies, a stop that fires while a product is
+/// made is seen within that, and the materialisation ends `Interrupted` (a whole product
+/// counted at once was one ask for all its copies).
 #[test]
 fn an_expanded_listing_stops_within_its_poll_interval() {
     use crate::rulesets::Ruleset;
@@ -261,11 +264,13 @@ fn an_expanded_listing_stops_within_its_poll_interval() {
         copies >= 100 * interval,
         "{copies} copies: the class's product must be far above POLL_UNITS"
     );
+    // The longest run of copies the listing counts at once (`batch::list`).
+    let run = interval;
     let polls = asks.load(Ordering::Relaxed);
     assert!(
-        polls >= copies / interval,
-        "{polls} asks of the stop for {copies} copies: more than {interval} copies made \
-         between two of them"
+        polls >= copies / (interval + run),
+        "{polls} asks of the stop for {copies} copies: more than {interval} copies plus one \
+         run of {run} made between two of them"
     );
     // A stop that fires at the middle ask, most of which the listing makes, and stays fired.
     let seen = AtomicUsize::new(0);
