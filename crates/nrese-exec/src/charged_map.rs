@@ -126,8 +126,12 @@ impl<K: Eq + Hash, V, H: Hold> ChargedMap<K, V, H> {
 /// `capacity` entries, if it can be allocated: its buckets (at least 16 below 15 entries, else
 /// a power of two at least 8/7 of them), their entries rounded up to the control bytes'
 /// alignment, a control byte a bucket and a group's more (hashbrown 0.16's `TableLayout`; a
-/// group is at most 16 bytes).
-fn table_bound<E>(capacity: usize) -> Option<usize> {
+/// group is at most 16 bytes). `E` is the table's entry: a map's `(K, V)`, a set's `T`. A
+/// table that removes entries can rehash without growing its length past its capacity: its
+/// holder charges this bound for the capacity hashbrown grows to, before it grows, as
+/// [`ChargedMap`] does for its own (`nrese-engine`'s pending inserts, SYN-54, 8 Nov). Held
+/// against hashbrown's allocation by this module's tests.
+pub fn table_bound<E>(capacity: usize) -> Option<usize> {
     const GROUP: usize = 16;
     let buckets = match capacity {
         0..15 => 16,
