@@ -147,39 +147,49 @@ mod tests {
         }
     }
 
-    /// Whether another process is refused the store's lock on `lock`: a child that tries the
-    /// record lock (`fcntl F_SETLK`) on it between its fork and its exec.
-    #[cfg(unix)]
-    fn held_against_another_process(lock: &Path) -> bool {
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::process::CommandExt as _;
-        let path = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
-        let mut command = std::process::Command::new("true");
-        // SAFETY: the hook runs in the forked child before exec and makes only system calls
-        // (open, fcntl, _exit) on memory made before the fork: no allocation and no lock.
-        unsafe {
-            command.pre_exec(move || {
-                let fd = libc::open(path.as_ptr(), libc::O_RDWR);
-                if fd < 0 {
-                    libc::_exit(2);
-                }
-                let mut range: libc::flock = std::mem::zeroed();
-                range.l_type = libc::F_WRLCK as _;
-                range.l_whence = libc::SEEK_SET as _;
-                let taken = libc::fcntl(fd, libc::F_SETLK, &range);
-                libc::_exit(if taken == 0 { 0 } else { 1 });
-            });
-        }
-        let code = command.status().unwrap().code();
-        assert!(matches!(code, Some(0 | 1)), "the probe failed: {code:?}");
-        code == Some(1)
+    /// The variable that makes [`a_second_process_locks`] act: the store it locks.
+    const SECOND_LOCK: &str = "NRESE_TEST_SECOND_LOCK";
+
+    /// Run in a second process of this test binary ([`held_against_another_process`]): takes
+    /// the store's lock in [`SECOND_LOCK`] and exits 3 if it is refused `Locked` (asserted
+    /// here, from its own acquire), 0 if it takes it, 4 for any other failure. In a test run
+    /// (no variable) it does nothing.
+    #[test]
+    fn a_second_process_locks() {
+        let Ok(dir) = std::env::var(SECOND_LOCK) else {
+            return;
+        };
+        let code = match StoreLock::acquire(Path::new(&dir)) {
+            Err(EngineError::Locked(_)) => 3,
+            Ok(_) => 0,
+            Err(error) => {
+                eprintln!("the second lock: {error}");
+                4
+            }
+        };
+        std::process::exit(code);
     }
 
-    /// Windows: a second handle's lock conflicts with the store's, as another process's does.
-    #[cfg(not(unix))]
-    fn held_against_another_process(lock: &Path) -> bool {
-        let other = OpenOptions::new().write(true).open(lock).unwrap();
-        other.try_lock().is_err()
+    /// Whether another process, this test binary run again ([`a_second_process_locks`]), is
+    /// refused the lock of the store in `dir`.
+    fn held_against_another_process(dir: &Path) -> bool {
+        let code = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "durability::lock::tests::a_second_process_locks",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(SECOND_LOCK, dir)
+            .status()
+            .unwrap()
+            .code();
+        assert!(
+            matches!(code, Some(0 | 3)),
+            "the second process failed: {code:?}"
+        );
+        code == Some(3)
     }
 
     /// A store opened again in this process as it closes (one thread's engine dropped while
@@ -192,7 +202,7 @@ mod tests {
     #[test]
     fn a_store_reopened_as_it_closes_stays_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join("LOCK");
+        let lock = dir.path();
         let first = StoreLock::acquire(dir.path()).unwrap();
         let reopened = Rc::new(RefCell::new(None));
         let (slot, root) = (Rc::clone(&reopened), dir.path().to_path_buf());
@@ -203,12 +213,12 @@ mod tests {
         let second = reopened.borrow_mut().take().expect("the hook ran");
         let second = second.expect("opened again as the first closed");
         assert!(
-            held_against_another_process(&lock),
+            held_against_another_process(lock),
             "another process could lock the store opened again"
         );
         drop(second);
         assert!(
-            !held_against_another_process(&lock),
+            !held_against_another_process(lock),
             "released, another process is still refused"
         );
     }

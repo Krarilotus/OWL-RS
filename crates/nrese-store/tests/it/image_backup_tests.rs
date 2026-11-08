@@ -148,3 +148,175 @@ fn pruning_the_archive_keeps_the_segments_after_a_revision() {
     );
     assert!(archive.path().join("00000000000000000014.wal").exists());
 }
+
+/// The variable that makes [`a_second_process_opens`] act: the store it opens.
+const SECOND_OPEN: &str = "NRESE_TEST_SECOND_OPEN";
+
+/// Run in a second process of this test binary ([`second_process_open`]): opens the engine
+/// store named by [`SECOND_OPEN`] and exits 3 if it is refused `Locked` (asserted here, from
+/// its own open), 0 if it opens holding one quad, 4 otherwise. In a test run (no variable) it
+/// does nothing.
+#[test]
+fn a_second_process_opens() {
+    let Ok(dir) = std::env::var(SECOND_OPEN) else {
+        return;
+    };
+    let config = nrese_engine::EngineConfig {
+        background_maintenance: false,
+        ..nrese_engine::EngineConfig::default()
+    };
+    let code = match nrese_engine::Engine::open(std::path::Path::new(&dir), config) {
+        Err(nrese_engine::EngineError::Locked(_)) => 3,
+        Ok(engine) if engine.stats().quads == 1 => 0,
+        Ok(engine) => {
+            eprintln!("the second open holds {} quads", engine.stats().quads);
+            4
+        }
+        Err(error) => {
+            eprintln!("the second open: {error}");
+            4
+        }
+    };
+    std::process::exit(code);
+}
+
+/// What a second process of this test binary gets opening the store in `dir`: 3 `Locked`,
+/// 0 opened with its quad ([`a_second_process_opens`]).
+fn second_process_open(dir: &std::path::Path) -> Option<i32> {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "image_backup_tests::a_second_process_opens",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(SECOND_OPEN, dir)
+        .status()
+        .unwrap()
+        .code()
+}
+
+/// A refused image placement whose image is a live store's `LOCK` (the image may have any
+/// name) leaves the store locked against another process (review r1, R1-F1). The placement
+/// hashes the file, so opens and closes it, and refuses: the hash doesn't match. Before the
+/// fix the store's lock was a record lock, which that close dropped: a second process opened
+/// the store beside the first. Once the first is dropped, the second opens with its commit.
+/// Windows: a guard (a handle's lock is its own).
+#[test]
+fn a_refused_placement_of_a_lock_file_leaves_the_store_locked() {
+    let data = tempdir().unwrap();
+    let config = nrese_engine::EngineConfig {
+        background_maintenance: false,
+        ..nrese_engine::EngineConfig::default()
+    };
+    let engine = nrese_engine::Engine::open(data.path(), config).unwrap();
+    let mut tx = engine.transaction();
+    let quad = nrese_rdf::Quad::new(
+        nrese_rdf::NamedNode::new_unchecked("http://example.com/s"),
+        nrese_rdf::NamedNode::new_unchecked("http://example.com/p"),
+        nrese_rdf::NamedNode::new_unchecked("http://example.com/o"),
+        nrese_rdf::GraphName::DefaultGraph,
+    );
+    tx.insert(quad.as_ref());
+    tx.commit().unwrap();
+    let manifest = nrese_store::ImageManifest {
+        format: "nrese-checkpoint".into(),
+        file: "checkpoint-00000000000000000001.nck".into(),
+        revision: 1,
+        quads: 1,
+        inferred: 0,
+        bytes: 0,
+        sha256: "0".repeat(64),
+        created_unix: 0,
+        nrese_version: "test".into(),
+    };
+    let target = tempdir().unwrap();
+    let refused = nrese_store::image_backup::place_image(
+        &data.path().join("LOCK"),
+        manifest,
+        &target.path().join("restored"),
+    );
+    assert!(
+        matches!(refused, Err(nrese_store::StoreError::Configuration(_))),
+        "the placement wasn't refused: {refused:?}"
+    );
+    assert_eq!(
+        second_process_open(data.path()),
+        Some(3),
+        "a second process opened the store beside a live engine"
+    );
+    drop(engine);
+    assert_eq!(
+        second_process_open(data.path()),
+        Some(0),
+        "the released store didn't open in a second process with its commit"
+    );
+}
+
+/// A restore names every directory it creates durably, through the placement owner
+/// (`restore_image` → `place_image` → `nrese_engine::place::create_dir_all`; review r1,
+/// R1-F2): into `sealed/a/b`, where `sealed` exists but can't be opened (mode 0o311), so its
+/// sync, which must name `a`, fails, and the restore must refuse before it returns. Before the
+/// fix only `a` and `b` were synced, so it returned. Guards: into `open/a/b` it restores, the
+/// store opens with its quad and takes a commit; into an existing empty directory too. Unix
+/// only (permissions); as root, where the mode doesn't keep the directory closed, the first
+/// row isn't checked.
+#[cfg(unix)]
+#[test]
+fn a_restore_names_every_directory_it_creates() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let base = tempdir().unwrap();
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    store
+        .execute_update_str("INSERT DATA { <http://example.com/a> <http://example.com/p> 1 }")
+        .unwrap();
+    let backup = base.path().join("backup");
+    store.backup_image(&backup).unwrap();
+    let mut wrong = Vec::new();
+
+    let sealed = base.path().join("sealed");
+    fs::create_dir(&sealed).unwrap();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o311)).unwrap();
+    if fs::read_dir(&sealed).is_ok() {
+        eprintln!("row sealed: not checked (the directory opens: root?)");
+    } else {
+        let restored = restore_image(&backup, &sealed.join("a").join("b"));
+        eprintln!(
+            "row sealed: {}",
+            if restored.is_err() { "ok" } else { "FAILED" }
+        );
+        if restored.is_ok() {
+            wrong.push("restored under a directory whose sync fails".to_owned());
+        }
+    }
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for (row, target) in [
+        (
+            "two missing levels (guard)",
+            base.path().join("open").join("a").join("b"),
+        ),
+        ("an existing directory (guard)", {
+            let existing = base.path().join("existing");
+            fs::create_dir(&existing).unwrap();
+            existing
+        }),
+    ] {
+        let opened = restore_image(&backup, &target).map(|_| {
+            let store = StoreService::new(StoreConfig::on_disk(&target)).unwrap();
+            store
+                .execute_update_str(
+                    "INSERT DATA { <http://example.com/b> <http://example.com/p> 2 }",
+                )
+                .unwrap();
+            count(&store)
+        });
+        let ok = matches!(opened, Ok(2));
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            wrong.push(format!("{row}: {opened:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

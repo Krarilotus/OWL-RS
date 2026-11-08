@@ -598,6 +598,79 @@ fn a_store_an_earlier_binary_has_open_is_refused() {
     Engine::open(dir.path(), config()).unwrap();
 }
 
+/// The variable that makes [`a_second_process_opens`] act: the store it opens.
+const SECOND_OPEN: &str = "NRESE_TEST_SECOND_OPEN";
+
+/// Run in a second process of this test binary ([`second_process_open`]): opens the store
+/// named by [`SECOND_OPEN`] and exits 3 if it is `Locked`, 0 if it opens holding `quad(0)`, 4
+/// otherwise. In a test run (no variable) it does nothing.
+#[test]
+fn a_second_process_opens() {
+    let Ok(dir) = std::env::var(SECOND_OPEN) else {
+        return;
+    };
+    let code = match Engine::open(Path::new(&dir), config()) {
+        Err(EngineError::Locked(_)) => 3,
+        Ok(engine) if contents(&engine).contains(&quad(0)) => 0,
+        other => {
+            eprintln!(
+                "the second open: {:?}",
+                other.map(|engine| contents(&engine))
+            );
+            4
+        }
+    };
+    std::process::exit(code);
+}
+
+/// What a second process of this test binary gets opening the store in `dir`: 3 `Locked`,
+/// 0 opened with `quad(0)` ([`a_second_process_opens`]).
+fn second_process_open(dir: &Path) -> Option<i32> {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durability_tests::a_second_process_opens",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(SECOND_OPEN, dir)
+        .status()
+        .unwrap()
+        .code()
+}
+
+/// A store stays locked against another process whatever else this process does with its
+/// lock file (review r1, R1-F1): here `LOCK` is read, so opened and closed, while the store is
+/// open. Before the fix the store's lock was a record lock, which any close of the file by the
+/// process drops: a second process opened the store too, and both could commit the same
+/// revision, one of them lost at the next reopen. Once the first engine is dropped, the second
+/// process opens and recovers its commit. Windows: a guard (a handle's lock is its own).
+#[test]
+fn a_store_stays_locked_when_its_lock_file_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &[(vec![quad(0)], Vec::new())]);
+    // Opened and closed; read where the platform lets it (Windows refuses a read of the
+    // locked range, which leaves the open and the close).
+    {
+        use std::io::Read as _;
+        let mut lock = fs::File::open(dir.path().join("LOCK")).unwrap();
+        let _ = lock.read_to_end(&mut Vec::new());
+    }
+    assert_eq!(
+        second_process_open(dir.path()),
+        Some(3),
+        "a second process opened the store beside a live engine"
+    );
+    drop(engine);
+    assert_eq!(
+        second_process_open(dir.path()),
+        Some(0),
+        "the released store didn't open in a second process with its commit"
+    );
+}
+
 /// Starts a child that marks `marker` once it exists and holds the process's descriptors
 /// for 3 s before it runs (Linux: in its fork-to-exec window); whether it ran.
 #[cfg(unix)]
