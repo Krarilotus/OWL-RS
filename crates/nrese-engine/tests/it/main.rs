@@ -2,6 +2,8 @@
 //! file. Each file is a module.
 
 mod bulk_load_tests;
+mod corpus_bounds_tests;
+mod corpus_settings_tests;
 mod cursor_tests;
 mod derived_index_tests;
 mod durability_tests;
@@ -9,6 +11,7 @@ mod engine_tests;
 mod index_encoding_tests;
 mod inferred_stack_tests;
 mod replication_tests;
+mod text_scope_tests;
 mod vector_tests;
 mod vocabulary_tests;
 

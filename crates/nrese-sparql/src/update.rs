@@ -66,6 +66,9 @@ pub struct UpdateOptions {
     /// Which statements each `WHERE` clause reads ([`crate::QueryOptions::read_model`]): the
     /// asserted ones only for a reader who sees no inferred statement. Default: both.
     pub read_model: nrese_engine::ReadModel,
+    /// What searches in `WHERE` clauses rank and select among
+    /// ([`crate::QueryOptions::search_scope`]).
+    pub search_scope: crate::SearchScope,
 }
 
 impl UpdateOptions {
@@ -179,6 +182,7 @@ fn apply_operation(
                 access: options.access.clone(),
                 geosparql_stated_only: options.geosparql_stated_only,
                 read_model: options.read_model,
+                search_scope: options.search_scope,
                 ..crate::query::QueryOptions::default()
             };
             let (deletes, inserts) = crate::native::delete_insert(
