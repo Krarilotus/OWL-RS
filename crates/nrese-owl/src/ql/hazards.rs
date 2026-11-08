@@ -49,6 +49,11 @@ pub enum Hazard {
     /// none of that side's classes or properties (`⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`), where the
     /// rewriting doesn't read the axiom.
     OpenLeft(Term),
+    /// An axiom on the term outside the profile of the closure the rewriting runs over,
+    /// and not covered by another hazard ([`crate::profile::covered`]). The closure's rules
+    /// are complete only for that profile, so named individuals may miss its conclusions
+    /// (I24c).
+    OutsideProfile(Term),
 }
 
 impl Hazard {
@@ -71,7 +76,8 @@ impl Hazard {
             | Self::Filler(t)
             | Self::Asserted(t)
             | Self::Untyped(t)
-            | Self::OpenLeft(t) => t,
+            | Self::OpenLeft(t)
+            | Self::OutsideProfile(t) => t,
         }
     }
 
@@ -114,6 +120,9 @@ impl Hazard {
             }
             Self::OpenLeft(_) => {
                 format!("an axiom on {t} whose left side any individual may be in")
+            }
+            Self::OutsideProfile(_) => {
+                format!("an axiom on {t} outside the profile whose rules the closure applies")
             }
         }
     }
@@ -273,15 +282,25 @@ fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
     }
 }
 
+/// What the TBox read of an ontology, for its hazards.
+pub(crate) struct Read<'a> {
+    /// The conclusions it doesn't read, each with its polarity: its ledger.
+    pub unread: &'a std::collections::BTreeSet<(ExprId, bool)>,
+    /// The axioms it reads only in part or not at all, by index.
+    pub partial: &'a std::collections::BTreeSet<usize>,
+    /// Whether the closure is OWL 2 RL's (`Closure::lists`); QL's otherwise.
+    pub rl: bool,
+}
+
 /// The hazards of `o` and the terms they reach, given the anonymous individuals' types
-/// (`types`, with `basics` naming their concepts) and the conclusions the TBox doesn't read
-/// (`unread`, its ledger, each with its polarity).
+/// (`types`, with `basics` naming their concepts) and what the TBox `read`.
 pub(crate) fn hazards(
     o: &Ontology,
     types: &[Type],
-    unread: &std::collections::BTreeSet<(ExprId, bool)>,
+    read: &Read<'_>,
     basic: &dyn Fn(u32) -> Basic,
 ) -> Hazards {
+    let (unread, rl) = (read.unread, read.rl);
     let mut found: Vec<Hazard> = Vec::new();
     // Properties connected by inclusions, inverses, equivalences and chains.
     let mut links: Vec<(Term, Term)> = Vec::new();
@@ -515,6 +534,31 @@ pub(crate) fn hazards(
     }
     start.extend(asserted);
     start.extend(untyped);
+    // Axioms outside the closure's profile that no other hazard covers (I24c, design note
+    // "Source 3"): seeded after the walk below, along their own edges.
+    let mut outside: Vec<(Term, Hazard, usize)> = Vec::new();
+    for (i, axiom) in o.axioms.iter().enumerate() {
+        // Read whole, the rewriting answers it; in the closure's profile, its rules do.
+        if !read.partial.contains(&i) || crate::profile::covered(o, axiom, rl) {
+            continue;
+        }
+        let concluded = crate::profile::concluded_terms(o, axiom, rl);
+        let equality = crate::profile::concludes_equality(o, axiom);
+        // A conclusion that equates may name no term of its own (`∀R.{a}`): its hazard is
+        // global, named by the axiom's properties.
+        let named = match concluded.is_empty() && equality {
+            true => crate::profile::properties(o, axiom),
+            false => concluded.clone(),
+        };
+        let Some(&first) = named.first() else {
+            continue;
+        };
+        let h = Hazard::OutsideProfile(first);
+        if equality && global.is_none() {
+            global = Some(h);
+        }
+        outside.extend(concluded.into_iter().map(|t| (t, h, i)));
+    }
     // An axiom whose left side any individual may be in meets every anonymous individual,
     // whether or not it shares a term with the individual's type. Seeded after the others,
     // so a term they reach keeps their reason.
@@ -564,7 +608,98 @@ pub(crate) fn hazards(
     if anonymous && global.is_none() {
         global = open_individual.map(Hazard::OpenLeft);
     }
+    // What named individuals may miss of uncovered axioms' conclusions, along every axiom
+    // from premise to conclusion (design note "Source 3"). A seed doesn't follow its own
+    // axiom back to its premise, which holds wherever its conclusion is missed. A term
+    // reached through another axiom follows every axiom, its seed's included.
+    let mut forward: HashMap<Term, Vec<(usize, Term)>> = HashMap::new();
+    for (i, axiom) in o.axioms.iter().enumerate() {
+        for (premise, conclusion) in directed_edges(o, axiom) {
+            for &a in &premise {
+                forward
+                    .entry(a)
+                    .or_default()
+                    .extend(conclusion.iter().map(|&c| (i, c)));
+            }
+        }
+    }
+    // Per term: the axiom whose edges it skips (`Some`), or none (`None`: every edge).
+    let mut reached: HashMap<Term, Option<usize>> = HashMap::new();
+    let mut queue: VecDeque<(Term, Hazard, Option<usize>)> = VecDeque::new();
+    for (t, h, i) in outside {
+        // Seeded by a second axiom: missed with another premise, so every edge.
+        let skip = match reached.get(&t) {
+            None => Some(i),
+            Some(&Some(j)) if j == i => continue,
+            Some(_) => None,
+        };
+        reached.insert(t, skip);
+        queue.push_back((t, h, skip));
+    }
+    while let Some((t, h, skip)) = queue.pop_front() {
+        affected.entry(t).or_insert(h);
+        if global.is_none() {
+            global = equating.get(&t).copied();
+        }
+        for &(j, u) in forward.get(&t).into_iter().flatten() {
+            if Some(j) == skip {
+                continue;
+            }
+            // Reached through another axiom: every edge from it, once.
+            if reached.get(&u) != Some(&None) {
+                reached.insert(u, None);
+                queue.push_back((u, h, None));
+            }
+        }
+    }
     Hazards { affected, global }
+}
+
+/// An axiom's links from its premise terms to its conclusion terms, one per direction:
+/// a subclass, domain or range axiom one way, each ordered pair of an equivalence on its
+/// own, property inclusions, inverses and equivalences as they link. Assertions have
+/// none.
+fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
+    let t = |e: ExprId| {
+        let mut out = Vec::new();
+        terms(o, e, &mut out);
+        out
+    };
+    match axiom {
+        Axiom::SubClassOf(l, r) => vec![(t(*l), t(*r))],
+        Axiom::EquivalentClasses(v) => v
+            .iter()
+            .flat_map(|&a| {
+                v.iter()
+                    .filter(move |&&b| b != a)
+                    .map(move |&b| (t(a), t(b)))
+            })
+            .collect(),
+        Axiom::DisjointUnion(class, parts) => parts
+            .iter()
+            .flat_map(|&p| [(t(p), vec![*class]), (vec![*class], t(p))])
+            .collect(),
+        Axiom::ObjectPropertyDomain(p, c) | Axiom::ObjectPropertyRange(p, c) => {
+            vec![(vec![p.named()], t(*c))]
+        }
+        Axiom::DataPropertyDomain(p, c) => vec![(vec![*p], t(*c))],
+        Axiom::SubObjectPropertyOf(chain, sup) => {
+            vec![(chain.iter().map(|p| p.named()).collect(), vec![sup.named()])]
+        }
+        Axiom::EquivalentObjectProperties(ps) => {
+            let all: Vec<Term> = ps.iter().map(|p| p.named()).collect();
+            vec![(all.clone(), all)]
+        }
+        Axiom::InverseObjectProperties(a, b) => {
+            vec![
+                (vec![a.named()], vec![b.named()]),
+                (vec![b.named()], vec![a.named()]),
+            ]
+        }
+        Axiom::SubDataPropertyOf(a, b) => vec![(vec![*a], vec![*b])],
+        Axiom::EquivalentDataProperties(ps) => vec![(ps.clone(), ps.clone())],
+        _ => Vec::new(),
+    }
 }
 
 /// For an axiom `l ⊑ r` whose left side any individual may be in with none of its terms,
