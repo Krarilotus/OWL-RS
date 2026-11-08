@@ -1334,7 +1334,11 @@ def samples(case: dict, result: dict) -> dict:
     section = metric.split(".")[0]
     # Repeated processes (`repeat`) pool their samples, as the queries' above.
     runs = result.get("_repeats", [result])
-    if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
+    # A section's samples are its own latency: they stand for the metric only where the metric is
+    # that latency's median (`SECTION.p50_ms`). Another field of it (a read latency, a p99, a max) is
+    # its own value, per process below (the orchestrator, 7 Nov 2026: C1's `commits.read_p50_ms` was
+    # timed by its commits' samples, and a 2,500-fold read slowdown was in no hypothesis).
+    if metric == f"{section}.p50_ms" and isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
     if "samples_ms" in result:
         return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
