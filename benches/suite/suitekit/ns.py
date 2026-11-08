@@ -15,6 +15,8 @@ other's builds and one job's cleanup removed another's volumes (office-pc, 19 Oc
                          the host's sweep leaves a resource whose checkout still exists) and
                          nrese.owner (tool cleanup), plus fleet.job=FLEET_JOB when set
     name_args(...)       `--name NAME` with the labels, for `docker run`
+    run_args(...)        `docker run` with its name, labels and memory: the start of every container
+                         the suite makes (tests/test_launch_owner.py fails on one built elsewhere)
     volume(action, ...)  a `docker volume` command: create (labelled), rm, inspect
     directory(base, kind, root)   a job's own directory under a shared one (a kit's binaries,
                          scratch, build context)
@@ -85,6 +87,14 @@ def labels(root: Path | str, owner: str, environ: dict | None = None) -> list[st
 
 def name_args(container: str, root: Path | str, owner: str, environ: dict | None = None) -> list[str]:
     return ["--name", container, *labels(root, owner, environ)]
+
+
+def run_args(root: Path | str, owner: str, name: str | None = None, memory: str | None = None,
+             environ: dict | None = None) -> list[str]:
+    """`docker run` for every container the suite starts: its name (none: Docker's), the labels (in a
+    fleet job, its `fleet.job`) and its hard memory cap without swap."""
+    return ["run", *(name_args(name, root, owner, environ) if name else labels(root, owner, environ)),
+            *(["--memory", memory, "--memory-swap", memory] if memory else [])]
 
 
 def volume(action: str, volume_name: str, root: Path | str | None = None, owner: str = "",

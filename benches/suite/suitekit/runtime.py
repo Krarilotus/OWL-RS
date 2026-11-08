@@ -428,7 +428,7 @@ class DockerRuntime(Runtime):
         self.containers: dict[str, Server] = {}
 
     def args(self, spec: Spec, detached: bool) -> list[str]:
-        args = [ns.executable(), "run", *ns.name_args(spec.name, ROOT, OWNER), "--init"]
+        args = [ns.executable(), *ns.run_args(ROOT, OWNER, spec.name, spec.memory), "--init"]
         # A measurement's own container: the quiet slot's watcher pauses the others.
         if os.environ.get("NRESE_QUIET_TOKEN"):
             args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
@@ -443,8 +443,6 @@ class DockerRuntime(Runtime):
             args += ["-p", f"{self.port}:{spec.port}"]
         if spec.user:
             args += ["-u", spec.user]
-        if spec.memory:
-            args += ["--memory", spec.memory, "--memory-swap", spec.memory]
         # Every system on the same CPUs when a run asks for it (DOCKER_CPUS, e.g. "8").
         if os.environ.get("DOCKER_CPUS"):
             args += ["--cpus", os.environ["DOCKER_CPUS"]]
@@ -554,7 +552,8 @@ class DockerRuntime(Runtime):
         return name
 
     def store_bytes(self, source):
-        out = run_quiet(["docker", "run", "--rm", "-v", f"{source}:/v:ro", "alpine", "du", "-sb", "/v"], 600)
+        out = run_quiet([ns.executable(), *ns.run_args(ROOT, OWNER), "--rm", "-v", f"{source}:/v:ro", "alpine",
+                         "du", "-sb", "/v"], 600)
         try:
             return int(out.stdout.split()[0])
         except (IndexError, ValueError):

@@ -326,7 +326,8 @@ class Suite:
             # scripts/lib/target-cpu.sh reads it; `portable` for none).
             cpu = os.environ.get("NRESE_TARGET_CPU", "native")
             rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
-            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
+            rc = self.host_command([ns.executable(), *ns.run_args(self.root, "suite"), "--rm", "--cpus", cpus,
+                                    "-v", f"{source.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
                                     "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
@@ -358,6 +359,11 @@ class Suite:
                                 "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log)
         return rc == 0
 
+    def in_data(self, *command: str):
+        """`command` in a container over the datasets' volume, read-only."""
+        return run_quiet([ns.executable(), *ns.run_args(self.root, "suite"), "--rm", "-v", f"{self.data_volume}:/data:ro",
+                          "alpine", *command])
+
     def data_missing(self, inputs: list[str]) -> list[str]:
         files = [i for i in inputs if i.startswith("/data/")]
         if not files:
@@ -365,9 +371,7 @@ class Suite:
         if self.data_volume:
             if self.args.dry_run:
                 return []
-            script = "; ".join(f"test -s {f} || echo {f}" for f in files)
-            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine", "sh", "-c", script])
-            return out.stdout.split()
+            return self.in_data("sh", "-c", "; ".join(f"test -s {f} || echo {f}" for f in files)).stdout.split()
         return [f for f in files if not (Path(self.data.source) / f[len("/data/"):]).is_file()]
 
     def data_sizes(self, inputs: list[str]) -> dict[str, int]:
@@ -376,8 +380,7 @@ class Suite:
         if not files or self.args.dry_run:
             return {}
         if self.data_volume:
-            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine",
-                             "stat", "-c", "%n %s", *files])
+            out = self.in_data("stat", "-c", "%n %s", *files)
             pairs = (line.rsplit(" ", 1) for line in out.stdout.splitlines() if " " in line)
             return {name: int(size) for name, size in pairs if size.isdigit()}
         sizes = {}
@@ -393,8 +396,7 @@ class Suite:
         if self.args.dry_run:
             return []
         if self.data_volume:
-            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine", "sh", "-c",
-                             "cat /data/real/*.source 2>/dev/null"])
+            out = self.in_data("sh", "-c", "cat /data/real/*.source 2>/dev/null")
             return [line for line in out.stdout.splitlines() if line.strip()]
         real = Path(self.data.source) / "real"
         return [line for f in sorted(real.glob("*.source")) for line in f.read_text().splitlines()
