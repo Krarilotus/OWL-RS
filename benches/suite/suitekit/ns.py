@@ -16,7 +16,8 @@ other's builds and one job's cleanup removed another's volumes (office-pc, 19 Oc
                          nrese.owner (tool cleanup), plus fleet.job=FLEET_JOB when set
     name_args(...)       `--name NAME` with the labels, for `docker run`
     run_args(...)        `docker run` with its name, labels and memory: the start of every container
-                         the suite makes (tests/test_launch_owner.py fails on one built elsewhere)
+                         the suite makes (tests/test_launch_owner.py fails on one built elsewhere); in
+                         a fleet job declaring its containers, the declared memory (declared_memory)
     volume(action, ...)  a `docker volume` command: create (labelled), rm, inspect
     directory(base, kind, root)   a job's own directory under a shared one (a kit's binaries,
                          scratch, build context)
@@ -39,6 +40,7 @@ other's builds and one job's cleanup removed another's volumes (office-pc, 19 Oc
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -89,10 +91,35 @@ def name_args(container: str, root: Path | str, owner: str, environ: dict | None
     return ["--name", container, *labels(root, owner, environ)]
 
 
+def declared_memory(environ: dict | None = None) -> str | None:
+    """In a fleet job that declares its containers (suitekit/fleet_cells.py jobs(): FLEET_JOB and
+    NRESE_SUITE_MEMORY_GB, as release_gate.data_job()'s NRESE_MAKER_MEMORY_GB for the makers), every
+    suite container's memory, in bytes: exactly the declaration's, which the fleet's watcher matches a
+    container by (within two pages; Docker's `1.5g` isn't exact). None elsewhere. A value that isn't a
+    positive number of GB is refused before anything starts."""
+    env = os.environ if environ is None else environ
+    value = env.get("NRESE_SUITE_MEMORY_GB", "") if env.get("FLEET_JOB") else ""
+    if not value:
+        return None
+    try:
+        gb = float(value)
+    except ValueError:
+        gb = math.nan
+    if not (math.isfinite(gb) and gb > 0):
+        raise ValueError(f"NRESE_SUITE_MEMORY_GB={value}: not a positive size in GB")
+    return f"{round(gb * 2**30)}b"
+
+
 def run_args(root: Path | str, owner: str, name: str | None = None, memory: str | None = None,
              environ: dict | None = None) -> list[str]:
     """`docker run` for every container the suite starts: its name (none: Docker's), the labels (in a
-    fleet job, its `fleet.job`) and its hard memory cap without swap."""
+    fleet job, its `fleet.job`) and its hard memory cap without swap. In a fleet job declaring its
+    containers, the declared memory; a caller asking any other is refused (ValueError) before anything
+    starts, since the fleet's watcher would stop the step at it (fleet Spec 9)."""
+    declared = declared_memory(environ)
+    if declared and memory not in (None, declared):
+        raise ValueError(f"a container asking {memory} in a fleet job that declares {declared} for its containers")
+    memory = declared or memory
     return ["run", *(name_args(name, root, owner, environ) if name else labels(root, owner, environ)),
             *(["--memory", memory, "--memory-swap", memory] if memory else [])]
 

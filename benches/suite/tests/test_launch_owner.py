@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,10 +21,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import adapters, manifest, ns  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
+from test_job_namespace import BASH  # noqa: E402  (Git's bash on Windows, not WSL's launcher)
 
-# A POSIX bash: Git's on Windows, not WSL's launcher (as test_job_namespace).
-BASH = next((b for b in (["C:/Program Files/Git/bin/bash.exe"] if os.name == "nt" else []) if Path(b).is_file()),
-            shutil.which("bash"))
 JOB = "Consol-SCC@office"  # case and punctuation kept: the watcher reads the label's exact value
 DECLARED = {"FLEET_JOB": JOB, "NRESE_SUITE_MEMORY_GB": "1.5"}  # a fraction: Docker's `1.5g` isn't exact bytes
 BYTES = f"{3 * 2**29}b"  # 1.5 GiB

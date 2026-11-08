@@ -122,7 +122,11 @@ class Context:
         """Every container's hard memory cap, without swap: DOCKER_MEMORY, "0" for none,
         by default 90 % of Docker's memory. A run past it is killed in its container
         instead of making the host thrash (nemo-sparq on LUBM 1000, 5 October 2026); it
-        couldn't have finished within the memory anyway."""
+        couldn't have finished within the memory anyway. In a fleet job that declares its
+        containers, the declaration's (ns.declared_memory): the fleet holds it outside the step's
+        slice, so the slice's ceiling below isn't its (#132, fleet Spec 9)."""
+        if declared := ns.declared_memory():
+            return declared
         setting = self.setting("DOCKER_MEMORY")
         # Under fleet no container runs uncapped or past what the job declared: Docker can't
         # join the step's slice, so its ceiling is the slice's limit less a GiB for the driver

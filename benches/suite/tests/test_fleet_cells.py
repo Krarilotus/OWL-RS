@@ -42,7 +42,7 @@ class FleetCells(unittest.TestCase):
         _, data, _ = abba.rg.data_job([case], {"cores": 2, "ram_gb": 0}, harness=None, containers_declared=True)
         declared = [{"name": "suite", "memory_gb": memory}] + data.get("containers", [])
         self.assertEqual(job["containers"], declared)
-        self.assertEqual(job["requires"]["ram_gb"], fleet_cells.SLICE_GB + sum(c["memory_gb"] for c in declared))
+        self.assertAlmostEqual(job["requires"]["ram_gb"], fleet_cells.SLICE_GB + sum(c["memory_gb"] for c in declared), 9)
         self.assertEqual(job["requires"]["cores"], max([2] + [c["cpus"] for c in declared if "cpus" in c]))
         self.assertEqual((job["env"]["NRESE_SUITE_MEMORY_GB"], "DOCKER_MEMORY" in job["env"]), (f"{memory:g}", False))
         self.assertEqual(job["env"].get("NRESE_MAKER_MEMORY_GB"), f"{declared[1]['memory_gb']:g}" if declared[1:] else None)
@@ -164,11 +164,11 @@ class FleetCells(unittest.TestCase):
                 self.assertIn(reason, output.getvalue())
 
     def test_a_member_whose_every_measured_row_failed_does_not_pass(self):
-        # Master 16:31 (#132 B2): a refused container is caught per system, leaving a bundle of failed rows; the cell
-        # mustn't then exit 0 as if it had measured. One ok row is a measurement (it passes).
+        # Master 16:31 (#132 B2): a refused container leaves failed rows; the cell mustn't exit 0 as if it had measured, one ok
+        # row is a measurement. Its own checkout: the landing lies outside it, and a gate's temp may be inside this one.
         import csv
         import subprocess
-        from suitekit import schema
+        from suitekit import fleet_cells, schema
         bins, gate, landing = self.out / "bin", self.out / "gate", self.out / "private" / "cell"
         harness = self.out / "suite-client-target" / "release" / "nrese-bench-harness"
         for directory in (bins, gate, harness.parent):
@@ -202,7 +202,7 @@ class FleetCells(unittest.TestCase):
                     patch.dict(os.environ, {"SUITE_CELL": json.dumps(payload), "FLEET_OUT": str(self.out / "export"),
                                             "NRESE_GATE_DIR": str(gate)}):
                 with contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(suite.main(["suite.py", "fleet", "--_member"]), expected)
+                    self.assertEqual(fleet_cells.member(self.out / "checkout", suite.load()[0]), expected)
                 if expected:
                     self.assertIn(refused, (landing / "stderr.log").read_text(encoding="utf-8"))
 
