@@ -462,15 +462,44 @@ fn partition(len: usize, below: impl Fn(usize) -> bool) -> usize {
 
 /// The order of the entries after the mapped base (or of all, without one): built when a
 /// search first needs it, extended by merging when the dictionary has grown.
-#[derive(Debug, Default)]
+///
+/// The dictionary keeps one behind its `order` lock, and readers clone it (an `Arc`) under a
+/// brief read guard. An extension is built from a clone and a view of the keys with no lock
+/// held, then installed only if the kept order is still the one it extended ([`Self::same`]):
+/// publish after the check.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct TextOrder {
     /// The entries `first..covered` are in `order`.
     pub(crate) first: u64,
     pub(crate) covered: u64,
-    pub(crate) order: Vec<u64>,
+    pub(crate) order: std::sync::Arc<Vec<u64>>,
+    /// The dictionary's generation it was built in: a rebase advances it, and an order built
+    /// in another is never installed.
+    pub(crate) generation: u64,
 }
 
 impl TextOrder {
+    /// An empty order of the dictionary's generation `generation`.
+    pub(crate) fn at(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+
+    /// Whether it holds the entries `first..len`: [`Self::extend`] would do nothing.
+    pub(crate) fn covers(&self, first: u64, len: u64) -> bool {
+        self.first == first && self.covered >= len
+    }
+
+    /// Whether `other` is this very order, unchanged since it was cloned.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.first == other.first
+            && self.covered == other.covered
+            && self.generation == other.generation
+            && std::sync::Arc::ptr_eq(&self.order, &other.order)
+    }
+
     /// Takes in the entries `covered..len` (all from `first` on if `first` changed).
     pub(crate) fn extend<'a>(
         &mut self,
@@ -482,7 +511,8 @@ impl TextOrder {
             *self = Self {
                 first,
                 covered: first,
-                order: Vec::new(),
+                order: std::sync::Arc::default(),
+                generation: self.generation,
             };
         }
         if self.covered >= len {
@@ -490,7 +520,7 @@ impl TextOrder {
         }
         let added: Vec<u64> = sorted(self.covered..len, key);
         let text = |index: u64| text_in(key(index));
-        let old = std::mem::take(&mut self.order);
+        let old = std::sync::Arc::clone(&self.order);
         let mut merged = Vec::with_capacity(old.len() + added.len());
         let (mut i, mut j) = (0, 0);
         while i < old.len() && j < added.len() {
@@ -505,7 +535,7 @@ impl TextOrder {
         }
         merged.extend_from_slice(&old[i..]);
         merged.extend_from_slice(&added[j..]);
-        self.order = merged;
+        self.order = std::sync::Arc::new(merged);
         self.covered = len;
     }
 }
@@ -737,6 +767,6 @@ mod tests {
         let mut order = TextOrder::default();
         order.extend(0, 4, &key);
         order.extend(0, keys.len() as u64, &key);
-        assert_eq!(order.order, all);
+        assert_eq!(*order.order, all);
     }
 }

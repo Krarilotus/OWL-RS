@@ -199,3 +199,131 @@ async fn a_request_of_another_protocol_or_shape_is_a_bad_request() -> TestResult
     assert_eq!(status, StatusCode::BAD_REQUEST);
     Ok(())
 }
+
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
+const EX: &str = "https://example.test/";
+
+/// `subject ⊑ ∃r.filler`.
+fn some(subject: &str, filler: &str) -> String {
+    format!(
+        "<{subject}> <{RDFS}subClassOf> _:r .\n\
+         _:r <{RDF}type> <{OWL}Restriction> .\n\
+         _:r <{OWL}onProperty> <{EX}r> .\n\
+         _:r <{OWL}someValuesFrom> <{filler}> .\n"
+    )
+}
+
+/// `A ⊑ ∀R.∃S.⊥` with `R ∘ S ⊑ S` and `S ∘ R ⊑ R`: with `a : A` and `R(a, b)` no model,
+/// and the universal over the irregular `R` is left out of the DL engines.
+fn irregular() -> String {
+    let chain = |p: &str, first: &str, second: &str, l: &str| {
+        format!(
+            "<{EX}{p}> <{OWL}propertyChainAxiom> _:{l}1 .\n\
+             _:{l}1 <{RDF}first> <{EX}{first}> .\n_:{l}1 <{RDF}rest> _:{l}2 .\n\
+             _:{l}2 <{RDF}first> <{EX}{second}> .\n_:{l}2 <{RDF}rest> <{RDF}nil> .\n"
+        )
+    };
+    format!(
+        "<{EX}R> <{RDF}type> <{OWL}ObjectProperty> .\n\
+         <{EX}S> <{RDF}type> <{OWL}ObjectProperty> .\n\
+         <{EX}A> <{RDF}type> <{OWL}Class> .\n\
+         {}{}\
+         <{EX}A> <{RDFS}subClassOf> _:u .\n\
+         _:u <{RDF}type> <{OWL}Restriction> .\n_:u <{OWL}onProperty> <{EX}R> .\n\
+         _:u <{OWL}allValuesFrom> _:e .\n\
+         _:e <{RDF}type> <{OWL}Restriction> .\n_:e <{OWL}onProperty> <{EX}S> .\n\
+         _:e <{OWL}someValuesFrom> <{OWL}Nothing> .\n",
+        chain("S", "R", "S", "s"),
+        chain("R", "S", "R", "q"),
+    )
+}
+
+/// The reasoning check's verdict (`nrese:draft-check/2`, notes N4 design G4-1 to G4-3):
+/// `logical_consistent` is `false` where the OWL 2 RL rules or the OWL 2 DL engines found
+/// no model, `true` where neither did and both decided, `null` where nothing decided. An
+/// inconsistent input lists no unsatisfiable class. Inputs from the witnesses
+/// `lane-d-draft-witness-cab7e725` and `lane-d-classification-witness-84baa169`.
+#[tokio::test]
+async fn the_verdict_is_the_rules_and_dl_engines_or_null() -> TestResult {
+    let member = format!("<{EX}a> <{RDF}type> <{EX}A> .\n");
+    let thing = format!("{OWL}Thing");
+    let nothing = format!("{OWL}Nothing");
+    let a = format!("{EX}A");
+    // (name, schema, data, logical_consistent, complete)
+    let cases = [
+        // ⊤ ⊑ ∃r.⊥: no model; the DL engines see it, the RL rules don't.
+        (
+            "top",
+            some(&thing, &nothing),
+            String::new(),
+            json!(false),
+            json!(true),
+        ),
+        // A ⊑ ∃r.⊥ with a : A.
+        (
+            "member",
+            some(&a, &nothing),
+            member.clone(),
+            json!(false),
+            json!(true),
+        ),
+        // a : ⊥, which the RL rules see (cls-nothing2).
+        (
+            "rules",
+            String::new(),
+            format!("<{EX}a> <{RDF}type> <{OWL}Nothing> .\n"),
+            json!(false),
+            json!(true),
+        ),
+        // No model, and nothing decides it.
+        (
+            "undecided",
+            irregular(),
+            format!("{member}<{EX}a> <{EX}R> <{EX}b> .\n"),
+            Value::Null,
+            json!(false),
+        ),
+        // A ⊑ ∃r.B with a : A: a model.
+        (
+            "consistent",
+            some(&a, &format!("{EX}B")),
+            member,
+            json!(true),
+            json!(true),
+        ),
+    ];
+    let app = test_app()?;
+    let declared = capabilities(&app).await?;
+    let mut wrong = Vec::new();
+    for (name, schema, data, consistent, complete) in cases {
+        let mut asked = request(&declared);
+        asked["operation"] = json!("reasoning");
+        asked["inputs"] = json!({"data": data, "schema": schema});
+        let reply = check(&app, asked).await?;
+        let got = (
+            &reply["terminal_status"],
+            &reply["logical_consistent"],
+            &reply["complete"],
+        );
+        if got != (&json!("completed"), &consistent, &complete) {
+            wrong.push(format!(
+                "{name}: (status, logical_consistent, complete) {got:?}, \
+                 expected (completed, {consistent}, {complete}): {reply}"
+            ));
+        }
+        if consistent == json!(false) && reply["unsatisfiable_classes"] != json!([]) {
+            wrong.push(format!(
+                "{name}: an inconsistent input lists unsatisfiable classes {}",
+                reply["unsatisfiable_classes"]
+            ));
+        }
+    }
+    // The field's meaning changed, so the semantics identifier did.
+    if declared["semantics"] != json!(["nrese:draft-check/2"]) {
+        wrong.push(format!("semantics {}", declared["semantics"]));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    Ok(())
+}

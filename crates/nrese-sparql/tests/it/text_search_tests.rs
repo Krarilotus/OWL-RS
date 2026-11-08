@@ -4,7 +4,7 @@
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query};
+use nrese_sparql::{GraphAccess, QueryOptions, QueryResults, evaluate_query, explain_query};
 use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
@@ -339,5 +339,258 @@ fn graphdb_lucene_predicates() {
     assert_eq!(
         query("SELECT ?x ?s WHERE { ?x luc:labels \"tower AND bridge\" ; luc:score ?s }"),
         table(&[&["bridge", "1"]])
+    );
+}
+
+/// `text:query`'s limit counts the literals of its property: a literal of another
+/// property that ranks higher ("bridge" three times in three words, BM25) takes none of
+/// the limit, so `(rdfs:label "bridge" 1)` finds the one label that matches.
+#[test]
+fn jena_limit_counts_the_property_literals_only() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdfs = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.w3.org/2000/01/rdf-schema#{local}"))
+    };
+    for (subject, property, text) in [
+        ("note", "comment", "bridge bridge bridge"),
+        ("span", "label", "the old bridge over the river"),
+    ] {
+        tx.insert(
+            Quad::new(
+                ex(subject),
+                rdfs(property),
+                Literal::new_simple_literal(text),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let plain = QueryOptions::default();
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (rdfs:label \"bridge\" 1) }",
+            &plain
+        ),
+        table(&[&["span"]])
+    );
+    // Without a property, the comment ranks first and the limit keeps it.
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (\"bridge\" 1) }",
+            &plain
+        ),
+        table(&[&["note"]])
+    );
+}
+
+/// How long the cyclic lists below may take before the test calls them hung: a bound
+/// that contains a walk unable to finish, not a measurement.
+const CYCLE_HANG: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A cyclic RDF list (`_:a rdf:rest _:a`) as `text:query`'s subject or object is not an
+/// argument list, as a list without `rdf:nil` isn't: the pattern is read as written and
+/// finds nothing here, instead of walking the cycle forever.
+#[test]
+fn cyclic_text_query_lists_answer() {
+    let queries = [
+        "SELECT ?s WHERE { ?s text:query _:a . _:a rdf:first \"bridge\" ; rdf:rest _:a }",
+        "SELECT ?s WHERE { ?s text:query _:a .          _:a rdf:first rdfs:label ; rdf:rest _:b . _:b rdf:first \"bridge\" ; rdf:rest _:a }",
+        "SELECT ?s WHERE { _:l text:query \"bridge\" . _:l rdf:first ?s ; rdf:rest _:l }",
+    ];
+    // Each list on a thread of its own, so that one that hangs doesn't hide the others.
+    let answers: Vec<_> = queries
+        .iter()
+        .map(|query| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let query =
+                format!("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {query}");
+            std::thread::spawn(move || {
+                let _ = send.send(rows(&engine(), &query, &QueryOptions::default()));
+            });
+            receive
+        })
+        .collect();
+    let failures: Vec<String> = answers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(case, receive)| match receive.recv_timeout(CYCLE_HANG) {
+            Ok(answer) if answer.is_empty() => None,
+            Ok(answer) => Some(format!("cyclic list {case}: {answer:?}")),
+            Err(e) => Some(format!("cyclic list {case}: no answer ({e})")),
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A search under `GRAPH ?g` matches only literals of the named graphs the query's dataset
+/// has (SPARQL 1.1 §13.3, §18.6): those `FROM NAMED` lists, and of those only the graphs its
+/// reader may read (`QueryOptions::access`: the others are absent). One row each, every row
+/// reported: the reader of every graph (a guard), a reader who may not read `g`, one who
+/// may, and `FROM NAMED` naming another graph or `g`.
+#[test]
+fn a_graph_search_matches_only_the_datasets_named_graphs() {
+    let engine = engine();
+    let reader = |graphs: &[&str]| QueryOptions {
+        access: Some(std::sync::Arc::new(GraphAccess {
+            default_graph: true,
+            graphs: graphs.iter().map(|g| format!("{EX}{g}")).collect(),
+            ..GraphAccess::default()
+        })),
+        ..QueryOptions::default()
+    };
+    let search = |from: &str| {
+        format!("SELECT ?o {from} WHERE {{ GRAPH ?g {{ ?o bds:search \"bridge\" }} }}")
+    };
+    let hidden = table(&[&["A bridge in another graph"]]);
+    let rows_of = [
+        (
+            "every graph",
+            search(""),
+            QueryOptions::default(),
+            hidden.clone(),
+        ),
+        ("g unreadable", search(""), reader(&[]), table(&[])),
+        ("g readable", search(""), reader(&["g"]), hidden.clone()),
+        (
+            "FROM NAMED another graph",
+            search("FROM NAMED <http://example.com/other>"),
+            QueryOptions::default(),
+            table(&[]),
+        ),
+        (
+            "FROM NAMED g",
+            search("FROM NAMED <http://example.com/g>"),
+            QueryOptions::default(),
+            hidden,
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, query, options, want) in rows_of {
+        let got = sorted(rows(&engine, &query, &options));
+        if got != want {
+            failed.push(format!("{name}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} rows failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// Another store's name for the default graph (`urn:x-arq:DefaultGraph`, rdflib's
+/// `urn:x-rdflib:default`; `compat`) reads the store's default graph only for a reader who
+/// may read it: for one who may not, the graph is absent from its dataset (SPARQL 1.1
+/// §13.3), as an unreadable named graph is, whatever reads it (a search, `text:query`, a
+/// sub-select, nested under `GRAPH ?g`, a vector search). The fixture's default graph
+/// alone holds `British Museum`; the review's witness (graph-search-scope r1, R1-D1).
+/// Rows: two guards (every graph; a reader of the default graph), then a reader of `g`
+/// alone through each path. Every row reported.
+#[test]
+fn default_graph_aliases_respect_reader_scope() {
+    let engine = engine();
+    let reader = |default_graph: bool| QueryOptions {
+        access: Some(std::sync::Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}g")],
+            default_graph,
+            ..GraphAccess::default()
+        })),
+        ..QueryOptions::default()
+    };
+    let museum = table(&[&["British Museum"]]);
+    let in_alias =
+        |alias: &str, inner: &str| format!("SELECT ?o WHERE {{ GRAPH <{alias}> {{ {inner} }} }}");
+    let search = "?o bds:search \"museum\"";
+    let arq = "urn:x-arq:DefaultGraph";
+    let rdflib = "urn:x-rdflib:default";
+    let rows_of = [
+        (
+            "every graph",
+            in_alias(arq, search),
+            QueryOptions::default(),
+            museum.clone(),
+        ),
+        (
+            "reader of the default graph",
+            in_alias(arq, search),
+            reader(true),
+            museum.clone(),
+        ),
+        (
+            "arq alias",
+            in_alias(arq, search),
+            reader(false),
+            table(&[]),
+        ),
+        (
+            "rdflib alias",
+            in_alias(rdflib, search),
+            reader(false),
+            table(&[]),
+        ),
+        (
+            "text:query",
+            in_alias(arq, "?s text:query \"museum\" ; rdfs:label ?o"),
+            reader(false),
+            table(&[]),
+        ),
+        (
+            "sub-select",
+            in_alias(arq, &format!("{{ SELECT ?o WHERE {{ {search} }} }}")),
+            reader(false),
+            table(&[]),
+        ),
+        (
+            "under GRAPH ?g",
+            format!("SELECT ?o WHERE {{ GRAPH ?g {{ GRAPH <{arq}> {{ {search} }} }} }}"),
+            reader(false),
+            table(&[]),
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, query, options, want) in rows_of {
+        let got = sorted(rows(&engine, &query, &options));
+        if got != want {
+            failed.push(format!("{name}: got {got:?}, want {want:?}"));
+        }
+    }
+    // A vector search under the alias: the default graph's vector, for a reader of nothing.
+    let vectors = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = vectors.transaction();
+    let vector = Literal::new_typed_literal(
+        "[1, 0]",
+        NamedNode::new_unchecked(nrese_engine::vector::DATATYPE),
+    );
+    tx.insert(Quad::new(ex("s"), ex("p"), vector, GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let nobody = QueryOptions {
+        access: Some(std::sync::Arc::new(GraphAccess::default())),
+        ..QueryOptions::default()
+    };
+    let near = format!(
+        "SELECT ?v WHERE {{ GRAPH <{arq}> {{ SERVICE <urn:nrese:vector:search> {{ \
+         ?v <urn:nrese:vector:near> \"[1, 0]\"^^<{}> ; <urn:nrese:vector:k> 1 ; \
+         <urn:nrese:vector:exact> true }} }} }}",
+        nrese_engine::vector::DATATYPE
+    );
+    for (name, options, want) in [
+        ("vector, every graph", QueryOptions::default(), 1),
+        ("vector, a reader of nothing", nobody, 0),
+    ] {
+        let got = rows(&vectors, &near, &options).len();
+        if got != want {
+            failed.push(format!("{name}: got {got} rows, want {want}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} rows failed:\n{}",
+        failed.len(),
+        failed.join("\n")
     );
 }

@@ -8,7 +8,8 @@
 //! whether or not the handler (or the refusal) needs it: an answer sent while the client
 //! still sends would close the connection under it, and clients that send the headers and
 //! the body apart (Python's `http.client`, for one) would see it aborted rather than the
-//! answer (found by the HTTP soak: 1 in 20 `POST …/sessions` with `{}` failed so).
+//! answer (found by the HTTP soak: 1 in 20 `POST …/sessions` with `{}` failed so). That
+//! read waits at most [`READ_AHEAD_WAIT`].
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -27,10 +28,22 @@ use crate::state::AppState;
 pub async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let client = client_address(&state, request.extensions(), request.headers());
     let checked = state.authenticate(request.headers(), client).await;
-    let mut request = match read_ahead(request).await {
-        Ok(request) => request,
-        Err(error) => {
+    let mut request = match tokio::time::timeout(READ_AHEAD_WAIT, read_ahead(request)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
             return ApiError::bad_request(format!("the request body: {error}")).into_response();
+        }
+        // The body didn't come in time: the credentials' refusal, or for valid ones 408
+        // (the handler can't run on a body partly read).
+        Err(_) => {
+            return match checked {
+                Ok(_) => ApiError::timeout(format!(
+                    "the request body didn't arrive within {} s",
+                    READ_AHEAD_WAIT.as_secs()
+                ))
+                .into_response(),
+                Err(error) => error.into_response(),
+            };
         }
     };
     match checked {
@@ -44,6 +57,11 @@ pub async fn authenticate(State(state): State<AppState>, request: Request, next:
 
 /// The largest body read whole before the answer.
 pub const READ_AHEAD: u64 = 64 * 1024;
+
+/// The longest the read-ahead waits for its body, the whole of it (a body sent a byte at a
+/// time doesn't extend it): a client that declares a body and withholds it gets its answer
+/// then. Far more than [`READ_AHEAD`] takes on any link a client uses.
+pub const READ_AHEAD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `request` with its body read whole if it has a known length up to [`READ_AHEAD`]; as it
 /// is otherwise (no body, a larger one, or one of unknown length, which handlers stream).

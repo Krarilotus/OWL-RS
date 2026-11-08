@@ -24,6 +24,12 @@
 //! the object of a statement in the graph the pattern reads. The matches start the
 //! pattern's joins, so the other triple patterns are read for them only.
 //!
+//! Under `GRAPH ?g` the search is evaluated per named graph, as SPARQL 1.1 §18.6 evaluates
+//! the pattern: a row per matched literal and named graph whose statements have it, `?g`
+//! bound to that graph, at the same relevance. `bds:rank`, `bds:minRank` and `bds:maxRank`
+//! count within each graph; so there `bds:maxRank` doesn't end the search early (every
+//! match is read, for the graphs still below it), while `bds:minRelevance` does.
+//!
 //! Jena's `text:query` (what Fuseki users send) runs on the same index:
 //!
 //! ```sparql
@@ -36,7 +42,8 @@
 //! The subject is `?s`, or a list of `?s`, the score, the matched literal, its graph and
 //! its property (any prefix of them; the graph stays unbound, the property too where the
 //! object names it). The object is the query string, or a list of an
-//! optional property, the query string, an optional limit on the matched literals, and
+//! optional property, the query string, an optional limit on the matched literals (objects
+//! of the property, if one is given), and
 //! `"lang:xx"` for the literals' language (other `name:value` options are ignored). The
 //! query string is read as Lucene's syntax as far as the index goes: words, phrases in
 //! double quotes, `word*` prefixes and fuzzy `word~` (two edits) or `word~1`; `AND` between
@@ -51,8 +58,10 @@
 //! `?x luc:score ?s` binds the relevance. The index name is not looked up: there is one
 //! index, over every string literal.
 
+use std::collections::HashMap;
+
 use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
-use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
+use nrese_rdf::{Literal, NamedNode, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use nrese_exec::IdTable;
@@ -75,6 +84,8 @@ pub(super) struct Search {
     max_rank: Option<usize>,
     /// Only literals in this language (`text:query`'s `"lang:xx"`).
     language: Option<String>,
+    /// Only literals that are objects of this property (`text:query`'s property).
+    property: Option<NamedNode>,
 }
 
 impl Search {
@@ -93,6 +104,7 @@ impl Search {
             min_rank: None,
             max_rank: None,
             language: None,
+            property: None,
         }
     }
 }
@@ -224,6 +236,11 @@ fn list(head: &TermPattern, triples: &[TriplePattern]) -> Option<(Vec<TermPatter
             })
         };
         let (first, rest) = (link(rdf::FIRST.as_str())?, link(rdf::REST.as_str())?);
+        // A node met again closes a cycle (`_:a rdf:rest _:a`): not a list, as one
+        // without `rdf:nil` isn't.
+        if used.contains(&rest) {
+            return None;
+        }
         items.push(triples[first].object.clone());
         used.extend([first, rest]);
         node = triples[rest].object.clone();
@@ -319,6 +336,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         let mut search = Search::new(literal.clone(), text);
         search.query.all_words = all_words;
         search.relevance = outputs.get(1).and_then(variable);
+        search.property = property.clone();
         // GraphDB: the score is a statement on the subject.
         if luc(triple).is_some()
             && let Some(score) = triples.iter().position(|t| {
@@ -364,8 +382,18 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
 }
 
 impl Context<'_> {
-    /// Whether `id` is the object of a statement in the active graph.
+    /// Whether `id` is the object of a statement in the active graph ([`Self::used_as_object_of`]
+    /// with any predicate).
     pub(super) fn used_as_object(&self, id: TermId) -> bool {
+        self.used_as_object_of(id, None)
+    }
+
+    /// Whether `id` is the object of a statement in the active graph, with `property` as its
+    /// predicate if given: under `GRAPH ?g`, in one of the dataset's named graphs where it
+    /// lists them (`FROM NAMED`, and of those only the graphs the reader may read:
+    /// `ResolvedDataset::restricted`). The graph and the property hold for the same
+    /// statement.
+    fn used_as_object_of(&self, id: TermId, property: Option<TermId>) -> bool {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
             GraphScope::Named(g) => GraphSelector::Exact(*g),
@@ -375,27 +403,51 @@ impl Context<'_> {
         };
         let pattern = QuadPattern {
             subject: None,
-            predicate: None,
+            predicate: property,
             object: Some(id),
             graph,
         };
         let merge_set = matches!(*self.graph.borrow(), GraphScope::Union)
             .then_some(self.merge_set.as_ref())
             .flatten();
+        let named = matches!(*self.graph.borrow(), GraphScope::Variable(_))
+            .then_some(self.named.as_deref())
+            .flatten();
         self.snapshot
             .quads_for_pattern_in(self.model, &pattern)
-            .any(|quad| merge_set.is_none_or(|graphs| graphs.contains(&quad.graph)))
+            .any(|quad| {
+                merge_set.is_none_or(|graphs| graphs.contains(&quad.graph))
+                    && named.is_none_or(|graphs| graphs.contains(&quad.graph))
+            })
     }
 
     /// The literals `search` matches, with their relevance and rank.
     pub(super) fn search(&self, search: &Search) -> NativeResult<Solutions> {
         self.check()?;
+        // The property restricts the literals before the rank limits count them, so the
+        // join with `?s <property> ?literal` drops none they counted. A property the
+        // store doesn't know: no literal.
+        let property = search
+            .property
+            .as_ref()
+            .map(|p| self.snapshot.lookup(p.as_ref().into()));
+        let graph_variable = match &*self.graph.borrow() {
+            GraphScope::Variable(variable) => Some(variable.clone()),
+            _ => None,
+        };
+        if let Some(variable) = graph_variable {
+            return self.search_per_graph(search, variable, property);
+        }
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
-        for found in self.snapshot.text_search(&search.query) {
+        let found = match property {
+            Some(None) => Vec::new(),
+            _ => self.snapshot.text_search(&search.query),
+        };
+        for found in found {
             if search
                 .min_relevance
                 .is_some_and(|min| found.relevance < min)
@@ -403,16 +455,10 @@ impl Context<'_> {
                 break;
             }
             let id = TermId::from_raw(found.id);
-            if let Some(language) = &search.language {
-                let in_language = matches!(
-                    self.term(found.id),
-                    Some(Term::Literal(l)) if l.language().is_some_and(|l| l.eq_ignore_ascii_case(language))
-                );
-                if !in_language {
-                    continue;
-                }
+            if !self.in_language(search, id) {
+                continue;
             }
-            if !self.used_as_object(id) {
+            if !self.used_as_object_of(id, property.flatten()) {
                 continue;
             }
             rank += 1;
@@ -436,5 +482,158 @@ impl Context<'_> {
             table,
             ordered: false,
         })
+    }
+
+    /// [`Self::search`] under `GRAPH ?g`, as SPARQL 1.1 §18.6 evaluates the pattern: in each
+    /// named graph of the dataset, with `graph` bound to it. A literal in several graphs
+    /// gives a row per graph, at the index's relevance; ranks count within each graph, so
+    /// `bds:rank`, `bds:minRank` and `bds:maxRank` are a graph's own. `bds:maxRank` can't end
+    /// the pass early (another graph may not have reached it yet); `bds:minRelevance` can
+    /// (relevance descends). One pass over the matches, and per match its statements in the
+    /// named graphs: no search per graph.
+    ///
+    /// `property` is the search's property as [`Self::search`] looked it up (`Some(None)`: one
+    /// the store doesn't know, so no literal): in each graph only literals that are objects
+    /// of it there are ranked.
+    fn search_per_graph(
+        &self,
+        search: &Search,
+        graph: Variable,
+        property: Option<Option<TermId>>,
+    ) -> NativeResult<Solutions> {
+        let memory = crate::QueryEvaluationError::MemoryLimit;
+        let mut vars = vec![search.matched.clone()];
+        vars.extend(search.relevance.iter().cloned());
+        vars.extend(search.rank.iter().cloned());
+        // The rows, and each row's graph, charged to the query's budget before they grow:
+        // the rows a literal in many graphs fans out to are refused before they outgrow it.
+        // Each charge declared before what it covers: on an error the buffer is freed first,
+        // then its charge released (brief v3 §3).
+        let mut held = nrese_exec::Reservation::new(&*self.budget);
+        let mut table = IdTable::new(vars.len());
+        let mut graph_of_row = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
+        // Each graph's rank so far, kept only where a rank decides anything; its table is
+        // charged before it grows (`spatial::map_room`), even where no row passes.
+        let ranked =
+            search.rank.is_some() || search.min_rank.is_some() || search.max_rank.is_some();
+        let mut ranks_held = nrese_exec::Reservation::new(&*self.budget);
+        let mut ranks: HashMap<TermId, usize> = HashMap::new();
+        let mut graphs = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
+        let found = match property {
+            Some(None) => Vec::new(),
+            _ => self.snapshot.text_search(&search.query),
+        };
+        for found in found {
+            self.check()?;
+            if search
+                .min_relevance
+                .is_some_and(|min| found.relevance < min)
+            {
+                break;
+            }
+            let id = TermId::from_raw(found.id);
+            if !self.in_language(search, id) {
+                continue;
+            }
+            self.named_graphs_using(id, property.flatten(), &mut graphs)?;
+            for &in_graph in graphs.iter() {
+                let rank = match ranked {
+                    true => {
+                        if !ranks.contains_key(&in_graph) {
+                            super::spatial::map_room(&mut ranks_held, &mut ranks)
+                                .map_err(memory)?;
+                        }
+                        let rank = ranks.entry(in_graph).or_default();
+                        *rank += 1;
+                        *rank
+                    }
+                    false => 0,
+                };
+                if search.max_rank.is_some_and(|max| rank > max)
+                    || search.min_rank.is_some_and(|min| rank < min)
+                {
+                    continue;
+                }
+                let mut row = vec![found.id];
+                if search.relevance.is_some() {
+                    row.push(self.id(&Term::from(Literal::from(found.relevance))));
+                }
+                if search.rank.is_some() {
+                    row.push(self.id(&Term::from(Literal::from(rank as i64))));
+                }
+                super::reserve_rows(&mut table, &mut held, 1, usize::MAX).map_err(memory)?;
+                table.push_row(&row);
+                graph_of_row.push(in_graph.raw()).map_err(memory)?;
+            }
+        }
+        self.check()?;
+        // Both stay charged to the query as its result, as `produced` charges one; the
+        // graph binding then follows the one rule (`bind_graph`).
+        let charged = held.transfer() + graph_of_row.charged();
+        let (graph_of_row, charge) = graph_of_row.into_parts();
+        charge.transfer();
+        let solutions = Solutions {
+            vars,
+            table,
+            ordered: false,
+        };
+        let solutions = super::bind_graph(solutions, &graph, super::RowGraphs::Each(graph_of_row));
+        // Where the search bound the graph variable itself, its column was replaced: what
+        // the result no longer holds is released.
+        self.budget
+            .release(charged.saturating_sub(solutions.table.memory_bytes()));
+        Ok(solutions)
+    }
+
+    /// Whether the literal `id` is in `search`'s language, where it names one.
+    fn in_language(&self, search: &Search, id: TermId) -> bool {
+        let Some(language) = &search.language else {
+            return true;
+        };
+        matches!(
+            self.term(id.raw()),
+            Some(Term::Literal(l)) if l.language().is_some_and(|l| l.eq_ignore_ascii_case(language))
+        )
+    }
+
+    /// The named graphs of the dataset (those it lists, where it lists them) whose
+    /// statements have `id` as their object, with `property` as their predicate if given,
+    /// sorted and each once, into `out`.
+    fn named_graphs_using(
+        &self,
+        id: TermId,
+        property: Option<TermId>,
+        out: &mut nrese_exec::ChargedVec<TermId>,
+    ) -> NativeResult<()> {
+        out.clear();
+        let pattern = QuadPattern {
+            subject: None,
+            predicate: property,
+            object: Some(id),
+            graph: GraphSelector::AnyNamed,
+        };
+        let named = self.named.as_deref();
+        // Each graph once as it is met: what is held is bounded by the graphs, not by the
+        // literal's statements; their scan stops at a cancellation.
+        for (read, quad) in self
+            .snapshot
+            .quads_for_pattern_in(self.model, &pattern)
+            .enumerate()
+        {
+            if read % 4096 == 4095 {
+                self.check()?;
+            }
+            let graph = quad.graph;
+            if out.last() == Some(&graph)
+                || out.contains(&graph)
+                || named.is_some_and(|graphs| !graphs.contains(&graph))
+            {
+                continue;
+            }
+            out.push(graph)
+                .map_err(crate::QueryEvaluationError::MemoryLimit)?;
+        }
+        out.sort_unstable();
+        Ok(())
     }
 }
