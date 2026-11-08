@@ -1,0 +1,435 @@
+//! A transaction's private vocabulary: the lifecycle contract's overlay
+//! (`notes/2026-11-08-dictionary-lifecycle-contract.md` P2, §4.1, §4.3; package 2a's design note
+//! `notes/2026-11-08-p2-bounded-vocabulary-design.md`).
+//!
+//! An [`Overlay`] resolves terms through the dictionary below its `start` (the length of the
+//! snapshot it opened over: append-only, so those ids never change) and then through its own
+//! [`Suffix`], where it adds what the dictionary didn't have at `start`. A term has one id in one
+//! overlay: shared if the dictionary had it at `start`, else its own, numbered from `start`. A
+//! triple term's components resolve first. What it adds is charged to its budget, and leaves
+//! nothing in the dictionary.
+//!
+//! [`Overlay::freeze`] makes an [`OverlayView`]: the entries there were then, for a snapshot to
+//! hold. Lookups through a view still read the overlay's table, accepting only its own entries.
+
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "snapshots and private transactions hold overlays from package 2b"
+    )
+)]
+
+use std::sync::Arc;
+
+use nrese_exec::{Budget, BudgetExceeded, Reservation};
+use nrese_rdf::{NamedOrBlankNode, Term, TermRef, Triple};
+use parking_lot::Mutex;
+
+use super::charged::ChargedArc;
+use super::dictionary::{
+    Dictionary, TRIPLE_KEY_LEN, decode_key, encode_key, encoded_len, key_lookup_bytes, triple_ids,
+    triple_key, view_key,
+};
+
+/// The most bytes the dictionary's probe of a key of `encoded` bytes allocates, on a plain or a
+/// compressed base, whichever is more ([`key_lookup_bytes`]).
+fn probe_bytes(encoded: usize) -> usize {
+    key_lookup_bytes(encoded, false).max(key_lookup_bytes(encoded, true))
+}
+
+/// The most bytes a lookup of `term` through an overlay or a view holds at once: a probe and
+/// then an own key, one after the other; for a triple term, its components' lookups one after
+/// another, then its own probe and key.
+fn lookup_scratch(term: TermRef<'_>) -> usize {
+    match term {
+        TermRef::Triple(triple) => [
+            lookup_scratch(triple.subject.as_ref().into()),
+            lookup_scratch(triple.predicate.as_ref().into()),
+            lookup_scratch(triple.object.as_ref()),
+            probe_bytes(TRIPLE_KEY_LEN) + TRIPLE_KEY_LEN,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0),
+        _ => probe_bytes(encoded_len(term)) + encoded_len(term),
+    }
+}
+use super::hash::key_hash;
+use super::suffix::{Frozen, Suffix};
+use super::{TermId, TermKind, TermView};
+
+/// A transaction's private vocabulary over the dictionary's entries below `start`.
+pub(crate) struct Overlay {
+    dictionary: Arc<Dictionary>,
+    start: u64,
+    budget: Arc<Budget>,
+    /// Its own entries. A leaf lock: held for one probe and push, never while taking another
+    /// lock or running parallel work.
+    suffix: Mutex<Suffix>,
+}
+
+impl Overlay {
+    /// An overlay over `dictionary`'s entries below `start` (the snapshot's length it opens
+    /// over), its own entries charged to `budget`.
+    pub(crate) fn over(dictionary: Arc<Dictionary>, start: u64, budget: Arc<Budget>) -> Arc<Self> {
+        let suffix = Mutex::new(Suffix::at(start, Arc::clone(&budget)));
+        Arc::new(Self {
+            dictionary,
+            start,
+            budget,
+            suffix,
+        })
+    }
+
+    pub(crate) fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// The id of `term`: inline, the dictionary's below `start`, or this overlay's own, added
+    /// if it is new. What it allocates is charged first. Refused, `term` is not added; a triple
+    /// term's components interned before the refusal stay, each its own entry, charged (a later
+    /// intern finds them; one id per term holds).
+    pub(crate) fn intern(&self, term: TermRef<'_>) -> Result<TermId, BudgetExceeded> {
+        if let Some(id) = self.dictionary.inline_id(term) {
+            return Ok(id);
+        }
+        if let TermRef::Triple(triple) = term {
+            // The components first: their ids make the key, and come before its own.
+            let ids = [
+                self.intern(triple.subject.as_ref().into())?,
+                self.intern(triple.predicate.as_ref().into())?,
+                self.intern(triple.object.as_ref())?,
+            ];
+            // The dictionary's probe of the key (on a compressed base, its compressed form too),
+            // then this one's key: charged first, at the larger of the two bases' bounds, since
+            // the probe takes its own guard and a rebase may change the base meanwhile.
+            let mut scratch = Reservation::new(&*self.budget);
+            scratch.charge(probe_bytes(TRIPLE_KEY_LEN) + TRIPLE_KEY_LEN)?;
+            if let Some(id) = self.dictionary.triple_term_bounded(ids, self.start) {
+                return Ok(id);
+            }
+            let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
+            triple_key(ids, &mut key);
+            return self.own(&key, TermKind::Triple);
+        }
+        let mut scratch = Reservation::new(&*self.budget);
+        let shared = self.dictionary.lookup_charged(term, self.start, |bytes| {
+            scratch.charge(bytes + encoded_len(term))
+        })?;
+        if let Some(id) = shared {
+            return Ok(id);
+        }
+        let mut key = Vec::with_capacity(encoded_len(term));
+        let kind = encode_key(term, &mut key);
+        self.own(&key, kind)
+    }
+
+    /// `key`'s id among this overlay's own entries, added if absent.
+    fn own(&self, key: &[u8], kind: TermKind) -> Result<TermId, BudgetExceeded> {
+        let hash = key_hash(key);
+        let mut suffix = self.suffix.lock();
+        let id = match suffix.find(hash, key) {
+            Some(id) => id,
+            None => suffix.push(key, hash)?,
+        };
+        Ok(TermId::new(kind, id))
+    }
+
+    /// [`Self::intern`] of each of `quad`'s terms (the default graph as itself). Refused, the
+    /// terms interned before the refusal stay, as [`Self::intern`]'s components do.
+    pub(crate) fn intern_quad(
+        &self,
+        quad: nrese_rdf::QuadRef<'_>,
+    ) -> Result<crate::EncodedQuad, BudgetExceeded> {
+        let graph = match super::dictionary::graph_term(quad.graph_name) {
+            Some(term) => self.intern(term)?,
+            None => TermId::DEFAULT_GRAPH,
+        };
+        Ok(crate::EncodedQuad::new(
+            self.intern(quad.subject.into())?,
+            self.intern(quad.predicate.into())?,
+            self.intern(quad.object)?,
+            graph,
+        ))
+    }
+
+    /// The id of `term` if it is known: inline, shared below `start`, or this overlay's own.
+    pub(crate) fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
+        self.lookup_below(term, u64::MAX)
+    }
+
+    /// [`Self::lookup`], counting only own entries below `end`.
+    fn lookup_below(&self, term: TermRef<'_>, end: u64) -> Option<TermId> {
+        if let Some(id) = self.dictionary.inline_id(term) {
+            return Some(id);
+        }
+        if let TermRef::Triple(triple) = term {
+            let ids = [
+                self.lookup_below(triple.subject.as_ref().into(), end)?,
+                self.lookup_below(triple.predicate.as_ref().into(), end)?,
+                self.lookup_below(triple.object.as_ref(), end)?,
+            ];
+            return self.triple_term_below(ids, end);
+        }
+        if let Some(id) = self.dictionary.lookup_bounded(term, self.start) {
+            return Some(id);
+        }
+        let mut key = Vec::with_capacity(encoded_len(term));
+        let kind = encode_key(term, &mut key);
+        self.find_below(&key, end).map(|id| TermId::new(kind, id))
+    }
+
+    /// The triple term of `components` below `end`: the dictionary's below `start`, else own.
+    fn triple_term_below(&self, components: [TermId; 3], end: u64) -> Option<TermId> {
+        if let Some(id) = self.dictionary.triple_term_bounded(components, self.start) {
+            return Some(id);
+        }
+        let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
+        triple_key(components, &mut key);
+        self.find_below(&key, end)
+            .map(|id| TermId::new(TermKind::Triple, id))
+    }
+
+    /// `key`'s own id, if it is below `end`.
+    fn find_below(&self, key: &[u8], end: u64) -> Option<u64> {
+        self.suffix
+            .lock()
+            .find(key_hash(key), key)
+            .filter(|&id| id < end)
+    }
+
+    /// The entries now, for a snapshot to hold: later interns don't change it. Its lists and
+    /// its block are charged to this overlay's budget.
+    pub(crate) fn freeze(self: &Arc<Self>) -> Result<OverlayView, BudgetExceeded> {
+        let frozen = self.suffix.lock().freeze()?;
+        let state = ViewState {
+            overlay: Arc::clone(self),
+            frozen,
+        };
+        Ok(OverlayView(ChargedArc::new(state, &self.budget)?))
+    }
+}
+
+/// An overlay's entries at one moment ([`Overlay::freeze`]): the dictionary's below `start`, its
+/// own `start..start + n`. Its identity is its overlay's. Cloned by every snapshot made from the
+/// one holding it; its block is charged and released after it is freed ([`ChargedArc`]).
+#[derive(Clone)]
+pub(crate) struct OverlayView(ChargedArc<ViewState>);
+
+pub(crate) struct ViewState {
+    overlay: Arc<Overlay>,
+    frozen: Frozen,
+}
+
+impl std::ops::Deref for OverlayView {
+    type Target = ViewState;
+
+    fn deref(&self) -> &ViewState {
+        &self.0
+    }
+}
+
+impl OverlayView {
+    pub(crate) fn dictionary(&self) -> &Arc<Dictionary> {
+        &self.overlay.dictionary
+    }
+
+    pub(crate) fn start(&self) -> u64 {
+        self.overlay.start
+    }
+
+    /// The end of its ids: `start + n`.
+    pub(crate) fn end(&self) -> u64 {
+        self.overlay.start + self.frozen.len()
+    }
+
+    /// Its own entries' count.
+    pub(crate) fn len(&self) -> u64 {
+        self.frozen.len()
+    }
+
+    /// Whether `other` is a view of the same overlay.
+    pub(crate) fn same_overlay(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.overlay, &other.overlay)
+    }
+
+    /// Own entry `id`'s key (a dictionary-kind id at or past `start`).
+    fn own_key(&self, id: TermId) -> Option<&[u8]> {
+        (id.kind().is_dictionary() && id.payload() >= self.start())
+            .then(|| self.frozen.key(id.payload()))
+            .flatten()
+    }
+
+    fn is_own(&self, id: TermId) -> bool {
+        id.kind().is_dictionary() && id.payload() >= self.start()
+    }
+
+    pub(crate) fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
+        self.overlay.lookup_below(term, self.end())
+    }
+
+    /// [`Self::lookup`], what it allocates charged first through `charge` ([`lookup_scratch`]):
+    /// at the larger of a plain and a compressed base's bounds, since its probes take their own
+    /// guards and a rebase may change the base between them.
+    pub(crate) fn lookup_charged<E>(
+        &self,
+        term: TermRef<'_>,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        charge(lookup_scratch(term))?;
+        Ok(self.lookup(term))
+    }
+
+    pub(crate) fn lookup_quad(&self, quad: nrese_rdf::QuadRef<'_>) -> Option<crate::EncodedQuad> {
+        let graph = match super::dictionary::graph_term(quad.graph_name) {
+            Some(term) => self.lookup(term)?,
+            None => TermId::DEFAULT_GRAPH,
+        };
+        Some(crate::EncodedQuad::new(
+            self.lookup(quad.subject.into())?,
+            self.lookup(quad.predicate.into())?,
+            self.lookup(quad.object)?,
+            graph,
+        ))
+    }
+
+    pub(crate) fn triple_term(&self, components: [TermId; 3]) -> Option<TermId> {
+        self.overlay.triple_term_below(components, self.end())
+    }
+
+    pub(crate) fn components(&self, id: TermId) -> Option<[TermId; 3]> {
+        if id.kind() != TermKind::Triple {
+            return None;
+        }
+        if id.payload() < self.start() {
+            return self.dictionary().components(id);
+        }
+        triple_ids(self.own_key(id)?)
+    }
+
+    pub(crate) fn decode(&self, id: TermId) -> Option<Term> {
+        if !self.is_own(id) {
+            return self.dictionary().decode(id);
+        }
+        let key = self.own_key(id)?;
+        let Some([s, p, o]) = triple_ids(key) else {
+            return Some(decode_key(key));
+        };
+        let Term::NamedNode(predicate) = self.decode(p)? else {
+            return None;
+        };
+        Some(
+            Triple::new(
+                NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
+                predicate,
+                self.decode(o)?,
+            )
+            .into(),
+        )
+    }
+
+    pub(crate) fn decode_charged<E>(
+        &self,
+        id: TermId,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<Term>, E> {
+        if !self.is_own(id) {
+            return self.dictionary().decode_charged(id, charge);
+        }
+        // As the dictionary's: a triple term's decode is its components' (`None` here).
+        let Some(key) = self.own_key(id).filter(|_| id.kind() != TermKind::Triple) else {
+            return Ok(None);
+        };
+        charge(key.len())?;
+        Ok(Some(decode_key(key)))
+    }
+
+    pub(crate) fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if !self.is_own(id) {
+            return self.dictionary().decode_bound(id);
+        }
+        self.own_key(id)
+            .filter(|_| id.kind() != TermKind::Triple)
+            .map(<[u8]>::len)
+    }
+
+    pub(crate) fn with_view<R>(&self, id: TermId, f: impl FnOnce(TermView<'_>) -> R) -> Option<R> {
+        if !self.is_own(id) {
+            return self.dictionary().with_view(id, f);
+        }
+        self.own_key(id).map(|key| f(view_key(key)))
+    }
+
+    /// Calls `f` with a lookup of entry views, the dictionary's below `start` under one of its
+    /// read guards, its own from the frozen entries (no lock).
+    pub(crate) fn with_views<R>(
+        &self,
+        f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
+    ) -> R {
+        self.dictionary().with_views(self.start(), |shared| {
+            let both = |id: TermId| match self.is_own(id) {
+                true => self.own_key(id).map(view_key),
+                false => shared(id),
+            };
+            f(&both)
+        })
+    }
+
+    pub(crate) fn decode_quad(&self, quad: crate::EncodedQuad) -> Option<nrese_rdf::Quad> {
+        let graph_name = if quad.graph.is_default_graph() {
+            nrese_rdf::GraphName::DefaultGraph
+        } else {
+            NamedOrBlankNode::try_from(self.decode(quad.graph)?)
+                .ok()?
+                .into()
+        };
+        let Term::NamedNode(predicate) = self.decode(quad.predicate)? else {
+            return None;
+        };
+        Some(nrese_rdf::Quad::new(
+            NamedOrBlankNode::try_from(self.decode(quad.subject)?).ok()?,
+            predicate,
+            self.decode(quad.object)?,
+            graph_name,
+        ))
+    }
+
+    /// The dictionary's matches below `start`, then its own, each sorted: every own id is above
+    /// every shared one.
+    pub(crate) fn matching_strings_scan(
+        &self,
+        test: &super::StringTest<'_>,
+    ) -> (Vec<TermId>, super::StringScan) {
+        let (mut found, mut scan) = self.dictionary().matching_strings_scan(test, self.start());
+        let matcher = super::strings::Matcher::new(test);
+        let mut own = Vec::new();
+        let mut tested = 0;
+        for (id, key) in self.frozen.entries() {
+            let ends = [key.len() as u64];
+            tested += matcher.slice(key, &ends[..], (0, 1), id, &mut own);
+        }
+        if self.frozen.len() > 0 {
+            scan.arenas += 1;
+            scan.slices += 1;
+            scan.keys_tested += tested;
+        }
+        // A key a pass finds is pushed once per pass: sorted, then each once.
+        own.sort_unstable();
+        own.dedup();
+        // Sorted as the dictionary's are: by id, kind first. An own id is above every shared one
+        // of its kind, not above every shared one: a shared language-tagged string sorts after
+        // an own simple literal.
+        found.extend(own);
+        found.sort_unstable();
+        (found, scan)
+    }
+
+    pub(crate) fn matching_strings(&self, test: &super::StringTest<'_>) -> Vec<TermId> {
+        self.matching_strings_scan(test).0
+    }
+}
+
+#[cfg(test)]
+#[path = "overlay_tests.rs"]
+mod tests;
