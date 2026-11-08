@@ -221,11 +221,12 @@ fn more_members_of_a_class_expression_keep_the_compiled_tbox() {
 ///   read equals a fresh one (still one member); deleting the last ones too: none left;
 /// - a commit without a note, and a transaction's pending state, rescan every one.
 ///
-/// Each read counts three things: memberships scanned, expressions walked, membership
-/// statements written into a schema. A noted commit walks only the expressions it
-/// touched, and writes a schema only where a membership changed (P2-C1 probe, 8 Nov: the
-/// rebuild of every expression's took 188 us a snapshot). Each schema read is compared
-/// with a fresh one: reuse never changes what is read.
+/// Each read counts three things: memberships scanned, membership changes walked,
+/// membership statements written into a schema. A noted commit walks only its changes,
+/// scans only where it removed the kept member, and writes a schema only where an
+/// expression gains or loses its last member (P2-C1 probes, 8 Nov: 188 us a snapshot for
+/// the rebuild, 1 us for each touched rescan). Each read is compared with a fresh one by
+/// what the TBox reads: the core, and which expressions have a member.
 #[test]
 fn a_noted_commit_rescans_only_the_memberships_it_touched() {
     let restrictions = 20;
@@ -258,7 +259,24 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
             MEMBERS_WRITTEN.get(),
         ]
     };
-    let fresh = |snapshot: &Snapshot| schema_statements(snapshot, &|_| true);
+    // What the TBox reads of a schema: its core, and which expressions have a member
+    // (the kept statement's identity is read by nothing: design note, "Membership cache").
+    let presence = |schema: &[nrese_owl::Statement], snapshot: &Snapshot| {
+        let rdf_type = iri(snapshot, RDF, "type").map(TermId::raw);
+        let mut core = Vec::new();
+        let mut members = Vec::new();
+        for s in schema {
+            let blank = TermId::from_raw(s.triple[2]).kind() == nrese_engine::TermKind::BlankNode;
+            match Some(s.triple[1]) == rdf_type && blank {
+                true => members.push(s.triple[2]),
+                false => core.push(*s),
+            }
+        }
+        members.sort_unstable();
+        members.dedup();
+        (core, members)
+    };
+    let fresh = |snapshot: &Snapshot| presence(&schema_statements(snapshot, &|_| true), snapshot);
     let mut wrong = Vec::new();
     let all = scans(&engine.snapshot());
     if all != [restrictions; 3] {
@@ -310,11 +328,11 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         let snapshot = engine.snapshot();
         let n = scans(&snapshot);
         let cached = ql.cached.lock().unwrap();
-        let read = cached[0].schema(&snapshot);
+        let read = presence(&cached[0].schema(&snapshot), &snapshot);
         drop(cached);
         if n != expected || read != fresh(&snapshot) {
             wrong.push(format!(
-                "{name}: {n:?} (expected {expected:?}; scanned, walked, written), equal to a                  fresh read: {}",
+                "{name}: {n:?} (expected {expected:?}; scanned, walked, written), fresh: {}",
                 read == fresh(&snapshot)
             ));
         }
@@ -333,7 +351,7 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         },
         true,
     );
-    check("a member added", [1, 1, 0]);
+    check("a member added", [0, 1, 0]);
     commit(
         &|tx| {
             tx.insert(quad("ann", &format!("{EX}knows"), "bob").as_ref());
@@ -348,7 +366,7 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         },
         true,
     );
-    check("the held member deleted", [1, 1, restrictions]);
+    check("the held member deleted", [1, 1, 0]);
     commit(
         &|tx| {
             for m in &members[1..] {
@@ -358,7 +376,7 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         },
         true,
     );
-    check("every member deleted", [1, 1, restrictions - 1]);
+    check("every member deleted", [1, 3, restrictions - 1]);
     commit(
         &|tx| {
             tx.insert(member("again").as_ref());
