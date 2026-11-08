@@ -1,20 +1,17 @@
-//! The DL-oracle differential (design note `2026-11-08-dl-oracle-differential-design.md`,
-//! decision 1 (a)). What a `complete` status under `owl2-ql` or `owl2-rl` claims
-//! (`nrese-sparql`'s `Regime`): every answer the closure's rules and the QL rewriting's
-//! existentials entail. The rewriting reports not `complete` where an axiom it doesn't follow
-//! meets anonymous individuals.
+//! The DL-oracle differential (design note `2026-11-08-dl-oracle-differential-design.md`).
+//! What a `complete` status under `owl2-ql` or `owl2-rl` claims, since a regime may claim it
+//! only where it answers every axiom the query can meet (I24c; master, 8 Nov 10:31): every
+//! certain answer owl2-dl gives (`DlAnswers::Exact`). One that claims `sound` too must hold
+//! nothing else.
 //!
-//! The test checks exactly that claim, in four steps:
-//! 1. The owl2-dl mode saturates the named individuals: their entailed types and the property
-//!    assertions between them.
-//! 2. Those facts are loaded with the case into a QL store and an RL store, rewriting on.
-//! 3. Each store answers the query. The named facts are DL-complete, so any certain answer
-//!    still missing comes through anonymous individuals.
-//! 4. A `complete` answer must contain owl2-dl's certain answers (`DlAnswers::Exact`). One that
-//!    claims `sound` too must hold nothing else.
+//! The comparison is direct ([`Relation::Direct`], master 12:33). The saturated one
+//! ([`Relation::Claim`]) only attributes a miss:
+//! - the case is loaded with owl2-dl's facts of its named individuals first;
+//! - a miss that remains comes through anonymous individuals (the I24b ledger);
+//! - one that goes away is a named individual's (the I24c classification).
 //!
-//! When owl2-dl can't decide (an error under `Exact`, a fact it can't settle), the case has no
-//! verdict. That is never agreement.
+//! When owl2-dl can't decide (an error under `Exact`, a fact it can't settle, a deadline),
+//! the case has no verdict. That is never agreement.
 
 use std::collections::BTreeSet;
 
@@ -164,15 +161,23 @@ fn rows(json: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
-/// What a QL/RL `complete` answer is compared with (design note, decision 1).
+/// What a QL/RL `complete` answer is compared with (design note, decision 1, as the master
+/// confirmed it on 8 Nov 12:33).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Relation {
-    /// (a), the contract: the named individuals are saturated under owl2-dl first, so only
-    /// answers through anonymous individuals can be missed.
+    /// Attribution: the named individuals are saturated under owl2-dl first, so only answers
+    /// through anonymous individuals can be missed.
     Claim,
-    /// (b), a diagnostic: owl2-dl's certain answers directly. That also counts the RL
-    /// closure's unclaimed gaps for named individuals.
+    /// The contract: owl2-dl's certain answers directly.
     Direct,
+}
+
+/// The test's deadline (review G1 r1, F4): past it, owl2-dl gets no time, a store no query,
+/// and a case no verdict.
+fn left(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|d| !d.is_zero())
 }
 
 /// The facts owl2-dl entails of the case's named individuals:
@@ -180,10 +185,15 @@ pub(crate) enum Relation {
 /// - its properties between them;
 /// - equality between them.
 ///
-/// `Err` where one can't be decided.
-fn saturation(dl: &nrese_store::MutationPipeline, parsed: &Parsed) -> Result<Vec<String>, String> {
+/// `Err` where one can't be decided, or `deadline` has passed.
+fn saturation(
+    dl: &nrese_store::MutationPipeline,
+    parsed: &Parsed,
+    deadline: std::time::Instant,
+) -> Result<Vec<String>, String> {
     let mut facts = Vec::new();
     let mut ask = |triple: String| -> Result<(), String> {
+        left(deadline).ok_or("the deadline passed")?;
         if !certain(dl, &format!("ASK {{ {triple} }}"))?.is_empty() {
             facts.push(format!("{triple} ."));
         }
@@ -206,14 +216,22 @@ fn saturation(dl: &nrese_store::MutationPipeline, parsed: &Parsed) -> Result<Vec
 }
 
 /// The verdict for `case` under each of owl2-ql and owl2-rl, rewriting on, compared by
-/// `relation`.
-pub(crate) fn verdicts(case: &Case, relation: Relation) -> Vec<(Ruleset, Verdict)> {
+/// `relation`, within `deadline`.
+pub(crate) fn verdicts(
+    case: &Case,
+    relation: Relation,
+    deadline: std::time::Instant,
+) -> Vec<(Ruleset, Verdict)> {
     let both = |v: Verdict| vec![(Ruleset::Owl2Ql, v.clone()), (Ruleset::Owl2Rl, v)];
+    let Some(time) = left(deadline) else {
+        return both(Verdict::Undecided("the deadline passed".to_owned()));
+    };
     let parsed = parse(case.turtle);
-    // Each owl2-dl task within a deadline and the tableau's node and branch budgets
-    // (design note, "The generator"): past them it can't decide, never agrees.
+    // Each owl2-dl task within 5 s, or what is left of the deadline, and the tableau's node
+    // and branch budgets (design note, "The generator"): past them it can't decide, never
+    // agrees.
     let dl = crate::dl::pipeline_with(nrese_store::DlConfig {
-        timeout: Some(std::time::Duration::from_secs(5)),
+        timeout: Some(time.min(std::time::Duration::from_secs(5))),
         max_nodes: Some(100_000),
         max_branch_points: Some(100_000),
         ..nrese_store::DlConfig::default()
@@ -233,7 +251,7 @@ pub(crate) fn verdicts(case: &Case, relation: Relation) -> Vec<(Ruleset, Verdict
     };
     let facts = match relation {
         Relation::Direct => Vec::new(),
-        Relation::Claim => match saturation(&dl, &parsed) {
+        Relation::Claim => match saturation(&dl, &parsed, deadline) {
             Ok(facts) => facts,
             Err(e) => return both(Verdict::Undecided(format!("saturation: {e}"))),
         },
@@ -241,6 +259,13 @@ pub(crate) fn verdicts(case: &Case, relation: Relation) -> Vec<(Ruleset, Verdict
     let saturated = format!("{}\n{}", parsed.lines.join("\n"), facts.join("\n"));
     let mut out = Vec::new();
     for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        if left(deadline).is_none() {
+            out.push((
+                ruleset,
+                Verdict::Undecided("the deadline passed".to_owned()),
+            ));
+            continue;
+        }
         let dir = tempfile::tempdir().unwrap();
         let store: StoreService =
             crate::ql_rewriting_tests::store(&saturated, dir.path(), ruleset, true);
@@ -395,15 +420,16 @@ fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
     ]
 }
 
-/// The fixed cases. Under the contract (decision 1 (a)), no QL or RL answer labelled
-/// `complete` misses a certain answer, and none claimed `sound` holds an uncertain one.
-/// Every fixture is decidable, so a fixture without a verdict fails too. The direct
-/// comparison (b) is printed beside each one, never asserted.
+/// The fixed cases. No QL or RL answer labelled `complete` misses a certain answer, and
+/// none claimed `sound` holds an uncertain one, under the direct comparison (the contract)
+/// and the saturated one (review G1 r1, F6: the direct verdict was printed, never asserted).
+/// Every fixture is decidable, so a fixture without a verdict fails too.
 ///
 /// On engine-v2 `7fa950ef`, each of the I24b, F1–F4 fixtures should be `missed`: the
 /// harness's own check (design note, "First campaign").
 #[test]
 fn the_review_fixtures_answer_as_the_dl_oracle() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut wrong = Vec::new();
     for (name, body, query) in review_fixtures() {
         let turtle = format!("{HEAD}{body}");
@@ -412,20 +438,61 @@ fn the_review_fixtures_answer_as_the_dl_oracle() {
             turtle: &turtle,
             query,
         };
-        let direct = verdicts(&case, Relation::Direct);
-        for ((ruleset, verdict), (_, plain)) in
-            verdicts(&case, Relation::Claim).into_iter().zip(direct)
+        let direct = verdicts(&case, Relation::Direct, deadline);
+        for ((ruleset, saturated), (_, verdict)) in verdicts(&case, Relation::Claim, deadline)
+            .into_iter()
+            .zip(direct)
         {
             eprintln!(
-                "VERDICT {name}, {}: (a) {verdict:?}; (b) {plain:?}",
+                "VERDICT {name}, {}: direct {verdict:?}; saturated {saturated:?}",
                 ruleset.name()
             );
-            if !matches!(verdict, Verdict::Agree | Verdict::Reported) {
-                wrong.push(format!("{name}, {}: {verdict:?}", ruleset.name()));
+            for (relation, v) in [("direct", &verdict), ("saturated", &saturated)] {
+                if !matches!(v, Verdict::Agree | Verdict::Reported) {
+                    wrong.push(format!("{name}, {}, {relation}: {v:?}", ruleset.name()));
+                }
             }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A number setting of the generated test, from the environment's `value` (review G1 r1,
+/// F2: a malformed value fell back to its default, and `NRESE_FUZZ_CASES=0` passed while
+/// comparing nothing): `default` where it is unset; an error where it is set but isn't a
+/// whole number of at least `min` (overflow included).
+fn setting(value: Option<&str>, default: u64, min: u64) -> Result<u64, String> {
+    match value {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) if n >= min => Ok(n),
+            Ok(n) => Err(format!("{n} is below {min}")),
+            Err(e) => Err(format!("{v:?}: {e}")),
+        },
+    }
+}
+
+/// [`setting`] of the variable `name`, failing the test before any work where it is invalid.
+fn env_setting(name: &str, default: u64, min: u64) -> u64 {
+    let value = match std::env::var(name) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => panic!("{name}: {e}"),
+    };
+    setting(value.as_deref(), default, min).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// Unset settings take their defaults; zero cases and malformed or overflowing values are
+/// refused (review G1 r1, F2).
+#[test]
+fn generated_test_settings_refuse_zero_and_invalid_values() {
+    assert_eq!(setting(None, 100, 1), Ok(100));
+    assert_eq!(setting(Some(" 7 "), 100, 1), Ok(7));
+    assert_eq!(setting(Some("0"), 0, 0), Ok(0), "seed 0 is a seed");
+    assert_eq!(setting(Some("18446744073709551615"), 0, 0), Ok(u64::MAX));
+    for refused in ["0", "", "x", "-1", "1.5", "18446744073709551616"] {
+        assert!(setting(Some(refused), 100, 1).is_err(), "{refused:?} taken");
+    }
 }
 
 /// A generated case (`nrese_owl::fuzz::templates::case`, all of SROIQ(D)) as N-Triples,
@@ -524,21 +591,40 @@ fn query(
 /// answer of owl2-dl, and none claimed `sound` holds an uncertain one. Each failure names
 /// its attribution, the saturated relation's verdict: missed there too, through anonymous
 /// individuals (the I24b ledger); agreed there, a named individual's (the I24c
-/// classification). The undecided cases are at most a fifth, in total and in each family
-/// with ten verdicts or more; every family's counts are printed (`FAMILY` lines).
+/// classification). Undecided verdicts are at most a fifth, in total and in each family
+/// with ten verdicts or more, and at least one verdict is decided (review G1 r1, F3). A case
+/// still inconsistent after its redraws was never compared, so it counts as undecided.
+/// Every family's counts are printed (`FAMILY` lines), and each failure its replay.
 ///
-/// `NRESE_FUZZ_SEED` varies the seeds; `NRESE_FUZZ_CASES` sets their number.
+/// Settings, each refused before any work where invalid ([`setting`]):
+/// - `NRESE_FUZZ_SEED` (default 0) varies the seeds;
+/// - `NRESE_FUZZ_CASES` (default 100, at least 1) sets their number;
+/// - `NRESE_FUZZ_DEADLINE_S` (default 240) bounds the whole test. Past it, the run stops
+///   and is inconclusive (review G1 r1, F4).
 #[test]
 fn generated_cases_answer_as_the_dl_oracle() {
-    let env = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
-    let base: u64 = env("NRESE_FUZZ_SEED").unwrap_or(0);
-    // 100 cases, about 49 s on one test thread (0.49 s a case, redraws included:
-    // `dlorc-g1-measure3b-875092fd`, 120 cases in 58.6 s).
-    let cases: u64 = env("NRESE_FUZZ_CASES").unwrap_or(100);
+    let base = env_setting("NRESE_FUZZ_SEED", 0, 0);
+    // 100 cases, about 20 s on one test thread (`dlorc-g1-measure5-51a049c1`: 120 cases in
+    // 24 s, redraws included).
+    let cases = env_setting("NRESE_FUZZ_CASES", 100, 1);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(env_setting("NRESE_FUZZ_DEADLINE_S", 240, 1));
+    let replay = |i: u64| {
+        format!(
+            "NRESE_FUZZ_SEED={base} NRESE_FUZZ_CASES={} cargo test --locked -p nrese-store \
+             --test it -- generated_cases_answer_as_the_dl_oracle --nocapture --test-threads 1",
+            i + 1
+        )
+    };
     let mut counts: std::collections::BTreeMap<&str, [usize; 6]> = Default::default();
     let mut failures = Vec::new();
+    let mut inconclusive = Vec::new();
     let mut redrawn = 0;
     for i in 0..cases {
+        if left(deadline).is_none() {
+            inconclusive.push(format!("the deadline passed after {i} of {cases} cases"));
+            break;
+        }
         // An inconsistent case says nothing of `complete` here, so it is drawn again, up to
         // three times (counted), and the families keep their share: nearly half the
         // verdicts of `dlorc-g1-measure2-6cc10f32` were inconsistent.
@@ -551,13 +637,14 @@ fn generated_cases_answer_as_the_dl_oracle() {
                 turtle: &turtle,
                 query: &queries[0],
             };
-            let first = verdicts(&case, Relation::Direct);
+            let first = verdicts(&case, Relation::Direct, deadline);
             if tries == 3 || !first.iter().any(|(_, v)| *v == Verdict::Inconsistent) {
                 break (seed, turtle, family, queries, first);
             }
             tries += 1;
             redrawn += 1;
         };
+        let at = format!("base {base}, case {i}, redraw {tries}, seed {seed} ({family})");
         for (n, query) in queries.iter().enumerate() {
             let case = Case {
                 name: family,
@@ -566,15 +653,12 @@ fn generated_cases_answer_as_the_dl_oracle() {
             };
             let found = match n {
                 0 => first.clone(),
-                _ => verdicts(&case, Relation::Direct),
+                _ => verdicts(&case, Relation::Direct, deadline),
             };
             for (ruleset, verdict) in found {
                 if let Verdict::Undecided(why) = &verdict {
                     let why: String = why.chars().take(120).collect();
-                    eprintln!(
-                        "UNDECIDED seed {seed} ({family}), {}: {why}",
-                        ruleset.name()
-                    );
+                    eprintln!("UNDECIDED {at}, {}: {why}", ruleset.name());
                 }
                 let class = match verdict {
                     Verdict::Agree => 0,
@@ -586,22 +670,24 @@ fn generated_cases_answer_as_the_dl_oracle() {
                 };
                 counts.entry(family).or_default()[class] += 1;
                 if matches!(class, 2 | 3) {
-                    let saturated = verdicts(&case, Relation::Claim)
+                    // Attribution within the deadline: past it, `Undecided`.
+                    let saturated = verdicts(&case, Relation::Claim, deadline)
                         .into_iter()
                         .find(|(r, _)| *r == ruleset)
                         .map(|(_, v)| v);
                     failures.push(format!(
-                        "seed {seed} ({family}), {}: {verdict:?}; saturated: {saturated:?}\n\
-                         {query}\n{turtle}",
-                        ruleset.name()
+                        "{at}, {}: {verdict:?}; saturated: {saturated:?}\n\
+                         replay: {}\n{query}\n{turtle}",
+                        ruleset.name(),
+                        replay(i)
                     ));
                 }
             }
         }
     }
-    let undecided = |c: &[usize; 6]| (c[4], c.iter().sum::<usize>());
+    // Undecided, an inconsistent case never compared among them, against every verdict.
+    let undecided = |c: &[usize; 6]| (c[4] + c[5], c.iter().sum::<usize>());
     let mut total = [0usize; 6];
-    let mut inconclusive = Vec::new();
     for (family, c) in &counts {
         eprintln!(
             "FAMILY {family}: agree {}, reported {}, missed {}, extra {}, undecided {}, \
@@ -620,6 +706,9 @@ fn generated_cases_answer_as_the_dl_oracle() {
     let (u, n) = undecided(&total);
     if 5 * u > n {
         inconclusive.push(format!("total: {u} of {n} undecided"));
+    }
+    if u == n {
+        inconclusive.push(format!("no decided verdict of {n}"));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));

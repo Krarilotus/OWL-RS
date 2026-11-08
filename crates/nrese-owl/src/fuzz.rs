@@ -447,9 +447,12 @@ impl Gen<'_> {
             if chain.len() < 2 {
                 chain.push(ObjProp::Named(props[self.rng.below(top as u64) as usize]));
             }
-            // Only the ends may be the superproperty.
+            // Only the ends may be the superproperty, and both only in `sup ∘ sup` (OWL 2
+            // regularity, Structural Specification §11.2; review G1 r1, F1: the draw above can
+            // put it at one end and the insertion at the other).
             let n = chain.len();
-            if chain[1..n - 1].iter().any(|r| r.named() == sup) {
+            let at_both_ends = n > 2 && chain[0].named() == sup && chain[n - 1].named() == sup;
+            if at_both_ends || chain[1..n - 1].iter().any(|r| r.named() == sup) {
                 return None;
             }
             return Some(Axiom::SubObjectPropertyOf(chain, ObjProp::Named(sup)));
