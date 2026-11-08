@@ -124,6 +124,30 @@ pub(crate) fn holders(dir: &Path) -> Vec<PathBuf> {
     holders
 }
 
+/// Makes the names leading to the existing directory `dir` durable, as [`create_dir_all`] does
+/// for the levels it finds, and makes none: the holder of each level synced, outermost first
+/// (a holder this process may not open for the sync, `PermissionDenied`, is left as it is).
+/// `NotFound` if `dir` isn't a directory: a write into a directory gone meanwhile must not
+/// make it again. For writes under a store's directory that don't go through the engine (the
+/// store's metadata, DUR-3 fix check DEFER-F1): its open leaves these names to the first
+/// durable write.
+pub fn name_existing(dir: &Path) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    for holder in holders(dir) {
+        match sync_dir(&holder) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Names `dir`, a directory in the store's root, and returns whether it made it, so that a
 /// reopen of a store at an absolute path syncs each directory once (timing of 8 Nov; a
 /// relative or `.` root still syncs `.` twice: fix check ONCE-N1):

@@ -1436,6 +1436,56 @@ fn a_reopen_syncs_its_names_before_anything_relies_on_them() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Naming an existing directory (`place::name_existing`, which the store's metadata writes go
+/// through: fix check DEFER-F1) syncs the holder of each level of its path, each once, and
+/// makes nothing. Rows, judged apart: an existing directory; one that isn't there (refused,
+/// `NotFound`, and not made: a write into a directory gone meanwhile mustn't make it again); a
+/// holder whose sync fails (refused); a holder this process may not open (`PermissionDenied`:
+/// left as it is, as for any found level). Written with the function (no earlier code to fail).
+#[test]
+fn naming_a_directory_syncs_its_holders_and_makes_nothing() {
+    use std::io::ErrorKind;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("a").join("b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut wrong = Vec::new();
+    let (named, synced) = dir_syncs_of(|| super::place::name_existing(&dir));
+    let holders: std::collections::BTreeMap<_, _> = dir
+        .ancestors()
+        .skip(1)
+        .filter(|level| !level.as_os_str().is_empty())
+        .map(|level| (level.to_path_buf(), 1))
+        .collect();
+    if let Err(error) = named {
+        wrong.push(format!("an existing directory: {error}"));
+    }
+    if synced != holders {
+        wrong.push(format!(
+            "an existing directory: synced {synced:#?}, expected each holder once: {holders:#?}"
+        ));
+    }
+    let gone = base.path().join("gone");
+    match super::place::name_existing(&gone) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        other => wrong.push(format!("a directory not there: {other:?}")),
+    }
+    if gone.exists() {
+        wrong.push("a directory not there was made".to_owned());
+    }
+    for (kind, refused) in [
+        (ErrorKind::Other, true),
+        (ErrorKind::PermissionDenied, false),
+    ] {
+        fault::FAIL_DIR_SYNC_OF.set(Some((base.path().to_path_buf(), kind)));
+        let named = super::place::name_existing(&dir);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if named.is_err() != refused {
+            wrong.push(format!("a holder failing with {kind:?}: {named:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A first commit whose names can't be synced is not acknowledged (the design note's attack
 /// 2): the store's directory sync failing, the commit returns an error and publishes nothing,
 /// and the log takes no more commits (the record is written, its outcome unknown, as for a
