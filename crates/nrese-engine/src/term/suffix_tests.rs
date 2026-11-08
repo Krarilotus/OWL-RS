@@ -355,3 +355,128 @@ fn a_push_onto_an_unsealed_tail_seals_every_full_block() {
         Some(4)
     );
 }
+
+/// T16 (package review r1 F1). An install that has to wait for a reader allocates nothing, on
+/// threads whose first wait it is. A thread's first park registers it with `parking_lot_core`,
+/// which allocates when its table is made or has to grow: growth comes as the count of live
+/// parking threads passes thresholds (three per bucket, powers of two). So one fresh thread
+/// proves nothing; 64 do. Each one, kept alive to the end so the count only rises:
+/// prepares (uncontended), has a reader hold the dictionary's read guard (`with_views`) for
+/// 20 ms, and installs behind it, measured. Before the fix the installs at a threshold
+/// allocate; with `prepare`'s warm-up none does. Measured, alone.
+#[test]
+fn an_install_that_waits_for_a_reader_allocates_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Barrier, mpsc};
+    if !nrese_exec::measure::alone() {
+        return;
+    }
+    const INSTALLERS: usize = 64;
+    let budget = Arc::new(Budget::unlimited());
+    let end = Arc::new(Barrier::new(INSTALLERS + 1));
+    let (sent, measured) = mpsc::channel();
+    let mut installers = Vec::with_capacity(INSTALLERS);
+    let mut allocated: Vec<usize> = Vec::with_capacity(INSTALLERS);
+    for i in 0..INSTALLERS {
+        let new = texts(&format!("new {i}"), 3);
+        let (dictionary, suffix) = dictionary_and_suffix(10, &new, &budget);
+        let (end, sent) = (Arc::clone(&end), sent.clone());
+        installers.push(std::thread::spawn(move || {
+            let dictionary = Arc::new(dictionary);
+            let slot = slot();
+            let guard = WriterGuard::hold(slot.lock());
+            let prepared = dictionary.prepare(&guard, &suffix).unwrap();
+            let [held, installing, released] = [(); 3].map(|()| Arc::new(AtomicBool::new(false)));
+            let reader = {
+                let dictionary = Arc::clone(&dictionary);
+                let (held, installing, released) = (
+                    Arc::clone(&held),
+                    Arc::clone(&installing),
+                    Arc::clone(&released),
+                );
+                std::thread::spawn(move || {
+                    dictionary.with_views(u64::MAX, |_| {
+                        held.store(true, Ordering::Release);
+                        // Held until the measured install has begun, then 20 ms more: the
+                        // install waits inside the measurement, whatever the measurement's own
+                        // start took.
+                        while !installing.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        released.store(true, Ordering::Release);
+                    })
+                })
+            };
+            while !held.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let (waited, bytes) = nrese_exec::measure::measure(|| {
+                installing.store(true, Ordering::Release);
+                let held_at_start = !released.load(Ordering::Acquire);
+                prepared.install();
+                held_at_start
+            });
+            reader.join().unwrap();
+            assert!(
+                waited,
+                "installer {i}: the reader held its guard as the install began"
+            );
+            assert_installed(&dictionary, 10, &new, &format!("installer {i}"));
+            sent.send(bytes).unwrap();
+            // Alive until every installer has measured: the count of parking threads only rises.
+            end.wait();
+        }));
+        // One installer measures at a time; the others wait on a barrier, allocating nothing.
+        allocated.push(measured.recv().unwrap());
+    }
+    end.wait();
+    for installer in installers {
+        installer.join().unwrap();
+    }
+    let at: Vec<(usize, usize)> = allocated
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, bytes)| bytes > 0)
+        .collect();
+    assert_eq!(
+        at,
+        [],
+        "(installer, bytes) of installs that allocated after waiting"
+    );
+}
+
+/// T17 (package review r1 F2: the handover). An installed key's allocation is the dictionary's
+/// from the install on: the suffix and its charge gone, the key still lives in the dictionary's
+/// tail and is counted in its stats; once a seal blocks it, it is freed.
+#[test]
+fn an_installed_key_is_the_dictionarys_until_it_is_sealed() {
+    let budget = Arc::new(Budget::unlimited());
+    let new = texts("handed over", 1);
+    let (dictionary, suffix) = dictionary_and_suffix(10, &new, &budget);
+    let (key, _) = suffix.keys().next().unwrap();
+    let weak = Arc::downgrade(key);
+    let before = dictionary.stats().arena_bytes;
+    let slot = slot();
+    let guard = WriterGuard::hold(slot.lock());
+    dictionary.prepare(&guard, &suffix).unwrap().install();
+    dictionary.seal(&guard);
+    drop(suffix);
+    assert_eq!(budget.used(), 0, "the private charge went with the suffix");
+    let owned = weak.upgrade().expect("the dictionary's tail owns the key");
+    assert_eq!(
+        dictionary.stats().arena_bytes,
+        before + owned.len() as u64,
+        "the dictionary's stats count it"
+    );
+    drop(owned);
+    for text in texts("more", BLOCK) {
+        dictionary.intern(literal(&text));
+    }
+    assert!(
+        weak.upgrade().is_none(),
+        "sealed into a block, the key is freed"
+    );
+    assert_installed(&dictionary, 10, &new, "after the seal");
+}
