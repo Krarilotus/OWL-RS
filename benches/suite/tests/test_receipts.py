@@ -337,30 +337,58 @@ class Driver(unittest.TestCase):
         self.assertEqual(receipt["settings"], {"JAVA_HEAP": "8g"})
         self.assertTrue({"RUST_IMAGE", "NRESE_TARGET_CPU", "RUSTFLAGS"} <= set(manifest.SETTINGS))
 
-    def test_an_image_s_receipt_says_where_it_came_from(self):
-        """P2 design review F5: a versioned tag with a known id isn't the image the checkout defines (a
-        cached build of an older context). One built here carries its context's tree id as a label;
-        one present before says it only by that label; a pulled one has no digest pin yet."""
+    def test_an_image_built_here_carries_its_context_s_tree(self):
+        """P2 design review F5: a build of the suite's own image is labelled with its context's git
+        tree id (a clean checkout only), so the image that runs says what it was built from."""
         suite = self.suite(runs=1)
         calls = []
 
         def docker(command, *args, **kwargs):
             calls.append(command)
             return 0
-        present = {"built:old": "benches/competitors/jena@0123", "cached:unlabelled": ""}
-        with patch.object(suite.args, "runtime", "docker"), patch.object(suite, "host_command", side_effect=docker), \
-                patch.object(suite.runtime, "image_present", side_effect=lambda image: image in present), \
-                patch.object(driver, "run_quiet", side_effect=lambda command, *a, **k: Mock(
-                    returncode=0, stdout=present.get(command[-1], "") + "\n")), \
-                patch.object(driver, "checkout_state", return_value={"commit": "c" * 40, "dirty": 0}), \
-                patch.object(driver.receipts, "object_ids", return_value={"benches/competitors/jena": "t" * 40}):
-            suite.ensure_images({"built:old": "competitors/jena", "cached:unlabelled": "competitors/jena",
-                                 "built:new": "competitors/jena", "pulled:tag": None})
-        self.assertEqual(suite.image_source["built:old"], "built from benches/competitors/jena@0123")
-        self.assertEqual(set(suite.image_source["cached:unlabelled"]), {"unknown"})
-        self.assertEqual(suite.image_source["built:new"], f"built from benches/competitors/jena@{'t' * 40}")
-        self.assertIn(f"owlrs.built-from=benches/competitors/jena@{'t' * 40}", next(c for c in calls if "build" in c))
-        self.assertIn("digest pin", suite.image_source["pulled:tag"]["unknown"])
+        for dirty, labelled in ((0, True), (2, False)):
+            with self.subTest(dirty=dirty), patch.object(suite.args, "runtime", "docker"), \
+                    patch.object(suite, "host_command", side_effect=docker), \
+                    patch.object(suite.runtime, "image_present", return_value=False), \
+                    patch.object(driver, "checkout_state", return_value={"commit": "c" * 40, "dirty": dirty}), \
+                    patch.object(driver.receipts, "object_ids", return_value={"benches/competitors/jena": "t" * 40}):
+                calls.clear()
+                suite.ensure_images({"nrese-bench/jena:6.2.0": "competitors/jena"})
+                build = next(c for c in calls if "build" in c)
+                self.assertEqual(f"owlrs.built-from=benches/competitors/jena@{'t' * 40}" in build, labelled)
+
+    def test_an_image_s_source_is_the_pinned_id_s_own(self):
+        """P1b review r1 F1: the source was read from the tag, the id from the pin map, and the two
+        could be different images: (a) an earlier preparation in the job pinned the tag to A (old,
+        unlabelled), and the tag now names B, labelled from the current tree; the containers run A;
+        (b) the tag was replaced between its preparation (a build, labelled) and its first pin. The
+        receipt pairs the pinned id with that id's own label: A's, or unknown."""
+        label = {"sha256:A": "", "sha256:B": "benches/competitors/jena@" + "t" * 40, "sha256:C": "benches/competitors/jena@old",
+                 "img:t": "benches/competitors/jena@" + "t" * 40}  # by tag: B's, the current tree's
+        inspect = lambda command, *a, **k: Mock(returncode=0, stdout=label.get(command[-1], "") + "\n")  # noqa: E731
+        for name, pinned, present in (("an earlier pin to an unlabelled A", "sha256:A", True),
+                                      ("replaced after its build, by C", "sha256:C", False)):
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                with patch.object(driver.ns, "pinned", return_value={"img:t": pinned}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    # Its preparation: (a) the tag present, naming B; (b) built here, labelled, then moved.
+                    with patch.object(suite.args, "runtime", "docker"), \
+                            patch.object(suite, "host_command", return_value=0), \
+                            patch.object(suite.runtime, "image_present", return_value=present), \
+                            patch.object(driver, "checkout_state", return_value={"commit": "c" * 40, "dirty": 0}), \
+                            patch.object(driver.receipts, "object_ids",
+                                         return_value={"benches/competitors/jena": "t" * 40}):
+                        suite.ensure_images({"img:t": "competitors/jena"})
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
+                image = self.cells(suite)["w/1/x"]["images"]["img:t"]
+                self.assertEqual(image["id"], pinned)
+                expected = f"built from {label[pinned]}" if label[pinned] else None
+                if expected:
+                    self.assertEqual(image["source"], expected)
+                else:
+                    self.assertEqual(set(image["source"]), {"unknown"})
 
     def test_what_a_cell_can_t_evidence_is_unknown_never_empty(self):
         """R6: a driver plan's inputs, images, build and settings are its child's; an input outside

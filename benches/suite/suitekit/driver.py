@@ -226,7 +226,7 @@ class Suite:
         self.written: list[Result] = []
         self.hashed: dict[str, str | None] = {}  # /data input -> its SHA-256 (data_hashes)
         self.built: dict[str, dict] = {}  # program -> the checkout it was built from in this run
-        self.image_source: dict[str, object] = {}  # image -> where it came from (ensure_images)
+        self.image_sources: dict[str, object] = {}  # image id -> where it came from (image_source)
         self.hash_s = 0.0
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
@@ -297,15 +297,11 @@ class Suite:
             return
         for image, context in needed.items():
             if self.runtime.image_present(image):
-                # Built here earlier: its label names the context it was built from (P2 design review F5).
-                label = run_quiet(["docker", "image", "inspect", "--format",
-                                   f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image])
-                found = (label.stdout.strip() if label.returncode == 0 else "").replace("<no value>", "")
-                self.image_source[image] = (f"built from {found}" if found else
-                                            receipts.unknown("present before this run, its build not recorded"))
                 continue
             if context:
-                # What it is built from: the context's git tree id in this run's commit, when that is clean.
+                # What it is built from, on the image itself: its context's git tree id in this run's
+                # commit, when that is clean (P2 design review F5). The receipt reads it off the id
+                # that runs (image_source), never off this tag (P1b review r1 F1).
                 state = checkout_state(self.root)
                 tree = (receipts.object_ids(self.root, state["commit"] or "", [f"benches/{context}"])[f"benches/{context}"]
                         if state.get("dirty") == 0 else None)
@@ -314,14 +310,23 @@ class Suite:
                 self.host_command(["docker", "build", "-q", "-t", image,
                                    *(["--label", f"{IMAGE_LABEL}={made}"] if made else []),
                                    str(self.root / "benches" / context)])
-                self.image_source[image] = (f"built from {made}" if made else
-                                            receipts.unknown("built from a checkout that wasn't a clean commit"))
             else:
                 self.say(f"pulling {image}")
                 self.host_command(["docker", "pull", "-q", image])
-                # A registry's tag names no content: unqualified until a digest-pin file exists.
-                self.image_source[image] = receipts.unknown("pulled: no digest pin to hold its id to")
             self.made_images.append(image)
+
+    def image_source(self, image_id: str):
+        """Where the image with this id came from, read off that id (the one the run's containers
+        run, its pin), never off a tag that may name another by now (P1b review r1 F1): its build
+        label, or unknown (no label: present before, built from an unclean checkout, or pulled with
+        no digest pin to hold it to)."""
+        if image_id not in self.image_sources:
+            label = run_quiet(["docker", "image", "inspect", "--format",
+                               f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image_id])
+            found = (label.stdout.strip() if label.returncode == 0 else "").replace("<no value>", "")
+            self.image_sources[image_id] = (f"built from {found}" if found else
+                                            receipts.unknown("no build label on the image that ran"))
+        return self.image_sources[image_id]
 
     def build_nrese(self, nrese) -> bool:
         """Builds an NRESE server (`nrese` or `nrese-oxigraph`) from its source tree."""
@@ -952,8 +957,9 @@ class Suite:
                 "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
                 "images": mine if child else {
-                    i: {"id": pins.get(i) or receipts.unknown("not in the run's pin map"),
-                        "source": self.image_source.get(i) or receipts.unknown("not prepared by this run")}
+                    i: {"id": pins[i], "source": self.image_source(pins[i])} if pins.get(i) else
+                       {"id": receipts.unknown("not in the run's pin map"),
+                        "source": receipts.unknown("no image pinned: none known to have run")}
                     for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
                 "build": mine if child else self.build_receipt(system),
                 # The settings that change a measurement; where a run keeps its files doesn't (F8).

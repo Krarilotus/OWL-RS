@@ -15,9 +15,9 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 | code | path -> its git object id at that commit: what a cell can execute in the repository |
 |  | (code_paths(): benches/ by entry less RESULTS, scripts, rust-toolchain.toml, .cargo; and |
 |  | BUILD_PATHS for a compiled NRESE or harness); coarse, exact: any change re-qualifies it |
-| images | image -> `id`, the one its containers ran (the run's pin map, ns.pinned), and `source`: |
-|  | "built from benches/CONTEXT@TREE" (built here, or labelled so by an earlier build), else |
-|  | unknown (present unlabelled; pulled: no digest pin yet) |
+| images | image -> `id`, the one its containers ran (the run's pin map, ns.pinned), and `source`, |
+|  | read off that id, never off the tag: "built from benches/CONTEXT@TREE" (its build label), |
+|  | else unknown (unlabelled; pulled: no digest pin yet) |
 | build | NRESE's server and the timing harness: built in this run from `commit` (its `dirty`), with |
 |  | `target_cpu`, inherited `rustflags_env`, and in Docker `rust_image` and `rustflags`; or unknown |
 | settings | the suite settings in force that change a measurement (manifest `settings` less |
