@@ -159,6 +159,28 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
     reader.finish()
 }
 
+/// The types that make a blank node a class expression to [`read`] (`Reader::blank_class`).
+/// Such a node in a class's place is read, or reported when it can't be (malformed,
+/// unsupported). A caller choosing input (the store's QL reader, by memberships) finds
+/// class expressions by these lists, not by a copy (I24c-2 review r1, F2).
+pub const CLASS_EXPRESSION_TYPES: [&str; 3] = [
+    "http://www.w3.org/2002/07/owl#Class",
+    "http://www.w3.org/2000/01/rdf-schema#Class",
+    "http://www.w3.org/2002/07/owl#Restriction",
+];
+
+/// The properties that make their blank subject a class expression to [`read`]
+/// (`Reader::blank_class`): the set operators, a restriction's property, and the n-ary
+/// restrictions' properties, which it reports as unsupported.
+pub const CLASS_EXPRESSION_PROPERTIES: [&str; 6] = [
+    "http://www.w3.org/2002/07/owl#intersectionOf",
+    "http://www.w3.org/2002/07/owl#unionOf",
+    "http://www.w3.org/2002/07/owl#complementOf",
+    "http://www.w3.org/2002/07/owl#oneOf",
+    "http://www.w3.org/2002/07/owl#onProperties",
+    "http://www.w3.org/2002/07/owl#onProperty",
+];
+
 /// What every reader adds to the axioms it read: the literals' parts, the anonymous
 /// individuals, and the diagnostics of OWL 2 DL's global restrictions.
 pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
@@ -614,6 +636,9 @@ impl<'a> Reader<'a> {
         terms.iter().map(|&t| self.class(t)).collect()
     }
 
+    /// A blank class expression. The types and properties it reads are
+    /// [`CLASS_EXPRESSION_TYPES`] and [`CLASS_EXPRESSION_PROPERTIES`]; a change here changes
+    /// them.
     fn blank_class(&mut self, node: Term) -> Option<ExprId> {
         let v = self.v;
         for class_type in [v.owl_class, v.rdfs_class, v.owl_restriction] {
