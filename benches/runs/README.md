@@ -71,4 +71,6 @@ older finished one never stands in for it); else its own invocation's commit, co
 build, settings, data hashes, outcome and answer verdict (`wrong` stands against counts that look
 right). What it couldn't evidence is `{ unknown = "why" }`. A licensed system's receipt holds
 no outcome or answers, whatever the outcome. A pair without a receipt predates them, or its
-attempts' record (attempts.jsonl) didn't survive: either way it has no evidence.
+attempts' record (attempts.jsonl) didn't survive: either way it has no evidence. Where a
+directory's attempts.jsonl lost records (its manifest names an invocation it lacks), every pair
+of the record has `receipt = { unknown = "…" }`: which cells those were, nothing tells.

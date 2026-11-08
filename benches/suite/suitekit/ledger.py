@@ -27,7 +27,8 @@ import re
 import tomllib
 from pathlib import Path
 
-from .manifest import read_attempts
+from .manifest import read_journal
+from .receipts import unknown
 from .schema import read
 from .summary import summarise
 
@@ -108,12 +109,14 @@ def run_directories(directory: Path) -> list[Path]:
 
 def from_results(directory: Path, root: Path) -> dict:
     runs = run_directories(directory)
-    rows, invocations = [], []
+    rows, invocations, named = [], [], {}
     for run in runs:
         # Runs of a batch number their repetitions alike: each keeps its own.
         rows += [r | {"run": f"{run.name}:{r['run']}"} if len(runs) > 1 else r for r in read(run / "results.csv")]
         if (run / "manifest.json").exists():
-            invocations += json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("invocations", [])
+            mine = json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("invocations", [])
+            invocations += mine
+            named[run] = {i["invocation"] for i in mine if i.get("invocation")}
     try:
         shown = directory.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
@@ -150,8 +153,14 @@ def from_results(directory: Path, root: Path) -> dict:
     # receipt in an unfinished one's place, nor one the journal doesn't hold, never the directory's
     # commit, outcome or answers (reviews cell-receipts r1 R2, R3; r3).
     newest: dict[str, dict] = {}
+    lost = []
     for run in runs:
-        for cell, attempt in {a["cell"]: a for a in read_attempts(run)}.items():
+        journal = read_journal(run)
+        # A journal lacking an invocation its manifest names has lost records, of cells nobody can
+        # name: then no receipt of this record stands, another directory's included (review r4 R2b).
+        if named.get(run, set()) - {r.get("invocation") for r in journal}:
+            lost.append(run.name)
+        for cell, attempt in {a["cell"]: a for a in journal if a.get("cell")}.items():
             if cell not in newest or str(attempt.get("started", "")) >= str(newest[cell].get("started", "")):
                 newest[cell] = attempt
     done = {(cell, r.get("attempt")): r for i in invocations for cell, r in (i.get("cells") or {}).items()
@@ -160,7 +169,9 @@ def from_results(directory: Path, root: Path) -> dict:
     for (workload, tier, system), pair in sorted(summarised.items()):
         entry = {"workload": workload, "tier": tier, "system": system} | pair.outcome()
         cell = f"{workload}/{tier}/{system}"
-        if (started := newest.get(cell)) is not None:
+        if lost:
+            entry["receipt"] = unknown(f"the attempts' record (attempts.jsonl) of {', '.join(lost)} lost records")
+        elif (started := newest.get(cell)) is not None:
             attempt = done.get((cell, started["attempt"])) or {
                 "attempt": started["attempt"], "started": started.get("started"), "complete": False}
             # A licensed system's outcome and answers are results, whatever the outcome: they stay
