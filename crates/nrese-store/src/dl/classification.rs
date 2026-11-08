@@ -156,6 +156,49 @@ mod tests {
         store
     }
 
+    /// A classification whose ontology the run's memory can't read reports its consistency
+    /// unknown, never consistent (SYN-61): over the empty ontology the engines are left with,
+    /// consistent would be their answer, which nothing read decided.
+    #[test]
+    fn a_classification_whose_ontology_does_not_fit_is_never_consistent() {
+        let store = StoreService::new(StoreConfig {
+            total_query_memory_bytes: 1 << 30,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap();
+        let mut data = String::from(
+            "PREFIX : <urn:cache:> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA { :A rdfs:subClassOf :B .",
+        );
+        for i in 0..2_000 {
+            data.push_str(&format!(" :a{i} a :A ."));
+        }
+        data.push('}');
+        store.update_str_ungated(&data).unwrap();
+        let snapshot = store.engine().snapshot();
+        // All but 4 KiB of the queries' pool held: the 2,000 statements don't fit.
+        let pool = store.runtime().query_memory().expect("the queries' pool");
+        let mut hold = nrese_exec::Reservation::new(Arc::new(store.envelope(None).part()));
+        hold.charge(pool.limit() - pool.used() - 4096).unwrap();
+        let verdicts = [
+            taxonomy(&store, &snapshot)
+                .classification
+                .consistency
+                .clone(),
+            realisation(&store, &snapshot)
+                .taxonomy
+                .classification
+                .consistency
+                .clone(),
+        ];
+        for verdict in verdicts {
+            assert!(
+                matches!(verdict, nrese_dl::verdict::Verdict::Unknown(_)),
+                "{verdict:?}"
+            );
+        }
+    }
+
     #[test]
     fn incomplete_explicit_results_are_retried() {
         // The public configuration requires a positive timeout. One nanosecond is
