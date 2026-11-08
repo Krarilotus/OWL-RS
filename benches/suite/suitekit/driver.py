@@ -216,7 +216,8 @@ class Suite:
             self.data = Mount(str(Path(data).resolve()), "/data")
         # Claim this invocation's scratch before creating anything we may later remove.
         self.scratch.mkdir(parents=True, exist_ok=False)
-        self.writer = Writer(self.results / "results.csv", echo=print)
+        self.results.mkdir(parents=True, exist_ok=True)  # the directory; its results.csv waits (writer)
+        self._writer: Writer | None = None
         self.made_files: list[str] = []  # datasets this run made, as /data paths
         self.made_volumes: list[str] = []
         self.made_images: list[str] = []
@@ -228,6 +229,19 @@ class Suite:
         self.manifest: Manifest | None = None
         self.answers = (Recorder(self.results, args.answers_reference, adjudications())
                         if args.answers == "full" and not args.dry_run else None)
+
+    @property
+    def writer(self) -> Writer:
+        """The run's results.csv, created at its first row: in a run, after main took the results
+        directory (Manifest's lock), never before, so a second starter, refused there, never opens
+        it (review cell-receipts r5 F1: Writer's exists check, then open "w")."""
+        if getattr(self, "_writer", None) is None:
+            self._writer = Writer(self.results / "results.csv", echo=print)
+        return self._writer
+
+    @writer.setter
+    def writer(self, writer: Writer):
+        self._writer = writer
 
     # --- helpers ---
     def say(self, text: str):
