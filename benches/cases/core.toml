@@ -1999,6 +1999,38 @@ cap_gb = 2
 systems = []
 
 [[case]]
+name = "split-turtle-flat"
+area = "parse"
+what = "the Turtle splitter alone (bulk load's skim before its parallel parse), one thread, from memory: the parse-turtle-flat file cut into 16 chunks, recovering, nothing parsed"
+semantics = "none"
+data = "turtle entities=250000 nested=0"
+tool_loads = false
+args = ["--split-turtle", "16:{data}", "--runs", "5"]
+queries = ""
+metric = "split_turtle.p50_ms"
+check = { "split_turtle.chunks" = 16 }
+pinned = "16 parts, a target in each of 1 M statements: 16 chunks"
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
+name = "split-turtle-nested"
+area = "parse"
+what = "the Turtle splitter alone, one thread, from memory: the parse-turtle-nested file (every bracket) cut into 16 chunks, recovering, nothing parsed"
+semantics = "none"
+data = "turtle entities=100000 nested=1"
+tool_loads = false
+args = ["--split-turtle", "16:{data}", "--runs", "5"]
+queries = ""
+metric = "split_turtle.p50_ms"
+check = { "split_turtle.chunks" = 16 }
+pinned = "16 parts, a target in each of 100,000 statements: 16 chunks"
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
 name = "parse-turtle-nested"
 area = "parse"
 what = "the Turtle parser alone, one thread, from memory: 1.3 M triples from 100,000 statements each using every bracket ([ ], ( ), <<( )>>, << >>, {| |}), the parser's cost per nested span"
