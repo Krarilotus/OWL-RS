@@ -21,13 +21,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
+use nrese_engine::{
+    EncodedQuad, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, Transaction,
+};
 use nrese_rdf::{
     BlankNode, GraphName as OxGraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term,
 };
 use nrese_sparql_syntax::algebra::GraphTarget;
 use nrese_sparql_syntax::term::{GraphName, GroundQuad, Quad as DataQuad};
-use nrese_sparql_syntax::{GraphUpdateOperation, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation, TransferOp, Update};
 use thiserror::Error;
 
 use crate::results::{QueryDatasetSpecification, QueryEvaluationError};
@@ -231,6 +233,72 @@ fn apply_operation(
         GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
             clear(tx, graph, options)?;
         }
+        GraphUpdateOperation::Transfer { op, from, to, .. } => {
+            // SPARQL 1.1 Update §3.2.3–3.2.5: a transfer between two names of one store graph
+            // changes nothing (review r1 of slice 2, S2-F1); the names are resolved first.
+            if graph_name(from) == graph_name(to) {
+                return Ok(());
+            }
+            let target = |graph: &GraphName| match graph {
+                GraphName::NamedNode(name) => GraphTarget::NamedNode(name.clone()),
+                GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+            };
+            if *op != TransferOp::Add {
+                clear(tx, &target(to), options)?;
+            }
+            add(tx, from, to, options)?;
+            if *op == TransferOp::Move {
+                clear(tx, &target(from), options)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ADD`, and the copy step of `MOVE` and `COPY`: every asserted statement of `from`, in the
+/// state before the operation, inserted into `to`. Its input is the graph as stored, not what
+/// a `WHERE` clause reads ([`GraphUpdateOperation::Transfer`]): no union default graph, inferred
+/// statement or protocol dataset. A graph the user may not read is absent, so nothing is
+/// copied from it; inserting into a graph the user may not write fails the request.
+fn add(
+    tx: &mut Transaction<'_>,
+    from: &GraphName,
+    to: &GraphName,
+    options: &UpdateOptions,
+) -> Result<(), UpdateError> {
+    let source = match graph_name(from) {
+        OxGraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+        OxGraphName::NamedNode(name) => tx.lookup(name.as_ref().into()),
+        OxGraphName::BlankNode(_) => None,
+    };
+    let Some(source) = source.filter(|&id| options.sees(tx, id)) else {
+        return Ok(());
+    };
+    let state = match tx.pending() {
+        (0, 0) => tx.base().clone(),
+        _ => tx.pending_snapshot(),
+    };
+    let mut quads = state
+        .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::in_graph(source))
+        .peekable();
+    if quads.peek().is_none() {
+        return Ok(());
+    }
+    let to = graph_name(to);
+    options.check_writable(&to)?;
+    let target = match &to {
+        OxGraphName::DefaultGraph => TermId::DEFAULT_GRAPH,
+        OxGraphName::NamedNode(name) => tx.intern(name.as_ref().into()),
+        OxGraphName::BlankNode(node) => tx.intern(node.as_ref().into()),
+    };
+    let cancelled = |_: nrese_exec::Stop| UpdateError::Cancelled;
+    let mut ticker = nrese_exec::Ticker::new(options.resources.stop()).map_err(cancelled)?;
+    for quad in quads {
+        ticker.tick(1).map_err(cancelled)?;
+        tx.insert_encoded(EncodedQuad {
+            graph: target,
+            ..quad
+        });
     }
     Ok(())
 }
