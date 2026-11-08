@@ -1521,6 +1521,8 @@ impl Store {
         let (len, mut seen) = (facts.len(), 0usize);
         let mut stopped = false;
         facts.retain(|&[s, p, o]| {
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::RetainStep, 1);
             if seen % RUN == 0 && !stopped {
                 stopped = poll.attempt(RUN.min(len - seen));
             }
@@ -3627,6 +3629,104 @@ mod counted_tests {
             "{asks} asks of the stop for {n} positions: more than {interval} positions plus \
              one run of {run} visited between two of them"
         );
+    }
+
+    /// REAS-2 fix check r1 (R2-F2). Spec (design note, rule 1: a producer of descriptors
+    /// yields them lazily, each counted as it is made): a job's length of one key's matches
+    /// (`Source::matches_len`, what `Job::new` asks) and a morsel's range of them
+    /// (`Source::scan_range`) read the key's chunk slices as they count them. One subject
+    /// over 3 × `POLL_UNITS` chunks of the unit tests' 16 pairs, in the input (unmarked) and
+    /// as a marked delta, each read on a poller whose stop has fired since it was made:
+    /// neither holds more than one run of `POLL_UNITS` slice descriptors at once. Built first,
+    /// every chunk's descriptor was held before the first was counted.
+    #[test]
+    fn a_key_s_slices_are_read_as_they_are_counted() {
+        use nrese_exec::measure;
+        if !measure::alone() {
+            return;
+        }
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let chunks = 3 * interval;
+        let pairs: Vec<Pair> = (0..(chunks * chunk_pairs()) as u64)
+            .map(|i| (7, 1_000 + i))
+            .collect();
+        let one_run = interval * std::mem::size_of::<Slice<'static>>();
+        let mut failed = Vec::new();
+        for marked in [false, true] {
+            let mut store = Store::new(vec![[7, 5, 1_000]]);
+            let at = store.index[&5];
+            let relation = &mut store.relations[at];
+            let seg = match marked {
+                false => {
+                    *relation = Relation::default();
+                    relation.input = Run::new(Pairs::chunked(pairs.clone()), false);
+                    Seg::All
+                }
+                true => {
+                    *relation = Relation {
+                        closed_by: Some(1),
+                        ..Relation::default()
+                    };
+                    relation.delta = Run::new(Pairs::chunked(pairs.clone()), false);
+                    relation.marks = Some(Marks {
+                        all: false,
+                        so: vec![vec![0; chunk_pairs().div_ceil(64)]; chunks],
+                        os: None,
+                    });
+                    Seg::DeltaNotBy(1)
+                }
+            };
+            let pattern = [Some(7), Some(5), None];
+            let fired = AtomicBool::new(false);
+            let stop = || fired.load(Ordering::Relaxed);
+            let poll = Poller::new(&stop).expect("not stopped yet");
+            fired.store(true, Ordering::Relaxed);
+            let (_, held) = measure::measure(|| {
+                let _ = Source::matches_len(&store, pattern, seg, &poll);
+            });
+            if held > one_run {
+                failed.push(format!("matches_len, marked {marked}: {held} bytes held"));
+            }
+            let fired = AtomicBool::new(false);
+            let stop = || fired.load(Ordering::Relaxed);
+            let poll = Poller::new(&stop).expect("not stopped yet");
+            fired.store(true, Ordering::Relaxed);
+            let (_, held) = measure::measure(|| {
+                let _ = Source::scan_range(&store, pattern, seg, 0..1, &poll, &mut |_| {});
+            });
+            if held > one_run {
+                failed.push(format!("scan_range, marked {marked}: {held} bytes held"));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "more than one run of {interval} slice descriptors ({one_run} bytes) held: \
+             {failed:#?}"
+        );
+    }
+
+    /// REAS-2 fix check r1 (R2-F3, a morsel's keep). Spec (design note, rule 2: a stop ends
+    /// the loop around it): a morsel's keep of its candidates (`Store::retain_new`) ends once
+    /// its poller has stopped. 16 × `POLL_UNITS` candidates the store doesn't hold, the stop
+    /// firing at its first ask after the keep has begun: the keep looks at no more than one
+    /// run of [`RUN`] candidates after it, and keeps none. Answering "not new" for the rest,
+    /// it looked at every one.
+    #[test]
+    fn a_morsel_s_keep_ends_at_its_stop() {
+        use crate::witness::{self, Site};
+        let n = 16 * RUN as u64;
+        let store = Store::new(vec![[1, 5, 2]]);
+        let mut facts: Vec<Triple> = (0..n).map(|i| [10 + i, 5, 3]).collect();
+        let first = witness::FirstWork::new(Site::RetainStep);
+        let stop = || first.ask();
+        let poll = Poller::new(&stop).expect("not stopped yet");
+        let _ = store.retain_new(&mut facts, &poll);
+        let after = first.after();
+        assert!(
+            after <= RUN as u64,
+            "{after} candidates looked at after the stop fired: more than one run of {RUN}"
+        );
+        assert!(facts.is_empty(), "a stopped keep keeps nothing");
     }
 }
 

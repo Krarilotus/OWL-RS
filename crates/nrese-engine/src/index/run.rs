@@ -46,6 +46,11 @@ impl PermutationRun {
             return 0;
         }
         let (first, last) = (start / 64, (end - 1) / 64);
+        #[cfg(test)]
+        crate::witness::add(
+            crate::witness::Site::TombstoneWords,
+            (last - first + 1) as u64,
+        );
         let mask_from = |bit: usize| u64::MAX << (bit % 64);
         let mask_to = |bit: usize| u64::MAX >> (63 - bit % 64);
         if first == last {

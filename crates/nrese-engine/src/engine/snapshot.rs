@@ -2142,3 +2142,89 @@ mod canonical_lifetime_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod count_visiting_tests {
+    use super::*;
+    use crate::witness::{self, Site};
+    use nrese_rdf::{GraphName, NamedNode};
+
+    /// REAS-2 fix check r1 (R2-F1, compact counts). Spec (`Snapshot::count_in_visiting`'s
+    /// contract): `visit` is called before the work it counts, and nothing more is read once
+    /// it returns false; a count's work is every stored position its scan passes, deleted
+    /// ones included. Under equality (one class, `a sameAs b`, unrelated to the data), 4 ×
+    /// `POLL_UNITS` statements `s_i p o`, then a commit deleting them, the runs kept apart:
+    /// counting `? p ?` scans a long run of deleted positions. A visitor that answers "stop"
+    /// at its first call: the count answers nothing, and the scan took at most `POLL_UNITS`
+    /// plus one run of steps in all. Counted per position handed on, the visitor was never
+    /// asked while the scan drained them.
+    #[test]
+    fn a_compact_count_tells_its_visitor_of_the_deleted_positions_it_passes() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 4 * interval;
+        let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        // No window ever merges (an older run of any size is more than 0 times a newer
+        // one): the commit after each one compacts in place without a worker, and would
+        // cancel the deletions against their inserts.
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let statement = |i: u64| {
+            Quad::new(
+                ex(&format!("s{i}")),
+                ex("p"),
+                ex("o"),
+                GraphName::DefaultGraph,
+            )
+        };
+        let mut tx = engine.transaction();
+        let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+        let same_as = tx.intern(same_as.as_ref().into());
+        let (a, b) = (
+            tx.intern(ex("a").as_ref().into()),
+            tx.intern(ex("b").as_ref().into()),
+        );
+        tx.insert_inferred(crate::EncodedTriple {
+            subject: a,
+            predicate: same_as,
+            object: b,
+        });
+        for i in 0..n {
+            tx.insert(statement(i).as_ref());
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for i in 0..n {
+            tx.remove(statement(i).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let p = snapshot.lookup(ex("p").as_ref().into()).unwrap();
+        let pattern = QuadPattern {
+            predicate: Some(p),
+            ..QuadPattern::all()
+        };
+        assert!(
+            snapshot
+                .expanding(ReadModel::Materialised, &pattern)
+                .is_some(),
+            "the count expands"
+        );
+        let before = witness::get(Site::ScanSteps);
+        let counted = snapshot.count_in_visiting(ReadModel::Materialised, &pattern, &mut |_| false);
+        let steps = witness::get(Site::ScanSteps) - before;
+        assert!(
+            steps <= 2 * interval,
+            "{steps} scan steps after the visitor was first due: more than {interval} plus one \
+             run of {interval}"
+        );
+        assert_eq!(counted, None, "a count its visitor stopped answers nothing");
+    }
+}
