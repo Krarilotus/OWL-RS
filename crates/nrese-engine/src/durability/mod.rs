@@ -177,7 +177,9 @@ impl Durable {
         policy: &CompactionPolicy,
         config: DurabilityConfig,
     ) -> EngineResult<Recovered> {
-        fs::create_dir_all(root)?;
+        // Durably named, every new level of it (review r1, R1-F2): commits acknowledged in it
+        // must not lose the directory that holds them.
+        place::create_dir_all(root)?;
         let lock = lock::StoreLock::acquire(root)?;
         checkpoint::remove_temporaries(root)?;
         crate::engine::spill::remove_leftovers(root)?;

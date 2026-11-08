@@ -3,20 +3,23 @@
 //!
 //! - **Within the process,** a registry of the open stores' directories refuses a second open
 //!   before the lock file is touched.
-//! - **Across processes,** on Unix a POSIX record lock (`fcntl F_SETLK`) on `<dir>/LOCK`. It
-//!   belongs to the process: a child forked while a thread starts it never holds it. The `flock`
-//!   this replaced belongs to the open file description, which a forked child shares until it
-//!   execs, so a store closed and reopened while any thread was starting a child process could
-//!   not be reopened (`Locked`) until that child ran. Closing any descriptor of a file drops the
-//!   process's record locks on it; the registry makes this the only descriptor of it.
-//! - **Earlier binaries** lock with `flock`, which record locks don't see. Opening takes that
-//!   `flock` too, without waiting, and releases it at once: held, an earlier binary has the store
-//!   open, and the open is refused. Nothing holds it afterwards, so children can't inherit it
-//!   (but in that moment). An earlier binary opening the store *after* this one isn't refused by
-//!   this; once this one has written a checkpoint (format 12) it refuses the store itself. Run no
-//!   earlier binary on a data directory a newer one uses (docs/ops/server-setup.md).
-//! - **Windows:** the handle-based lock (`LockFileEx`); std's handles aren't inherited by a
-//!   child.
+//! - **Across processes,** an exclusive lock of the open file description on `<dir>/LOCK`
+//!   (`File::try_lock`: Unix `flock`, Windows `LockFileEx`), as earlier binaries take it, so
+//!   they and this exclude each other both ways.
+//!   - Another descriptor of the file, opened and closed by anyone in this process (a reader, an
+//!     image placement hashing it), is another description and releases nothing. A POSIX
+//!     record lock (`fcntl`), which any close drops, was tried and gave that up (review r1,
+//!     R1-F1).
+//!   - A child forked while the store is open shares the description until it execs or ends.
+//!     The lock is therefore released explicitly when the store is dropped (`unlock`, which
+//!     releases it for the description, the child's share included), never by the last close:
+//!     a child in its fork-to-exec window can't keep a closed store locked (open row
+//!     IB1312-8ba4).
+//!   - After a crash (no drop), a child that shares the description holds the lock until it
+//!     execs or ends: the store is refused, never shared. This crate's children all exec
+//!     (`std::process::Command`).
+//!   - On NFS, Linux emulates `flock` with record locks, so another close releases the lock
+//!     there: don't put a data directory on NFS.
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -30,8 +33,8 @@ static OPEN: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// The lock of an open store, released when dropped.
 pub(crate) struct StoreLock {
-    /// Held open for the lock (Unix: the record lock lives as long as it does); closed, when
-    /// dropped, before [`OPEN`] lets another open of the store in.
+    /// Holds the lock; unlocked and closed, when dropped, before [`OPEN`] lets another open of
+    /// the store in.
     file: Option<File>,
     /// Its entry in [`OPEN`].
     dir: PathBuf,
@@ -54,8 +57,10 @@ impl StoreLock {
             .truncate(false)
             .write(true)
             .open(dir.join("LOCK"))?;
-        if !lock_process(&file)? {
-            return Err(locked());
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(locked()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         open.insert(dir.clone());
         Ok(Self {
@@ -70,63 +75,18 @@ impl Drop for StoreLock {
         let mut open = OPEN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Closed first, under the registry: closing a descriptor of the file drops all this
-        // process's record locks on it, so it must not close after another open of the store
-        // has taken its own (sol-loop S1).
-        drop(self.file.take());
+        // Released explicitly, for the description (a forked child may share it), and closed,
+        // both under the registry, before another open of the store can try (sol-loop S1).
+        if let Some(file) = self.file.take()
+            && let Err(error) = file.unlock()
+        {
+            tracing::warn!(dir = %self.dir.display(), %error, "unlocking a store failed; its lock goes with its last descriptor");
+        }
         open.remove(&self.dir);
         drop(open);
         #[cfg(test)]
         tests::after_release();
     }
-}
-
-/// Takes the store's lock on `file` for this process, without waiting: `false` if another
-/// process has the store. Unix: no earlier binary holds its `flock` (taken and released at
-/// once), then the process's exclusive record lock.
-#[cfg(unix)]
-fn lock_process(file: &File) -> std::io::Result<bool> {
-    // An earlier binary's lock: held, it has the store open.
-    if file.try_lock().is_err() {
-        return Ok(false);
-    }
-    let held = record_lock(file);
-    file.unlock()?;
-    held
-}
-
-/// The process's exclusive record lock on `file` (`fcntl F_SETLK`, the whole file), without
-/// waiting: `false` if another process holds one.
-#[cfg(unix)]
-fn record_lock(file: &File) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: `flock` is a plain C struct, valid zeroed; the fields set are its documented
-    // ones.
-    let mut range: libc::flock = unsafe { std::mem::zeroed() };
-    range.l_type = libc::F_WRLCK as _;
-    range.l_whence = libc::SEEK_SET as _;
-    range.l_start = 0;
-    range.l_len = 0; // to the end, however long the file grows
-    // SAFETY: the descriptor is open for writing (as `F_WRLCK` needs) for the whole call, and
-    // `range` is a valid `flock` that outlives it.
-    let done = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &range) };
-    match done {
-        0 => Ok(true),
-        _ => {
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EACCES) => Ok(false),
-                _ => Err(error),
-            }
-        }
-    }
-}
-
-/// Windows: the handle's own lock (`LockFileEx`, as earlier binaries take it), held as long
-/// as the handle is; a child doesn't inherit the handle.
-#[cfg(not(unix))]
-fn lock_process(file: &File) -> std::io::Result<bool> {
-    Ok(file.try_lock().is_ok())
 }
 
 #[cfg(test)]
