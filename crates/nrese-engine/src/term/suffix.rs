@@ -62,10 +62,6 @@ pub(crate) struct Chunk {
 /// released after, as its fields drop. An `Arc<Chunk>` dropped as such would release them
 /// first and free its block after: memory held beyond its charge.
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the vocabulary freezes a suffix in package 2")
-)]
 struct ChunkRef(Option<Arc<Chunk>>);
 
 impl std::ops::Deref for ChunkRef {
@@ -307,7 +303,24 @@ pub(crate) struct Prepared<'s> {
     pub(super) installed: bool,
     /// The writer slot it was prepared under: it can't outlive the slot.
     pub(super) _slot: &'s super::slot::WriterGuard<'s>,
+    /// Not `Send`: it installs on the thread that prepared it, whose parking state `prepare`
+    /// made ([`super::slot::warm_parking`]). A reference to the guard alone would be `Send`
+    /// (`MutexGuard<()>` is `Sync`); this field makes the type say it.
+    pub(super) _here: std::marker::PhantomData<*const ()>,
 }
+
+/// `Prepared` is not `Send`, checked when the crate compiles: were it `Send`, both impls below
+/// would apply and the item's trait would be ambiguous (the form `static_assertions`'
+/// `assert_not_impl_any!` expands to, without the dependency).
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    struct Invalid;
+    impl<T: ?Sized + Send> AmbiguousIfSend<Invalid> for T {}
+    let _ = <Prepared<'static> as AmbiguousIfSend<_>>::some_item;
+};
 
 #[cfg_attr(
     not(test),

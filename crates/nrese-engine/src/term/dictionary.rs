@@ -1608,6 +1608,9 @@ impl Dictionary {
         if end.is_none_or(|end| end > super::pending::PROVISIONAL) {
             return Err(PrepareError::Full);
         }
+        // What waiting for a lock allocates on this thread, made now: the install waits for
+        // readers on this thread (`Prepared` can't leave it), after the durable step.
+        super::slot::warm_parking();
         let mut inner = self.inner.write();
         if inner.len() != suffix.start() {
             return Err(PrepareError::Diverged {
@@ -1622,6 +1625,7 @@ impl Dictionary {
             suffix,
             installed: false,
             _slot: slot,
+            _here: std::marker::PhantomData,
         })
     }
 
@@ -1641,13 +1645,6 @@ impl Dictionary {
     }
 
     /// A prepared install given up (dropped): the room stays as slack.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a publication's prepared install is dropped on failure in package 9"
-        )
-    )]
     pub(super) fn unpromise(&self) {
         self.inner.write().unpromise();
     }
