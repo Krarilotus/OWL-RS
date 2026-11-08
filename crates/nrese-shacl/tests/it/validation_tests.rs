@@ -1537,6 +1537,75 @@ fn fresh_blank_nodes_compare_up_to_their_names() {
     );
 }
 
+/// Fresh blank nodes compare up to their names, not beyond: a value whose triple names one
+/// fresh node twice (`<<( _:x ex:p _:x )>>`) and one that names two (`<<( _:x ex:p _:y )>>`)
+/// are different results. A change of the shapes from the first query to the second
+/// introduces its result; the same query again (fresh names drawn anew) introduces nothing.
+#[test]
+fn fresh_blank_nodes_compare_by_where_they_stand() {
+    let one = "TRIPLE(?b, <http://example.com/p>, ?b)";
+    let two = "TRIPLE(?b, <http://example.com/p>, BNODE())";
+    let select =
+        |value: &str| format!("SELECT $this ({value} AS ?value) WHERE {{ BIND(BNODE() AS ?b) }}");
+    let shapes = |value: &str| {
+        format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Q .
+             ex:Q sh:select '''{}''' .",
+            select(value)
+        )
+    };
+    let graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH));
+    let query = NamedNodeRef::new_unchecked("http://example.com/Q");
+    let sh_select = NamedNodeRef::new_unchecked("http://www.w3.org/ns/shacl#select");
+    for (row, from, to, introduced) in [("one to two", one, two, 1), ("again", one, one, 0)] {
+        let store = engine("ex:b ex:q ex:c .", &shapes(from));
+        let before = store.snapshot();
+        let shapes_before = compiled(&before);
+        let mut tx = store.transaction();
+        if from != to {
+            let (old, new) = (select(from), select(to));
+            tx.remove(QuadRef::new(
+                query,
+                sh_select,
+                nrese_rdf::LiteralRef::new_simple_literal(&old),
+                graph,
+            ));
+            tx.insert(QuadRef::new(
+                query,
+                sh_select,
+                nrese_rdf::LiteralRef::new_simple_literal(&new),
+                graph,
+            ));
+        } else {
+            // A change of the shapes that leaves the constraint as it was.
+            tx.insert(QuadRef::new(
+                NamedNodeRef::new_unchecked("http://example.com/S"),
+                NamedNodeRef::new_unchecked("http://www.w3.org/2000/01/rdf-schema#comment"),
+                nrese_rdf::LiteralRef::new_simple_literal("annotated"),
+                graph,
+            ));
+        }
+        let after = tx.pending_snapshot();
+        let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+        let report = nrese_shacl::validate_shapes_change(
+            &before,
+            Some(&shapes_before),
+            &after,
+            &shapes_after,
+            DEFAULT,
+            &Resources::default(),
+        )
+        .expect("nothing stops it");
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(
+            report.results.len(),
+            introduced,
+            "{row}: {:?}",
+            report.results
+        );
+    }
+}
+
 /// A query's fresh blank nodes are told apart from the data's, whatever their labels (SYN-56
 /// r3 S3): with a stored blank node labelled `fresh0`, TRIPLE(fresh, ex:p, stored) and
 /// TRIPLE(stored, ex:p, fresh) are different results; removing the first leaves the second
