@@ -1,5 +1,7 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
+use std::sync::atomic::Ordering;
+
 use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
@@ -192,6 +194,7 @@ impl<'e> Transaction<'e> {
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
             revision: base.revision,
+            committed_micros: base.committed_micros,
             dictionary_len: self.engine.shared.dictionary.len(),
             equality: match self.changes_equality() {
                 true => Default::default(),
@@ -243,6 +246,7 @@ impl<'e> Transaction<'e> {
                 .with_delta(&asserted_inserts, &asserted_deletes),
             inferred: seen.inferred.with_delta(&[], &gone),
             revision: seen.revision,
+            committed_micros: seen.committed_micros,
             dictionary_len: self.engine.shared.dictionary.len(),
             equality: match self.changes_equality() {
                 true => Default::default(),
@@ -546,13 +550,10 @@ impl<'e> Transaction<'e> {
             deletes: asserted.deletes.into_iter().collect(),
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
-            committed_micros: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_micros() as u64),
-            ),
+            // Stamped as it goes to the log ([`Inner::publish_record`]).
+            committed_micros: None,
         };
-        engine.publish_record(&record, dictionary_len, changes_equality)?;
+        engine.publish_record(&record, true, dictionary_len, changes_equality)?;
         Ok(summary)
     }
 }
@@ -561,9 +562,15 @@ impl Inner {
     /// Publishes `record` as the next revision, its terms already in the dictionary
     /// (`dictionary_len` of them): logged first in durable mode, then post-commit
     /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    ///
+    /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
+    /// goes to the log, its runs built and its layout converted, and the record and the
+    /// version take that one time (review r1, R1-F1). A replicated record keeps the
+    /// primary's time, which the clock takes too.
     pub(super) fn publish_record(
         &self,
         record: &CommitRecord,
+        local: bool,
         dictionary_len: u64,
         changes_equality: bool,
     ) -> EngineResult<()> {
@@ -599,16 +606,20 @@ impl Inner {
         // The contents published from and to, for reader-scoped searches' lineage
         // ([`super::corpora`]), recorded once the publication's locks are let go.
         let published = std::cell::Cell::new(None);
-        let publish = |current: &Version| {
+        let published_to = &published;
+        let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
-            published.set(Some((current.content, content)));
+            published_to.set(Some((current.content, content)));
             Version {
                 content,
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
+                // The latest of its commits: unknown stays unknown, and a replicated record
+                // (a primary's log may step back) bounds what came before too.
+                committed_micros: crate::durability::later(current.committed_micros, committed),
                 dictionary_len,
                 equality: match changes_equality {
                     true => Default::default(),
@@ -620,12 +631,35 @@ impl Inner {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(record)?;
-                shared.versions.publish(publish);
+                let mut stamp = || shared.stamp();
+                let stamp: Option<&mut dyn FnMut() -> u64> = match local {
+                    true => Some(&mut stamp),
+                    false => None,
+                };
+                let committed = wal.append(record, stamp)?;
+                if !local {
+                    shared
+                        .clock
+                        .fetch_max(committed.unwrap_or(0), Ordering::Relaxed);
+                }
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 wal.bytes_since_checkpoint()
             }
             None => {
-                shared.versions.publish(publish);
+                let committed = match local {
+                    true => Some(shared.stamp()),
+                    false => {
+                        shared
+                            .clock
+                            .fetch_max(record.committed_micros.unwrap_or(0), Ordering::Relaxed);
+                        record.committed_micros
+                    }
+                };
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 0
             }
         };

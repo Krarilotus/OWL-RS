@@ -833,10 +833,15 @@ fn a_replica_scores_as_its_primary() {
     tx.insert(label("y", "gamma from the log", None).as_ref());
     tx.remove(label("f0", "filler 0", None).as_ref());
     tx.commit().unwrap();
-    let batch = primary
-        .log_since(replica.stats().revision, 1 << 20)
+    let at = replica.stats().revision;
+    let batch = primary.log_since(at, 1 << 20).unwrap();
+    replica
+        .apply_log(
+            &batch.frames,
+            &batch.expectation(at),
+            &nrese_exec::stop::StopSource::none(),
+        )
         .unwrap();
-    replica.apply_log(&batch.frames).unwrap();
     let derived = replica.snapshot().text_corpus_stats().derived;
     assert_eq!(
         texts(&replica.snapshot(), &every(&replica.snapshot(), q)),
@@ -932,9 +937,10 @@ fn a_reader_vector_search_selects_and_counts_the_visible_vectors() {
     let snapshot = engine.snapshot();
     let mut query = nrese_engine::VectorQuery::new(vec![0.3, 1.0], 3);
     query.metric = nrese_engine::vector::Metric::L2;
+    let unlimited = Arc::new(nrese_exec::Budget::unlimited());
     let search = |scope: &TextScope| {
         let (hits, report) = snapshot
-            .vector_search_in(MODEL, scope, &query, &|_| true, None)
+            .vector_search_in(MODEL, scope, &query, &|_| true, &unlimited)
             .unwrap();
         let values: Vec<String> = hits
             .iter()
@@ -1085,7 +1091,7 @@ fn a_vector_search_of_an_absent_dimension_builds_no_corpus() {
     let query = nrese_engine::VectorQuery::new(vec![1.0, 0.0], 3);
     let found = engine
         .snapshot()
-        .vector_search_in(MODEL, &EVERY, &query, &|_| true, Some(&budget))
+        .vector_search_in(MODEL, &EVERY, &query, &|_| true, &budget)
         .map(|(hits, report)| (hits.len(), report.space, report.scanned));
     assert_eq!(found.ok(), Some((0, 0, 0)));
 }

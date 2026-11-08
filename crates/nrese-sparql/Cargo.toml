@@ -11,6 +11,8 @@ license.workspace = true
 rayon = { workspace = true }
 nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
+# A vector search's charged id tables: their allocation size.
+hashbrown = { workspace = true }
 # OWL 2 QL: the schema read from RDF and the tree-witness rewriting.
 nrese-owl = { path = "../nrese-owl" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
