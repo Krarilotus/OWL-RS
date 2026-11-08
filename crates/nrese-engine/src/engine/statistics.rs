@@ -32,6 +32,15 @@
 //!
 //! A scan stops once the slices have found more than
 //! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
+//!
+//! Only a published snapshot admits (the lifecycle contract's S3): every claim, rebuild,
+//! build, save, load and kept entry here takes its [`SharedState`] and works on that
+//! token's snapshot alone. An unpublished one (a writer's pending state, a speculative or
+//! private one, a view of them) reads what published snapshots kept and computes the rest
+//! for itself, keeping nothing: with no sets kept it plans without them. A restricted view
+//! of a published snapshot keeps its own statistics ([`Statistics::for_view`]), which have
+//! no directory. A closed store's statistics write and read its directory no more
+//! ([`Statistics::close_dir`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +52,7 @@ use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
 use super::snapshot::HeavyGroups;
-use super::{ReadModel, Snapshot, Version};
+use super::{ReadModel, SharedState, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
@@ -103,7 +112,9 @@ pub(crate) struct Statistics {
     building: BuildCell<ReadModel, CharacteristicSets>,
     /// What the sets kept are charged to (`None`: an unlimited budget of their own).
     budget: Mutex<Option<Arc<Budget>>>,
-    /// Where they are saved and read back (`derived/` of a durable engine).
+    /// Where they are saved and read back (`derived/` of a durable engine), while its store
+    /// is open: held across every save and load, so that [`Self::close_dir`] waits for one
+    /// under way and none starts after it.
     dir: Mutex<Option<std::path::PathBuf>>,
     /// Scans of the store for the sets begun: what the tests count.
     scans: AtomicU64,
@@ -170,6 +181,10 @@ type HeavyEntry = (
     Option<cell::Kept<ChargedVec<(TermId, u64)>>>,
 );
 
+/// What a heavy-group read asks for: the pattern as read, in a permutation, the groups past a
+/// match count.
+type HeavyRead = (QuadPattern, Permutation, u64);
+
 /// Heavy-group lists kept; the cache is cleared when it fills up. Entries, not bytes: each
 /// list's bytes are charged to the statistics' budget.
 const HEAVY_ENTRIES: usize = 256;
@@ -193,15 +208,18 @@ impl Statistics {
         }
     }
 
-    /// The number of distinct subjects and objects of `graphs` in `model` at `version`:
-    /// cached, or computed by `count` (`None`: it can't be, and nothing is kept).
+    /// The number of distinct subjects and objects of `graphs` in `model` at `snapshot`'s
+    /// version as `model` reads it: cached, or computed by `count` (`None`: it can't be, and
+    /// nothing is kept). Kept for a published snapshot alone; an unpublished one's is
+    /// computed for it each time.
     pub(crate) fn node_count(
         &self,
-        version: &Arc<Version>,
+        snapshot: &Snapshot,
         model: ReadModel,
         graphs: GraphSelector,
         count: impl FnOnce() -> Option<u64>,
     ) -> Option<u64> {
+        let version = snapshot.data(model);
         let found = self.nodes.lock().iter().find_map(|(weak, m, g, n)| {
             (*m == model && *g == graphs && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(version)))
                 .then_some(*n)
@@ -210,29 +228,46 @@ impl Statistics {
             return found;
         }
         let n = count()?;
+        if let Some(state) = snapshot.shared_state() {
+            self.keep_node_count(&state, model, graphs, n);
+        }
+        Some(n)
+    }
+
+    /// Keeps `n` as the node count of `graphs` in `model` at the token's version.
+    fn keep_node_count(
+        &self,
+        state: &SharedState<'_>,
+        model: ReadModel,
+        graphs: GraphSelector,
+        n: u64,
+    ) {
+        let version = state.snapshot().data(model);
         let mut nodes = self.nodes.lock();
         nodes.retain(|(weak, ..)| weak.strong_count() > 0);
         if nodes.len() >= NODE_ENTRIES {
             nodes.clear();
         }
         nodes.push((Arc::downgrade(version), model, graphs, n));
-        Some(n)
     }
 
-    /// The groups of `pattern` (as read) in `permutation` at `version` in `model` that more
-    /// than `min` quads match: kept, or walked by `walk` into vectors charged to the budget
-    /// it is given (the one [`Self::set_budget`] set, else an unlimited one), and kept so.
-    /// `None` where the budget can't take them: then nothing of them stays charged, and
-    /// the version's readers get none without a walk each.
+    /// The groups of `pattern` (as read) in `permutation` at `snapshot`'s version as `model`
+    /// reads it that more than `min` quads match: kept, or walked by `walk` into vectors
+    /// charged to the budget it is given (the one [`Self::set_budget`] set, else an unlimited
+    /// one), and kept so. `None` where the budget can't take them: then nothing of them stays
+    /// charged, and the version's readers get none without a walk each. An unpublished
+    /// snapshot's are walked for it each time and kept for no one, charged to `reader` (its
+    /// reader's budget) where it brought one, else as kept ones are, while it holds them.
     pub(crate) fn heavy_groups(
         &self,
-        version: &Arc<Version>,
+        snapshot: &Snapshot,
         model: ReadModel,
-        pattern: QuadPattern,
-        permutation: Permutation,
-        min: u64,
+        read: HeavyRead,
+        reader: Option<Arc<Budget>>,
         walk: impl FnOnce(&Arc<Budget>) -> Result<ChargedVec<(TermId, u64)>, BudgetExceeded>,
     ) -> Option<HeavyGroups> {
+        let (pattern, permutation, min) = read;
+        let version = snapshot.data(model);
         let found = self
             .heavy
             .lock()
@@ -249,12 +284,33 @@ impl Statistics {
             return found;
         }
         self.heavy_walks.fetch_add(1, Ordering::Relaxed);
-        let budget = self.budget.lock().clone();
-        let budget = budget.unwrap_or_else(|| Arc::new(Budget::unlimited()));
+        let kept_budget = || {
+            let budget = self.budget.lock().clone();
+            budget.unwrap_or_else(|| Arc::new(Budget::unlimited()))
+        };
+        let Some(state) = snapshot.shared_state() else {
+            let budget = reader.unwrap_or_else(kept_budget);
+            return walk(&budget).ok().map(Arc::new);
+        };
+        let budget = kept_budget();
         let kept = walk(&budget)
             .and_then(|groups| cell::Kept::new(groups, Arc::clone(&budget)))
             .ok();
         let groups = kept.as_ref().map(|kept| Arc::clone(kept.value()));
+        self.keep_heavy(&state, model, read, kept);
+        groups
+    }
+
+    /// Keeps `kept` as the heavy groups of `read` at the token's version.
+    fn keep_heavy(
+        &self,
+        state: &SharedState<'_>,
+        model: ReadModel,
+        read: HeavyRead,
+        kept: Option<cell::Kept<ChargedVec<(TermId, u64)>>>,
+    ) {
+        let (pattern, permutation, min) = read;
+        let version = state.snapshot().data(model);
         let mut heavy = self.heavy.lock();
         heavy.retain(|(weak, ..)| weak.strong_count() > 0);
         if heavy.len() >= HEAVY_ENTRIES {
@@ -268,7 +324,6 @@ impl Statistics {
             min,
             kept,
         ));
-        groups
     }
 
     /// Walks for heavy groups begun ([`Self::heavy_groups`]).
@@ -281,20 +336,25 @@ impl Statistics {
     /// (drifted ones while one rebuild replaces them), read from their file (written
     /// after a build, read at the first use after a start), or built now, the first
     /// time, by one planner while the others help with it and wait, on Rayon workers
-    /// too ([`Build`]); none where that build failed (the next caller builds again).
+    /// too ([`Build`]); none where that build failed (the next caller builds again). An
+    /// unpublished snapshot gets the sets kept, drifted or not, and starts nothing: none if
+    /// none are kept.
     pub(crate) fn characteristic_sets(
         self: &Arc<Self>,
         snapshot: &Snapshot,
         model: ReadModel,
     ) -> Option<Arc<CharacteristicSets>> {
+        let Some(state) = snapshot.shared_state() else {
+            return self.sets.lock().get(&model).and_then(Sets::sets);
+        };
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let size = snapshot.count_in(model, &pattern).at_least();
-        if let Kept::Sets(sets) = self.kept_sets(snapshot, model, size) {
+        if let Kept::Sets(sets) = self.kept_sets(&state, model, size) {
             return sets;
         }
         let kept = || self.sets.lock().get(&model).map(Sets::sets);
         match self.building.claim(model, Kind::Sliced, kept) {
-            Claim::Build(builder) => self.build_sets(&builder, snapshot, model, size, true),
+            Claim::Build(builder) => self.build_sets(&builder, &state, model, size, true),
             // Another planner's build: helped with and waited for (a sliced build turns no
             // waiter away).
             Claim::Wait(build) => build.wait().ok().flatten(),
@@ -318,12 +378,12 @@ impl Statistics {
 
     /// The sets of `model` kept, or read from their file if none are; drifted ones by more
     /// than a quarter from `size` too, with one rebuild started for them.
-    fn kept_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel, size: u64) -> Kept {
+    fn kept_sets(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel, size: u64) -> Kept {
         let mut sets = self.sets.lock();
         let kept = match sets.entry(model) {
             std::collections::hash_map::Entry::Occupied(kept) => kept.into_mut(),
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                let Some((built, at)) = self.load_sets(snapshot, model) else {
+                let Some((built, at)) = self.load_sets(state, model) else {
                     return Kept::Cold;
                 };
                 // Over the budget: none until the next build (there were none before).
@@ -336,7 +396,7 @@ impl Statistics {
         };
         if !kept.fits(size) && !kept.rebuilding {
             kept.rebuilding = true;
-            self.rebuild(snapshot, model);
+            self.rebuild(state, model);
         }
         Kept::Sets(kept.sets())
     }
@@ -353,16 +413,26 @@ impl Statistics {
     }
 
     /// Rebuilds the drifted sets of `model` on a thread of its own, scanning on that
-    /// thread alone, and replaces them when done; planners go on with the old ones.
-    fn rebuild(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
-        let (statistics, snapshot) = (Arc::clone(self), snapshot.clone());
+    /// thread alone, and replaces them when done; planners go on with the old ones. The
+    /// thread owns a clone of the token's snapshot and takes its own token from it for
+    /// every later stage (the design check's F3): the sets are that snapshot's, whatever
+    /// is published meanwhile.
+    fn rebuild(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel) {
+        let (statistics, snapshot) = (Arc::clone(self), state.snapshot().clone());
         let started = std::thread::Builder::new()
             .name("nrese-statistics".to_owned())
             .spawn(move || {
+                // A clone keeps its publication: never `None`, so never left asked for.
+                let Some(state) = snapshot.shared_state() else {
+                    if let Some(kept) = statistics.sets.lock().get_mut(&model) {
+                        kept.rebuilding = false;
+                    }
+                    return;
+                };
                 let builder = statistics.claim_anyway(model);
                 let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-                let size = snapshot.count_in(model, &pattern).at_least();
-                statistics.build_sets(&builder, &snapshot, model, size, false);
+                let size = state.snapshot().count_in(model, &pattern).at_least();
+                statistics.build_sets(&builder, &state, model, size, false);
             });
         if started.is_err()
             && let Some(kept) = self.sets.lock().get_mut(&model)
@@ -375,11 +445,11 @@ impl Statistics {
     /// Builds the characteristic sets of `model` now, whatever the size, keeps and saves
     /// them: for a store that has just been loaded, so that no query after a start waits
     /// for them or competes with their build.
-    pub(crate) fn prepare_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
+    pub(crate) fn prepare_sets(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel) {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let size = snapshot.count_in(model, &pattern).at_least();
+        let size = state.snapshot().count_in(model, &pattern).at_least();
         let builder = self.claim_anyway(model);
-        self.build_sets(&builder, snapshot, model, size, true);
+        self.build_sets(&builder, state, model, size, true);
     }
 
     /// The sets of `model` scanned (on every core or on this thread alone), kept as built
@@ -387,14 +457,14 @@ impl Statistics {
     fn build_sets(
         &self,
         builder: &Builder<'_, ReadModel, CharacteristicSets>,
-        snapshot: &Snapshot,
+        state: &SharedState<'_>,
         model: ReadModel,
         size: u64,
         every_core: bool,
     ) -> Option<Arc<CharacteristicSets>> {
         let started = std::time::Instant::now();
         self.scans.fetch_add(1, Ordering::Relaxed);
-        let built = self.scan_sets(builder.build(), snapshot, model, every_core);
+        let built = self.scan_sets(builder.build(), state, model, every_core);
         tracing::debug!(
             ?model,
             statements = size,
@@ -404,7 +474,7 @@ impl Statistics {
             ms = started.elapsed().as_millis() as u64,
             "characteristic sets built"
         );
-        self.save_sets(snapshot, model, size, built.as_ref());
+        self.save_sets(state, model, size, built.as_ref());
         // Built and charged while the old sets are still kept, then put in their place.
         let kept = match built.map(|sets| self.keep(sets)) {
             Some(Ok(kept)) => Some(kept),
@@ -474,10 +544,11 @@ impl Statistics {
     fn scan_sets(
         &self,
         build: &Build<CharacteristicSets>,
-        snapshot: &Snapshot,
+        state: &SharedState<'_>,
         model: ReadModel,
         every_core: bool,
     ) -> Option<Gathered> {
+        let snapshot = state.snapshot();
         let ranges: Arc<[(TermId, TermId)]> = subject_ranges(
             snapshot.dictionary_len(),
             rayon::current_num_threads() as u64 * 4,
@@ -538,8 +609,23 @@ impl Statistics {
         format!("statistics-{model:?}").to_ascii_lowercase()
     }
 
-    fn save_sets(&self, snapshot: &Snapshot, model: ReadModel, size: u64, sets: Option<&Gathered>) {
-        let Some(dir) = self.dir.lock().clone() else {
+    /// Their store's directory is no more theirs (the store closes): no save or load starts
+    /// after this, and one under way has ended when it returns.
+    pub(crate) fn close_dir(&self) {
+        *self.dir.lock() = None;
+    }
+
+    /// Saves `sets` of the token's snapshot, under the directory's lock (see `dir`).
+    fn save_sets(
+        &self,
+        state: &SharedState<'_>,
+        model: ReadModel,
+        size: u64,
+        sets: Option<&Gathered>,
+    ) {
+        let snapshot = state.snapshot();
+        let dir = self.dir.lock();
+        let Some(dir) = dir.as_deref() else {
             return;
         };
         let covered = snapshot.dictionary_len();
@@ -551,7 +637,7 @@ impl Statistics {
             return;
         };
         let written =
-            crate::term::derived::save(&dir, &Self::sets_name(model), covered, fingerprint, |w| {
+            crate::term::derived::save(dir, &Self::sets_name(model), covered, fingerprint, |w| {
                 w.u64(size)?;
                 match sets {
                     Some(sets) => {
@@ -566,13 +652,17 @@ impl Statistics {
         }
     }
 
-    /// The sets of `model` saved for this dictionary: (`None` if there were too many to
-    /// keep, the size they were built at).
-    fn load_sets(&self, snapshot: &Snapshot, model: ReadModel) -> Option<(Option<Gathered>, u64)> {
-        let dir = self.dir.lock().clone()?;
-        // None for a private snapshot: saved sets are the published dictionary's.
-        let dictionary = snapshot.shared_dictionary()?;
-        let (_, loaded) = crate::term::derived::load(&dir, &Self::sets_name(model), |covered| {
+    /// The sets of `model` saved for the token's dictionary: (`None` if there were too many
+    /// to keep, the size they were built at). Read under the directory's lock (see `dir`).
+    fn load_sets(
+        &self,
+        state: &SharedState<'_>,
+        model: ReadModel,
+    ) -> Option<(Option<Gathered>, u64)> {
+        let dir = self.dir.lock();
+        let dir = dir.as_deref()?;
+        let dictionary = state.snapshot().shared_dictionary()?;
+        let (_, loaded) = crate::term::derived::load(dir, &Self::sets_name(model), |covered| {
             dictionary.fingerprint(covered)
         })?;
         let mut reader = loaded.reader();
@@ -585,8 +675,9 @@ impl Statistics {
     }
 
     /// The number of distinct values of `permutation`'s first unbound component among the
-    /// matches of `pattern` in `model`: cached, or computed now (see the module docs).
-    /// `None` where [`Snapshot::distinct_in`] can't answer.
+    /// matches of `pattern` in `model`: cached, or computed now (see the module docs), and
+    /// kept for a published snapshot alone. `None` where [`Snapshot::distinct_in`] can't
+    /// answer.
     pub(crate) fn distinct(
         &self,
         snapshot: &Snapshot,
@@ -606,12 +697,20 @@ impl Statistics {
         }
         // Computed without the lock: concurrent planners may both compute it once.
         let distinct = snapshot.distinct_in(model, pattern, permutation)?;
+        if let Some(state) = snapshot.shared_state() {
+            self.keep_distinct(&state, key, distinct, count);
+        }
+        Some(distinct)
+    }
+
+    /// Keeps `distinct` for `key` as computed at `count` matches. The key has no snapshot
+    /// dimension: the token proves only that a published snapshot computed it.
+    fn keep_distinct(&self, _state: &SharedState<'_>, key: Key, distinct: u64, count: u64) {
         let mut cache = self.distinct.lock();
         if cache.len() >= ENTRIES {
             cache.clear();
         }
         cache.insert(key, (distinct, count));
-        Some(distinct)
     }
 }
 
