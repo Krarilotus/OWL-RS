@@ -673,6 +673,8 @@ impl Snapshot {
     fn restricted(&self, inferred: crate::index::IndexVersion, held: Held) -> Snapshot {
         let version = Arc::new(Version {
             content: super::Content::fresh(),
+            // A masked or restricted view: the same asserted stack.
+            asserted_content: self.version.asserted_content,
             asserted: self.version.asserted.clone(),
             inferred,
             revision: self.version.revision,
@@ -956,6 +958,13 @@ impl Snapshot {
 
     pub fn revision(&self) -> u64 {
         self.version.revision
+    }
+
+    /// What its asserted statements are ([`super::AssertedIdentity`]): shared across the
+    /// views of one asserted stack, so a cache keyed by it must not depend on the view's
+    /// scope or equality mode; a transaction's pending state has its own.
+    pub fn asserted_identity(&self) -> super::AssertedIdentity {
+        self.version.asserted_content
     }
 
     /// What this snapshot reads, for caches of results computed on it: two snapshots with

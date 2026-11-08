@@ -24,6 +24,10 @@ pub struct CommitSummary {
     /// Inferred quads added and removed.
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
+    /// The asserted state after it ([`Snapshot::asserted_identity`](crate::Snapshot::asserted_identity)):
+    /// new where it changed asserted statements, the base's otherwise. A caller that
+    /// keeps state by it learns here what the commit published, never from a later read.
+    pub asserted: super::AssertedIdentity,
 }
 
 /// Pending changes to one stack, kept *exact* against the base snapshot: `inserts` are
@@ -170,6 +174,8 @@ impl<'e> Transaction<'e> {
         let base = self.base.version();
         let version = Version {
             content: super::Content::fresh(),
+            // Pending: its own, even without asserted changes (staged terms).
+            asserted_content: super::AssertedIdentity::fresh(),
             asserted: base
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -213,6 +219,8 @@ impl<'e> Transaction<'e> {
         let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
         let version = Version {
             content: super::Content::fresh(),
+            // Pending: its own, even without asserted changes (staged terms).
+            asserted_content: super::AssertedIdentity::fresh(),
             asserted: seen
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -492,17 +500,18 @@ impl<'e> Transaction<'e> {
             inferred,
         } = self;
         let count = |set: &HashSet<EncodedQuad>| set.len() as u64;
-        let summary = |revision| CommitSummary {
+        let summary = |revision, asserted_identity| CommitSummary {
             revision,
+            asserted: asserted_identity,
             inserted: count(&asserted.inserts),
             deleted: count(&asserted.deletes),
             inferred_inserted: count(&inferred.inserts),
             inferred_deleted: count(&inferred.deletes),
         };
         if asserted.counts() == (0, 0) && inferred.counts() == (0, 0) {
-            return Ok(summary(base.revision()));
+            return Ok(summary(base.revision(), base.asserted_identity()));
         }
-        let summary = summary(base.revision() + 1);
+        let mut summary = summary(base.revision() + 1, base.asserted_identity());
         let shared = &engine.shared;
         let dictionary_len = shared.dictionary.len();
         let dictionary_start = base.dictionary_len();
@@ -525,7 +534,10 @@ impl<'e> Transaction<'e> {
             // Stamped as it goes to the log ([`Inner::publish_record`]).
             committed_micros: None,
         };
-        engine.publish_record(&record, true, dictionary_len, changes_equality)?;
+        // Kept: the base's (single writer; a merge keeps it).
+        if let Some(new) = engine.publish_record(&record, true, dictionary_len, changes_equality)? {
+            summary.asserted = new;
+        }
         Ok(summary)
     }
 }
@@ -534,6 +546,8 @@ impl Inner {
     /// Publishes `record` as the next revision, its terms already in the dictionary
     /// (`dictionary_len` of them): logged first in durable mode, then post-commit
     /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    /// Returns the published version's new [`AssertedIdentity`](super::AssertedIdentity),
+    /// `None` where it keeps the previous one (no asserted change).
     ///
     /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
     /// goes to the log, its runs built and its layout converted, and the record and the
@@ -545,7 +559,7 @@ impl Inner {
         local: bool,
         dictionary_len: u64,
         changes_equality: bool,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<Option<super::AssertedIdentity>> {
         let shared = &self.shared;
         // The first quad in a named graph turns a default-graph asserted stack into a quad
         // stack. No merge or mapped checkpoint may replace its runs between the conversion
@@ -575,11 +589,15 @@ impl Inner {
                 .is_none_or(|index| index.layout() == asserted_layout)
         );
         let revision = record.revision;
+        // New where the record changes asserted statements; kept for an inferred-only one.
+        let asserted_identity = (!record.inserts.is_empty() || !record.deletes.is_empty())
+            .then(super::AssertedIdentity::fresh);
         let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             Version {
                 content: super::Content::fresh(),
+                asserted_content: asserted_identity.unwrap_or(current.asserted_content),
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
@@ -632,6 +650,6 @@ impl Inner {
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
         self.after_commit(wal_bytes);
-        Ok(())
+        Ok(asserted_identity)
     }
 }

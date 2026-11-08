@@ -5,10 +5,12 @@
 //! [`QlRewriting`] is the store's switch and its cache of the compiled schema; the
 //! rewriting of a query's basic graph patterns is `native/ql.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId};
+use nrese_engine::{
+    AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
+};
 use nrese_owl::ql::Tbox;
 use nrese_rdf::{NamedNodeRef, Term};
 
@@ -126,10 +128,39 @@ pub struct QlRewriting {
     /// Whether the data has a witness's tree wherever it folds, per probe, for one
     /// snapshot view (design §3).
     realised: Mutex<(Option<SnapshotIdentity>, HashMap<String, bool>)>,
+    /// The latest commits' changes to memberships of class expressions
+    /// ([`Self::note_commit`]), oldest first, at most [`NOTES`].
+    notes: Mutex<std::collections::VecDeque<Note>>,
 }
 
 /// Schemas compiled for different readers kept at once.
 const READERS: usize = 8;
+
+/// Commits whose membership changes are kept ([`QlRewriting::note_commit`]).
+const NOTES: usize = 64;
+
+/// Expressions a commit's note names at most; past it, every expression is read again.
+const TOUCHED: usize = 1024;
+
+/// One commit's changes to memberships: from one asserted state to the next, the class
+/// expressions an `rdf:type` statement was added to or removed from (`None`: too many,
+/// all of them).
+#[derive(Debug)]
+struct Note {
+    from: AssertedIdentity,
+    to: AssertedIdentity,
+    touched: Option<Vec<u64>>,
+}
+
+/// What a cached schema's memberships were read at: reused only for the same asserted
+/// statements by the same ids (equality and canonical mode), notes leading from it.
+#[derive(Debug)]
+struct Members {
+    at: AssertedIdentity,
+    equality: Option<TermId>,
+    canonical: bool,
+    of: HashMap<u64, Member>,
+}
 
 #[derive(Debug)]
 struct Cached {
@@ -145,6 +176,8 @@ struct Cached {
     /// mentions it. Ordinary data can introduce that id without changing the schema.
     thing: Option<nrese_owl::Term>,
     tbox: Arc<Tbox>,
+    /// Each expression's membership in `schema`, for the next snapshot's read.
+    members: Members,
 }
 
 impl QlRewriting {
@@ -155,7 +188,47 @@ impl QlRewriting {
             limits: Limits::default(),
             cached: Mutex::new(Vec::new()),
             realised: Mutex::new((None, HashMap::new())),
+            notes: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Notes a commit from asserted state `from` to `to` that added or removed the
+    /// memberships of `touched` (`None`: unknown or too many; [`touched_expressions`]):
+    /// the next schema read reuses the other expressions' memberships. Only for a commit
+    /// that happened; a write without a note makes the next read scan every expression.
+    pub fn note_commit(
+        &self,
+        from: AssertedIdentity,
+        to: AssertedIdentity,
+        touched: Option<Vec<u64>>,
+    ) {
+        if from == to {
+            return;
+        }
+        let mut notes = self.notes.lock().unwrap_or_else(|p| p.into_inner());
+        if notes.len() == NOTES {
+            notes.pop_front();
+        }
+        notes.push_back(Note { from, to, touched });
+    }
+
+    /// The expressions whose memberships may differ between asserted states `from` and
+    /// `to`: `Some` of them where notes lead from one to the other, `None` (every one)
+    /// otherwise.
+    fn touched_between(
+        &self,
+        from: AssertedIdentity,
+        to: AssertedIdentity,
+    ) -> Option<HashSet<u64>> {
+        let notes = self.notes.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = HashSet::new();
+        let mut at = from;
+        while at != to {
+            let note = notes.iter().find(|n| n.from == at)?;
+            out.extend(note.touched.as_ref()?.iter().copied());
+            at = note.to;
+        }
+        Some(out)
     }
 
     /// Whether the data at snapshot `identity` has the tree of probe `key`
@@ -232,7 +305,27 @@ impl QlRewriting {
         let keep = |graph: u64| {
             access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
         };
-        let mut statements = schema_statements(snapshot, &keep);
+        // The memberships the entry read, where nothing a commit since changed them can
+        // differ: the same view mode, and notes from its asserted state to this one.
+        let asserted = snapshot.asserted_identity();
+        let reuse = at.map(|i| &cached[i].members).and_then(|m| {
+            (m.equality == key.equality && m.canonical == key.canonical)
+                .then(|| self.touched_between(m.at, asserted).map(|t| (m, t)))
+                .flatten()
+        });
+        let known = |node: u64| {
+            let (members, touched) = reuse.as_ref()?;
+            (!touched.contains(&node))
+                .then(|| members.of.get(&node).copied())
+                .flatten()
+        };
+        let (mut statements, of) = read_schema(snapshot, &keep, &known);
+        let members = Members {
+            at: asserted,
+            equality: key.equality,
+            canonical: key.canonical,
+            of,
+        };
         if let Some(access) = access {
             statements.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
         }
@@ -241,6 +334,7 @@ impl QlRewriting {
             .filter(|c| c.thing == thing && c.schema.as_ref() == statements)
         {
             c.key = key;
+            c.members = members;
             return Arc::clone(&c.tbox);
         }
         let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
@@ -256,9 +350,32 @@ impl QlRewriting {
             schema: statements.into_boxed_slice(),
             thing,
             tbox: Arc::clone(&tbox),
+            members,
         });
         tbox
     }
+}
+
+/// The class expressions `tx` changes a membership of: the blank objects of the
+/// `rdf:type` statements it asserts or retracts, sorted (`None` past [`TOUCHED`]), for
+/// [`QlRewriting::note_commit`]. Costs the transaction's changes.
+pub fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<u64>> {
+    let Some(rdf_type) = iri(tx.base(), RDF, "type") else {
+        // No `rdf:type` term before it: every statement it adds may be one.
+        return tx.inserted().next().is_none().then(Vec::new);
+    };
+    let mut out: Vec<u64> = Vec::new();
+    for quad in tx.inserted().chain(tx.deleted()) {
+        if quad.predicate == rdf_type && quad.object.kind() == nrese_engine::TermKind::BlankNode {
+            out.push(quad.object.raw());
+            if out.len() > TOUCHED {
+                return None;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
 }
 
 fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
@@ -269,6 +386,26 @@ fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
 /// the declarations', the cells of the lists they name, and per class expression one
 /// statement of an individual in it, from a graph `keep` admits.
 fn schema_statements(snapshot: &Snapshot, keep: &dyn Fn(u64) -> bool) -> Vec<nrese_owl::Statement> {
+    read_schema(snapshot, keep, &|_| None).0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Memberships [`read_schema`] scanned on this thread (the reuse tests count them).
+    static MEMBER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What an expression's membership is ([`schema_statements`]): one statement, or none.
+type Member = Option<nrese_owl::Statement>;
+
+/// [`schema_statements`], with each expression's membership taken from `known` where it
+/// knows it (`Some`), scanned otherwise; and the memberships, for the next read.
+fn read_schema(
+    snapshot: &Snapshot,
+    keep: &dyn Fn(u64) -> bool,
+    known: &dyn Fn(u64) -> Option<Member>,
+) -> (Vec<nrese_owl::Statement>, HashMap<u64, Member>) {
+    let mut members: HashMap<u64, Member> = HashMap::new();
     let mut out = Vec::new();
     let scan = |pattern: QuadPattern, out: &mut Vec<nrese_owl::Statement>| {
         out.extend(
@@ -318,6 +455,13 @@ fn schema_statements(snapshot: &Snapshot, keep: &dyn Fn(u64) -> bool) -> Vec<nre
         expressions.sort_unstable();
         expressions.dedup();
         for node in expressions {
+            if let Some(member) = known(node) {
+                out.extend(member);
+                members.insert(node, member);
+                continue;
+            }
+            #[cfg(test)]
+            MEMBER_SCANS.set(MEMBER_SCANS.get() + 1);
             let member = snapshot
                 .quads_for_pattern_in(
                     ReadModel::Asserted,
@@ -331,10 +475,12 @@ fn schema_statements(snapshot: &Snapshot, keep: &dyn Fn(u64) -> bool) -> Vec<nre
                             Some(Term::NamedNode(n))
                                 if nrese_owl::diagnostics::reserved_name(n.as_str()))
                 });
-            out.extend(member.map(|q| nrese_owl::Statement {
+            let member = member.map(|q| nrese_owl::Statement {
                 triple: [q.subject.raw(), q.predicate.raw(), q.object.raw()],
                 graph: q.graph.raw(),
-            }));
+            });
+            out.extend(member);
+            members.insert(node, member);
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
@@ -378,7 +524,7 @@ fn schema_statements(snapshot: &Snapshot, keep: &dyn Fn(u64) -> bool) -> Vec<nre
     }
     out.sort();
     out.dedup();
-    out
+    (out, members)
 }
 
 /// The snapshot's terms, as the mapping reads them.

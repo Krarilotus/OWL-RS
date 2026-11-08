@@ -213,6 +213,159 @@ fn more_members_of_a_class_expression_keep_the_compiled_tbox() {
     assert!(Arc::ptr_eq(&original, &ql.tbox(&engine.snapshot(), None)));
 }
 
+/// A commit's note keeps the other expressions' memberships for the next schema read
+/// (P2-C1, the read loss of 8 Nov: each new snapshot scanned every expression's members).
+/// With 20 restrictions, 3 members each:
+/// - a noted commit adding a member to one rescans that one; an ordinary edge, none;
+/// - deleting the member the schema holds while others remain rescans it, and the schema
+///   read equals a fresh one (still one member); deleting the last ones too: none left;
+/// - a commit without a note, and a transaction's pending state, rescan every one.
+///
+/// Each schema read is compared with a fresh one: reuse never changes what is read.
+#[test]
+fn a_noted_commit_rescans_only_the_memberships_it_touched() {
+    let restrictions = 20;
+    let mut text = String::from(
+        "@prefix : <http://example.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n",
+    );
+    for e in 0..restrictions {
+        text.push_str(&format!(
+            "_:e{e} a owl:Restriction ; owl:onProperty :S{e} ; owl:someValuesFrom :A .\n"
+        ));
+        for k in 0..3 {
+            text.push_str(&format!(":m{e}_{k} a _:e{e} .\n"));
+        }
+    }
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for q in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+        tx.insert(q.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    let ql = QlRewriting::new(Closure { lists: false });
+    let scans = |snapshot: &Snapshot| {
+        MEMBER_SCANS.set(0);
+        let tbox = ql.tbox(snapshot, None);
+        (MEMBER_SCANS.get(), tbox)
+    };
+    let fresh = |snapshot: &Snapshot| schema_statements(snapshot, &|_| true);
+    let mut wrong = Vec::new();
+    let (all, _) = scans(&engine.snapshot());
+    if all != restrictions {
+        wrong.push(format!("first read: {all} scans"));
+    }
+    // One restriction's node and its members' statements, as the store has them.
+    let snapshot = engine.snapshot();
+    let rdf_type = iri(&snapshot, RDF, "type").unwrap();
+    let on = iri(&snapshot, OWL, "onProperty").unwrap();
+    let node = snapshot
+        .quads_for_pattern_in(
+            ReadModel::Asserted,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(on),
+                object: None,
+                graph: GraphSelector::Any,
+            },
+        )
+        .next()
+        .unwrap()
+        .subject;
+    let members: Vec<_> = snapshot
+        .quads_for_pattern_in(
+            ReadModel::Asserted,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(rdf_type),
+                object: Some(node),
+                graph: GraphSelector::Any,
+            },
+        )
+        .collect();
+    drop(snapshot);
+    let decode = |id| engine.snapshot().decode(id).unwrap();
+    let Term::BlankNode(blank) = decode(node) else {
+        panic!("not a blank node");
+    };
+    let commit = |change: &dyn Fn(&mut nrese_engine::Transaction<'_>), noted: bool| {
+        let mut tx = engine.transaction();
+        change(&mut tx);
+        let (from, touched) = (tx.base().asserted_identity(), touched_expressions(&tx));
+        let summary = tx.commit().unwrap();
+        if noted {
+            ql.note_commit(from, summary.asserted, touched);
+        }
+    };
+    let mut check = |name: &str, expected: usize| {
+        let snapshot = engine.snapshot();
+        let (n, _) = scans(&snapshot);
+        let cached = ql.cached.lock().unwrap();
+        let read = cached[0].schema.to_vec();
+        drop(cached);
+        if n != expected || read != fresh(&snapshot) {
+            wrong.push(format!(
+                "{name}: {n} scans (expected {expected}), equal to a fresh read: {}",
+                read == fresh(&snapshot)
+            ));
+        }
+    };
+    let member = |n: &str| {
+        Quad::new(
+            NamedNode::new_unchecked(format!("{EX}{n}")),
+            NamedNode::new_unchecked(format!("{RDF}type")),
+            blank.clone(),
+            GraphName::DefaultGraph,
+        )
+    };
+    commit(
+        &|tx| {
+            tx.insert(member("new").as_ref());
+        },
+        true,
+    );
+    check("a member added", 1);
+    commit(
+        &|tx| {
+            tx.insert(quad("ann", &format!("{EX}knows"), "bob").as_ref());
+        },
+        true,
+    );
+    check("an edge", 0);
+    // The member the schema holds: the first of the restriction's in store order.
+    commit(
+        &|tx| {
+            tx.remove_encoded(members[0]);
+        },
+        true,
+    );
+    check("the held member deleted", 1);
+    commit(
+        &|tx| {
+            for m in &members[1..] {
+                tx.remove_encoded(*m);
+            }
+            tx.remove(member("new").as_ref());
+        },
+        true,
+    );
+    check("every member deleted", 1);
+    commit(
+        &|tx| {
+            tx.insert(member("again").as_ref());
+        },
+        false,
+    );
+    check("a commit without a note", restrictions);
+    let tx = engine.transaction();
+    MEMBER_SCANS.set(0);
+    ql.tbox(&tx.pending_snapshot(), None);
+    if MEMBER_SCANS.get() != restrictions {
+        wrong.push(format!("pending: {} scans", MEMBER_SCANS.get()));
+    }
+    drop(tx);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn introducing_owl_thing_without_changing_the_schema_matches_fresh_preparation() {
     let engine = engine("");
