@@ -494,4 +494,71 @@ mod tests {
             .collect();
         assert!(missing.is_empty(), "never drawn: {missing:?} ({drawn:?})");
     }
+
+    /// The role chains of `o` that OWL 2's regularity doesn't admit (*OWL 2 Structural
+    /// Specification* §11.2), for the order of `sig.object_properties` (the generator's: a
+    /// chain goes up it). With `R` the superproperty and each `Sᵢ` before `R` (an inverse
+    /// by its property), a chain into `R` is one of:
+    /// - `R ∘ R`;
+    /// - `S₁ ∘ … ∘ Sₙ`;
+    /// - `R ∘ S₁ ∘ … ∘ Sₙ`;
+    /// - `S₁ ∘ … ∘ Sₙ ∘ R`.
+    fn irregular_chains(o: &Ontology, sig: &Signature) -> Vec<String> {
+        let at = |t: Term| sig.object_properties.iter().position(|&p| p == t);
+        let mut out = Vec::new();
+        for axiom in &o.axioms {
+            let Axiom::SubObjectPropertyOf(chain, sup) = axiom else {
+                continue;
+            };
+            let n = chain.len();
+            if n < 2 {
+                continue;
+            }
+            let r = sup.named();
+            let is_r = |p: &ObjProp| *p == ObjProp::Named(r);
+            let below = |p: &ObjProp| matches!((at(p.named()), at(r)), (Some(a), Some(b)) if a < b);
+            let regular = matches!(sup, ObjProp::Named(_))
+                && ((n == 2 && is_r(&chain[0]) && is_r(&chain[1]))
+                    || chain.iter().all(below)
+                    || (is_r(&chain[0]) && chain[1..].iter().all(below))
+                    || (is_r(&chain[n - 1]) && chain[..n - 1].iter().all(below)));
+            if !regular {
+                out.push(format!("{axiom:?}"));
+            }
+        }
+        out
+    }
+
+    /// Every role chain the generator emits is regular (review G1 r1, F1: a chain with its
+    /// superproperty at both ends, `p2 ∘ p1 ∘ p2 ⊑ p2`, is not), for the base generator
+    /// and the templated cases, over the default signature and the differential's.
+    #[test]
+    fn role_chains_are_regular() {
+        let differential = Sizes {
+            object_properties: 3,
+            simple: 2,
+            individuals: 4,
+            ..Sizes::default()
+        };
+        let mut irregular = Vec::new();
+        for sizes in [Sizes::default(), differential] {
+            let mut next = 0;
+            let sig = Signature::new(sizes, &mut |_| {
+                next += 1;
+                next
+            });
+            for seed in 0..500 {
+                let base = ontology(&mut Rng::new(seed), &sig, Profile::sroiq());
+                let templated = case(&mut Rng::new(seed), &sig, Profile::sroiq()).ontology;
+                for (what, o) in [("ontology", base), ("case", templated)] {
+                    irregular.extend(
+                        irregular_chains(&o, &sig)
+                            .into_iter()
+                            .map(|a| format!("{sizes:?} seed {seed} {what}: {a}")),
+                    );
+                }
+            }
+        }
+        assert!(irregular.is_empty(), "{}", irregular.join("\n"));
+    }
 }
