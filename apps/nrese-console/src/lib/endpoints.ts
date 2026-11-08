@@ -25,10 +25,27 @@ export function selectedGraphTarget(graphMode: GraphMode, graphIri: string): Gra
   return graphMode === "named" ? { kind: "named", iri: graphIri } : DEFAULT_GRAPH;
 }
 
-/** The request's query string for `target`. The server checks the IRI and the graph's
- * existence; the client sends what was named, whole. */
+/** Named graphs the server reads as the default graph, for other stores' clients (Jena's and
+ * rdflib's names): `nrese_sparql::compat::names_default_graph`, the one list; a test keeps
+ * this copy equal to it. */
+export const DEFAULT_GRAPH_ALIASES: readonly string[] = [
+  "urn:x-arq:DefaultGraph",
+  "urn:x-rdflib:default",
+];
+
+/** The request's query string for `target`, which every graph request is built from. A
+ * named target the server would read as the default graph is refused here, before any
+ * request: a named target acts on that named graph or on nothing (SYN-72 R1-F1). The server
+ * checks the IRI and the graph's existence; the client sends what was named, whole. */
 export function graphQuery(target: GraphTarget): string {
-  return target.kind === "default"
-    ? "?default"
-    : `?graph=${encodeURIComponent(target.iri)}`;
+  if (target.kind === "default") {
+    return "?default";
+  }
+  if (DEFAULT_GRAPH_ALIASES.includes(target.iri)) {
+    throw new Error(
+      `${target.iri} names the default graph on this server, not a named graph: ` +
+        "target the default graph (--graph default) to mean it",
+    );
+  }
+  return `?graph=${encodeURIComponent(target.iri)}`;
 }
