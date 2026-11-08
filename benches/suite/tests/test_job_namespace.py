@@ -146,7 +146,7 @@ def fake_docker(tmp: Path) -> tuple[dict, dict]:
     return python_side, isolation.environment(**state, NRESE_DOCKER=sh.as_posix())
 
 
-CLEANUP = ("scripts/bench-cleanup.sh", "scripts/lib/disk.sh", "scripts/lib/ns.sh")
+CLEANUP = ("scripts/bench-cleanup.sh", "scripts/lib/disk.sh", *isolation.NS_SH)
 
 
 def cleanup_checkout(root: Path) -> Path:
@@ -293,9 +293,8 @@ def bash(script: str, *args: str, env: dict | None = None, timeout: int = 300,
 
 
 # gate-publish.sh, what it sources, and what a revision's build identity reads from its commit.
-# suitekit/lock.py: ns.sh's host lock where there is no flock (Git Bash).
-GATE_PUBLISH = ("scripts/lib/gate-publish.sh", "scripts/lib/ns.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
-                "scripts/lib/target-cpu.sh", "rust-toolchain.toml", "benches/suite/suitekit/lock.py")
+GATE_PUBLISH = ("scripts/lib/gate-publish.sh", *isolation.NS_SH, "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
+                "scripts/lib/target-cpu.sh", "rust-toolchain.toml")
 
 
 @unittest.skipUnless(BASH, "needs bash")
@@ -427,6 +426,52 @@ FLEET_JOB=mine ns_clean "$1" "" all
             log = (tmp / "log").read_text().split("\n")[:4]
         self.assertEqual([line.split()[0] for line in log], ["start", "end", "start", "end"], log)
         self.assertEqual(log[0].split()[1], log[1].split()[1])
+
+    # suitekit/lock.py: ns.sh's host lock where there is no flock (Git Bash), which the makers take
+    # (ns_serialize datasets): without it the Windows gate's makers stopped at it (#153, 8 Nov 2026).
+    MAKERS = ("benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+              "scripts/lib/ns.sh", "scripts/lib/disk.sh", "benches/suite/suitekit/lock.py")
+
+    def maker_runs(self, script: str, args: list[str], env: dict) -> list[list[str]]:
+        """The `docker run`s a maker script starts, by a Docker stub first on PATH that records each
+        call (a `test -s` probe finds nothing, so it makes every file; everything else succeeds)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            this = isolation.checkout(tmp / "checkout", *self.MAKERS)  # benches/suite: ns.sh resolves it on load
+            stub = tmp / "bin" / "docker"
+            stub.parent.mkdir()
+            calls = tmp / "calls"
+            stub.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\037" "$a"; done >> "' + calls.as_posix() + '"\n'
+                            f'echo >> "{calls.as_posix()}"\n'
+                            'case " $* " in *" test -s "*) exit 1 ;; esac\nexit 0\n', newline="\n")
+            stub.chmod(0o755)
+            run_env = isolation.inherit("NRESE_", "FLEET_", PATH=f"{stub.parent.as_posix()}{os.pathsep}{os.environ['PATH']}",
+                                        NRESE_LOCK_DIR=(tmp / "locks").as_posix(), NRESE_MIN_FREE_GB="0",
+                                        NRESE_DATASET_DIR=(tmp / "data").as_posix(), **env)
+            done = subprocess.run([BASH, (this / script).as_posix(), *args], env=run_env, capture_output=True,
+                                  text=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            lines = [line.split("\037")[:-1] for line in calls.read_text(encoding="utf-8").splitlines() if line]
+        return [words for words in lines if words[:1] == ["run"]]
+
+    def test_a_maker_s_containers_carry_their_job_s_label_and_declared_limits(self):
+        """The master, 8 Nov 2026 (pkg/maker-containers): a timing job declares the container its data
+        makers start (F61, release_gate.data_job()); the fleet's runner stops the step at a container
+        made during it without the job's `fleet.job` label, or without a declared container's exact
+        memory and CPUs. So every container the LUBM and OWL2Bench makers start, the `test -s` probes
+        and the clean-up included, carries both; outside a fleet job, neither (as before)."""
+        job = {"FLEET_JOB": "abba-run-x", "NRESE_MAKER_MEMORY_GB": "6", "NRESE_MAKER_CPUS": "3"}
+        for script, args in (("benches/reasoning/prepare-lubm.sh", ["1", "10"]),
+                             ("benches/reasoning/prepare-owl2bench.sh", ["RL:1"])):
+            with self.subTest(script=script):
+                runs = self.maker_runs(script, args, job)
+                self.assertGreaterEqual(len(runs), 4, runs)
+                for words in runs:
+                    flags = " ".join(words)
+                    self.assertIn("--label fleet.job=abba-run-x", flags)
+                    self.assertIn("--memory 6g --memory-swap 6g --cpus 3", flags)
+                for words in self.maker_runs(script, args, {}):
+                    self.assertFalse(any(w.startswith("fleet.job=") or w == "--memory" for w in words), words)
 
     def test_the_lint_takes_mounts_names_and_compose_and_documents_what_it_cant(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,7 +7,10 @@ use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
 
-use super::{Inner, ReadModel, Snapshot, Stack, Version};
+mod pending;
+
+use self::pending::{Pending, SnapshotChanges};
+use super::{Inner, ReadModel, Snapshot, Version};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
 use crate::index::Layout;
@@ -31,57 +34,12 @@ pub struct CommitSummary {
     pub asserted: super::AssertedIdentity,
 }
 
-/// Pending changes to one stack, kept *exact* against the base snapshot: `inserts` are
-/// absent from the base, `deletes` are present in it, and the two sets are disjoint. That
-/// invariant is what the index's sign-sum visibility rule relies on.
-#[derive(Default)]
-struct Delta {
-    inserts: HashSet<EncodedQuad>,
-    deletes: HashSet<EncodedQuad>,
-}
-
-impl Delta {
-    /// Adds `quad`; returns `false` if it was already visible. `in_base` is only evaluated
-    /// when needed.
-    fn insert(&mut self, quad: EncodedQuad, in_base: impl FnOnce() -> bool) -> bool {
-        if self.deletes.remove(&quad) {
-            return true; // re-insert of a quad deleted earlier in this transaction
-        }
-        !in_base() && self.inserts.insert(quad)
-    }
-
-    /// Removes `quad`; returns `false` if it was not visible.
-    fn remove(&mut self, quad: EncodedQuad, in_base: impl FnOnce() -> bool) -> bool {
-        if self.inserts.remove(&quad) {
-            return true; // undo an insert made earlier in this transaction
-        }
-        in_base() && self.deletes.insert(quad)
-    }
-
-    fn contains(&self, quad: &EncodedQuad, in_base: impl FnOnce() -> bool) -> bool {
-        self.inserts.contains(quad) || (!self.deletes.contains(quad) && in_base())
-    }
-
-    fn counts(&self) -> (usize, usize) {
-        (self.inserts.len(), self.deletes.len())
-    }
-
-    /// No net change: what a commit publishes no run for, and, for the asserted stack,
-    /// keeps the asserted identity for ([`Transaction::asserted_identity_after`]).
-    fn is_empty(&self) -> bool {
-        self.counts() == (0, 0)
-    }
-
-    fn net(&self) -> i64 {
-        self.inserts.len() as i64 - self.deletes.len() as i64
-    }
-}
-
 /// A write transaction holding the engine's single writer slot.
 ///
-/// It keeps one exact delta per stack. Asserted quads are written through the plain methods
-/// ([`insert`](Self::insert), [`remove`](Self::remove), …); inferred ones only through the
-/// `*_inferred` methods, which the reasoner uses and request handlers must not.
+/// It keeps one exact delta per stack, in its `Pending` changes. Asserted quads are written
+/// through the plain methods ([`insert`](Self::insert), [`remove`](Self::remove), …); inferred
+/// ones only through the `*_inferred` methods, which the reasoner uses and request handlers
+/// must not.
 ///
 /// **Disjointness.** No quad is ever both asserted and inferred. An inferred quad is visible
 /// only while it is not asserted (including pending changes), and the commit drops every
@@ -99,9 +57,8 @@ pub struct Transaction<'e> {
     /// The writer slot; `None` for a speculative transaction ([`crate::Engine::speculative`]),
     /// which never commits.
     _slot: Option<MutexGuard<'e, ()>>,
-    base: Snapshot,
-    asserted: Delta,
-    inferred: Delta,
+    /// The base snapshot and the pending changes over it.
+    pending: Pending,
     /// What [`Self::asserted_identity_after`] answered first, which the commit publishes.
     after: OnceLock<super::AssertedIdentity>,
 }
@@ -109,11 +66,9 @@ pub struct Transaction<'e> {
 impl<'e> Transaction<'e> {
     pub(super) fn new(engine: &'e Inner, slot: Option<MutexGuard<'e, ()>>) -> Self {
         Self {
-            base: engine.shared.snapshot(),
+            pending: Pending::over(engine.shared.snapshot()),
             engine,
             _slot: slot,
-            asserted: Delta::default(),
-            inferred: Delta::default(),
             after: OnceLock::new(),
         }
     }
@@ -127,10 +82,12 @@ impl<'e> Transaction<'e> {
     /// or never happens leaves the id to no snapshot. Never persisted: a reopen gives new
     /// ones.
     pub fn asserted_identity_after(&self) -> super::AssertedIdentity {
-        *self.after.get_or_init(|| match self.asserted.is_empty() {
-            true => self.base.asserted_identity(),
-            false => super::AssertedIdentity::fresh(),
-        })
+        *self
+            .after
+            .get_or_init(|| match self.pending.asserted().is_empty() {
+                true => self.pending.base().asserted_identity(),
+                false => super::AssertedIdentity::fresh(),
+            })
     }
 
     /// Debug builds: no asserted change follows [`Self::asserted_identity_after`].
@@ -142,44 +99,9 @@ impl<'e> Transaction<'e> {
         changed
     }
 
-    fn delta(&self, stack: Stack) -> &Delta {
-        match stack {
-            Stack::Asserted => &self.asserted,
-            Stack::Inferred => &self.inferred,
-        }
-    }
-
-    /// True if `quad` is in `stack`'s base plus pending delta, before disjointness is applied.
-    fn delta_contains(&self, stack: Stack, quad: &EncodedQuad) -> bool {
-        self.delta(stack)
-            .contains(quad, || self.base.stack_contains(stack, quad))
-    }
-
-    /// True if `quad` is visible in `stack`, including pending changes. An asserted quad
-    /// hides the same inferred quad, as the commit will drop it.
-    fn stack_contains(&self, stack: Stack, quad: &EncodedQuad) -> bool {
-        self.delta_contains(stack, quad)
-            && (stack == Stack::Asserted || !self.delta_contains(Stack::Asserted, quad))
-    }
-
-    /// Inferred quads that are also asserted after the pending changes; the commit drops them
-    /// from the inferred stack. The base stacks are disjoint, so only pending inserts of
-    /// either stack can overlap. O(d log n) for d pending inserts.
-    fn shadowed_inferred(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
-        let newly_asserted = self
-            .asserted
-            .inserts
-            .iter()
-            .filter(|quad| self.delta_contains(Stack::Inferred, quad));
-        let newly_inferred = self.inferred.inserts.iter().filter(|quad| {
-            !self.asserted.inserts.contains(*quad) && self.delta_contains(Stack::Asserted, quad)
-        });
-        newly_asserted.chain(newly_inferred).copied()
-    }
-
     /// The state this transaction started from, without its pending changes.
     pub fn base(&self) -> &Snapshot {
-        &self.base
+        self.pending.base()
     }
 
     /// The state the transaction would commit, as a snapshot: the base with the pending
@@ -187,25 +109,14 @@ impl<'e> Transaction<'e> {
     /// published. It sees the terms the transaction interned. Costs O(d log d) for d
     /// pending changes.
     pub fn pending_snapshot(&self) -> Snapshot {
-        let shadowed: HashSet<EncodedQuad> = self.shadowed_inferred().collect();
-        let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
-        let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
         // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
-        let inferred_inserts: Vec<EncodedQuad> = self
-            .inferred
-            .inserts
-            .iter()
-            .filter(|quad| !shadowed.contains(*quad))
-            .copied()
-            .collect();
-        let mut inferred_deletes: Vec<EncodedQuad> =
-            self.inferred.deletes.iter().copied().collect();
-        inferred_deletes.extend(shadowed.iter().filter(|quad| {
-            !self.inferred.inserts.contains(*quad)
-                && !self.inferred.deletes.contains(*quad)
-                && self.base.stack_contains(Stack::Inferred, quad)
-        }));
-        let base = self.base.version();
+        let SnapshotChanges {
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        } = self.pending.snapshot_changes();
+        let base = self.pending.base().version();
         let content = super::Content::fresh();
         if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
             let changed = [
@@ -242,7 +153,7 @@ impl<'e> Transaction<'e> {
             },
             canonical: Default::default(),
         };
-        self.base.with_version(version)
+        self.pending.base().with_version(version)
     }
 
     /// [`Self::pending_snapshot`] as a reader of `view` reads it: `view` is a restricted
@@ -255,19 +166,10 @@ impl<'e> Transaction<'e> {
     /// statements: the view's runs are shared, never copied or scanned.
     pub fn pending_over(&self, view: &Snapshot, hidden: &[EncodedQuad]) -> Snapshot {
         let seen = view.version();
-        let mut gone: Vec<EncodedQuad> = self
-            .inferred
-            .deletes
-            .iter()
-            .chain(self.asserted.inserts.iter())
-            .chain(hidden)
-            .filter(|quad| seen.inferred.contains(quad))
-            .copied()
-            .collect();
-        gone.sort_unstable();
-        gone.dedup();
-        let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
-        let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
+        let gone = self.pending.over_gone(&seen.inferred, hidden);
+        let asserted = self.pending.asserted();
+        let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
         let content = super::Content::fresh();
         if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
             corpora.record(
@@ -305,14 +207,7 @@ impl<'e> Transaction<'e> {
         let Some(same_as) = *self.engine.shared.equality.read() else {
             return false;
         };
-        [
-            &self.asserted.inserts,
-            &self.asserted.deletes,
-            &self.inferred.inserts,
-            &self.inferred.deletes,
-        ]
-        .into_iter()
-        .any(|set| set.iter().any(|quad| quad.predicate == same_as))
+        self.pending.touches_predicate(same_as)
     }
 
     /// Number of asserted and inferred quads, including pending changes.
@@ -323,20 +218,7 @@ impl<'e> Transaction<'e> {
     /// Number of quads visible in `model`, including pending changes. O(1) for the asserted
     /// stack; the inferred count costs O(d log n) for d pending inserts.
     pub fn len_in(&self, model: ReadModel) -> u64 {
-        Stack::ALL
-            .into_iter()
-            .filter(|&stack| model.includes(stack))
-            .map(|stack| {
-                let base = self.base.len_in(stack.model());
-                let shadowed = match stack {
-                    Stack::Asserted => 0,
-                    Stack::Inferred => self.shadowed_inferred().count() as u64,
-                };
-                base.checked_add_signed(self.delta(stack).net())
-                    .and_then(|len| len.checked_sub(shadowed))
-                    .expect("exact deltas keep counts non-negative")
-            })
-            .sum()
+        self.pending.len_in(model)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -345,23 +227,23 @@ impl<'e> Transaction<'e> {
 
     /// Pending asserted (inserted, deleted) counts.
     pub fn pending(&self) -> (usize, usize) {
-        self.asserted.counts()
+        self.pending.asserted().counts()
     }
 
     /// Pending asserted inserts: quads absent from the base that the commit would add.
     pub fn inserted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
-        self.asserted.inserts.iter().copied()
+        self.pending.asserted().inserts.iter().copied()
     }
 
     /// Pending asserted deletes: quads present in the base that the commit would remove.
     pub fn deleted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
-        self.asserted.deletes.iter().copied()
+        self.pending.asserted().deletes.iter().copied()
     }
 
     /// Pending inferred (inserted, deleted) counts, before the commit drops inferred quads
     /// that end up asserted.
     pub fn inferred_pending(&self) -> (usize, usize) {
-        self.inferred.counts()
+        self.pending.inferred().counts()
     }
 
     pub fn contains(&self, quad: &EncodedQuad) -> bool {
@@ -369,9 +251,7 @@ impl<'e> Transaction<'e> {
     }
 
     pub fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
-        Stack::ALL
-            .into_iter()
-            .any(|stack| model.includes(stack) && self.stack_contains(stack, quad))
+        self.pending.contains_in(model, quad)
     }
 
     /// Asserted and inferred quads matching `pattern`, including pending changes.
@@ -389,48 +269,17 @@ impl<'e> Transaction<'e> {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e> {
-        let pattern = *pattern;
-        Stack::ALL
-            .into_iter()
-            .filter(move |&stack| model.includes(stack))
-            .flat_map(move |stack| {
-                let delta = self.delta(stack);
-                let inferred = stack == Stack::Inferred;
-                // Base inferred quads can only be shadowed by pending asserted inserts (the
-                // base stacks are disjoint): a hash probe instead of an index lookup.
-                let base = self.base.stack_quads(stack, &pattern).filter(move |quad| {
-                    let shadowed = inferred && self.asserted.inserts.contains(quad);
-                    !shadowed && !delta.deletes.contains(quad)
-                });
-                let pending = delta.inserts.iter().copied().filter(move |quad| {
-                    let shadowed = inferred && self.delta_contains(Stack::Asserted, quad);
-                    !shadowed && pattern.matches(quad)
-                });
-                base.chain(pending)
-            })
+        self.pending.quads_for_pattern_in(model, pattern)
     }
 
     /// True if the named graph `graph` contains at least one quad, including pending changes.
     pub fn contains_named_graph(&self, graph: TermId) -> bool {
-        !graph.is_default_graph()
-            && self
-                .quads_for_pattern(&QuadPattern::in_graph(graph))
-                .next()
-                .is_some()
+        self.pending.contains_named_graph(graph)
     }
 
     /// Named graphs that are non-empty including pending changes, in id order.
     pub fn named_graphs(&self) -> Vec<TermId> {
-        let mut graphs: Vec<TermId> = self
-            .base
-            .named_graphs()
-            .chain(self.asserted.inserts.iter().map(|quad| quad.graph))
-            .filter(|graph| !graph.is_default_graph())
-            .collect();
-        graphs.sort_unstable();
-        graphs.dedup();
-        graphs.retain(|&graph| self.contains_named_graph(graph));
-        graphs
+        self.pending.named_graphs()
     }
 
     /// Returns the id of `term`, adding it to the dictionary if needed.
@@ -474,19 +323,13 @@ impl<'e> Transaction<'e> {
     /// Returns `false` if it was already asserted; asserting an inferred quad returns `true`
     /// (it becomes explicit).
     pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
-        let base = &self.base;
-        let changed = self
-            .asserted
-            .insert(quad, || base.stack_contains(Stack::Asserted, &quad));
+        let changed = self.pending.insert_asserted(quad);
         self.assert_unanswered(changed)
     }
 
     /// Retracts an asserted quad; inferred quads are unaffected.
     pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
-        let base = &self.base;
-        let changed = self
-            .asserted
-            .remove(quad, || base.stack_contains(Stack::Asserted, &quad));
+        let changed = self.pending.remove_asserted(quad);
         self.assert_unanswered(changed)
     }
 
@@ -505,45 +348,36 @@ impl<'e> Transaction<'e> {
     /// Adds an inferred statement (in the default graph). Returns `false` if it is already
     /// inferred, or asserted (asserted statements are never also inferred). Reasoner only.
     pub fn insert_inferred(&mut self, triple: EncodedTriple) -> bool {
-        let quad = triple.in_default_graph();
-        if self.stack_contains(Stack::Asserted, &quad) {
-            return false;
-        }
-        let base = &self.base;
-        self.inferred
-            .insert(quad, || base.stack_contains(Stack::Inferred, &quad))
+        self.pending.insert_inferred(triple.in_default_graph())
     }
 
     /// Removes an inferred statement; returns `false` if it was not visible as inferred.
     /// Reasoner only.
     pub fn remove_inferred(&mut self, triple: EncodedTriple) -> bool {
-        let quad = triple.in_default_graph();
-        if !self.stack_contains(Stack::Inferred, &quad) {
-            return false;
-        }
-        let base = &self.base;
-        self.inferred
-            .remove(quad, || base.stack_contains(Stack::Inferred, &quad))
+        self.pending.remove_inferred(triple.in_default_graph())
     }
 
     /// Pending inferred inserts.
     pub fn inferred_inserted(&self) -> impl Iterator<Item = EncodedTriple> + '_ {
-        self.inferred.inserts.iter().map(|&quad| quad.into())
+        self.pending
+            .inferred()
+            .inserts
+            .iter()
+            .map(|&quad| quad.into())
     }
 
     /// Pending inferred deletes.
     pub fn inferred_deleted(&self) -> impl Iterator<Item = EncodedTriple> + '_ {
-        self.inferred.deletes.iter().map(|&quad| quad.into())
+        self.pending
+            .inferred()
+            .deletes
+            .iter()
+            .map(|&quad| quad.into())
     }
 
     /// Enforces disjointness: inferred quads that end up asserted leave the inferred stack.
     fn take_over_inferred(&mut self) {
-        let shadowed: Vec<_> = self.shadowed_inferred().collect();
-        let base = &self.base;
-        for quad in shadowed {
-            self.inferred
-                .remove(quad, || base.stack_contains(Stack::Inferred, &quad));
-        }
+        self.pending.take_over_inferred();
     }
 
     /// Publishes the pending changes of both stacks as one new revision. In durable mode the
@@ -561,18 +395,16 @@ impl<'e> Transaction<'e> {
         // The id the commit publishes where it changes asserted statements: the one
         // reserved ([`Self::asserted_identity_after`]), or one chosen when published. Never
         // the base's: a change after an answer of "unchanged" still gets a new one.
-        let reserved =
-            self.after.get().copied().filter(|&after| {
-                !self.asserted.is_empty() && after != self.base.asserted_identity()
-            });
+        let reserved = self.after.get().copied().filter(|&after| {
+            !self.pending.asserted().is_empty() && after != self.pending.base().asserted_identity()
+        });
         let Self {
             engine,
             _slot,
-            base,
-            asserted,
-            inferred,
+            pending,
             after,
         } = self;
+        let (base, asserted, inferred) = pending.into_parts();
         let promised = after.into_inner();
         let count = |set: &HashSet<EncodedQuad>| set.len() as u64;
         let summary = |revision, asserted_identity| CommitSummary {
