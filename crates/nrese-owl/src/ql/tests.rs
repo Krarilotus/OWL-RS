@@ -420,7 +420,7 @@ fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
     );
 }
 
-/// Existentials in a right side the TBox reads as nothing make anonymous individuals no
+/// Existentials in a conclusion the TBox doesn't read make anonymous individuals no
 /// generator types (I24b). Each row gives the entailment that names the terms, from the
 /// OWL 2 Direct Semantics. A row expecting nothing has no anonymous individual to meet.
 /// - `C ⊑ ∀R.∃S.A`: an `R`-successor of a `C` has an `S`-successor in `A`. The same holds
@@ -429,12 +429,18 @@ fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
 /// - `C ⊑ ¬∀R.¬A`, which is `∃R.A`.
 /// - An individual asserted to be in `∀R.∃S.A`, with an `R`-successor: that successor has
 ///   an `S`-successor in `A`.
-/// - Nothing: `∀R.⊤`, `∀R.⊥`, `≤ 0 R`, and `∀` over a data property.
+/// - A left side the TBox doesn't read, or reads in part (review r1, F1): `A ⊓ B ⊑ ∃S.A`
+///   gives an `A ⊓ B` an `S`-successor in `A`. The same holds for `A ⊓ B ⊑ ∀R.∃S.A`, and
+///   for the unread branch of `A ⊔ (B ⊓ E) ⊑ ∃S.A`.
+/// - `DisjointUnion(C, ∃R.A, ∃R.B)` (F2): a `C` has an `R`-successor (the direction from
+///   `C` to the union).
+/// - Nothing: `∀R.⊤`, `∀R.⊥`, `≤ 0 R`, `∀` over a data property, and an unread left side
+///   whose conclusion is a class (`A ⊓ B ⊑ C`).
 #[test]
 fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
     let untyped = |r: &str, ts: &[&str]| -> Vec<String> {
         ts.iter()
-            .map(|t| format!("{t}: an existential on {r} under a universal, union or complement"))
+            .map(|t| format!("{t}: an existential on {r} in a conclusion the TBox doesn't read"))
             .collect()
     };
     let asserted = |r: &str, ts: &[&str]| -> Vec<String> {
@@ -480,6 +486,32 @@ fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
             format!("ClassAssertion(ObjectAllValuesFrom(:R {some}) :c)\nObjectPropertyAssertion(:R :c :x)"),
             "S(?x ?y), A(?y)",
             asserted("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(ObjectIntersectionOf(:A :B) {some})"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(ObjectIntersectionOf(:A :B) ObjectAllValuesFrom(:R {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(ObjectUnionOf(:A ObjectIntersectionOf(:B :E)) ObjectSomeValuesFrom(:S :D))"
+                .into(),
+            "S(?x ?y), D(?y)",
+            untyped("S", &["S", "D"]),
+        ),
+        (
+            "DisjointUnion(:C ObjectSomeValuesFrom(:R :A) ObjectSomeValuesFrom(:R :B))".into(),
+            "R(?x ?y)",
+            untyped("R", &["R"]),
+        ),
+        (
+            "SubClassOf(ObjectIntersectionOf(:A :B) :C)".into(),
+            "C(?x), A(?x)",
+            Vec::new(),
         ),
         (
             "SubClassOf(:C ObjectAllValuesFrom(:R owl:Thing))".into(),

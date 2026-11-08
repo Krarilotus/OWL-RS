@@ -1314,6 +1314,75 @@ fn existentials_under_a_universal_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Existentials an axiom concludes where the TBox reads the axiom in part (I24b review r1,
+/// F1 and F2). Each case is entailed by the OWL 2 Direct Semantics (§2.2.3, §2.3.1). Each
+/// must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
+/// - `(A ⊓ B) ⊑ ∃S.D` with `c : A, B`: `c` has an `S`-successor in `D`.
+/// - `(A ⊓ B) ⊑ ∀R.∃S.D` with `R(c, x)`: `x` has one.
+/// - `DisjointUnion(C, ∃R.A, ∃R.B)` with `c : C`: `c` has an `R`-successor, though neither
+///   branch is certain.
+#[test]
+fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let some = "[ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ]";
+    let cases = [
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf {some} .
+                 :c a :A, :B ."
+            ),
+            vec![
+                format!("ASK {{ <{E}c> <{E}S> ?y . ?y a <{E}D> }}"),
+                format!("ASK {{ ?y a <{E}D> }}"),
+            ],
+        ),
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom {some} ] .
+                 :c a :A, :B ; :R :x ."
+            ),
+            vec![
+                format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}D> }}"),
+                format!("ASK {{ ?y a <{E}D> }}"),
+            ],
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf (
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :A ]
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :B ] ) .
+                 :c a :C ."
+            ),
+            vec![format!("ASK {{ <{E}c> <{E}R> ?y }}")],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, queries)) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            for query in queries {
+                let result = store
+                    .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                    .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+                let answer = String::from_utf8(result.payload).unwrap();
+                let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+                if !answer.contains("true") && matches!(status, "complete" | "none") {
+                    wrong.push(format!(
+                        "case {n}, {}, {query}: {answer}, {status}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
