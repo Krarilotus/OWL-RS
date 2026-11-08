@@ -185,6 +185,13 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
             RdfFormat::Turtle,
             format!("VERSION 12 \"a\nb\"\n<urn:s> <urn:p> <urn:o> .{AFTER}"),
         ),
+        // An escaped line break is part of a valid short string: that VERSION ends with it
+        // (sol-loop r2 S5).
+        (
+            false,
+            RdfFormat::Turtle,
+            format!("VERSION \"a\\\nb\"\n<urn:s> <urn:p> \"o\" .{AFTER}"),
+        ),
         // A byte order mark before the first directive: the parser reads past it, so the
         // directive is in force in every chunk (sol-loop r1 S4; before this package too).
         (
