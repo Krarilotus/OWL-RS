@@ -556,6 +556,54 @@ pub(crate) fn search<'b>(
     ))
 }
 
+/// The `query.k` vectors of `input` nearest to `query.vector` among those `eligible`
+/// takes, then `accept` takes (by id): every eligible vector compared, the graph unused,
+/// so that no vector `eligible` refuses changes which are selected (a reader's search,
+/// `SearchScope::Reader`). The report's space and scan are the eligible vectors, counted in
+/// a pass of their own: the scan is the global one ([`nrese_vector::exact`], charged to
+/// `budget` as [`search`]'s is), `eligible` asked first and `accept` only of what it took
+/// (the separate kernel was dropped by the instruction count, master 7 Nov 17:08;
+/// `syn24-count-4-8faacb59`). No lock of the index is held, as in [`search`]: the same
+/// snapshot, scoped.
+pub(crate) fn search_eligible<'b>(
+    input: Option<SearchInput>,
+    query: &VectorQuery,
+    eligible: &(dyn Fn(u64) -> bool + Sync),
+    accept: &(dyn Fn(u64) -> bool + Sync),
+    budget: &'b Budget,
+) -> Result<(ChargedVec<Hit, &'b Budget>, VectorSearchReport), BudgetExceeded> {
+    let Some(SearchInput { vectors, .. }) = input else {
+        return Ok((
+            ChargedVec::new(budget),
+            VectorSearchReport {
+                space: 0,
+                graph: false,
+                scanned: 0,
+            },
+        ));
+    };
+    let taken = (0..vectors.len() as u32)
+        .filter(|&position| eligible(vectors.id(position)))
+        .count();
+    let both = |id: u64| eligible(id) && accept(id);
+    let hits = nrese_vector::exact(
+        &vectors,
+        &query.vector,
+        query.k,
+        query.metric,
+        &both,
+        budget,
+    )?;
+    Ok((
+        hits,
+        VectorSearchReport {
+            space: taken,
+            graph: false,
+            scanned: taken,
+        },
+    ))
+}
+
 /// Builds or extends the graph `query` uses, from what `index` holds now, and installs
 /// it, ending `reservation` if it still holds the space (a background build's; a warm-up
 /// or a small space's build has none).

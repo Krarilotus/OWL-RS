@@ -132,6 +132,24 @@ its resolution floors and memory policy, and the measurements they rest on).
    configurations (its `config` in [hosts.toml](../hosts.toml) when each run started, or
    the CPU governor the runs read), are refused (exit 2); `--allow-host-change` compares
    them anyway, flagged as no evidence of a code change.
+   **One input:** a case whose two sides didn't load the same external input files, byte for
+   byte, or don't say which, gets no time, throughput, memory or work verdict; its status,
+   checks and answers are judged as any case's (a failure found is 1). What a case loads has one answer,
+   `suitekit/inputs.py` (frozen datasets, converted ORE ontologies, reference taxonomies,
+   concatenations; a kind it doesn't know is external, of unknown bytes), which each record's
+   `inputs` hashes and the comparison requires in full. Such a case is listed as a different
+   or unknown input, and the comparison exits 2 when no case of a side loaded the same input
+   and nothing failed. A new release of a
+   dataset (lubm-10 and lubm-100 on 7 Nov 2026) is such a difference, whatever its triples,
+   and so is a concatenation's other order. Suite results follow the same rule over every
+   `/data` file their manifests list or hash: only a manifest that states its inputs'
+   SHA-256 (`dataset_sha256`) establishes them, so until suite runs record it their
+   comparisons are refused.
+   **One generation of timing units:** each record says its own (`series_units`; none is 1).
+   A case whose two sides' units can't be brought together (an unknown generation, or an old
+   series of another quantity) gets no time verdict and no ratio; its status, checks, work
+   counters, throughput and memory are compared as for any case. With no case left on one
+   side whose time compares, compare exits 2, unless something else failed: that is exit 1.
 1. **Lost work first:** cases, repetitions, series or client widths missing on one side,
    and failed checks, are listed before any time. A known issue (the outcome a case
    declares, such as a memory limit, on both sides) earns no timing verdict: its checked
@@ -160,7 +178,7 @@ its resolution floors and memory policy, and the measurements they rest on).
 
 Every block times copies of the builds made for it ([PROTOCOL.md §5, "the unit"](../PROTOCOL.md#the-release-gate): a cached file's offset is shared by every block that times that file).
 
-- **The command for it:** [`benches/suite/abba.py`](../suite/abba.py). Declare a family file (sides a and b, the cases, each with a content check), then run `abba.py jobs FAMILY` and submit the jobs. `abba.py report` gives the verdict: an interleaved A-A' arm, the A-A' floor, Holm, and exit codes 0/1/2/3/4. The ways below are what it is built from.
+- **The command for it:** [`benches/suite/abba.py`](../suite/abba.py). Declare a family file (sides a and b, the cases, each with a content check), then run `abba.py jobs FAMILY` and submit the jobs. `abba.py report` gives the verdict: an interleaved A-A' arm, the A-A' floor, Holm, and exit codes 0/1/2/3/4/5 (5: some declared hypotheses not compared, each with its reason: never a pass; [benches/abba/README.md](../abba/README.md) gives their meaning and precedence). `release_gate.py verdict` holds the same: a hypothesis no round compared is NOT PASSED. The ways below are what it is built from.
 - **Catalog cases, through the gate's steps:** `release-gate.sh build REV` for each side, then `prepare HARNESS` with `GATE_BASELINES=base GATE_CASES=...`. Then `block N HARNESS 1 - base=REV cand=REV` for N = 1..k (four reports a block), and `report HARNESS cand=REV base=REV`.
 - **Directly:** `fast.py block --block N --cases C --side base:BINDIR:REV --side cand:BINDIR:REV --seed S --fresh-copies DIR --out PASSES`. This needs the native runtime and prepared data, and a BINDIR laid out like a gate build (`release/examples/perf_lab`, REVISION, SHA256SUMS).
 - **A hand-rolled `perf_lab` loop (no catalog case):** at each block's start run `cp -a "$BIN" "$W/copy-$k-$side" && sync` for each side, time from the copy, and `rm -rf` it at the block's end. Never time one file in two blocks.

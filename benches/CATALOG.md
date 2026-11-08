@@ -521,6 +521,10 @@ the tableau). Pairs that hang are recorded in their case (`hangs`) and not run a
 | `rdfs-plus-lubm10` | reasoning | rdfs-plus | graphdb: rdfs-plus, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 10 under RDFS-Plus |
 | `horst-lubm10` | reasoning | owl-horst | jena: owl-horst, graphdb: owl-horst, anzograph: owl-horst, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten | Jena | LUBM 10 under OWL-Horst (pD*) |
 | `ql-lubm10` | reasoning | owl2-ql | graphdb: owl2-ql, stardog: owl2-ql, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 10 under OWL 2 QL, materialised |
+| `ql-memberships-reuse` | reasoning | owl2-ql | none: NRESE's own column |  | 100 restrictions with 100 individuals asserted to be in each, queried with the OWL 2 QL rewriting on one snapshot: the compiled schema reused |
+| `ql-memberships-data-commits` | reasoning | owl2-ql | none: NRESE's own column |  | the same with 400 commits of an ordinary edge (added, then removed) and a reader running the queries meanwhile: each new snapshot's first query reads the schema again |
+| `ql-memberships-type-commits-wide` | reasoning | owl2-ql | none: NRESE's own column |  | 1,000 restrictions with 10 members each, and 400 commits of memberships (each adds one to every restriction on S0, then removes it) with a reader: the schema read and compiled again per membership revision |
+| `ql-memberships-type-commits-deep` | reasoning | owl2-ql | none: NRESE's own column |  | 10 restrictions with 1,000 members each, and the same membership commits with a reader: few expressions, many memberships per expression |
 | `custom-tc` | reasoning | custom | nemo: custom, jena: custom, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten | Nemo | transitive closure of a random graph (2,000 nodes, 3,000 edges) as Notation3 user rules |
 | `commits-readers` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries |
 | `commits-rdfs` | maintenance | rdfs | graphdb: rdfs, rdfox: rdfs |  | the same commits under RDFS, without readers |

@@ -159,7 +159,9 @@ class GraphdbContract(unittest.TestCase):
         for key, value in settings.items():
             self.assertEqual(recorded[key], 'set' if key == 'GRAPHDB_LICENSE' else value)
         self.assertNotIn('/private/', manifest.path.read_text())
+        manifest.close()  # one run at a time owns a results directory
         defaults = Manifest(self.ctx.logs, self.ctx.root, [], args, 'docker', {})
+        self.addCleanup(defaults.close)
         self.assertEqual(defaults.entry['settings'], {})
 
 

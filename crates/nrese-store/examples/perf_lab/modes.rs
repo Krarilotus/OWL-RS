@@ -343,6 +343,37 @@ pub fn parse_turtle(file: &Path, runs: usize) -> Result<String, Box<dyn std::err
     ))
 }
 
+/// A Turtle file cut into up to `parts` chunks for parallel parsing `runs` times from
+/// memory, recovering as bulk load does (`RdfParser::split_slice_for_parallel_parsing`):
+/// the skim alone, nothing parsed.
+pub fn split_turtle(
+    file: &Path,
+    parts: usize,
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_rdf_io::{RdfFormat, RdfParser};
+    let bytes = std::fs::read(file)?;
+    let mut times = Vec::new();
+    let mut chunks = 0;
+    for _ in 0..runs {
+        let at = Instant::now();
+        chunks = RdfParser::from_format(RdfFormat::Turtle)
+            .recovering()
+            .split_slice_for_parallel_parsing(&bytes, parts)?
+            .len();
+        times.push(at.elapsed());
+    }
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "split {} bytes into {chunks} chunks × {runs}: p50 {p50:.1} ms, max {max:.1} ms",
+        bytes.len()
+    );
+    Ok(format!(
+        "{{\"chunks\": {chunks}, \"parts\": {parts}, \"bytes\": {}, \"runs\": {runs}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}}}",
+        bytes.len()
+    ))
+}
+
 /// Parsing and planning a query without running it, `runs` times: the cost of the parser
 /// and the rewrites on large or deeply nested queries. The JSON object of a query in the
 /// report, with the plan's size (steps and rewrites) as its counts.

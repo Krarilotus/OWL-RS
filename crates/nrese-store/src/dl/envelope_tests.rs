@@ -122,10 +122,18 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
     // The premise's copy alone is larger than the bounds' rows: a limit below it leaves
     // the bounds room and the compilation none.
     let snapshot = store.engine().snapshot();
-    let premise = nrese_dl::memory::ontology_bytes(&ontology_at(&store, &snapshot));
+    let premise = nrese_dl::memory::ontology_bytes(ontology_at(&store, &snapshot).unwrap().value());
     assert!(
         premise > 64 << 10,
         "the ABox makes compiling the larger part"
+    );
+    // What the store keeps for every request once the revision's U1, views and ontology are
+    // built: charged within the catalog since SYN-61, the same after every request.
+    let kept = catalog.used();
+    assert_eq!(
+        kept,
+        store.dl().bounds.kept().used(),
+        "only the bounds' keep"
     );
     let mut ends = Vec::new();
     let mut limit = 256;
@@ -133,9 +141,11 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         let memory = store.envelope(Some(limit));
         let end = run(&store, &memory);
         assert!(memory.refused() || end == End::Answered, "at {limit} bytes");
+        // Back to what the store keeps: nothing of the request stays, in its envelope or in
+        // the bounds'.
         assert_eq!(
             catalog.used(),
-            0,
+            kept,
             "at {limit} bytes the catalog's budget is back"
         );
         ends.push((limit, end));
@@ -169,4 +179,17 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
     }
     // The store answers the next request in full.
     assert_eq!(run(&store, &store.envelope(None)), End::Answered);
+    // What the bounds kept goes with them: the store closed, the catalog holds nothing.
+    assert!(
+        store.dl().bounds.kept().used() > 0,
+        "the bounds kept nothing"
+    );
+    drop(unlimited);
+    drop(snapshot);
+    drop(store);
+    assert_eq!(
+        catalog.used(),
+        0,
+        "the store closed, its bounds still charged"
+    );
 }

@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tomllib
 from pathlib import Path
 
+from .manifest import read_journal
+from .receipts import unknown
 from .schema import read
 from .summary import summarise
 
@@ -50,7 +53,10 @@ def toml_value(value) -> str:
             return "[" + ", ".join(toml_value(v) for v in value) + "]"
         return "[\n" + "".join(f"  {toml_value(v)},\n" for v in value) + "]"
     if isinstance(value, dict):
-        return "{ " + ", ".join(f"{k} = {toml_value(v)}" for k, v in value.items()) + " }"
+        # A key that isn't bare (a receipt's repository path, /data input or image) is quoted; TOML
+        # has no null, so a value not known (None) is left out: absent, never the string "None".
+        return "{ " + ", ".join(f"{k if re.fullmatch(r'[A-Za-z0-9_-]+', k) else json.dumps(k)} = {toml_value(v)}"
+                                for k, v in value.items() if v is not None) + " }"
     return json.dumps(str(value), ensure_ascii=False)
 
 
@@ -103,12 +109,14 @@ def run_directories(directory: Path) -> list[Path]:
 
 def from_results(directory: Path, root: Path) -> dict:
     runs = run_directories(directory)
-    rows, invocations = [], []
+    rows, invocations, named = [], [], {}
     for run in runs:
         # Runs of a batch number their repetitions alike: each keeps its own.
         rows += [r | {"run": f"{run.name}:{r['run']}"} if len(runs) > 1 else r for r in read(run / "results.csv")]
         if (run / "manifest.json").exists():
-            invocations += json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("invocations", [])
+            mine = json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("invocations", [])
+            invocations += mine
+            named[run] = {i["invocation"] for i in mine if i.get("invocation")}
     try:
         shown = directory.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
@@ -140,11 +148,39 @@ def from_results(directory: Path, root: Path) -> dict:
         record["started"] = rows[0]["date"]
         record["host"] = rows[0]["host"]
         record["commit"] = "unknown (before run manifests)"
-    pairs = []
-    for (workload, tier, system), pair in sorted(summarise(rows).items()):
-        pairs.append({"workload": workload, "tier": tier, "system": system} | pair.outcome())
+    # Each cell's newest attempt, from its directory's journal (on disk before its work; its order,
+    # not the clock), finished or not; its receipt only the one under that attempt: never an older
+    # receipt in an unfinished one's place, nor one the journal doesn't hold, never the directory's
+    # commit, outcome or answers (reviews cell-receipts r1 R2, R3; r3).
+    newest: dict[str, dict] = {}
+    lost = []
+    for run in runs:
+        journal = read_journal(run)
+        # A journal lacking an invocation its manifest names has lost records, of cells nobody can
+        # name: then no receipt of this record stands, another directory's included (review r4 R2b).
+        if named.get(run, set()) - {r.get("invocation") for r in journal}:
+            lost.append(run.name)
+        for cell, attempt in {a["cell"]: a for a in journal if a.get("cell")}.items():
+            if cell not in newest or str(attempt.get("started", "")) >= str(newest[cell].get("started", "")):
+                newest[cell] = attempt
+    done = {(cell, r.get("attempt")): r for i in invocations for cell, r in (i.get("cells") or {}).items()
+            if r.get("complete")}
+    pairs, summarised = [], summarise(rows)
+    for (workload, tier, system), pair in sorted(summarised.items()):
+        entry = {"workload": workload, "tier": tier, "system": system} | pair.outcome()
+        cell = f"{workload}/{tier}/{system}"
+        if lost:
+            entry["receipt"] = unknown(f"the attempts' record (attempts.jsonl) of {', '.join(lost)} lost records")
+        elif (started := newest.get(cell)) is not None:
+            attempt = done.get((cell, started["attempt"])) or {
+                "attempt": started["attempt"], "started": started.get("started"), "complete": False}
+            # A licensed system's outcome and answers are results, whatever the outcome: they stay
+            # local (R1); its receipt says only what ran.
+            entry["receipt"] = ({k: v for k, v in attempt.items() if k not in ("outcome", "answers")}
+                                if pair.publish == "permission" else attempt)
+        pairs.append(entry)
     record["pairs"] = pairs
-    restricted = any(p["outcome"] == "restricted" for p in pairs)
+    restricted = any(p.publish == "permission" for p in summarised.values())
     record["publishable"] = "free systems only" if restricted else "all"
     from . import cases
     from .versus import versus

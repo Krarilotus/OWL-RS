@@ -39,17 +39,72 @@ use nrese_reasoner::delta::{self, Base};
 use nrese_reasoner::eval::{GroundProgram, Schema, Stop};
 use nrese_reasoner::ir::{self, Triple};
 
-/// U1's own facts beyond its input, indexed for every bound pattern.
-#[derive(Debug, Default, Clone)]
+/// U1's own facts beyond its input, indexed for every bound pattern. What it holds is charged
+/// to `held` before it grows ([`Self::try_insert`], SYN-61); a fact's share is released once
+/// it is removed and the trees have freed what they free.
+#[derive(Debug, Default)]
 pub struct Stack {
     spo: BTreeSet<[u64; 3]>,
     pos: BTreeSet<[u64; 3]>,
     osp: BTreeSet<[u64; 3]>,
     /// Facts per predicate, for the delta executor's estimates.
     per_predicate: std::collections::HashMap<u64, usize>,
+    /// Last: released after the trees and table it covers are freed.
+    held: Option<nrese_exec::Reservation>,
 }
 
+/// The largest node of the stack's trees: std's B-tree (B = 6) internal node, 11 keys, 12
+/// child links, a parent link and two 16-bit counts, aligned.
+const TREE_NODE: usize =
+    (11 * size_of::<[u64; 3]>() + 13 * size_of::<usize>() + 4).next_multiple_of(8);
+/// An upper bound on what one fact takes in each tree: every node but the root holds at
+/// least 5 keys, after an insert and after a remove alike (std's B-tree rebalances an
+/// underfull node), so the nodes number at most one per 5 keys, the root aside.
+const TREE_FACT: usize = TREE_NODE.div_ceil(5);
+/// An upper bound on what one more predicate takes in the per-predicate table: an entry and
+/// its control byte at a load of 7/8 rounded up to a power of two (so at most 16/7 slots an
+/// entry), the old table beside the new one while it grows (half as many again).
+const PREDICATE: usize = (16 + 1) * 16 * 3 / (7 * 2) + 1;
+/// What the stack takes once it holds anything: each tree's root, which may hold fewer than 5
+/// keys, and the table's smallest allocation (4 slots and its control group), twice over while
+/// it grows.
+const FIRST: usize = 3 * TREE_NODE + 2 * (4 * (16 + 1) + 16);
+
 impl Stack {
+    /// An empty stack charging what it holds to `budget`.
+    pub fn within(budget: &std::sync::Arc<nrese_exec::Budget>) -> Self {
+        Self {
+            held: Some(nrese_exec::Reservation::new(std::sync::Arc::clone(budget))),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::insert`], charging what the fact takes first; nothing is inserted where the
+    /// budget can't take it.
+    pub fn try_insert(&mut self, t: Triple) -> Result<bool, nrese_exec::BudgetExceeded> {
+        if self.spo.contains(&t) {
+            return Ok(false);
+        }
+        if let Some(held) = &mut self.held {
+            // Charged once and kept: the roots and the table, which removes don't shrink.
+            let first = if held.bytes() == 0 { FIRST } else { 0 };
+            let predicate = match self.per_predicate.contains_key(&t[1]) {
+                true => 0,
+                false => PREDICATE,
+            };
+            held.charge(3 * TREE_FACT + first + predicate)?;
+        }
+        Ok(self.insert(t))
+    }
+
+    /// [`Self::remove`], releasing the fact's share of the trees once they have freed it.
+    pub fn remove_charged(&mut self, t: Triple) -> bool {
+        let removed = self.remove(t);
+        if removed && let Some(held) = &mut self.held {
+            held.release(3 * TREE_FACT);
+        }
+        removed
+    }
     pub fn len(&self) -> usize {
         self.spo.len()
     }
@@ -62,7 +117,8 @@ impl Stack {
         self.spo.contains(t)
     }
 
-    pub fn insert(&mut self, [s, p, o]: Triple) -> bool {
+    /// Uncharged: [`Self::try_insert`] outside this module.
+    fn insert(&mut self, [s, p, o]: Triple) -> bool {
         if !self.spo.insert([s, p, o]) {
             return false;
         }
@@ -72,7 +128,8 @@ impl Stack {
         true
     }
 
-    pub fn remove(&mut self, [s, p, o]: Triple) -> bool {
+    /// Uncharged: [`Self::remove_charged`] outside this module.
+    fn remove(&mut self, [s, p, o]: Triple) -> bool {
         if !self.spo.remove(&[s, p, o]) {
             return false;
         }
@@ -453,16 +510,37 @@ impl Change {
     }
 }
 
-/// Why U1 isn't available: its evaluation ran out of its budget.
+/// Why U1 isn't available: its evaluation ran out of its budget, or (`refused`) the queries'
+/// memory couldn't hold what it reads or keeps. A refused U1 is never kept: once memory is
+/// free again the next read builds it (SYN-61); one that gave up stays so for its revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GaveUp(pub String);
+pub struct GaveUp {
+    pub why: String,
+    pub refused: bool,
+}
+
+impl GaveUp {
+    /// Gave up within its budgets (time, the memory watch, a missing term).
+    pub fn new(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            refused: false,
+        }
+    }
+
+    /// A budget refused what U1 reads or keeps.
+    pub fn refused(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            refused: true,
+        }
+    }
+}
 
 /// Poll the caller's store watch as well as the process owner's safety fallback.
 fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
     if stop() || nrese_reasoner::eval::over_memory_limit() {
-        Err(GaveUp(
-            "the upper bound's evaluation was stopped".to_owned(),
-        ))
+        Err(GaveUp::new("the upper bound's evaluation was stopped"))
     } else {
         Ok(())
     }
@@ -541,17 +619,40 @@ fn reasoner_rules(program: &bounds::Program, values: &Values) -> Vec<ir::Rule> {
 }
 
 /// The materialised view's facts (every graph, each once).
-fn view_facts(view: &Snapshot, stop: Stop<'_>) -> Result<Vec<Triple>, GaveUp> {
-    let mut facts = Vec::new();
+/// The materialised view's facts (every graph, each once), charged to `budget` as they are
+/// collected (SYN-61: the whole view, U1's build's largest scratch).
+fn view_facts(
+    view: &Snapshot,
+    stop: Stop<'_>,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<nrese_exec::ChargedVec<Triple>, GaveUp> {
+    let mut facts = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
     for q in view.quads_for_pattern_in(ReadModel::Materialised, &pattern([None, None, None])) {
         if facts.len() % 1024 == 0 {
             check_stop(stop)?;
         }
-        facts.push([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
+        facts
+            .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
+            .map_err(|_| GaveUp::refused(SCRATCH_REFUSED))?;
     }
-    facts.sort_unstable();
-    facts.dedup();
+    sort_dedup(&mut facts);
     Ok(facts)
+}
+
+/// Why U1 isn't available when its build's scratch doesn't fit.
+const SCRATCH_REFUSED: &str = "its evaluation's input doesn't fit the queries' memory";
+
+/// `facts` sorted, each once; in place, allocating nothing.
+pub(crate) fn sort_dedup(facts: &mut nrese_exec::ChargedVec<Triple>) {
+    facts.sort_unstable();
+    let mut kept = 0;
+    for i in 0..facts.len() {
+        if i == 0 || facts[i] != facts[kept - 1] {
+            facts[kept] = facts[i];
+            kept += 1;
+        }
+    }
+    facts.truncate(kept);
 }
 
 impl Upper {
@@ -565,6 +666,7 @@ impl Upper {
         view: &Snapshot,
         resolve: &dyn Fn(TermRef<'_>) -> Option<TermId>,
         stop: Stop<'_>,
+        kept: &std::sync::Arc<nrese_exec::Budget>,
     ) -> Result<Self, GaveUp> {
         check_stop(stop)?;
         let started = Instant::now();
@@ -577,16 +679,15 @@ impl Upper {
         });
         let schema = Schema::owl(&mut vocabulary);
         if vocabulary.missing {
-            return Err(GaveUp(
-                "its terms haven't reached this replica yet: the primary interns them in a commit"
-                    .to_owned(),
+            return Err(GaveUp::new(
+                "its terms haven't reached this replica yet: the primary interns them in a commit",
             ));
         }
         // The literals U1 compares, by value: of the view, the program's facts, its rules.
         let compared = program.compared_predicates();
         let mut values = Values::default();
-        let mut input = view_facts(view, stop)?;
-        values.add_objects(view, &input, compared);
+        let mut input = view_facts(view, stop, kept)?;
+        values.add_objects(view, input.iter(), compared);
         let program_facts: Vec<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
         values.add_objects(view, &program_facts, compared);
         for rule in &program.rules {
@@ -600,12 +701,17 @@ impl Upper {
         }
         let rules = reasoner_rules(&program, &values);
         let facts: HashSet<Triple> = program_facts.iter().map(|&f| values.map(f)).collect();
-        for t in &mut input {
+        for t in input.iter_mut() {
             *t = values.map(*t);
         }
-        input.extend(facts.iter().copied());
-        input.sort_unstable();
-        input.dedup();
+        for &fact in &facts {
+            input
+                .push(fact)
+                .map_err(|_| GaveUp::refused(SCRATCH_REFUSED))?;
+        }
+        sort_dedup(&mut input);
+        // The input's charge is held until the evaluation that consumes it returns.
+        let (input, input_held) = input.into_parts();
         // Equality by representatives: the closure over one term per class, the input's
         // facts that mention a class rewritten beside it, each other identity placed in
         // its class.
@@ -617,21 +723,28 @@ impl Upper {
             nrese_reasoner::batch::Listing::Stored,
             stop,
         )
-        .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
+        .map_err(|_| GaveUp::new("the upper bound's evaluation was stopped"))?;
         let same_as = program.names.same_as;
-        let mut stack = Stack::default();
+        // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
+        // evaluation's own working set is watched (`stop`), as the support sets' is.
+        let mut stack = Stack::within(kept);
+        let refused = |_| GaveUp::refused("its facts don't fit the queries' memory");
         for (i, t) in m.derived.into_iter().enumerate() {
             if i % 1024 == 0 {
                 check_stop(stop)?;
             }
-            stack.insert(t);
+            stack.try_insert(t).map_err(refused)?;
         }
+        // The input is consumed and the derived facts (which may have reused it) freed.
+        drop(input_held);
         for (representative, members) in m.classes.classes() {
             for (i, &member) in members.iter().filter(|&&m| m != representative).enumerate() {
                 if i % 1024 == 0 {
                     check_stop(stop)?;
                 }
-                stack.insert([member, same_as, representative]);
+                stack
+                    .try_insert([member, same_as, representative])
+                    .map_err(refused)?;
             }
         }
         let s = &program.signature;
@@ -747,7 +860,7 @@ impl Upper {
             self.ground.as_ref(),
             stop,
         )
-        .map_err(|_| GaveUp("the upper bound's maintenance was stopped".to_owned()))?;
+        .map_err(|_| GaveUp::new("the upper bound's maintenance was stopped"))?;
         change.program = update.program;
         // An equality the commit brings (the RL closure's, say: a functional property is
         // OWL 2 RL) or U1 derives: U1 then has classes.
@@ -766,19 +879,21 @@ impl Upper {
     }
 
     /// Applies a commit's change ([`Self::change`]) once the commit is done, the literals
-    /// it read by value first among them.
-    pub fn apply(&mut self, change: Change) {
+    /// it read by value first among them. Refused where the stack's budget can't take its
+    /// new facts: U1 is then partly changed, and not to be kept.
+    pub fn apply(&mut self, change: Change) -> Result<(), nrese_exec::BudgetExceeded> {
         for t in change.moved.into_iter().chain(change.remove) {
-            self.stack.remove(t);
+            self.stack.remove_charged(t);
         }
         for t in change.insert {
-            self.stack.insert(t);
+            self.stack.try_insert(t)?;
         }
         if let Some(program) = change.program {
             self.ground = Some(program);
         }
         self.values.absorb(change.noted);
         self.elapsed = change.elapsed;
+        Ok(())
     }
 
     /// The clashes the stack would have after `change`.

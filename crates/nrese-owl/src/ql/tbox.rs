@@ -133,10 +133,9 @@ impl Tbox {
     /// Why answers to `cq` through anonymous individuals may be missing
     /// (docs/design/ql-rewriting.md §7): each atom's term reached by a hazard, with the
     /// hazard; a hazard that reaches every term once, under the first atom. Empty: none.
+    /// Also where the rewriting has nothing to rewrite ([`Self::is_empty`]): individuals
+    /// asserted to be in an existential have anonymous successors of their own.
     pub fn concerns(&self, cq: &Cq) -> Vec<(Term, Hazard)> {
-        if self.is_empty() {
-            return Vec::new();
-        }
         let mut out: Vec<(Term, Hazard)> = Vec::new();
         for atom in &cq.atoms {
             let term = match atom {
@@ -144,17 +143,27 @@ impl Tbox {
                 Atom::Role(_, p, _) => *p,
                 Atom::Other(..) => continue,
             };
-            let hazard = self
-                .hazards
-                .global
-                .or_else(|| self.hazards.affected.get(&term).copied());
-            if let Some(h) = hazard
+            if let Some(h) = self.concern(term)
                 && !out.iter().any(|&(t, _)| t == term)
             {
                 out.push((term, h));
             }
         }
         out
+    }
+
+    /// The hazard by which answers on `term` (a class or property) through anonymous
+    /// individuals may be missing, if any.
+    pub fn concern(&self, term: Term) -> Option<Hazard> {
+        self.hazards
+            .global
+            .or_else(|| self.hazards.affected.get(&term).copied())
+    }
+
+    /// Whether some answer through anonymous individuals may be missing: a term has a
+    /// [`Self::concern`].
+    pub fn has_concerns(&self) -> bool {
+        self.hazards.global.is_some() || !self.hazards.affected.is_empty()
     }
 
     /// Whether the rewriting may change an atom on `term` (a class or property): for the
@@ -372,8 +381,12 @@ impl Tbox {
     /// The members of `set` a named individual can be stated to be (classes and
     /// existentials), leaving out those whose instances the materialisation makes
     /// instances of another member (one of each set of equivalent ones kept). Each
-    /// member's walk is paid from `work`, and so is reading what they reach.
+    /// member's walk is paid from `work`, and so is reading what they reach. With
+    /// `owl:Thing` in `set`, every individual is a member: `[Basic::Thing]` alone, no walk.
     fn minimal(&self, set: Vec<u32>, work: &Work) -> Result<Vec<Basic>, ()> {
+        if set.iter().any(|&id| self.basic(id) == Basic::Thing) {
+            return Ok(vec![Basic::Thing]);
+        }
         let set: Vec<u32> = set
             .into_iter()
             .filter(|&id| matches!(self.basic(id), Basic::Class(_) | Basic::Exists(_)))
@@ -765,13 +778,15 @@ impl Builder {
                 tbox.reaching.entry(sigma).or_default().push(ty);
             }
         }
+        // `⊤ ⊑ B` is a gap too: the closure states no individual to be a Thing, so it
+        // applies none of them (P2-C1 review r1 F1).
         tbox.gaps = tbox
             .up
             .iter()
             .zip(&tbox.base_up)
             .enumerate()
             .any(|(id, (up, base))| {
-                !matches!(tbox.basics[id], Basic::Fresh(_) | Basic::Thing)
+                !matches!(tbox.basics[id], Basic::Fresh(_))
                     && up.iter().any(|sup| {
                         !base.contains(sup) && !matches!(tbox.basics[*sup as usize], Basic::Thing)
                     })

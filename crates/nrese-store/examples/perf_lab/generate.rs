@@ -145,6 +145,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "layered" => layered(&params, &mut rng, &mut nt, &commits)?,
         "entities" => entities(&params, &mut rng, &mut nt)?,
         "churn" => churn(&params, &mut nt, &commits)?,
+        "ql-memberships" => ql_memberships(&params, &mut nt, &commits)?,
         "batches" => batches(&params, &mut nt, &commits)?,
         "geo" => geo(&params, &mut rng, &mut nt)?,
         "text" => text(&params, &mut rng, &mut nt)?,
@@ -582,6 +583,78 @@ fn entities(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     }
     let mut e = Expect::new();
     e.insert("entities".into(), json!(n));
+    Ok(e)
+}
+
+/// What the OWL 2 QL schema reader reads per blank class expression (P2-C1 review r1's cost
+/// question): `expressions` restrictions `_:eE` (`owl:onProperty :S{E mod 10}`,
+/// `owl:someValuesFrom :A{E mod 10}`), each with `members` individuals asserted to be in it
+/// (`:mE_K a _:eE`), a generating axiom `:P ⊑ ∃worksFor.Org`, 1,000 people in `P` linked by
+/// `knows`. `commits` commits each add a statement and as many later remove it again:
+/// `types=1` a membership of every restriction on `S0` (what the reader rescans), otherwise a
+/// `knows` edge (ordinary data). After the last commit the store holds what it held before.
+fn ql_memberships(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
+    let (expressions, members) = (p.get("expressions", 100), p.get("members", 100));
+    let (changes, types) = (p.get("commits", 0), p.get("types", 0) == 1);
+    let people = 1000;
+    let a = rdf("type");
+    for e in 0..expressions {
+        let node = format!("_:e{e}");
+        nt.t(&node, &a, &owl("Restriction"))?;
+        nt.t(&node, &owl("onProperty"), &ex(format!("S{}", e % 10)))?;
+        nt.t(&node, &owl("someValuesFrom"), &ex(format!("A{}", e % 10)))?;
+        for k in 0..members {
+            nt.t(&ex(format!("m{e}_{k}")), &a, &node)?;
+        }
+    }
+    nt.t("_:works", &a, &owl("Restriction"))?;
+    nt.t("_:works", &owl("onProperty"), &ex("worksFor"))?;
+    nt.t("_:works", &owl("someValuesFrom"), &ex("Org"))?;
+    nt.t(&ex("P"), &rdfs("subClassOf"), "_:works")?;
+    for i in 0..people {
+        nt.t(&ex(format!("p{i}")), &a, &ex("P"))?;
+        nt.t(
+            &ex(format!("p{i}")),
+            &ex("knows"),
+            &ex(format!("p{}", (i + 1) % people)),
+        )?;
+    }
+    let mut out = BufWriter::new(File::create(commits)?);
+    let (on, s0) = (owl("onProperty"), ex("S0"));
+    for i in 0..changes {
+        if types {
+            writeln!(
+                out,
+                "INSERT {{ {} a ?e }} WHERE {{ ?e {on} {s0} }}",
+                ex(format!("new{i}"))
+            )?;
+        } else {
+            writeln!(
+                out,
+                "INSERT DATA {{ {} {} {} }}",
+                ex(format!("new{i}")),
+                ex("knows"),
+                ex("p0")
+            )?;
+        }
+    }
+    for i in 0..changes {
+        if types {
+            writeln!(out, "DELETE WHERE {{ {} a ?e }}", ex(format!("new{i}")))?;
+        } else {
+            writeln!(
+                out,
+                "DELETE DATA {{ {} {} {} }}",
+                ex(format!("new{i}")),
+                ex("knows"),
+                ex("p0")
+            )?;
+        }
+    }
+    let mut e = Expect::new();
+    e.insert("knows".into(), json!(people));
+    e.insert("people".into(), json!(people));
+    e.insert("commits".into(), json!(2 * changes));
     Ok(e)
 }
 

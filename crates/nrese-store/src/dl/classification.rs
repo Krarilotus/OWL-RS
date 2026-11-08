@@ -49,7 +49,10 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
         Taxonomy::complete,
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
-            None => run(store, snapshot, classify::classify),
+            None => run(store, snapshot, classify::classify, |t, why| {
+                t.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
+                t.incomplete.push(why)
+            }),
         },
     )
 }
@@ -61,7 +64,14 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
         &store.dl().classification.realisation,
         snapshot.revision(),
         complete,
-        || run(store, snapshot, classify::realise),
+        || {
+            run(store, snapshot, classify::realise, |r, why| {
+                r.taxonomy.classification.consistency =
+                    nrese_dl::verdict::Verdict::Unknown(why.clone());
+                r.taxonomy.incomplete.push(why.clone());
+                r.incomplete.push(why)
+            })
+        },
     )
 }
 
@@ -96,18 +106,31 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
 
 /// `engine` over `snapshot`'s asserted ontology, within one timeout that includes
 /// reading the ontology.
+/// Its reading of the ontology draws on the run's envelope too (SYN-61); where that can't
+/// take it, the engine's result over no axioms with its consistency unknown, `incomplete`
+/// saying why (never kept: a result kept is complete). Over no axioms the engine would say
+/// consistent, which nothing read decided.
 fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
     engine: fn(&nrese_owl::Ontology, &classify::Options) -> T,
+    incomplete: fn(&mut T, String),
 ) -> T {
     let started = Instant::now();
-    let ontology = source::read_snapshot(snapshot);
     let mut options = options(store);
+    let memory = options.tableau.memory.clone().unwrap_or_default();
+    let read = source::read_snapshot(snapshot, memory);
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
-    engine(&ontology, &options)
+    match read {
+        Ok(ontology) => engine(&ontology, &options),
+        Err(_) => {
+            let mut none = engine(&nrese_owl::Ontology::default(), &options);
+            incomplete(&mut none, source::refused("the revision"));
+            none
+        }
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +159,49 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// A classification whose ontology the run's memory can't read reports its consistency
+    /// unknown, never consistent (SYN-61): over the empty ontology the engines are left with,
+    /// consistent would be their answer, which nothing read decided.
+    #[test]
+    fn a_classification_whose_ontology_does_not_fit_is_never_consistent() {
+        let store = StoreService::new(StoreConfig {
+            total_query_memory_bytes: 1 << 30,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap();
+        let mut data = String::from(
+            "PREFIX : <urn:cache:> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA { :A rdfs:subClassOf :B .",
+        );
+        for i in 0..2_000 {
+            data.push_str(&format!(" :a{i} a :A ."));
+        }
+        data.push('}');
+        store.update_str_ungated(&data).unwrap();
+        let snapshot = store.engine().snapshot();
+        // All but 4 KiB of the queries' pool held: the 2,000 statements don't fit.
+        let pool = store.runtime().query_memory().expect("the queries' pool");
+        let mut hold = nrese_exec::Reservation::new(Arc::new(store.envelope(None).part()));
+        hold.charge(pool.limit() - pool.used() - 4096).unwrap();
+        let verdicts = [
+            taxonomy(&store, &snapshot)
+                .classification
+                .consistency
+                .clone(),
+            realisation(&store, &snapshot)
+                .taxonomy
+                .classification
+                .consistency
+                .clone(),
+        ];
+        for verdict in verdicts {
+            assert!(
+                matches!(verdict, nrese_dl::verdict::Verdict::Unknown(_)),
+                "{verdict:?}"
+            );
+        }
     }
 
     #[test]

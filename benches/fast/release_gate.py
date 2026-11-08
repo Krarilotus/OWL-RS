@@ -616,7 +616,7 @@ def decide(parts: list[list[dict]]) -> dict:
     round 3 could still get rejected, whether or not round 1 flagged it: a loss first seen while
     confirming another is confirmed too, not dropped); everything else passes at the end of its
     budget."""
-    family, rounds_p, where = [], {}, {}
+    family, rounds_p, where, untested = [], {}, {}, {}
     for rounds in parts:
         declared = rounds[0].get("family") or list(rounds[0].get("pvalues", {}))
         family += [h for h in declared if h not in where]
@@ -625,6 +625,13 @@ def decide(parts: list[list[dict]]) -> dict:
         for k, report in enumerate(rounds[:3]):
             for h, p in (report.get("pvalues") or {}).items():
                 rounds_p.setdefault(h, [None, None, None])[k] = p
+        # A declared hypothesis any round given didn't test, for the reason the gate gave
+        # (compare_case), the statistical slots or not: not part of a pass however the rest comes
+        # out (review abba-not-compared r1 W-OUT1; release-not-compared r1 W1: a fourth round's).
+        for report in rounds:
+            for h, why in (report.get("not_compared") or {}).items():
+                if h in declared:
+                    untested.setdefault(h, why)
     combined = {h: gatestats.combine_rounds(rounds_p.get(h, [None, None, None])) for h in family}
     rejected = gatestats.holm(combined)
     # Round 3 where it could still decide: Holm rejects it if every hypothesis measured in round 2
@@ -644,7 +651,8 @@ def decide(parts: list[list[dict]]) -> dict:
         elif h in third and h in best:
             pending.append(h)
     return {"family": family, "m": len(family), "combined": combined, "rounds": rounds_p,
-            "losses": sorted(rejected, key=lambda h: combined[h]), "pending": pending}
+            "losses": sorted(rejected, key=lambda h: combined[h]), "pending": pending,
+            "not_compared": {h: untested[h] for h in family if h in untested}}
 
 
 # --- the owner-approved trade-offs (benches/release-tradeoffs.toml) ----------------------------
@@ -1648,20 +1656,127 @@ def frozen(files: set[str], datasets: Path) -> dict[str, dict]:
     return {d["file"]: d for d in tomllib.loads(datasets.read_text(encoding="utf-8"))["dataset"]}
 
 
+# The makers a job runs where its host lacks a frozen file (Johannes, 2 Nov 2026, decisions 1 and 8:
+# "a job sets up what it needs where it's missing", never a blanket copy; orchestrator, 7 Nov):
+# a `made_by` command's start -> what the job asks the fleet for to run it. Each writes into a
+# directory aside (NRESE_DATASET_DIR; the Docker makers bind-mount it instead of the shared volume),
+# checked against its pins before it enters the cache (data_state()). Every other maker's files
+# are the verified bench assets'.
+DATASET_MAKERS = {
+    "bash benches/reasoning/prepare-lubm.sh": ["docker"],
+    "bash benches/reasoning/prepare-owl2bench.sh": ["docker"],
+    "perf_lab generate support-stress": [],
+}
+SUPPORT_STRESS = "perf_lab generate support-stress"
+# Makers whose output a copy can meet only by its form: riot labels the blank nodes afresh on every
+# make. Their files count as makeable only with a form pin (`rdfc_sha256`); one without keeps the
+# assets (sol-loop r1 S1: owl2bench-ql-1.nt).
+FORM_ONLY = {"bash benches/reasoning/prepare-owl2bench.sh"}
+
+
+def maker_of(entry: dict) -> tuple[str, list[str]] | None:
+    """The job-run maker of a frozen file (its DATASET_MAKERS start and what it needs), or None: none
+    here, or one whose copies can't meet the file's pins."""
+    made = entry.get("made_by", "")
+    found = next(((start, needs) for start, needs in DATASET_MAKERS.items() if made.startswith(start + " ")), None)
+    if found and found[0] in FORM_ONLY and not entry.get("rdfc_sha256"):
+        return None
+    return found
+
+
+def makers_at(checkout: str | Path, harness: str) -> bool:
+    """Whether the harness at commit `harness` of `checkout` makes datasets (its release_gate.py names
+    DATASET_MAKERS: staged datasets, engine-v2 838cd7eb, PR #129). A job's placement is planned by the
+    submitter's data_needs(), its data made by the harness's prepare: a harness from before them asks
+    no maker, so a file only a maker makes is missing where no earlier job left it (orchestrator,
+    8 Nov 2026: abba-run-055fe886-f3da61f9). Unknown (not a commit there): False, refused."""
+    import subprocess
+    done = subprocess.run(["git", "-C", str(checkout), "grep", "-q", "-e", "DATASET_MAKERS", harness, "--",
+                           "benches/fast/release_gate.py"], capture_output=True, timeout=60)
+    return done.returncode == 0
+
+
+def made_only(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
+    """The cases' frozen files only a DATASET_MAKERS maker provides here (no bench-assets copy is
+    planned for them: data_needs())."""
+    entries = frozen({f for c in cases for f in volume_files(c)}, datasets)
+    return sorted({f for c in cases for f in volume_files(c) if maker_of(entries.get(f, {}))})
+
+
 def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
-    """What a host must hold for the cases' frozen inputs (fleet `has`): the verified bench assets
-    (hosts.toml `inputs`: the datasets, ORE ontologies and the reference taxonomies). The SPARQL
-    workloads' data is the job's own to make (Johannes, 2 Nov 2026: "Data is the job's
-    responsibility, not the fleet's"): release-gate.sh prepare makes what benches/sparql/prepare.sh
-    can into the host's cache (data_state()), the job asking its disk (data_disk_gb())."""
+    """What a host must hold or run for the cases' frozen inputs (fleet `has`). The job makes what
+    benches/sparql/prepare.sh and the DATASET_MAKERS can (Johannes, 2 Nov 2026: "Data is the job's
+    responsibility, not the fleet's"), asking what its makers need (Docker) and its disk
+    (data_disk_gb()); the verified bench assets (hosts.toml `inputs`) only for a file no maker
+    here makes, an ORE ontology or a reference taxonomy. So a plan the fleet takes places the job
+    where each case's data is there or can be made (REAS, 7 Nov 2026, failed at its data step
+    after its plan passed)."""
     entries = frozen({f for c in cases for f in volume_files(c)}, datasets)
     out = set()
     for c in cases:
-        if any(SPARQL_PREPARE not in entries.get(f, {}).get("made_by", "") for f in volume_files(c)):
-            out.add(ASSETS)
+        for f in volume_files(c):
+            entry = entries.get(f, {})
+            if SPARQL_PREPARE in entry.get("made_by", ""):
+                continue
+            maker = maker_of(entry)
+            out.update(maker[1] if maker else [ASSETS])
         if any(s.startswith("ore:") for s in [c.get("data", ""), *c.get("extra", [])]) or c.get("reference"):
             out.add(ASSETS)
     return sorted(out)
+
+
+def pin_problem(path: Path, entry: dict, rdfc) -> str | None:
+    """Why the file at `path` isn't its freeze (None: it is): its bytes' SHA-256 is its `sha256`, or,
+    for a file pinned by form, its RDFC-1.0 canonical N-Quads' SHA-256 (`rdfc(path)`) is its
+    `rdfc_sha256`. The datasets' one check, for the data view and for a made file alike. riot labels
+    univ-bench.nt's blank nodes afresh on every make (stage-data-probe-1, 7 Nov 2026); a form pin
+    with no `rdfc` to compute the form fails closed."""
+    with open(path, "rb") as f:
+        sha = hashlib.file_digest(f, "sha256").hexdigest()
+    if sha == entry.get("sha256"):
+        return None
+    said = f"sha256 {sha[:12]}, pinned {str(entry.get('sha256', 'none'))[:12]}"
+    form = entry.get("rdfc_sha256")
+    if not form:
+        return said
+    if rdfc is None:
+        return f"{said}; pinned by form (rdfc_sha256) too, but nothing here computes it (NRESE_RDFC)"
+    got = rdfc(path)
+    return None if got == form else f"{said}; RDFC-1.0 sha256 {got[:12]}, pinned {form[:12]}"
+
+
+def dataset_source(name: str, entry: dict, dirs: list[Path], rdfc) -> tuple[Path | None, str | None]:
+    """The first copy of `name` in `dirs` (the host's assets, then its dataset cache) that is its
+    pin (pin_problem()), and None; or, none being, the first copy there and why it isn't (None, None:
+    no copy). A copy at another size than its pin's is an older release (lubm-10, lubm-100 became
+    their sorted distinct lines, 7 Nov 2026), skipped without hashing it."""
+    copies = [d / name for d in dirs if d and (d / name).is_file()]
+    for path in copies:
+        if entry.get("bytes") and path.stat().st_size != entry["bytes"]:
+            continue
+        if pin_problem(path, entry, rdfc) is None:
+            return path, None
+    if not copies:
+        return None, None
+    first = copies[0]
+    if entry.get("bytes") and first.stat().st_size != entry["bytes"]:
+        return first, f"{first.stat().st_size} bytes, pinned {entry['bytes']}"
+    return first, pin_problem(first, entry, rdfc)
+
+
+def rdfc_hash(binary: str | None):
+    """The SHA-256 of a file's RDFC-1.0 canonical N-Quads, by the harness's `nrese-rdf-io` example
+    `rdfc` at `binary` (None: none here). A failed run gives a value no pin has."""
+    import subprocess
+    if not binary:
+        return None
+
+    def run(path: Path) -> str:
+        done = subprocess.run([binary, str(path)], capture_output=True, timeout=3600)
+        if done.returncode != 0:
+            return f"rdfc failed (exit {done.returncode}): {done.stderr.decode(errors='replace').strip()[-120:]}"
+        return hashlib.sha256(done.stdout).hexdigest()
+    return run
 
 
 def sparql_data() -> Path:
@@ -1670,11 +1785,12 @@ def sparql_data() -> Path:
 
 
 def data_disk_gb(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> float:
-    """The disk a job may fill making its cases' SPARQL data where the host lacks it: each
-    frozen file benches/sparql/prepare.sh makes, twice (its source and the file), in GB."""
+    """The disk a job may fill making its cases' data where the host lacks it: each frozen file
+    benches/sparql/prepare.sh or a DATASET_MAKERS maker makes, twice (its source and the file), in GB."""
     files = {f for c in cases for f in volume_files(c)}
     entries = frozen(files, datasets)
-    made = [entries[f] for f in files if SPARQL_PREPARE in entries.get(f, {}).get("made_by", "")]
+    made = [entries[f] for f in files if f in entries
+            and (SPARQL_PREPARE in entries[f].get("made_by", "") or maker_of(entries[f]))]
     return math.ceil(2 * sum(d.get("bytes", 0) for d in made) / 1e9)
 
 
@@ -1712,34 +1828,108 @@ def data_state(cases: list[dict], make: bool = False, root: Path | None = None,
       (BENCH_INPUTS_REV): extracted aside, checked, and only then put in place; a delivery that
       isn't the pins fails and leaves the cache as it was.
     Lines, and whether everything is there and as pinned."""
-    import subprocess
     root = root or ROOT
     general, cache = hosts_registry.input_path("general"), sparql_data()
     files = sorted({f for c in cases for f in volume_files(c)})  # a concatenation's parts too (Sol r2 T2)
     entries = frozen(set(files), root / "benches" / "datasets.toml")
     lines, ok = [], True
-    for name in files:
-        entry = entries.get(name, {})
-        found = next((d / name for d in (general, cache) if d and (d / name).is_file()), None)
-        if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
-            dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
-            done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
-            lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
-            if done.returncode != 0:
-                ok = False
-            found = cache / name if (cache / name).is_file() else None
-        if found is None:
-            ok = False
-            how = (f"made by `{entry['made_by']}`" if entry.get("made_by") else "no recorded maker")
-            lines.append(f"MISSING {name}: {how}")
-        elif entry.get("bytes") and found.stat().st_size != entry["bytes"]:
-            # The probe's diagnosis; in prepare (`make`), the freeze check that follows refuses it by
-            # its SHA-256, the datasets' one gate, so this step doesn't second-guess it.
-            ok = ok and make
-            lines.append(f"DIFFERS {name}: {found} is {found.stat().st_size} bytes, frozen {entry['bytes']}"
-                         + (" (prepare's freeze check decides)" if make else ""))
+    asides: dict[str, Path] = {}
+    try:
+        for name in files:
+            entry = entries.get(name, {})
+            found = next((d / name for d in (general, cache) if d and (d / name).is_file()), None)
+            if make and maker_of(entry) and entry.get("bytes"):
+                # A copy at another size than the pin is an older release: one this job can make is
+                # made rather than stopped on (the view takes the copy that is its pin).
+                found = next((d / name for d in (general, cache) if d and (d / name).is_file()
+                              and (d / name).stat().st_size == entry["bytes"]), None)
+            if found is None and make and maker_of(entry):
+                found = make_dataset(name, entry, root, cache, asides, lines)
+                if found is None:
+                    ok = False
+                    continue
+            ok = probe_dataset(name, entry, found, make, cache, root, lines) and ok
+    finally:
+        import shutil
+        for aside in asides.values():
+            shutil.rmtree(aside, ignore_errors=True)
+    return query_sets_state(cases, make, root, cache, inputs_repo, lines, ok)
+
+
+def make_dataset(name: str, entry: dict, root: Path, cache: Path, asides: dict[str, Path],
+                 lines: list[str]) -> Path | None:
+    """`name` made by its DATASET_MAKERS maker into a directory aside (one run per maker command;
+    support-stress's maker makes the whole workload at once), checked against its pin
+    (pin_problem()), and only then renamed into the cache: its path there, or None (why, in
+    `lines`). A file that isn't its pin stays out, and the cache is as it was."""
+    import subprocess
+    import sys
+    import tempfile
+    import time
+    command = entry["made_by"]
+    key = SUPPORT_STRESS if command.startswith(SUPPORT_STRESS + " ") else command
+    if key not in asides:
+        cache.mkdir(parents=True, exist_ok=True)
+        aside = asides[key] = Path(tempfile.mkdtemp(prefix=".make-", dir=cache))
+        if key == SUPPORT_STRESS:
+            perf_lab = os.environ.get("NRESE_PERF_LAB", "")
+            argv = [sys.executable, (root / "benches/fast/prepare-support-stress.py").as_posix(), perf_lab,
+                    aside.as_posix(), (aside / "answers.json").as_posix()] if perf_lab else []
         else:
-            lines.append(f"present {name}: {found}, its frozen size (prepare checks its SHA-256)")
+            import shutil
+            words = command.split()  # bash SCRIPT ARGS; the bash on PATH (Windows' own is WSL's launcher)
+            argv = [shutil.which("bash") or "bash", (root / words[1]).as_posix(), *words[2:]]
+        if not argv:
+            lines.append(f"FAILED making `{key}`: no perf_lab here (NRESE_PERF_LAB)")
+        else:
+            start = time.monotonic()
+            done = subprocess.run(argv, cwd=root, env={**os.environ, "NRESE_DATASET_DIR": aside.as_posix()})
+            lines.append(f"ran `{key}` aside: exit {done.returncode}, {time.monotonic() - start:.0f} s")
+    made = asides[key] / name
+    if not made.is_file():
+        lines.append(f"FAILED {name}: `{command}` made no {name}")
+        return None
+    if problem := pin_problem(made, entry, rdfc_hash(os.environ.get("NRESE_RDFC"))):
+        lines.append(f"FAILED {name}: made by `{command}`, not as pinned: {problem}")
+        return None
+    target = cache / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    made.replace(target)
+    lines.append(f"made {name} by `{command}`, as pinned: {target}, {target.stat().st_size} bytes")
+    return target
+
+
+def probe_dataset(name: str, entry: dict, found: Path | None, make: bool, cache: Path, root: Path,
+                  lines: list[str]) -> bool:
+    """One frozen file as the host holds it (a line in `lines`); with `make`, a missing one
+    benches/sparql/prepare.sh makes is made into the cache first. Whether it may stand."""
+    import subprocess
+    ok = True
+    if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
+        dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
+        done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
+        lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
+        if done.returncode != 0:
+            ok = False
+        found = cache / name if (cache / name).is_file() else None
+    if found is None:
+        how = (f"made by `{entry['made_by']}`" if entry.get("made_by") else "no recorded maker")
+        lines.append(f"MISSING {name}: {how}")
+        return False
+    if entry.get("bytes") and found.stat().st_size != entry["bytes"]:
+        # The probe's diagnosis; in prepare (`make`), the freeze check that follows refuses it by
+        # its SHA-256, the datasets' one gate, so this step doesn't second-guess it.
+        lines.append(f"DIFFERS {name}: {found} is {found.stat().st_size} bytes, frozen {entry['bytes']}"
+                     + (" (prepare's freeze check decides)" if make else ""))
+        return ok and make
+    lines.append(f"present {name}: {found}, its frozen size (prepare checks its SHA-256)")
+    return ok
+
+
+def query_sets_state(cases: list[dict], make: bool, root: Path, cache: Path, inputs_repo: Path | None,
+                     lines: list[str], ok: bool) -> tuple[list[str], bool]:
+    """data_state()'s query sets (@watdiv...): exact pinned names and SHA-256, taken from the bench
+    inputs where they aren't (its docstring)."""
     pin_file = root / "benches/sparql/queries.sha256"
     pins = [line.split("  ", 1) for line in (pin_file.read_text(encoding="utf-8").splitlines()
                                              if pin_file.is_file() else []) if "  " in line]
@@ -2081,6 +2271,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
             blocking_losses.append(text)
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
     lines += [f"- **pending** (a round that could reject it hasn't run): {h}" for h in d["pending"]]
+    lines += [f"- **not compared**: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: {why}"
+              for h, why in d["not_compared"].items()]
     lines += [f"- {b}" for b in other] + [f"- pass error: {e}" for e in errors]
     covered = {c for t in timed for c in t.get("planned", [])}
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
@@ -2089,8 +2281,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
     lines.append(f"- W3C: {'passed' if w3c['passed'] else 'NOT passed'} ({'; '.join(w3c['errors']) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards['passed'] else 'NOT passed'} "
                  f"({'; '.join(guards['errors'][:5]) or str(guards['guards']) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not d["pending"] and not other and not errors and not diagnostic
-              and not missing and w3c["passed"] and guards["passed"])
+    passed = (not blocking_losses and not d["pending"] and not d["not_compared"] and not other and not errors
+              and not diagnostic and not missing and w3c["passed"] and guards["passed"])
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]
     return passed, "\n".join(lines) + "\n"
 
@@ -2364,8 +2556,11 @@ def main() -> int:
         code, said = fleet_call("check", str(path))
         print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
         if not args.submit:
-            print(f"not submitted (--plan): fleet submit {path}, or this command with --submit")
-            return 0
+            # A plan the fleet refuses exits as refused (abba.py run --plan's sibling, review
+            # release-not-compared r1 OUT1).
+            print(f"not submitted (--plan): fleet submit {path}, or this command with --submit"
+                  + ("; fleet check refuses it (above)" if code else ""))
+            return 1 if code else 0
         if code != 0:
             print("not submitted: fleet check didn't take the set (above)", file=sys.stderr)
             return 1
