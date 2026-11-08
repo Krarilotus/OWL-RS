@@ -591,41 +591,17 @@ fn support_sets_run(
                     .map_err(Stopped::Refused)?;
             }
         }
-        // The rules' schema parts' charges, for the round (their jobs hold copies).
-        let mut schemas_held: Vec<Held<'_>> = Vec::new();
-        let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Annotation)> = Vec::new();
-        for (k, &(rule, grounding)) in rules.iter().enumerate() {
+        // The rules' schema parts, with their charges, for the round: one each, rule `k`'s at
+        // `k`; jobs refer to them by index, never copy them (review r2 C1.b).
+        let mut schemas: Vec<Held<'_>> = Vec::with_capacity(rules.len());
+        for &(_, grounding) in &rules {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
             let held = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
                 .map_err(Stopped::Refused)?;
-            let schema = held.annotation.clone();
-            // Its charge kept for the round, while its jobs hold copies of it.
-            schemas_held.push(held);
-            let Head::Facts(heads) = &rule.head else {
-                continue;
-            };
-            if schema.is_empty() {
-                continue;
-            }
-            // Instances with a changed premise; all of them when a schema fact changed.
-            if whole[k] {
-                jobs.extend(Job::full(&source, rule).map(|job| (job, heads.as_slice(), schema)));
-            } else {
-                for i in 0..rule.body.len() {
-                    let job =
-                        Job::new(
-                            &source,
-                            rule,
-                            i,
-                            |j| {
-                                if j == i { Seg::Delta } else { Seg::All }
-                            },
-                        );
-                    jobs.extend(job.map(|job| (job, heads.as_slice(), schema.clone())));
-                }
-            }
+            schemas.push(held);
         }
+        let jobs = round_jobs(&source, &rules, &schemas, &whole);
         let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
             .iter()
             .enumerate()
@@ -639,7 +615,8 @@ fn support_sets_run(
         let mut parts: Vec<Found> = tasks
             .par_iter()
             .map(|(j, range)| {
-                let (job, heads, schema) = &jobs[*j];
+                let (job, heads, k) = &jobs[*j];
+                let schema = &schemas[*k];
                 let mut out = run.found();
                 let mut body = Vec::with_capacity(job.rule.body.len());
                 let Some(mut poll) = Poller::new(&fired) else {
@@ -687,7 +664,7 @@ fn support_sets_run(
         // The round's peak beside the sets: its delta and its morsels (its derivations are
         // charged, [`Limits::scratch`]).
         let round = delta.bytes().total()
-            + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], Annotation)>()
+            + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], usize)>()
             + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>()
             + parts.capacity() * size_of::<Found>();
         run.check(held(&sets, annotations) + round)?;
@@ -760,6 +737,42 @@ fn support_sets_run(
         run.check(held(&sets, annotations))?;
     }
     Ok(sets)
+}
+
+/// A support round's jobs over `source`: of each rule with fact heads and a schema part
+/// (`schemas[k]` for rule `k`), the instances with a changed premise (all of them where
+/// `whole[k]`), each with its heads and `k`. They refer to their schema part by index and
+/// never copy it: the one charged part serves them all (review r2 C1.b).
+fn round_jobs<'s, S: Source + ?Sized>(
+    source: &'s S,
+    rules: &[(&'s Rule, Grounding)],
+    schemas: &[Held<'_>],
+    whole: &[bool],
+) -> Vec<(Job<'s>, &'s [super::ir::Atom], usize)> {
+    let mut jobs = Vec::new();
+    for (k, &(rule, _)) in rules.iter().enumerate() {
+        let Head::Facts(heads) = &rule.head else {
+            continue;
+        };
+        if schemas[k].is_empty() {
+            continue;
+        }
+        // Instances with a changed premise; all of them when a schema fact changed.
+        if whole[k] {
+            jobs.extend(Job::full(source, rule).map(|job| (job, heads.as_slice(), k)));
+        } else {
+            for i in 0..rule.body.len() {
+                let job = Job::new(
+                    source,
+                    rule,
+                    i,
+                    |j| if j == i { Seg::Delta } else { Seg::All },
+                );
+                jobs.extend(job.map(|job| (job, heads.as_slice(), k)));
+            }
+        }
+    }
+    jobs
 }
 
 /// The facts of the closure `facts` that hold for a reader of the statements `readable`
@@ -1469,6 +1482,65 @@ impl<'a> Charged<'a> {
     }
 }
 
+/// One set under the charge of its words (the singleton fast path's union), owned together:
+/// the set drops before its charge; each replacement is charged before it is made, the one
+/// it replaces released after it is freed (review r2 C1.a). A set held inline costs no charge.
+struct ChargedSet<'a> {
+    /// Before `charge`: fields drop in order.
+    set: GraphSet,
+    charge: Reservation<&'a Budget>,
+}
+
+impl<'a> ChargedSet<'a> {
+    /// A copy of `set`, its words charged first.
+    fn copy(set: &GraphSet, budget: &'a Budget) -> Result<Self, BudgetExceeded> {
+        let mut charge = Reservation::new(budget);
+        let bytes = set.heap_bytes();
+        if bytes > 0 {
+            charge.charge(bytes)?;
+        }
+        Ok(Self {
+            set: set.clone(),
+            charge,
+        })
+    }
+
+    /// Becomes its union with `other`: the union's words (at most the longer operand's)
+    /// charged before it is made, the old set's released after it is freed.
+    fn union_with(&mut self, other: &GraphSet) -> Result<(), BudgetExceeded> {
+        let bytes = self.set.heap_bytes().max(other.heap_bytes());
+        if bytes > 0 {
+            self.charge.charge(bytes)?;
+        }
+        let next = self.set.union(other);
+        let old = std::mem::replace(&mut self.set, next);
+        let freed = old.heap_bytes();
+        drop(old);
+        if freed > 0 {
+            self.charge.release(freed);
+        }
+        Ok(())
+    }
+
+    /// The set as a one-set annotation: where it holds words, its list's slot is charged
+    /// too before the list is made.
+    fn into_held(mut self, truncated: bool) -> Result<Held<'a>, BudgetExceeded> {
+        if self.charge.bytes() > 0 {
+            // Refused here, `self` drops whole: the set before its charge.
+            self.charge.charge(slots(1))?;
+        }
+        let Self { set, charge } = self;
+        Ok(Held {
+            annotation: Annotation {
+                sets: vec![set],
+                truncated,
+                beyond_own: truncated,
+            },
+            _charge: charge,
+        })
+    }
+}
+
 /// Sets gathered as they come under one budget, owned together: their list (charged as it
 /// grows) drops before their words' charge.
 struct Gathered<'a> {
@@ -1676,9 +1748,11 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
     cap: usize,
     run: &Run<'a>,
 ) -> Result<Held<'a>, BudgetExceeded> {
-    // The usual case, one set everywhere: a single union, nothing to minimise.
+    // The usual case, one set everywhere: a single union, nothing to minimise. Its copies
+    // charged before they are made (review r2 C1.a); held inline, nothing is charged, so a
+    // derivation costs no shared atomic.
     if let [only] = start.sets.as_slice() {
-        let mut one = only.clone();
+        let mut one = ChargedSet::copy(only, run.scratch)?;
         let mut truncated = start.truncated;
         let mut single = true;
         for premise in body {
@@ -1687,7 +1761,7 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
             };
             match own.sets.as_slice() {
                 [set] => {
-                    one = one.union(set);
+                    one.union_with(set)?;
                     truncated |= own.truncated;
                 }
                 _ => {
@@ -1697,21 +1771,7 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
             }
         }
         if single {
-            // One set: its list's slot and words charged where it holds any on the heap
-            // (none charged per instance otherwise: no shared atomic per derivation).
-            let held = one.heap_bytes();
-            let annotation = Annotation {
-                sets: vec![one],
-                truncated,
-                beyond_own: truncated,
-            };
-            return match held {
-                0 => Ok(Held::uncharged(annotation, run)),
-                _ => Ok(Held {
-                    _charge: run.room(slots(1) + held)?,
-                    annotation,
-                }),
-            };
+            return one.into_held(truncated);
         }
     }
     // The product as it stands, with its charge, until the next replaces it (sol-loop r5 S1).
@@ -1787,6 +1847,125 @@ fn merge(
 
 #[cfg(test)]
 mod tests {
+    /// Review r2 C1.a, by the allocator: the singleton fast path charges each spilled copy
+    /// and union before it is made, under a budget with room or none, and holds nothing
+    /// beyond its charge where it leaves early (a premise with no sets) or falls back to the
+    /// product (a premise with two). Each row is checked on its own.
+    #[test]
+    fn a_singleton_union_is_charged_before_it_is_made() {
+        use super::{Annotation, GraphSet, Limits, Run, premise_sets_from};
+        use hashbrown::HashMap;
+        use nrese_exec::{Budget, measure};
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        // Graphs past 2^16: a singleton holds 1,025 words on the heap.
+        let one = |graph: u32| Annotation {
+            sets: vec![GraphSet::of(graph)],
+            ..Annotation::default()
+        };
+        let (p, q, r, unknown) = ([1, 2, 3], [3, 2, 4], [4, 2, 5], [9, 9, 9]);
+        let mut sets: HashMap<[u64; 3], Annotation> = HashMap::new();
+        sets.insert(p, one(1 << 16));
+        sets.insert(q, one((1 << 16) + 1));
+        sets.insert(
+            r,
+            Annotation {
+                sets: vec![GraphSet::of(1 << 16), GraphSet::of(70_000)],
+                ..Annotation::default()
+            },
+        );
+        let start = Annotation::empty_set();
+        let rows: [(&str, Vec<[u64; 3]>, usize, bool); 4] = [
+            ("spilled singletons", vec![p, q], usize::MAX, false),
+            ("refused", vec![p, q], 0, true),
+            ("early exit", vec![p, unknown], usize::MAX, false),
+            ("fallback to the product", vec![p, r], usize::MAX, false),
+        ];
+        let mut failed = Vec::new();
+        for (what, body, limit, refused) in rows {
+            let budget = Arc::new(Budget::new(limit));
+            let (got, excess) = measure::measure_within(&budget, || {
+                let run = Run::new(Limits::unlimited(&budget));
+                premise_sets_from(&body, &start, &sets, 8, &run).map(|held| held.sets.len())
+            });
+            if got.is_err() != refused || excess != 0 || budget.used() != 0 {
+                failed.push(format!(
+                    "{what}: {:?}, {excess} bytes beyond the charge, {} still charged",
+                    got.map_err(|_| "refused"),
+                    budget.used()
+                ));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// Review r2 C1.b, by the allocator: a round's jobs refer to their rule's charged schema
+    /// part and hold no copy of it. Over several live jobs, what building them allocates is
+    /// the same whatever the schema parts' set count and span.
+    #[test]
+    fn round_jobs_hold_no_copy_of_their_schema_parts() {
+        use super::{Annotation, Changed, GraphSet, Grounding, Held, round_jobs};
+        use crate::batch::Store;
+        use crate::ir::{Rule, Term, Triple, parse_rules};
+        use crate::vocabulary::LocalVocabulary;
+        use nrese_exec::{Budget, Reservation, measure};
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        let mut vocabulary = LocalVocabulary::default();
+        let mut rules = parse_rules(
+            "r1: (?x rdfs:p ?y), (?y rdfs:p ?z) -> (?x rdfs:q ?z)",
+            &mut vocabulary,
+        )
+        .unwrap();
+        rules.extend(parse_rules("r2: (?x rdfs:p ?y) -> (?x rdfs:r ?y)", &mut vocabulary).unwrap());
+        let Term::Const(p) = rules[0].body[0].0[1] else {
+            panic!("a constant predicate")
+        };
+        let mut facts: Vec<Triple> = (0..64u64).map(|i| [1_000 + i, p, 1_001 + i]).collect();
+        facts.sort_unstable();
+        let store = Store::new(facts);
+        let source = Changed {
+            all: &store,
+            changed: &store,
+        };
+        let rule_refs: Vec<(&Rule, Grounding)> = rules
+            .iter()
+            .enumerate()
+            .map(|(r, rule)| (rule, Grounding::Rule(r)))
+            .collect();
+        // Rule 1 run whole (one job), rule 2 by its changed premise.
+        let whole = [true, false];
+        let budget = Arc::new(Budget::unlimited());
+        let mut beyond = Vec::new();
+        for (count, span) in [(2u32, 64u32), (64, 1 << 12), (512, 1 << 16)] {
+            let schemas: Vec<Held<'_>> = rule_refs
+                .iter()
+                .map(|_| Held {
+                    annotation: Annotation {
+                        sets: (0..count)
+                            .map(|j| GraphSet::of(j * (span / count)))
+                            .collect(),
+                        ..Annotation::default()
+                    },
+                    _charge: Reservation::new(&*budget),
+                })
+                .collect();
+            let (live, excess) = measure::measure_within(&budget, || {
+                round_jobs(&source, &rule_refs, &schemas, &whole).len()
+            });
+            assert!(live >= 2, "several live jobs: {live}");
+            beyond.push(excess);
+        }
+        assert!(
+            beyond.windows(2).all(|w| w[0] == w[1]),
+            "what the jobs hold grows with their schema parts: {beyond:?}"
+        );
+    }
+
     /// Sol-loop r6 S3: the sets a grounding's alternatives gathered are chosen among under a
     /// budget that holds exactly them and `minimal`'s output slots, and nothing more is
     /// asked: their words are carried over, not charged again. After, only what the output
