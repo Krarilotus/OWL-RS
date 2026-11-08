@@ -8,6 +8,7 @@ outcome (R1), images are the ones run (R4), the code is everything the repositor
 from __future__ import annotations
 
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -15,13 +16,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from suitekit import driver, ledger, manifest, receipts  # noqa: E402
+from suitekit import driver, ledger, manifest, receipts, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
 HEADER = ("date,host,runtime,system,version,publish,workload,tier,regime,run,task,item,repeat,status,ms,"
@@ -410,11 +412,56 @@ class Driver(unittest.TestCase):
         # D2's own name was on disk before any of its attempts (its Manifest): it can't vanish.
         self.assertIn(self.root / "batch", synced)
 
+    def test_two_starters_at_once_never_truncate_the_winner_s_rows(self):
+        """Review cell-receipts r5 F1, results-lock r1 R1: two runs started at once into one
+        directory. The loser is paused after deciding its results.csv is missing and before
+        Writer's open "w" (the order before the fix), or, with the fix, before it reaches the
+        directory's lock; the winner takes the directory and writes its header and a known row;
+        then the loser goes on. The winner's header and row survive, and the loser is refused."""
+        results, decided, go, outcome = self.root / "results", threading.Event(), threading.Event(), {}
+        loser: list[threading.Thread] = []
+        real_open, real_manifest = open, driver.Manifest
+
+        def pause():
+            if threading.current_thread() in loser and not decided.is_set():
+                decided.set()
+                self.assertTrue(go.wait(30), "the loser was never released")
+
+        def opening(path, mode="r", *args, **kwargs):
+            if "w" in mode and Path(path).name == "results.csv":
+                pause()  # its decision made: the file was missing or empty
+            return real_open(path, mode, *args, **kwargs)
+
+        def manifest_of(*args, **kwargs):
+            pause()
+            return real_manifest(*args, **kwargs)
+
+        def lose():
+            outcome["main"] = self.main(results)
+        with patch.object(schema, "open", opening, create=True), patch.object(driver, "Manifest", manifest_of):
+            loser.append(threading.Thread(target=lose))
+            loser[0].start()
+            self.assertTrue(decided.wait(30), "the loser never reached its decision")
+            winner = self.suite(runs=1)  # the directory's lock, then its first row
+            winner.emit(dict(date=winner.date, host="h", runtime="process", system="x", version="-",
+                             publish="free", workload="w", tier="1", regime="none", run=1),
+                        task="load", item="the winner's row", ms=5)
+            go.set()
+            loser[0].join(30)
+        self.assertFalse(loser[0].is_alive())
+        rows = list(csv.reader(io.StringIO((results / "results.csv").read_text(encoding="utf-8"))))
+        self.assertEqual(rows[0], driver.FIELDS)
+        self.assertIn("the winner's row", [r[driver.FIELDS.index("item")] for r in rows[1:]])
+        code, err, ran = outcome["main"]
+        self.assertEqual(code, 2)
+        self.assertFalse(ran)
+        self.assertIn("another run is writing into it", err)
+
     def test_a_second_starter_never_opens_the_results_another_run_owns(self):
-        """Review cell-receipts r5 F1: Suite() created results.csv (schema.Writer: an exists check,
-        then open "w") before main took the directory's lock (Manifest), so two starters at once
-        could truncate each other's rows. While one run owns the directory, a second is refused
-        without opening its results.csv at all, and the first's rows stay as they were."""
+        """Guard of the order (review cell-receipts r5 F1): while one run owns the directory, a
+        second is refused without opening its results.csv at all, and the first's rows stay as
+        they were. Its red before the fix is the constructor called, not a lost row: the first
+        run's header was already there, so that Writer truncated nothing (results-lock r1 R1)."""
         first = self.suite(runs=1)
         first.emit(dict(date=first.date, host="h", runtime="process", system="x", version="-", publish="free",
                         workload="w", tier="1", regime="none", run=1), task="load", ms=5)
