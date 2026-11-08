@@ -18,7 +18,7 @@ use crate::jsonld::JsonLdOptions;
 use crate::jsonld::parser::{JsonLdParser, JsonLdSettings};
 use crate::ntriples::LineParser;
 use crate::rdfxml::{RdfXmlParser, RdfXmlSettings};
-use crate::turtle::split::{Skim, Skimmer, directives_before};
+use crate::turtle::split::{Cut, Skim, Skimmer, directives_before};
 use crate::turtle::{TurtleParser, TurtleSettings};
 
 /// How to read a document: its format, and the settings that apply to every format.
@@ -271,18 +271,18 @@ impl RdfParser {
         &self,
         bytes: &'b [u8],
         skim: &Skim,
-        cuts: &[(u64, u64, u64)],
+        cuts: &[Cut],
     ) -> Result<Vec<QuadParser<'b, io::Empty>>, RdfParseError> {
-        let mut starts = vec![(0, 0, 0)];
+        let mut starts = vec![Cut::START];
         starts.extend(cuts.iter().copied());
         let mut parsers = Vec::with_capacity(starts.len());
-        for (i, &(start, line, line_start)) in starts.iter().enumerate() {
-            let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.0);
+        for (i, &cut) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.offset);
             let parser = TurtleParser::from_slice(
-                &bytes[start as usize..end as usize],
+                &bytes[cut.offset as usize..end as usize],
                 self.turtle_settings(),
             )
-            .for_chunk(start, line, line_start, &directives_before(skim, start))?;
+            .for_chunk(cut, &directives_before(skim, cut.offset))?;
             parsers.push(self.clone().wrap(Inner::Turtle(parser)));
         }
         Ok(parsers)
@@ -310,20 +310,16 @@ impl RdfParser {
                 skimmer.feed(&buffer[..read]);
             }
             let skim = skimmer.finish();
-            let mut starts = vec![(0, 0, 0)];
+            let mut starts = vec![Cut::START];
             starts.extend(skim.cuts.iter().copied());
             let mut parsers = Vec::with_capacity(starts.len());
-            for (i, &(start, line, line_start)) in starts.iter().enumerate() {
-                let end = starts.get(i + 1).map_or(length, |s| s.0);
+            for (i, &cut) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).map_or(length, |s| s.offset);
                 let mut file = File::open(path)?;
-                file.seek(SeekFrom::Start(start))?;
-                let reader = BufReader::with_capacity(256 * 1024, file).take(end - start);
-                let parser = TurtleParser::from_reader(reader, self.turtle_settings()).for_chunk(
-                    start,
-                    line,
-                    line_start,
-                    &directives_before(&skim, start),
-                )?;
+                file.seek(SeekFrom::Start(cut.offset))?;
+                let reader = BufReader::with_capacity(256 * 1024, file).take(end - cut.offset);
+                let parser = TurtleParser::from_reader(reader, self.turtle_settings())
+                    .for_chunk(cut, &directives_before(&skim, cut.offset))?;
                 parsers.push(self.clone().wrap(Inner::Turtle(parser)));
             }
             return Ok(parsers);
