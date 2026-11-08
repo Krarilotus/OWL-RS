@@ -105,22 +105,6 @@ def run_directories(directory: Path) -> list[Path]:
     return sorted(d for d in directory.iterdir() if (d / "results.csv").exists())
 
 
-def answer_verdicts(runs: list[Path]) -> dict[tuple, str]:
-    """(workload, tier, system) -> its worst answer verdict (answers.PRECEDENCE) in the runs'
-    answers.json: a recorded `wrong` stands against rows that count right."""
-    from .answers import PRECEDENCE
-    worst: dict[tuple, str] = {}
-    for run in runs:
-        path = run / "answers.json"
-        if not path.exists():
-            continue
-        for v in json.loads(path.read_text(encoding="utf-8")).get("verdicts", []):
-            key = (v["workload"], str(v["tier"]), v["system"])
-            if key not in worst or PRECEDENCE.index(v["verdict"]) < PRECEDENCE.index(worst[key]):
-                worst[key] = v["verdict"]
-    return worst
-
-
 def from_results(directory: Path, root: Path) -> dict:
     runs = run_directories(directory)
     rows, invocations = [], []
@@ -160,22 +144,24 @@ def from_results(directory: Path, root: Path) -> dict:
         record["started"] = rows[0]["date"]
         record["host"] = rows[0]["host"]
         record["commit"] = "unknown (before run manifests)"
-    # Each cell's receipt (receipts.py), its newest invocation's: what it ran and its own outcome,
-    # never the directory's commit or outcome (several invocations, several commits).
-    receipts: dict[str, dict] = {}
+    # Each cell's newest attempt (receipts.py), finished or not: never an older receipt in an
+    # unfinished one's place, never the directory's commit, outcome or answers (review r1 R2, R3).
+    newest: dict[str, dict] = {}
     for invocation in invocations:
-        receipts.update(invocation.get("cells") or {})
-    verdicts = answer_verdicts(runs)
-    pairs = []
-    for (workload, tier, system), pair in sorted(summarise(rows).items()):
+        for cell, attempt in (invocation.get("cells") or {}).items():
+            if cell not in newest or str(attempt.get("started", "")) >= str(newest[cell].get("started", "")):
+                newest[cell] = attempt
+    pairs, summarised = [], summarise(rows)
+    for (workload, tier, system), pair in sorted(summarised.items()):
         entry = {"workload": workload, "tier": tier, "system": system} | pair.outcome()
-        if entry["outcome"] != "restricted" and (worst := verdicts.get((workload, tier, system))):
-            entry["answers"] = worst  # a licensed system's verdict is a result: it stays local
-        if (receipt := receipts.get(f"{workload}/{tier}/{system}")) is not None:
-            entry["receipt"] = receipt
+        if (attempt := newest.get(f"{workload}/{tier}/{system}")) is not None:
+            # A licensed system's outcome and answers are results, whatever the outcome: they stay
+            # local (R1); its receipt says only what ran.
+            entry["receipt"] = ({k: v for k, v in attempt.items() if k not in ("outcome", "answers")}
+                                if pair.publish == "permission" else attempt)
         pairs.append(entry)
     record["pairs"] = pairs
-    restricted = any(p["outcome"] == "restricted" for p in pairs)
+    restricted = any(p.publish == "permission" for p in summarised.values())
     record["publishable"] = "free systems only" if restricted else "all"
     from . import cases
     from .versus import versus
