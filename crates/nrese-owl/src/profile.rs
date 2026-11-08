@@ -655,42 +655,51 @@ pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
 ///
 /// Then any fact may follow, and its hazard reaches every term.
 pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
-    fn equates(o: &Ontology, e: ExprId, positive: bool) -> bool {
+    /// `witness`: `e` describes a fresh witness of an existential, whose own nominal only
+    /// names it (`∃S.{a}` is the edge `S(x, a)`, Sol r2 S3). Constraints inside it may still
+    /// reach existing individuals, its predecessor through an inverse among them (Sol r3
+    /// S4: `∃S.(∀S⁻.{a})` makes `x` be `a`).
+    fn equates(o: &Ontology, e: ExprId, positive: bool, witness: bool) -> bool {
+        let w = |f: &ExprId, p: bool| equates(o, *f, p, true);
+        let every = |f: &ExprId, p: bool| equates(o, *f, p, false);
         match (o.class(e), positive) {
-            (ClassExpr::OneOf(_), true) => true,
-            (ClassExpr::And(es) | ClassExpr::Or(es), p) => es.iter().any(|&e| equates(o, e, p)),
-            (ClassExpr::Not(e), p) => equates(o, *e, !p),
+            (ClassExpr::OneOf(_), true) => !witness,
+            (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
+                es.iter().any(|&e| equates(o, e, p, witness))
+            }
+            (ClassExpr::Not(e), p) => equates(o, *e, !p, witness),
             // `≤ n` for n ≥ 1, positive or as `¬≥ n+1`; `≤ 0 R.F` excludes `F`, so its filler
             // counts negated (Sol r1 S1, S2: `≤ 0 R.¬{a}` equates, `= 0 R.{a}` doesn't).
             (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
-            | (ClassExpr::Min(1, _, f), false) => equates(o, *f, false),
+            | (ClassExpr::Min(1, _, f), false) => every(f, false),
             (ClassExpr::Max(n, ..), true) => *n >= 1,
             (ClassExpr::Min(n, ..), false) => *n >= 2,
             // `= n` for n ≥ 1 holds `≤ n`.
             (ClassExpr::Exact(..), true) => true,
-            // `¬= n` is `≤ n−1` or `≥ n+1`; only the bound can equate.
-            (ClassExpr::Exact(n, _, f), false) => *n >= 2 || (*n == 1 && equates(o, *f, false)),
-            // A filler that holds of every existing successor (`∀R.F`, `¬∃R.F`) equates as
-            // it would of the individual. One that holds of a witness only (`∃R.F`, `≥ n`,
-            // `¬∀R.F`, `¬≤ n`) equates no existing individual: `∃S.{a}` is the edge
-            // `S(x, a)` (Sol r2 S3).
-            (ClassExpr::All(_, f), true) | (ClassExpr::Some(_, f), false) => {
-                equates(o, *f, positive)
+            // `¬= n` is `≤ n−1` or `≥ n+1`.
+            (ClassExpr::Exact(n, _, f), false) => {
+                *n >= 2 || (*n == 1 && every(f, false)) || w(f, true)
             }
+            // A filler that holds of every existing successor (`∀R.F`, `¬∃R.F`).
+            (ClassExpr::All(_, f), true) | (ClassExpr::Some(_, f), false) => every(f, positive),
+            // A filler that holds of a witness (`∃R.F`, `≥ n`, `¬∀R.F`, `¬≤ n`).
+            (ClassExpr::Some(_, f) | ClassExpr::Min(_, _, f), true)
+            | (ClassExpr::Max(_, _, f), false) => w(f, true),
+            (ClassExpr::All(_, f), false) => w(f, false),
             _ => false,
         }
     }
     match axiom {
-        Axiom::SubClassOf(_, b) => equates(o, *b, true),
-        Axiom::EquivalentClasses(v) => v.iter().any(|&e| equates(o, e, true)),
-        Axiom::DisjointClasses(v) => v.iter().any(|&e| equates(o, e, false)),
+        Axiom::SubClassOf(_, b) => equates(o, *b, true, false),
+        Axiom::EquivalentClasses(v) => v.iter().any(|&e| equates(o, e, true, false)),
+        Axiom::DisjointClasses(v) => v.iter().any(|&e| equates(o, e, false, false)),
         Axiom::DisjointUnion(_, v) => v
             .iter()
-            .any(|&e| equates(o, e, true) || equates(o, e, false)),
+            .any(|&e| equates(o, e, true, false) || equates(o, e, false, false)),
         Axiom::ObjectPropertyDomain(_, c)
         | Axiom::ObjectPropertyRange(_, c)
         | Axiom::DataPropertyDomain(_, c)
-        | Axiom::ClassAssertion(c, _) => equates(o, *c, true),
+        | Axiom::ClassAssertion(c, _) => equates(o, *c, true, false),
         Axiom::ObjectCharacteristic(
             Characteristic::Functional | Characteristic::InverseFunctional,
             _,
