@@ -55,8 +55,20 @@ impl Block {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test support: [`Inner::keep_promise`] on this thread finds no room, as an allocator
+    /// out of it would (package 1's T4).
+    pub(super) static REFUSE_PROMISED_ROOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The allocator had no room for what [`Heap::reserve`] asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NoRoom;
+
 /// Entries kept on the heap, from id `start` on: sealed blocks of [`BLOCK`] keys, then the
-/// tail, fewer than [`BLOCK`], each key its own `Arc` (a view shares them).
+/// tail, each key its own `Arc` (a view shares them): fewer than [`BLOCK`], but for the moment
+/// between a publisher's install and its seal ([`Heap::install`], [`Heap::seal`]).
 #[derive(Default)]
 pub(super) struct Heap {
     pub(super) start: u64,
@@ -95,8 +107,8 @@ impl Heap {
     }
 
     /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its id. The tail is
-    /// sealed into a block when it holds [`BLOCK`] keys: its keys are copied once, under the
-    /// write lock that appends.
+    /// sealed into blocks when it holds [`BLOCK`] keys or more ([`Self::seal`]): its keys are
+    /// copied once, under the write lock that appends.
     pub(super) fn push(&mut self, key: &[u8], hash: u64) -> u64 {
         let id = self.start + self.len();
         self.tail.push(Arc::from(key));
@@ -108,12 +120,67 @@ impl Heap {
             ..
         } = self;
         table.insert_unique(hash, id, |&i| hashes[(i - *start) as usize]);
-        if self.tail.len() == BLOCK {
-            let block = Block::of(self.tail.iter().map(|key| &**key));
-            self.blocks.push(Arc::new(block));
-            self.tail.clear();
+        if self.tail.len() >= BLOCK {
+            self.seal();
         }
         id
+    }
+
+    /// Room for `more` entries in the tail, the hashes and the table, made now so that
+    /// [`Self::install`] of that many allocates nothing. On an error the entries are unchanged;
+    /// room already grown may stay, as slack.
+    pub(super) fn reserve(&mut self, more: usize) -> Result<(), NoRoom> {
+        self.tail.try_reserve(more).map_err(|_| NoRoom)?;
+        self.hashes.try_reserve(more).map_err(|_| NoRoom)?;
+        let Heap {
+            table,
+            hashes,
+            start,
+            ..
+        } = self;
+        table
+            .try_reserve(more, |&i| hashes[(i - *start) as usize])
+            .map_err(|_| NoRoom)
+    }
+
+    /// Appends `keys` (none an entry yet: a publisher's own, [`super::suffix`]) with their
+    /// hashes, in order, taking their `Arc`s, not copying their bytes, and leaves the tail
+    /// unsealed, however long: [`Self::key`] reads a tail of any length. Allocates nothing
+    /// where [`Self::reserve`] made room for them; correct, and allocating, where it didn't.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications install with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn install<'k>(&mut self, keys: impl IntoIterator<Item = (&'k Arc<[u8]>, u64)>) {
+        for (key, hash) in keys {
+            let id = self.start + self.len();
+            self.tail.push(Arc::clone(key));
+            self.hashes.push(hash);
+            let Heap {
+                table,
+                hashes,
+                start,
+                ..
+            } = self;
+            table.insert_unique(hash, id, |&i| hashes[(i - *start) as usize]);
+        }
+    }
+
+    /// Seals the tail's first keys into blocks of [`BLOCK`] while it holds that many, copying
+    /// them once; fewer than [`BLOCK`] stay. Ids and keys stay as they were.
+    pub(super) fn seal(&mut self) {
+        let full = self.tail.len() / BLOCK * BLOCK;
+        if full == 0 {
+            return;
+        }
+        for keys in self.tail[..full].chunks(BLOCK) {
+            let block = Block::of(keys.iter().map(|key| &**key));
+            self.blocks.push(Arc::new(block));
+        }
+        self.tail.drain(..full);
     }
 
     /// The heap of `keys` (none an entry yet, their hashes `hashes`), from id `start`; `None`
@@ -208,6 +275,9 @@ pub(super) struct Inner {
     /// Advanced by every rebase (the one change of the base): a text order built for one
     /// generation is never installed in another ([`super::order::TextOrder`]).
     pub(super) generation: u64,
+    /// Entries a prepared install has room reserved for in the heap ([`Self::promise`]): a
+    /// rebase reserves as much in the heap it builds, so the install still allocates nothing.
+    promised: usize,
 }
 
 impl Inner {
@@ -219,7 +289,87 @@ impl Inner {
             segments: Vec::new(),
             starts: Vec::new(),
             generation,
+            promised: 0,
         }
+    }
+
+    /// Reserves room in the heap for `more` entries and records it as promised to one
+    /// prepared install ([`super::suffix::Prepared`]). On an error the entries and the promise
+    /// are unchanged; room already grown may stay, as slack.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications prepare with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn promise(&mut self, more: usize) -> Result<(), NoRoom> {
+        debug_assert_eq!(
+            self.promised, 0,
+            "one prepared install at a time (the writer slot)"
+        );
+        self.heap.reserve(more)?;
+        self.promised = more;
+        Ok(())
+    }
+
+    /// What [`Self::promise`] reserved and is still promised.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications install with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn promised(&self) -> usize {
+        self.promised
+    }
+
+    /// The promise kept ([`Self::install`]) or given up (a prepared install dropped): the
+    /// room stays, as slack.
+    pub(super) fn unpromise(&mut self) {
+        self.promised = 0;
+    }
+
+    /// Takes `other`'s promise into this one, a rebase's new state, reserving its room here
+    /// first. On an error the entries and the promise are unchanged; room already grown in this
+    /// new state may stay, as slack (the caller then keeps the old state).
+    pub(super) fn keep_promise(&mut self, other: &Inner) -> Result<(), NoRoom> {
+        #[cfg(test)]
+        if other.promised > 0 && REFUSE_PROMISED_ROOM.with(std::cell::Cell::get) {
+            return Err(NoRoom);
+        }
+        if other.promised > 0 {
+            self.heap.reserve(other.promised)?;
+            self.promised = other.promised;
+        }
+        Ok(())
+    }
+
+    /// Appends a prepared install's keys, the next ids ([`super::suffix::Prepared`]), and
+    /// ends its promise. Allocates nothing where the promise holds.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications install with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn install<'k>(&mut self, keys: impl IntoIterator<Item = (&'k Arc<[u8]>, u64)>) {
+        self.heap.install(keys);
+        self.promised = 0;
+    }
+
+    /// Seals the heap's tail into blocks while it holds [`BLOCK`] keys ([`Heap::seal`]).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications seal after their install in package 9"
+        )
+    )]
+    pub(super) fn seal(&mut self) {
+        self.heap.seal();
     }
 
     pub(super) fn base_len(&self) -> u64 {
@@ -344,6 +494,7 @@ impl Inner {
             starts: self.starts.clone(),
             heap: self.heap.keys(),
             generation: self.generation,
+            promised: 0,
         })
     }
 }
