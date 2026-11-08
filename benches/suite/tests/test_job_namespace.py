@@ -428,16 +428,17 @@ FLEET_JOB=mine ns_clean "$1" "" all
         self.assertEqual([line.split()[0] for line in log], ["start", "end", "start", "end"], log)
         self.assertEqual(log[0].split()[1], log[1].split()[1])
 
+    # suitekit/lock.py: ns.sh's host lock where there is no flock (Git Bash), which the makers take
+    # (ns_serialize datasets): without it the Windows gate's makers stopped at it (#153, 8 Nov 2026).
     MAKERS = ("benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
-              "scripts/lib/ns.sh", "scripts/lib/disk.sh")
+              "scripts/lib/ns.sh", "scripts/lib/disk.sh", "benches/suite/suitekit/lock.py")
 
     def maker_runs(self, script: str, args: list[str], env: dict) -> list[list[str]]:
         """The `docker run`s a maker script starts, by a Docker stub first on PATH that records each
         call (a `test -s` probe finds nothing, so it makes every file; everything else succeeds)."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
-            this = isolation.checkout(tmp / "checkout", *self.MAKERS)
-            (this / "benches" / "suite").mkdir(parents=True, exist_ok=True)  # ns.sh resolves it on load
+            this = isolation.checkout(tmp / "checkout", *self.MAKERS)  # benches/suite: ns.sh resolves it on load
             stub = tmp / "bin" / "docker"
             stub.parent.mkdir()
             calls = tmp / "calls"
