@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -295,10 +296,18 @@ class Suite:
         """needed: image -> build context under benches/ (None: pulled)."""
         if self.args.runtime != "docker":
             return
+        pins = image_pins(self.root)
         for image, context in needed.items():
-            if self.runtime.image_present(image):
+            pin = None if context else pins.get(image)
+            if self.runtime.image_present(image) and (pin is None or pin in repo_digests(image)):
                 continue
-            if context:
+            if pin:
+                # A tag names no content, its digest does: pulled by its pin and tagged, so what runs
+                # is the pinned content (P1c), one present that isn't it included.
+                self.say(f"pulling {image} at its pin {pin[:19]}")
+                self.host_command(["docker", "pull", "-q", f"{repository(image)}@{pin}"])
+                self.host_command(["docker", "tag", f"{repository(image)}@{pin}", image])
+            elif context:
                 # What it is built from, on the image itself: its context's git tree id in this run's
                 # commit, when that is clean (P2 design review F5). The receipt reads it off the id
                 # that runs (image_source), never off this tag (P1b review r1 F1).
@@ -315,18 +324,23 @@ class Suite:
                 self.host_command(["docker", "pull", "-q", image])
             self.made_images.append(image)
 
-    def image_source(self, image_id: str):
+    def image_source(self, image: str, image_id: str):
         """Where the image with this id came from, read off that id (the one the run's containers
         run, its pin), never off a tag that may name another by now (P1b review r1 F1): its build
-        label, or unknown (no label: present before, built from an unclean checkout, or pulled with
-        no digest pin to hold it to)."""
-        if image_id not in self.image_sources:
+        label; or, for a tag with a digest pin (images.toml), "pulled, pinned DIGEST" when that id
+        holds the pin (P1c); else unknown, with why."""
+        if (image, image_id) not in self.image_sources:
             label = run_quiet(["docker", "image", "inspect", "--format",
                                f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image_id])
             found = (label.stdout.strip() if label.returncode == 0 else "").replace("<no value>", "")
-            self.image_sources[image_id] = (f"built from {found}" if found else
-                                            receipts.unknown("no build label on the image that ran"))
-        return self.image_sources[image_id]
+            pin = image_pins(self.root).get(image)
+            held = repo_digests(image_id)
+            self.image_sources[(image, image_id)] = (
+                f"built from {found}" if found else
+                f"pulled, pinned {pin}" if pin and pin in held else
+                receipts.unknown(f"pulled: its digests ({', '.join(sorted(held)) or 'none'}) aren't its pin {pin}")
+                if pin else receipts.unknown("no build label and no digest pin (benches/suite/images.toml)"))
+        return self.image_sources[(image, image_id)]
 
     def build_nrese(self, nrese) -> bool:
         """Builds an NRESE server (`nrese` or `nrese-oxigraph`) from its source tree."""
@@ -957,7 +971,7 @@ class Suite:
                 "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
                 "images": mine if child else {
-                    i: {"id": pins[i], "source": self.image_source(pins[i])} if pins.get(i) else
+                    i: {"id": pins[i], "source": self.image_source(i, pins[i])} if pins.get(i) else
                        {"id": receipts.unknown("not in the run's pin map"),
                         "source": receipts.unknown("no image pinned: none known to have run")}
                     for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
@@ -1074,6 +1088,36 @@ class Suite:
                         self.made_images.remove(image)
 
 
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def image_pins(root: Path) -> dict[str, str]:
+    """The digest pins of the images the suite pulls (benches/suite/images.toml `[pins]`: tag =
+    "sha256:..."); none, none. A pin that isn't a digest is refused: a tag names no content."""
+    path = root / "benches/suite/images.toml"
+    if not path.is_file():
+        return {}
+    pins = tomllib.loads(path.read_text(encoding="utf-8")).get("pins", {})
+    if not isinstance(pins, dict) or not all(isinstance(v, str) and DIGEST.fullmatch(v) for v in pins.values()):
+        raise ValueError(f"{path}: [pins] maps each tag to its digest, sha256: and 64 hex digits")
+    return pins
+
+
+def repository(image: str) -> str:
+    """An image reference without its tag (`qlever/qlever:latest` -> `qlever/qlever`)."""
+    name, colon, tag = image.rpartition(":")
+    return name if colon and "/" not in tag else image
+
+
+def repo_digests(image: str) -> set[str]:
+    """The registry digests a local image (tag or id) holds (`docker image inspect` RepoDigests)."""
+    done = run_quiet(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image])
+    try:
+        return {d.rpartition("@")[2] for d in json.loads(done.stdout or "[]") or []} if done.returncode == 0 else set()
+    except ValueError:
+        return set()
+
+
 def build_settings() -> dict[str, str]:
     """A build's configuration from the environment it runs in: the CPU it compiles for
     (NRESE_TARGET_CPU, scripts/lib/target-cpu.sh's; `native` unset) and the RUSTFLAGS it inherits.
@@ -1093,8 +1137,11 @@ def held_lock(name: str):
 
 
 def images(argv: list[str], systems: dict, root: Path) -> int:
-    """`suite.py images [systems]`: the images the systems need, one per line, with the
-    directory under benches/ an image is built from ("-": pulled from its registry)."""
+    """`suite.py images [--digests] [systems]`: the images the systems need, one per line, with the
+    directory under benches/ an image is built from ("-": pulled from its registry). --digests: the
+    pulled ones' registry digests as this host has them, as images.toml's [pins] lines."""
+    digests = "--digests" in argv
+    argv = [a for a in argv if a != "--digests"]
     keys = argv or [k for k in systems if k in ADAPTERS]
     ctx = Context(None, root, root, root, Mount("-", "/data"), [], 0, dict(os.environ), "images")
     seen = {}
@@ -1107,7 +1154,12 @@ def images(argv: list[str], systems: dict, root: Path) -> int:
         for image, context in system.builds():
             seen[image] = context
     for image, context in seen.items():
-        print(f"{image}\t{context}")
+        if not digests:
+            print(f"{image}\t{context}")
+        elif context == "-":
+            held = sorted(repo_digests(image))
+            print(f'"{image}" = "{held[0]}"' if len(held) == 1 else
+                  f"# {image}: {'not on this host' if not held else 'several digests: ' + ', '.join(held)}")
     return 0
 
 

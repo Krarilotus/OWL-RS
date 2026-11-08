@@ -1,0 +1,9 @@
+# The digests of the images the suite pulls (a tag names no content; its digest does).
+# A pulled image with a pin here is pulled by that digest and tagged, so a run runs the pinned
+# content, and its cell's receipt says "pulled, pinned DIGEST"; one without a pin, or whose id
+# doesn't hold it, has an unknown source and its cell is never current (suite.py coverage).
+# Images the suite builds itself need none: they carry their context's tree (receipts: images).
+#
+# A pin is the registry digest of the tag as pulled: on a host that has pulled the systems'
+# images, `python benches/suite/suite.py images --digests [systems]` prints this table's lines.
+[pins]
