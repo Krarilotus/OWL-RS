@@ -896,6 +896,13 @@ mod tests {
                 "/sys/fs/cgroup/system.slice/x.service/cgroup.controllers",
                 "memory",
             ),
+            (
+                "/sys/fs/cgroup/user.slice/user-1000.slice/run.scope/cgroup.procs",
+                PROCS,
+            ),
+            ("/sys/fs/cgroup/system.slice/x.service/cgroup.procs", PROCS),
+            ("/sys/fs/cgroup/memory/docker/abc/cgroup.procs", PROCS),
+            ("/sys/fs/cgroup/memory/free/cgroup.procs", PROCS),
             ("/sys/fs/cgroup/memory/memory.limit_in_bytes", NONE),
             ("/sys/fs/cgroup/memory/docker/memory.limit_in_bytes", NONE),
             (
@@ -988,6 +995,20 @@ mod tests {
             let path = format!("/sys/fs/cgroup/{scope}.scope/cgroup.controllers");
             (path, "memory".to_owned())
         }))
+        .chain(
+            [
+                "app.slice/run.scope",
+                "system.slice/x.service",
+                "memory/docker/abc",
+                "zero.scope",
+                "blind.scope",
+                "odd.scope",
+            ]
+            .map(|group| {
+                let path = format!("/sys/fs/cgroup/{group}/cgroup.procs");
+                (path, PROCS.to_owned())
+            }),
+        )
         .collect();
         let meminfo = |available: u64| {
             format!(
@@ -1028,9 +1049,15 @@ mod tests {
         }
     }
 
-    /// cgroup v2 and v1's memory hierarchy where systemd mounts them.
-    const MOUNTS: &str = "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
-                          35 25 0:31 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+    /// The namespace's root, cgroup v2 at /sys/fs/cgroup and v1's memory hierarchy at
+    /// /sys/fs/cgroup/memory (mounted on the v2 tree here, to keep both under one prefix).
+    const MOUNTS: &str = "23 23 8:1 / / rw - ext4 /dev/root rw\n\
+                          30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                          35 30 0:31 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+
+    /// The process as `/proc/self/stat` names it, and as its group's `cgroup.procs` lists it.
+    const STAT: &str = "4242 (nrese-server) S 1\n";
+    const PROCS: &str = "4242\n";
 
     /// `files` and [`MOUNTS`] as `/proc/self/mountinfo`, for [`system`].
     fn fixture(files: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
@@ -1052,6 +1079,7 @@ mod tests {
             let text = match path {
                 "/proc/meminfo" => meminfo.map(str::to_owned),
                 "/proc/self/cgroup" => own.map(str::to_owned),
+                "/proc/self/stat" => Some(STAT.to_owned()),
                 _ => files.get(path).cloned(),
             };
             text.ok_or_else(|| std::io::ErrorKind::NotFound.into())
