@@ -1542,18 +1542,34 @@ fn grounding_sets<'a, L: Lookup + ?Sized>(
     if let Some(exceeded) = refused {
         return Err(exceeded);
     }
-    // `minimal`'s output charged before it is made; the sets' slots charged until it has
-    // consumed them, their words beside them; then the output's charge alone kept.
-    let mut charge = run.room(slots(all.len().min(cap)))?;
-    let (all, _slots) = all.into_parts();
+    let mut held = choose(all, held_words, cap, run)?;
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
-    let mut out = minimal(all, cap, &|_| false);
-    out.truncated |= truncated;
-    out.beyond_own |= truncated;
-    charge.resize(slots(out.sets.capacity()) + words(&out.sets))?;
+    held.annotation.truncated |= truncated;
+    held.annotation.beyond_own |= truncated;
+    Ok(held)
+}
+
+/// `minimal` of the sets `all` gathered (their words charged in `words_held`), with the
+/// charge of what its output holds: its output's slots charged before it is made; after it,
+/// the input's slots released (`minimal` freed them), the dropped sets' words released, and
+/// the kept sets' words carried over, not charged again (sol-loop r6 S3).
+fn choose<'a>(
+    all: ChargedVec<GraphSet, &'a Budget>,
+    mut words_held: Reservation<&'a Budget>,
+    cap: usize,
+    run: &Run<'a>,
+) -> Result<Held<'a>, BudgetExceeded> {
+    let mut charge = run.room(slots(all.len().min(cap)))?;
+    let (all, input) = all.into_parts();
+    let out = minimal(all, cap, &|_| false);
+    drop(input);
+    // Both shrink: what the output holds is at most what was charged for it.
+    words_held.resize(words(&out.sets))?;
+    charge.resize(slots(out.sets.capacity()))?;
+    let bytes = charge.transfer() + words_held.transfer();
     Ok(Held {
         annotation: out,
-        _charge: charge,
+        _charge: Reservation::adopt(&**run.scratch, bytes),
     })
 }
 
@@ -1678,6 +1694,43 @@ fn merge(
 
 #[cfg(test)]
 mod tests {
+    /// Sol-loop r6 S3: the sets a grounding's alternatives gathered are chosen among under a
+    /// budget that holds exactly them and `minimal`'s output slots, and nothing more is
+    /// asked: their words are carried over, not charged again. After, only what the output
+    /// holds stays charged.
+    #[test]
+    fn chosen_sets_are_charged_once() {
+        use super::{Budget, ChargedVec, GraphSet, Limits, Reservation, Run, choose, slots, words};
+        use std::sync::Arc;
+        // Eight sets past 128 graphs, each with words on the heap, two of them covering
+        // others (`minimal` drops them), cap 8.
+        let mut sets: Vec<GraphSet> = (0..6).map(|g| GraphSet::of(200 + g)).collect();
+        sets.push(GraphSet::of(200).union(&GraphSet::of(250)));
+        sets.push(GraphSet::of(201).union(&GraphSet::of(251)));
+        let gathered = {
+            let probe = Arc::new(Budget::unlimited());
+            let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(&probe);
+            all.extend_from_slice(&sets).unwrap();
+            all.charged() + words(&sets)
+        };
+        let budget = Arc::new(Budget::new(gathered + slots(sets.len())));
+        let b: &Budget = &budget;
+        let mut words_held = Reservation::new(b);
+        words_held.charge(words(&sets)).unwrap();
+        let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(b);
+        all.extend_from_slice(&sets).unwrap();
+        let run = Run::new(Limits::unlimited(&budget));
+        let held = choose(all, words_held, 8, &run).expect("nothing asked twice");
+        assert_eq!(held.sets.len(), 6, "the two covering sets dropped");
+        assert_eq!(
+            budget.used(),
+            slots(held.sets.capacity()) + words(&held.sets),
+            "only what the output holds stays charged"
+        );
+        drop(held);
+        assert_eq!(budget.used(), 0);
+    }
+
     /// Sol-loop r5 S1, by the allocator (`nrese_exec::measure`, which `Budget::peak` can't
     /// replace: it sees allocations nothing charged). A premise product's unions and
     /// `minimal`'s output are charged before they are made, the product's charge lives as long
