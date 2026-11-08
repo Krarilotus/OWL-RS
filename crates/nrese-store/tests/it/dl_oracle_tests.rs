@@ -607,12 +607,14 @@ fn generated_cases_answer_as_the_dl_oracle() {
     // 100 cases, about 20 s on one test thread (`dlorc-g1-measure5-51a049c1`: 120 cases in
     // 24 s, redraws included).
     let cases = env_setting("NRESE_FUZZ_CASES", 100, 1);
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(env_setting("NRESE_FUZZ_DEADLINE_S", 240, 1));
+    let deadline_s = env_setting("NRESE_FUZZ_DEADLINE_S", 240, 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_s);
+    // Every setting, so a custom deadline replays too (review G1 r2, F5).
     let replay = |i: u64| {
         format!(
-            "NRESE_FUZZ_SEED={base} NRESE_FUZZ_CASES={} cargo test --locked -p nrese-store \
-             --test it -- generated_cases_answer_as_the_dl_oracle --nocapture --test-threads 1",
+            "NRESE_FUZZ_SEED={base} NRESE_FUZZ_CASES={} NRESE_FUZZ_DEADLINE_S={deadline_s} \
+             cargo test --locked -p nrese-store --test it -- \
+             generated_cases_answer_as_the_dl_oracle --nocapture --test-threads 1",
             i + 1
         )
     };
@@ -723,6 +725,10 @@ fn judge(counts: &Counts, deadline: std::time::Instant) -> Vec<String> {
     }
     if u == n {
         inconclusive.push(format!("no decided verdict of {n}"));
+    }
+    // Time only moves on: a deadline that passed at any point in the run has passed now.
+    if left(deadline).is_none() {
+        inconclusive.push("the deadline passed during the run".to_owned());
     }
     inconclusive
 }
