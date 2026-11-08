@@ -1702,7 +1702,7 @@ def maker_of(entry: dict, tables: "DataTables | None" = None) -> tuple[str, list
     """The job-run maker of a frozen file (its DATASET_MAKERS start and what it needs), or None: none
     there, or one whose copies can't meet the file's pins. By `tables` (a harness's: harness_tables();
     default this tree's)."""
-    makers, form_only = (DATASET_MAKERS, FORM_ONLY) if tables is None else (tables.makers or {}, tables.form_only)
+    makers, form_only = (DATASET_MAKERS, FORM_ONLY) if tables is None else (tables.makers, tables.form_only)
     made = entry.get("made_by", "")
     found = next(((start, needs) for start, needs in makers.items() if made.startswith(start + " ")), None)
     if found and found[0] in form_only and not entry.get("rdfc_sha256"):
@@ -1719,20 +1719,18 @@ def maker_of(entry: dict, tables: "DataTables | None" = None) -> tuple[str, list
 
 class DataTables(NamedTuple):
     """A tree's dataset metadata, as its data step uses it (release_gate.py data_state() and
-    make_dataset() in that tree): its catalogue (benches/datasets.toml, by file; None: not readable
-    there) and the tables above. `makers` None: the tree has no DATASET_MAKERS (before engine-v2
-    838cd7eb, PR #129); `containers` None: no MAKER_CONTAINERS (before pkg/maker-containers). `held`:
-    the maker scripts there whose containers take the job's label and limits (they call
-    scripts/lib/ns.sh's ns_maker_args, and ns.sh defines it)."""
+    make_dataset() in that tree): its catalogue (benches/datasets.toml, by file; None: this tree has
+    none, a test's own repository; a harness's is always there: harness_tables()) and the tables above,
+    from its [makers]. `held`: the maker scripts there whose containers take the job's label and
+    limits (they call scripts/lib/ns.sh's ns_maker_args, and ns.sh defines it)."""
     catalogue: dict[str, dict] | None
-    makers: dict[str, list[str]] | None
+    makers: dict[str, list[str]]
     form_only: set[str]
     sparql: str
-    containers: dict[str, tuple] | None
+    containers: dict[str, tuple]
     held: frozenset[str] = frozenset()
 
 
-TABLES = ("DATASET_MAKERS", "FORM_ONLY", "SPARQL_PREPARE", "MAKER_CONTAINERS")
 NS_HELPER = "scripts/lib/ns.sh"
 
 
@@ -1767,11 +1765,13 @@ def harness_tables(checkout: str | Path, harness: str) -> DataTables:
     (catalogue_makers(): declared data, nothing in its code can change what the job is told; review
     r2 R2-W1), and which of its makers' scripts are held to a declaration (held_makers()).
 
-    A harness from before [makers] (engine-v2 838cd7eb up to pkg/maker-containers, a closed set: each
-    has its tables as one literal assignment) is read from its release_gate.py's literals
-    (legacy_tables()); it has no container sizes. A file not there reads as missing (None, or its table
-    absent); refused (HarnessRefused), naming the remedy: malformed metadata, or container sizes kept
-    as code."""
+    Refused (HarnessRefused), naming the remedy: no catalogue at that commit (none there, or no such
+    commit in `checkout`), one that doesn't read, a malformed [makers], or none. A harness without
+    [makers] (before pkg/maker-containers, PR #129's included) is refused whatever its code says, and
+    nothing of its release_gate.py is read: a reader of tables kept as code sees what one literal
+    says, while the harness's code can change it (fix check r3 R3-W1 of pkg/maker-containers: an alias
+    added Docker to LUBM's needs, planned with no container; the master, 8 Nov 2026: "remove the legacy
+    reader"). Merging engine-v2, which every timing plan does, gives a harness [makers]."""
     import subprocess
 
     def at(path: str) -> str | None:
@@ -1779,80 +1779,29 @@ def harness_tables(checkout: str | Path, harness: str) -> DataTables:
                               text=True, encoding="utf-8", errors="replace", timeout=60)
         return done.stdout if done.returncode == 0 else None
 
-    remedy = "merge engine-v2 into it, or give --harness at or after pkg/maker-containers"
+    remedy = "merge refactor/engine-v2 (with [makers]) into the harness, or pass --harness at a commit that has them"
 
     def refuse(why: str):
-        raise HarnessRefused(f"the harness {harness[:12]}'s {why}, so the data its jobs make can't be read from "
-                             f"it: {remedy}")
+        raise HarnessRefused(f"the harness {harness[:12]}'s {why}, so what its data step makes, and in which "
+                             f"containers, can't be read from it: {remedy}")
 
     text = at("benches/datasets.toml")
+    if text is None:
+        refuse("benches/datasets.toml can't be shown (check --harness names a commit of this checkout), nor its "
+               "dataset makers ([makers])")
     try:
-        whole = tomllib.loads(text) if text is not None else None
-        catalogue = {d["file"]: d for d in whole["dataset"]} if whole is not None else None
+        whole = tomllib.loads(text)
+        catalogue = {d["file"]: d for d in whole["dataset"]}
     except (tomllib.TOMLDecodeError, KeyError, TypeError) as error:
         refuse(f"benches/datasets.toml doesn't read ({error})")
-    if whole is not None and "makers" in whole:
-        try:
-            makers, form_only, sparql, containers = catalogue_makers(whole["makers"])
-        except ValueError as error:
-            refuse(f"benches/datasets.toml {error}")
-        return DataTables(catalogue, makers, form_only, sparql, containers, held_makers(at, containers))
-    found = legacy_tables(at("benches/fast/release_gate.py"), refuse)
-    if "MAKER_CONTAINERS" in found:  # a revision of pkg/maker-containers before [makers]: sizes as code
-        refuse("container sizes are code (MAKER_CONTAINERS), not benches/datasets.toml [makers]")
-    return DataTables(catalogue, found.get("DATASET_MAKERS"), set(found.get("FORM_ONLY", ())),
-                      found.get("SPARQL_PREPARE", SPARQL_DEFAULT), None)
-
-
-def legacy_tables(source: str | None, refuse) -> dict:
-    """The TABLES of a release_gate.py from before benches/datasets.toml [makers], each the literal of
-    its one top-level assignment, never run; anything else writing a table name refuses (`refuse`). For
-    the closed set of those revisions only (harness_tables()), each verified to have one literal per
-    table (8 Nov 2026: 19 revisions, engine-v2 since 838cd7eb and every branch tip with dataset makers),
-    so it needn't model Python's scopes and aliases: a revision with [makers] is never read here."""
-    import ast
-    found: dict = {}
+    if "makers" not in whole:
+        refuse("benches/datasets.toml has no [makers], its dataset makers and their containers as data "
+               "(engine-v2 has them since pkg/maker-containers)")
     try:
-        tree = ast.parse(source) if source else ast.Module(body=[], type_ignores=[])
-    except (SyntaxError, ValueError) as error:
-        refuse(f"release_gate.py doesn't parse ({error})")
-    # Each table is what its one top-level assignment says, a literal. Anything else that writes or changes
-    # it, anywhere in the file, would make that literal a stale prefix of the table its prepare uses
-    # (review r2 of pkg/maker-containers, R2-W1): refused, never run to learn what it does.
-    literal = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target, value = node.targets[0], node.value
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:  # sol-loop r3 S2
-            target, value = node.target, node.value
-        else:
-            continue
-        if isinstance(target, ast.Name) and target.id in TABLES:
-            if target.id in literal:
-                refuse(f"{target.id} is assigned more than once")
-            literal[target.id] = target
-            try:
-                found[target.id] = ast.literal_eval(value)
-            except ValueError:
-                refuse(f"{target.id} isn't a literal")
-    mutating = {"update", "setdefault", "pop", "popitem", "clear", "add", "discard", "remove", "append", "extend",
-                "insert", "__setitem__", "__delitem__", "__ior__"}
-    for node in ast.walk(tree):
-        base = node.value if isinstance(node, (ast.Subscript, ast.Attribute)) else None
-        written = (isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load) and node.id in TABLES
-                   and literal.get(node.id) is not node)
-        written |= (isinstance(base, ast.Name) and base.id in TABLES and not isinstance(node.ctx, ast.Load))
-        written |= (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name) and node.func.value.id in TABLES
-                    and node.func.attr in mutating)
-        written |= isinstance(node, ast.alias) and (node.asname or node.name) in TABLES
-        written |= isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in TABLES
-        if written:
-            name = next(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and n.id in TABLES) \
-                if not isinstance(node, (ast.alias, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                else (node.asname or node.name) if isinstance(node, ast.alias) else node.name
-            refuse(f"{name} is changed after its literal (line {getattr(node, 'lineno', '?')})")
-    return found
+        makers, form_only, sparql, containers = catalogue_makers(whole["makers"])
+    except ValueError as error:
+        refuse(f"benches/datasets.toml {error}")
+    return DataTables(catalogue, makers, form_only, sparql, containers, held_makers(at, containers))
 
 
 def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | None) -> tuple[dict, dict, dict]:
@@ -1866,23 +1815,14 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
     run one at a time; `ram_gb` grows by its memory, which the fleet takes out of every step's slice,
     so the builds and blocks keep what they asked; and the env its makers' containers take their
     limits from (scripts/lib/ns.sh ns_maker_args). A job that runs no such maker is asked as before,
-    nothing declared. Refused (HarnessRefused): a harness without dataset makers where this tree's
-    catalogue has the cases' files made by a job (PR #139: asking the bench assets instead doesn't put
-    them on the host; the master, 8 Nov 2026), one without a readable catalogue, and one whose makers
-    start containers it has no size for (before pkg/maker-containers: they'd start them unlabelled)."""
+    nothing declared. Refused (HarnessRefused): a harness without a readable catalogue with [makers]
+    (harness_tables(): PR #139's harness without dataset makers among them, whose prepare doesn't make
+    what the plan counts on), a case file its catalogue doesn't name, and makers that start containers
+    it has no size for or doesn't hold to the declaration."""
     files = {f for c in cases for f in volume_files(c)}
     tables = local_tables() if harness is None or not files else harness_tables(*harness)
     if harness is not None and files:
         named = harness[1][:12]
-        if tables.makers is None and (made := made_only(cases)):
-            raise HarnessRefused(
-                f"the harness {named} has no dataset makers (engine-v2 838cd7eb, PR #129), so it can't make "
-                f"{made[0]}" + (f" and {len(made) - 1} more" if len(made) > 1 else "")
-                + ": merge engine-v2 into it, or give --harness at or after that commit")
-        if tables.catalogue is None:
-            raise HarnessRefused(f"the harness {named} has no readable benches/datasets.toml, so the data its "
-                                 "job makes can't be read from it: check --harness names a commit of this checkout "
-                                 "(it and git show it there), or give one at or after engine-v2 838cd7eb")
         if unknown := sorted(files - set(tables.catalogue)):  # sol-loop r3 S4
             raise HarnessRefused(f"the harness {named}'s catalogue has no {unknown[0]}"
                                  + (f" and {len(unknown) - 1} more" if len(unknown) > 1 else "")
@@ -1895,7 +1835,7 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
     starts = {found[0] for f in files if (found := maker_of(tables.catalogue.get(f, {}), tables)) and found[1]}
     starts |= {f"bash {tables.sparql}" for f in files
                if tables.sparql in tables.catalogue.get(f, {}).get("made_by", "")}
-    sizes = {start: (tables.containers or {}).get(start) for start in starts}
+    sizes = {start: tables.containers.get(start) for start in starts}
     named = harness[1][:12] if harness else "here"
     # Every maker of a declared job runs in the one declared container, SPARQL's too (sol-loop r3 S3).
     if unsized := sorted(s for s, size in sizes.items() if size is None):
@@ -1913,14 +1853,6 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
     requires |= {"os": "linux", "ram_gb": requires["ram_gb"] + memory}
     return (requires, {"spec": 9, "containers": [{"name": "maker", "memory_gb": memory, "cpus": cpus}]},
             {"NRESE_MAKER_MEMORY_GB": f"{memory:g}", "NRESE_MAKER_CPUS": f"{cpus:g}"})
-
-
-def made_only(cases: list[dict]) -> list[str]:
-    """The cases' frozen files only a DATASET_MAKERS maker provides by this tree's catalogue (no
-    bench-assets copy is planned for them: data_needs()); PR #139's refusal of a harness without makers."""
-    tables = local_tables()
-    return sorted({f for c in cases for f in volume_files(c)
-                   if maker_of((tables.catalogue or {}).get(f, {}), tables)})
 
 
 def data_needs(cases: list[dict], tables: DataTables | None = None) -> list[str]:
