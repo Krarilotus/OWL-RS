@@ -40,7 +40,8 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
-          "scripts/lib/suite-python.sh", *isolation.NS_SH, "benches/suite/requirements.txt")
+          "scripts/lib/suite-python.sh", "scripts/lib/gate-node.sh", *isolation.NS_SH,
+          "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 case "$1" in
@@ -980,6 +981,20 @@ class WindowsJob(Repo):
                                     f'echo "$*" >> "{seen.as_posix()}"\n'
                                     f'exec "{Path(sys.executable).as_posix()}" "$@"\n', newline="\n")
         (own / "python").chmod(0o755)
+        # The console's Node the tree pins (scripts/lib/gate-tools.txt node), in the host's cache
+        # already, as gate-node.sh lays it out on this platform: its node reports the pinned version,
+        # and npm and npx (the tier's console step) succeed.
+        platform = "win-x64" if os.name == "nt" else "linux-x64"
+        node_version, node_sha = re.search(rf"^node (\S+) .*?\b{platform} (\S+)",
+                                           (self.repo / "scripts/lib/gate-tools.txt").read_text(), re.M).groups()
+        node_entry = cache / f"node-{node_version}-{node_sha[:12]}"
+        node_bin = node_entry if platform == "win-x64" else node_entry / "bin"
+        node_bin.mkdir(parents=True)
+        pinned_npm = self.root / "pinned-npm"
+        for tool, body in {"node": f"echo v{node_version}\n", "npm": f'echo "$*" >> "{pinned_npm.as_posix()}"\n',
+                           "npx": "exit 0\n"}.items():
+            (node_bin / tool).write_text(f"#!/bin/sh\n{body}", newline="\n")
+            (node_bin / tool).chmod(0o755)
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
@@ -1044,7 +1059,8 @@ class WindowsJob(Repo):
             self.assertEqual([(s["name"], s["code"]) for s in result["steps"]],
                              [("W3C data", 0), ("build", int(failed.get("build", 0))),
                               ("clippy", int(failed.get("clippy", 0))), ("test", 0), ("doc tests", 0),
-                              ("suite contracts", 0)],
+                              ("suite contracts", 0), ("console dependencies", 0), ("console typecheck", 0),
+                              ("console tests", 0)],
                              f"SPEC windows-run: case {case}")
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
@@ -1055,6 +1071,9 @@ class WindowsJob(Repo):
             self.assertIn("benches/suite/tests/isolation.py", ran,
                           f"SPEC windows-python: the suite contracts ran with the host's Python: case {case}")
             seen.unlink()
+            self.assertIn("ci --no-audit --no-fund", pinned_npm.read_text() if pinned_npm.exists() else "",
+                          f"SPEC windows-node: the console step ran with the pinned Node's npm: case {case}")
+            pinned_npm.unlink()
 
 
 class SuitePython(unittest.TestCase):

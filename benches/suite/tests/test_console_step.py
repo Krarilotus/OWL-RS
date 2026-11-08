@@ -1,5 +1,5 @@
 """The console's step of a tier (scripts/check.sh `console`, run by the push tier for a change under
-apps/nrese-console/ and by `all`): its typecheck and tests run wherever the tier does. A gate's
+apps/nrese-console/, by the Windows tier and by `all`): its typecheck and tests run wherever the tier does. A gate's
 checkout is fresh, without node_modules; the step installs the console's dependencies from its
 lockfile there, and a host that can't install them fails the step by name. It never passes the
 console unchecked (before 8 Nov 2026 it printed "skipped" and passed).
@@ -22,9 +22,19 @@ ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 # A caller's gate, slot, fleet or cargo variables would make the tier behave as its caller's does.
 LEAKS = ("NRESE_", "FLEET_", "CARGO_BUILD_", "CARGO_TARGET_DIR")
-# Stand-ins, each call one line in $FAKE/calls. cargo (the tier's fmt) succeeds; npm fails `ci`
-# while $FAKE/no-install exists; npx succeeds.
-CARGO = '#!/bin/sh\necho "cargo $*" >> "$FAKE/calls"\nexit 0\n'
+# Stand-ins, each call one line in $FAKE/calls. cargo succeeds (metadata: one package, foo); the
+# build admission (scripts/cargo-guarded.sh), the W3C data fetch and the suite contracts succeed;
+# npm fails `ci` while $FAKE/no-install exists; npx succeeds.
+CARGO = """#!/bin/sh
+echo "cargo $*" >> "$FAKE/calls"
+[ "$1" != metadata ] || echo '{"packages":[{"name":"foo"}]}'
+exit 0
+"""
+STUBS = {
+    "scripts/cargo-guarded.sh": '#!/bin/sh\necho "guarded $*" >> "$FAKE/calls"\nexit 0\n',
+    "scripts/fetch-w3c-tests.sh": '#!/bin/sh\necho "w3c" >> "$FAKE/calls"\nexit 0\n',
+    "benches/suite/tests/isolation.py": 'import os\nopen(os.environ["FAKE"] + "/calls", "a").write("suite\\n")\n',
+}
 NPM = """#!/bin/sh
 echo "npm $*" >> "$FAKE/calls"
 case " $* " in
@@ -63,8 +73,8 @@ class ConsoleStep(unittest.TestCase):
         self.git(self.root, "init", "-q", str(self.repo))
         (self.repo / "scripts").mkdir()
         shutil.copy(ROOT / "scripts/check.sh", self.repo / "scripts/check.sh")
-        for rel, text in {"apps/nrese-console/package.json": "{}\n", "apps/nrese-console/package-lock.json": "{}\n",
-                          CONSOLE_FILE: "export {};\n"}.items():
+        for rel, text in {**STUBS, "apps/nrese-console/package.json": "{}\n",
+                          "apps/nrese-console/package-lock.json": "{}\n", CONSOLE_FILE: "export {};\n"}.items():
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(text, newline="\n")
         self.git(self.repo, "add", "-A")
@@ -78,6 +88,13 @@ class ConsoleStep(unittest.TestCase):
     def push_tier(self):
         return subprocess.run([BASH, "scripts/check.sh", "push"], cwd=self.repo, capture_output=True, text=True,
                               env=self.env, timeout=120, stdin=subprocess.DEVNULL)
+
+    def windows_tier(self):
+        env = {**self.env, "FLEET_OUT": (self.root / "out").as_posix()}
+        env.pop("NRESE_FILES_FROM")
+        (self.root / "out").mkdir(exist_ok=True)
+        return subprocess.run([BASH, "scripts/check.sh", "windows"], cwd=self.repo, capture_output=True, text=True,
+                              env=env, timeout=120, stdin=subprocess.DEVNULL)
 
     def calls(self, tool):
         path = self.fake / "calls"
@@ -103,6 +120,19 @@ class ConsoleStep(unittest.TestCase):
         self.assertRegex(done.stdout, r"(?m)^  1  console dependencies \(",
                          f"SPEC console-step-never-skips: the summary names the step:\n{out}")
         self.assertNotIn("skipped", out, "SPEC console-step-never-skips: nothing passes as skipped")
+
+    def test_the_windows_tier_checks_the_console_too(self):
+        # The Windows tier runs everything, whatever changed: the console's checks included (before
+        # 8 Nov 2026 no Windows gate ran them).
+        done = self.windows_tier()
+        out = done.stdout + done.stderr
+        self.assertEqual(self.calls("npm")[:1], ["npm --prefix apps/nrese-console ci --no-audit --no-fund"],
+                         f"SPEC console-step-windows: the dependencies from the lockfile:\n{out}")
+        self.assertEqual(self.calls("npx"), ["npx --prefix apps/nrese-console vitest run --root apps/nrese-console"],
+                         f"SPEC console-step-windows: the console's tests run:\n{out}")
+        self.assertRegex(done.stdout, r"(?m)^  0  console tests \(",
+                         f"SPEC console-step-windows: as a step of the tier's summary:\n{out}")
+        self.assertEqual(done.returncode, 0, out)
 
     def test_installed_dependencies_are_used_as_they_are(self):
         (self.repo / "apps/nrese-console/node_modules").mkdir()
