@@ -244,34 +244,6 @@ impl Collect<'_> {
     }
 }
 
-/// The properties of an expression's restrictions.
-fn properties(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing | ClassExpr::OneOf(_) => {}
-        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
-            for &p in parts {
-                properties(o, p, out);
-            }
-        }
-        ClassExpr::Not(inner) => properties(o, *inner, out),
-        ClassExpr::Some(p, f)
-        | ClassExpr::All(p, f)
-        | ClassExpr::Min(_, p, f)
-        | ClassExpr::Max(_, p, f)
-        | ClassExpr::Exact(_, p, f) => {
-            out.push(p.named());
-            properties(o, *f, out);
-        }
-        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
-        ClassExpr::DataSome(p, _)
-        | ClassExpr::DataAll(p, _)
-        | ClassExpr::DataHasValue(p, _)
-        | ClassExpr::DataMin(_, p, _)
-        | ClassExpr::DataMax(_, p, _)
-        | ClassExpr::DataExact(_, p, _) => out.push(*p),
-    }
-}
-
 /// The named classes and properties of an expression.
 fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
     match o.class(e) {
@@ -303,11 +275,11 @@ fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 
 /// The hazards of `o` and the terms they reach, given the anonymous individuals' types
 /// (`types`, with `basics` naming their concepts) and the conclusions the TBox doesn't read
-/// (`unread`, its ledger).
+/// (`unread`, its ledger, each with its polarity).
 pub(crate) fn hazards(
     o: &Ontology,
     types: &[Type],
-    unread: &std::collections::BTreeSet<ExprId>,
+    unread: &std::collections::BTreeSet<(ExprId, bool)>,
     basic: &dyn Fn(u32) -> Basic,
 ) -> Hazards {
     let mut found: Vec<Hazard> = Vec::new();
@@ -462,9 +434,9 @@ pub(crate) fn hazards(
     // its existentials untyped. Each is seeded like an asserted one: its role, and its
     // filler's terms.
     let mut untyped: Vec<(Term, Hazard)> = Vec::new();
-    for &e in unread {
+    for &(e, positive) in unread {
         let (mut roles, mut fillers) = (Vec::new(), Vec::new());
-        generated(o, e, &mut roles, &mut fillers);
+        generated(o, e, positive, &mut roles, &mut fillers);
         if let Some(&role) = roles.first() {
             let h = Hazard::Untyped(role);
             untyped.extend(fillers.into_iter().map(|t| (t, h)));
@@ -688,46 +660,88 @@ fn enumerated(o: &Ontology, e: ExprId) -> Option<Term> {
 
 /// The roles of the existentials (`∃`, `≥ n`) in an expression ([`generated`]).
 fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    generated(o, e, out, &mut Vec::new());
+    generated(o, e, true, out, &mut Vec::new());
 }
 
-/// The roles of the existentials (`∃`, `≥ n`, `= n`) an expression concludes, into
-/// `roles`, and their fillers' terms, into `fillers`. It looks under conjunctions, unions,
-/// fillers, and universals, whose fillers hold of the successors they reach (I24b:
-/// `∀R.∃S.A`). Under a complement any restriction may be an existential (`¬∀R.¬A` is
-/// `∃R.A`), so there every restriction's property is a role and every term a filler's.
-/// Conservative: it may name a role no individual is made for, never miss one.
-fn generated(o: &Ontology, e: ExprId, roles: &mut Vec<Term>, fillers: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::Some(p, f) | ClassExpr::Min(_, p, f) | ClassExpr::Exact(_, p, f) => {
+/// The existentials concluded by `e` (`positive`) or by its complement: their roles into
+/// `roles`, their fillers' terms into `fillers`. The expression is read in negation normal
+/// form, the complement pushed inward (fix check r1, F3):
+/// - Generating: `∃R.F`, and `≥ n` and `= n` for n ≥ 1.
+/// - Generating once negated: `¬≤ n` (`≥ n+1`), `¬= n` (it may be `≥ n+1`), and `¬∀R.F`
+///   (`∃R.¬F`).
+/// - Not generating: `∀` and `≤` themselves, and `¬∃R.F` (`∀R.¬F`).
+///
+/// It looks under conjunctions, unions, and the fillers of universals and existentials:
+/// a universal's filler holds of the successors it reaches (I24b: `∀R.∃S.A`). Conservative:
+/// it may name a role no individual is made for, never miss one.
+fn generated(
+    o: &Ontology,
+    e: ExprId,
+    positive: bool,
+    roles: &mut Vec<Term>,
+    fillers: &mut Vec<Term>,
+) {
+    // An existential on `p`, its successor in filler `f` (none for a data value).
+    fn generates(
+        o: &Ontology,
+        p: Term,
+        f: Option<ExprId>,
+        roles: &mut Vec<Term>,
+        fillers: &mut Vec<Term>,
+    ) {
+        roles.push(p);
+        if let Some(f) = f {
+            terms(o, f, fillers);
+            generated(o, f, true, roles, fillers);
+        }
+    }
+    match (o.class(e), positive) {
+        (ClassExpr::Some(p, f), true) => generates(o, p.named(), Some(*f), roles, fillers),
+        (ClassExpr::Min(n, p, f) | ClassExpr::Exact(n, p, f), true) if *n >= 1 => {
+            generates(o, p.named(), Some(*f), roles, fillers)
+        }
+        (ClassExpr::Max(_, p, f) | ClassExpr::Exact(_, p, f), false) => {
+            generates(o, p.named(), Some(*f), roles, fillers)
+        }
+        (ClassExpr::All(p, f), false) => {
+            // `∃R.¬F`: its successor is outside `F`, and in what `¬F` concludes.
             roles.push(p.named());
             terms(o, *f, fillers);
-            generated(o, *f, roles, fillers);
+            generated(o, *f, false, roles, fillers);
         }
-        ClassExpr::DataSome(p, _) | ClassExpr::DataMin(_, p, _) | ClassExpr::DataExact(_, p, _) => {
-            roles.push(*p);
+        (ClassExpr::All(_, f), true) | (ClassExpr::Some(_, f), false) => {
+            generated(o, *f, positive, roles, fillers)
         }
-        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
+        (ClassExpr::DataSome(p, _), true)
+        | (ClassExpr::DataAll(p, _), false)
+        | (ClassExpr::DataMax(_, p, _), false)
+        | (ClassExpr::DataExact(_, p, _), false) => generates(o, *p, None, roles, fillers),
+        (ClassExpr::DataMin(n, p, _) | ClassExpr::DataExact(n, p, _), true) if *n >= 1 => {
+            generates(o, *p, None, roles, fillers)
+        }
+        (ClassExpr::And(parts) | ClassExpr::Or(parts), _) => {
             for &p in parts {
-                generated(o, p, roles, fillers);
+                generated(o, p, positive, roles, fillers);
             }
         }
-        ClassExpr::All(_, f) => generated(o, *f, roles, fillers),
-        ClassExpr::Not(inner) => {
-            let mut all = Vec::new();
-            terms(o, *inner, &mut all);
-            properties(o, *inner, roles);
-            fillers.extend(all);
-        }
-        ClassExpr::Thing
-        | ClassExpr::Nothing
-        | ClassExpr::Class(_)
-        | ClassExpr::OneOf(_)
-        | ClassExpr::Max(..)
-        | ClassExpr::HasValue(..)
-        | ClassExpr::HasSelf(_)
-        | ClassExpr::DataAll(..)
-        | ClassExpr::DataHasValue(..)
-        | ClassExpr::DataMax(..) => {}
+        (ClassExpr::Not(inner), _) => generated(o, *inner, !positive, roles, fillers),
+        (
+            ClassExpr::Thing
+            | ClassExpr::Nothing
+            | ClassExpr::Class(_)
+            | ClassExpr::OneOf(_)
+            | ClassExpr::Min(..)
+            | ClassExpr::Exact(..)
+            | ClassExpr::Max(..)
+            | ClassExpr::HasValue(..)
+            | ClassExpr::HasSelf(_)
+            | ClassExpr::DataSome(..)
+            | ClassExpr::DataMin(..)
+            | ClassExpr::DataExact(..)
+            | ClassExpr::DataAll(..)
+            | ClassExpr::DataHasValue(..)
+            | ClassExpr::DataMax(..),
+            _,
+        ) => {}
     }
 }
