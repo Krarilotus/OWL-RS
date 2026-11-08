@@ -575,29 +575,26 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// state's blank nodes goes through the frontier as any other term. Where nothing compares
     /// the results ([`Validator::comparing`]), a blank node or a triple term holding one is the
     /// query's term as it is: no lookup, no comparison form (the report shows the same term).
-    fn result_term(&self, term: &Term) -> ResultTerm {
-        if !self.compares && holds_blank_node(term) {
-            return ResultTerm::Computed(Box::new(Computed {
-                term: term.clone(),
-                key: None,
-            }));
+    fn result_term(&self, term: Term) -> ResultTerm {
+        if !self.compares && holds_blank_node(&term) {
+            return ResultTerm::Computed(Box::new(Computed { term, key: None }));
         }
         if let Term::BlankNode(_) = term {
-            return match self.graph.lookup(term) {
+            return match self.graph.lookup(&term) {
                 Some(id) => ResultTerm::Stored(id),
                 None => ResultTerm::Computed(Box::new(Computed {
-                    term: term.clone(),
+                    term,
                     key: Some(fresh_blank()),
                 })),
             };
         }
-        let key = match term {
-            Term::Triple(_) if holds_blank_node(term) => {
+        let key = match &term {
+            Term::Triple(_) if holds_blank_node(&term) => {
                 let mut fresh = Vec::new();
-                let key = self.triple_key(term, &mut fresh);
+                let key = self.triple_key(&term, &mut fresh);
                 if !fresh.is_empty() {
                     return ResultTerm::Computed(Box::new(Computed {
-                        term: term.clone(),
+                        term,
                         key: Some(key),
                     }));
                 }
@@ -605,12 +602,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
             }
             _ => None,
         };
-        match self.known(term) {
+        match self.known(&term) {
             Some(id) => ResultTerm::Stored(id),
-            None => ResultTerm::Computed(Box::new(Computed {
-                term: term.clone(),
-                key,
-            })),
+            None => ResultTerm::Computed(Box::new(Computed { term, key })),
         }
     }
 
@@ -659,10 +653,14 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// An IRI a query bound as `?path`, as a result holds it (as [`Validator::result_term`]).
-    fn result_path(&self, path: &NamedNode) -> ResultPath {
-        match self.known(&Term::NamedNode(path.clone())) {
+    fn result_path(&self, path: NamedNode) -> ResultPath {
+        let path = Term::NamedNode(path);
+        match self.known(&path) {
             Some(id) => ResultPath::Path(Path::Predicate(id)),
-            None => ResultPath::Computed(Box::new(path.clone())),
+            None => match path {
+                Term::NamedNode(path) => ResultPath::Computed(Box::new(path)),
+                _ => unreachable!("made a named node above"),
+            },
         }
     }
 
@@ -1204,8 +1202,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
                                 break;
                             }
                         };
-                        // `?failure` first: such a row's terms are never read.
-                        let found = sparql::found(&solution);
+                        // The solution's terms are moved into the result, not copied; a
+                        // `?failure` row's are dropped unread.
+                        let found = sparql::found(solution);
                         if found.failure {
                             failure("the query reported ?failure");
                             continue;
