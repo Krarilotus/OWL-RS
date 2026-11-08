@@ -358,7 +358,7 @@ fn parallel<T: Sync, O: Send>(
     // the readers go after it has closed.
     let [ready, start, done, end] = [(); 4].map(|()| Barrier::new(parts.len() + 1));
     #[cfg(feature = "inject")]
-    let mut late = hook("late-reader");
+    let (late_run, mut late) = (hook("late-reader"), hook("late-reader"));
     std::thread::scope(|scope| {
         let readers: Vec<_> = parts
             .into_iter()
@@ -371,7 +371,7 @@ fn parallel<T: Sync, O: Send>(
                 scope.spawn(move || {
                     #[cfg(feature = "inject")]
                     if late {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        hold_late_reader();
                     }
                     // The allocator sets up a thread's heap on its first allocation (about
                     // 7,500 instructions, measured): here, before `ready`, so before the
@@ -394,6 +394,10 @@ fn parallel<T: Sync, O: Send>(
                 })
             })
             .collect();
+        #[cfg(feature = "inject")]
+        if late_run {
+            eprintln!("inject: the controller waits for its readers");
+        }
         ready.wait();
         let counted = window.count(|| {
             start.wait();
@@ -416,9 +420,23 @@ fn hook(name: &str) -> bool {
     std::env::var("TRC_INJECT").is_ok_and(|hook| hook == name)
 }
 
+/// Test-only (`late-reader`, the first reader of [`parallel`]): held before its warm-up until the
+/// test writes a line to stdin, saying so on stderr; once released, it says whether the window
+/// had begun to open meanwhile ([`crate::window_opening`]). The test reads the controller's
+/// own lines while it holds the reader, so no timing decides what it sees.
+#[cfg(feature = "inject")]
+fn hold_late_reader() {
+    eprintln!("inject: late reader held");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    match crate::window_opening() {
+        true => eprintln!("inject: late reader released, the window already opening"),
+        false => eprintln!("inject: late reader released, the window not yet open"),
+    }
+}
+
 /// Test-only (`wrong-view`): the first IRI the first reader views, replaced by another IRI of
-/// the same length, a wrong answer the run must refuse. (`late-reader`, in [`parallel`]: the
-/// first reader starts a second late, whose warm-up must still stay out of the window.)
+/// the same length, a wrong answer the run must refuse.
 #[cfg(feature = "inject")]
 fn inject<'v>(view: TermView<'v>, injected: &mut bool) -> TermView<'v> {
     match view {

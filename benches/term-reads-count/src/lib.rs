@@ -341,6 +341,13 @@ impl Window {
     /// ready first (`ops::parallel`), and the load's pool threads went idle while the op's
     /// input was prepared.
     pub(crate) fn count<R>(&mut self, op: impl FnOnce() -> R) -> Result<R, String> {
+        // Test-only (tests/inject.rs, late-reader): the window begins to open here, before
+        // perf's enable and the allocation reset.
+        #[cfg(feature = "inject")]
+        {
+            WINDOW_OPENING.store(true, Ordering::SeqCst);
+            eprintln!("inject: the window opens");
+        }
         let opened = match &mut self.control {
             Some(control) => control.send(b"enable\n"),
             None => Ok(()),
@@ -458,6 +465,15 @@ impl Control {
     fn send(&mut self, _: &'static [u8]) -> Result<(), &'static str> {
         Ok(())
     }
+}
+
+/// Test-only: whether a window has begun to open ([`Window::count`]).
+#[cfg(feature = "inject")]
+static WINDOW_OPENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "inject")]
+pub(crate) fn window_opening() -> bool {
+    WINDOW_OPENING.load(Ordering::SeqCst)
 }
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);

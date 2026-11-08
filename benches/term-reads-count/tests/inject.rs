@@ -2,16 +2,17 @@
 //! by the run's `TRC_INJECT`. Run them with `cargo test --release --features inject`: each
 //! builds a store.
 
-use std::process::{Command, Output};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Output, Stdio};
 
 /// The allocation pass (no perf needed) of `op` at 16 threads, with `fault` injected.
-fn run(op: &str, fault: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_term-reads-count"))
+fn runner(op: &str, fault: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_term-reads-count"));
+    command
         .args(["--shape", "memory", "--op", op, "--threads", "16"])
         .args(["--count", "allocs"])
-        .env("TRC_INJECT", fault)
-        .output()
-        .expect("the runner starts")
+        .env("TRC_INJECT", fault);
+    command
 }
 
 /// A reader of the parallel `with_views` that returns a wrong value of the right length fails
@@ -19,7 +20,9 @@ fn run(op: &str, fault: &str) -> Output {
 /// another IRI of the same length.
 #[test]
 fn a_wrong_view_of_the_same_length_on_one_reader_fails_the_run() {
-    let run = run("with_views", "wrong-view");
+    let run: Output = runner("with_views", "wrong-view")
+        .output()
+        .expect("the runner starts");
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
         !run.status.success(),
@@ -32,17 +35,51 @@ fn a_wrong_view_of_the_same_length_on_one_reader_fails_the_run() {
     );
 }
 
-/// A reader that starts late still does its setup before the counted phase (fix check r2,
-/// R2-F1): the first of 16 readers waits a second before its warm-up allocation, and `noop`'s
+/// A reader that is late with its setup holds the window shut, and its setup isn't counted
+/// (fix check r2, R2-F1; r3: by the test's own schedule, no timing). The first of 16 readers
+/// is held before its warm-up until this test releases it on stdin. While it is held, the
+/// controller must stop short of the window: it says it waits for its readers, and must not
+/// say the window opens. Released, the reader must find the window not yet open, and noop's
 /// phase, which allocates nothing itself, must count no allocation.
 #[test]
 fn a_late_readers_warm_up_stays_out_of_the_counted_phase() {
-    let run = run("noop", "late-reader");
+    let mut child = runner("noop", "late-reader")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the runner starts");
+    let mut stderr = BufReader::new(child.stderr.take().expect("its stderr"));
+    let (mut held, mut waits, mut seen) = (false, false, Vec::new());
+    while !(held && waits) {
+        let mut line = String::new();
+        let read = stderr.read_line(&mut line).expect("its stderr reads");
+        seen.push(line.trim_end().to_owned());
+        match line.trim_end() {
+            "inject: late reader held" => held = true,
+            "inject: the controller waits for its readers" => waits = true,
+            "inject: the window opens" => {
+                let _ = child.kill();
+                panic!("the window began to open while a reader was still held: {seen:?}");
+            }
+            _ if read == 0 => panic!("the run ended before the reader was released: {seen:?}"),
+            _ => {}
+        }
+    }
+    let mut stdin = child.stdin.take().expect("its stdin");
+    stdin.write_all(b"go\n").expect("the reader is released");
+    drop(stdin);
+    let mut rest = String::new();
+    for line in stderr.lines() {
+        rest.push_str(&line.expect("its stderr reads"));
+        rest.push('\n');
+    }
+    let run = child.wait_with_output().expect("the run ends");
     let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success(), "the run failed: {rest}");
     assert!(
-        run.status.success(),
-        "the run failed: {}",
-        String::from_utf8_lossy(&run.stderr)
+        rest.contains("inject: late reader released, the window not yet open"),
+        "the window opened before the late reader was released: {rest}"
     );
     assert!(
         stdout.contains("\"allocs\":0,\"alloc_bytes\":0}"),
