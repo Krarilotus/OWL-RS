@@ -99,16 +99,18 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(len(tokens), 2)
 
     def test_job_declares_resources_identity_answers_and_private_landing(self):
-        # Spec points 2/3/7: ordinary unpinned timed jobs carry declared steps and durable outputs.
+        # Fleet owner 8 Nov: spec 9, exclusive host, memory-only containers covered by step RAM.
         code, text = self.run_plan("--budget-hours", "50", "--plan")
         self.assertEqual(code, 0, text)
         job = self.document()["job"][0]
         self.assertEqual(job["kind"], "owlrs.timed")
-        self.assertEqual(job["class"], "exclusive")
+        self.assertEqual((job["class"], job.get("untimed_steps", [])), ("exclusive", []))
+        self.assertEqual(job["spec"], 9)
+        self.assertEqual(job["containers"], [{"name": "suite", "memory_gb": 28}])
         self.assertEqual(job["priority"], 600)
         self.assertFalse(job["requires"].get("hosts"))
         self.assertEqual(job["inputs"][0]["source"]["rev"], A)
-        self.assertEqual(len(job["step_needs"]), len(job["steps"]))
+        self.assertEqual([n["ram_gb"] for n in job["step_needs"]], [28] * len(job["steps"]))
         for need in job["step_needs"]:
             for field in ("cores", "ram_gb", "disk_gb"):
                 self.assertGreater(need[field], 0)
