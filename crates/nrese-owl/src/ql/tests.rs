@@ -420,6 +420,101 @@ fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
     );
 }
 
+/// Existentials in a right side the TBox reads as nothing make anonymous individuals no
+/// generator types (I24b). Each row gives the entailment that names the terms, from the
+/// OWL 2 Direct Semantics. A row expecting nothing has no anonymous individual to meet.
+/// - `C ⊑ ∀R.∃S.A`: an `R`-successor of a `C` has an `S`-successor in `A`. The same holds
+///   through an inverse, nested under `∀T`, and for `∃S.⊤` (`S` only).
+/// - `C ⊑ ∃R.A ⊔ ∃R.B`: a `C` has an `R`-successor.
+/// - `C ⊑ ¬∀R.¬A`, which is `∃R.A`.
+/// - An individual asserted to be in `∀R.∃S.A`, with an `R`-successor: that successor has
+///   an `S`-successor in `A`.
+/// - Nothing: `∀R.⊤`, `∀R.⊥`, `≤ 0 R`, and `∀` over a data property.
+#[test]
+fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
+    let untyped = |r: &str, ts: &[&str]| -> Vec<String> {
+        ts.iter()
+            .map(|t| format!("{t}: an existential on {r} under a universal, union or complement"))
+            .collect()
+    };
+    let asserted = |r: &str, ts: &[&str]| -> Vec<String> {
+        ts.iter()
+            .map(|t| format!("{t}: an individual is asserted to be in an existential on {r}"))
+            .collect()
+    };
+    let some = "ObjectSomeValuesFrom(:S :A)";
+    let rows: Vec<(String, &str, Vec<String>)> = vec![
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:R {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:R) {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:R ObjectAllValuesFrom(:T {some})))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R ObjectSomeValuesFrom(:S owl:Thing)))".into(),
+            "S(?x ?y)",
+            untyped("S", &["S"]),
+        ),
+        (
+            "SubClassOf(:C ObjectUnionOf(ObjectSomeValuesFrom(:R :A) ObjectSomeValuesFrom(:R :B)))"
+                .into(),
+            "R(?x ?y)",
+            untyped("R", &["R"]),
+        ),
+        (
+            "SubClassOf(:C ObjectComplementOf(ObjectAllValuesFrom(:R ObjectComplementOf(:A))))"
+                .into(),
+            "R(?x ?y), A(?y)",
+            untyped("R", &["R", "A"]),
+        ),
+        (
+            format!("ClassAssertion(ObjectAllValuesFrom(:R {some}) :c)\nObjectPropertyAssertion(:R :c :x)"),
+            "S(?x ?y), A(?y)",
+            asserted("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R owl:Thing))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R owl:Nothing))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectMaxCardinality(0 :R))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "Declaration(DataProperty(:d))\nSubClassOf(:C DataAllValuesFrom(:d <http://www.w3.org/2001/XMLSchema#integer>))"
+                .into(),
+            "d(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (axioms, atoms, expected) in rows {
+        let found = concerns(&axioms, atoms);
+        if found != expected {
+            wrong.push(format!(
+                "{axioms}\n  {atoms}: {found:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
     // Found by the mixed differential test (case 2378 of seed 11): a transitive property
