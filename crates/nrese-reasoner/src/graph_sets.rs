@@ -38,7 +38,6 @@
 
 mod found;
 
-use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -280,6 +279,16 @@ impl GraphSet {
         Self(words)
     }
 
+    /// The bytes [`Self::of`]`(graph)` holds on the heap, without making it: its words past the
+    /// two held inline (`from_elem` allocates exactly the words it is given).
+    fn heap_bytes_of(graph: u32) -> usize {
+        let words = (graph / 64) as usize + 1;
+        match words > 2 {
+            true => words * size_of::<u64>(),
+            false => 0,
+        }
+    }
+
     pub fn union(&self, other: &Self) -> Self {
         let (long, short) = if self.0.len() >= other.0.len() {
             (self, other)
@@ -355,31 +364,253 @@ impl<S: Source + ?Sized> Source for Changed<'_, S> {
     }
 }
 
-/// The sets of facts as an evaluation reads them: `None` for a fact without sets yet.
-trait Lookup: Sync {
-    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, Annotation>>;
+/// Where facts are asserted, as an evaluation asks it: read where it is kept, never copied
+/// into a list per question (fix check r2, C1.b residual).
+pub trait Graphs: Sync {
+    /// Calls `graph` with each graph that asserts `fact` (none for a fact only inferred), in
+    /// any order, the same ones each time it is asked.
+    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32));
+
+    /// Whether `graph` asserts `fact`.
+    fn holds(&self, fact: Triple, graph: u32) -> bool;
 }
 
-impl Lookup for HashMap<Triple, Annotation> {
-    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, Annotation>> {
-        self.get(fact).map(Cow::Borrowed)
+/// At most one graph a fact (`None`: in none), as a function gives it.
+impl<F: Fn(Triple) -> Option<u32> + Sync> Graphs for F {
+    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32)) {
+        if let Some(one) = self(fact) {
+            graph(one);
+        }
+    }
+
+    fn holds(&self, fact: Triple, graph: u32) -> bool {
+        self(fact) == Some(graph)
     }
 }
 
-/// During an update: the facts it recomputes as they are now, the others as they were.
-struct Recomputing<'a> {
-    now: &'a HashMap<Triple, Annotation>,
-    affected: &'a HashSet<Triple>,
-    previous: &'a (dyn Fn(Triple) -> Annotation + Sync),
+/// Each asserted fact with a graph that holds it, sorted, each pair once.
+#[derive(Clone, Copy)]
+pub struct InGraphs<'a>(pub &'a [(Triple, u32)]);
+
+impl InGraphs<'_> {
+    /// The pairs of `fact`.
+    fn of(&self, fact: Triple) -> &[(Triple, u32)] {
+        let start = self.0.partition_point(|(f, _)| *f < fact);
+        let end = start + self.0[start..].partition_point(|(f, _)| *f == fact);
+        &self.0[start..end]
+    }
 }
 
-impl Lookup for Recomputing<'_> {
-    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, Annotation>> {
+impl Graphs for InGraphs<'_> {
+    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32)) {
+        self.of(fact).iter().for_each(|&(_, g)| graph(g));
+    }
+
+    fn holds(&self, fact: Triple, graph: u32) -> bool {
+        self.of(fact)
+            .binary_search_by_key(&graph, |&(_, g)| g)
+            .is_ok()
+    }
+}
+
+/// `fact`'s graphs in a list: for the sets an evaluation keeps (its result, under the W1
+/// exemption of the module doc), never for a lookup's.
+fn listed(graphs: &dyn Graphs, fact: Triple) -> Vec<u32> {
+    let mut list = Vec::new();
+    graphs.each(fact, &mut |graph| list.push(graph));
+    list
+}
+
+/// A fact's sets where its caller keeps them, read by reference: a list, or the entries of
+/// a pool of distinct sets. Nothing is copied (fix check r2, C1.b residual).
+#[derive(Debug, Clone, Copy)]
+pub struct Sets<'k> {
+    list: List<'k>,
+    /// As [`Annotation::truncated`].
+    pub truncated: bool,
+    /// As [`Annotation::beyond_own`].
+    pub beyond_own: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum List<'k> {
+    Slice(&'k [GraphSet]),
+    /// `pool[id]` for each `(_, id)` of `ids`, in their order.
+    Pooled {
+        ids: &'k [(Triple, u32)],
+        pool: &'k [GraphSet],
+    },
+}
+
+impl Sets<'static> {
+    /// No sets.
+    pub const NONE: Self = Self {
+        list: List::Slice(&[]),
+        truncated: false,
+        beyond_own: false,
+    };
+}
+
+impl<'k> Sets<'k> {
+    /// `annotation`'s sets and marks.
+    pub fn of(annotation: &'k Annotation) -> Self {
+        Self {
+            list: List::Slice(&annotation.sets),
+            truncated: annotation.truncated,
+            beyond_own: annotation.beyond_own,
+        }
+    }
+
+    /// The sets of `pool` that `ids` index (a fact's entries, each with an index into the
+    /// pool), marked `truncated` and as wide (one mark kept for both).
+    pub fn pooled(ids: &'k [(Triple, u32)], pool: &'k [GraphSet], truncated: bool) -> Self {
+        Self {
+            list: List::Pooled { ids, pool },
+            truncated,
+            beyond_own: truncated,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self.list {
+            List::Slice(sets) => sets.len(),
+            List::Pooled { ids, .. } => ids.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, i: usize) -> &'k GraphSet {
+        match self.list {
+            List::Slice(sets) => &sets[i],
+            List::Pooled { ids, pool } => &pool[ids[i].1 as usize],
+        }
+    }
+
+    /// The sets, in order.
+    pub fn iter(&self) -> impl Iterator<Item = &'k GraphSet> + 'k {
+        let sets = *self;
+        (0..sets.len()).map(move |i| sets.get(i))
+    }
+
+    /// The one set, if there is exactly one.
+    fn only(&self) -> Option<&'k GraphSet> {
+        (self.len() == 1).then(|| self.get(0))
+    }
+}
+
+/// A fact's sets before a change ([`Change::previous`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Previous<'k> {
+    /// These, where the caller keeps them.
+    Sets(Sets<'k>),
+    /// Those it starts with, from its graphs ([`initial_sets`]; the empty set for an axiom):
+    /// the caller keeps none to lend, so the update makes them, charged first. Only for a
+    /// fact whose graphs the change left as they were (a fact whose graphs changed is
+    /// touched, so recomputed and never asked for).
+    Own,
+}
+
+/// The sets of facts as an evaluation reads them: `None` for a fact without sets yet. Read
+/// where they are kept; made under the run's charge where nothing is kept ([`Looked`]),
+/// `Err` where that is refused.
+trait Lookup<'r>: Sync {
+    fn sets_of(&self, fact: &Triple) -> Result<Option<Looked<'_, 'r>>, BudgetExceeded>;
+}
+
+/// The sets a lookup found.
+enum Looked<'k, 'r> {
+    /// Where they are kept.
+    Kept(Sets<'k>),
+    /// One set held inline: nothing on the heap, nothing charged.
+    One(GraphSet),
+    /// Made for the lookup, under their charge on the run's working budget.
+    Made(Held<'r>),
+}
+
+impl Looked<'_, '_> {
+    fn sets(&self) -> Sets<'_> {
+        match self {
+            Self::Kept(sets) => *sets,
+            Self::One(set) => Sets {
+                list: List::Slice(std::slice::from_ref(set)),
+                truncated: false,
+                beyond_own: false,
+            },
+            Self::Made(held) => Sets::of(held),
+        }
+    }
+}
+
+impl<'r> Lookup<'r> for HashMap<Triple, Annotation> {
+    fn sets_of(&self, fact: &Triple) -> Result<Option<Looked<'_, 'r>>, BudgetExceeded> {
+        Ok(self.get(fact).map(|found| Looked::Kept(Sets::of(found))))
+    }
+}
+
+/// During an update: the facts it recomputes as they are now, the others as they were,
+/// borrowed from where `previous` keeps them, or, for those it keeps none of
+/// ([`Previous::Own`]), made from `graphs` and `axioms` (sorted) at `cap`, charged to `run`.
+struct Recomputing<'a, 'p, 'r> {
+    now: &'a HashMap<Triple, Annotation>,
+    affected: &'a HashSet<Triple>,
+    previous: &'a (dyn Fn(Triple) -> Previous<'p> + Sync),
+    graphs: &'a dyn Graphs,
+    axioms: &'a [Triple],
+    cap: usize,
+    run: &'a Run<'r>,
+}
+
+impl<'r> Lookup<'r> for Recomputing<'_, '_, 'r> {
+    fn sets_of(&self, fact: &Triple) -> Result<Option<Looked<'_, 'r>>, BudgetExceeded> {
         if self.affected.contains(fact) {
             return self.now.sets_of(fact);
         }
-        let previous = (self.previous)(*fact);
-        (!previous.is_empty()).then_some(Cow::Owned(previous))
+        match (self.previous)(*fact) {
+            Previous::Sets(sets) => Ok((!sets.is_empty()).then_some(Looked::Kept(sets))),
+            Previous::Own => own_sets(*fact, self.graphs, self.axioms, self.cap, self.run),
+        }
+    }
+}
+
+/// The sets `fact` starts with ([`initial_sets`] of its graphs; the empty set for an axiom,
+/// one of `axioms`, sorted), made for a lookup: one graph's set held inline is made with
+/// nothing allocated; any more are charged to `run` before they are made (fix check r2,
+/// C1.b residual). `None` where it has none.
+fn own_sets<'k, 'r>(
+    fact: Triple,
+    graphs: &dyn Graphs,
+    axioms: &[Triple],
+    cap: usize,
+    run: &Run<'r>,
+) -> Result<Option<Looked<'k, 'r>>, BudgetExceeded> {
+    if axioms.binary_search(&fact).is_ok() {
+        return Ok(Some(Looked::One(GraphSet::default())));
+    }
+    let (mut n, mut words, mut first) = (0usize, 0usize, None);
+    graphs.each(fact, &mut |graph| {
+        n += 1;
+        words = words.saturating_add(GraphSet::heap_bytes_of(graph));
+        first.get_or_insert(graph);
+    });
+    match first {
+        None => Ok(None),
+        Some(graph) if n == 1 && words == 0 && cap > 0 => {
+            Ok(Some(Looked::One(GraphSet::of(graph))))
+        }
+        Some(_) => {
+            // As `initial_sets`: `minimal` of the graphs' sets, each its own.
+            let mut made = Charged::with_capacity(run, n, cap, words)?;
+            graphs.each(fact, &mut |graph| {
+                if made.sets.len() < n {
+                    made.push(GraphSet::of(graph));
+                }
+            });
+            let held = made.minimal(cap, &|_| true)?;
+            Ok((!held.is_empty()).then_some(Looked::Made(held)))
+        }
     }
 }
 
@@ -424,17 +655,13 @@ fn minimal(mut sets: Vec<GraphSet>, cap: usize, own: &dyn Fn(&GraphSet) -> bool)
     }
 }
 
-/// Whether a set is one graph that asserts `fact`, its graphs looked up once, when first
-/// asked ([`minimal`]'s `own`).
-fn own_graph_of(
-    fact: Triple,
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
-) -> impl Fn(&GraphSet) -> bool + '_ {
-    let graphs = std::cell::OnceCell::new();
+/// Whether a set is one graph that asserts `fact` ([`minimal`]'s `own`): one question to
+/// `graphs` per set asked, no list of them made.
+fn own_graph_of(fact: Triple, graphs: &dyn Graphs) -> impl Fn(&GraphSet) -> bool + '_ {
     move |set: &GraphSet| {
         let mut members = set.graphs();
         matches!((members.next(), members.next()), (Some(graph), None)
-            if graphs.get_or_init(|| graphs_of(fact)).contains(&graph))
+            if graphs.holds(fact, graph))
     }
 }
 
@@ -447,7 +674,7 @@ pub fn support_sets(
     facts: &[Triple],
     program: &GroundProgram,
     axioms: &[Triple],
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    graphs_of: &dyn Graphs,
     cap: usize,
     limits: Limits<'_>,
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
@@ -459,7 +686,7 @@ fn support_sets_run(
     facts: &[Triple],
     program: &GroundProgram,
     axioms: &[Triple],
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    graphs_of: &dyn Graphs,
     cap: usize,
     run: &Run<'_>,
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
@@ -468,8 +695,11 @@ fn support_sets_run(
         .par_iter()
         .filter_map(|&fact| {
             let axiom = axioms.binary_search(&fact).is_ok();
-            let initial =
-                initial_sets(if axiom { Vec::new() } else { graphs_of(fact) }, axiom, cap);
+            let graphs = match axiom {
+                true => Vec::new(),
+                false => listed(graphs_of, fact),
+            };
+            let initial = initial_sets(graphs, axiom, cap);
             (!initial.is_empty()).then_some((fact, initial))
         })
         .collect();
@@ -788,10 +1018,7 @@ pub fn closure_within(
     readable: &(dyn Fn(Triple) -> bool + Sync),
     limits: Limits<'_>,
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
-    let one_graph = |fact: Triple| match readable(fact) {
-        true => vec![0],
-        false => Vec::new(),
-    };
+    let one_graph = |fact: Triple| readable(fact).then_some(0);
     let mut sets = support_sets(facts, program, axioms, &one_graph, 1, limits)?;
     sets.retain(|_, annotation| !annotation.is_empty());
     debug_assert!(sets.values().all(|annotation| !annotation.truncated));
@@ -915,14 +1142,14 @@ fn independently_derived_run<S: Source + Sync + ?Sized>(
         ..Annotation::default()
     };
     let empty = Annotation::empty_set();
-    let previous = |other: Triple| match axioms.binary_search(&other).is_ok() {
-        true => empty.clone(),
-        false => derivable.clone(),
+    // Lent, not copied per lookup.
+    let previous = |other: Triple| {
+        Previous::Sets(Sets::of(match axioms.binary_search(&other).is_ok() {
+            true => &empty,
+            false => &derivable,
+        }))
     };
-    let one_graph = |other: Triple| match other != fact && asserted(other) {
-        true => vec![0],
-        false => Vec::new(),
-    };
+    let one_graph = |other: Triple| (other != fact && asserted(other)).then_some(0);
     let change = Change {
         source,
         in_closure: &|other| source.contains(other),
@@ -1092,8 +1319,9 @@ pub struct Change<'a, S: ?Sized> {
     /// Every fact whose own graphs changed, or that the change added to the closure or
     /// removed from it.
     pub touched: &'a [Triple],
-    /// A fact's sets before the change, with its mark.
-    pub previous: &'a (dyn Fn(Triple) -> Annotation + Sync),
+    /// A fact's sets before the change, with its mark: lent from where the caller keeps them
+    /// for the whole update, never copied for it (fix check r2, C1.b residual).
+    pub previous: &'a (dyn Fn(Triple) -> Previous<'a> + Sync),
     /// Past this many affected facts the update gives up (a recomputation is cheaper).
     pub limit: usize,
 }
@@ -1118,7 +1346,7 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
     change: &Change<'_, S>,
     program: &GroundProgram,
     axioms: &[Triple],
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    graphs_of: &dyn Graphs,
     cap: usize,
     limits: Limits<'_>,
 ) -> Result<Option<HashMap<Triple, Annotation>>, Stopped> {
@@ -1130,7 +1358,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
     change: &Change<'_, S>,
     program: &GroundProgram,
     axioms: &[Triple],
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    graphs_of: &dyn Graphs,
     cap: usize,
     run: &Run<'_>,
 ) -> Result<Option<HashMap<Triple, Annotation>>, Stopped> {
@@ -1162,7 +1390,10 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         .iter()
         .map(|&fact| {
             let axiom = axioms.binary_search(&fact).is_ok();
-            let graphs = if axiom { Vec::new() } else { graphs_of(fact) };
+            let graphs = match axiom {
+                true => Vec::new(),
+                false => listed(graphs_of, fact),
+            };
             (fact, initial_sets(graphs, axiom, cap))
         })
         .collect();
@@ -1182,6 +1413,10 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             now: &now,
             affected: &affected,
             previous: change.previous,
+            graphs: graphs_of,
+            axioms,
+            cap,
+            run,
         };
         let mut poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
         rules
@@ -1206,6 +1441,10 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             now: &now,
             affected: &affected,
             previous: change.previous,
+            graphs: graphs_of,
+            axioms,
+            cap,
+            run,
         };
         let list: Vec<Triple> = members.iter().copied().collect();
         // One poller per parallel task, not per derivation search (as `rederived`).
@@ -1316,6 +1555,10 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                 now: &now,
                 affected: &affected,
                 previous: change.previous,
+                graphs: graphs_of,
+                axioms,
+                cap,
+                run,
             };
             instances(&source, &rules, run, &|k, bindings, out| {
                 let rule = rules[k].0;
@@ -1377,7 +1620,7 @@ fn merge_found(
     fact: Triple,
     entries: &[found::Entry],
     cap: usize,
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    graphs_of: &dyn Graphs,
     annotations: &mut usize,
 ) -> Result<bool, Stopped> {
     let (n, kept) = (
@@ -1716,7 +1959,7 @@ fn delta_facts(store: &Store) -> Vec<Triple> {
 /// Every alternative's sets are held together until `minimal` chooses among them: their
 /// slots and words are charged to `run`'s working budget as they are added, and held
 /// through `minimal` (review r1 C1); `Err` where it has no room.
-fn grounding_sets<'a, L: Lookup + ?Sized>(
+fn grounding_sets<'a, L: Lookup<'a> + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
     sets: &L,
@@ -1756,8 +1999,9 @@ fn grounding_sets<'a, L: Lookup + ?Sized>(
 /// Each step's product (every union of a kept set with one of the premise's) is charged to
 /// `run`'s working budget before it is built and held until `minimal` has consumed it: its
 /// slots, and at most the longer operand's words per union (review r1 C1); `Err` where it
-/// has no room. Exact: `minimal` sees the whole product, as before.
-fn premise_sets_from<'a, L: Lookup + ?Sized>(
+/// has no room. Exact: `minimal` sees the whole product, as before. A premise's sets are read
+/// where they are kept ([`Lookup`]), never copied first (fix check r2, C1.b residual).
+fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
     body: &[Triple],
     start: &Annotation,
     sets: &L,
@@ -1772,15 +2016,16 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
         let mut truncated = start.truncated;
         let mut single = true;
         for premise in body {
-            let Some(own) = sets.sets_of(premise) else {
+            let Some(found) = sets.sets_of(premise)? else {
                 return Ok(Held::uncharged(Annotation::default(), run));
             };
-            match own.sets.as_slice() {
-                [set] => {
+            let own = found.sets();
+            match own.only() {
+                Some(set) => {
                     one.union_with(set)?;
                     truncated |= own.truncated;
                 }
-                _ => {
+                None => {
                     single = false;
                     break;
                 }
@@ -1804,20 +2049,20 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
         }
     };
     for premise in body {
-        let Some(own) = sets.sets_of(premise) else {
+        let Some(found) = sets.sets_of(premise)? else {
             return Ok(Held::uncharged(Annotation::default(), run));
         };
+        let own = found.sets();
         // Charged first: the unions (their slots, at most the longer operand's words each)
         // and `minimal`'s output beside them; past what a budget can count, refused.
-        let n = product.sets.len().saturating_mul(own.sets.len());
+        let n = product.sets.len().saturating_mul(own.len());
         let unions_words = own
-            .sets
             .len()
             .saturating_mul(words(&product.sets))
-            .saturating_add(product.sets.len().saturating_mul(words(own.sets.iter())));
+            .saturating_add(product.sets.len().saturating_mul(words(own.iter())));
         let mut next = Charged::with_capacity(run, n, cap, unions_words)?;
         for a in &product.sets {
-            for b in own.sets.iter() {
+            for b in own.iter() {
                 next.push(a.union(b));
             }
         }
@@ -1842,7 +2087,7 @@ fn merge(
     fact: Triple,
     from: Annotation,
     cap: usize,
-    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    graphs_of: &dyn Graphs,
     annotations: &mut usize,
 ) -> bool {
     let current = sets.entry(fact).or_default();
@@ -1928,7 +2173,8 @@ mod tests {
     #[test]
     fn an_unaffected_premise_is_read_where_it_is_kept() {
         use super::{
-            Annotation, GraphSet, Limits, Recomputing, Run, initial_sets, premise_sets_from,
+            Annotation, GraphSet, InGraphs, Limits, Previous, Recomputing, Run, Sets,
+            premise_sets_from,
         };
         use hashbrown::{HashMap, HashSet};
         use nrese_exec::{Budget, measure};
@@ -1968,29 +2214,12 @@ mod tests {
             let entries: Vec<([u64; 3], u32)> = (0..pool.len() as u32).map(|i| (x, i)).collect();
             let placed: Vec<([u64; 3], u32)> = graphs.iter().map(|&g| (x, g)).collect();
             // The store's callback (`nrese-store` support.rs, `SupportSets::updated`).
-            let previous = |fact: [u64; 3]| -> Annotation {
-                if fact != x {
-                    return Annotation::default();
-                }
-                match own {
-                    false => Annotation {
-                        sets: entries
-                            .iter()
-                            .map(|&(_, id)| pool[id as usize].clone())
-                            .collect(),
-                        truncated: false,
-                        beyond_own: false,
-                    },
-                    true => {
-                        let graphs_of: Vec<u32> = placed
-                            .iter()
-                            .filter(|&&(f, _)| f == fact)
-                            .map(|&(_, g)| g)
-                            .collect();
-                        initial_sets(graphs_of, false, cap)
-                    }
-                }
+            let previous = |fact: [u64; 3]| match (fact == x, own) {
+                (false, _) => Previous::Sets(Sets::NONE),
+                (true, false) => Previous::Sets(Sets::pooled(&entries, &pool, false)),
+                (true, true) => Previous::Own,
             };
+            let asserted = InGraphs(&placed);
             let budget = Arc::new(Budget::new(limit));
             let (got, excess) = measure::measure_within(&budget, || {
                 let run = Run::new(Limits::unlimited(&budget));
@@ -1998,6 +2227,10 @@ mod tests {
                     now: &now,
                     affected: &affected,
                     previous: &previous,
+                    graphs: &asserted,
+                    axioms: &[],
+                    cap,
+                    run: &run,
                 };
                 premise_sets_from(&[x, a], &start, &lookup, cap, &run)
             });
@@ -2040,6 +2273,20 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// What an own set's charge counts before it is made ([`super::own_sets`]) is what the
+    /// set holds: either side of the inline edge (128 graphs) and far past it.
+    #[test]
+    fn a_singletons_heap_bytes_are_known_before_it_is_made() {
+        use super::GraphSet;
+        for graph in [0, 63, 64, 127, 128, 129, 191, 192, 1 << 16, (1 << 16) + 1] {
+            assert_eq!(
+                GraphSet::heap_bytes_of(graph),
+                GraphSet::of(graph).heap_bytes(),
+                "graph {graph}"
+            );
+        }
     }
 
     /// Review r2 C1.b, by the allocator: a round's jobs refer to their rule's charged schema
