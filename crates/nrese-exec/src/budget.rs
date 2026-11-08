@@ -1569,6 +1569,39 @@ mod tests {
         assert_eq!(server.used(), 0);
     }
 
+    /// Pushes near a budget's limit cost copies linear in what they push, and the vector
+    /// never holds more than the limit: where doubling has no room it grows to what fits,
+    /// and is refused at most one growth later, not reallocated (every item copied) at
+    /// each push. The limit is 90,000 items' bytes, so doubling from 32,768 items (32,768
+    /// beside 65,536) has no room. Grown by what each push asks, that vector reallocated
+    /// about 12,000 times from 32,768 items on, about 470 million items copied.
+    #[test]
+    fn pushes_near_the_limit_copy_each_item_a_bounded_number_of_times() {
+        const LIMIT: usize = 90_000 * 8;
+        let budget = Budget::new(LIMIT);
+        let mut vec: ChargedVec<u64, &Budget> = ChargedVec::new(&budget);
+        let (mut pushed, mut copied, mut growths) = (0usize, 0usize, 0usize);
+        loop {
+            let (capacity, len) = (vec.capacity(), vec.len());
+            if vec.push(pushed as u64).is_err() {
+                break;
+            }
+            if vec.capacity() != capacity {
+                growths += 1;
+                copied += len;
+            }
+            pushed += 1;
+            assert!(budget.used() <= LIMIT && vec.capacity() * 8 <= LIMIT);
+        }
+        assert!(
+            copied <= 2 * pushed,
+            "{copied} items copied for {pushed} pushes in {growths} growths"
+        );
+        assert!(budget.peak() <= LIMIT, "peak {}", budget.peak());
+        assert_eq!(budget.used(), vec.capacity() * 8);
+        assert!(vec.iter().copied().eq(0..pushed as u64));
+    }
+
     #[test]
     fn a_reservation_releases_what_it_holds_when_dropped() {
         let budget = Arc::new(Budget::new(100));
