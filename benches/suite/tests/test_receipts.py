@@ -799,25 +799,152 @@ class Driver(unittest.TestCase):
                     where = outer / ".cargo" / "config.toml" if case == "ancestor" else home / "config.toml"
                     self.assertIn(str(where.resolve()), controlled["unknown"])
 
-    def test_a_temporary_directory_under_a_cargo_config_gives_an_uncontrolled_build(self):
-        """P1e (master 22:34): the layout a fleet Windows job has, a TEMP under a directory with a
-        .cargo/config.toml: build_export_base puts the export there (it isn't inside the build's own
-        checkout), cargo would read that config, and the build says so, naming the file the test
-        wrote."""
-        self.checkout(self.root, "suite")
+    def test_an_export_goes_beside_its_checkout_and_a_config_there_is_named(self):
+        """P1e (build-controlled-build-3, phuoc-yu): the launcher's free-disk guard measures the
+        filesystem it runs from, the export's; one in the system's temporary directory (a small /tmp)
+        refused a build whose target had room. The export goes beside the build's own checkout,
+        wherever TEMP is, on the filesystem the guard always measured. Cargo reads a .cargo/config
+        above it there too: a build with one beside its checkout says so, naming the file the test
+        wrote (the layout of a fleet Windows job's checkout, master 22:34)."""
         outer = self.clean_root()
+        source = self.checkout(outer / "repo", "nrese")
         (outer / ".cargo").mkdir()
         (outer / ".cargo" / "config.toml").write_text("[build]\n", encoding="utf-8")
-        temp = outer / "temp"
-        temp.mkdir()
-        with patch.object(driver.tempfile, "gettempdir", return_value=str(temp)), \
+        self.checkout(self.root, "suite")
+        elsewhere = self.clean_root()  # TEMP, somewhere else
+        with patch.object(driver.tempfile, "gettempdir", return_value=str(elsewhere)), \
                 patch.dict(driver.os.environ, {"CARGO_HOME": str(self.root / "no-cargo-home")}):
-            build = self.built()
-        for made in self.builds:
-            self.assertEqual(made["cwd"].resolve().parent, temp.resolve())
+            build = self.built(source=source)
+        self.assertEqual(self.builds[0]["cwd"].resolve().parent, outer.resolve())  # NRESE's, beside its checkout
+        self.assertEqual(self.builds[1]["cwd"].resolve().parent, self.root.resolve().parent)  # the harness's
         controlled = build["nrese"]["controlled"]
         self.assertIsInstance(controlled, dict, "a config above the export isn't controlled")
         self.assertIn(str((outer / ".cargo" / "config.toml").resolve()), controlled["unknown"])
+
+    def test_an_export_is_the_commit_s_tree_byte_for_byte_whatever_git_s_attributes_say(self):
+        """P1e review r1 F1 (master 23:12): git archive applies export-ignore and export-subst, from
+        attributes outside the commit too (core.attributesFile, .git/info/attributes), and replace refs
+        swap an object under its id: an export without .cargo/config.toml read as controlled. The
+        export holds every file of the commit's tree with its committed bytes, nothing else; a build
+        in it reads its committed .cargo/config.toml and is controlled."""
+        self.checkout(self.root, "suite")
+        (self.root / "version.txt").write_text("$Format:%H$\n", encoding="utf-8", newline="\n")
+        self.git(self.root, "add", "version.txt")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "subst")
+        commit = self.git(self.root, "rev-parse", "HEAD")
+        attributes = self.root / "data" / "attributes"
+        attributes.write_text(".cargo/config.toml export-ignore\nversion.txt export-subst\n", encoding="utf-8")
+        (self.root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (self.root / ".git" / "info" / "attributes").write_text("Cargo.lock export-ignore\n", encoding="utf-8")
+        lock = self.git(self.root, "rev-parse", "HEAD:Cargo.lock")
+        other = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="replaced",
+                               capture_output=True, text=True, check=True).stdout.strip()
+        self.git(self.root, "replace", lock, other)
+        external = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.attributesFile",
+                    "GIT_CONFIG_VALUE_0": str(attributes)}
+        expected = {path: self.git(self.root, "--no-replace-objects", "cat-file", "blob", f"{commit}:{path}")
+                    for path in self.git(self.root, "ls-tree", "-r", "--name-only", commit).splitlines()}
+        with tempfile.TemporaryDirectory() as d, patch.dict(driver.os.environ, external):
+            driver.export_commit(self.root, commit, Path(d))
+            got = {f.relative_to(d).as_posix(): f.read_text(encoding="utf-8").strip()
+                   for f in Path(d).rglob("*") if f.is_file()}
+        self.assertEqual(set(got), set(expected))  # .cargo/config.toml and Cargo.lock both there
+        self.assertEqual(got, {k: v.strip() for k, v in expected.items()})  # $Format$ kept, Cargo.lock not replaced
+        base = self.clean_root()
+        with patch.dict(driver.os.environ, {**external, "CARGO_HOME": str(self.root / "no-cargo-home")}):
+            build = self.built(export_base=base)
+        for made in self.builds:
+            self.assertIn(".cargo/config.toml", made["files"])
+        self.assertIs(build["nrese"]["controlled"], True)
+
+    def test_an_export_refuses_what_isn_t_a_plain_file(self):
+        """P1e review r1 F1, attack 14: a symlink (or submodule) entry is refused, never followed nor
+        dropped: the build doesn't run."""
+        self.checkout(self.root, "suite")
+        target = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="Cargo.toml",
+                                capture_output=True, text=True, check=True).stdout.strip()
+        self.git(self.root, "update-index", "--add", "--cacheinfo", f"120000,{target},link")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "a link")
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(OSError) as refused:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d))
+        self.assertIn("link", str(refused.exception))
+
+    def test_the_commit_exported_is_the_one_the_build_s_record_names(self):
+        """P1e review r1 F1: the export binds to the commit built_from recorded, never HEAD read again
+        (a checkout that moves between the two would build another commit than its record names)."""
+        self.checkout(self.root, "suite")
+        recorded = self.git(self.root, "rev-parse", "HEAD")
+        suite = self.suite(runs=1, skip_build=False)
+        states = iter([{"commit": recorded, "dirty": 0}] + [{"commit": "f" * 40, "dirty": 0}] * 5)
+        with patch.object(driver, "checkout_state", side_effect=lambda *a: next(states)), \
+                patch.object(driver, "export_commit") as exported, \
+                patch.object(suite, "host_command", return_value=0), \
+                patch.object(driver, "toolchain_here", return_value=dict(self.DECLARED)):
+            suite.build_harness()
+        self.assertEqual(exported.call_args.args[1], recorded)
+
+    def test_a_build_that_raises_still_has_its_record_in_the_manifest(self):
+        """P1e review r1 F2: a builder that raises (an OSError at launch, a log it can't create, an
+        interrupt) still leaves its record in the run's manifest."""
+        suite = self.suite(runs=1, skip_build=False)
+
+        def raising(*a):
+            suite.built["nrese"] = {"commit": "a" * 40, "controlled": True}
+            raise OSError("no bash")
+        nrese = Mock(spec=driver.Nrese, key="nrese", regimes={"none": ""}, images=Mock(return_value=[]),
+                     builds=Mock(return_value=[]), script_builds=Mock(return_value=[]),
+                     supports=Mock(return_value=None), definition_paths=())
+        with patch.object(suite, "build_nrese", side_effect=raising), \
+                patch.object(driver, "plans", return_value=[Plan("w", "1")]), \
+                patch.object(driver, "adapter", return_value=nrese), \
+                patch.object(suite, "ensure_data", return_value=None), \
+                patch.object(suite, "sif_missing", return_value=None), self.assertRaises(OSError):
+            suite.run()
+        entry = json.loads((suite.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][-1]
+        self.assertEqual(entry.get("builds"), {"nrese": {"commit": "a" * 40, "controlled": True}})
+
+    def test_an_export_past_its_deadline_stops_its_git_and_fails(self):
+        """P1e review r1 F4: one deadline for the whole export, its git children killed at it."""
+        self.checkout(self.root, "suite")
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(OSError) as late:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d), timeout=0)
+        self.assertIn("deadline", str(late.exception))
+
+    def test_an_export_refuses_two_directory_spellings_one_filesystem_merges(self):
+        """P1e sol-loop r3 S3: `Dir/a` and `dir/b` are two trees in git, one directory where case
+        folds (Windows): the export refuses rather than merge them (case folding emulated here)."""
+        self.checkout(self.root, "suite")
+        blob = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="x",
+                              capture_output=True, text=True, check=True).stdout.strip()
+        for path in ("Dir/a", "dir/b"):
+            self.git(self.root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "two spellings")
+        with tempfile.TemporaryDirectory() as d, patch.object(driver.os.path, "normcase", side_effect=str.lower), \
+                self.assertRaises(OSError) as refused:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d))
+        self.assertIn("same", str(refused.exception))
+
+    def test_a_stalled_export_is_killed_at_its_deadline(self):
+        """P1e sol-loop r3 S4: a cat-file that never answers is killed at the export's deadline, and
+        the export fails saying so, well within it plus a margin."""
+        self.checkout(self.root, "suite")
+        real = subprocess.Popen
+        started = []
+
+        def stalled(argv, *a, **k):
+            if "cat-file" in argv:
+                child = real([sys.executable, "-c", "import time; time.sleep(120)"], *a, **k)
+                started.append(child)
+                return child
+            return real(argv, *a, **k)
+        began = time.monotonic()
+        with tempfile.TemporaryDirectory() as d, patch.object(driver.subprocess, "Popen", side_effect=stalled), \
+                self.assertRaises(OSError) as late:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d), timeout=2)
+        self.assertLess(time.monotonic() - began, 30)
+        self.assertIn("deadline", str(late.exception))
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())  # killed, not left running
 
     def test_every_compile_time_variable_our_sources_read_is_set_by_cargo_or_never_passed(self):
         """P2 second lead 17:59 (rule: fix recurring mistakes mechanically): a variable our Rust sources
