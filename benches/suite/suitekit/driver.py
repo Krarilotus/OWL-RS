@@ -16,6 +16,7 @@ import argparse
 import atexit
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import time
 import tomllib
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
@@ -379,8 +381,7 @@ class Suite:
         source = nrese.source(ctx)
         # What it is built from and with (P2 design review F4): its checkout when the build starts, and
         # the build's own configuration, never an environment list taken for its defaults.
-        self.built[nrese.key] = {**{k: v for k, v in checkout_state(Path(source)).items() if k in ("commit", "dirty")},
-                                 **build_settings()}
+        self.built[nrese.key] = built_from(Path(source), "nrese")
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
         if self.args.runtime == "docker":
@@ -397,12 +398,19 @@ class Suite:
             # scripts/lib/target-cpu.sh reads it; `portable` for none).
             cpu = os.environ.get("NRESE_TARGET_CPU", "native")
             rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
-            self.built[nrese.key].update(rust_image=nrese.rust_image(ctx), rustflags=rustflags)
+            # In the run's pinned id of its Rust image, as every container (ns.pin_images), never
+            # its tag looked up again; a dry run's echo names the tag.
+            tag = nrese.rust_image(ctx)
+            image = ns.pinned(self.root).get(tag) or (tag if self.args.dry_run else None)
+            if image is None:
+                self.say(f"the {nrese.key} build: its Rust image {tag} isn't pinned for this run")
+                return False
+            self.built[nrese.key].update(rust_image=tag, rust_image_id=image, rustflags=rustflags)
             rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
                                     "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
-                                    "-w", "/src", nrese.rust_image(ctx),
+                                    "-w", "/src", image,
                                     "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
         else:
@@ -424,8 +432,7 @@ class Suite:
             self.say(f"--skip-build requires an existing harness: {self.harness()} (set HARNESS)")
             return False
         self.say("building the harness (release)")
-        self.built["harness"] = {**{k: v for k, v in checkout_state(self.root).items() if k in ("commit", "dirty")},
-                                 **build_settings()}
+        self.built["harness"] = built_from(self.root, "harness")
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
         rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
                                 "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log)
@@ -985,6 +992,7 @@ class Suite:
             return
         entry = self.manifest.entry
         commit = entry["git"].get("commit") or ""
+        moved = checkout_moved(self.root, entry["git"])
         ctx = self.context_for_images()
         pins = ns.pinned(self.root)  # the ids the containers ran (runtime.py), never a tag looked up again
         child = plan.kind in ("kit", "driver")
@@ -998,7 +1006,8 @@ class Suite:
             scripted = set() if child else {tag for tag, _, _ in system.script_builds(ctx)}
             mine = receipts.unknown(f"a {plan.kind} plan's: its child's, not recorded here")
             out[cell] = {
-                **attempts[cell], "complete": True, "commit": commit, "dirty": entry["git"].get("dirty"),
+                **attempts[cell], "complete": True, "commit": receipts.unknown(moved) if moved else commit,
+                "dirty": entry["git"].get("dirty"),
                 "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
                 "images": mine if child else {
@@ -1152,11 +1161,62 @@ def repo_digests(image: str) -> set[str]:
         return set()
 
 
-def build_settings() -> dict[str, str]:
-    """A build's configuration from the environment it runs in: the CPU it compiles for
-    (NRESE_TARGET_CPU, scripts/lib/target-cpu.sh's; `native` unset) and the RUSTFLAGS it inherits.
-    The toolchain is the checkout's (rust-toolchain.toml, in the receipt's code)."""
-    return {"target_cpu": os.environ.get("NRESE_TARGET_CPU", "native"), "rustflags_env": os.environ.get("RUSTFLAGS", "")}
+def built_from(source: Path, program: str) -> dict:
+    """What a build of `program` ("nrese", "harness") compiles, as it starts: its checkout's commit and
+    dirty count (the build's own, recorded apart from the invocation's), the git ids of its
+    receipts.BUILD_SOURCES at that commit, what its build scripts read outside git (build_inputs),
+    and its configuration (build_settings, this process's)."""
+    state = {k: v for k, v in checkout_state(source).items() if k in ("commit", "dirty")}
+    return {**state, "sources": receipts.object_ids(source, state.get("commit") or "", receipts.BUILD_SOURCES[program]),
+            "inputs": build_inputs(source, program), **build_settings(os.environ)}
+
+
+def expected_build_inputs(program: str) -> dict:
+    """What a default build of `program` has for build_inputs: none of them holds a file (a fresh
+    checkout: the console build is ignored, never committed)."""
+    return {path: "no files" for path in receipts.BUILD_INPUTS[program]}
+
+
+def build_inputs(source: Path, program: str) -> dict:
+    """receipts.BUILD_INPUTS of `program` under `source` -> "no files" (missing or empty: a build
+    script embeds nothing either way), else "sha256:" over each file's path and SHA-256, in path
+    order; unknown, why, where it can't be read."""
+    out = {}
+    for path in receipts.BUILD_INPUTS[program]:
+        top = source / path
+        try:
+            def fail(error):
+                raise error
+            files = sorted((Path(folder, name) for folder, _, names in os.walk(top, onerror=fail, followlinks=True)
+                            for name in names), key=lambda f: f.relative_to(top).as_posix()) if top.is_dir() else []
+            digest = hashlib.sha256()
+            for f in files:
+                named = f.relative_to(top).as_posix()
+                digest.update(f"{named}\0{hashlib.sha256(f.read_bytes()).hexdigest()}\n".encode())
+            out[path] = f"sha256:{digest.hexdigest()}" if files else "no files"
+        except OSError as error:
+            out[path] = receipts.unknown(f"can't be read: {error}")
+    return out
+
+
+def checkout_moved(root: Path, start: dict) -> str:
+    """Why the checkout isn't the one a run started from (its manifest `git`), read again as a tier's
+    receipts are written, or "" (P2 design r4 R1): another commit, or changed since a clean start (a
+    dirty start is unqualified already). One that moves and comes back between two reads isn't seen."""
+    now = checkout_state(root)
+    if now.get("commit") != start.get("commit"):
+        return f"checkout moved during the run: {start.get('commit')} -> {now.get('commit')}"
+    if start.get("dirty") == 0 and now.get("dirty") != 0:
+        return f"checkout changed during the run: clean at its start, {now.get('dirty')} changed paths now"
+    return ""
+
+
+def build_settings(env: Mapping[str, str]) -> dict[str, str]:
+    """A build's configuration from the environment `env` it runs in, and nothing else: the CPU it
+    compiles for (NRESE_TARGET_CPU, scripts/lib/target-cpu.sh's; `native` unset) and the RUSTFLAGS it
+    inherits. build_settings({}) is the default build's (P2 design review r3 F14). The toolchain is the
+    checkout's (rust-toolchain.toml, in the build's sources)."""
+    return {"target_cpu": env.get("NRESE_TARGET_CPU", "native"), "rustflags_env": env.get("RUSTFLAGS", "")}
 
 
 @contextlib.contextmanager
