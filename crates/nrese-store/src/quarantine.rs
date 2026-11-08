@@ -474,6 +474,13 @@ impl Quarantine {
             log.write_all(format!("{line}\n").as_bytes())?;
             log.sync_data()?;
             if new {
+                #[cfg(test)]
+                if tests::FAIL_LOG_DIR_SYNC.get() {
+                    return Err(std::io::Error::other(
+                        "the quarantine's directory sync failed (a test's)",
+                    )
+                    .into());
+                }
                 nrese_engine::place::sync_dir(dir)?;
             }
         }
@@ -908,6 +915,80 @@ fn percent_encode(c: char, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The quarantine directory's sync after a resolution's append fails.
+        pub(super) static FAIL_LOG_DIR_SYNC: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// A discard is acknowledged only once its log's name is durable (DUR-3 fix check r1,
+    /// R2-F1). The first discard makes the resolutions log, appends and syncs it, and the sync
+    /// of the quarantine directory, which must name the log, fails: refused. Tried again with
+    /// that sync still failing, the log now there: refused too. Before the fix the log was taken
+    /// for durably named and the discard acknowledged. Once the sync works: acknowledged, and
+    /// kept across a reopen. Guard: a second discard into the durable log.
+    #[test]
+    fn a_discard_is_acknowledged_only_once_its_log_is_durably_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let file = dir.path().join("bad.nt");
+        fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> .\n\
+             <http://example.com/b> \"no predicate\" .\n",
+        )
+        .unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let ids: Vec<String> = store
+            .quarantine()
+            .list(&QuarantineFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.statement.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        let mut wrong = Vec::new();
+        FAIL_LOG_DIR_SYNC.set(true);
+        for row in ["the first discard", "tried again"] {
+            let discarded = store.quarantine().discard(&ids[..1], None);
+            eprintln!(
+                "row {row}: {}",
+                if discarded.is_err() { "ok" } else { "FAILED" }
+            );
+            if discarded.is_ok() {
+                wrong.push(format!(
+                    "{row}: acknowledged with its log's name not durable"
+                ));
+            }
+        }
+        FAIL_LOG_DIR_SYNC.set(false);
+        let discarded = store.quarantine().discard(&ids[..1], None);
+        if !matches!(discarded, Ok(1)) {
+            wrong.push(format!("once the sync works: {discarded:?}"));
+        }
+        let guard = store.quarantine().discard(&ids[1..], None);
+        if !matches!(guard, Ok(1)) {
+            wrong.push(format!("guard, the durable log: {guard:?}"));
+        }
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.quarantine().open_count() != 0 {
+            wrong.push(format!(
+                "after a reopen {} are open, not 0",
+                store.quarantine().open_count()
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     #[test]
     fn repairs_encode_inside_iris_only() {

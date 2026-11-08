@@ -1134,15 +1134,22 @@ fn store_directories_are_made_through_the_placement_owner() {
     for file in files {
         let text = std::fs::read_to_string(crates.join(file)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
+        // Inside an inline test module, any name, at the file's top level: skipped up to its
+        // closing brace (an out-of-line `mod tests;` is no module here: sol-loop round 4, S2).
+        let mut in_tests = false;
         for (n, line) in lines.iter().enumerate() {
-            // An inline test module ends the file's code (an out-of-line `mod tests;` doesn't:
-            // sol-loop round 4, S2).
+            if in_tests {
+                in_tests = *line != "}";
+                continue;
+            }
             let tests_begin = line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(n + 1)
-                    .is_some_and(|next| next.trim().ends_with("mod tests {"));
+                && lines.get(n + 1).is_some_and(|next| {
+                    let next = next.trim_start();
+                    next.contains("mod ") && next.trim_end().ends_with('{')
+                });
             if tests_begin {
-                break;
+                in_tests = true;
+                continue;
             }
             let makes = ["create_dir_all(", "create_dir(", "fs::rename("]
                 .into_iter()
@@ -1150,7 +1157,15 @@ fn store_directories_are_made_through_the_placement_owner() {
                     line.contains(call)
                         && !line.contains(&format!("place::{}", call.trim_start_matches("fs::")))
                 });
-            if makes && !exempt.iter().any(|exempt| line.contains(exempt)) {
+            // A raw write may only make a temporary, which is then synced and placed (fix check
+            // r1: the backup manifest was written under its own name, unsynced).
+            let writes = ["fs::write(", "File::create("]
+                .iter()
+                .any(|call| line.contains(call))
+                && !["tmp", "temporary", "staged", "partial", "placing"]
+                    .iter()
+                    .any(|temporary| line.contains(temporary));
+            if (makes || writes) && !exempt.iter().any(|exempt| line.contains(exempt)) {
                 found.push(format!("{file}:{}: {}", n + 1, line.trim()));
             }
         }

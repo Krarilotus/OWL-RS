@@ -397,6 +397,12 @@ impl StoreService {
             file.sync_all()?;
             drop(file);
             nrese_engine::place::rename(&temporary, &path)?;
+            #[cfg(test)]
+            if marker_tests::FAIL_MARKER_SYNC.get() {
+                return Err(std::io::Error::other(
+                    "the marker's directory sync failed (a test's)",
+                ));
+            }
             nrese_engine::place::sync_dir(&self.config.data_dir)
         })();
         placed.map_err(crate::error::StoreError::Io)?;
@@ -2003,6 +2009,79 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use std::cell::Cell;
+
+    use super::StoreService;
+    use crate::StoreConfig;
+
+    thread_local! {
+        /// The reasoning marker's directory sync fails, after its rename.
+        pub(super) static FAIL_MARKER_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A reasoning marker whose publication failed after its rename is still cleared by the
+    /// next clear of the inferences (DUR-3 fix check r1, R2-F2). A rematerialisation under RDFS
+    /// of `a a C . C subClassOf D` publishes its inferences, renames its marker into place, and
+    /// the marker's directory sync then fails: `InferencesNotRecorded`. The inferences are
+    /// cleared; the store must no longer claim them current, then or after a reopen, and a later
+    /// RDFS rematerialisation derives `a a D`. Before the fix the marker stayed while the store
+    /// took it for gone, so the clear left it: after it, the store claimed RDFS current with no
+    /// inferences (a wrong `NotEntailed` for `a a D`).
+    #[test]
+    fn a_marker_whose_placement_failed_is_still_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.nt");
+        std::fs::write(
+            &data,
+            "<http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.com/C> .\n<http://example.com/C> \
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> .\n",
+        )
+        .unwrap();
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        // A bulk load invalidates the reasoning: the store takes no marker to be in place.
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![data],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let program = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
+            .materialised_program()
+            .expect("RDFS reasons");
+        FAIL_MARKER_SYNC.set(true);
+        let refused = store.rematerialise(&program);
+        FAIL_MARKER_SYNC.set(false);
+        assert!(
+            matches!(refused, Err(crate::StoreError::InferencesNotRecorded(_))),
+            "{refused:?}"
+        );
+        store.clear_inferred().unwrap();
+        let mut wrong = Vec::new();
+        if store.reasoning_state().is_some() {
+            wrong.push("after the clear, the inferences are claimed current");
+        }
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.reasoning_state().is_some() {
+            wrong.push("after a reopen, the inferences are claimed current");
+        }
+        store.rematerialise(&program).unwrap();
+        let answer = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        if !String::from_utf8_lossy(&answer.payload).contains("true") {
+            wrong.push("a later RDFS rematerialisation doesn't derive a a D");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
 
 #[cfg(test)]
