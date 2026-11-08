@@ -147,7 +147,7 @@ impl Snapshot {
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Literals, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search_in(query, Some(&corpus));
+        let mut matches = self.underlying().text_search_in(query, Some(&corpus));
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
         Ok(matches)
     }
@@ -169,7 +169,7 @@ impl Snapshot {
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Subjects, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut found = self.dictionary.iri_search_in(query, Some(&corpus));
+        let mut found = self.underlying().iri_search_in(query, Some(&corpus));
         found.retain(|m| TermId::from_raw(m.id).payload() < known);
         if let Some((classes, true)) = self.corpus_classes(Documents::Subjects, model) {
             // Best first: the first of each class is its best identity's.
@@ -199,7 +199,7 @@ impl Snapshot {
     ) -> Result<super::VectorHits<'b>, nrese_exec::BudgetExceeded> {
         // The space first: no vector of the query's dimension, nothing found and nothing
         // reported, before a corpus is admitted (attack list item 7; sol-loop r1 S3).
-        let Some(input) = self.dictionary.vector_input(query) else {
+        let Some(input) = self.underlying().vector_input(query) else {
             let none = crate::VectorSearchReport {
                 space: 0,
                 graph: false,
@@ -441,7 +441,7 @@ impl Snapshot {
                     // Every typed literal is a member (of one word): the scan reads the
                     // vectors among them.
                     true => Bits::derived(&base, &changes, span, request, |_| 1)?,
-                    false => self.dictionary.with_text_index(iris, |index| {
+                    false => self.underlying().with_text_index(iris, |index| {
                         index.derive(&base, &changes, span, request)
                     })?,
                 }
@@ -535,10 +535,10 @@ impl Snapshot {
         Ok(match documents {
             Documents::Vectors => Bits::counted(bits, |_| 1),
             Documents::Literals => self
-                .dictionary
+                .underlying()
                 .with_text_index(false, |index| index.corpus(bits)),
             Documents::Subjects => self
-                .dictionary
+                .underlying()
                 .with_text_index(true, |index| index.corpus(bits)),
         })
     }
@@ -547,8 +547,8 @@ impl Snapshot {
     /// dictionary's entries.
     fn cover(&self, documents: Documents) {
         match documents {
-            Documents::Literals => self.dictionary.prepare_text(false, None),
-            Documents::Subjects => self.dictionary.prepare_text(true, None),
+            Documents::Literals => self.underlying().prepare_text(false, None),
+            Documents::Subjects => self.underlying().prepare_text(true, None),
             // The vector search covers its index itself, under its own lock.
             Documents::Vectors => {}
         }

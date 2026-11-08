@@ -246,10 +246,6 @@ impl Suffix {
 }
 
 /// [`Suffix::freeze`]'s view: the entries `start..start + len` when it was taken.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pending snapshots hold it in package 2")
-)]
 pub(crate) struct Frozen {
     start: u64,
     len: u64,
@@ -257,10 +253,6 @@ pub(crate) struct Frozen {
     starts: ChargedVec<u64>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pending snapshots read it in package 2")
-)]
 impl Frozen {
     pub(crate) fn len(&self) -> u64 {
         self.len
@@ -285,13 +277,6 @@ impl Frozen {
 }
 
 /// Entry `id`'s key among `chunks`, which start at `starts`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "pending snapshots read a frozen suffix in package 2"
-    )
-)]
 fn chunk_key<'c>(chunks: &'c [ChunkRef], starts: &[u64], id: u64) -> Option<&'c [u8]> {
     let at = starts
         .partition_point(|&start| start <= id)
