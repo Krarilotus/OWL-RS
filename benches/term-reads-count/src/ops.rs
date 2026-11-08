@@ -326,9 +326,11 @@ pub(crate) fn run(
     Ok(rows as u64)
 }
 
-/// `read` over `items` into `out`, both split into one part per thread. The threads start
-/// before the window opens and end after it closes, so neither is counted. A reader that
-/// panics still meets the barriers, and the run fails with its message.
+/// `read` over `items` into `out` (one result per item), both split into exactly `threads`
+/// parts, some empty if there are fewer items: as many readers as `noop` has at that thread
+/// count, so it calibrates every run. The threads start before the window opens and end after
+/// it closes, so neither is counted. A reader that panics still meets the barriers, and the
+/// run fails with its message.
 fn parallel<T: Sync, O: Send>(
     threads: usize,
     snapshot: &Snapshot,
@@ -341,8 +343,16 @@ fn parallel<T: Sync, O: Send>(
         // On the main thread, nothing to meet: the window holds the op alone.
         return window.count(|| read(snapshot, items, out));
     }
-    let size = items.len().div_ceil(threads);
-    let parts: Vec<(&[T], &mut [O])> = items.chunks(size).zip(out.chunks_mut(size)).collect();
+    let (mut items, mut out) = (items, out);
+    let mut parts: Vec<(&[T], &mut [O])> = Vec::with_capacity(threads);
+    for part in 0..threads {
+        // An equal share of what is left: the parts' sizes differ by one at most.
+        let size = items.len() / (threads - part);
+        let (these, rest) = items.split_at(size);
+        let (theirs, others) = std::mem::take(&mut out).split_at_mut(size);
+        parts.push((these, theirs));
+        (items, out) = (rest, others);
+    }
     let [start, done, end] = [(); 3].map(|()| Barrier::new(parts.len() + 1));
     std::thread::scope(|scope| {
         let readers: Vec<_> = parts
@@ -351,6 +361,9 @@ fn parallel<T: Sync, O: Send>(
                 let snapshot = snapshot.clone();
                 let (start, done, end, read) = (&start, &done, &end, &read);
                 scope.spawn(move || {
+                    // The allocator sets up a thread's heap on its first allocation (about
+                    // 7,500 instructions, measured): here, before the window, not in the op.
+                    drop(std::hint::black_box(Box::new(0_u64)));
                     start.wait();
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         read(&snapshot, part, out)
