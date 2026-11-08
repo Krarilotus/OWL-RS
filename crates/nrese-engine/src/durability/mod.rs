@@ -189,7 +189,7 @@ impl Durable {
         // deferred-sync design note). A root made: every level now, as a new store pays once.
         let found = root.is_dir();
         let holders: Vec<PathBuf> = match found {
-            true => place::holders(root),
+            true => place::holders(root)?,
             false => {
                 place::create_dir_all(root)?;
                 Vec::new()
