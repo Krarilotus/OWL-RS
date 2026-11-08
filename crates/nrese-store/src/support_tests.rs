@@ -412,3 +412,83 @@ fn the_closure_after_a_change_estimates_within_a_run_of_the_stop() {
          of {run} read between two of them"
     );
 }
+
+/// REAS-2 review r1 F4: a restricted reader's view is brought to a commit from the changed
+/// facts (`SupportSets::changes_since`), each counted before it is decided, and its store
+/// probes too. g16's reader, its sets computed, then a commit of 3,000 memberships of `C` in
+/// a graph it can't read: with their `x a D`, 6,000 changed facts that both versions hide,
+/// under the update's limit (a quarter of the earlier sets plus 10,000 touched facts), so
+/// the sets are updated, not recomputed; each is decided, then probed four times in the
+/// second pass. After the poller is made, the stop is asked at least once every
+/// `POLL_UNITS` plus one run of those decisions and probes. Hidden by both, a fact was
+/// decided with no count, and the second pass's probes had none.
+#[test]
+fn a_restricted_view_s_changes_are_counted_as_they_are_read() {
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let n = 3_000;
+    let store = past_the_cap();
+    // The update's pipeline sets its rules on the store (a new epoch), so it is made first,
+    // under the rules the sets are computed with.
+    let reasoner = nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::for_mode(
+        nrese_reasoner::ReasoningMode::for_ruleset(nrese_reasoner::rulesets::Ruleset::Owl2Rl),
+    ));
+    let pipeline = crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner));
+    let supports = store.supports();
+    let compilation = Compilation {
+        hide_unnamed_classes: false,
+        by_representatives: false,
+        compact: false,
+        cap: 16,
+    };
+    let working = Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: None,
+    };
+    let before = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&before).unwrap();
+    let earlier = supports
+        .compute(&before, &generation, compilation, &working)
+        .unwrap()
+        .unwrap();
+    let members: String = (0..n).map(|i| format!("<{EX}x{i}> a <{EX}C> . ")).collect();
+    pipeline
+        .execute_update(&crate::SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ GRAPH <{EX}hidden> {{ {members} }} }}"
+        )))
+        .unwrap();
+    let after = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&after).unwrap();
+    let sets = supports
+        .compute(&after, &generation, compilation, &working)
+        .unwrap()
+        .unwrap();
+    let changed = sets.since.as_ref().map_or(0, |(_, changed)| changed.len());
+    assert!(
+        changed >= n,
+        "{changed} facts changed: the sets weren't updated"
+    );
+    let access = GraphAccess {
+        graphs: vec![format!("{EX}g16")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    };
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || {
+        asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    };
+    let changes = sets
+        .changes_since(&after, &earlier, &before, &access, &working, &stop)
+        .expect("never stopped");
+    assert!(changes.is_some(), "the view is brought to the commit");
+    // Its poller's creation asks once; then each fact's decision and its four probes.
+    let asked = asks.load(std::sync::atomic::Ordering::Relaxed) - 1;
+    let (work, run) = (5 * changed, interval);
+    assert!(
+        asked >= work / (interval + run),
+        "{asked} asks of the stop for {changed} changed facts ({work} decisions and probes): more \
+         than {interval} plus one run of {run} between two of them"
+    );
+}

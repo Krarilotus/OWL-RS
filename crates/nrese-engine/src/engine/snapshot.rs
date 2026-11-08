@@ -858,14 +858,17 @@ impl Snapshot {
     /// the stored matches over representatives weighted by how many quads each stands for,
     /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
     /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
-    /// holds (its maximum then; PR #70 fix check 2 F3).
+    /// holds (its maximum then; PR #70 fix check 2 F3). `visit(1)` is called for each stored
+    /// quad it scans and each copy it expands; `None` as soon as it returns false
+    /// ([`Self::count_in_visiting`]).
     fn expanded_count(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
         limit: u64,
-    ) -> Count {
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<Count> {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
@@ -873,7 +876,10 @@ impl Snapshot {
         for stack in Stack::ALL {
             for quad in data.stack(stack).scan(&normalised) {
                 if count >= limit {
-                    return Count::AtLeast(count);
+                    return Some(Count::AtLeast(count));
+                }
+                if !visit(1) {
+                    return None;
                 }
                 if !quad.graph.is_default_graph() {
                     count += u64::from(
@@ -890,19 +896,27 @@ impl Snapshot {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
                         let (mut copies, wanted) = (0, limit - count);
+                        let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
+                            if !visit(1) {
+                                stopped = true;
+                                return std::ops::ControlFlow::Break(());
+                            }
                             copies += u64::from(visibility.shows(&copy, touching));
                             match copies >= wanted {
                                 true => std::ops::ControlFlow::Break(()),
                                 false => std::ops::ControlFlow::Continue(()),
                             }
                         });
+                        if stopped {
+                            return None;
+                        }
                         Some(copies)
                     }
                 };
                 match copies.and_then(|copies| count.checked_add(copies)) {
                     Some(sum) => count = sum,
-                    None => return Count::AtLeast(u64::MAX),
+                    None => return Some(Count::AtLeast(u64::MAX)),
                 }
             }
         }
@@ -912,18 +926,20 @@ impl Snapshot {
             && normalised != *pattern
             && !self.canonical
         {
-            count += self
-                .data(model)
-                .asserted
-                .scan(pattern)
-                .filter(|quad| !quad.graph.is_default_graph())
-                .take(usize::try_from(limit - count).unwrap_or(usize::MAX))
-                .count() as u64;
+            for quad in self.data(model).asserted.scan(pattern) {
+                if count >= limit {
+                    break;
+                }
+                if !visit(1) {
+                    return None;
+                }
+                count += u64::from(!quad.graph.is_default_graph());
+            }
         }
-        match count >= limit {
+        Some(match count >= limit {
             true => Count::AtLeast(count),
             false => Count::Exact(count),
-        }
+        })
     }
 
     /// An estimate of [`count_in`](Self::count_in) for planning, O(r log n): with
@@ -1140,10 +1156,26 @@ impl Snapshot {
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
     /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
+        self.count_in_visiting(model, pattern, &mut |_| true)
+            .expect("never stopped")
+    }
+
+    /// [`Self::count_in`], calling `visit(n)` for the work as it goes: each stored quad
+    /// `expanded_count` scans and each copy it expands (1 each), each run a held count reads
+    /// (that run's tombstone words + 1), each quad a default-graph post-filter scans (1
+    /// each). `None` as soon as `visit` returns false: the count is abandoned, nothing is
+    /// cached. A reader whose stop must see a long count counts with it (REAS-2 review r1 F2:
+    /// maintenance's estimates under compact equality scan the stored matches).
+    pub fn count_in_visiting(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<Count> {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, u64::MAX);
+            return self.expanded_count(&classes, model, pattern, u64::MAX, visit);
         }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan, both
@@ -1157,19 +1189,32 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            return Count::Exact(self.held_count(model, &every) - self.held_count(model, &default));
+            let every = self.held_count(model, &every, visit)?;
+            let default = self.held_count(model, &default, visit)?;
+            return Some(Count::Exact(every - default));
         }
-        Count::Exact(self.held_count(model, pattern))
+        self.held_count(model, pattern, visit).map(Count::Exact)
     }
 
-    /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion.
-    fn held_count(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+    /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion,
+    /// each run's work visited (`IndexVersion::count_plan_visiting`).
+    fn held_count(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<u64> {
         let plan = AccessPlan::for_pattern(pattern);
-        Stack::ALL
-            .into_iter()
-            .filter(|&stack| model.includes(stack))
-            .map(|stack| self.data(model).stack(stack).count_plan(&plan))
-            .sum()
+        let mut sum = 0;
+        for stack in Stack::ALL {
+            if model.includes(stack) {
+                sum += self
+                    .data(model)
+                    .stack(stack)
+                    .count_plan_visiting(&plan, visit)?;
+            }
+        }
+        Some(sum)
     }
 
     /// True if some quad matches `pattern` in `model`; cheaper than
@@ -1178,7 +1223,11 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, 1).at_least() > 0;
+            return self
+                .expanded_count(&classes, model, pattern, 1, &mut |_| true)
+                .expect("never stopped")
+                .at_least()
+                > 0;
         }
         if pattern.graph == GraphSelector::AnyNamed {
             return self.count_in(model, pattern).at_least() > 0;

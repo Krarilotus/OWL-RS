@@ -40,8 +40,13 @@ impl<'a> EngineBase<'a> {
         }
     }
 
-    /// Whether `fact` was in the state before the transaction (any graph, either stack).
-    fn known_before(&self, fact: Triple) -> bool {
+    /// Whether `fact` was in the state before the transaction (any graph, either stack): one
+    /// lookup, counted on `poll` before it is made (review r1 F5). Stopped, it reads as not
+    /// known, an answer the caller discards.
+    fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> bool {
+        if poll.tick() {
+            return false;
+        }
         let [s, p, o] = fact.map(Some);
         self.snapshot
             .quads_for_pattern_in(
@@ -83,11 +88,18 @@ impl VisitsBase for EngineBase<'_> {
         self.inserts.visit(bound, visit);
     }
 
+    /// The engine's count's work counted on `probe` as it goes (review r1 F2: under compact
+    /// equality it scans the stored matches); stopped, 0, an answer the stage's check
+    /// discards.
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
-        let committed = self
-            .snapshot
-            .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
-            .at_least();
+        let Some(committed) = self.snapshot.count_in_visiting(
+            ReadModel::Materialised,
+            &pattern(bound, GraphSelector::Any),
+            &mut |n| probe.visited(n),
+        ) else {
+            return 0;
+        };
+        let committed = committed.at_least();
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
         usize::try_from(committed)
@@ -259,19 +271,29 @@ pub fn maintain_with(
         // derived one known before) count on the commit's stop, as the update's do.
         let stop: crate::eval::Stop<'_> = &|| operation.fired();
         let prep = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
-        // Facts new to the state: in no graph and not inferred before the transaction.
+        // Facts new to the state: in no graph and not inferred before the transaction. Each
+        // lookup in the state before counts on `prep` (review r1 F5); stopped, a filter's
+        // output means nothing and the maintenance ends there.
         let mut inserted: Vec<Triple> = tx
             .inserted()
             .map(triple)
-            .filter(|&t| !base.known_before(t))
+            .filter(|&t| !base.known_before(t, &prep))
             .collect();
+        if prep.stopped() {
+            return Err(operation.interrupted());
+        }
         if !(inserted.is_empty() && tx.deleted().next().is_none()) {
             missing_axioms = program
                 .axioms
                 .iter()
                 .copied()
-                .filter(|&axiom| !base.known_before(axiom) && !base.inserts.contains(axiom, &prep))
+                .filter(|&axiom| {
+                    !base.known_before(axiom, &prep) && !base.inserts.contains(axiom, &prep)
+                })
                 .collect();
+            if prep.stopped() {
+                return Err(operation.interrupted());
+            }
             inserted.extend(missing_axioms.iter().copied());
         }
         if let Some(closure) = rebuilt.as_ref().filter(|_| !first_load) {
@@ -280,8 +302,11 @@ pub fn maintain_with(
                     .inferred
                     .iter()
                     .map(|t| triple(t.in_default_graph()))
-                    .filter(|&fact| !base.known_before(fact)),
+                    .filter(|&fact| !base.known_before(fact, &prep)),
             );
+            if prep.stopped() {
+                return Err(operation.interrupted());
+            }
         }
         inserted.sort_unstable();
         inserted.dedup();

@@ -976,12 +976,15 @@ impl Run {
         }
     }
 
-    fn estimate(&self, s: Option<u64>, o: Option<u64>) -> usize {
+    /// An upper bound on the pairs matching the bound positions: a chunk range read per chunk
+    /// the key's pairs span, each counted on `probe` (review r1 F2: a key can span many
+    /// chunks).
+    fn estimate(&self, s: Option<u64>, o: Option<u64>, probe: Probe<'_, '_>) -> usize {
         match (s, o) {
             (Some(s), Some(o)) => usize::from(self.contains(s, o)),
-            (Some(s), None) => self.so.range(s).map(<[Pair]>::len).sum(),
+            (Some(s), None) => probe.counted(self.so.range(s)).map(<[Pair]>::len).sum(),
             (None, Some(o)) => match &self.os {
-                Some(os) => os.range(o).map(<[Pair]>::len).sum(),
+                Some(os) => probe.counted(os.range(o)).map(<[Pair]>::len).sum(),
                 None => self.so.len(),
             },
             (None, None) => self.so.len(),
@@ -1241,10 +1244,14 @@ impl Relation {
                 }
             }
             None => {
-                if poll.attempt(self.delta.len()) {
+                // Each pair read counted as it is read (review r1 F1).
+                let mut objects: Vec<u64> = poll
+                    .counted(self.delta.so.iter())
+                    .map(|&(_, o)| o)
+                    .collect();
+                if poll.stopped() {
                     return;
                 }
-                let mut objects: Vec<u64> = self.delta.so.iter().map(|&(_, o)| o).collect();
                 objects.sort_unstable();
                 objects.dedup();
                 objects.into_iter().for_each(f);
@@ -1370,14 +1377,16 @@ impl Relation {
     }
 
     /// An upper bound on the matches of the bound positions in `seg`.
-    fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> usize {
+    fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg, probe: Probe<'_, '_>) -> usize {
         match seg {
             Seg::Delta | Seg::DeltaNotBy(_) => match self.skips(seg) {
                 Some(marks) if marks.all => 0,
-                _ => self.delta.estimate(s, o),
+                _ => self.delta.estimate(s, o, probe),
             },
             Seg::Old | Seg::All => {
-                self.input.estimate(s, o) + self.base.estimate(s, o) + self.recent.estimate(s, o)
+                self.input.estimate(s, o, probe)
+                    + self.base.estimate(s, o, probe)
+                    + self.recent.estimate(s, o, probe)
             }
         }
     }
@@ -1502,11 +1511,23 @@ impl Store {
     /// Those searches were 54 % of LUBM 100's reasoning samples, but mostly the cache
     /// misses at their targets, which a finger keeps: the reasoning took 6 % less.
     /// Returns how often it started the runs from the beginning: once per relation.
-    fn retain_new(&self, facts: &mut Vec<Triple>) -> u64 {
+    /// Each fact's probe counted on `poll`, a run of at most [`RUN`] at a time (review r1 F1:
+    /// a morsel bounds its drivers, not its output); stopped, the rest is dropped, and the
+    /// morsel, which asks its poller next, keeps nothing.
+    fn retain_new(&self, facts: &mut Vec<Triple>, poll: &Poller<'_>) -> u64 {
         let mut at: Option<(u64, Option<&Relation>)> = None;
         let mut fingers = [PairsFinger::default(); 3];
         let mut starts = 0;
+        let (len, mut seen) = (facts.len(), 0usize);
+        let mut stopped = false;
         facts.retain(|&[s, p, o]| {
+            if seen % RUN == 0 && !stopped {
+                stopped = poll.attempt(RUN.min(len - seen));
+            }
+            seen += 1;
+            if stopped {
+                return false;
+            }
             if at.is_none_or(|(q, _)| q != p) {
                 at = Some((p, self.relation(p)));
                 fingers = [PairsFinger::default(); 3];
@@ -1677,18 +1698,19 @@ impl Store {
                 let Some(poll) = Poller::new(stop) else {
                     return out;
                 };
-                // The pairs of `slices`, counted before they are read; false once stopped.
+                // The pairs of `slices`, each counted as it is read (review r1 F1: a slice is
+                // a whole chunk, or the whole input); false once stopped.
                 let read = |out: &mut Vec<Triple>,
                             slices: &mut dyn Iterator<Item = &[Pair]>,
                             swapped: bool| {
                     for slice in slices {
-                        if poll.attempt(slice.len()) {
-                            return false;
-                        }
-                        out.extend(slice.iter().map(|&(a, b)| match swapped {
+                        out.extend(poll.counted(slice).map(|&(a, b)| match swapped {
                             true => [b, p, a],
                             false => [a, p, b],
                         }));
+                        if poll.stopped() {
+                            return false;
+                        }
                     }
                     !poll.tick()
                 };
@@ -1717,15 +1739,14 @@ impl Store {
                             }
                         }
                         None => {
-                            if poll.attempt(run.so.len()) {
-                                return Vec::new();
-                            }
                             out.extend(
-                                run.so
-                                    .iter()
+                                poll.counted(run.so.iter())
                                     .filter(|(_, o)| terms.contains(o))
                                     .map(|&(s, o)| [s, p, o]),
                             );
+                            if poll.stopped() {
+                                return Vec::new();
+                            }
                         }
                     }
                 }
@@ -1851,11 +1872,15 @@ impl Visits for Store {
         }
     }
 
+    /// Each relation asked about counted as it is asked, and each chunk range it reads
+    /// (review r1 F1, F2).
     fn size(&self, [s, p, o]: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
         match p {
-            Some(p) => self.relation(p).map_or(0, |r| r.estimate(s, o, seg)),
-            None if !probe.units(self.relations.len()) => 0,
-            None => self.relations.iter().map(|r| r.estimate(s, o, seg)).sum(),
+            Some(p) => self.relation(p).map_or(0, |r| r.estimate(s, o, seg, probe)),
+            None => probe
+                .counted(&self.relations)
+                .map(|r| r.estimate(s, o, seg, probe))
+                .sum(),
         }
     }
 
@@ -1869,13 +1894,18 @@ impl Visits for Store {
         seg: Seg,
         probe: Probe<'_, '_>,
     ) -> Option<usize> {
-        if p.is_none() && !probe.units(self.relations.len()) {
-            return Some(0);
-        }
-        self.relations_of(p)
+        // Each relation asked about, and each slice it holds of the matches, counted as it is
+        // read (review r1 F1, F2).
+        probe
+            .counted(self.relations_of(p))
             .map(|(_, relation)| {
                 let slices = relation.matching(s, o, seg)?;
-                Some(slices.iter().map(|slice| slice.pairs.len()).sum::<usize>())
+                Some(
+                    probe
+                        .counted(slices.iter())
+                        .map(|slice| slice.pairs.len())
+                        .sum::<usize>(),
+                )
             })
             .sum()
     }
@@ -2958,12 +2988,9 @@ fn run_body(
         }
         let probes = Probes::for_jobs(jobs.len());
         let starts = std::sync::atomic::AtomicU64::new(0);
-        // One probe per fact, counted before they are read.
+        // One probe per fact, counted as they are made ([`Store::retain_new`]).
         let keep = |facts: &mut Vec<Triple>, poll: &Poller<'_>| {
-            if poll.attempt(facts.len()) {
-                return;
-            }
-            let n = store.retain_new(facts);
+            let n = store.retain_new(facts, poll);
             starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         };
         candidates.extend(run_jobs_by_morsel(

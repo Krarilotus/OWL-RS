@@ -422,17 +422,13 @@ impl InGraphs<'_> {
     }
 }
 
-/// The call counted, then the fact's entries, ahead.
+/// The call counted, then the fact's entries as they are handed on (review r1 F1).
 impl Graphs for InGraphs<'_> {
     fn each(&self, fact: Triple, poll: &Poller<'_>, graph: &mut dyn FnMut(u32)) {
         if poll.tick() {
             return;
         }
-        let entries = self.of(fact);
-        if poll.attempt(entries.len()) {
-            return;
-        }
-        entries.iter().for_each(|&(_, g)| graph(g));
+        poll.counted(self.of(fact)).for_each(|&(_, g)| graph(g));
     }
 
     fn holds(&self, fact: Triple, graph: u32, poll: &Poller<'_>) -> bool {

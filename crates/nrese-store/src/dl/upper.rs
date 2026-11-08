@@ -427,9 +427,11 @@ struct UpperBase<'a> {
 }
 
 impl UpperBase<'_> {
-    /// Whether the view has `s p o`, `o` standing for every literal of its value.
-    fn in_view(&self, [s, p, o]: Triple) -> bool {
-        self.values.members(o).any(|o| {
+    /// Whether the view has `s p o`, `o` standing for every literal of its value: each
+    /// member's lookup counted on `poll` before it is made (review r1 F3: a value can be
+    /// written in many ways). Stopped, it answers false, which the stage's check discards.
+    fn in_view(&self, [s, p, o]: Triple, poll: &Poller<'_>) -> bool {
+        poll.counted(self.values.members(o)).any(|o| {
             self.view
                 .quads_for_pattern_in(
                     ReadModel::Materialised,
@@ -446,10 +448,14 @@ impl UpperBase<'_> {
 impl VisitsBase for UpperBase<'_> {
     fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         let [s, p, o] = bound;
-        let objects: Vec<Option<u64>> = match o {
-            Some(o) => self.values.members(o).map(Some).collect(),
-            None => vec![None],
-        };
+        // A bound object's members read as they are visited, never copied first (review r1
+        // F3: a value can be written in many ways).
+        let objects = o
+            .map(|o| self.values.members(o))
+            .into_iter()
+            .flatten()
+            .map(Some)
+            .chain(o.is_none().then_some(None));
         for o in objects {
             // Each member's lookup is a unit.
             if !visit.skip() {
@@ -483,11 +489,18 @@ impl VisitsBase for UpperBase<'_> {
         });
     }
 
+    /// The view's count's work counted on `probe` as it goes (review r1 F2); stopped, 0, an
+    /// answer the stage's check discards.
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
-        let view = self
-            .view
-            .count_in(ReadModel::Materialised, &pattern(bound))
-            .at_least();
+        let Some(view) =
+            self.view
+                .count_in_visiting(ReadModel::Materialised, &pattern(bound), &mut |n| {
+                    probe.visited(n)
+                })
+        else {
+            return 0;
+        };
+        let view = view.at_least();
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
         usize::try_from(view)
@@ -500,10 +513,9 @@ impl VisitsBase for UpperBase<'_> {
         self.stack.contains(&fact) || self.asserts(fact, probe)
     }
 
-    /// Each literal member the view is asked about is a unit.
+    /// Each literal member the view is asked about is a unit, counted as it is asked.
     fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.facts.contains(&fact)
-            || (probe.units(self.values.members(fact[2]).count()) && self.in_view(fact))
+        self.facts.contains(&fact) || self.in_view(fact, probe.poller())
     }
 }
 
@@ -893,7 +905,14 @@ impl Upper {
             stack: &self.stack,
             values: &values,
         };
-        deleted.retain(|t| !base.in_view(*t));
+        // Each deleted fact's lookups in the view, counted on the commit's stop (review r1 F3);
+        // stopped, the list means nothing and the change ends here.
+        let stopped = || GaveUp::new("the upper bound's maintenance was stopped");
+        let prep = Poller::new(stop).ok_or_else(stopped)?;
+        deleted.retain(|t| !base.in_view(*t, &prep));
+        if prep.stopped() {
+            return Err(stopped());
+        }
         let mut change = Change {
             moved,
             ..Change::default()
@@ -924,7 +943,6 @@ impl Upper {
         change.merges = inserted.iter().any(equates) || update.insert.iter().any(equates);
         change.remove = update.remove;
         // A probe per inserted fact, on the commit's stop as the update's reads are.
-        let stopped = || GaveUp::new("the upper bound's maintenance was stopped");
         let poll = Poller::new(stop).ok_or_else(stopped)?;
         change.insert = update
             .insert
