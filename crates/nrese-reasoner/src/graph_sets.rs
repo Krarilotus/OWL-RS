@@ -400,7 +400,8 @@ pub fn initial_sets(graphs: Vec<u32>, axiom: bool, cap: usize) -> Annotation {
 fn minimal(mut sets: Vec<GraphSet>, cap: usize, own: &dyn Fn(&GraphSet) -> bool) -> Annotation {
     sets.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
     sets.dedup();
-    let mut out: Vec<GraphSet> = Vec::new();
+    // At most `cap` and at most the input: allocated once, at the size a caller charges.
+    let mut out: Vec<GraphSet> = Vec::with_capacity(sets.len().min(cap));
     let (mut truncated, mut beyond_own) = (false, false);
     for set in sets {
         if out.iter().any(|kept| kept.is_subset(&set)) {
@@ -498,7 +499,14 @@ fn support_sets_run(
         }
         let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
             .map_err(Stopped::Refused)?;
-        merge(&mut sets, fact, from, cap, graphs_of, &mut annotations);
+        merge(
+            &mut sets,
+            fact,
+            from.annotation.clone(),
+            cap,
+            graphs_of,
+            &mut annotations,
+        );
     }
     // The rules with their schema premises; transitivity as a rule here (the module's
     // closure has no instances to annotate).
@@ -583,12 +591,17 @@ fn support_sets_run(
                     .map_err(Stopped::Refused)?;
             }
         }
+        // The rules' schema parts' charges, for the round (their jobs hold copies).
+        let mut schemas_held: Vec<Held<'_>> = Vec::new();
         let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Annotation)> = Vec::new();
         for (k, &(rule, grounding)) in rules.iter().enumerate() {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
-            let schema = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
+            let held = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
                 .map_err(Stopped::Refused)?;
+            let schema = held.annotation.clone();
+            // Its charge kept for the round, while its jobs hold copies of it.
+            schemas_held.push(held);
             let Head::Facts(heads) = &rule.head else {
                 continue;
             };
@@ -1150,7 +1163,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
     let fired = || run.fired();
     // The schema facts' part per rule: they aren't affected, so it is fixed. A sequential
     // stage with its own poller (sol-loop r7, R7-1), checked before its sets are used.
-    let schemas: Vec<Annotation> = {
+    let schemas: Vec<Held<'_>> = {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
@@ -1201,7 +1214,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                     // latches the run, which its pollers see.
                     let mut from = run.found();
                     let mut refused = false;
-                    let mut take = |found: Result<Annotation, BudgetExceeded>| {
+                    let mut take = |found: Result<Held<'_>, BudgetExceeded>| {
                         if refused {
                             return;
                         }
@@ -1372,6 +1385,32 @@ fn merge_found(
     ))
 }
 
+/// An annotation of the support algebra and the charge of what its sets hold, on the run's
+/// working budget: the caller holds both until it has taken the sets (review r1 C1, sol-loop
+/// r5 S1). Fields drop in order: the sets before their charge.
+struct Held<'a> {
+    annotation: Annotation,
+    _charge: Reservation<&'a Budget>,
+}
+
+impl<'a> Held<'a> {
+    /// `annotation`, with nothing more charged for it (sets held inline, or nothing).
+    fn uncharged(annotation: Annotation, run: &Run<'a>) -> Self {
+        Self {
+            annotation,
+            _charge: Reservation::new(&**run.scratch),
+        }
+    }
+}
+
+impl std::ops::Deref for Held<'_> {
+    type Target = Annotation;
+
+    fn deref(&self) -> &Annotation {
+        &self.annotation
+    }
+}
+
 /// One fact's reduced derivations ([`found`]) as an annotation: their sets, marked if one
 /// was ([`merge`] reads the mark as one beyond the fact's own graphs).
 fn annotation_of(entries: &[found::Entry]) -> Annotation {
@@ -1468,26 +1507,28 @@ fn delta_facts(store: &Store) -> Vec<Triple> {
 /// Every alternative's sets are held together until `minimal` chooses among them: their
 /// slots and words are charged to `run`'s working budget as they are added, and held
 /// through `minimal` (review r1 C1); `Err` where it has no room.
-fn grounding_sets<L: Lookup + ?Sized>(
+fn grounding_sets<'a, L: Lookup + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
     sets: &L,
     cap: usize,
     empty: &Annotation,
     poll: &mut Poller<'_>,
-    run: &Run<'_>,
-) -> Result<Annotation, BudgetExceeded> {
-    let budget: &Budget = run.scratch;
-    let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(budget);
+    run: &Run<'a>,
+) -> Result<Held<'a>, BudgetExceeded> {
+    let budget: &'a Budget = run.scratch;
+    // Before the sets: locals drop in reverse, the sets first (sol-loop r5 S2).
     let mut held_words = Reservation::new(budget);
+    let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(budget);
     let (mut truncated, mut refused) = (false, None);
     program.for_each_alternative(grounding, poll, |premises, _| {
         let added = premise_sets_from(premises, empty, sets, cap, run).and_then(|found| {
             truncated |= found.truncated;
             held_words.charge(words(&found.sets))?;
-            let n = found.sets.len();
+            let Held { annotation, .. } = found;
+            let n = annotation.sets.len();
             all.fill(n, |room| {
-                found.sets.into_iter().for_each(|set| room.push(set))
+                annotation.sets.into_iter().for_each(|set| room.push(set))
             })
         });
         match added {
@@ -1501,13 +1542,19 @@ fn grounding_sets<L: Lookup + ?Sized>(
     if let Some(exceeded) = refused {
         return Err(exceeded);
     }
-    // The sets' slots charged until `minimal` has consumed them; their words beside them.
+    // `minimal`'s output charged before it is made; the sets' slots charged until it has
+    // consumed them, their words beside them; then the output's charge alone kept.
+    let mut charge = run.room(slots(all.len().min(cap)))?;
     let (all, _slots) = all.into_parts();
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
     let mut out = minimal(all, cap, &|_| false);
     out.truncated |= truncated;
     out.beyond_own |= truncated;
-    Ok(out)
+    charge.resize(slots(out.sets.capacity()) + words(&out.sets))?;
+    Ok(Held {
+        annotation: out,
+        _charge: charge,
+    })
 }
 
 /// The minimal unions of the sets `start` with one set per premise of `body`, marked if
@@ -1517,13 +1564,13 @@ fn grounding_sets<L: Lookup + ?Sized>(
 /// `run`'s working budget before it is built and held until `minimal` has consumed it: its
 /// slots, and at most the longer operand's words per union (review r1 C1); `Err` where it
 /// has no room. Exact: `minimal` sees the whole product, as before.
-fn premise_sets_from<L: Lookup + ?Sized>(
+fn premise_sets_from<'a, L: Lookup + ?Sized>(
     body: &[Triple],
     start: &Annotation,
     sets: &L,
     cap: usize,
-    run: &Run<'_>,
-) -> Result<Annotation, BudgetExceeded> {
+    run: &Run<'a>,
+) -> Result<Held<'a>, BudgetExceeded> {
     // The usual case, one set everywhere: a single union, nothing to minimise.
     if let [only] = start.sets.as_slice() {
         let mut one = only.clone();
@@ -1531,7 +1578,7 @@ fn premise_sets_from<L: Lookup + ?Sized>(
         let mut single = true;
         for premise in body {
             let Some(own) = sets.sets_of(premise) else {
-                return Ok(Annotation::default());
+                return Ok(Held::uncharged(Annotation::default(), run));
             };
             match own.sets.as_slice() {
                 [set] => {
@@ -1545,24 +1592,39 @@ fn premise_sets_from<L: Lookup + ?Sized>(
             }
         }
         if single {
-            return Ok(Annotation {
+            // One set: its list's slot and words charged where it holds any on the heap
+            // (none charged per instance otherwise: no shared atomic per derivation).
+            let held = one.heap_bytes();
+            let annotation = Annotation {
                 sets: vec![one],
                 truncated,
                 beyond_own: truncated,
-            });
+            };
+            return match held {
+                0 => Ok(Held::uncharged(annotation, run)),
+                _ => Ok(Held {
+                    _charge: run.room(slots(1) + held)?,
+                    annotation,
+                }),
+            };
         }
     }
+    // The product as it stands, held under `held` until the next replaces it (sol-loop r5
+    // S1): declared first, so it drops after the sets.
+    let mut held = run.room(slots(start.sets.len()) + words(&start.sets))?;
     let mut product = start.clone();
     for premise in body {
         let Some(own) = sets.sets_of(premise) else {
-            return Ok(Annotation::default());
+            return Ok(Held::uncharged(Annotation::default(), run));
         };
-        // Charged first: past what a budget can count, refused as having no room.
+        // Charged first: the unions (their slots, at most the longer operand's words each)
+        // and `minimal`'s output beside them; past what a budget can count, refused.
         let n = product.sets.len().saturating_mul(own.sets.len());
         let bytes = slots(n)
+            .saturating_add(slots(n.min(cap)))
             .saturating_add(own.sets.len().saturating_mul(words(&product.sets)))
             .saturating_add(product.sets.len().saturating_mul(words(own.sets.iter())));
-        let _room = run.room(bytes)?;
+        let mut room = run.room(bytes)?;
         let mut next = Vec::with_capacity(n);
         for a in &product.sets {
             for b in own.sets.iter() {
@@ -1570,14 +1632,21 @@ fn premise_sets_from<L: Lookup + ?Sized>(
             }
         }
         let truncated = product.truncated || own.truncated;
+        // The step's product replaces the last (freed under its charge, still held), and
+        // only what it holds stays charged.
         product = minimal(next, cap, &|_| false);
         product.truncated |= truncated;
         product.beyond_own |= truncated;
+        room.resize(slots(product.sets.capacity()) + words(&product.sets))?;
+        held = room;
     }
     // A premise without sets yet: the instance gives nothing now, whatever was cut.
     Ok(match product.is_empty() {
-        true => Annotation::default(),
-        false => product,
+        true => Held::uncharged(Annotation::default(), run),
+        false => Held {
+            annotation: product,
+            _charge: held,
+        },
     })
 }
 
@@ -1609,6 +1678,45 @@ fn merge(
 
 #[cfg(test)]
 mod tests {
+    /// Sol-loop r5 S1, by the allocator (`nrese_exec::measure`, which `Budget::peak` can't
+    /// replace: it sees allocations nothing charged). A premise product's unions and
+    /// `minimal`'s output are charged before they are made, the product's charge lives as long
+    /// as it does, and the result's goes with it: nothing held beyond the charge, at a cap as
+    /// large as the product (every union kept). Rows: unions inline, and unions whose words
+    /// spill past 128 graphs.
+    #[test]
+    fn a_premise_product_holds_nothing_beyond_its_charge() {
+        use super::{Annotation, GraphSet, Limits, Run, premise_sets_from};
+        use hashbrown::HashMap;
+        use nrese_exec::{Budget, measure};
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        let n = 64u32;
+        for (what, b) in [("inline", 64u32), ("spilled", 200)] {
+            let (p, q) = ([1, 2, 3], [3, 2, 4]);
+            let mut sets: HashMap<[u64; 3], Annotation> = HashMap::new();
+            let family = |graphs: std::ops::Range<u32>| Annotation {
+                sets: graphs.map(GraphSet::of).collect(),
+                ..Annotation::default()
+            };
+            sets.insert(p, family(0..n));
+            sets.insert(q, family(b..b + n));
+            let start = Annotation::empty_set();
+            let cap = (n * n) as usize;
+            let budget = Arc::new(Budget::unlimited());
+            let (kept, excess) = measure::measure_within(&budget, || {
+                let run = Run::new(Limits::unlimited(&budget));
+                let held = premise_sets_from(&[p, q], &start, &sets, cap, &run).unwrap();
+                held.sets.len()
+            });
+            assert_eq!(kept, cap, "{what}: every union kept");
+            assert_eq!(excess, 0, "{what}: {excess} bytes held beyond the charge");
+            assert_eq!(budget.used(), 0, "{what}: still charged");
+        }
+    }
+
     /// Against the definition, over random ontologies spread over three graphs: for every
     /// set R of graphs, the facts with a support set inside R are exactly the closure of
     /// the statements in R (no cap).
