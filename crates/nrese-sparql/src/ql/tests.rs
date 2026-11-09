@@ -427,6 +427,41 @@ fn rewritings_with_other_closures_keep_their_own_tboxes_of_a_version() {
     assert!(Arc::ptr_eq(&on_ql, &ql.tbox(&pending, None)));
 }
 
+/// A probe asks the default graph the query reads, which the union mode decides (sol-loop
+/// r1 S1): a store's own snapshot and a pending one, read in one mode then the other, each
+/// get their answers, whether the probes are the store's or the version's. Here the witness
+/// is only in a named graph: in the union it is realised, outside it the rewriting answers.
+#[test]
+fn probes_are_kept_per_default_graph_mode() {
+    let engine = engine("");
+    let mut tx = engine.transaction();
+    tx.insert(
+        Quad::new(
+            NamedNode::new_unchecked(format!("{EX}ann")),
+            NamedNode::new_unchecked(format!("{EX}worksFor")),
+            NamedNode::new_unchecked(format!("{EX}acme")),
+            GraphName::NamedNode(NamedNode::new_unchecked(format!("{EX}g"))),
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(quad("bob", &format!("{EX}knows"), "acme").as_ref());
+    let pending = tx.pending_snapshot();
+    let expected = ["<http://example.org/ann>"];
+    for snapshot in [&engine.snapshot(), &pending] {
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        for union in [true, false, true] {
+            let options = QueryOptions {
+                union_default_graph: union,
+                ..sharing(&ql)
+            };
+            let report = check(snapshot, &options, &expected);
+            assert_eq!(report.realised, usize::from(union), "union {union}");
+        }
+    }
+}
+
 /// A mask of a published snapshot is published (dictionary 3.0): changing only its
 /// inferred mask, the schema read reuses the kept TBox, and its answers and probes are what
 /// a fresh rewriting gives it (review r0 §5 item 4).
