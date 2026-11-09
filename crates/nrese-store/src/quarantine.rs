@@ -285,6 +285,7 @@ impl Quarantine {
                         Err(_) if !terminated => {
                             // Recovery must remove the torn tail, or the next record would
                             // join it and an acknowledged resolution would disappear on reopen.
+                            tracing::warn!(bytes = line.len(), record = %String::from_utf8_lossy(&line), "truncating a torn quarantine resolution");
                             drop(reader);
                             log.set_len(framed)?;
                             log.sync_data()?;
