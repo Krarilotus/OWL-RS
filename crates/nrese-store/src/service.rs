@@ -230,12 +230,19 @@ impl StoreService {
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
+        // So does what client transactions keep between requests.
+        let sessions = crate::sessions::Sessions::within(
+            std::sync::Arc::new(
+                nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+            ),
+            crate::sessions::SESSION_IDLE,
+        );
         let service = Self {
             process_memory,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
-            sessions: std::sync::Arc::default(),
+            sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),

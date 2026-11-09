@@ -273,8 +273,12 @@ fn add(
         .sessions()
         .add(session, access.origin.as_deref(), ops)
     {
-        true => Ok(StatusCode::NO_CONTENT),
-        false => Err(no_session(session)),
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(no_session(session)),
+        Err(refused) => Err(super::sparql::map_query_error(
+            &state.policy(),
+            refused.into(),
+        )),
     }
 }
 
