@@ -1456,7 +1456,7 @@ impl<'a> Context<'a> {
             // Besides the context's options, a result depends on the base IRI (`IRI()`)
             // and on the user's access, which may hide inferred statements.
             let fixed = format!("{base:?} {:?}", options.access);
-            ctx.cache = ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into());
+            ctx.cache = Some(ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into()));
         }
         ctx.evaluator.set_canonical(ctx.canonical.clone());
         ctx

@@ -44,9 +44,17 @@
 //!
 //! **Published state only** (the lifecycle contract's S3). Everything that changes what
 //! other queries find (a claim, a pin, a revision's advance, an offer, an output slot, the
-//! insert and its evictions) takes the engine's [`SharedState`] of the snapshot computed on,
-//! and the key it stores under has that snapshot's identity: a writer's pending state, a
-//! speculative or private one, never reaches it. Looking a key up needs no token.
+//! insert and its evictions) takes the engine's [`Admission`] of the snapshot computed on,
+//! and the key it stores under has that snapshot's identity. The store's cache admits only
+//! a published snapshot's (`Shared`): a writer's pending state, a speculative or private
+//! one, never reaches it. Looking a key up needs no admission.
+//!
+//! **An unpublished version's own cache.** What an unpublished snapshot computes is kept in
+//! a cache its version owns ([`ResultCache::for_admission`]; the engine's `OwnState`): a
+//! session reading its kept pending view again is answered from it, and nothing else reaches
+//! it. It has the store's cache's capacity and policy, holds no pin, and everything it keeps
+//! is charged to a part of the envelope of the request that made it, refused when that is
+//! full and released when the version's last holder drops it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -54,8 +62,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use nrese_engine::{SharedState, SnapshotIdentity};
+use nrese_engine::{Admission, Snapshot, SnapshotIdentity};
 use nrese_exec::IdTable;
+use nrese_exec::{Budget, Envelope, Reservation};
 use nrese_rdf::Term;
 
 /// A part computed faster than this isn't kept: a hit would save less than looking it
@@ -86,13 +95,21 @@ pub(crate) struct Key {
 }
 
 impl Key {
-    /// The key `part` is admitted under: the identity of the token's own snapshot. Every key
-    /// the cache stores, claims or pins under is made here.
-    fn admitted(state: SharedState<'_>, part: Arc<[u8]>) -> Self {
+    /// The key `part` is admitted under: the identity of the admission's own snapshot. Every
+    /// key the cache stores, claims or pins under is made here.
+    fn admitted(admission: Admission<'_>, part: Arc<[u8]>) -> Self {
         Self {
-            snapshot: state.snapshot().identity(),
+            snapshot: of(admission).identity(),
             part,
         }
+    }
+}
+
+/// The snapshot `admission` was taken from.
+fn of(admission: Admission<'_>) -> &Snapshot {
+    match admission {
+        Admission::Shared(state) => state.snapshot(),
+        Admission::Own(own) => own.snapshot(),
     }
 }
 
@@ -242,6 +259,9 @@ struct State {
     revision: u64,
     flights: HashMap<Key, Arc<Flight>>,
     pins: BTreeMap<String, Pin>,
+    /// An unpublished version's own cache: the bytes of its entries, charged to its budget
+    /// ([`ResultCache::owned`]); `None` for the store's.
+    held: Option<Reservation>,
 }
 
 impl State {
@@ -286,6 +306,9 @@ impl State {
             self.ranking.remove(&rank);
         }
         self.bytes -= entry.bytes;
+        if let Some(held) = &mut self.held {
+            held.release(entry.bytes);
+        }
         // A map that held many small entries keeps its slots: give back what few use.
         if self.entries.capacity() > 2 * self.entries.len() + 64 {
             self.entries.shrink_to_fit();
@@ -360,6 +383,9 @@ pub struct ResultCache {
     capacity: usize,
     /// Admit every part that fits, however cheap ([`Self::admitting_all`]).
     admit_all: bool,
+    /// An unpublished version's own cache: what its entries are charged to
+    /// ([`Self::owned`]); `None` for the store's.
+    budget: Option<Arc<Budget>>,
     state: Mutex<State>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -384,14 +410,13 @@ pub enum CachedOutput<'s> {
     Hit(Arc<[u8]>),
     /// Not cached: write the answer, then offer its bytes to the slot.
     Miss(OutputSlot<'s>),
-    /// Not cached and not to be (no cache, unpublished state such as a transaction's pending
-    /// one, a volatile query, a pin).
+    /// Not cached and not to be (no cache, a transaction view, a volatile query, a pin).
     Off,
 }
 
 /// Where a written answer is offered to the result cache ([`CachedOutput::Miss`]): it holds
-/// the token of the published snapshot it was made for, so its offer admits for that
-/// snapshot and no other, and it can't outlive the snapshot.
+/// the admission of the snapshot it was made for, so its offer admits for that snapshot and
+/// no other, into the cache that admission reaches, and it can't outlive the snapshot.
 ///
 /// ```
 /// # use nrese_sparql::{CachedOutput, QueryOptions, ResultCache, cached_output};
@@ -434,7 +459,7 @@ pub enum CachedOutput<'s> {
 /// ```
 pub struct OutputSlot<'s> {
     cache: Arc<ResultCache>,
-    state: SharedState<'s>,
+    state: Admission<'s>,
     part: Arc<[u8]>,
 }
 
@@ -470,13 +495,13 @@ pub(crate) enum Claim<'c> {
     Bypass,
 }
 
-/// A part this query computes ([`Claim::Compute`]), for the published snapshot whose token
+/// A part this query computes ([`Claim::Compute`]), for the snapshot whose admission
 /// claimed it: its key is that snapshot's, and it finishes for it alone. Dropped without
 /// [`Computing::finish`], it lets its waiters compute the part themselves.
 pub(crate) struct Computing<'c> {
     cache: &'c ResultCache,
-    /// The token it was claimed with: its key is this snapshot's ([`Self::key`]).
-    state: SharedState<'c>,
+    /// The admission it was claimed with: its key is this snapshot's ([`Self::key`]).
+    state: Admission<'c>,
     part: Arc<[u8]>,
     flight: Arc<Flight>,
     finished: bool,
@@ -528,6 +553,7 @@ impl ResultCache {
         Self {
             capacity,
             admit_all: false,
+            budget: None,
             state: Mutex::default(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -536,6 +562,56 @@ impl ResultCache {
             rejected: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
         }
+    }
+
+    /// An unpublished version's own cache beside the store's `shared` one (module docs): its
+    /// capacity and admission policy, everything it keeps charged to `budget`.
+    pub(crate) fn owned(shared: &ResultCache, budget: Arc<Budget>) -> Self {
+        let state = State {
+            held: Some(Reservation::new(Arc::clone(&budget))),
+            ..State::default()
+        };
+        Self {
+            admit_all: shared.admit_all,
+            budget: Some(budget),
+            state: Mutex::new(state),
+            ..Self::new(shared.capacity)
+        }
+    }
+
+    /// The cache `admission` admits into, beside the store's `shared` one: that one for a
+    /// published snapshot; for an unpublished one, its version's own, made on first use with
+    /// a part of `memory` (the envelope of the request making it) as its budget.
+    pub(crate) fn for_admission(
+        shared: &Arc<ResultCache>,
+        admission: Admission<'_>,
+        memory: &Envelope,
+    ) -> Arc<ResultCache> {
+        match admission {
+            Admission::Shared(_) => Arc::clone(shared),
+            Admission::Own(own) => {
+                own.get_or_insert_with(|| ResultCache::owned(shared, Arc::new(memory.part())))
+            }
+        }
+    }
+
+    /// Whether `bytes` more fit the budget of a version's own cache (always, for the store's).
+    fn room(&self, bytes: usize) -> bool {
+        self.budget
+            .as_ref()
+            .is_none_or(|budget| budget.remaining() >= bytes)
+    }
+
+    /// Whether this cache admits for `admission`: the store's for a published snapshot, a
+    /// version's own for an unpublished one. No caller passes the other kind (the scope and
+    /// every admission come from one context's snapshot); one that did is refused.
+    fn admits(&self, admission: Admission<'_>) -> bool {
+        let fits = matches!(
+            (self.budget.is_some(), admission),
+            (false, Admission::Shared(_)) | (true, Admission::Own(_))
+        );
+        debug_assert!(fits, "an admission of the other kind");
+        fits
     }
 
     /// This cache admitting every part that takes at most a quarter of the budget,
@@ -566,19 +642,24 @@ impl ResultCache {
             && micros.saturating_mul(COPY_BYTES_PER_MICRO) >= 2 * bytes as u64
     }
 
-    /// Looks `part` up on the token's snapshot; on a miss, the caller computes it or waits
-    /// for whoever does. `pin` names the query whose whole result `part` is, to pin it.
+    /// Looks `part` up on the admission's snapshot; on a miss, the caller computes it or
+    /// waits for whoever does. `pin` names the query whose whole result `part` is, to pin it
+    /// (the store's cache alone holds pins: a pin on unpublished state is refused before it
+    /// is claimed, [`crate::native`]'s `eval_root`).
     pub(crate) fn claim<'c>(
         &'c self,
-        token: SharedState<'c>,
+        token: Admission<'c>,
         part: &Arc<[u8]>,
         pin: Option<&PinRequest>,
     ) -> Claim<'c> {
+        if !self.admits(token) {
+            return Claim::Bypass;
+        }
         let key = &Key::admitted(token, Arc::clone(part));
         let mut state = self.state();
         // A query on a newer revision: what older ones computed is unreachable now.
         state.advance(key.snapshot.revision);
-        if let Some(pin) = pin {
+        if let Some(pin) = pin.filter(|_| self.budget.is_none()) {
             state.pins.insert(
                 pin.name.clone(),
                 Pin {
@@ -646,13 +727,17 @@ impl ResultCache {
         Some(payload)
     }
 
-    /// A query's whole answer on the token's snapshot in the format `part` names: the bytes
-    /// if cached, else a slot to offer them to once written ([`crate::query::cached_output`]).
+    /// A query's whole answer on the admission's snapshot in the format `part` names: the
+    /// bytes if cached, else a slot to offer them to once written
+    /// ([`crate::query::cached_output`]).
     pub(crate) fn output<'s>(
         self: &Arc<Self>,
-        token: SharedState<'s>,
+        token: Admission<'s>,
         part: Arc<[u8]>,
     ) -> CachedOutput<'s> {
+        if !self.admits(token) {
+            return CachedOutput::Off;
+        }
         match self.hit(&mut self.state(), &Key::admitted(token, Arc::clone(&part))) {
             Some(Payload::Output(bytes)) => CachedOutput::Hit(bytes),
             _ => CachedOutput::Miss(OutputSlot {
@@ -663,17 +748,20 @@ impl ResultCache {
         }
     }
 
-    /// Offers a part computed on the token's snapshot without a claim (a prefix of a basic
-    /// graph pattern's joins, which no other query waits for): `payload` is made only if
-    /// one of `bytes` that took `cost` is worth keeping.
+    /// Offers a part computed on the admission's snapshot without a claim (a prefix of a
+    /// basic graph pattern's joins, which no other query waits for): `payload` is made only
+    /// if one of `bytes` that took `cost` is worth keeping.
     pub(crate) fn offer(
         &self,
-        token: SharedState<'_>,
+        token: Admission<'_>,
         part: &Arc<[u8]>,
         bytes: usize,
         cost: Duration,
         payload: impl FnOnce() -> Option<Payload>,
     ) {
+        if !self.admits(token) {
+            return;
+        }
         self.misses.fetch_add(1, Ordering::Relaxed);
         let key = Key::admitted(token, Arc::clone(part));
         self.admit(&key, bytes, cost, MIN_COST, payload);
@@ -689,7 +777,8 @@ impl ResultCache {
         floor: Duration,
         payload: impl FnOnce() -> Option<Payload>,
     ) {
-        if !self.worth(bytes, cost, floor) {
+        // Nothing is made for a version's own cache whose budget can't take it.
+        if !self.worth(bytes, cost, floor) || !self.room(bytes) {
             self.rejected.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -767,6 +856,17 @@ impl ResultCache {
                 state.clock = state.clock.max(f64::from_bits(rank));
                 self.evicted.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        // A version's own cache keeps what its budget takes. Checked first, so that the
+        // envelope it draws from, another request's, isn't marked refused by a charge that
+        // can't fit (`Budget::refused`, which the DL status path reads).
+        if !self.room(bytes) {
+            return reject(&mut state, None);
+        }
+        if let Some(held) = &mut state.held
+            && held.charge(bytes).is_err()
+        {
+            return reject(&mut state, None);
         }
         state.bytes += bytes;
         state.entries.insert(
@@ -890,8 +990,8 @@ mod tests {
         snapshot
     }
 
-    /// A part on a published snapshot: what a query admits it with (its snapshot's token) and
-    /// looks it up by ([`Self::key`]).
+    /// A part on a snapshot: what a query admits it with (its snapshot's admission) and looks
+    /// it up by ([`Self::key`]).
     struct Probe {
         snapshot: nrese_engine::Snapshot,
         part: Arc<[u8]>,
@@ -905,9 +1005,24 @@ mod tests {
             }
         }
 
-        fn token(&self) -> SharedState<'_> {
-            self.snapshot.shared_state().expect("a published snapshot")
+        fn token(&self) -> Admission<'_> {
+            self.snapshot.admission()
         }
+    }
+
+    /// A writer's pending snapshot: unpublished, so admitted into a version's own cache.
+    fn pending() -> nrese_engine::Snapshot {
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        tx.insert(nrese_rdf::QuadRef::new(
+            nrese_rdf::NamedNodeRef::new_unchecked("http://e/s"),
+            nrese_rdf::NamedNodeRef::new_unchecked("http://e/p"),
+            nrese_rdf::Literal::from(1_i64).as_ref(),
+            nrese_rdf::GraphNameRef::DefaultGraph,
+        ));
+        let pending = tx.pending_snapshot();
+        assert!(matches!(pending.admission(), Admission::Own(_)));
+        pending
     }
 
     fn key(snapshot: &nrese_engine::Snapshot, part: &str) -> Probe {
@@ -1007,6 +1122,59 @@ mod tests {
         assert_eq!(cache.lookup(&new.key()).unwrap().table.len(), 10);
         assert_eq!(cache.stats().entries, 1);
         assert!(cache.state().flights.is_empty());
+    }
+
+    /// 3.6's design note §11, O4 and O5: a version's own cache keeps what its budget takes.
+    ///
+    /// - Input: an own cache charged to a part of a 4,000-byte envelope (about two parts of
+    ///   100 rows, 1,597 bytes each with their bookkeeping); four such parts computed on a
+    ///   pending snapshot; then `clear`; then the cache dropped.
+    /// - Expected: two are kept and the others refused; the envelope holds exactly what the
+    ///   cache holds, and isn't marked refused (another request's, whose status reads it);
+    ///   `clear` and the drop give it all back.
+    #[test]
+    fn a_versions_own_cache_keeps_what_its_budget_takes() {
+        let view = pending();
+        let envelope = Envelope::new(Some(4_000), None);
+        let store = ResultCache::new(1 << 20);
+        let own = ResultCache::owned(&store, Arc::new(envelope.part()));
+        for i in 0..4 {
+            compute(&own, &key(&view, &format!("q{i}")), 100, SLOW);
+        }
+        let stats = own.stats();
+        assert_eq!((stats.entries, stats.rejected), (2, 2), "{stats:?}");
+        assert_eq!(envelope.used(), stats.bytes, "charged as held");
+        assert!(!envelope.refused(), "no refusal recorded on the envelope");
+        assert_eq!(store.stats().entries, 0, "the store's cache holds nothing");
+        own.clear();
+        assert_eq!(envelope.used(), 0, "cleared, released");
+        compute(&own, &key(&view, "again"), 100, SLOW);
+        assert!(envelope.used() > 0);
+        drop(own);
+        assert_eq!(envelope.used(), 0, "dropped with its version, released");
+    }
+
+    /// 3.6's design note §11, O7: the store's cache admits only published state, a version's
+    /// own cache only unpublished state; the other kind is refused (and asserts in debug
+    /// builds; no caller passes one).
+    #[test]
+    fn each_cache_admits_only_its_own_kind() {
+        let (published, pending) = (published(1), pending());
+        let store = ResultCache::new(1 << 20);
+        let own = ResultCache::owned(&store, Arc::new(Envelope::unlimited().part()));
+        assert!(store.admits(published.admission()) && own.admits(pending.admission()));
+        let wrong = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (
+                store.admits(pending.admission()),
+                own.admits(published.admission()),
+            )
+        }));
+        match wrong {
+            // Debug builds assert; anything else is a failure of its own.
+            Err(_) if cfg!(debug_assertions) => {}
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(admitted) => assert_eq!(admitted, (false, false)),
+        }
     }
 
     #[test]
