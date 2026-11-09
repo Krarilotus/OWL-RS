@@ -3130,8 +3130,8 @@ mod tests {
             }
             term
         };
-        // Past the 64 levels the parser took, the text decodes as its fallback, a literal of
-        // the text, as the parser's did: this test checks only that its charge covers it.
+        // Past the 64 levels the N-Triples parser took (review r1 R1: the first RDF 1.2 version
+        // wrote any depth), the text still reads back as the term.
         let past = "nested 65, past the parser";
         // A private-use tag of 32,768 subtags (sol-loop r1 S1: the parser's tag check held 16
         // bytes for each).
@@ -3245,9 +3245,10 @@ mod tests {
                 let bound = dictionary.decode_bound(id).unwrap();
                 let (plain, peak) = measure::measure(|| dictionary.decode(id));
                 let plain = plain.expect("a term");
-                if shape != past {
-                    assert_eq!(&plain, written, "{shape}: plain decode");
-                }
+                assert!(
+                    &plain == written,
+                    "{shape}: plain decode, not the term written"
+                );
                 let expected = &plain;
                 println!(
                     "{shape}: key {} bytes, bound {bound}, plain decode's peak {peak}",
@@ -3277,5 +3278,44 @@ mod tests {
                 assert_eq!((excess, short.used()), (0, 0), "{shape}: refused");
             }
         }
+    }
+
+    /// Package C3, review r1 R1: a triple term 65 levels deep, keyed by its text as the first
+    /// RDF 1.2 version wrote it (that version set no depth limit), restored as its checkpoint
+    /// holds it, under a triple term keyed by ids: the decode, plain and charged, gives the
+    /// term built apart, not its text as a literal.
+    #[test]
+    fn a_deep_triple_term_keyed_by_its_text_reads_back_under_one_keyed_by_ids() {
+        let iri = |s: &str| NamedNode::new_unchecked(format!("urn:{s}"));
+        let mut deep: Term = iri("o").into();
+        for level in 0..65 {
+            deep = nrese_rdf::Triple::new(iri(&format!("s{level}")), iri("p"), deep).into();
+        }
+        let expected: Term = nrese_rdf::Triple::new(iri("t"), iri("p"), deep.clone()).into();
+        let mut key = vec![TAG_TRIPLE];
+        key.extend_from_slice(deep.to_string().as_bytes());
+        let (mut t, mut p, mut over_key) = (Vec::new(), Vec::new(), Vec::new());
+        encode_key(TermRef::NamedNode(iri("t").as_ref()), &mut t);
+        encode_key(TermRef::NamedNode(iri("p").as_ref()), &mut p);
+        let text = TermId::new(TermKind::Triple, 0);
+        let ids = [
+            TermId::new(TermKind::Iri, 1),
+            TermId::new(TermKind::Iri, 2),
+            text,
+        ];
+        triple_key(ids, &mut over_key);
+        let dictionary = Dictionary::default();
+        dictionary.restore_keys(&[&key, &t, &p, &over_key]).unwrap();
+        let over = TermId::new(TermKind::Triple, 3);
+        assert!(
+            dictionary.decode(text) == Some(deep.clone()),
+            "the text key alone"
+        );
+        assert!(
+            dictionary.decode(over) == Some(expected.clone()),
+            "under ids"
+        );
+        let charged = dictionary.decode_charged(over, |_| Ok::<(), ()>(()));
+        assert!(charged == Ok(Some(expected)), "charged, under ids");
     }
 }

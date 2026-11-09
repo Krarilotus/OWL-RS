@@ -260,8 +260,8 @@ mod tests {
     /// character the writer escapes, well-formed language tags in either case, base
     /// directions, datatypes, `xsd:string` among them), the decode is the parser's term, and
     /// it holds no more than [`bound`] of the text's length (its strings' capacities and its
-    /// boxes); past the parser's 64 levels, and for text that is no term, both give the text
-    /// as a literal.
+    /// boxes); for text that is no term, which the writer never wrote, both give the text as a
+    /// literal.
     #[test]
     fn a_text_reads_back_as_the_parser_read_it() {
         let mut random = Random(0x2545_f491_4f6c_dd1d);
@@ -282,21 +282,33 @@ mod tests {
                 "round {round}: {text}"
             );
         }
-        let mut deep: Term = NamedNode::new_unchecked("urn:o").into();
-        for _ in 0..=MAX_NESTING {
-            let (s, p) = (
-                NamedNode::new_unchecked("urn:s"),
-                NamedNode::new_unchecked("urn:p"),
-            );
-            deep = Triple::new(s, p, deep).into();
-        }
         for text in [
-            deep.to_string(),
-            "<<( <urn:s> <urn:p> )>>".into(),
-            "x".into(),
+            "<<( <urn:s> <urn:p> )>>",
+            "<<( <urn:s> <urn:p> <urn:o>",
+            "x",
         ] {
-            assert_eq!(decode(&text), parsed(&text), "{text}");
-            assert_eq!(decode(&text), Literal::new_simple_literal(&text).into());
+            assert_eq!(decode(text), parsed(text), "{text}");
+            assert_eq!(decode(text), Literal::new_simple_literal(text).into());
+        }
+    }
+
+    /// Package C3, review r1 R1: the first RDF 1.2 version wrote triple terms of any depth
+    /// (`Triple::new` and its interning set no limit), and its stores still open, so their text
+    /// reads back as the term at any depth: 65 levels (one past the 64 the N-Triples parser
+    /// takes, which gave the text back as a literal) and 1,000, each against the term built
+    /// apart, and within [`bound`].
+    #[test]
+    fn a_triple_term_reads_back_at_any_depth() {
+        for depth in [64, 65, 1_000] {
+            let mut expected: Term = NamedNode::new_unchecked("urn:o").into();
+            for level in 0..depth {
+                let s = NamedNode::new_unchecked(format!("urn:s{level}"));
+                expected = Triple::new(s, NamedNode::new_unchecked("urn:p"), expected).into();
+            }
+            let text = expected.to_string();
+            let decoded = decode(&text);
+            assert!(decoded == expected, "depth {depth}: not the term");
+            assert!(decoded.heap_bytes() <= bound(text.len()), "depth {depth}");
         }
     }
 
