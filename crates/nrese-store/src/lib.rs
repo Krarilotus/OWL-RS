@@ -89,6 +89,8 @@ pub use nrese_engine::cpu;
 /// How the process returns freed memory to the system, registered by the binary that picks
 /// the allocator.
 pub use nrese_engine::memory::set_release as set_memory_release;
+/// Durable placement of what recovery reads (a replica's data directory, for the server).
+pub use nrese_engine::place;
 pub use nrese_engine::{
     Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
     VocabularyEncoding, WalDamage,

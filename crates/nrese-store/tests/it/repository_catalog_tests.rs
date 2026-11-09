@@ -424,7 +424,8 @@ fn a_removal_whose_files_are_held_stays_removed_after_a_restart() {
     assert!(!path.exists(), "reclaimed at the start");
 }
 
-/// The reasoning marker of a recomputation can't be written (`reasoning.tmp` taken), so
+/// The reasoning marker of a recomputation can't be written (its staging name
+/// `reasoning.state.tmp` taken), so
 /// the recomputation fails after it has published the new inferences: a failed change to
 /// RDFS from none restores the old closure, not only the old write path.
 #[test]
@@ -449,7 +450,7 @@ fn a_change_whose_recomputation_fails_after_publishing_restores_the_old_closure(
         .contains("true")
     };
     assert!(!derived());
-    std::fs::create_dir(dir.path().join("repositories/probe/reasoning.tmp")).expect("taken");
+    std::fs::create_dir(dir.path().join("repositories/probe/reasoning.state.tmp")).expect("taken");
     let rdfs = RepositorySettings {
         reasoning: Some("rdfs".to_owned()),
         ..RepositorySettings::default()
@@ -474,7 +475,7 @@ fn a_change_whose_closure_cant_be_restored_makes_the_repository_unavailable() {
         ..RepositorySettings::default()
     };
     catalog.create("probe", rdfs).expect("created");
-    std::fs::create_dir(dir.path().join("repositories/probe/reasoning.tmp")).expect("taken");
+    std::fs::create_dir(dir.path().join("repositories/probe/reasoning.state.tmp")).expect("taken");
     let rl = RepositorySettings {
         reasoning: Some("owl2-rl".to_owned()),
         ..RepositorySettings::default()
