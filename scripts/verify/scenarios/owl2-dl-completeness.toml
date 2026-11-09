@@ -52,13 +52,14 @@ restart = true
 [[step]]
 name = "the exact answer and its completeness survive reopen"
 path = "/dataset/query"
-params = { query = "SELECT ?x { ?x a <http://example.com/D> } ORDER BY ?x" }
+params = { query = "SELECT ?x { ?x a <http://example.com/D> }" }
 headers = { Accept = "application/sparql-results+json" }
 [step.expect]
 status = 200
 headers = { nrese-completeness = "complete; regime=owl2-dl; lower=2; upper=3; unresolved=0" }
 rows = 3
-json = { "$.results.bindings[*].x.value" = ["http://example.com/w", "http://example.com/x", "http://example.com/y"] }
+# Three distinct values in three rows fix the set without requiring an order.
+json = { "$.results.bindings[*].x.value" = { length = 3, matches = '^(?=.*"http://example\.com/w")(?=.*"http://example\.com/x")(?=.*"http://example\.com/y")' } }
 
 [[step]]
 name = "export the reopened ontology's instances"
