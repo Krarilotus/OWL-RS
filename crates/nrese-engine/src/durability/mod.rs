@@ -188,13 +188,15 @@ impl Durable {
         // an open does costs it a journal commit and a device flush (timing of 8 Nov,
         // deferred-sync design note). A root made: every level now, as a new store pays once.
         let found = root.is_dir();
-        let mut holders: Vec<PathBuf> = match found {
-            true => place::holders(root)?,
+        let named = match found {
+            true => Some(place::Named::resolve(root)?),
             false => {
                 place::create_dir_all(root)?;
-                Vec::new()
+                None
             }
         };
+        let mut holders: Vec<(PathBuf, PathBuf)> =
+            named.iter().flat_map(place::Named::holders).collect();
         // Whether the open changes the store on disk: then what it changed, and the names
         // with it, are synced before it returns, as before.
         let mut changed = !found;
@@ -267,10 +269,14 @@ impl Durable {
         // names them. One found may itself be a link to a directory elsewhere (review r1,
         // R1-L1): the names its resolution reads (the link's holder, its target's chain) join
         // the holders, under the same found-level rule, as the store's records live there.
+        // Resolved from where the root's resolution ended (one walk of their common chain).
         let mut internal = |dir: &Path| -> EngineResult<bool> {
             let made = place::create_store_dir(dir)?;
-            if !made {
-                holders.extend(place::holders(dir)?);
+            if !made && let Some(named) = &named {
+                let name = dir
+                    .file_name()
+                    .expect("a store's internal directory has a name");
+                holders.extend(named.beyond(name)?);
             }
             Ok(made)
         };

@@ -190,16 +190,22 @@ impl PendingNames {
     /// directories), each once.
     /// Each directory once by its canonical path: one spelled through a link (the store's root
     /// as opened) and physically (the holder of its WAL directory's entry, DUR-4 review r1)
-    /// is the same directory.
-    pub(crate) fn new(holders: Vec<PathBuf>, own: impl IntoIterator<Item = PathBuf>) -> Self {
+    /// is the same directory. `holders` come with their canonical paths (the resolution's);
+    /// only `own` is canonicalised here.
+    pub(crate) fn new(
+        holders: Vec<(PathBuf, PathBuf)>,
+        own: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
         let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
         let mut keys: Vec<PathBuf> = Vec::new();
         let named = holders
             .into_iter()
-            .map(|dir| (dir, true))
-            .chain(own.into_iter().map(|dir| (dir, false)));
-        for (dir, found) in named {
-            let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            .map(|(dir, key)| (dir, key, true))
+            .chain(own.into_iter().map(|dir| {
+                let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                (dir, key, false)
+            }));
+        for (dir, key, found) in named {
             match keys.iter().position(|seen| *seen == key) {
                 // Both a holder and the store's own (a relative root, a linked root): the
                 // stricter.
