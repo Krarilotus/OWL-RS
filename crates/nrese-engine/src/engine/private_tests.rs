@@ -372,7 +372,8 @@ fn a_private_transaction_records_no_corpus_lineage() {
     let steps = || engine.snapshot().text_corpus_stats().steps;
     let start = steps();
 
-    let mut writer = engine.speculative();
+    // A writer, never committed (the control: its pending snapshot records a step).
+    let mut writer = engine.transaction();
     writer.insert(quad("b", "label", literal("gamma")).as_ref());
     let _control = writer.pending_snapshot();
     let after_writer = steps();

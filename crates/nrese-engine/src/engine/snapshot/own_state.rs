@@ -30,7 +30,8 @@ pub enum Admission<'s> {
 ///
 /// ```
 /// let engine = nrese_engine::Engine::new(Default::default()).unwrap();
-/// let pending = engine.speculative().pending_snapshot();
+/// let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+/// let pending = engine.speculative(budget).pending_snapshot().unwrap();
 /// let nrese_engine::Admission::Own(own) = pending.admission() else {
 ///     panic!("a pending snapshot is unpublished");
 /// };

@@ -103,7 +103,25 @@ impl Program {
     /// Compiles `program` against the engine dictionary; `intern` gives ids to the
     /// constants.
     pub fn compile(program: &RuleProgram, intern: &dyn Fn(TermRef<'_>) -> TermId) -> Self {
-        let mut constants = Constants { intern };
+        match Self::try_compile(program, &|term| {
+            Ok::<_, std::convert::Infallible>(intern(term))
+        }) {
+            Ok(compiled) => compiled,
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::compile`] with an interner that can refuse (a private transaction's, whose
+    /// budget charges its terms: dictionary lifecycle V1): the first refusal, and no
+    /// program, whose constants would hold no id for the refused term.
+    pub fn try_compile<E>(
+        program: &RuleProgram,
+        intern: &dyn Fn(TermRef<'_>) -> Result<TermId, E>,
+    ) -> Result<Self, E> {
+        let mut constants = Constants {
+            intern,
+            refused: None,
+        };
         let rules = program
             .rules(&mut constants)
             .expect("the built-in rulesets parse (tested), user rules are checked at startup");
@@ -119,7 +137,10 @@ impl Program {
             .axiom_triples(&mut constants)
             .expect("the built-in axioms parse (tested), user facts are checked at startup");
         axioms.sort_unstable();
-        Self {
+        if let Some(refused) = constants.refused {
+            return Err(refused);
+        }
+        Ok(Self {
             program: program.clone(),
             rules,
             lists,
@@ -134,7 +155,7 @@ impl Program {
             axioms,
             plan: None,
             axioms_storable: std::sync::OnceLock::new(),
-        }
+        })
     }
 
     /// This program computing full closures over representatives of `owl:sameAs` classes
@@ -249,24 +270,39 @@ pub(crate) fn term_text(term: &nrese_rdf::Term) -> String {
     }
 }
 
-/// Interns the rules' constants into the engine dictionary.
-struct Constants<'a> {
-    intern: &'a dyn Fn(TermRef<'_>) -> TermId,
+/// Interns the rules' constants into the engine dictionary. A refusal is kept (the first),
+/// its constant given a placeholder id that [`Program::try_compile`] never lets out: it
+/// returns the refusal instead of the program.
+struct Constants<'a, E> {
+    intern: &'a dyn Fn(TermRef<'_>) -> Result<TermId, E>,
+    refused: Option<E>,
 }
 
-impl Vocabulary for Constants<'_> {
+impl<E> Constants<'_, E> {
+    fn id(&mut self, term: TermRef<'_>) -> u64 {
+        match (self.intern)(term) {
+            Ok(id) => id.raw(),
+            Err(refused) => {
+                self.refused.get_or_insert(refused);
+                0
+            }
+        }
+    }
+}
+
+impl<E> Vocabulary for Constants<'_, E> {
     fn iri(&mut self, iri: &str) -> u64 {
-        (self.intern)(NamedNodeRef::new_unchecked(iri).into()).raw()
+        self.id(NamedNodeRef::new_unchecked(iri).into())
     }
 
     fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
         let literal = LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype));
-        (self.intern)(literal.into()).raw()
+        self.id(literal.into())
     }
 
     fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
         let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
-        (self.intern)(literal.into()).raw()
+        self.id(literal.into())
     }
 
     fn blank_node_ids(&self) -> Option<(u64, u64)> {

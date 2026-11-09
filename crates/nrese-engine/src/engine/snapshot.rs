@@ -2108,7 +2108,9 @@ impl Snapshot {
 /// let snapshot = engine.snapshot();
 /// let state = snapshot.shared_state().expect("a published snapshot");
 /// assert!(std::ptr::eq(state.snapshot(), &snapshot));
-/// assert!(engine.speculative().pending_snapshot().shared_state().is_none());
+/// let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+/// let pending = engine.speculative(budget).pending_snapshot().unwrap();
+/// assert!(pending.shared_state().is_none());
 /// ```
 ///
 /// No code outside the engine can make one:

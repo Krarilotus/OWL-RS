@@ -368,7 +368,10 @@ fn two_value_types_on_one_version_are_separate() {
     struct Spatial(u32);
     struct Results(u32);
     let engine = engine();
-    let pending = engine.speculative().pending_snapshot();
+    let pending = engine
+        .speculative(Arc::new(Budget::unlimited()))
+        .pending_snapshot()
+        .unwrap();
     let own = own(&pending);
     assert_eq!(own.get_or_insert_with(|| Spatial(1)).0, 1);
     assert!(own.get::<Results>().is_none(), "another type: none yet");

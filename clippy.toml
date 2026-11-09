@@ -4,4 +4,10 @@ disallowed-methods = [
     # statements the source's own DL bounds derive from it alone. Its callers are `nrese-store/src/dl/bounds.rs`
     # (the bounds' lower and upper views) and the engine's own test of it.
     { path = "nrese_engine::Snapshot::with_inferred_derived_within", reason = "only the store's DL bounds derive views that keep publication (dictionary 3.0b)" },
+    # Dictionary V1 (notes/2026-11-09-dict-v1-speculative-private-design.md §1.1): the one dictionary append without
+    # the writer slot, for system vocabulary only (contract limit L2). Its callers are `nrese-store/src/dl/source.rs`
+    # (the DL and OWL vocabulary and the fresh entailment names; the U1 build's generated names, for the bounds'
+    # cold build and the upper-facts report) and the engine's own test of it. A request's terms go through a
+    # private transaction.
+    { path = "nrese_engine::Engine::intern_system_vocabulary", reason = "only the DL source's system vocabulary appends without the writer slot (dictionary V1)" },
 ]

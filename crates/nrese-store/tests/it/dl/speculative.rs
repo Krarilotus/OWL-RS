@@ -133,6 +133,90 @@ fn a_dl_explanation_appends_no_terms() {
     assert_eq!(terms(store), before, "the explanation appended terms");
 }
 
+/// Item 7, a store route: the explanation under a memory limit too small for it, measured
+/// here rather than picked. Its private transaction's names are charged to the request's
+/// envelope; a refusal there is the route's memory error.
+///
+/// - Input: the explanation route of `a_dl_explanation_appends_no_terms`, on stores whose
+///   server-wide query memory (the request's envelope) is 1 KiB, doubled until the route
+///   answers, then the limits between the last refusal and that one, halved down to 64 bytes.
+/// - Expected: below the route's need, every answer is the memory limit's error
+///   (`is_memory_limit`) or the route's existing "undecided" (`Incomplete`, a test of the
+///   explanation stopped at its budget), never an explanation; at every limit the dictionary
+///   stays as it was (no fallback to shared names); at the need, the verified explanation.
+#[test]
+fn an_explanation_refused_for_memory_is_the_memory_limit() {
+    let explain = |limit: usize| -> (Result<bool, nrese_store::StoreError>, bool) {
+        let store = StoreService::new(StoreConfig {
+            total_query_memory_bytes: limit,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store");
+        crate::support::load_past_the_pipeline(
+            &store,
+            "<http://example.com/A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+             <http://example.com/B> . <http://example.com/w> a <http://example.com/A> .",
+        );
+        let before = terms(&store);
+        let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let (w, b) = (named("w"), named("B"));
+        let statement: [TermRef<'_>; 3] = [
+            w.as_ref().into(),
+            rdf_type.as_ref().into(),
+            b.as_ref().into(),
+        ];
+        let answer = store
+            .explain_dl(&ReadScope::All, statement)
+            .map(|explained| explained.is_some_and(|e| e.verified));
+        (answer, terms(&store) == before)
+    };
+    let mut failed = Vec::new();
+    let mut refused_at = Vec::new();
+    let mut limit = 1024usize;
+    let need = loop {
+        let (answer, kept) = explain(limit);
+        if !kept {
+            failed.push(format!("{limit} bytes: the dictionary grew"));
+        }
+        match answer {
+            Ok(true) => break limit,
+            Ok(false) => failed.push(format!("{limit} bytes: an unverified or no explanation")),
+            Err(error) if error.is_memory_limit() => refused_at.push(limit),
+            Err(nrese_store::StoreError::Incomplete(_)) => {}
+            Err(error) => failed.push(format!("{limit} bytes: {error}")),
+        }
+        assert!(
+            limit < 1 << 34,
+            "no limit up to 16 GiB answers: {failed:#?}"
+        );
+        limit *= 2;
+    };
+    // Between the last refusal and the need, halving the gap: the same rules hold.
+    let (mut low, mut high) = (need / 2, need);
+    while high - low > 64 {
+        let mid = low + (high - low) / 2;
+        let (answer, kept) = explain(mid);
+        if !kept {
+            failed.push(format!("{mid} bytes: the dictionary grew"));
+        }
+        match answer {
+            Ok(true) => high = mid,
+            Ok(false) => failed.push(format!("{mid} bytes: an unverified or no explanation")),
+            Err(error) if error.is_memory_limit() => {
+                refused_at.push(mid);
+                low = mid;
+            }
+            Err(nrese_store::StoreError::Incomplete(_)) => low = mid,
+            Err(error) => failed.push(format!("{mid} bytes: {error}")),
+        }
+    }
+    assert!(
+        !refused_at.is_empty(),
+        "no limit was refused as memory: {failed:#?}"
+    );
+    assert!(failed.is_empty(), "need {high} bytes: {failed:#?}");
+}
+
 /// Item 1, the exact query services (a guard: their only speculative terms are the tests'
 /// fresh names, system vocabulary the bounds' first read appends on the parent and here
 /// alike).

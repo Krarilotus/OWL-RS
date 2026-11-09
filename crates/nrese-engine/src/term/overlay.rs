@@ -74,10 +74,14 @@ impl Overlay {
         })
     }
 
-    /// Test support: its `start`, which its views report ([`OverlayView::start`]).
-    #[cfg(test)]
+    /// Its `start`, which its views report ([`OverlayView::start`]): where its own ids begin.
     pub(crate) fn start(&self) -> u64 {
         self.start
+    }
+
+    /// The end of its ids now: `start` plus its own entries so far.
+    pub(crate) fn end(&self) -> u64 {
+        self.start + self.suffix.lock().len()
     }
 
     /// The id of `term`: inline, the dictionary's below `start`, or this overlay's own, added

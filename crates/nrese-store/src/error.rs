@@ -36,8 +36,10 @@ pub enum StoreError {
     Configuration(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// An engine error other than a memory refusal, which converts to the memory limit's
+    /// error (`From<EngineError>`).
     #[error("storage engine error: {0}")]
-    Engine(#[from] EngineError),
+    Engine(#[source] EngineError),
     #[error("SPARQL syntax error: {0}")]
     SparqlSyntax(#[from] SparqlSyntaxError),
     #[error("SPARQL evaluation error: {0}")]
@@ -127,6 +129,18 @@ pub enum Refusal {
 impl From<nrese_exec::BudgetExceeded> for StoreError {
     fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
         QueryEvaluationError::MemoryLimit(exceeded).into()
+    }
+}
+
+/// An engine's memory refusal (a private transaction's budget: dictionary lifecycle V1) is
+/// the request's memory limit, as a [`nrese_exec::BudgetExceeded`]'s; any other error is
+/// the engine's.
+impl From<EngineError> for StoreError {
+    fn from(error: EngineError) -> Self {
+        match error {
+            EngineError::MemoryLimit(exceeded) => exceeded.into(),
+            other => Self::Engine(other),
+        }
     }
 }
 
