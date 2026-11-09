@@ -251,12 +251,21 @@ fn apply_operation(
 /// a `WHERE` clause reads ([`GraphUpdateOperation::Transfer`]): no union default graph, inferred
 /// statement or protocol dataset. A graph the user may not read is absent, so nothing is
 /// copied from it; inserting into a graph the user may not write fails the request.
+///
+/// Memory (SYN-54 review r1, F1): the source's statements are read into a buffer charged to
+/// the request's envelope, and their room in the pending changes is reserved from the
+/// transaction's budget before it grows ([`Transaction::try_reserve_inserts`], where the
+/// transaction has one: the mutation pipeline's and a pending read's do). A copy past either
+/// is refused with the typed memory error, and the destination's name is interned only once
+/// nothing can be refused.
 fn add(
     tx: &mut Transaction<'_>,
     from: &GraphName,
     to: &GraphName,
     options: &UpdateOptions,
 ) -> Result<(), UpdateError> {
+    let memory = |error| UpdateError::Evaluation(QueryEvaluationError::MemoryLimit(error));
+    let cancelled = |_: nrese_exec::Stop| UpdateError::Cancelled;
     let source = match graph_name(from) {
         OxGraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
         OxGraphName::NamedNode(name) => tx.lookup(name.as_ref().into()),
@@ -265,32 +274,40 @@ fn add(
     let Some(source) = source.filter(|&id| options.sees(tx, id)) else {
         return Ok(());
     };
-    let state = match tx.pending() {
-        (0, 0) => tx.base().clone(),
-        _ => tx.pending_snapshot(),
-    };
-    let mut quads = state
-        .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::in_graph(source))
-        .peekable();
-    if quads.peek().is_none() {
+    let mut ticker = nrese_exec::Ticker::new(options.resources.stop()).map_err(cancelled)?;
+    // The state before this operation, the request's earlier operations included.
+    let mut quads = nrese_exec::ChargedVec::new(Arc::new(options.resources.memory.part()));
+    for quad in tx.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::in_graph(source)) {
+        ticker.tick(1).map_err(cancelled)?;
+        quads.push(quad).map_err(memory)?;
+    }
+    if quads.is_empty() {
         return Ok(());
     }
     let to = graph_name(to);
     options.check_writable(&to)?;
+    if tx.charges_pending() {
+        tx.try_reserve_inserts(quads.len())
+            .map_err(|error| match error {
+                nrese_engine::EngineError::MemoryLimit(error) => memory(error),
+                error => {
+                    UpdateError::Evaluation(QueryEvaluationError::Unexpected(error.to_string()))
+                }
+            })?;
+    }
     let target = match &to {
         OxGraphName::DefaultGraph => TermId::DEFAULT_GRAPH,
         OxGraphName::NamedNode(name) => tx.intern(name.as_ref().into()),
         OxGraphName::BlankNode(node) => tx.intern(node.as_ref().into()),
     };
-    let cancelled = |_: nrese_exec::Stop| UpdateError::Cancelled;
-    let mut ticker = nrese_exec::Ticker::new(options.resources.stop()).map_err(cancelled)?;
-    for quad in quads {
+    for &quad in quads.iter() {
         ticker.tick(1).map_err(cancelled)?;
         tx.insert_encoded(EncodedQuad {
             graph: target,
             ..quad
         });
     }
+    ticker.finish().map_err(cancelled)?;
     Ok(())
 }
 
