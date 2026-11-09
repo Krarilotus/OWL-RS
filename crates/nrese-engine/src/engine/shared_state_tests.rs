@@ -132,6 +132,16 @@ fn pending_states_of_both_kinds_grant_no_token() {
     );
 }
 
+/// `source` with `added` as statements its DL bounds derived (3.0b): the constructor's own
+/// test, beside its one caller.
+#[allow(clippy::disallowed_methods)]
+fn derived(source: &Snapshot, added: EncodedQuad) -> Snapshot {
+    let triple = EncodedTriple::new(added.subject, added.predicate, added.object);
+    source
+        .with_inferred_derived_within(&[triple], &budget())
+        .unwrap()
+}
+
 /// Review §5 item 2 and F2: views keep or clear eligibility by the design note's matrix, and
 /// never launder an ineligible snapshot.
 ///
@@ -179,6 +189,13 @@ fn views_keep_or_clear_eligibility_by_the_matrix() {
                     .with_inferred_mask(&mask, &budget())
                     .unwrap()
                     .unwrap(),
+            ),
+            // 3.0b: the DL bounds' derivation keeps its source's publication, the upper
+            // bound's read with its equality too.
+            ("derived within", derived(source, added)),
+            (
+                "derived, with equality",
+                derived(source, added).with_equality(predicate),
             ),
             ("equality", source.with_equality(predicate)),
             ("stored", source.stored()),

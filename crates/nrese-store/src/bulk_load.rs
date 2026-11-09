@@ -397,13 +397,15 @@ impl BlankNodeScope {
         }
     }
 
+    /// `quad` in this load's blank-node scope, in the graph the store keeps it in
+    /// ([`crate::rdf_io::stored`]).
     fn scope(&self, quad: Quad) -> Quad {
         let Quad {
             subject,
             predicate,
             object,
             graph_name,
-        } = quad;
+        } = crate::rdf_io::stored(quad);
         Quad {
             subject: match subject {
                 NamedOrBlankNode::BlankNode(node) => self.node(&node).into(),

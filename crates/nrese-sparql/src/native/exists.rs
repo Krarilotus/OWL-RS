@@ -350,7 +350,7 @@ fn split(
 impl Context<'_> {
     /// A variable no query can name, for a column the executor adds for itself (`what`, one
     /// word: [`nrese_sparql_syntax::internal::variable`]).
-    fn synthetic(&self, what: &str) -> Variable {
+    pub(super) fn synthetic(&self, what: &str) -> Variable {
         let n = self.synthetic.get();
         self.synthetic.set(n + 1);
         nrese_sparql_syntax::internal::variable(what, n)

@@ -47,6 +47,22 @@ from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, slic
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
+class DeclaredRuntime:
+    """A runtime that says only its kind and that it runs nothing: what an adapter's declarations
+    (images, builds, script_builds, rust_image) may ask of one. Anything else is an AttributeError."""
+    __slots__ = ("kind",)
+    dry = True
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+
+def declared_context(root: Path, kind: str) -> "Context":
+    """The context an adapter declares its images and builds in for runtime `kind`: `root`, no
+    settings (the defaults), never the environment (suite.py coverage: a receipt's own runtime)."""
+    return Context(DeclaredRuntime(kind), root, root, root, Mount("-", "/data"), [], 0, {}, "declared")
+
+
 def images_for(adapter, root: Path) -> list[str]:
     """The images an adapter's containers run, the pulled (`images`) and the built here (`builds`),
     as `suite.py images` asks: the pin set of the tools that pin them at their start
