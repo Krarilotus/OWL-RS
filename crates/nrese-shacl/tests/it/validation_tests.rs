@@ -125,7 +125,7 @@ fn ill_formed_shapes_are_errors_that_name_the_shape() {
 #[test]
 fn sh_datatype_rejects_what_the_datatype_map_calls_ill_typed() {
     let huge = "9".repeat(200);
-    let rows: [(&str, String, &str, bool); 11] = [
+    let rows: [(&str, String, &str, bool); 12] = [
         (
             "string holding U+0001",
             "\"a\\u0001b\"^^xsd:string".into(),
@@ -189,6 +189,14 @@ fn sh_datatype_rejects_what_the_datatype_map_calls_ill_typed() {
         (
             "control: a language-tagged literal",
             "\"a\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+        // RDF 1.1 Concepts §3.3: a language-tagged string is any lexical form with a tag; the
+        // XML character restriction is xsd:string's (the U+0001 row above), not rdf:langString's.
+        (
+            "language-tagged string holding U+0001",
+            "\"a\\u0001b\"@en".into(),
             "rdf:langString",
             false,
         ),

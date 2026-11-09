@@ -291,6 +291,16 @@ mod tests {
             Value::parse("a", Datatype::LangString, Some("EN")),
             Ok(Value::LangString("a".into(), "en".into()))
         );
+        // RDF 1.1 Concepts §3.3: a language-tagged string's lexical form is any string; XML's
+        // character restriction is xsd:string's.
+        assert_eq!(
+            Value::parse("a\u{1}b", Datatype::LangString, Some("en")),
+            Ok(Value::LangString("a\u{1}b".into(), "en".into()))
+        );
+        assert!(matches!(
+            Value::parse("a\u{1}b", Datatype::String, None),
+            Err(LiteralError::IllTyped(_))
+        ));
         assert_eq!(
             v("a@En", Datatype::PlainLiteral),
             Value::LangString("a".into(), "en".into())
