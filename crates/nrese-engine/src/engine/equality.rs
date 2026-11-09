@@ -384,16 +384,18 @@ impl Classes {
         };
         // The reasoner's union kernel (G7 of the investigation of 6 October 2026).
         let mut union = nrese_exec::classes::Classes::default();
+        let mut credit = Credit::default();
         for stack in Stack::ALL {
             for quad in meter.scan(version.stack(stack), &pattern) {
                 let (a, b) = (quad.subject.raw(), quad.object.raw());
                 if a == b {
                     continue;
                 }
-                // A union moves the smaller side's members: counted before it is made
-                // (REAS-3a sol-loop r1 S1). One union is one step, done whole once counted. A
-                // pair already in one class (one member list) moves nothing and counts one
-                // unit (sol-loop r2 S6: an inferred star over an asserted chain).
+                // A union moves the smaller side's members: a step that can't be split
+                // (`nrese_exec::classes::Classes::union`), counted whole before it is made
+                // (REAS-3a sol-loop r1 S1, review r1 R1). A pair already in one class (one
+                // member list) moves nothing and counts one unit (sol-loop r2 S6: an inferred
+                // star over an asserted chain).
                 if M::COUNTED {
                     let (class_a, class_b) = (union.class_of(a), union.class_of(b));
                     let moved = match (class_a, class_b) {
@@ -403,7 +405,7 @@ impl Classes {
                             size(class_a).min(size(class_b)) as u64
                         }
                     };
-                    if !meter.units(moved) {
+                    if !credit.take_many(meter, moved) {
                         return None;
                     }
                 }
@@ -413,38 +415,64 @@ impl Classes {
         if meter.stopped() {
             return None;
         }
-        let mut copied = true;
-        let members = union.classes().map_while(|(representative, members)| {
-            copied = !M::COUNTED || meter.units(members.len() as u64);
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            if copied {
-                crate::witness::add(crate::witness::Site::ClassFinish, members.len() as u64);
-            }
-            copied.then(|| (representative, members.to_vec()))
-        });
-        let mut classes = Self::default();
-        for (_, mut identities) in members {
-            if identities.len() < 2 {
+        // Finishing the classes (REAS-3a review r1 R1): each identity copied out of the union
+        // kernel, and each checked for a literal and indexed, is a unit counted before it is
+        // handled, a chunk of at most `POLL_UNITS` at a time, so a stop is seen within a run
+        // of identities however large a class is. A class's sort is the one step here that
+        // can't be split: counted whole (its identities) before it runs, in place. The maps
+        // are made at their final size before the first insert, counted as the identities
+        // they will hold, so no insert grows them.
+        let chunk = nrese_exec::POLL_UNITS as usize;
+        let mut copies: Vec<Vec<u64>> = Vec::with_capacity(union.classes().size_hint().0);
+        let mut identities_in_all = 0;
+        for (_, members) in union.classes() {
+            if members.len() < 2 {
                 continue;
             }
+            let mut identities = Vec::with_capacity(members.len());
+            for part in members.chunks(chunk) {
+                if !credit.take_many(meter, part.len() as u64) {
+                    return None;
+                }
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::ClassFinish, part.len() as u64);
+                identities.extend_from_slice(part);
+            }
+            identities_in_all += identities.len();
+            copies.push(identities);
+        }
+        if !credit.take_many(meter, identities_in_all as u64) {
+            return None;
+        }
+        let mut classes = Self {
+            aliases: HashMap::with_capacity(identities_in_all - copies.len()),
+            members: HashMap::with_capacity(copies.len()),
+            literals: false,
+        };
+        for mut identities in copies {
+            if !credit.take_many(meter, identities.len() as u64) {
+                return None;
+            }
             identities.sort_unstable();
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            crate::witness::add(crate::witness::Site::ClassFinish, identities.len() as u64);
-            classes.literals |= identities
-                .iter()
-                .any(|&id| is_literal(TermId::from_raw(id)));
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
-            for &identity in &identities[1..] {
+            classes.literals |= is_literal(TermId::from_raw(representative));
+            for part in identities[1..].chunks(chunk) {
+                if !credit.take_many(meter, part.len() as u64) {
+                    return None;
+                }
                 #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-                crate::witness::add(crate::witness::Site::ClassFinish, 1);
-                classes.aliases.insert(identity, representative);
+                crate::witness::add(crate::witness::Site::ClassFinish, part.len() as u64);
+                for &identity in part {
+                    classes.literals |= is_literal(TermId::from_raw(identity));
+                    classes.aliases.insert(identity, representative);
+                }
             }
             classes
                 .members
                 .insert(representative, identities.into_boxed_slice());
         }
-        copied.then_some(classes)
+        Some(classes)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -694,6 +722,27 @@ impl Credit {
             self.0 = run;
         }
         self.0 -= 1;
+        true
+    }
+
+    /// Takes `n` units at once (a chunk of units, or a step that can't be split), asking
+    /// `meter` for a run when fewer are left: `POLL_UNITS`, or `n` where that is more (counted
+    /// in runs of at most `POLL_UNITS`, the step done whole once counted); what was left of the
+    /// last run is dropped, so between two asks there is at most one run of work. False once
+    /// the meter has stopped.
+    #[inline]
+    pub(crate) fn take_many<M: Metering>(&mut self, meter: M, n: u64) -> bool {
+        if !M::COUNTED {
+            return true;
+        }
+        if self.0 < n {
+            let run = n.max(u64::from(nrese_exec::POLL_UNITS));
+            if !meter.units(run) {
+                return false;
+            }
+            self.0 = run;
+        }
+        self.0 -= n;
         true
     }
 }

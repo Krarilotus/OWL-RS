@@ -12,13 +12,18 @@
 //! (`nrese_reasoner::eval::Poller`).
 //!
 //! So after a reader's stop fires, a counted read does at most the units its visitor last
-//! allowed, then stops at its next call: `POLL_UNITS` plus the run in progress per task
-//! (REAS-2's invariant, one level down). A step that can't be split, and costs more than
-//! `POLL_UNITS` units, is counted whole (in runs of at most `POLL_UNITS`) before it is done:
-//! a merge step over more cursors, a union of two equality classes (the smaller side's
-//! members move), one class's copy and sort. The run in progress is then that step, bounded
-//! by the largest class or the run count, not by the data a read passes over (REAS-3a,
-//! sol-loop r1 S1; splitting a union is the union kernel's, `nrese_exec::classes`).
+//! allowed, at most `POLL_UNITS`, then stops at its next call (REAS-2's invariant, one level
+//! down). Every loop of a counted read asks within that many units of work, with three steps
+//! that can't be split as the only exception. Each is counted whole before it starts (in
+//! runs of at most `POLL_UNITS`), then done whole: CPU work over memory the read already
+//! holds, growing none but the list it works on.
+//! - A merge step reads its cursors, one per run the read's ranges are in (`index::merge`).
+//! - A union of two equality classes moves the smaller side's members
+//!   (`nrese_exec::classes::Classes::union`).
+//! - A class build sorts each class's members once, in place, and makes its maps at their
+//!   final size, once (`Classes::of_with`).
+//!
+//! (REAS-3a sol-loop r1 S1, review r1 R1 and R2.)
 
 /// A read its visitor stopped: an error its caller has to handle, never an answer (REAS-2
 /// fix check r1, rule 2; one type for the engine and the reasoner).

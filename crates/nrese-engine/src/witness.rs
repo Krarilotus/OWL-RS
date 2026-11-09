@@ -32,8 +32,9 @@ pub enum Site {
     /// union kernel, each it checks for a literal and indexes as an alias (`Classes::of_with`;
     /// its sorts are not counted here).
     ClassFinish,
-    /// Merge cursors read outside a merge step: the remaining-entries hint
-    /// (`SignedMerge::remaining`).
+    /// Merge cursors read outside a merge step. The remaining-entries hint
+    /// (`SignedMerge::remaining`) read every cursor until REAS-3a review r1 R2; it now keeps
+    /// its count as the cursors advance and reads none, so nothing counts here.
     CursorReads,
 }
 
