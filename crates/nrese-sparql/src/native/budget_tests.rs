@@ -810,6 +810,10 @@ fn a_closures_buffers_are_charged_while_they_live() {
 /// Each must be refused while holding less than 2 MiB: the order of 131,072 ids alone is 1 MiB,
 /// and a set of the nodes seen more. Searched uncharged and charged on arrival, both were held
 /// before the refusal.
+///
+/// The store's planner statistics, which the first join planned on a store builds and keeps
+/// for every later query (about 5 MB over this chain), are the store's, not the search's: a
+/// join is planned once before the cases are measured.
 #[test]
 fn a_search_from_a_bound_end_is_charged_while_it_searches() {
     if !alone() {
@@ -825,6 +829,8 @@ fn a_search_from_a_bound_end_is_charged_while_it_searches() {
                 ("s".to_owned(), "t".to_owned(), "c".to_owned()),
             ]),
     );
+    let join = "SELECT ?s ?o WHERE { ?s <urn:t> <urn:c> . ?s <urn:p>+ ?o }";
+    let _ = query_held(&engine, join, LIMIT);
     let last = format!("SELECT ?s WHERE {{ ?s <urn:p>+ <urn:n{}> }}", N - 1);
     let cases = [
         (
@@ -832,10 +838,7 @@ fn a_search_from_a_bound_end_is_charged_while_it_searches() {
             "SELECT ?o WHERE { <urn:n0> <urn:p>+ ?o }",
         ),
         ("backwards from a bound end", last.as_str()),
-        (
-            "one bound start in a join",
-            "SELECT ?s ?o WHERE { ?s <urn:t> <urn:c> . ?s <urn:p>+ ?o }",
-        ),
+        ("one bound start in a join", join),
     ];
     let failures: Vec<String> = cases
         .into_iter()
