@@ -7,6 +7,11 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Fault points other crates' tests reach (src/fault_points.rs): off by default, turned on only by
+# nrese-store's dev-dependency on this crate; no product build has them (scripts/check-features.sh).
+fault-points = []
+
 [dependencies]
 aho-corasick = "1.1"
 crc32fast = "1.5"
