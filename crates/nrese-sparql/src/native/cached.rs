@@ -375,6 +375,11 @@ pub(crate) fn output_key(
         super::query_dataset(query),
         super::query_base(query),
     );
+    // A canonical view the budgets refused: the answer is that refusal, never a cached one
+    // (the context reads the snapshot as given meanwhile; sol-loop r2 S2).
+    if ctx.canonical_refused.is_some() {
+        return None;
+    }
     let scope = ctx.cache.as_ref()?;
     let mut encoder = ctx.key_start(scope);
     encoder.tag(b'S');
