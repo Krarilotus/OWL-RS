@@ -124,6 +124,19 @@ impl Context<'_> {
             return Ok((self.vector_service(inner, bound)?, None));
         }
         let variable = match name {
+            // A blank node or literal put in for the endpoint ([`super::substitute`]) is no
+            // IRI: as a variable endpoint without one, never called.
+            NamedNodePattern::NamedNode(endpoint)
+                if nrese_sparql_syntax::internal::is_constant(endpoint.as_str()) =>
+            {
+                if silent {
+                    return Ok((self.unit()?, None));
+                }
+                return Err(QueryEvaluationError::Service(
+                    "SERVICE: an endpoint must be an IRI".into(),
+                )
+                .into());
+            }
             NamedNodePattern::NamedNode(endpoint) => {
                 let found = self.call_silently(endpoint.as_str(), inner, bound, silent)?;
                 return Ok((found, None));
