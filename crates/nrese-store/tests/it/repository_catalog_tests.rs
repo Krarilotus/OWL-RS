@@ -250,9 +250,10 @@ fn a_repository_switches_the_ql_rewriting() {
 /// under it) to `owl2-rl` with the QL rewriting on answers through the existential at once:
 /// whether the setting changes with the reasoning or was on already. Specified: as
 /// [`a_repository_switches_the_ql_rewriting`]'s `on`; with it `off`, no bob (the control:
-/// the answer comes from the rewriting, not from stored inferences). A guard: the catalogue
-/// slice applies the QL setting before the new write path switches the bounds off (its
-/// sol-loop r1, S1, thought that lost the rewriting; this passes on that head too).
+/// the answer comes from the rewriting, not from stored inferences). The data is written
+/// through the repository's own write path, so `owl2-dl` stays active up to the change (a
+/// write path of other reasoning, as the test support's, switches it off). Catalogue slice
+/// sol-loop r1–r2, S1.
 #[test]
 fn a_change_from_owl2_dl_to_owl2_rl_keeps_the_ql_rewriting() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -271,14 +272,9 @@ fn a_change_from_owl2_dl_to_owl2_rl_keeps_the_ql_rewriting() {
         catalog
             .create(id, settings("owl2-dl", under_dl))
             .expect("created");
-        let store = catalog
-            .get(id)
-            .expect("created")
-            .pipeline
-            .read()
-            .store()
-            .clone();
-        store
+        let pipeline = std::sync::Arc::clone(&*catalog.get(id).expect("created").pipeline.read());
+        let store = std::sync::Arc::clone(pipeline.store());
+        pipeline
             .execute_update_str(
                 "PREFIX owl: <http://www.w3.org/2002/07/owl#>
                  PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -289,6 +285,10 @@ fn a_change_from_owl2_dl_to_owl2_rl_keeps_the_ql_rewriting() {
                  }",
             )
             .expect("written");
+        assert!(
+            store.dl().active(),
+            "{id}: owl2-dl is active before the change"
+        );
         catalog
             .change(id, settings("owl2-rl", Some(after)))
             .expect("changed");
