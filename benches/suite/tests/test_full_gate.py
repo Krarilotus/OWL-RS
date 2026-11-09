@@ -20,6 +20,8 @@ class FullGate(unittest.TestCase):
             root = Path(directory)
             (root / "scripts").mkdir()
             shutil.copy(ROOT / "scripts/check.sh", root / "scripts/check.sh")
+            (root / "scripts/lib").mkdir()
+            shutil.copy(ROOT / "scripts/lib/gate-tools.txt", root / "scripts/lib/gate-tools.txt")
             for name in ("cargo-guarded.sh", "check-locks.sh", "check-names.sh", "fetch-w3c-tests.sh"):
                 (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n", newline="\n")
                 (root / "scripts" / name).chmod(0o755)
@@ -30,7 +32,7 @@ class FullGate(unittest.TestCase):
   metadata) echo '{"packages":[{"name":"fixture"}]}' ;;
   deny)
     [ "$DENY" != missing ] || exit 101
-    [ "$2" != --version ] || exit 0
+    [ "$2" != --version ] || { echo "cargo-deny $DENY_VERSION"; exit 0; }
     echo "$*" >> "$SEEN"
     case "$DENY:$*" in
       workspace:*--manifest-path*) exit 0 ;;
@@ -46,17 +48,23 @@ exit 0
                 path = binaries / name
                 path.write_text("#!/bin/sh\n" + body, newline="\n")
                 path.chmod(0o755)
-            for state in ("missing", "workspace", "harness", "ok"):
+            # Spec: master's r1 F2: a version other than the checked-in pin fails
+            # all, with both installed and required versions in its diagnostic.
+            for state in ("missing", "workspace", "harness", "older", "newer", "ok"):
                 with self.subTest(state=state):
                     seen = root / f"seen-{state}"
+                    version = {"older": "0.20.1", "newer": "0.20.3"}.get(state, "0.20.2")
                     env = isolation.inherit("NRESE_", "FLEET_", "CARGO_",
                         PATH=binaries.as_posix() + os.pathsep + os.environ["PATH"],
                         REAL_PYTHON=Path(sys.executable).as_posix(), NRESE_ON_BUILD_HOST="1",
-                        DENY=state, SEEN=seen.as_posix())
+                        DENY=state, DENY_VERSION=version, SEEN=seen.as_posix())
                     done = subprocess.run([shutil.which("bash"), "scripts/check.sh", "all"],
                                           cwd=root, env=env, capture_output=True, text=True, timeout=60)
                     self.assertEqual(done.returncode, 0 if state == "ok" else 1,
                                      f"SPEC required deny: {state}\n{done.stdout}{done.stderr}")
+                    if state in ("older", "newer"):
+                        self.assertIn(version, done.stdout + done.stderr)
+                        self.assertIn("0.20.2", done.stdout + done.stderr)
                     if state != "missing":
                         self.assertEqual(seen.read_text().splitlines(), [
                             "deny --all-features check",
