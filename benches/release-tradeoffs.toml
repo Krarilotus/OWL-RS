@@ -1,13 +1,21 @@
-# The owner-approved trade-offs of the release gate (benches/PROTOCOL.md §5, "The release
-# gate"; benches/fast/release_gate.py). The gate tolerates no loss in time or memory: a loss is
-# accepted only when an entry here covers it, and then it is reported as an accepted trade-off.
-# Nothing else waives a loss. Only the owner adds an entry, with the date and reason of the
-# approval and the win that pays for it.
+# The owner-approved policy of the release gate (benches/PROTOCOL.md §5, "The release gate";
+# benches/fast/release_gate.py load_policy): the one place that accepts what the bar forbids. The
+# gate tolerates no loss in time or memory and no wrong answer. A loss is accepted only when a
+# trade-off here covers it; a wrong answer only when an exception here names its case and outcome.
+# Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
+# `known` issue explain evidence, they grant nothing.
 #
-# An entry covers a loss when its case and dimension match (and its baseline, if `against`
-# names one), the worse end of the loss's interval is at most `max_ratio`, and the paying win
-# shows as `better` against the same baseline in the same report. Dimensions are as the report
-# names them: time/<series>, memory/lifetime, memory/phase/<phase>, qps/<clients>, ...
+# `release-gate.sh verdict CAND ...` reads this file at the candidate's commit, never from a timed
+# report: an entry counts for the candidates whose tree holds it.
+#
+# Only Johannes approves an entry (role.owners). Each carries `by = "Johannes"`, the `approved`
+# date, a `reason`, his words (`quote`, verbatim) and where he said them (`source`). An entry
+# without them makes the file an error, and the verdict NOT PASSED.
+#
+# A trade-off covers a loss when its case and dimension match (and its baseline, if `against` names
+# one), the worse end of the loss's interval is at most `max_ratio`, and the paying win shows as
+# `better` against the same baseline in the same report. Dimensions are as the report names them:
+# time/<series>, memory/lifetime, memory/phase/<phase>, qps/<clients>, ...
 #
 # [[tradeoff]]
 # case = "lab-olympics"
@@ -15,6 +23,20 @@
 # against = "main"                      # optional: base or main; omitted, either
 # max_ratio = 1.10                      # the loss's interval may reach at most this ratio
 # approved = "2026-10-20"
-# by = "the owner"
+# by = "Johannes"
 # reason = "the string interner's shards: 10 % more memory at load for loads 27 % faster"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
 # pays_with = { case = "load-entities", dimension = "time/_" }
+#
+# An exception accepts one outcome of one case (outcome: wrong; a declared limit needs none: it
+# blocks where a baseline completes and is named where none does).
+#
+# [[exception]]
+# case = "<a case of benches/cases>"
+# outcome = "wrong"
+# approved = "2026-11-09"
+# by = "Johannes"
+# reason = "<why it ships>"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"

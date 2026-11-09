@@ -391,12 +391,19 @@ arises, the same for every side:
   (the governor, boost, THP) are recorded, never changed: phuoc-yu's is performance with boost,
   office-pc's powersave with energy preference balance_performance (a shared host).
 
-**Trade-offs.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing that accepts a
-loss, and only the owner adds to it: a case, a dimension, optionally the baseline, the largest
-ratio the loss's interval may reach, the date, approver and reason, and the win that pays for
-it, which must show as *better* in the same report. A covered loss is reported as an
-*accepted trade-off*; anything beyond its bound, without its win, or on another dimension
-blocks. The list starts empty.
+**Trade-offs and exceptions.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing
+that accepts what the bar forbids, and only Johannes adds to it. Each entry carries his approval:
+the date, `by = "Johannes"`, the reason, his words verbatim and their source. A *trade-off*
+accepts a loss: it names a case, a dimension, optionally the baseline, the largest ratio the
+loss's interval may reach, and the win that pays for it, which must show as *better* in the same
+report. A covered loss is reported as an *accepted trade-off*; anything beyond its bound, without
+its win, or on another dimension blocks. An *exception* accepts one case's wrong answer: a
+candidate's `wrong` outcome blocks unless one names that case and outcome, even where the case
+declares the outcome and every baseline is wrong too; a declared `outcome` and `known` issue
+explain evidence and grant nothing. A declared limit (memory-limit, gave-up, timeout,
+unsupported) blocks where a baseline completes and is named where none does. The verdict reads
+the file at the candidate's commit, never from a report, and lists every entry it applied and
+every exception the candidate didn't need. The list starts empty.
 
 **Memory, one policy** (research round 8). Tested, where both sides report them: the scope's
 anonymous and kernel memory at its peak (Linux: `anon` + `kernel` of the case's cgroup
@@ -414,15 +421,25 @@ is marked); the gate's question is time and memory.
 data required (`NRESE_W3C_REQUIRED`: a suite without its data fails, never skips; the OWL 2
 test cases pinned by SHA-256) and `--nocapture`; each suite's counts are checked against
 [fast/w3c-expected.toml](fast/w3c-expected.toml): no failure, at least its passes, at most its
-known skips and disputes. The guards are the test names §0's Guard column gives; each must run
-and pass (a name no test has, or an ignored one, fails: docs and code disagree).
+known skips and disputes. The kits are the ones that file declares, each with the suites its own
+log reports; the checker launches them (`release_gate.py w3c --run`), and a kit that exits
+non-zero or without passing libtest summaries fails, whatever its log says. The guards are the
+test names §0's Guard column gives; each must run and pass (a name no test has, or an ignored
+one, fails: docs and code disagree), under a test run that exited 0.
+
+**One candidate.** Each check writes a receipt: the commit and tree it ran, the build identity
+(`scripts/lib/gate-key.sh` `gate_identity`), the host and job, every unit it launched with its
+exit code and log's SHA-256. `verdict CAND ...` passes only when every timed part timed CAND's
+tree and every check's receipt names it (a merge commit of the same tree is the same candidate);
+a result without a receipt, a timed directory without its report, or two results of one kind in
+the checks' directory are refused.
 
 ```sh
 bash scripts/release-gate.sh jobs HEAD --out jobs/   # build, timed (phuoc-yu), big (khaleesi-wsl), checks (office-pc)
 fleet submit jobs/*.toml                             # with FLEET_OWNER set; then fleet results ... --to R
 bash scripts/release-gate.sh confirm R/rg-H8-timed R/rg-H8-big --out jobs/   # rg-H8-confirm, rg-H8-big-confirm
 fleet submit jobs/rg-H8-*confirm*.toml               # then confirm again on every round's results, if pending
-bash scripts/release-gate.sh verdict R/rg-H8-timed R/rg-H8-confirm R/rg-H8-big R/rg-H8-big-confirm R/rg-H8-checks
+bash scripts/release-gate.sh verdict HEAD R/rg-H8-timed R/rg-H8-confirm R/rg-H8-big R/rg-H8-big-confirm R/rg-H8-checks
 ```
 
 ## 6. Records: every number traceable
