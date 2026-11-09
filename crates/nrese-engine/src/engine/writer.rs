@@ -40,7 +40,9 @@ pub enum NoteError {
     Refused(std::io::Error),
     /// The journal may name the revision: the commit is refused and the log poisoned, as after
     /// a failed write of its record, so that no other commit takes the revision the journal may
-    /// name ([`EngineError::Io`](crate::EngineError::Io)).
+    /// name ([`EngineError::Io`](crate::EngineError::Io)). That error is the one a failed
+    /// write of the record returns, by intent: the caller knows from its own journal whether
+    /// the note wrote, and must not tell them apart by the error.
     Unknown(std::io::Error),
 }
 

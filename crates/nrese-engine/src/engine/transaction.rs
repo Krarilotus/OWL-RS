@@ -97,8 +97,9 @@ impl<'e> Transaction<'e> {
     /// [`super::NoteError::Unknown`] refuses the commit as `Refused` does. The note runs with
     /// the writer slot, the WAL and possibly the compaction slot held (contracts.md, lock
     /// order): it must not call into the engine or wait for a lock, and its own I/O holds back
-    /// compaction and checkpoints for as long as it takes. A later call replaces the note.
+    /// compaction and checkpoints for as long as it takes. One note per commit.
     pub fn note_commit(&mut self, note: super::CommitNote<'e>) {
+        debug_assert!(self.note.is_none(), "one note per commit");
         self.note = Some(note);
     }
 
