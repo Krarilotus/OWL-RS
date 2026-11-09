@@ -537,7 +537,7 @@ impl Context<'_> {
                     terms.insert(variable.clone(), term);
                 }
             }
-            let substituted = super::substitute::Values { terms: &terms }.pattern(pattern);
+            let substituted = super::substitute::Values::new(self, &terms)?.pattern(pattern);
             let found = match graph {
                 Some(id) => self.in_graph(
                     GraphScope::Named(nrese_engine::TermId::from_raw(id)),
