@@ -202,9 +202,10 @@ fn owl2_rl_rejects_inconsistent_commits() {
 
 /// The G3 safety audit (7 October 2026): a commit the OWL 2 RL gate rejects listed its
 /// premises whatever the committer could read. A committer who may read and write `open`
-/// only is rejected for what the secret schema makes inconsistent, and the rejection shows
-/// the premises asserted in the graphs it may read: not the secret disjointness, nor the
-/// type the secret subclass axiom infers. A committer who reads everything sees them all.
+/// only is rejected for what the secret schema makes inconsistent. Its own graphs violate
+/// nothing by themselves, so the rejection shows no premise (Q07: even its own statement
+/// would tell that the secret schema relates `:A` to what it committed). A committer who
+/// reads everything sees them all.
 #[test]
 fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
     use nrese_sparql::GraphAccess;
@@ -239,26 +240,31 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
         let Err(MutationError::Rejected(reject)) = result else {
             panic!("expected a rejection, got {result:?}");
         };
-        let explanation = reject.explanation.expect("an explanation");
-        let shown: Vec<String> = explanation
-            .evidence
-            .iter()
-            .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
-            .collect();
         let secret = |text: &str| text.contains("disjointWith") || text.contains(&format!("{EX}B"));
         if restricted {
-            // The committer's own statement, nothing of the secret graph or inferred from it.
-            assert!(
-                shown
-                    .iter()
-                    .any(|s| s.contains(&format!("{EX}x")) && s.contains(&format!("{EX}A"))),
-                "{shown:#?}"
-            );
-            assert!(!shown.iter().any(|s| secret(s)), "{shown:#?}");
-            assert!(!secret(&explanation.summary), "{}", explanation.summary);
+            // Nothing of the secret graph, nor what it relates to the committer's statement.
+            assert!(reject.explanation.is_none(), "{reject:?}");
+            assert!(reject.attribution.is_none(), "{reject:?}");
             assert!(!secret(&reject.detail), "{}", reject.detail);
-            assert!(reject.detail.contains("not shown"), "{}", reject.detail);
+            assert!(
+                !reject.detail.contains(&format!("{EX}A")),
+                "{}",
+                reject.detail
+            );
+            assert!(
+                reject
+                    .detail
+                    .contains("Only statements in graphs you can read are shown"),
+                "{}",
+                reject.detail
+            );
         } else {
+            let explanation = reject.explanation.expect("an explanation");
+            let shown: Vec<String> = explanation
+                .evidence
+                .iter()
+                .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
+                .collect();
             assert_eq!(shown.len(), 3, "{shown:#?}");
             assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
         }

@@ -111,6 +111,25 @@ class Isolation(unittest.TestCase):
                           if isinstance(node, ast.Constant) and node.value in ("GIT_", "--local-env-vars")]
         self.assertEqual(found, [], "SPEC one git policy: only isolation.py strips or lists git's variables")
 
+    def test_a_fixture_copies_ns_sh_only_with_its_lock(self):
+        """Orchestrator, 8 Nov 2026: three fixtures copied scripts/lib/ns.sh by hand, two of them
+        without suitekit/lock.py, which ns.sh locks with where there is no flock (Git Bash); #153's
+        Windows gate failed on one. No fixture's list of files to copy (a module's constant) names
+        ns.sh itself: it takes isolation.NS_SH; and a checkout of ns.sh without its lock is refused.
+        (A test making a file of that name in a repository of its own copies nothing.)"""
+        found = []
+        for path in sorted(ISOLATION.parent.glob("*.py")):
+            if path != ISOLATION:
+                found += [f"{path.name}:{node.lineno}" for node in ast.parse(path.read_text("utf-8")).body
+                          if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Tuple, ast.List, ast.Set))
+                          and any(isinstance(e, ast.Constant) and e.value == "scripts/lib/ns.sh"
+                                  for e in node.value.elts)]
+        self.assertEqual(found, [], "SPEC a fixture copies ns.sh through isolation.NS_SH, its lock with it")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                isolation.checkout(Path(tmp), "scripts/lib/ns.sh")
+            self.assertFalse((Path(tmp) / "scripts/lib/ns.sh").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

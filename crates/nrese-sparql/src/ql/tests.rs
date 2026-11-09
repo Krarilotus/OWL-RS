@@ -545,3 +545,33 @@ fn supported_graph_readers_keep_separate_schema_entries() {
     assert!(!Arc::ptr_eq(&original, &ql.tbox(&pending, Some(&visible))));
     assert!(ql.tbox(&pending, Some(&hidden)).is_empty());
 }
+
+/// Structural guard (I24c-2): every term of the mapping's vocabulary is either read as
+/// schema or named in `NOT_READ` with its reason, never both, and `NOT_READ` names only
+/// terms the vocabulary has. A term the mapping gains is read until someone classifies it
+/// otherwise; a renamed one fails here.
+#[test]
+fn the_reader_reads_the_mapping_vocabulary() {
+    let fields: Vec<&str> = nrese_owl::Vocabulary::iris()
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect();
+    let stale: Vec<&&str> = NOT_READ.iter().filter(|n| !fields.contains(*n)).collect();
+    assert!(stale.is_empty(), "not in the vocabulary: {stale:?}");
+    let (properties, classes) = (&READ_PROPERTIES[..], &READ_CLASSES[..]);
+    for (field, iri) in nrese_owl::Vocabulary::iris() {
+        let read = properties
+            .iter()
+            .chain(classes)
+            .filter(|r| **r == iri)
+            .count();
+        let skipped = NOT_READ.contains(&field);
+        assert_eq!(
+            (read, skipped),
+            (usize::from(!skipped), skipped),
+            "{field} ({iri}): read {read} times, listed as not read: {skipped}"
+        );
+    }
+    let facet = format!("{}minInclusive", nrese_owl::vocab::XSD);
+    assert!(properties.contains(&facet.as_str()), "the facets are read");
+}
