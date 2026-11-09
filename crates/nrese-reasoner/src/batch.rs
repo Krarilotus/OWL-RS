@@ -3516,6 +3516,8 @@ fn list(
                         )
                     },
                     |(mut copies, mut scratch, poll), fact| {
+                        #[cfg(test)]
+                        crate::witness::add(crate::witness::Site::ExpandedFact, 1);
                         let [ms, mp, mo] = fact.each_ref().map(|id| {
                             reps.classes
                                 .class_of(*id)

@@ -11,18 +11,45 @@ use std::cell::Cell;
 pub(crate) enum Site {
     /// U1's lookups of a fact in its view (`UpperBase::in_view`).
     InView,
+    /// Touched facts the cached rederived fallback asks the closure about
+    /// (`compute_rederived`'s `in_closure`).
+    FallbackProbe,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 1] = const { [Cell::new(0)] };
+    static COUNTS: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
 }
 
-/// Counts `n` units at `site` on this thread.
+/// What [`on_first`] left to run: the site's index and the action.
+type Due = Option<(usize, Box<dyn FnOnce()>)>;
+
+thread_local! {
+    static ON_FIRST: std::cell::RefCell<Due> = const { std::cell::RefCell::new(None) };
+}
+
+/// Counts `n` units at `site` on this thread, then runs what [`on_first`] left for it.
 pub(crate) fn add(site: Site, n: u64) {
     COUNTS.with(|counts| {
         let count = &counts[site as usize];
         count.set(count.get() + n);
     });
+    let due = ON_FIRST.with(|on| {
+        let mut on = on.borrow_mut();
+        match &*on {
+            Some((at, _)) if *at == site as usize => on.take(),
+            _ => None,
+        }
+    });
+    if let Some((_, then)) = due {
+        then();
+    }
+}
+
+/// Runs `then` once, on this thread, right after `site` next counts: how a test makes a
+/// stop that the code reads from a flag (a query's cancellation) fire at the first real
+/// unit of work.
+pub(crate) fn on_first(site: Site, then: Box<dyn FnOnce()>) {
+    ON_FIRST.with(|on| *on.borrow_mut() = Some((site as usize, then)));
 }
 
 /// The units counted at `site` on this thread so far.

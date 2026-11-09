@@ -1059,6 +1059,8 @@ impl<'r> Job<'r> {
         seg_of: impl Fn(usize) -> Seg,
         poll: &Poller<'_>,
     ) -> Option<Self> {
+        #[cfg(test)]
+        crate::witness::add(crate::witness::Site::JobConstruction, 1);
         // An atom over a predicate without facts can't match. A stopped read makes no job,
         // never one over a part of its drivers: a program's rules bound the loop that asks
         // (fix check r1 triage, BOUNDED), and the stage's latched check ends it.
@@ -1691,6 +1693,8 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
     tasks
         .par_iter()
         .map(|(j, range)| {
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::MorselTask, 1);
             let job = &jobs[*j];
             let Head::Facts(heads) = &job.rule.head else {
                 return finish(*j, Vec::new());
@@ -2974,6 +2978,62 @@ mod tests {
             ),
             (0, 0),
             "scans opened and facts scanned by a search on a stopped poller"
+        );
+    }
+
+    /// REAS-2 fix check r2 (R3-F2, SW143). Spec (design note, rule 2 completed: a parallel
+    /// pass over tasks that can stop is a fallible pass, and no task starts after one has
+    /// failed): a round's morsels end at the operation's stop. One job over 16 morsels of
+    /// drivers, on a one-thread pool, the stop firing (a) as the first morsel makes its poller
+    /// and (b) inside the first morsel's run: no morsel task starts after the one that saw it.
+    /// A stopped morsel finished as an ordinary empty result, and every later morsel started,
+    /// made its poller and finished empty too.
+    #[test]
+    fn a_round_s_morsels_end_at_its_stop() {
+        use crate::witness::{self, Site};
+        let morsels = 16;
+        let facts: Vec<Triple> = (0..(morsels * MORSEL) as u64)
+            .map(|i| [i, 11, 1_000_000 + i])
+            .collect();
+        let source = Counting {
+            facts,
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let rule = Rule {
+            name: "copy".to_owned(),
+            body: vec![Atom([Term::Var(0), Term::Const(11), Term::Var(1)])],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([Term::Var(0), Term::Const(12), Term::Var(1)])]),
+        };
+        let jobs: Vec<Job<'_>> = Job::full(&source, &rule, &Poller::never())
+            .into_iter()
+            .collect();
+        assert_eq!(jobs.len(), 1, "one job");
+        assert_eq!(jobs[0].drivers(), morsels * MORSEL, "its drivers");
+        let keep = |fact: Triple, poll: &Poller<'_>| Ok(!source.contains(fact, poll)?);
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a pool");
+        let mut failed = Vec::new();
+        for at in ["the first morsel's poller", "inside the first morsel"] {
+            let started = one.install(|| {
+                let asks = AtomicUsize::new(0);
+                // The first ask is the first morsel's poller's; the second, inside its run.
+                let skip = usize::from(at != "the first morsel's poller");
+                let stop = || asks.fetch_add(1, Ordering::Relaxed) >= skip;
+                let start = witness::get(Site::MorselTask);
+                let _ = run_jobs(&source, &jobs, &keep, &stop);
+                witness::get(Site::MorselTask) - start
+            });
+            if started > 1 {
+                failed.push(format!("{at}: {started} of {morsels} morsel tasks started"));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "morsels started after the stop fired, beyond the one that saw it: {failed:#?}"
         );
     }
 }

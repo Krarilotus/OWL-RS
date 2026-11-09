@@ -14,10 +14,24 @@ pub(crate) enum Site {
     KnownBefore,
     /// Candidates a morsel's keep looks at (`Store::retain_new`).
     RetainStep,
+    /// Job constructions started (`Job::new`).
+    JobConstruction,
+    /// `owl:sameAs` partner reads started for a dependency key (`same_as_partners`).
+    PartnerRead,
+    /// Morsel tasks started (`run_morsels`).
+    MorselTask,
+    /// Facts an expanded listing's fold takes (`batch::list`).
+    ExpandedFact,
+    /// Candidates `rederived`'s one-step pass takes.
+    OneStepCandidate,
+    /// Head groups the support round's per-head pass takes.
+    HeadGroup,
+    /// Merges of a fact's derivations into its sets started (`merge`).
+    Merge,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 2] = const { [Cell::new(0), Cell::new(0)] };
+    static COUNTS: [Cell<u64>; 9] = const { [const { Cell::new(0) }; 9] };
 }
 
 /// Counts `n` units at `site` on this thread.
