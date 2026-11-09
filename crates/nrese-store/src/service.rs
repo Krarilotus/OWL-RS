@@ -230,12 +230,19 @@ impl StoreService {
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
+        // So does what client transactions keep between requests.
+        let sessions = crate::sessions::Sessions::within(
+            std::sync::Arc::new(
+                nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+            ),
+            crate::sessions::SESSION_IDLE,
+        );
         let service = Self {
             process_memory,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
-            sessions: std::sync::Arc::default(),
+            sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),
@@ -730,6 +737,11 @@ impl StoreService {
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        } else if let Some(state) = self.reasoning_state() {
+            // Off: the rewriting the closure and the setting call for, whatever came first
+            // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
+            // path, which switches the bounds off, exists).
+            self.note_ql(&state);
         }
     }
 
@@ -1017,16 +1029,29 @@ impl StoreService {
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
     }
 
-    /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
-    /// without reasoning, or for asserted statements only): sound, and complete only for
-    /// what the ruleset derives, never certain answers under OWL 2 DL. Known before the
-    /// query runs.
+    /// The status of answers that don't go through the DL bounds; known before the query
+    /// runs. `None` only where no reasoning path can leave answers out: asserted statements
+    /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
+    /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
+    /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
+    /// rules' closure without the bounds ([`Self::dl_mode`]): sound only, never complete
+    /// (SYN-72 slice 2 r1 F1).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        if self.dl.active() || prepared.read_model() == ReadModel::Asserted {
+        if prepared.read_model() == ReadModel::Asserted {
             return None;
+        }
+        if self.dl.active() {
+            let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+            status.incomplete(
+                "dl",
+                "a read of the inferred statements alone: the rules' closure, without the DL \
+                 bounds; certain answers under OWL 2 DL may be missing"
+                    .to_owned(),
+            );
+            return Some(status);
         }
         let ruleset = self
             .materialised
@@ -1298,6 +1323,9 @@ impl StoreService {
         // read as the reader may; what they change is checked at the commit (the view is
         // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
+        // What the operations' transfers reserve of the pending changes is the reading
+        // query's too.
+        tx.charge_pending_to(std::sync::Arc::new(memory.part()))?;
         let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {

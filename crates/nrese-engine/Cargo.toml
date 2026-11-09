@@ -7,6 +7,15 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Fault points other crates' tests reach (src/fault_points.rs): off by default, turned on only by
+# nrese-store's dev-dependency on this crate; no product build has them (scripts/check-features.sh).
+fault-points = []
+# The work counters of src/witness.rs, for other crates' tests (REAS-3: the work an adapter's
+# read does in the engine, after its stop): a dev-dependency with this feature. Never in product
+# builds; the count jobs check that none of theirs has it.
+witness = []
+
 [dependencies]
 aho-corasick = "1.1"
 crc32fast = "1.5"
@@ -34,12 +43,6 @@ tracing.workspace = true
 # nrese-exec already uses.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
-
-[features]
-# The work counters of src/witness.rs, for other crates' tests (REAS-3: the work an adapter's
-# read does in the engine, after its stop): a dev-dependency with this feature. Never in product
-# builds; the count jobs check that none of theirs has it.
-witness = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

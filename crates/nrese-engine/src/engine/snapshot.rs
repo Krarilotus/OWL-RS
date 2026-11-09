@@ -20,6 +20,10 @@ pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
+mod own_state;
+pub(crate) use own_state::OwnSlots;
+pub use own_state::{Admission, OwnState};
+
 mod reader_search;
 pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
@@ -381,7 +385,8 @@ impl std::fmt::Debug for Snapshot {
 
 impl Snapshot {
     /// A snapshot of `version`, not published: no [`SharedState`]. The bulk path's checkpoint
-    /// image is made so, before its version is installed.
+    /// image is made so, of a version that is never installed (one made from it is). Never of
+    /// an installed version: its own slots ([`OwnState`]) would be that version's.
     pub(super) fn new(
         version: Arc<Version>,
         dictionary: Arc<Dictionary>,
@@ -418,12 +423,25 @@ impl Snapshot {
         }
     }
 
+    /// Where what this snapshot derives may be kept (the lifecycle contract's S3): in state
+    /// other operations reach for a published snapshot ([`SharedState`]), in its own
+    /// version's slots for a pending, private, staged or added-to one ([`OwnState`]).
+    pub fn admission(&self) -> Admission<'_> {
+        match self.published {
+            true => Admission::Shared(SharedState { snapshot: self }),
+            false => Admission::Own(OwnState::new(self)),
+        }
+    }
+
     /// The capability to admit into state other operations reach, for a published snapshot
-    /// alone (the lifecycle contract's S3); `None` for a pending, private, staged or
-    /// added-to one, which computes for its request instead. Reading entries made from
-    /// published snapshots needs none.
+    /// alone ([`Self::admission`]'s `Shared`); `None` for a pending, private, staged or
+    /// added-to one, which computes for its request or keeps it in its own version instead.
+    /// Reading entries made from published snapshots needs none.
     pub fn shared_state(&self) -> Option<SharedState<'_>> {
-        self.published.then_some(SharedState { snapshot: self })
+        match self.admission() {
+            Admission::Shared(state) => Some(state),
+            Admission::Own(_) => None,
+        }
     }
 
     /// This snapshot reading the default graph expanded over the `owl:sameAs` classes of
@@ -726,6 +744,28 @@ impl Snapshot {
         added: &[crate::quad::EncodedTriple],
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        self.inferred_added_within(added, budget, ViewOf::Addition)
+    }
+
+    /// [`Self::with_inferred_added_within`] for statements this snapshot's own DL bounds
+    /// derive from it alone: the view keeps this snapshot's publication (a published
+    /// snapshot's gets a token, an unpublished one's none). F2's contract revision for the
+    /// store's DL bounds (the master, 8 Nov): they are its only caller. The workspace's
+    /// `clippy.toml` disallows it everywhere else, a source policy, not a capability.
+    pub fn with_inferred_derived_within(
+        &self,
+        derived: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        self.inferred_added_within(derived, budget, ViewOf::Derived)
+    }
+
+    fn inferred_added_within(
+        &self,
+        added: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+        of: ViewOf,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
         use std::mem::size_of;
         let stack = &self.version.inferred;
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
@@ -745,11 +785,7 @@ impl Snapshot {
         let (inferred, run) = built?;
         let held =
             nrese_exec::Reservation::adopt(Arc::clone(budget), held.transfer() + run.transfer());
-        Ok(self.restricted(
-            inferred,
-            Held::new(self.held.with(0), held),
-            ViewOf::Addition,
-        ))
+        Ok(self.restricted(inferred, Held::new(self.held.with(0), held), of))
     }
 
     /// This snapshot with the inferred statements `mask` hides removed, as
@@ -807,6 +843,7 @@ impl Snapshot {
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {
@@ -816,7 +853,7 @@ impl Snapshot {
             version,
             vocabulary: self.vocabulary.clone(),
             published: match of {
-                ViewOf::Restriction => self.published,
+                ViewOf::Restriction | ViewOf::Derived => self.published,
                 ViewOf::Addition => false,
             },
             statistics: Arc::new(self.statistics.for_view()),
@@ -1114,6 +1151,58 @@ impl Snapshot {
 
     /// A snapshot of `version` over this one's vocabulary and statistics: a transaction's
     /// pending state, never published, whatever this one is.
+    /// A pending version over this snapshot's (DUR-6): its asserted stack with the `asserted`
+    /// inserts and deletes and its inferred stack with the `inferred` ones, each as one more
+    /// run (the asserted base read in the quad layout where they need it, its runs' forms
+    /// shared and counted in `forms`, the store's index memory, not charged here), in the
+    /// version `make` builds of the two. What it makes is charged to `budget` before it is
+    /// made and held by the result until its last holder lets it go: its version, its runs,
+    /// their lists, the charge's own box and parts. A refusal leaves nothing made.
+    pub(super) fn pending_within(
+        &self,
+        asserted: [&[EncodedQuad]; 2],
+        inferred: [&[EncodedQuad]; 2],
+        forms: &crate::index::Forms,
+        budget: &Arc<nrese_exec::Budget>,
+        make: impl FnOnce(crate::index::IndexVersion, crate::index::IndexVersion) -> Version,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        use std::mem::size_of;
+        let version = &self.version;
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(
+            boxed(size_of::<Version>())
+                + version.asserted.runs_bytes(1)
+                + version.inferred.runs_bytes(1)
+                + 2 * boxed(size_of::<crate::index::run::Run>())
+                + Held::overhead(self.held.count()),
+        )?;
+        let (asserted, asserted_held) =
+            version
+                .asserted
+                .with_change_within(asserted[0], asserted[1], forms, budget)?;
+        let (inferred, inferred_held) =
+            match version
+                .inferred
+                .with_change_within(inferred[0], inferred[1], forms, budget)
+            {
+                Ok(built) => built,
+                Err(refused) => {
+                    // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
+                    drop(asserted);
+                    drop(asserted_held);
+                    return Err(refused);
+                }
+            };
+        let held = nrese_exec::Reservation::adopt(
+            Arc::clone(budget),
+            held.transfer() + asserted_held.transfer() + inferred_held.transfer(),
+        );
+        let held = Held::new(self.held.with(0), held);
+        let mut snapshot = self.with_version(make(asserted, inferred));
+        snapshot.held = held;
+        Ok(snapshot)
+    }
+
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         let version = Arc::new(version);
         let canonical_data = self.canonical_view(&version);
@@ -2237,13 +2326,16 @@ impl<'s> SharedState<'s> {
 }
 
 /// What a restricted view's inferred stack is to its source's ([`Snapshot::restricted`]):
-/// a restriction keeps the source's publication, an addition never has one.
+/// a restriction or a derivation keeps the source's publication, an addition never has one.
 #[derive(Clone, Copy)]
 enum ViewOf {
     /// Fewer of the source's inferred statements: a subset, `Only` or a mask.
     Restriction,
     /// Statements the source doesn't have, never published.
     Addition,
+    /// Statements the source's own DL bounds derive from it alone
+    /// ([`Snapshot::with_inferred_derived_within`]).
+    Derived,
 }
 
 /// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
