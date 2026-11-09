@@ -20,6 +20,9 @@ class FullGate(unittest.TestCase):
             root = Path(directory)
             (root / "scripts").mkdir()
             shutil.copy(ROOT / "scripts/check.sh", root / "scripts/check.sh")
+            # The full tier's features step (DUR-4) runs the real guard: its `cargo tree` reaches
+            # the fake cargo below, which lists nothing, so no test-only feature is found.
+            shutil.copy(ROOT / "scripts/check-features.sh", root / "scripts/check-features.sh")
             (root / "scripts/lib").mkdir()
             shutil.copy(ROOT / "scripts/lib/gate-tools.txt", root / "scripts/lib/gate-tools.txt")
             for name in ("cargo-guarded.sh", "check-locks.sh", "check-names.sh", "fetch-w3c-tests.sh"):
