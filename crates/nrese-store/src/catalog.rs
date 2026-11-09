@@ -752,6 +752,8 @@ impl Catalog {
                 .store()
                 .set_reader_corpus_bytes(bytes);
         }
+        #[cfg(test)]
+        tests::publishing();
         *repository.settings.write() = settings;
         Ok(())
     }
@@ -971,6 +973,64 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::{TRASH, existing, valid};
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        /// What a test runs on the changing thread just before a change publishes its
+        /// settings ([`super::Catalog::patch`]).
+        static PUBLISHING: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The hook [`PUBLISHING`] holds, if a test set one.
+    pub(super) fn publishing() {
+        if let Some(hook) = PUBLISHING.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// A change of reasoning publishes its settings and its write path together
+    /// (C1001-R1-O1): a reader, just before the change publishes its settings, sees the old
+    /// reasoning beside the old settings, never the new write path beside the old settings.
+    /// Red without the fix, which published the write path first.
+    #[test]
+    fn a_change_publishes_its_settings_and_its_reasoning_together() {
+        use super::{DEFAULT_REPOSITORY, RepositorySettings};
+        let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+        let catalog = super::Catalog::open(
+            store,
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap();
+        let repository = catalog.get(DEFAULT_REPOSITORY).unwrap();
+        let mode = || repository.pipeline.read().reasoner().mode_name();
+        let before = (mode(), repository.settings.read().reasoning.clone());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (observer, record) = (repository.clone(), std::sync::Arc::clone(&seen));
+        PUBLISHING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mode = observer.pipeline.read().reasoner().mode_name();
+                let saved = observer.settings.read().reasoning.clone();
+                *record.lock().unwrap() = Some((mode, saved));
+            }))
+        });
+        let rdfs = RepositorySettings {
+            reasoning: Some("rdfs".to_owned()),
+            ..RepositorySettings::default()
+        };
+        catalog.change(DEFAULT_REPOSITORY, rdfs).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            Some(before),
+            "a reader just before the settings publish"
+        );
+        assert_eq!(
+            (mode(), repository.settings.read().reasoning.clone()),
+            ("rdfs", Some("rdfs".to_owned())),
+            "after the change"
+        );
+    }
 
     fn on_disk(dir: &std::path::Path) -> super::Catalog {
         let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir)).unwrap();
