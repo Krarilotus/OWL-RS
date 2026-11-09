@@ -24,7 +24,8 @@ use crate::{SparqlUpdateRequest, StatementPattern, StoreService};
 
 /// The graph of the access state in the system store.
 pub const STATE_GRAPH: &str = "urn:nrese:system:access";
-/// The graph of its history.
+/// The graph of its history. It decides user identities too (which names had a local login,
+/// SYN-64): never prune or compact it without keeping that fact for every name.
 pub const HISTORY_GRAPH: &str = "urn:nrese:system:history";
 const CHANGE: &str = "urn:nrese:change:";
 const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -51,9 +52,19 @@ pub struct AccessControl {
     state: RwLock<Arc<AccessState>>,
     /// The saved queries ([`super::queries`]); writes hold its lock.
     pub(super) queries: RwLock<super::queries::Queries>,
-    /// Changes one at a time; holds the next change's number.
-    writer: Mutex<u64>,
+    /// Changes one at a time.
+    writer: Mutex<Writer>,
     logins: Logins,
+}
+
+/// What changes need, held through each change.
+struct Writer {
+    /// The next change's number.
+    next: u64,
+    /// The names that ever had a local login ([`local_past`]): a user record created for
+    /// one of them gets an id (SYN-64 r2). Kept under this lock with the change that adds
+    /// to it, so no create misses one.
+    local_past: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for AccessControl {
@@ -141,18 +152,21 @@ impl AccessControl {
             .map_err(|error| AccessError::Store(error.to_string()))?;
         let state = rdf::decode(&quads, base);
         let queries = super::queries::load(&store)?;
+        let statements = quads.len();
         let control = Self {
             store,
             state: RwLock::new(Arc::new(state)),
             queries: RwLock::new(queries),
-            writer: Mutex::new(0),
+            writer: Mutex::new(Writer {
+                next: 0,
+                local_past: BTreeSet::new(),
+            }),
             logins: Logins::new(limits),
         };
-        let next = control
-            .history(usize::MAX)?
-            .first()
-            .map_or(1, |latest| latest.number + 1);
-        *control.writer.lock().expect("writer") = next;
+        let (records, resources) = control.read_history()?;
+        let local_past = local_past(&records, resources, statements, &control.state())?;
+        let next = records.first().map_or(1, |latest| latest.number + 1);
+        *control.writer.lock().expect("writer") = Writer { next, local_past };
         Ok(control)
     }
 
@@ -163,7 +177,7 @@ impl AccessControl {
 
     /// Whether the state was never changed.
     pub fn is_new(&self) -> bool {
-        *self.writer.lock().expect("writer") == 1
+        self.writer.lock().expect("writer").next == 1
     }
 
     /// What `principal` may read and write in `repository`.
@@ -195,19 +209,19 @@ impl AccessControl {
             | Change::RemoveUser(name) => Some(name.clone()),
             _ => None,
         };
-        let mut next = self.writer.lock().expect("writer");
+        let mut writer = self.writer.lock().expect("writer");
         let before = self.state();
         let mut after = (*before).clone();
         let summary = after.apply(by, change)?;
         // The records it creates are named by its number (SYN-64).
-        after.identify_new(&before, *next);
+        after.identify_new(&before, writer.next, &writer.local_past);
         let graph = iri(STATE_GRAPH);
         let old: BTreeSet<Quad> = rdf::encode(&before, &graph).into_iter().collect();
         let new: BTreeSet<Quad> = rdf::encode(&after, &graph).into_iter().collect();
         let removed: Vec<Quad> = old.difference(&new).cloned().collect();
         let added: Vec<Quad> = new.difference(&old).cloned().collect();
         let record = ChangeRecord {
-            number: *next,
+            number: writer.next,
             author: by.display(),
             time: now(),
             reason: reason.to_owned(),
@@ -225,8 +239,14 @@ impl AccessControl {
         self.store
             .update_ungated(&SparqlUpdateRequest::new(update))
             .map_err(|error| AccessError::Store(error.to_string()))?;
+        // Committed: the names it leaves with a local login join those that had one.
+        for (name, user) in &after.users {
+            if user.password_hash.is_some() {
+                writer.local_past.insert(name.clone());
+            }
+        }
         *self.state.write().expect("state") = Arc::new(after);
-        *next += 1;
+        writer.next += 1;
         if let Some(user) = ends_sessions {
             self.logins.close_all(&user);
         }
@@ -323,6 +343,14 @@ impl AccessControl {
 
     /// The latest `limit` changes, the latest first.
     pub fn history(&self, limit: usize) -> Result<Vec<ChangeRecord>, AccessError> {
+        let (mut records, _) = self.read_history()?;
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    /// Every change, the latest first, and how many change resources the history holds (more
+    /// than the changes when one has no readable number).
+    fn read_history(&self) -> Result<(Vec<ChangeRecord>, usize), AccessError> {
         let quads = self
             .store
             .statements(
@@ -370,9 +398,68 @@ impl AccessControl {
             })
             .collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.number));
-        records.truncate(limit);
-        Ok(records)
+        Ok((records, changes.len()))
     }
+}
+
+/// The names that ever had a local login, from `records` (every change, the latest first, of
+/// `resources` change resources) and the state they made (`state`, from `statements`
+/// statements): SYN-64 r2, a user record created for one of them is a new person. The history
+/// decides identities, so one that can't answer refuses the open rather than guess (either
+/// guess errs: on disclosure, or on moving token users' spaces).
+fn local_past(
+    records: &[ChangeRecord],
+    resources: usize,
+    statements: usize,
+    state: &AccessState,
+) -> Result<BTreeSet<String>, AccessError> {
+    let refuse = |why: String| {
+        AccessError::Store(format!(
+            "the access history is incomplete ({why}): it can't tell which user names had a local \
+             login, so the access state isn't opened; restore the system store from a backup"
+        ))
+    };
+    if records.len() != resources {
+        return Err(refuse("a change has no readable number".to_owned()));
+    }
+    if statements > 0 && records.is_empty() {
+        return Err(refuse(
+            "the state has statements, the history none".to_owned(),
+        ));
+    }
+    if let Some((at, record)) = records
+        .iter()
+        .rev()
+        .enumerate()
+        .find(|(at, record)| record.number != *at as u64 + 1)
+    {
+        return Err(refuse(format!(
+            "change {} where {} belongs",
+            record.number,
+            at + 1
+        )));
+    }
+    let password = format!("<{}passwordHash>", rdf::NS);
+    let names: BTreeSet<String> = records
+        .iter()
+        .flat_map(|record| &record.added)
+        .filter_map(|line| {
+            let (subject, rest) = line.split_once(' ')?;
+            if rest.split(' ').next()? != password {
+                return None;
+            }
+            rdf::user_named(subject)
+        })
+        .collect();
+    if let Some(name) = state
+        .users
+        .iter()
+        .find(|(name, user)| user.password_hash.is_some() && !names.contains(*name))
+        .map(|(name, _)| name)
+    {
+        return Err(refuse(format!("user {name}'s local login is in no change")));
+    }
+    Ok(names)
 }
 
 /// A change's record as statements of the history graph.
