@@ -11,6 +11,7 @@
 mod attribution;
 pub(crate) mod command;
 mod error;
+pub(crate) mod evidence;
 mod pipeline;
 mod record;
 mod ticket;

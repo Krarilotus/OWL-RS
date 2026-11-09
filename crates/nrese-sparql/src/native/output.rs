@@ -280,7 +280,8 @@ impl DirectResults<'_> {
                 for part in parts {
                     let mut rest = part.as_slice();
                     while !rest.is_empty() {
-                        let (now, later) = rest.split_at((CHUNK - buffer.len()).min(rest.len()));
+                        let (now, later) =
+                            rest.split_at(CHUNK.saturating_sub(buffer.len()).min(rest.len()));
                         buffer.extend_from_slice(now);
                         rest = later;
                         if buffer.len() >= CHUNK {

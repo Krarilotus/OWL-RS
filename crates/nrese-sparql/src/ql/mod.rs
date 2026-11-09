@@ -12,7 +12,7 @@ use nrese_engine::{
     AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
-use nrese_rdf::{NamedNodeRef, Term};
+use nrese_rdf::{NamedNodeRef, Term, vocab};
 
 use crate::GraphAccess;
 
@@ -27,74 +27,164 @@ const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
+/// The terms of the mapping's vocabulary ([`nrese_owl::Vocabulary`], by field) the reader
+/// doesn't read as schema, each for its reason. It reads every other one: a property in
+/// every statement it is the predicate of, a class (capitalised) in the `rdf:type`
+/// statements of its members. So a term the mapping knows is never left out unclassified
+/// (I24c-2; the test `the_reader_reads_the_mapping_vocabulary` holds the list to it).
+const NOT_READ: &[&str] = &[
+    // How the rest is read: declarations through `rdf:type`, lists along their cells.
+    "rdf_type",
+    "first",
+    "rest",
+    "nil",
+    // Entities, not schema vocabulary: their statements are assertions.
+    "owl_top_object_property",
+    "owl_bottom_object_property",
+    "owl_top_data_property",
+    "owl_bottom_data_property",
+    // Individual-level, possibly large, and none adds a schema axiom: equality is read as
+    // present or not ([`has_equality`]); inequality and negative assertions conclude no
+    // fact, and the classes' members are data.
+    "owl_same_as",
+    "owl_different_from",
+    "owl_all_different",
+    "owl_distinct_members",
+    "owl_negative_property_assertion",
+    "owl_source_individual",
+    "owl_assertion_property",
+    "owl_target_individual",
+    "owl_target_value",
+    "owl_named_individual",
+    "owl_thing",
+    "owl_nothing",
+    // The ontology header and annotations, which the mapping reads past.
+    "owl_ontology",
+    "owl_imports",
+    "owl_axiom",
+    "owl_annotation",
+    "owl_annotated_source",
+    "owl_annotated_property",
+    "owl_annotated_target",
+];
+
+// What the reader reads, chosen at compile time from the mapping's vocabulary
+// (`nrese_owl::Vocabulary::IRIS`, `vocab::DATA_IRIS`): fixed IRIs cost nothing at run time
+// (orchestrator, 8 Nov 17:28; #155's count found a `LazyLock` table's 4.6 KB of peak live
+// bytes in every process).
+
+/// Whether `a` and `b` are the same text (in a `const`).
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether vocabulary field `field` is one of [`NOT_READ`].
+const fn not_read(field: &str) -> bool {
+    let mut i = 0;
+    while i < NOT_READ.len() {
+        if same(NOT_READ[i], field) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether an IRI's local name is capitalised: a class, read through its members.
+const fn capitalised(iri: &str) -> bool {
+    let b = iri.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1] != b'#' && b[i - 1] != b'/' {
+        i -= 1;
+    }
+    i < b.len() && b[i].is_ascii_uppercase()
+}
+
+/// Whether `iri` is one of the vocabulary's classes the reader reads.
+const fn read_class(iri: &str) -> bool {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let mut i = 0;
+    while i < iris.len() {
+        let (field, term) = iris[i];
+        if !not_read(field) && capitalised(term) && same(term, iri) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The IRIs the reader reads as classes (`class`) or as schema properties, the first `N`
+/// of them, with how many there are. The properties take the data ranges' facets too
+/// (`DATA_IRIS`, but `rdfs:Literal`: a datatype there and a class here).
+const fn read_iris<const N: usize>(class: bool) -> ([&'static str; N], usize) {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let data = nrese_owl::vocab::DATA_IRIS;
+    let mut out = [""; N];
+    let mut n = 0;
+    let mut i = 0;
+    while i < iris.len() {
+        let (field, iri) = iris[i];
+        if !not_read(field) && capitalised(iri) == class {
+            if n < N {
+                out[n] = iri;
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while !class && j < data.len() {
+        if !read_class(data[j]) {
+            if n < N {
+                out[n] = data[j];
+            }
+            n += 1;
+        }
+        j += 1;
+    }
+    (out, n)
+}
+
 /// The schema properties read, in every graph.
-const SCHEMA: &[(&str, &str)] = &[
-    (RDFS, "subClassOf"),
-    (OWL, "equivalentClass"),
-    (RDFS, "subPropertyOf"),
-    (OWL, "equivalentProperty"),
-    (OWL, "inverseOf"),
-    (RDFS, "domain"),
-    (RDFS, "range"),
-    (OWL, "onProperty"),
-    (OWL, "someValuesFrom"),
-    (OWL, "allValuesFrom"),
-    (OWL, "hasValue"),
-    (OWL, "minCardinality"),
-    (OWL, "minQualifiedCardinality"),
-    (OWL, "cardinality"),
-    (OWL, "qualifiedCardinality"),
-    (OWL, "onClass"),
-    (OWL, "onDataRange"),
-    (OWL, "intersectionOf"),
-    (OWL, "unionOf"),
-    (OWL, "disjointUnionOf"),
-    // What the rewriting doesn't follow, for the completeness it reports (design §7).
-    (OWL, "propertyChainAxiom"),
-    (OWL, "hasKey"),
-    (OWL, "oneOf"),
-    (OWL, "complementOf"),
-    (OWL, "hasSelf"),
-    (OWL, "maxCardinality"),
-    (OWL, "maxQualifiedCardinality"),
-];
+const READ_PROPERTIES: [&str; read_iris::<0>(false).1] = read_iris(false).0;
+/// The classes whose members' `rdf:type` statements are read.
+const READ_CLASSES: [&str; read_iris::<0>(true).1] = read_iris(true).0;
 
-/// The classes whose members' `rdf:type` statements are read: what the mapping needs to
-/// know about the schema's terms.
-const DECLARATIONS: &[(&str, &str)] = &[
-    (OWL, "Restriction"),
-    (OWL, "Class"),
-    (RDFS, "Class"),
-    (RDFS, "Datatype"),
-    (OWL, "ObjectProperty"),
-    (OWL, "DatatypeProperty"),
-    (OWL, "AnnotationProperty"),
-    (OWL, "SymmetricProperty"),
-    (OWL, "ReflexiveProperty"),
-    (OWL, "TransitiveProperty"),
-    (OWL, "FunctionalProperty"),
-    (OWL, "InverseFunctionalProperty"),
-];
-
-/// The properties that make their blank subject a class expression (`nrese-owl`'s
-/// mapping): a restriction's and the set operators'.
-const EXPRESSIONS: &[&str] = &[
-    "onProperty",
-    "intersectionOf",
-    "unionOf",
-    "complementOf",
-    "oneOf",
-];
-
-/// The list-valued properties whose lists are read.
+/// The list-valued properties whose lists are read, by the vocabulary's fields.
 const LISTS: &[&str] = &[
-    "intersectionOf",
-    "unionOf",
-    "disjointUnionOf",
-    "propertyChainAxiom",
-    "hasKey",
-    "oneOf",
+    "owl_intersection_of",
+    "owl_union_of",
+    "owl_disjoint_union_of",
+    "owl_property_chain_axiom",
+    "owl_has_key",
+    "owl_one_of",
+    "owl_members",
+    "owl_on_properties",
+    "owl_with_restrictions",
 ];
+
+/// [`LISTS`]' IRIs; a field the vocabulary lacks fails the build.
+const LIST_IRIS: [&str; LISTS.len()] = {
+    let mut out = [""; LISTS.len()];
+    let mut i = 0;
+    while i < LISTS.len() {
+        out[i] = nrese_owl::Vocabulary::iri(LISTS[i]);
+        i += 1;
+    }
+    out
+};
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -186,6 +276,9 @@ struct Cached {
     /// Compilation also needs the dictionary's id of Thing, even if no schema axiom
     /// mentions it. Ordinary data can introduce that id without changing the schema.
     thing: Option<nrese_owl::Term>,
+    /// Whether the snapshot asserts an equality of individuals, in any graph
+    /// ([`has_equality`]).
+    equality: bool,
     tbox: Arc<Tbox>,
     /// Each expression's membership in the compiled schema, for the next snapshot's read.
     members: Members,
@@ -356,6 +449,7 @@ impl QlRewriting {
         };
         let asserted = snapshot.asserted_identity();
         let core = read_core(snapshot);
+        let equality = has_equality(snapshot);
         // An entry of this reader whose core and view mode are this snapshot's, with notes
         // from its memberships' asserted state to this one: its memberships are brought
         // forward by the noted changes, in place (P2-C1 probes, 8 Nov: rebuilding every
@@ -366,6 +460,7 @@ impl QlRewriting {
         if let Some(i) = at {
             let c = &mut cached[i];
             let changes = (c.thing == thing
+                && c.equality == equality
                 && c.members.equality == key.equality
                 && c.members.canonical == key.canonical
                 && *c.core == *core)
@@ -400,7 +495,13 @@ impl QlRewriting {
                     return Arc::clone(&c.tbox);
                 }
                 let statements = filtered_schema(c, snapshot, &core, access);
-                let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
+                let tbox = Arc::new(compile(
+                    snapshot,
+                    &statements,
+                    self.closure,
+                    thing,
+                    equality,
+                ));
                 c.tbox = Arc::clone(&tbox);
                 return tbox;
             }
@@ -420,18 +521,26 @@ impl QlRewriting {
             of,
         };
         if let Some(c) = at.map(|i| &mut cached[i]).filter(|c| {
-            c.thing == thing && *c.core == *core && present(&c.members.of) == present(&members.of)
+            c.thing == thing
+                && c.equality == equality
+                && *c.core == *core
+                && present(&c.members.of) == present(&members.of)
         }) {
             c.key = key;
             c.members = members;
             return Arc::clone(&c.tbox);
         }
-        let mut reader_core = core.clone();
-        if let Some(access) = access {
-            reader_core.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
-        }
-        let statements = with_members(&reader_core, expressions.iter().map(|e| &members.of[e]));
-        let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
+        let statements = with_members(
+            &reader_core(snapshot, &core, access),
+            expressions.iter().map(|e| &members.of[e]),
+        );
+        let tbox = Arc::new(compile(
+            snapshot,
+            &statements,
+            self.closure,
+            thing,
+            equality,
+        ));
         if let Some(i) = at {
             cached.remove(i);
         }
@@ -444,6 +553,7 @@ impl QlRewriting {
             core: core.into_boxed_slice(),
             expressions: expressions.into_boxed_slice(),
             thing,
+            equality,
             tbox: Arc::clone(&tbox),
             members,
         });
@@ -459,12 +569,44 @@ fn filtered_schema(
     core: &[nrese_owl::Statement],
     access: Option<&GraphAccess>,
 ) -> Vec<nrese_owl::Statement> {
-    let reader_core: Vec<nrese_owl::Statement> = core
-        .iter()
+    with_members(
+        &reader_core(snapshot, core, access),
+        c.expressions.iter().map(|e| &c.members.of[e]),
+    )
+}
+
+/// `core` in the graphs `access` admits.
+fn reader_core(
+    snapshot: &Snapshot,
+    core: &[nrese_owl::Statement],
+    access: Option<&GraphAccess>,
+) -> Vec<nrese_owl::Statement> {
+    core.iter()
         .filter(|s| access.is_none_or(|a| a.allows_id(snapshot, TermId::from_raw(s.graph))))
         .copied()
-        .collect();
-    with_members(&reader_core, c.expressions.iter().map(|e| &c.members.of[e]))
+        .collect()
+}
+
+/// Whether the snapshot asserts an equality of individuals (`owl:sameAs`), in any graph:
+/// one probe. The TBox learns only that ([`Tbox::with_equality`]), never which statement:
+/// no name reaches a reader who can't read its graph (I24c-2 review r1, F1), and no sampled
+/// statement the mapping may leave out stands for the rest (F3). Fail-closed for readers
+/// who see only some graphs.
+fn has_equality(snapshot: &Snapshot) -> bool {
+    iri(snapshot, OWL, "sameAs").is_some_and(|same_as| {
+        snapshot
+            .quads_for_pattern_in(
+                ReadModel::Asserted,
+                &QuadPattern {
+                    subject: None,
+                    predicate: Some(same_as),
+                    object: None,
+                    graph: GraphSelector::Any,
+                },
+            )
+            .next()
+            .is_some()
+    })
 }
 
 /// The expressions with a member in `of`, sorted: what the TBox reads of the memberships.
@@ -511,7 +653,11 @@ fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<Members
 }
 
 fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
-    snapshot.lookup(NamedNodeRef::new_unchecked(&format!("{namespace}{local}")).into())
+    named(snapshot, &format!("{namespace}{local}"))
+}
+
+fn named(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
+    snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
 }
 
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
@@ -564,24 +710,21 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         object,
         graph: GraphSelector::Any,
     };
-    for &(namespace, local) in SCHEMA {
-        if let Some(p) = iri(snapshot, namespace, local) {
-            scan(pattern(p, None), &mut out);
-        }
+    for p in READ_PROPERTIES.iter().filter_map(|p| named(snapshot, p)) {
+        scan(pattern(p, None), &mut out);
     }
-    if let Some(rdf_type) = iri(snapshot, RDF, "type") {
-        for &(namespace, local) in DECLARATIONS {
-            if let Some(class) = iri(snapshot, namespace, local) {
-                scan(pattern(rdf_type, Some(class)), &mut out);
-            }
+    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
+    if let Some(rdf_type) = lookup(vocab::rdf::TYPE) {
+        for class in READ_CLASSES.iter().filter_map(|c| named(snapshot, c)) {
+            scan(pattern(rdf_type, Some(class)), &mut out);
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
-    let (first, rest) = (iri(snapshot, RDF, "first"), iri(snapshot, RDF, "rest"));
+    let (first, rest) = (lookup(vocab::rdf::FIRST), lookup(vocab::rdf::REST));
     if let (Some(first), Some(rest)) = (first, rest) {
-        let heads: Vec<u64> = LISTS
+        let heads: Vec<u64> = LIST_IRIS
             .iter()
-            .filter_map(|local| iri(snapshot, OWL, local))
+            .filter_map(|p| named(snapshot, p))
             .flat_map(|p| {
                 out.iter()
                     .filter(move |s| s.triple[1] == p.raw())
@@ -622,22 +765,30 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
 
 /// The class expressions `core` makes ([`read_core`]): blank subjects of a restriction's
 /// or a set operator's property, sorted. Read from the core, never from data: an entry
-/// whose core is unchanged keeps its list.
+/// whose core is unchanged keeps its list. `core` is sorted, so each subject's statements
+/// are adjacent, and each subject is taken once, in order.
 fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64> {
-    let operators: Vec<u64> = EXPRESSIONS
-        .iter()
-        .filter_map(|local| iri(snapshot, OWL, local))
-        .map(TermId::raw)
-        .collect();
-    let mut out: Vec<u64> = core
-        .iter()
-        .filter(|s| operators.contains(&s.triple[1]))
-        .map(|s| s.triple[0])
-        .filter(|&node| TermId::from_raw(node).kind() == nrese_engine::TermKind::BlankNode)
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+    debug_assert!(core.is_sorted());
+    // The mapping's own markers, those it can't read included (an n-ary or a malformed
+    // restriction), so the memberships of every node it would read as a class expression
+    // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
+    let id_of = |iri: &str| named(snapshot, iri).map(TermId::raw);
+    let markers = nrese_owl::mapping::ClassExpressionMarkers::lookup(&id_of);
+    let operators = markers.properties();
+    let types: Vec<u64> = markers.types.into_iter().flatten().collect();
+    let rdf_type = id_of(const { nrese_owl::Vocabulary::iri("rdf_type") });
+    // A restriction has both a marker type and a marker property: matched statement by
+    // statement, each was found twice, then sorted and deduplicated (i24c2-attrib3-da692156).
+    core.chunk_by(|a, b| a.triple[0] == b.triple[0])
+        .filter(|of| {
+            TermId::from_raw(of[0].triple[0]).kind() == nrese_engine::TermKind::BlankNode
+                && of.iter().any(|s| {
+                    operators.contains(&s.triple[1])
+                        || (Some(s.triple[1]) == rdf_type && types.contains(&s.triple[2]))
+                })
+        })
+        .map(|of| of[0].triple[0])
+        .collect()
 }
 
 /// The membership the schema reads of class expression `node` (design §7: individuals
@@ -740,8 +891,13 @@ fn compile(
     statements: &[nrese_owl::Statement],
     closure: Closure,
     thing: Option<nrese_owl::Term>,
+    equality: bool,
 ) -> Tbox {
     let terms = SnapshotTerms(snapshot);
     let ontology = nrese_owl::read(statements, &terms);
-    Tbox::compile(&ontology, closure, thing)
+    let tbox = Tbox::compile(&ontology, closure, thing);
+    match equality {
+        true => tbox.with_equality(closure),
+        false => tbox,
+    }
 }

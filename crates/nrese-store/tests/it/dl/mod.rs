@@ -2,7 +2,7 @@
 
 mod bounds;
 mod cache_admission;
-mod classification;
+pub(crate) mod classification;
 mod consistency;
 mod entailment;
 mod explain;

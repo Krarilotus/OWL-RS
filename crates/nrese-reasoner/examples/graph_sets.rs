@@ -64,13 +64,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all = asserted.clone();
     all.extend(&inferred);
     all.sort_unstable();
-    let graph_of = |fact: Triple| -> Vec<u32> {
-        if asserted.binary_search(&fact).is_ok() {
-            vec![(fact[0] % u64::from(graphs)) as u32]
-        } else {
-            Vec::new()
-        }
+    // An in-memory lookup: one unit a call on the reading task's poller (`Graphs` for a
+    // function).
+    let graph_of = |fact: Triple| -> Option<u32> {
+        asserted
+            .binary_search(&fact)
+            .is_ok()
+            .then_some((fact[0] % u64::from(graphs)) as u32)
     };
+    let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let started = Instant::now();
     let sets = nrese_reasoner::graph_sets::support_sets(
         &all,
@@ -78,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         &graph_of,
         cap,
-        nrese_reasoner::graph_sets::Limits::UNLIMITED,
+        nrese_reasoner::graph_sets::Limits::unlimited(&scratch),
     )
     .map_err(|stopped| format!("{stopped:?}"))?;
     let elapsed = started.elapsed();

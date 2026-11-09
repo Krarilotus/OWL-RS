@@ -1,19 +1,15 @@
+import { DEFAULT_GRAPH, type GraphMode, type GraphTarget } from "../lib/endpoints";
+
 export type CliCommand =
   | { kind: "runtime" }
   | { kind: "capabilities" }
   | { kind: "reasoning" }
   | { kind: "query"; text: string; accept: string }
   | { kind: "update"; text: string }
-  | { kind: "tell"; text: string; graphMode: "default" | "named"; graphIri: string }
-  | { kind: "graph-read"; graphMode: "default" | "named"; graphIri: string }
-  | {
-      kind: "graph-write";
-      method: "PUT" | "POST";
-      text: string;
-      graphMode: "default" | "named";
-      graphIri: string;
-    }
-  | { kind: "graph-delete"; graphMode: "default" | "named"; graphIri: string };
+  | { kind: "tell"; text: string; target: GraphTarget }
+  | { kind: "graph-read"; target: GraphTarget }
+  | { kind: "graph-write"; method: "PUT" | "POST"; text: string; target: GraphTarget }
+  | { kind: "graph-delete"; target: GraphTarget };
 
 export type CliOptions = {
   baseUrl: string;
@@ -31,8 +27,9 @@ type PendingOptions = {
   text?: string;
   file?: string;
   accept: string;
-  graphMode: "default" | "named";
-  graphIri: string;
+  /** As given; unset when the flag wasn't. */
+  graphMode?: GraphMode;
+  graphIri?: string;
 };
 
 const HELP_TEXT = `Usage:
@@ -41,10 +38,11 @@ const HELP_TEXT = `Usage:
   npm run cli -- reasoning
   npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
   npm run cli -- update --file .\\change.ru
-  npm run cli -- tell --file .\\data.ttl --graph named --graph-iri https://example.org/g
-  npm run cli -- graph-read --graph named --graph-iri https://example.org/g
-  npm run cli -- graph-write --method PUT --file .\\data.ttl --graph named --graph-iri https://example.org/g
-  npm run cli -- graph-delete --graph named --graph-iri https://example.org/g
+  npm run cli -- tell --file .\\data.ttl --graph-iri https://example.org/g
+  npm run cli -- graph-read --graph-iri https://example.org/g
+  npm run cli -- graph-write --method PUT --file .\\data.ttl --graph-iri https://example.org/g
+  npm run cli -- graph-delete --graph-iri https://example.org/g
+  npm run cli -- graph-delete --graph default
 
 Global options:
   --base-url <url>     Backend base URL. Defaults to NRESE_API_BASE_URL or http://127.0.0.1:8080
@@ -56,7 +54,9 @@ Content options:
   --file <path>        Read SPARQL/RDF payload from file
   --accept <type>      Query accept header. Default: application/sparql-results+json
   --graph <mode>       default | named
-  --graph-iri <iri>    Named graph IRI when --graph named
+  --graph-iri <iri>    The named graph to act on
+                       graph-delete and graph-write --method PUT need --graph default or --graph-iri;
+                       the others act on the default graph without either
   --method <verb>      PUT | POST for graph-write
   --require-complete   Exit 3 when the answers aren't shown to be complete (NRESE-Completeness)`;
 
@@ -91,8 +91,6 @@ export function parseCliArgs(argv: string[]): CliOptions {
     token: process.env.NRESE_API_TOKEN,
     headers: {},
     accept: "application/sparql-results+json",
-    graphMode: "default",
-    graphIri: "",
   };
 
   let method: "PUT" | "POST" = "PUT";
@@ -132,11 +130,17 @@ export function parseCliArgs(argv: string[]): CliOptions {
         if (value !== "default" && value !== "named") {
           throw new Error(`Invalid --graph value "${value}"`);
         }
+        if (pending.graphMode !== undefined) {
+          throw new Error("--graph given twice: name one graph");
+        }
         pending.graphMode = value;
         index += 1;
         break;
       }
       case "--graph-iri":
+        if (pending.graphIri !== undefined) {
+          throw new Error("--graph-iri given twice: name one graph");
+        }
         pending.graphIri = requireValue(rest, index, arg);
         index += 1;
         break;
@@ -174,54 +178,68 @@ function buildCommand(
 ): CliCommand {
   switch (commandName) {
     case "runtime":
+      refuseGraphFlags(commandName, pending);
       return { kind: "runtime" };
     case "capabilities":
+      refuseGraphFlags(commandName, pending);
       return { kind: "capabilities" };
     case "reasoning":
+      refuseGraphFlags(commandName, pending);
       return { kind: "reasoning" };
     case "query":
+      refuseGraphFlags(commandName, pending);
       return { kind: "query", text: requireText(pending), accept: pending.accept };
     case "update":
+      refuseGraphFlags(commandName, pending);
       return { kind: "update", text: requireText(pending) };
     case "tell":
-      validateGraphOptions(pending);
-      return {
-        kind: "tell",
-        text: requireText(pending),
-        graphMode: pending.graphMode,
-        graphIri: pending.graphIri,
-      };
+      return { kind: "tell", text: requireText(pending), target: graphTarget(commandName, pending, false) };
     case "graph-read":
-      validateGraphOptions(pending);
-      return {
-        kind: "graph-read",
-        graphMode: pending.graphMode,
-        graphIri: pending.graphIri,
-      };
+      return { kind: "graph-read", target: graphTarget(commandName, pending, false) };
     case "graph-write":
-      validateGraphOptions(pending);
       return {
         kind: "graph-write",
         method,
         text: requireText(pending),
-        graphMode: pending.graphMode,
-        graphIri: pending.graphIri,
+        target: graphTarget(commandName, pending, method === "PUT"),
       };
     case "graph-delete":
-      validateGraphOptions(pending);
-      return {
-        kind: "graph-delete",
-        graphMode: pending.graphMode,
-        graphIri: pending.graphIri,
-      };
+      return { kind: "graph-delete", target: graphTarget(commandName, pending, true) };
     default:
       throw new Error(`Unknown command "${commandName}"\n\n${HELP_TEXT}`);
   }
 }
 
-function validateGraphOptions(pending: PendingOptions): void {
-  if (pending.graphMode === "named" && !pending.graphIri) {
+/** The one graph the flags name, or a refusal before any request (SYN-72): `--graph-iri`
+ * names that graph, `--graph default` the default graph, and the two together contradict.
+ * A command that drops or replaces a graph acts only on one named explicitly; one that adds
+ * or reads takes the default graph when neither flag is given. */
+function graphTarget(
+  commandName: string,
+  pending: PendingOptions,
+  dropsOrReplaces: boolean,
+): GraphTarget {
+  const { graphMode, graphIri } = pending;
+  if (graphMode === "default" && graphIri !== undefined) {
+    throw new Error("--graph default and --graph-iri name different graphs: give one");
+  }
+  if (graphIri !== undefined) {
+    return { kind: "named", iri: graphIri };
+  }
+  if (graphMode === "named") {
     throw new Error("Named graph operations require --graph-iri");
+  }
+  if (graphMode === undefined && dropsOrReplaces) {
+    throw new Error(
+      `${commandName} drops or replaces a graph: name it with --graph default or --graph-iri <iri>`,
+    );
+  }
+  return DEFAULT_GRAPH;
+}
+
+function refuseGraphFlags(commandName: string, pending: PendingOptions): void {
+  if (pending.graphMode !== undefined || pending.graphIri !== undefined) {
+    throw new Error(`${commandName} takes no graph: --graph and --graph-iri don't apply`);
   }
 }
 
