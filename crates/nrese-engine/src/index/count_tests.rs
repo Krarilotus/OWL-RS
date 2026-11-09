@@ -127,7 +127,7 @@ fn largest_gap(read: impl Fn(Visitor<'_>)) -> u64 {
 /// searches stay within its visitor's interval, also where they find nothing. An interval of
 /// runs, 32 statements each, and a subject above every stored one, so that each run's range is
 /// empty (no cursor, no merge step): stopped after each of its visitor's yeses, a counted
-/// scan, count, existence probe and membership probe each do at most two intervals of work
+/// scan, count, existence probe and membership probe each do at most an interval of work
 /// between two asks (and after the last). Counting one unit per run's search, a chunk of runs
 /// counted at once, an interval of searches of about six comparisons each ran unseen.
 #[test]
@@ -178,11 +178,11 @@ fn counted_reads_search_empty_ranges_within_their_visitor_s_interval() {
             }),
         ),
     ];
-    let over: Vec<_> = gaps.iter().filter(|(_, gap)| *gap > 2 * interval).collect();
+    let over: Vec<_> = gaps.iter().filter(|(_, gap)| *gap > interval).collect();
     assert!(
         over.is_empty(),
         "work between two asks of the visitor past {}: {over:?}",
-        2 * interval
+        interval
     );
 }
 
@@ -191,7 +191,7 @@ fn counted_reads_search_empty_ranges_within_their_visitor_s_interval() {
 /// done): a counted scan steps through many deltas of one statement within its visitor's
 /// interval. Three intervals of runs that insert and delete one statement in turn (inserted
 /// last, so it is there), then a run with a second statement: stopped after each of its
-/// visitor's yeses, the scan does at most two intervals of work between two asks (and after
+/// visitor's yeses, the scan does at most an interval of work between two asks (and after
 /// the last), and unstopped it reads both statements. Counting a step's cursors before it and
 /// then taking it whole, the first step's three intervals of cursors ran unseen.
 #[test]
@@ -224,9 +224,9 @@ fn a_counted_scan_steps_through_many_deltas_within_its_visitor_s_interval() {
         "the statement inserted last and the second one"
     );
     assert!(
-        largest <= 2 * interval,
+        largest <= interval,
         "{largest} units of work between two asks of the visitor: at most {}",
-        2 * interval
+        interval
     );
 }
 
@@ -276,7 +276,7 @@ fn a_held_count_reads_its_tombstones_within_a_run_of_its_visitor() {
 /// probes, counted before it is looked at): a counted existence probe looks at its runs within
 /// its visitor's interval. Three intervals of runs, one statement each, none with tombstones
 /// and none matching the probe (so it reads every run): between two asks of the visitor (and
-/// after the last) it looks at no more than two intervals of runs. Reading every run's
+/// after the last) it looks at no more than an interval of runs. Reading every run's
 /// tombstones before the first ask, it looked at all of them unseen.
 #[test]
 fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
@@ -313,9 +313,9 @@ fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
     assert_eq!(found, Ok(false), "no run holds the probed statement");
     let largest = largest.get();
     assert!(
-        largest <= 2 * interval,
+        largest <= interval,
         "{largest} runs looked at between two asks of the visitor: at most {}",
-        2 * interval
+        interval
     );
 }
 
@@ -324,7 +324,7 @@ fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
 /// scan over many runs reads its cursors within its visitor's interval. Five intervals of runs,
 /// one statement each, all matching (a range in every run, a cursor each): from the scan's
 /// first ask to its third quad, between two asks of the visitor (and after the last), it
-/// does no more than two intervals of work: runs searched, their comparisons, cursors read and
+/// does no more than an interval of work: runs searched, their comparisons, cursors read and
 /// the merge's work (fix check r1 F1: a step compared every cursor after one count). Its
 /// credit's hint summed every cursor before each ask, five intervals unseen.
 #[test]
@@ -366,8 +366,8 @@ fn a_counted_scan_reads_its_cursors_within_its_visitor_s_interval() {
     assert_eq!(first.len(), 3, "every run's statement matches");
     let largest = largest.get();
     assert!(
-        largest <= 2 * interval,
+        largest <= interval,
         "{largest} runs, cursors and keys read between two asks of the visitor: at most {}",
-        2 * interval
+        interval
     );
 }

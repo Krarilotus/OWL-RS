@@ -375,9 +375,10 @@ impl IndexVersion {
         let mut ledger = Ledger::new(visit);
         let mut sign = 0;
         for run in self.runs.iter() {
+            sign += run.sign_of_counted(quad, &mut ledger).ok_or(Stopped)?;
+            // Looked at once its search was counted, the run with it (`bound_counted`).
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::RunProbes, 1);
-            sign += run.sign_of_counted(quad, &mut ledger).ok_or(Stopped)?;
         }
         Ok(sign > 0)
     }
@@ -421,12 +422,12 @@ impl IndexVersion {
         // r1 F1, design attack r2 E2).
         let mut ledger = Ledger::new(visit);
         for run in self.runs.iter() {
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            crate::witness::add(crate::witness::Site::RunProbes, 1);
             let keys = &run.permutation(adapted.permutation).keys;
             let start = keys
                 .bound_counted(&adapted.low, &mut ledger)
                 .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
             if start < keys.len() && keys.get(start) <= adapted.high {
                 return Ok(true);
             }
@@ -456,13 +457,13 @@ impl IndexVersion {
         let mut ledger = Ledger::new(visit);
         let mut merge = SignedMerge::new(std::iter::empty());
         for perm_run in self.runs.iter() {
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            crate::witness::add(crate::witness::Site::RunProbes, 1);
             let perm = perm_run.permutation(adapted.permutation);
             let (start, end) = perm
                 .keys
                 .range_counted(&adapted.low, &adapted.high, &mut ledger)
                 .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
             if !merge.add((perm, start, end), &mut ledger) {
                 return Err(Stopped);
             }
