@@ -274,6 +274,8 @@ fn get_growth_accepts_a_channel_filled_by_an_unread_body() {
         "application/n-triples",
     );
     runtime.block_on(send(app.clone(), request.clone()));
+    // The recorded red exceeded the old allowance. This drained baseline remains
+    // schedule-dependent; only the unread endpoint below is synchronised.
     let ((status, _, lines), drained) =
         measure::measure(|| runtime.block_on(send(app.clone(), request.clone())));
     assert_eq!(status, StatusCode::OK);
