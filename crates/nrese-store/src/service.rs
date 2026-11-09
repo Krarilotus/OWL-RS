@@ -506,6 +506,8 @@ impl StoreService {
         use std::sync::atomic::Ordering;
         // Before the commit it precedes: a reader that saw the old epoch sees the change.
         self.certificate_epoch.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        hooks::run(&hooks::INSIDE_INVALIDATION);
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
@@ -2256,6 +2258,9 @@ pub(crate) mod hooks {
         /// An entailment check has found the certificate current and is about to read the
         /// closure.
         pub(crate) static AFTER_CERTIFIED: Hook = const { RefCell::new(None) };
+        /// An invalidation of the certificate has begun its change of the epoch, and the old
+        /// certificate is still in place.
+        pub(crate) static INSIDE_INVALIDATION: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
@@ -2485,6 +2490,73 @@ mod certificate_tests {
         )];
         let answer = store.entails(rdfs(), &conclusion);
         join(&joined);
+        eprintln!("the answer: {answer:?}");
+        assert!(
+            !matches!(answer, Ok(crate::Entailment::NotEntailed)),
+            "NotEntailed for a conclusion the data entails"
+        );
+    }
+
+    /// An entailment that starts inside an invalidation answers from a certified closure
+    /// (fix check r1 on review r1, F1's read side): a bulk replace with the same statements has
+    /// begun clearing the certificate, the old one still in place, when an entailment starts
+    /// and finds it current; the replace then clears it, commits an empty inferred stack, and
+    /// only then does the entailment read the closure. The data entails `a a D` before and
+    /// after; the answer must not be `NotEntailed`. Before the fix the reader's epoch was taken
+    /// after the invalidation's one increment, so it was the same after its reads, and the
+    /// answer from the cleared stack stood.
+    #[test]
+    fn an_entailment_started_inside_an_invalidation_answers_from_a_certified_closure() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let (certified, has_certified) = mpsc::channel();
+        let (go, gone) = mpsc::channel::<()>();
+        let reader = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&reader);
+        let racer = store.clone();
+        hooks::INSIDE_INVALIDATION.set(Some(Box::new(move || {
+            let thread = std::thread::spawn(move || {
+                hooks::AFTER_CERTIFIED.set(Some(Box::new(move || {
+                    let _ = certified.send(());
+                    let _ = gone.recv_timeout(WAIT);
+                })));
+                let node = |name: &str| {
+                    nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"))
+                };
+                racer.entails(
+                    rdfs(),
+                    &[nrese_rdf::Triple::new(
+                        node("a"),
+                        nrese_rdf::NamedNode::new_unchecked(
+                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                        ),
+                        node("D"),
+                    )],
+                )
+            });
+            let _ = has_certified.recv_timeout(WAIT);
+            *slot.lock().unwrap() = Some(thread);
+        })));
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![both],
+                replace: true,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let _ = go.send(());
+        let thread = reader
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the invalidation ran its hook");
+        let answer = thread.join().expect("the entailment returns");
         eprintln!("the answer: {answer:?}");
         assert!(
             !matches!(answer, Ok(crate::Entailment::NotEntailed)),
