@@ -55,7 +55,7 @@ pub struct CommitSummary {
 pub struct Transaction<'e> {
     engine: &'e Inner,
     /// The writer slot; `None` for the old speculative transaction
-    /// ([`crate::Engine::speculative_shared`], until V2), which never commits.
+    /// ([`crate::Engine::speculative_shared`], until V1b), which never commits.
     _slot: Option<MutexGuard<'e, ()>>,
     /// The base snapshot and the pending changes over it.
     pending: Pending,

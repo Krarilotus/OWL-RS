@@ -10,4 +10,8 @@ disallowed-methods = [
     # cold build and the upper-facts report) and the engine's own test of it. A request's terms go through a
     # private transaction.
     { path = "nrese_engine::Engine::intern_system_vocabulary", reason = "only the DL source's system vocabulary appends without the writer slot (dictionary V1)" },
+    # Dictionary V1, temporary until V1b: the old shared speculative transaction, whose terms enter the dictionary. Its
+    # one caller is the RL refutation's rule constants (`nrese-store/src/entailment.rs`); V1b moves it to a private
+    # transaction and removes the method.
+    { path = "nrese_engine::Engine::speculative_shared", reason = "the shared speculative transaction appends a request's terms; only the RL refutation until V1b (dictionary V1)" },
 ]

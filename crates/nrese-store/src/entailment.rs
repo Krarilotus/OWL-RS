@@ -117,7 +117,9 @@ impl StoreService {
         let (stop, room) = (|| memory.exceeded(), || memory.room());
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let config = self.config();
-        // V1: private once the reasoner's maintenance takes either transaction kind.
+        // Until V1b (the reasoner's maintenance over either transaction kind): the old shared
+        // form, so the rule constants this compiles still enter the dictionary.
+        #[allow(clippy::disallowed_methods)]
         let mut tx = self.engine().speculative_shared();
         for t in opposite {
             let quad = Quad::new(

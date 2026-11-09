@@ -422,12 +422,14 @@ impl StoreService {
                 base_iri,
                 payload,
             } => {
-                // The shapes go into a graph of a speculative transaction, never committed:
-                // they share the repository's dictionary, as stored shapes do, and leave no
-                // trace. It takes no writer slot, so commits go on meanwhile. The graph holds
-                // no stored statement (SYN-58).
-                // V1: private once V2 reads a private transaction through SPARQL.
-                let mut tx = self.engine().speculative_shared();
+                // The shapes go into a graph of a private transaction, never committed: their
+                // terms are its own, charged to the request's envelope, and none enters the
+                // dictionary (dictionary lifecycle V1); stored terms keep their ids in it. It
+                // takes no writer slot, so commits go on meanwhile. The graph holds no stored
+                // statement (SYN-58). One budget for the request, so its pending snapshot is
+                // made once for every check (`pending_snapshot_within`'s memo).
+                let reads = std::sync::Arc::new(resources.memory.part());
+                let mut tx = self.engine().speculative(std::sync::Arc::clone(&reads));
                 let revision = tx.base().revision();
                 let validated = match &request.graphs {
                     ValidatedGraphs::Named(iri) => Some(graph_iri(iri)?),
@@ -443,10 +445,10 @@ impl StoreService {
                     BlankNodes::Fresh,
                 )?;
                 for quad in &quads {
-                    tx.insert(quad.as_ref());
+                    tx.try_insert(quad.as_ref())?;
                 }
                 let (report, shapes, applicable) = validate_view(
-                    &tx,
+                    &nrese_sparql::PendingRead::new(&tx, &reads),
                     tx.lookup(scratch.into()),
                     tx.lookup(stored.as_ref().into()),
                     request,
