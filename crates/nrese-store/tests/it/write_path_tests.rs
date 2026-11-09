@@ -261,6 +261,8 @@ fn no_public_method_commits_outside_the_pipeline() {
         "nrese-store/src/dl/bounds_lock_tests.rs",
         // ... and its cold build beside the query-ontology cache (N1).
         "nrese-store/src/dl/query_tests.rs",
+        // ... and the U1 a cold read keeps, before any commit (dictionary lifecycle V1, item 5).
+        "nrese-store/src/dl/source_tests.rs",
         "nrese-store/src/query_executor_tests.rs",
     ];
     let mut commits = 0;
