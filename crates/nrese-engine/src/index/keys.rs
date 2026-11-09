@@ -929,8 +929,9 @@ impl PackedKeys {
         positions: &[usize],
         out: &mut [Vec<u64>],
     ) {
+        // Exactly: what a charged caller reserved for them ([`super::ColumnScan::decode`]).
         for column in out.iter_mut() {
-            column.reserve(end.saturating_sub(start));
+            column.reserve_exact(end.saturating_sub(start));
         }
         let mut i = start;
         while i < end {

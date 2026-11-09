@@ -35,7 +35,7 @@ use std::borrow::Cow;
 
 use keys::PackedKeys;
 use merge::SignedMerge;
-use nrese_exec::{BudgetExceeded, ChargedVec, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
@@ -491,14 +491,19 @@ impl IndexVersion {
     /// run, appended to `out`: sorted by value within a run, a value once per run that has
     /// it. Each run's range is walked group by group ([`PackedKeys::groups`]): no search per
     /// group, so many small groups cost a scan of the column, few large ones a search each.
-    pub(crate) fn group_counts(
+    ///
+    /// `out` and each part walked in parallel grow charged to `budget` (`out`'s), one
+    /// charge a growth, before they allocate: a reader's walk can't outgrow its budget
+    /// (D16-039 F7). Refused, the walk ends with what it charged released.
+    pub(crate) fn group_counts<'b>(
         &self,
         plan: &AccessPlan,
         position: usize,
-        out: &mut Vec<(u64, i64)>,
-    ) {
+        out: &mut ChargedVec<(u64, i64), &'b Budget>,
+        budget: &'b Budget,
+    ) -> Result<(), BudgetExceeded> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return;
+            return Ok(());
         };
         debug_assert!(
             !adapted.exclude_default_graph,
@@ -509,21 +514,30 @@ impl IndexVersion {
         let position = if adapted.permutation == plan.permutation {
             position
         } else if position == 0 {
-            out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
-            return;
+            return out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
         } else {
             position - 1
         };
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
-            let walk = |start: usize, end: usize, out: &mut Vec<(u64, i64)>| {
+            // The walk can't stop between groups: a refused group ends what it appends, and
+            // the walk only skips over the rest.
+            let walk = |start: usize,
+                        end: usize,
+                        out: &mut ChargedVec<(u64, i64), &'b Budget>|
+             -> Result<(), BudgetExceeded> {
+                let mut refused = None;
                 perm.keys.groups(start, end, position, |value, i, j| {
-                    out.push((value, (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64));
+                    if refused.is_none() {
+                        let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                        refused = out.push((value, count)).err();
+                    }
                 });
+                refused.map_or(Ok(()), Err)
             };
             if end - start < 2 * GROUP_PART {
-                walk(start, end, out);
+                walk(start, end, out)?;
                 continue;
             }
             // Large ranges in parts on every core, cut at block boundaries; a group that
@@ -532,27 +546,28 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
-            let parts: Vec<Vec<(u64, i64)>> = cuts
+            let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
-                    let mut part = Vec::new();
-                    walk(cut[0], cut[1], &mut part);
-                    part
+                    let mut part = ChargedVec::new(budget);
+                    walk(cut[0], cut[1], &mut part)?;
+                    Ok(part)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, BudgetExceeded>>()?;
             let first = out.len();
             for part in parts {
-                let mut groups = part.into_iter();
-                if let Some((value, count)) = groups.next() {
-                    let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
-                    match out.last_mut() {
-                        Some(last) if spans => last.1 += count,
-                        _ => out.push((value, count)),
-                    }
+                let Some((&(value, count), rest)) = part.split_first() else {
+                    continue;
+                };
+                let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
+                match out.last_mut() {
+                    Some(last) if spans => last.1 += count,
+                    _ => out.push((value, count))?,
                 }
-                out.extend(groups);
+                out.extend_from_slice(rest)?;
             }
         }
+        Ok(())
     }
 
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
@@ -579,31 +594,37 @@ impl IndexVersion {
         }
     }
 
-    /// Appends, for each of `components` (quad components: subject 0, predicate 1, object
-    /// 2, graph 3), its values among the quads matching `plan`, in the plan's order, to
-    /// the matching vector of `out`, decoded a block and a column at a time. Answers only
-    /// for a version of at most one run without tombstones (`false`, nothing appended,
-    /// otherwise: then quads must be merged and cancelled one by one).
-    pub(crate) fn scan_columns(
+    /// The scan, a block and a column at a time, of `components` (quad components:
+    /// subject 0, predicate 1, object 2, graph 3) among the quads matching `plan`, in the
+    /// plan's order: its rows are known before anything is decoded, so a caller charges
+    /// them first ([`ColumnScan::rows`], then [`ColumnScan::decode`]). Answers only for a
+    /// version of at most one run without tombstones (`None` otherwise: then quads must be
+    /// merged and cancelled one by one).
+    pub(crate) fn column_scan(
         &self,
         plan: &AccessPlan,
         components: &[usize],
-        out: &mut [Vec<u64>],
-    ) -> bool {
+    ) -> Option<ColumnScan<'_>> {
+        let nothing = ColumnScan {
+            keys: None,
+            start: 0,
+            end: 0,
+            positions: Vec::new(),
+        };
         let Some(adapted) = self.layout.adapt(plan) else {
-            return true; // nothing this layout holds matches
+            return Some(nothing); // nothing this layout holds matches
         };
         if adapted.exclude_default_graph {
-            return false;
+            return None;
         }
         let run = match &*self.runs {
-            [] => return true,
+            [] => return Some(nothing),
             [run] => run,
-            _ => return false,
+            _ => return None,
         };
         let perm = run.permutation(adapted.permutation);
         if !perm.tombstones.is_empty() {
-            return false;
+            return None;
         }
         let order = adapted.permutation.order();
         let positions: Vec<usize> = components
@@ -616,8 +637,12 @@ impl IndexVersion {
             })
             .collect();
         let (start, end) = perm.range(&adapted.low, &adapted.high);
-        perm.keys.decode_columns(start, end, &positions, out);
-        true
+        Some(ColumnScan {
+            keys: Some(&perm.keys),
+            start,
+            end,
+            positions,
+        })
     }
 
     pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
@@ -761,6 +786,30 @@ impl IndexVersion {
     /// once ([`Self::with_run`], [`Self::with_runs`]).
     pub(crate) fn runs_bytes(&self, extra: usize) -> usize {
         2 * (self.runs.len() + extra) * std::mem::size_of::<Arc<Run>>() + 16
+    }
+}
+
+/// A column scan of one version ([`IndexVersion::column_scan`]): how many rows it decodes,
+/// known before it decodes them.
+pub(crate) struct ColumnScan<'a> {
+    keys: Option<&'a PackedKeys>,
+    start: usize,
+    end: usize,
+    positions: Vec<usize>,
+}
+
+impl ColumnScan<'_> {
+    /// The rows [`Self::decode`] appends to each column.
+    pub(crate) fn rows(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Appends each component's values to the matching vector of `out`, which grows by
+    /// exactly [`Self::rows`]: the capacity a caller charged for them.
+    pub(crate) fn decode(&self, out: &mut [Vec<u64>]) {
+        if let Some(keys) = self.keys {
+            keys.decode_columns(self.start, self.end, &self.positions, out);
+        }
     }
 }
 

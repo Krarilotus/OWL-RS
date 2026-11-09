@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use nrese_exec::ChargedVec;
+
 use super::compaction::{CompactionPolicy, merge_runs};
 use super::run::Run;
 use super::{IndexVersion, Layout};
@@ -181,10 +183,13 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
                 .take_while(|(l, h)| l == h)
                 .count();
             if bound < 4 && !plan.exclude_default_graph {
-                let mut counts = Vec::new();
-                version.group_counts(&plan, bound, &mut counts);
+                let budget = nrese_exec::Budget::unlimited();
+                let mut counts = ChargedVec::new(&budget);
+                version
+                    .group_counts(&plan, bound, &mut counts, &budget)
+                    .expect("an unlimited budget");
                 let mut totals = std::collections::BTreeMap::new();
-                for (value, count) in counts {
+                for &(value, count) in counts.iter() {
                     *totals.entry(value).or_insert(0i64) += count;
                 }
                 totals.retain(|_, count| *count != 0);
@@ -369,10 +374,13 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
         graph: GraphSelector::Any,
     };
     let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
-    let mut counts = Vec::new();
-    version.group_counts(&plan, 1, &mut counts);
+    let budget = nrese_exec::Budget::unlimited();
+    let mut counts = ChargedVec::new(&budget);
+    version
+        .group_counts(&plan, 1, &mut counts, &budget)
+        .expect("an unlimited budget");
     let mut totals = std::collections::BTreeMap::new();
-    for (value, count) in counts {
+    for &(value, count) in counts.iter() {
         *totals.entry(value).or_insert(0i64) += count;
     }
     totals.retain(|_, count| *count != 0);
