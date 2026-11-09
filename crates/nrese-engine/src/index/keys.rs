@@ -1010,7 +1010,7 @@ impl PackedKeys {
             return Some((start, start));
         }
         account
-            .take(3 * self.levels() + BLOCK_PROBES)
+            .take_cost(|| 3 * self.levels() + BLOCK_PROBES)
             .then(|| (start, self.end_from(start, high)))
     }
 
@@ -1018,7 +1018,7 @@ impl PackedKeys {
     /// (the run it reads counted with it): `None` once the account has stopped.
     pub(crate) fn bound_counted(&self, key: &Key, account: &mut impl Account) -> Option<usize> {
         account
-            .take(self.levels() + BLOCK_PROBES + 1)
+            .take_cost(|| self.levels() + BLOCK_PROBES + 1)
             .then(|| self.bound_in(0, self.len, key, false))
     }
 

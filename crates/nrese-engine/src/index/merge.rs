@@ -9,9 +9,10 @@
 //!
 //! One step ([`SignedMerge::step`]) serves the plain reads and the counted ones: its work is
 //! counted on an [`Account`] a portion at a time, each portion before it is done (REAS-3a fix
-//! check r1 F1). While two or more inputs are live, their heads are kept in a binary heap
-//! with the least key on top, so each occurrence a step takes costs O(log k) comparisons for
-//! k inputs. A last live input is read without comparing.
+//! check r1 F1). Over at most [`LINEAR_UP_TO`] inputs a step compares all their keys for the
+//! least, O(k) for k inputs. Over more, their heads are kept in a binary heap with the least
+//! key on top, so each occurrence a step takes costs O(log k) comparisons. A last live input
+//! is read without comparing.
 
 use std::collections::BinaryHeap;
 use std::collections::binary_heap::PeekMut;
@@ -61,8 +62,8 @@ impl PartialOrd for Head {
 /// The most a merge over `runs` runs holds at once. That is its list of cursors and its
 /// heap of their heads, each grown by doubling from a capacity of 4, so at most an old and
 /// a new array of each at once. Each cursor's buffer of decoded keys counts too: a buffer's
-/// first block is at most [`BLOCK`] keys, and the next grows it to twice that. With one
-/// live input the heap holds nothing.
+/// first block is at most [`BLOCK`] keys, and the next grows it to twice that. Over at most
+/// [`LINEAR_UP_TO`] inputs the heap holds nothing.
 pub(crate) fn scan_bytes(runs: usize) -> usize {
     let capacity = runs.next_power_of_two().max(4);
     let buffer = 3 * BLOCK * std::mem::size_of::<Key>();
@@ -71,6 +72,21 @@ pub(crate) fn scan_bytes(runs: usize) -> usize {
 
 /// A range at least this long left in the current block is decoded block-wise.
 const BUFFER_FROM: usize = 16;
+
+/// The most inputs a merge selects among by comparing all their keys; over more, it keeps a
+/// heap. Measured on the merge alone, 2 to 40 inputs, long merges and short ones of 4 entries
+/// an input (instructions:u, `p2-reas3-sweep1` and `sweep2`): from 4 inputs on, the heap does
+/// less on distinct keys and on one long input among short ones; up to 3 the linear selection
+/// does about as much or less. On keys every input holds, it does less at every count (at 4
+/// inputs, 174 instructions an entry against the heap's 259).
+pub(super) const LINEAR_UP_TO: usize = 3;
+
+/// What building the heap compares at most: a push of each of `LINEAR_UP_TO + 1` heads.
+const HEAP_BUILD: u64 = (LINEAR_UP_TO as u64 + 1) * levels(LINEAR_UP_TO);
+
+// A linear step's selection, and the heap's build with its input, are each one portion.
+const _: () = assert!(2 * (LINEAR_UP_TO as u64) <= crate::visit::PORTION);
+const _: () = assert!(HEAP_BUILD < crate::visit::PORTION);
 
 /// `n` units of a merge's work, counted where they are done in a build with the work
 /// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
@@ -84,8 +100,8 @@ fn worked(n: usize) {
 /// The levels of a binary heap of `len` entries: what a push onto it compares at most. A
 /// pop or a change of its top compares at most twice that.
 #[inline]
-fn levels(len: usize) -> u64 {
-    u64::from(usize::BITS - len.leading_zeros())
+const fn levels(len: usize) -> u64 {
+    (usize::BITS - len.leading_zeros()) as u64
 }
 
 impl Cursor<'_> {
@@ -145,12 +161,15 @@ impl Cursor<'_> {
 }
 
 pub(crate) struct SignedMerge<'a> {
-    /// Every cursor made, each at a fixed index; an exhausted one is in neither `heads` nor
+    /// The live cursors, an exhausted one removed, until the merge has a heap. Then every
+    /// cursor made, each at a fixed index; an exhausted one is in neither `heads` nor
     /// `single`, and its buffer is freed.
     cursors: Vec<Cursor<'a>>,
-    /// The live cursors' heads while two or more are live; empty otherwise.
+    /// Whether the merge has a heap: from its input after the [`LINEAR_UP_TO`]th on.
+    heaped: bool,
+    /// The live cursors' heads while two or more are live; empty otherwise or without a heap.
     heads: BinaryHeap<Head>,
-    /// The live cursor while just one is: read without comparing.
+    /// The live cursor while just one is, after a heap: read without comparing.
     single: Option<usize>,
     /// The entries the live cursors have left: summed as they are made, less one for each
     /// occurrence a step takes, so [`Self::remaining`] reads no cursor (REAS-3a review r1 R2).
@@ -165,6 +184,7 @@ impl<'a> SignedMerge<'a> {
     pub(crate) fn new(parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>) -> Self {
         let mut merge = Self {
             cursors: Vec::new(),
+            heaped: false,
             heads: BinaryHeap::new(),
             single: None,
             left: 0,
@@ -182,7 +202,7 @@ impl<'a> SignedMerge<'a> {
     ) {
         self.cursors.clear();
         self.heads.clear();
-        (self.single, self.left, self.stopped) = (None, 0, false);
+        (self.heaped, self.single, self.left, self.stopped) = (false, None, 0, false);
         for part in parts {
             let added = self.add(part, &mut Free);
             debug_assert!(added, "nothing is counted");
@@ -200,16 +220,24 @@ impl<'a> SignedMerge<'a> {
         if pos >= end {
             return true;
         }
-        let push = match self.single {
-            Some(_) => 1,
-            None => levels(self.heads.len()),
+        debug_assert!(
+            self.single.is_none(),
+            "a merge's inputs come before its steps"
+        );
+        let cursor = self.cursors.len();
+        let push = if self.heaped {
+            levels(self.heads.len())
+        } else if cursor == LINEAR_UP_TO {
+            HEAP_BUILD
+        } else {
+            0
         };
         if self.stopped || !account.take(1 + push) {
             self.stopped = true;
             return false;
         }
         worked(1);
-        let (key, cursor) = (run.keys.get(pos), self.cursors.len());
+        let key = run.keys.get(pos);
         self.cursors.push(Cursor {
             run,
             pos,
@@ -219,17 +247,16 @@ impl<'a> SignedMerge<'a> {
             buffered: pos + 1,
         });
         self.left += end - pos;
-        if let Some(other) = self.single.take() {
-            let other_key = self.cursors[other].key;
-            self.heads.push(Head {
-                key: other_key,
-                cursor: other,
-            });
+        if self.heaped {
             self.heads.push(Head { key, cursor });
-        } else if self.heads.is_empty() {
-            self.single = Some(cursor);
-        } else {
-            self.heads.push(Head { key, cursor });
+        } else if cursor == LINEAR_UP_TO {
+            for (cursor, input) in self.cursors.iter().enumerate() {
+                self.heads.push(Head {
+                    key: input.key,
+                    cursor,
+                });
+            }
+            self.heaped = true;
         }
         true
     }
@@ -253,6 +280,9 @@ impl<'a> SignedMerge<'a> {
         if self.stopped {
             return Err(Stopped);
         }
+        if !self.heaped {
+            return self.select(account);
+        }
         if self.heads.len() == 1 {
             // The last other head went in the step before. Popping a heap's last head
             // compares nothing.
@@ -260,7 +290,7 @@ impl<'a> SignedMerge<'a> {
         }
         if let Some(i) = self.single {
             let cursor = &mut self.cursors[i];
-            if !account.take(cursor.advance_cost()) {
+            if !account.take_cost(|| cursor.advance_cost()) {
                 return self.stop();
             }
             let item = (cursor.key, cursor.sign());
@@ -285,7 +315,7 @@ impl<'a> SignedMerge<'a> {
                 break;
             };
             let cursor = &mut self.cursors[top.cursor];
-            if !account.take(cursor.advance_cost()) || !account.take(repair) {
+            if !account.take_cost(|| cursor.advance_cost()) || !account.take_cost(|| repair) {
                 drop(top);
                 return self.stop();
             }
@@ -302,6 +332,50 @@ impl<'a> SignedMerge<'a> {
             if self.heads.peek().is_none_or(|head| head.key != key) {
                 break;
             }
+        }
+        Ok(Some((key, sign)))
+    }
+
+    /// [`Self::step`] without a heap, over at most [`LINEAR_UP_TO`] live inputs: the least of
+    /// their keys, then each input at it taken, an exhausted one removed. Comparing and testing
+    /// each input is counted first, then each advance.
+    #[inline]
+    fn select(&mut self, account: &mut impl Account) -> Result<Option<(Key, i64)>, Stopped> {
+        if let [cursor] = self.cursors.as_mut_slice() {
+            if !account.take_cost(|| cursor.advance_cost()) {
+                return self.stop();
+            }
+            let item = (cursor.key, cursor.sign());
+            self.left -= 1;
+            if !cursor.advance() {
+                self.cursors.clear();
+            }
+            return Ok(Some(item));
+        }
+        // The end is counted too.
+        if !account.take((2 * self.cursors.len()).max(1) as u64) {
+            return self.stop();
+        }
+        worked(self.cursors.len());
+        let Some(&key) = self.cursors.iter().map(|cursor| &cursor.key).min() else {
+            return Ok(None);
+        };
+        let (mut sign, mut i) = (0, 0);
+        while i < self.cursors.len() {
+            worked(1);
+            let cursor = &mut self.cursors[i];
+            if cursor.key == key {
+                if !account.take_cost(|| cursor.advance_cost()) {
+                    return self.stop();
+                }
+                sign += cursor.sign();
+                self.left -= 1;
+                if !cursor.advance() {
+                    self.cursors.swap_remove(i);
+                    continue;
+                }
+            }
+            i += 1;
         }
         Ok(Some((key, sign)))
     }
