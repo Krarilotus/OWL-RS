@@ -715,3 +715,34 @@ fn a_pending_view_hiding_an_equality_edge_keeps_its_classes_apart() {
         );
     }
 }
+
+/// The kept pending snapshot after a refused write (V1-engine review r1, F1). A matching
+/// removal refused part way keeps the removals before the refusal (`remove_matching`'s
+/// contract), so they are pending changes, and a pending snapshot must hold them.
+///
+/// - Input: 1,000 committed statements; a private transaction over them with 16 KiB, its
+///   pending snapshot taken (so kept); then the removal of all of them, refused part way.
+/// - Expected: `MemoryLimit`, with some removed; the next pending snapshot has the
+///   transaction's statements (`len`), not the kept snapshot's 1,000.
+#[test]
+fn a_pending_snapshot_after_a_removal_refused_part_way_holds_its_removals() {
+    let engine = engine();
+    let mut load = engine.transaction();
+    for n in 0..1_000 {
+        load.insert(quad("a", "p", literal(&n.to_string())).as_ref());
+    }
+    load.commit().expect("commit");
+    let base = engine.snapshot();
+    let mut tx = engine
+        .speculative_over(&base, Arc::new(Budget::new(16 * 1024)))
+        .unwrap();
+    let reader = budget();
+    assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), 1_000);
+    let refused = tx.remove_matching(&QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "{refused:?}"
+    );
+    assert!(tx.len() < 1_000, "refused part way: {:?}", tx.pending());
+    assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), tx.len());
+}
