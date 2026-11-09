@@ -72,12 +72,13 @@ pub trait PendingView: sealed::Sealed {
 
     fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool;
 
-    /// Quads matching `pattern` in `model`, including pending changes.
+    /// Quads matching `pattern` in `model`, including pending changes. The iterator borrows
+    /// the transaction only, never `pattern`: a scan may outlive the pattern it was made from.
     fn quads_for_pattern_in<'a>(
         &'a self,
         model: ReadModel,
         pattern: &QuadPattern,
-    ) -> impl Iterator<Item = EncodedQuad> + 'a;
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, Self>;
 
     /// True if the named graph `graph` has a quad, including pending changes.
     fn contains_named_graph(&self, graph: TermId) -> bool;
@@ -120,7 +121,7 @@ pub trait PendingWrite: PendingView {
 
 /// A write transaction answers `Ok` of its inherent methods. DUR-6 charges its pending
 /// snapshots to the budget; until then the budget is not read.
-impl PendingView for Transaction<'_> {
+impl<'e> PendingView for Transaction<'e> {
     #[inline]
     fn base(&self) -> &Snapshot {
         Transaction::base(self)
@@ -186,7 +187,7 @@ impl PendingView for Transaction<'_> {
         &'a self,
         model: ReadModel,
         pattern: &QuadPattern,
-    ) -> impl Iterator<Item = EncodedQuad> + 'a {
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e> {
         Transaction::quads_for_pattern_in(self, model, pattern)
     }
 
@@ -251,7 +252,7 @@ impl PendingWrite for Transaction<'_> {
 /// A private transaction answers its inherent methods, the infallible ones as `Ok`. Its
 /// pending snapshots' freeze is charged to the budget it was opened with; `budget` keys its
 /// memo ([`PrivateTransaction::pending_snapshot_within`]).
-impl PendingView for PrivateTransaction<'_> {
+impl<'e> PendingView for PrivateTransaction<'e> {
     #[inline]
     fn base(&self) -> &Snapshot {
         PrivateTransaction::base(self)
@@ -317,7 +318,7 @@ impl PendingView for PrivateTransaction<'_> {
         &'a self,
         model: ReadModel,
         pattern: &QuadPattern,
-    ) -> impl Iterator<Item = EncodedQuad> + 'a {
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e> {
         PrivateTransaction::quads_for_pattern_in(self, model, pattern)
     }
 
