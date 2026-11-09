@@ -114,19 +114,20 @@ def with_attempt(result: dict, attempt: str) -> dict:
 
 
 def attempt_record(kind: str, attempt: str, tree: str) -> dict:
-    """KIND's attempt record as `release_gate.py attempt` writes it (KIND.attempt.SEQUENCE-ID.json beside
-    its result)."""
+    """KIND's attempt record as `release_gate.py attempt` writes it (KIND.attempt.SEQUENCE.json beside
+    its result; write_attempts() adds its sequence)."""
     return {"kind": kind, "attempt": attempt, "tree": tree}
 
 
 def write_attempts(where: Path, kind: str, records: list) -> list[Path]:
-    """RECORDS as KIND's attempt records in WHERE, oldest first (sequence 1, 2, ...): a dict as its
-    content, a str as a record's raw text that isn't one. Their paths."""
+    """RECORDS as KIND's attempt records in WHERE, oldest first (KIND.attempt.SEQUENCE.json, sequence 1,
+    2, ...): a dict as its content, with its sequence; a str as a record's raw text that isn't one.
+    Their paths."""
     paths = []
     for sequence, record in enumerate(records, start=1):
-        attempt = record["attempt"] if isinstance(record, dict) else "f" * 32
-        paths.append(where / f"{kind}.attempt.{sequence:09d}-{attempt}.json")
-        paths[-1].write_text(json.dumps(record) if isinstance(record, dict) else record, encoding="utf-8")
+        paths.append(where / f"{kind}.attempt.{sequence:09d}.json")
+        paths[-1].write_text(json.dumps({**record, "sequence": sequence}) if isinstance(record, dict) else record,
+                             encoding="utf-8")
     return paths
 
 
@@ -523,8 +524,9 @@ class GuardRun(Scratch):
 
 class AttemptRecords(Scratch):
     """Fix check r2, R2 (the orchestrator's design of 13:01): each check step writes a fresh attempt record
-    first, under a name of its own (KIND.attempt.SEQUENCE-ID.json: a random id and the tree; 13:17); its
-    result and receipt carry that id; the verdict takes a result only of the newest record's id."""
+    first, its sequence its name (KIND.attempt.SEQUENCE.json, created exclusively; inside, a random id
+    and the tree; fix checks r2 and r3); its result and receipt carry that id; the verdict takes a
+    result only of the newest record's id, and none from a history it can't order."""
 
     def attempt(self, kind: str, where: Path) -> str:
         done = subprocess.run([sys.executable, str(GATE), "attempt", kind, str(where)], cwd=self.repo.path,
@@ -547,13 +549,14 @@ class AttemptRecords(Scratch):
         self.assertNotEqual(attempts["w3c"], attempts["guards"])
         for kind in attempts:
             [path] = out.glob(f"{kind}.attempt.*.json")
-            self.assertEqual(path.name, f"{kind}.attempt.000000001-{attempts[kind]}.json")
+            self.assertEqual(path.name, f"{kind}.attempt.000000001.json")
             record = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(record, attempt_record(kind, attempts[kind], self.repo.tree(a)))
+            self.assertEqual(record, {**attempt_record(kind, attempts[kind], self.repo.tree(a)), "sequence": 1})
         # A second attempt of a kind is a new file, one sequence higher; the first stays.
         again = self.attempt("w3c", out)
         self.assertEqual(sorted(p.name for p in out.glob("w3c.attempt.*.json")),
-                         [f"w3c.attempt.000000001-{attempts['w3c']}.json", f"w3c.attempt.000000002-{again}.json"])
+                         ["w3c.attempt.000000001.json", "w3c.attempt.000000002.json"])
+        self.assertEqual(json.loads((out / "w3c.attempt.000000002.json").read_text(encoding="utf-8"))["attempt"], again)
         attempts["w3c"] = again
         made = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--log", str(out / "test.log"),
                                "--identity", IDENTITY, "--attempt", attempts["guards"], "--json", str(out / "guards.json")],
@@ -640,6 +643,42 @@ class AttemptRecords(Scratch):
                 done = verdict_on(self.repo.path, a, where, rounds(a), w3c, guards)
                 self.assertEqual(done.returncode, 1, f"SPEC {name}: an ambiguous history\n{done.stdout}")
                 self.assertIn("guards: its attempt history is ambiguous", done.stdout)
+        with self.subTest("an unreadable name below the newest"):
+            where = self.tmp / "history-unreadable"
+            where.mkdir()
+            w3c_attempt = self.attempt("w3c", where)
+            (where / "guards.attempt.junk.json").write_text("{}", encoding="utf-8")
+            newest = self.attempt("guards", where)
+            w3c, guards = checks(a, tree)
+            with_attempt(w3c, w3c_attempt)
+            with_attempt(guards, newest)
+            done = verdict_on(self.repo.path, a, where, rounds(a), w3c, guards)
+            self.assertEqual(done.returncode, 1, f"SPEC an unreadable name\n{done.stdout}")
+            self.assertIn("guards.attempt.junk.json: not an attempt record's name", done.stdout)
+
+    def test_an_attempt_never_takes_a_sequence_another_holds_and_its_tries_are_bounded(self):
+        # Spec: the orchestrator's design (fix check r3, item 1): a taken name sends an attempt to the next
+        # sequence; when every sequence it may try is taken, it refuses by name and records nothing.
+        where = self.tmp / "taken"
+        where.mkdir()
+        (where / "guards.attempt.000000002.json").write_text("{}", encoding="utf-8")
+        real = gate_module.attempt_records
+        stale = lambda *args: gate_module.AttemptHistory([], [], [])  # noqa: E731  a scan before 2 was taken
+        launched = os.getcwd()
+        os.chdir(self.repo.path)
+        try:
+            self.repo.commit()
+            with patch.object(gate_module, "attempt_records", lambda *args: real(*args)._replace(sequences=[1])):
+                gate_module.attempt_record("guards", where)
+            self.assertTrue((where / "guards.attempt.000000003.json").is_file(), "SPEC 2 was taken: 3")
+            with patch.object(gate_module, "ATTEMPT_TRIES", 2), patch.object(gate_module, "attempt_records", stale):
+                (where / "guards.attempt.000000001.json").write_text("{}", encoding="utf-8")
+                with self.assertRaisesRegex(SystemExit, "sequences 1 to 2 of guards .* are all taken"):
+                    gate_module.attempt_record("guards", where)
+        finally:
+            os.chdir(launched)
+        self.assertEqual(sorted(p.name for p in where.iterdir()),
+                         [f"guards.attempt.00000000{n}.json" for n in (1, 2, 3)])
 
     def test_a_result_of_another_attempt_or_none_is_refused(self):
         # Spec: the orchestrator's design, items 3 and 5, and 13:17: the result's own record, then a newer
