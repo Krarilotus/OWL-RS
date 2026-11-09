@@ -114,6 +114,14 @@ impl TermKind {
         )
     }
 
+    /// True for every RDF literal kind; triple terms and the graph marker are not literals.
+    pub const fn is_literal(self) -> bool {
+        !matches!(
+            self,
+            Self::DefaultGraph | Self::Iri | Self::BlankNode | Self::Triple
+        )
+    }
+
     /// True for dictionary-backed literal kinds.
     pub const fn is_dictionary_literal(self) -> bool {
         matches!(self, Self::String | Self::LangString | Self::TypedLiteral)

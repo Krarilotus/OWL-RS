@@ -248,7 +248,7 @@ pub(crate) struct Values {
 impl Values {
     /// Notes `id` if it is a literal: its value's representative from now on.
     fn add(&mut self, view: &Snapshot, id: u64) {
-        if !is_literal(id) || !self.seen.insert(id) {
+        if !TermId::from_raw(id).kind().is_literal() || !self.seen.insert(id) {
             return;
         }
         let Some(value) = value_of(view, id) else {
@@ -318,7 +318,10 @@ struct Noting<'a> {
 
 impl Noting<'_> {
     fn add(&mut self, view: &Snapshot, id: u64) {
-        if !is_literal(id) || self.base.seen.contains(&id) || !self.added.seen.insert(id) {
+        if !TermId::from_raw(id).kind().is_literal()
+            || self.base.seen.contains(&id)
+            || !self.added.seen.insert(id)
+        {
             return;
         }
         let Some(value) = value_of(view, id) else {
@@ -787,7 +790,7 @@ impl Upper {
             return named(o);
         }
         (named(o) && self.object_properties.contains(&p))
-            || (is_literal(o) && self.data_properties.contains(&p))
+            || (TermId::from_raw(o).kind().is_literal() && self.data_properties.contains(&p))
     }
 
     /// The stack's change for a commit, computed before it and applied after it
@@ -951,15 +954,6 @@ impl Upper {
     pub fn is_internal(&self, term: u64) -> bool {
         self.program.is_internal(term)
     }
-}
-
-/// Whether a term is a literal (of any of the engine's literal kinds).
-fn is_literal(t: u64) -> bool {
-    use nrese_engine::TermKind;
-    !matches!(
-        TermId::from_raw(t).kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
 }
 
 #[cfg(test)]
