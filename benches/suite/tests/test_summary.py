@@ -75,6 +75,53 @@ class LoadedInputs(unittest.TestCase):
     frozen input files, byte for byte, on both sides; a form pin never stands in for them."""
     OLD, NEW = "66f44fa8" + "0" * 56, "85b6ccc3" + "0" * 56
 
+    def test_cross_host_fast_reports_keep_correctness_and_work(self):
+        # Spec: D16-151: refuse host-dependent measures, still report failures (1)
+        # before a timing refusal (2), including deterministic work on equal inputs.
+        for change, message in (({"answers": {"q": 2}}, "ANSWERS DIFFER"),
+                                ({"status": "failed"}, "CHANGED"),
+                                ({"checks": [{"path": "rows", "got": 2, "ok": False}]}, "failed checks/status"),
+                                ({"counters": {"work": 103}}, "MORE WORK"), ({}, "REFUSED")):
+            with self.subTest(change=change):
+                base = self.report(100, {}, case="rl-hierarchy")
+                new = self.report(1000, {}, case="rl-hierarchy")
+                new["machine"]["host"] = "other-fixture"
+                for r in base["records"]:
+                    r.update(answers={"q": 1}, counters={"work": 100})
+                for r in new["records"]:
+                    r.update(answers={"q": 1}, counters={"work": 100}, peak_mib=10000,
+                             throughput=[{"clients": 1, "qps": 1}])
+                    r.update(change)
+                code, text = self.compare(base, new)
+                self.assertEqual(code, 1 if change else 2, text)
+                self.assertIn(message, text)
+                for verdict in ("SLOWER", "MORE MEMORY", "LOWER QPS"):
+                    self.assertNotIn(verdict, text)
+
+    def test_cross_host_csv_keeps_wrong_answers_and_withholds_measures(self):
+        # Spec: D16-151 applies to the suite CSV entry point as well as fast JSON.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            base = write(directory / "base", [load(), query("q", 10)])
+            new = write(directory / "new", [load(), query("q", 1000, rows=2)])
+            for path, host in ((base, "fixture"), (new, "other-fixture")):
+                (path.parent / "manifest.json").write_text(json.dumps({"invocations": [{
+                    "machine": {"host": host}, "started": "2026-11-07T16:00:00",
+                    "datasets": {}, "dataset_sha256": {}}]}), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = compare.main([str(base), str(new)])
+            self.assertEqual(code, 1, out.getvalue())
+            self.assertIn("answers differ", out.getvalue())
+            self.assertNotIn("100.00x", out.getvalue())
+            # Guard: equal answers still refuse measurements, including the query sum.
+            write(new.parent, [load(), query("q", 1000)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = compare.main([str(base), str(new)])
+            self.assertEqual(code, 2, out.getvalue())
+            self.assertNotIn("sum of medians", out.getvalue())
+
     def report(self, ms, inputs=None, case="rdfs-full-lubm10"):
         record = {"case": case, "status": "ok", "samples": {"reason.p50_ms": [ms, ms]}, "metric": ms}
         if inputs is not None:
@@ -148,6 +195,28 @@ class LoadedInputs(unittest.TestCase):
             self.assertNotIn("different input", text)
             self.assertNotIn("input unknown", text)
             self.assertIn("faster", text)
+
+    def test_csv_different_inputs_refuse_before_correctness(self):
+        # Spec: master's r1 F1 direction: another dataset release -> Inputs/exit 2;
+        # statement counts and answers caused by the new input are not regressions.
+        for host in ("fixture", "other-fixture"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                base = self.suite_run(directory / "base", 100, {"/data/d.nt": 1}, {"/data/d.nt": self.OLD})
+                new = self.suite_run(directory / "new", 50, {"/data/d.nt": 1}, {"/data/d.nt": self.NEW})
+                write(new.parent, [row(task="load", rows=10, ms=10), query("q1", 50, rows=2)])
+                manifest = new.parent / "manifest.json"
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                data["invocations"][0]["machine"]["host"] = host
+                manifest.write_text(json.dumps(data), encoding="utf-8")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = compare.main([str(base), str(new)])
+                self.assertEqual(code, 2, out.getvalue())
+                self.assertIn("## Inputs", out.getvalue())
+                self.assertIn("different input", out.getvalue())
+                for verdict in ("statement counts differ", "answers differ", "regression(s)"):
+                    self.assertNotIn(verdict, out.getvalue())
 
     def test_a_perf_lab_case_compares_on_the_same_bytes_and_is_refused_on_others(self):
         """The orchestrator, 7 Nov 2026 (17:12): leads compare perf-lab runs (the `lab-*` cases, the

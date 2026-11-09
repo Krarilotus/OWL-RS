@@ -325,3 +325,70 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
     );
     Ok(())
 }
+
+/// A replica's data directory, made by its bootstrap, is durably named (sol-loop round 3 on
+/// DUR-3 review r1, S1): into `sealed/a`, where `sealed` exists but can't be opened (mode
+/// 0o311), so its sync, which must name `a`, fails, the bootstrap must refuse. Before the fix it
+/// made `a` itself, and the placement then took it for a directory provisioned beforehand. Guard:
+/// into `open/a` it takes the image and the store opens with it. Unix only (permissions); as root,
+/// where the mode doesn't keep the directory closed, the first row isn't checked.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bootstrap_names_the_data_directory_it_makes() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let primary_dir = tempfile::tempdir()?;
+    let primary_state = state(
+        StoreService::new(StoreConfig::on_disk(primary_dir.path()))?,
+        ReplicationConfig {
+            mode: ReplicationMode::Primary,
+            ..ReplicationConfig::default()
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let primary_app = build_app(primary_state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, primary_app).await.expect("primary");
+    });
+    update(&base, "INSERT DATA { ex:a a ex:C }").await;
+    let config = ReplicationConfig {
+        mode: ReplicationMode::Replica,
+        primary: Some(base.clone()),
+        ..ReplicationConfig::default()
+    };
+    let replicas = tempfile::tempdir()?;
+    let mut wrong = Vec::new();
+
+    let sealed = replicas.path().join("sealed");
+    std::fs::create_dir(&sealed)?;
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o311))?;
+    if std::fs::read_dir(&sealed).is_ok() {
+        eprintln!("row sealed: not checked (the directory opens: root?)");
+    } else {
+        let taken = replication::bootstrap(&config, &sealed.join("a")).await;
+        eprintln!(
+            "row sealed: {}",
+            if taken.is_err() { "ok" } else { "FAILED" }
+        );
+        if let Ok(taken) = taken {
+            wrong.push(format!(
+                "bootstrapped under a directory whose sync fails: {taken:?}"
+            ));
+        }
+    }
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))?;
+
+    let open = replicas.path().join("open").join("a");
+    let taken = replication::bootstrap(&config, &open).await;
+    let ok = matches!(taken, Ok(Some(revision)) if revision == primary_state.store().current_revision())
+        && StoreService::new(StoreConfig::on_disk(&open))?
+            .stats()?
+            .quad_count
+            > 0;
+    eprintln!("row open (guard): {}", if ok { "ok" } else { "FAILED" });
+    if !ok {
+        wrong.push(format!("guard: bootstrap into open/a: {taken:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}

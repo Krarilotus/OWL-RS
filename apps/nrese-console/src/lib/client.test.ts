@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import { NreseClient } from "./client";
+import { DEFAULT_GRAPH, selectedGraphTarget } from "./endpoints";
 
 describe("NreseClient", () => {
   test("builds query requests against the configured base URL", async () => {
@@ -52,6 +53,60 @@ describe("NreseClient", () => {
     expect(response.suggestions[0]?.label).toBe("X");
   });
 
+  // SYN-72 C-1107: every graph request names exactly its target (Graph Store Protocol §4:
+  // `?default` or one `graph=` parameter carrying the whole IRI).
+  test.each([
+    [{ kind: "named", iri: "https://example.org/g#x&y z" }, "?graph=https%3A%2F%2Fexample.org%2Fg%23x%26y%20z"],
+    [{ kind: "default" }, "?default"],
+  ] as const)("sends graph requests to %j", async (target, query) => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(null, { status: 204 }),
+    );
+    const client = new NreseClient({ fetchImpl: fetchImpl as typeof fetch });
+
+    await client.deleteGraph(target);
+    await client.writeGraph("PUT", "", target);
+    await client.readGraph(target);
+    await client.runTell("", target);
+
+    expect(fetchImpl.mock.calls.map(([input]) => input)).toEqual([
+      `/dataset/data${query}`,
+      `/dataset/data${query}`,
+      `/dataset/data${query}`,
+      `/dataset/tell${query}`,
+    ]);
+  });
+
+  // SYN-72 R1-F1: the server reads these named graphs as the default graph
+  // (nrese-sparql/src/compat.rs); a named target naming one is refused before any request.
+  test.each(["urn:x-arq:DefaultGraph", "urn:x-rdflib:default"])(
+    "refuses a named target %s, sending nothing",
+    async (iri) => {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(null, { status: 204 }),
+      );
+      const client = new NreseClient({ fetchImpl: fetchImpl as typeof fetch });
+      const target = { kind: "named", iri } as const;
+
+      await expect(client.deleteGraph(target)).rejects.toThrow(/default graph/i);
+      await expect(client.writeGraph("PUT", "", target)).rejects.toThrow(/default graph/i);
+      await expect(client.writeGraph("POST", "", target)).rejects.toThrow(/default graph/i);
+      await expect(client.readGraph(target)).rejects.toThrow(/default graph/i);
+      await expect(client.runTell("", target)).rejects.toThrow(/default graph/i);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    },
+  );
+
+  // Guard (unchanged behaviour): the console's selector names the default graph in default
+  // mode whatever its IRI field holds, and the typed IRI in named mode.
+  test("maps the console's graph selector to its target", () => {
+    expect(selectedGraphTarget("default", "http://example.com/g")).toEqual({ kind: "default" });
+    expect(selectedGraphTarget("named", "http://example.com/g")).toEqual({
+      kind: "named",
+      iri: "http://example.com/g",
+    });
+  });
+
   test("sends the configured headers with every request", async () => {
     // The review of 3 October 2026 (C3): diagnostics reads and graph DELETE went without.
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
@@ -70,10 +125,10 @@ describe("NreseClient", () => {
     await client.autocomplete("x");
     await client.runQuery("ASK {}", "application/sparql-results+json");
     await client.runUpdate("INSERT DATA {}");
-    await client.runTell("", "default", "");
-    await client.readGraph("default", "");
-    await client.writeGraph("PUT", "", "default", "");
-    await client.deleteGraph("default", "");
+    await client.runTell("", DEFAULT_GRAPH);
+    await client.readGraph(DEFAULT_GRAPH);
+    await client.writeGraph("PUT", "", DEFAULT_GRAPH);
+    await client.deleteGraph(DEFAULT_GRAPH);
 
     expect(fetchImpl).toHaveBeenCalledTimes(12);
     for (const [input, init] of fetchImpl.mock.calls) {
