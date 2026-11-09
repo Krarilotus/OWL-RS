@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 fn fixture() -> (StoreService, [u64; 3]) {
     let store = StoreService::new(StoreConfig::in_memory()).unwrap();
-    store
-        .update_str_ungated(
+    let reasoner = nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default());
+    crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner))
+        .execute_update_str(
             "PREFIX : <urn:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
          INSERT DATA { :dp a owl:DatatypeProperty . :a :dp 1 .
          :holder :value <<( :s :p :o )>> . }",
