@@ -34,11 +34,12 @@ fn a_held_count_reads_its_tombstones_within_a_run_of_its_visitor() {
         ..QuadPattern::all()
     });
     let before = witness::get(Site::TombstoneWords);
-    let mut largest = 0;
-    let counted = version.count_plan_visiting(&plan, &mut |units| {
-        largest = largest.max(units);
+    let largest = std::cell::Cell::new(0);
+    let counted = version.count_plan_visiting(&plan, &|units| {
+        largest.set(largest.get().max(units));
         witness::get(Site::TombstoneWords) == before
     });
+    let largest = largest.get();
     let read = witness::get(Site::TombstoneWords) - before;
     assert!(
         read <= interval + 2,

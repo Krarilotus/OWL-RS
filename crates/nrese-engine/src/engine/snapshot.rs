@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
-use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisibility};
+use super::equality::{
+    Classes as EqualityClasses, Credit, Expand, Metering, Unmetered, Visibility as CopyVisibility,
+};
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
@@ -21,6 +23,9 @@ pub use cursor::{ProbeCursor, Seek};
 mod reader_search;
 pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
+
+mod counted;
+pub use counted::CountedSnapshot;
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
@@ -851,6 +856,37 @@ impl Snapshot {
         }
     }
 
+    /// [`Self::expanding`], a build of the classes counted on `meter`: `Err` where it stopped
+    /// (REAS-3, sweep SW012). A canonical snapshot's alias view is made as `expanding` makes
+    /// it: no counted reader reads canonically (REAS-3 design note, residuals).
+    fn expanding_with<M: super::equality::Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Result<Option<Arc<EqualityClasses>>, crate::visit::Stopped> {
+        let default_graph = match pattern.graph {
+            GraphSelector::Any => true,
+            GraphSelector::AnyNamed => false,
+            GraphSelector::Exact(graph) => graph.is_default_graph(),
+        };
+        if model == ReadModel::Asserted || !default_graph {
+            return Ok(None);
+        }
+        let Some(same_as) = self.equality else {
+            return Ok(None);
+        };
+        let classes = match self.canonical {
+            true => self.version.equality.canonical(&self.version, same_as),
+            false => self
+                .version
+                .equality
+                .classes_with(&self.version, same_as, meter)
+                .ok_or(crate::visit::Stopped)?,
+        };
+        Ok((!classes.is_empty()).then_some(classes))
+    }
+
     /// The classes a read of `pattern` in `model` expands: equality is on, some class
     /// exists, the model has inferred statements and the pattern can match the default
     /// graph.
@@ -945,29 +981,32 @@ impl Snapshot {
     /// the stored matches over representatives weighted by how many quads each stands for,
     /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
     /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
-    /// holds (its maximum then; PR #70 fix check 2 F3). `visit(1)` is called before each
-    /// stored position its scans pass, deleted ones included (`QuadScan::next_visiting`;
-    /// REAS-2 fix check r1, R2-F1), and before each copy it expands; `None` as soon as it
-    /// returns false, nothing more read ([`Self::count_in_visiting`]).
-    fn expanded_count(
+    /// holds (its maximum then; PR #70 fix check 2 F3). A counted count ([`Metering`]) counts
+    /// each stored position its scans pass, deleted ones included (REAS-2 fix check r1,
+    /// R2-F1), each copy it expands and each visibility probe; `None` once its meter has
+    /// stopped, nothing more read ([`Self::count_in_visiting`]). [`Self::count_in`]'s is
+    /// unmetered: the plain scans and probes (REAS-3, the master's 01:37 condition (b)).
+    fn expanded_count<M: Metering>(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
         limit: u64,
-        visit: &mut dyn FnMut(u64) -> bool,
+        meter: M,
     ) -> Option<Count> {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
         let mut count: u64 = 0;
+        let mut credit = Credit::default();
         for stack in Stack::ALL {
-            let mut scan = data.stack(stack).scan(&normalised);
+            let mut scan = meter.scan(data.stack(stack), &normalised);
             loop {
                 if count >= limit {
                     return Some(Count::AtLeast(count));
                 }
-                let Some(quad) = scan.next_visiting(visit).ok()? else {
+                // A scan its meter stopped ends: told below.
+                let Some(quad) = scan.next() else {
                     break;
                 };
                 if !quad.graph.is_default_graph() {
@@ -985,19 +1024,27 @@ impl Snapshot {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
                         let (mut copies, wanted) = (0, limit - count);
+                        // The copies to come, a counted count's hint for its runs.
+                        let all = match M::COUNTED {
+                            true => classes.copies(&quad, pattern) as u64,
+                            false => 0,
+                        };
+                        let mut made = 0;
                         let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
-                            if !visit(1) {
+                            if !credit.take(meter, all.saturating_sub(made)) {
                                 stopped = true;
                                 return std::ops::ControlFlow::Break(());
                             }
-                            copies += u64::from(visibility.shows(&copy, touching));
+                            made += 1;
+                            copies += u64::from(visibility.shows_with(&copy, touching, meter));
                             match copies >= wanted {
                                 true => std::ops::ControlFlow::Break(()),
                                 false => std::ops::ControlFlow::Continue(()),
                             }
                         });
-                        if stopped {
+                        // A visibility probe that saw the stop answered for nothing.
+                        if stopped || meter.stopped() {
                             return None;
                         }
                         Some(copies)
@@ -1009,18 +1056,24 @@ impl Snapshot {
                 }
             }
         }
+        if meter.stopped() {
+            return None;
+        }
         if count < limit
             && model == ReadModel::Materialised
             && pattern.graph == GraphSelector::Any
             && normalised != *pattern
             && !self.canonical
         {
-            let mut scan = self.data(model).asserted.scan(pattern);
+            let mut scan = meter.scan(&self.data(model).asserted, pattern);
             while count < limit {
-                let Some(quad) = scan.next_visiting(visit).ok()? else {
+                let Some(quad) = scan.next() else {
                     break;
                 };
                 count += u64::from(!quad.graph.is_default_graph());
+            }
+            if meter.stopped() {
+                return None;
             }
         }
         Some(match count >= limit {
@@ -1273,7 +1326,7 @@ impl Snapshot {
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
     /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
-        self.count_in_visiting(model, pattern, &mut |_| true)
+        self.count_with(model, pattern, Unmetered)
             .expect("never stopped")
     }
 
@@ -1290,10 +1343,53 @@ impl Snapshot {
         pattern: &QuadPattern,
         visit: &mut dyn FnMut(u64) -> bool,
     ) -> Option<Count> {
+        // The counted reads share one visitor among their producers ([`crate::visit`]): this
+        // one, called from one place at a time, is shared through a cell, and latched as the
+        // contract has it: once it says stop it is not asked again, and `visit(0)` (whether
+        // it has stopped) is answered here, never passed on.
+        let visit = std::cell::RefCell::new(visit);
+        let stopped = std::cell::Cell::new(false);
+        self.count_visited(model, pattern, &|n| {
+            if stopped.get() {
+                return false;
+            }
+            if n == 0 {
+                return true;
+            }
+            let go = (visit.borrow_mut())(n);
+            stopped.set(!go);
+            go
+        })
+    }
+
+    /// [`Self::count_in_visiting`] on a counted read's visitor ([`crate::visit`]), the
+    /// equality classes it needs built counted too (REAS-3, sweep SW012).
+    pub(crate) fn count_visited(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: crate::visit::Visitor<'_>,
+    ) -> Option<Count> {
+        self.count_with(model, pattern, visit)
+    }
+
+    /// [`Self::count_in`]'s work on `meter`: unmetered, the plain reads; on a visitor,
+    /// counted.
+    fn count_with<M: Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Option<Count> {
+        // Asked once whatever the count does (a layout that holds nothing of it does no
+        // work): a stopped visitor always gets `None`.
+        if meter.stopped() {
+            return None;
+        }
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
-        if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, u64::MAX, visit);
+        if let Some(classes) = self.expanding_with(model, pattern, meter).ok()? {
+            return self.expanded_count(&classes, model, pattern, u64::MAX, meter);
         }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan, both
@@ -1307,29 +1403,26 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            let every = self.held_count(model, &every, visit)?;
-            let default = self.held_count(model, &default, visit)?;
+            let every = self.held_count(model, &every, meter)?;
+            let default = self.held_count(model, &default, meter)?;
             return Some(Count::Exact(every - default));
         }
-        self.held_count(model, pattern, visit).map(Count::Exact)
+        self.held_count(model, pattern, meter).map(Count::Exact)
     }
 
     /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion,
-    /// each run's work visited (`IndexVersion::count_plan_visiting`).
-    fn held_count(
+    /// each run's work counted on `meter` (`IndexVersion::count_plan_visiting`).
+    fn held_count<M: Metering>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
-        visit: &mut dyn FnMut(u64) -> bool,
+        meter: M,
     ) -> Option<u64> {
         let plan = AccessPlan::for_pattern(pattern);
         let mut sum = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
-                sum += self
-                    .data(model)
-                    .stack(stack)
-                    .count_plan_visiting(&plan, visit)?;
+                sum += meter.count_plan(self.data(model).stack(stack), &plan)?;
             }
         }
         Some(sum)
@@ -1342,7 +1435,7 @@ impl Snapshot {
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self
-                .expanded_count(&classes, model, pattern, 1, &mut |_| true)
+                .expanded_count(&classes, model, pattern, 1, Unmetered)
                 .expect("never stopped")
                 .at_least()
                 > 0;

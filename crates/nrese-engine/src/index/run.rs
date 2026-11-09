@@ -46,7 +46,7 @@ impl PermutationRun {
             return 0;
         }
         let (first, last) = (start / 64, (end - 1) / 64);
-        #[cfg(any(test, feature = "witness"))]
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         crate::witness::add(
             crate::witness::Site::TombstoneWords,
             (last - first + 1) as u64,
@@ -75,7 +75,7 @@ impl PermutationRun {
         &self,
         start: usize,
         end: usize,
-        visit: &mut dyn FnMut(u64) -> bool,
+        visit: crate::visit::Visitor<'_>,
     ) -> Option<u64> {
         if self.tombstones.is_empty() || start >= end {
             return Some(0);
@@ -90,7 +90,7 @@ impl PermutationRun {
             if !visit((upto - at) as u64) {
                 return None;
             }
-            #[cfg(any(test, feature = "witness"))]
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::TombstoneWords, (upto - at) as u64);
             for (i, &word) in self.tombstones[at..upto].iter().enumerate() {
                 let i = at + i;

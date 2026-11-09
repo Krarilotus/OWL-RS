@@ -121,6 +121,11 @@ impl<'a> SignedMerge<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.cursors.iter().map(|c| c.end - c.pos).sum()
     }
+
+    /// The cursors the next step compares: what a step costs ([`crate::visit`]: a unit each).
+    pub(crate) fn active(&self) -> usize {
+        self.cursors.len()
+    }
 }
 
 impl Iterator for SignedMerge<'_> {

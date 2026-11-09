@@ -51,13 +51,16 @@ pub(crate) fn get(site: Site) -> u64 {
 /// asking thread since the ask before (REAS-3: the work a read does in the engine, below the
 /// adapter that counts what it is handed). The largest such gap is what a stop arriving just
 /// after an ask can't see; the invariant bounds it by `POLL_UNITS` plus one run. The work after
-/// the last ask counts too ([`Self::largest`]): a stop could fire there as well.
+/// the last ask counts too ([`Self::largest`]): a stop could fire there as well. Debug builds
+/// only, as the engine's counters are.
+#[cfg(debug_assertions)]
 pub(crate) struct EngineGaps {
     site: nrese_engine::witness::Site,
     last: std::sync::atomic::AtomicU64,
     largest: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(debug_assertions)]
 impl EngineGaps {
     pub(crate) fn new(site: nrese_engine::witness::Site) -> Self {
         Self {

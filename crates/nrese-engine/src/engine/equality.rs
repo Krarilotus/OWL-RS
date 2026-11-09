@@ -49,15 +49,36 @@ impl std::fmt::Debug for EqualityCell {
 impl EqualityCell {
     /// The classes of `version` under `same_as`.
     pub(crate) fn classes(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
+        self.classes_with(version, same_as, Unmetered)
+            .expect("an unmetered build never stops")
+    }
+
+    /// [`Self::classes`], a build's work counted on `meter`; `None` where it stopped, nothing
+    /// kept. Built outside the cell's lock (REAS-3, master 9 Nov 01:37 (d)): a reader that
+    /// finds no classes builds its own, the first build finished is kept and a later one
+    /// takes it, so a reader never waits out another's build unseen by its own stop; under
+    /// contention two builds may run at once (their charges are transient). The rule 3.0c's
+    /// own-state slot follows.
+    pub(crate) fn classes_with<M: Metering>(
+        &self,
+        version: &Version,
+        same_as: TermId,
+        meter: M,
+    ) -> Option<Arc<Classes>> {
+        if let Some((id, classes, _)) = self.0.lock().as_ref()
+            && *id == same_as
+        {
+            return Some(Arc::clone(classes));
+        }
+        let built = Arc::new(Classes::of_with(version, same_as, meter)?);
         let mut cell = self.0.lock();
         if let Some((id, classes, _)) = cell.as_ref()
             && *id == same_as
         {
-            return Arc::clone(classes);
+            return Some(Arc::clone(classes));
         }
-        let classes = Arc::new(Classes::of(version, same_as));
-        *cell = Some((same_as, Arc::clone(&classes), None));
-        classes
+        *cell = Some((same_as, Arc::clone(&built), None));
+        Some(built)
     }
 
     /// A cell already holding `classes` under `same_as`, for a version whose default graph
@@ -342,8 +363,10 @@ pub struct Classes {
 }
 
 impl Classes {
-    /// The classes the `sameAs` statements of `version`'s default graph make.
-    fn of(version: &Version, same_as: TermId) -> Self {
+    /// The classes the `sameAs` statements of `version`'s default graph make, the build's
+    /// work counted on `meter` (each statement its scan passes, each identity it copies);
+    /// `None` where it stopped (REAS-3, sweep SW012).
+    fn of_with<M: Metering>(version: &Version, same_as: TermId, meter: M) -> Option<Self> {
         let pattern = QuadPattern {
             subject: None,
             predicate: Some(same_as),
@@ -353,16 +376,21 @@ impl Classes {
         // The reasoner's union kernel (G7 of the investigation of 6 October 2026).
         let mut union = nrese_exec::classes::Classes::default();
         for stack in Stack::ALL {
-            for quad in version.stack(stack).scan(&pattern) {
+            for quad in meter.scan(version.stack(stack), &pattern) {
                 let (a, b) = (quad.subject.raw(), quad.object.raw());
                 if a != b {
                     union.union(a, b);
                 }
             }
         }
-        let members = union
-            .classes()
-            .map(|(representative, members)| (representative, members.to_vec()));
+        if meter.stopped() {
+            return None;
+        }
+        let mut copied = true;
+        let members = union.classes().map_while(|(representative, members)| {
+            copied = !M::COUNTED || meter.units(members.len() as u64);
+            copied.then(|| (representative, members.to_vec()))
+        });
         let mut classes = Self::default();
         for (_, mut identities) in members {
             if identities.len() < 2 {
@@ -381,7 +409,7 @@ impl Classes {
                 .members
                 .insert(representative, identities.into_boxed_slice());
         }
-        classes
+        copied.then_some(classes)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -577,6 +605,153 @@ impl Values<'_> {
     }
 }
 
+/// How an equality read counts its work ([`crate::visit`]): not at all ([`Unmetered`], what
+/// every uncounted read compiles to, its calls inlined to nothing and its scans the plain
+/// ones), or on a counted read's visitor. Its scans and probes are the index's counted twins
+/// there; once the visitor has stopped they end early and the read is the visitor's to fail
+/// (REAS-3, sweeps SW012–SW015).
+pub(crate) trait Metering: Copy {
+    /// Whether it counts anything (resolved when compiled).
+    const COUNTED: bool;
+    /// Its scans of an index.
+    type Scan<'a>: Iterator<Item = EncodedQuad>
+    where
+        Self: 'a;
+    /// Counts `n` units before they are done: false once stopped.
+    fn units(self, n: u64) -> bool;
+    /// Whether it has stopped, counting nothing.
+    fn stopped(self) -> bool;
+    /// A scan of `index` for `pattern`.
+    fn scan<'a>(
+        self,
+        index: &'a crate::index::IndexVersion,
+        pattern: &QuadPattern,
+    ) -> Self::Scan<'a>
+    where
+        Self: 'a;
+    /// Whether `index` holds `quad`; false once stopped.
+    fn contains(self, index: &crate::index::IndexVersion, quad: &EncodedQuad) -> bool;
+    /// `index`'s held count for `plan`; `None` once stopped.
+    fn count_plan(
+        self,
+        index: &crate::index::IndexVersion,
+        plan: &crate::quad::AccessPlan,
+    ) -> Option<u64>;
+}
+
+/// A meter's count taken a unit at a time and asked for a run at a time: one call of the
+/// visitor per run of at most `POLL_UNITS` units, a decrement per unit (REAS-2's r8 form:
+/// a call per unit cost +0.6 % on replicate, the run form noise). Nothing for an unmetered
+/// read.
+#[derive(Default)]
+pub(crate) struct Credit(u64);
+
+impl Credit {
+    /// Takes one unit, asking `meter` for the next run when none is left: `left` units at
+    /// most (the ones still to come, this one included), and at most `POLL_UNITS`; false
+    /// once the meter has stopped.
+    #[inline]
+    pub(crate) fn take<M: Metering>(&mut self, meter: M, left: u64) -> bool {
+        if !M::COUNTED {
+            return true;
+        }
+        if self.0 == 0 {
+            let run = left.clamp(1, u64::from(nrese_exec::POLL_UNITS));
+            if !meter.units(run) {
+                return false;
+            }
+            self.0 = run;
+        }
+        self.0 -= 1;
+        true
+    }
+}
+
+/// Counting nothing: the plain reads.
+#[derive(Clone, Copy)]
+pub(crate) struct Unmetered;
+
+impl Metering for Unmetered {
+    const COUNTED: bool = false;
+    type Scan<'a> = crate::index::QuadScan<'a>;
+
+    #[inline(always)]
+    fn units(self, _: u64) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn stopped(self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn scan<'a>(
+        self,
+        index: &'a crate::index::IndexVersion,
+        pattern: &QuadPattern,
+    ) -> Self::Scan<'a>
+    where
+        Self: 'a,
+    {
+        index.scan(pattern)
+    }
+
+    #[inline(always)]
+    fn contains(self, index: &crate::index::IndexVersion, quad: &EncodedQuad) -> bool {
+        index.contains(quad)
+    }
+
+    #[inline(always)]
+    fn count_plan(
+        self,
+        index: &crate::index::IndexVersion,
+        plan: &crate::quad::AccessPlan,
+    ) -> Option<u64> {
+        Some(index.count_plan(plan))
+    }
+}
+
+impl<'v> Metering for crate::visit::Visitor<'v> {
+    const COUNTED: bool = true;
+    type Scan<'a>
+        = crate::index::CountedScan<'a, 'v>
+    where
+        Self: 'a;
+
+    #[inline]
+    fn units(self, n: u64) -> bool {
+        crate::visit::units(self, n)
+    }
+
+    fn stopped(self) -> bool {
+        crate::visit::stopped(self)
+    }
+
+    fn scan<'a>(
+        self,
+        index: &'a crate::index::IndexVersion,
+        pattern: &QuadPattern,
+    ) -> Self::Scan<'a>
+    where
+        Self: 'a,
+    {
+        index.scan_counted(pattern, self)
+    }
+
+    fn contains(self, index: &crate::index::IndexVersion, quad: &EncodedQuad) -> bool {
+        index.contains_counted(quad, self).unwrap_or(false)
+    }
+
+    fn count_plan(
+        self,
+        index: &crate::index::IndexVersion,
+        plan: &crate::quad::AccessPlan,
+    ) -> Option<u64> {
+        index.count_plan_visiting(plan, self)
+    }
+}
+
 /// Which copies of a stored default-graph quad a read shows: in the inferred model none
 /// that is asserted; in either model none asserted only in named graphs (a statement
 /// asserted somewhere is never inferred).
@@ -597,9 +772,9 @@ impl<'a> Visibility<'a> {
         }
     }
 
-    fn asserted_anywhere(&self, copy: &EncodedQuad) -> bool {
+    fn asserted_anywhere<M: Metering>(&self, copy: &EncodedQuad, meter: M) -> bool {
         if !self.named_graphs {
-            return self.version.asserted.contains(copy);
+            return meter.contains(&self.version.asserted, copy);
         }
         let pattern = QuadPattern {
             subject: Some(copy.subject),
@@ -607,21 +782,35 @@ impl<'a> Visibility<'a> {
             object: Some(copy.object),
             graph: GraphSelector::Any,
         };
-        self.version.asserted.scan(&pattern).next().is_some()
+        meter
+            .scan(&self.version.asserted, &pattern)
+            .next()
+            .is_some()
     }
 
     /// Whether `copy` (in the default graph), a copy of a stored quad that `touching`
     /// classes or not, is shown.
     pub(crate) fn shows(&self, copy: &EncodedQuad, touching: bool) -> bool {
+        self.shows_with(copy, touching, Unmetered)
+    }
+
+    /// [`Self::shows`], its probes counted on `meter` (REAS-3, sweep SW015): once stopped,
+    /// an answer the stopped read discards.
+    pub(crate) fn shows_with<M: Metering>(
+        &self,
+        copy: &EncodedQuad,
+        touching: bool,
+        meter: M,
+    ) -> bool {
         if self.inferred_only {
-            return !self.asserted_anywhere(copy);
+            return !self.asserted_anywhere(copy, meter);
         }
         // Without classes the stored quad is the only copy: asserted in the default graph,
         // or inferred (never asserted anywhere).
         if !touching || !self.named_graphs {
             return true;
         }
-        self.version.asserted.contains(copy) || !self.asserted_anywhere(copy)
+        meter.contains(&self.version.asserted, copy) || !self.asserted_anywhere(copy, meter)
     }
 
     /// Whether every copy of a stored quad is shown without asking each.
@@ -641,7 +830,11 @@ impl<'a> Visibility<'a> {
 /// heap's growth is charged to the reader's budget before it grows, the old allocation
 /// beside the new while the copies move, and released once freed ([`Reads`]); a growth
 /// the budget refuses ends the scan, the refusal kept for the reader.
-pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
+///
+/// A counted read's expansion ([`Metering`]) counts each copy it makes before it makes it
+/// and each copy it hands on, and its visibility probes; its input is a counted scan. Once
+/// the meter has stopped it hands on nothing more (REAS-3, sweeps SW013, SW014).
+pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>, M: Metering = Unmetered> {
     input: std::iter::Peekable<I>,
     classes: Arc<Classes>,
     pattern: QuadPattern,
@@ -653,6 +846,9 @@ pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
     reads: Option<super::snapshot::ReadBudget>,
     held: usize,
     refused: bool,
+    meter: M,
+    /// The units the meter has counted ahead and not yet used ([`Credit`]).
+    credit: Credit,
 }
 
 impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
@@ -665,7 +861,35 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
         model: ReadModel,
         version: &'a Version,
     ) -> Self {
+        Expand::metered(
+            input,
+            classes,
+            pattern,
+            permutation,
+            named,
+            model,
+            version,
+            Unmetered,
+        )
+    }
+}
+
+impl<'a, I: Iterator<Item = EncodedQuad>, M: Metering> Expand<'a, I, M> {
+    /// [`Expand::new`], its work counted on `meter`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn metered(
+        input: I,
+        classes: Arc<Classes>,
+        pattern: QuadPattern,
+        permutation: Permutation,
+        named: bool,
+        model: ReadModel,
+        version: &'a Version,
+        meter: M,
+    ) -> Self {
         Self {
+            meter,
+            credit: Credit::default(),
             input: input.peekable(),
             classes,
             pattern,
@@ -744,26 +968,35 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
         if !self.classes.is_canonical(&raw) {
             return true;
         }
-        if !self.room(self.classes.copies(&raw, &self.pattern)) {
+        let copies = self.classes.copies(&raw, &self.pattern);
+        if !self.room(copies) {
             return self.refuse();
         }
-        let (permutation, visibility) = (self.permutation, self.visibility);
+        let (permutation, visibility, meter) = (self.permutation, self.visibility, self.meter);
         let touching = self.classes.touches(&raw);
         let all = visibility.shows_all(touching);
-        let pending = &mut self.pending;
+        let (pending, credit) = (&mut self.pending, &mut self.credit);
+        let mut stopped = false;
+        let mut left = copies as u64;
         self.classes.expand(&raw, &self.pattern, &mut |quad| {
-            #[cfg(any(test, feature = "witness"))]
+            // Each copy a unit, counted a run at a time before it is made (SW013).
+            if !credit.take(meter, left) {
+                stopped = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            left = left.saturating_sub(1);
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::ExpandCopies, 1);
-            if all || visibility.shows(&quad, touching) {
+            if all || visibility.shows_with(&quad, touching, meter) {
                 pending.push(Reverse(permutation.to_key(&quad)));
             }
             std::ops::ControlFlow::Continue(())
         });
-        true
+        !(M::COUNTED && stopped)
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>> Expand<'_, I> {
+impl<I: Iterator<Item = EncodedQuad>, M: Metering> Expand<'_, I, M> {
     /// Ends the scan after a refused growth: nothing more is given (the refusal is the
     /// reader's to see), the heap freed before its charge is released.
     fn refuse(&mut self) -> bool {
@@ -776,7 +1009,7 @@ impl<I: Iterator<Item = EncodedQuad>> Expand<'_, I> {
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>> Drop for Expand<'_, I> {
+impl<I: Iterator<Item = EncodedQuad>, M: Metering> Drop for Expand<'_, I, M> {
     /// The heap freed, then its charge released.
     fn drop(&mut self) {
         self.pending = BinaryHeap::new();
@@ -786,7 +1019,7 @@ impl<I: Iterator<Item = EncodedQuad>> Drop for Expand<'_, I> {
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, I> {
+impl<I: Iterator<Item = EncodedQuad>, M: Metering> Iterator for Expand<'_, I, M> {
     type Item = EncodedQuad;
 
     fn next(&mut self) -> Option<EncodedQuad> {
@@ -794,6 +1027,12 @@ impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, I> {
             return None;
         }
         loop {
+            // A counted read's step, a copy handed on or an input quad pulled: a unit, and
+            // the end once its meter has stopped (the heap's rest is never walked).
+            let left = self.pending.len() as u64 + 1;
+            if !self.credit.take(self.meter, left) {
+                return None;
+            }
             // What the heap holds may go out once no later input can sort before it.
             if let Some(Reverse(first)) = self.pending.peek() {
                 let (pattern, permutation) = (&self.pattern, self.permutation);

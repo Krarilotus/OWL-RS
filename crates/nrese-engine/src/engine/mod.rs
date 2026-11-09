@@ -62,8 +62,8 @@ pub use equality::Classes as EqualityClasses;
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
-    SharedState, Snapshot, SnapshotIdentity, TextScope,
+    Count, CountedSnapshot, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused,
+    Seek, SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 

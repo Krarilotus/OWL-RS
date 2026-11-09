@@ -270,9 +270,146 @@ impl IndexVersion {
 
     /// True if `quad` is visible. O(r log n).
     pub(crate) fn contains(&self, quad: &EncodedQuad) -> bool {
-        #[cfg(any(test, feature = "witness"))]
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         crate::witness::add(crate::witness::Site::RunProbes, self.runs.len() as u64);
         self.runs.iter().map(|run| run.sign_of(quad)).sum::<i64>() > 0
+    }
+
+    /// [`Self::contains`], each run it probes a unit on `visit`, counted a run of at most
+    /// `POLL_UNITS` runs before they are probed ([`crate::visit`]; REAS-3, sweep SW009).
+    pub(crate) fn contains_counted(
+        &self,
+        quad: &EncodedQuad,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        // Asked at least once: a stopped visitor gets `Err` however few the runs.
+        if self.runs.is_empty() && crate::visit::stopped(visit) {
+            return Err(Stopped);
+        }
+        let mut sign = 0;
+        for runs in self.runs.chunks(nrese_exec::POLL_UNITS as usize) {
+            if !visit(runs.len() as u64) {
+                return Err(Stopped);
+            }
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, runs.len() as u64);
+            sign += runs.iter().map(|run| run.sign_of(quad)).sum::<i64>();
+        }
+        Ok(sign > 0)
+    }
+
+    /// [`Self::any_plan`], each run it searches a unit on `visit` and, where it counts, the
+    /// count's work ([`Self::count_plan_visiting`]) (REAS-3, sweep SW010).
+    pub(crate) fn any_plan_counted(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        // Asked at least once: a stopped visitor gets `Err` however little there is to read.
+        let Some(adapted) = self.layout.adapt(plan).filter(|_| !self.runs.is_empty()) else {
+            return match crate::visit::stopped(visit) {
+                true => Err(Stopped),
+                false => Ok(false),
+            };
+        };
+        let has_tombstones = self
+            .runs
+            .iter()
+            .any(|run| !run.permutation(adapted.permutation).tombstones.is_empty());
+        if adapted.exclude_default_graph || has_tombstones {
+            let count = self.count_plan_visiting(plan, visit);
+            return count.map(|count| count > 0).ok_or(Stopped);
+        }
+        for runs in self.runs.chunks(nrese_exec::POLL_UNITS as usize) {
+            if !visit(runs.len() as u64) {
+                return Err(Stopped);
+            }
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, runs.len() as u64);
+            let found = runs.iter().any(|run| {
+                let keys = &run.permutation(adapted.permutation).keys;
+                let start = keys.bound_in(0, keys.len(), &adapted.low, false);
+                start < keys.len() && keys.get(start) <= adapted.high
+            });
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Self::scan_plan`], each run's range search a unit on `visit` as the scan is made, a
+    /// run of at most `POLL_UNITS` runs at a time (REAS-3, sweep SW006); its steps are counted
+    /// by [`QuadScan::next_counted`] or [`CountedScan`], whose first step asks the visitor
+    /// where there was no run to search.
+    pub(crate) fn scan_plan_counted(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'_>,
+    ) -> Result<QuadScan<'_>, Stopped> {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return Ok(QuadScan {
+                merge: SignedMerge::new(std::iter::empty()),
+                permutation: plan.permutation,
+                exclude_default_graph: false,
+            });
+        };
+        // The ranges handed to the merge as they are searched, no list of them first (the
+        // plain scan's shape: a list per scan cost the counted reads about 2.7 % on the support
+        // update, p2-reas3-cnt4); each chunk of at most POLL_UNITS runs counted before it.
+        let run = nrese_exec::POLL_UNITS as usize;
+        let total = self.runs.len();
+        let mut stopped = false;
+        let parts = self.runs.iter().enumerate().map_while(|(i, perm_run)| {
+            if i % run == 0 {
+                let chunk = run.min(total - i) as u64;
+                if !visit(chunk) {
+                    stopped = true;
+                    return None;
+                }
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::RunProbes, chunk);
+            }
+            let perm = perm_run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            Some((perm, start, end))
+        });
+        let merge = SignedMerge::new(parts);
+        if stopped {
+            return Err(Stopped);
+        }
+        Ok(QuadScan {
+            merge,
+            permutation: adapted.permutation,
+            exclude_default_graph: adapted.exclude_default_graph,
+        })
+    }
+
+    /// [`Self::scan`] for a counted read: made and stepped counted on `visit`
+    /// ([`Self::scan_plan_counted`], [`QuadScan::next_counted`]), ending at once where `visit`
+    /// had stopped (the stop is the visitor's to tell).
+    pub(crate) fn scan_counted<'v>(
+        &self,
+        pattern: &QuadPattern,
+        visit: Visitor<'v>,
+    ) -> CountedScan<'_, 'v> {
+        self.scan_plan_iter_counted(&AccessPlan::for_pattern(pattern), visit)
+    }
+
+    /// [`Self::scan_counted`] for a plan.
+    pub(crate) fn scan_plan_iter_counted<'v>(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'v>,
+    ) -> CountedScan<'_, 'v> {
+        let scan = self
+            .scan_plan_counted(plan, visit)
+            .unwrap_or_else(|Stopped| QuadScan {
+                merge: SignedMerge::new(std::iter::empty()),
+                permutation: plan.permutation,
+                exclude_default_graph: false,
+            });
+        scan.counted(visit)
     }
 
     /// All visible quads matching `pattern`, in the order of the chosen permutation.
@@ -303,27 +440,24 @@ impl IndexVersion {
     /// − 2 × tombstones in range): O(r log n) for tombstone-free runs, plus a popcount over
     /// the range otherwise. Plans with a default-graph post-filter count by scanning.
     pub(crate) fn count_plan(&self, plan: &AccessPlan) -> u64 {
-        self.count_plan_visiting(plan, &mut |_| true)
+        self.count_plan_visiting(plan, &|_| true)
             .expect("never stopped")
     }
 
     /// [`Self::count_plan`], calling `visit(n)` (`n` at most `POLL_UNITS`) before the work it
     /// counts: each run's range search (one), its tombstone words as they are read
     /// (`PermutationRun::tombstones_in_visiting`), each merge step a default-graph
-    /// post-filter scan takes ([`QuadScan::next_visiting`]). `None` as soon as `visit` returns
-    /// false, nothing more read (REAS-2 fix check r1, R2-F1: the count lives in the reader).
-    pub(crate) fn count_plan_visiting(
-        &self,
-        plan: &AccessPlan,
-        visit: &mut dyn FnMut(u64) -> bool,
-    ) -> Option<u64> {
+    /// post-filter scan takes, a unit per cursor it compares ([`QuadScan::next_counted`]).
+    /// `None` as soon as `visit` returns false, nothing more read (REAS-2 fix check r1,
+    /// R2-F1: the count lives in the reader).
+    pub(crate) fn count_plan_visiting(&self, plan: &AccessPlan, visit: Visitor<'_>) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
             return Some(0);
         };
         if adapted.exclude_default_graph {
             let mut count = 0u64;
-            let mut scan = self.scan_plan(plan);
-            while scan.next_visiting(visit).ok()?.is_some() {
+            let mut scan = self.scan_plan_counted(plan, visit).ok()?;
+            while scan.next_counted(visit).ok()?.is_some() {
                 count += 1;
             }
             return Some(count);
@@ -546,7 +680,7 @@ impl IndexVersion {
             };
         };
         let parts = self.runs.iter().map(|run| {
-            #[cfg(any(test, feature = "witness"))]
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::RunProbes, 1);
             let perm = run.permutation(plan.permutation);
             let (start, end) = perm.range(&plan.low, &plan.high);
@@ -697,7 +831,7 @@ impl Iterator for QuadScan<'_> {
     fn next(&mut self) -> Option<EncodedQuad> {
         loop {
             let (key, sign) = self.merge.next()?;
-            #[cfg(any(test, feature = "witness"))]
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
@@ -715,29 +849,28 @@ impl Iterator for QuadScan<'_> {
     }
 }
 
-/// A read its visitor stopped ([`QuadScan::next_visiting`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Stopped;
+pub(crate) use crate::visit::{Stopped, Visitor};
 
 impl QuadScan<'_> {
-    /// [`Iterator::next`], calling `visit(1)` before each merge step, a key passed over
-    /// (deleted, or in the default graph where it is left out) as much as one handed on
-    /// (REAS-2 fix check r1, R2-F1: a count's work is every position its scan passes, so
-    /// a long deleted run can't be drained unseen). `Err` once `visit` returns false,
-    /// nothing more read. Readers that count nothing use `next`, which this leaves as it was.
+    /// [`Iterator::next`], each merge step's work a unit per cursor it compares on `visit`
+    /// before it is taken, keys passed over (deleted, or in the default graph where it is
+    /// left out) as much as the one handed on (REAS-2 fix check r1, R2-F1: a long deleted run
+    /// can't be drained unseen; REAS-3, sweeps SW005, SW007: a step's cost is its cursors).
+    /// Counts and counted reads alike. `Err` once `visit` has stopped, nothing more read.
+    /// Readers that count nothing use `next`, which this leaves as it was.
     #[inline]
-    pub(crate) fn next_visiting(
+    pub(crate) fn next_counted(
         &mut self,
-        visit: &mut dyn FnMut(u64) -> bool,
+        visit: Visitor<'_>,
     ) -> Result<Option<EncodedQuad>, Stopped> {
         loop {
-            if !visit(1) {
+            if !crate::visit::units(visit, self.merge.active().max(1) as u64) {
                 return Err(Stopped);
             }
             let Some((key, sign)) = self.merge.next() else {
                 return Ok(None);
             };
-            #[cfg(any(test, feature = "witness"))]
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
@@ -747,6 +880,61 @@ impl QuadScan<'_> {
                 continue;
             }
             return Ok(Some(quad));
+        }
+    }
+}
+
+impl<'a> QuadScan<'a> {
+    /// This scan as an iterator for a counted read: [`Self::next_counted`]'s quads, ending
+    /// where it ends or stops (the stop is the visitor's to tell: `visit(0)`).
+    pub(crate) fn counted<'v>(self, visit: Visitor<'v>) -> CountedScan<'a, 'v> {
+        CountedScan {
+            scan: self,
+            visit,
+            credit: 0,
+        }
+    }
+}
+
+/// [`QuadScan::counted`]: [`QuadScan::next_counted`]'s count taken from a credit, the
+/// visitor asked once per run of at most `POLL_UNITS` units (as many as the scan's ranges
+/// hold at most), not once per step.
+pub(crate) struct CountedScan<'a, 'v> {
+    scan: QuadScan<'a>,
+    visit: Visitor<'v>,
+    /// Units counted ahead and not yet used.
+    credit: u64,
+}
+
+impl Iterator for CountedScan<'_, '_> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        loop {
+            let cost = self.scan.merge.active().max(1) as u64;
+            if self.credit < cost {
+                // A run ahead: what the ranges can still take, at most POLL_UNITS, at least
+                // this step (a step over more cursors than that is counted in runs whole).
+                let left = (self.scan.merge.remaining() as u64).saturating_mul(cost);
+                let run = left.min(u64::from(nrese_exec::POLL_UNITS)).max(cost);
+                if !crate::visit::units(self.visit, run) {
+                    return None;
+                }
+                self.credit += run;
+            }
+            self.credit -= cost;
+            let (key, sign) = self.scan.merge.next()?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
+            if sign <= 0 {
+                continue;
+            }
+            let quad = self.scan.permutation.key_to_quad(&key);
+            if self.scan.exclude_default_graph && quad.graph.is_default_graph() {
+                continue;
+            }
+            return Some(quad);
         }
     }
 }
