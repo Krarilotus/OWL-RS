@@ -1095,3 +1095,133 @@ fn a_vector_search_of_an_absent_dimension_builds_no_corpus() {
         .map(|(hits, report)| (hits.len(), report.space, report.scanned));
     assert_eq!(found.ok(), Some((0, 0, 0)));
 }
+
+/// A statement about a non-IRI identity of a class (`_:b owl:sameAs ex:needle`, or
+/// `"needle" owl:sameAs ex:needle`) shows its IRI identities as subjects to a reader of
+/// equality classes: inserting `_:b ex:p ex:o` into `ex:g` puts `ex:needle` in the IRI
+/// corpus of `ex:g`, deleting it takes `ex:needle` out (3.2 sol-loop r1 R1-S1: the touched
+/// terms left non-IRI subjects out before the class expansion, so the derived corpus missed
+/// the change). Both derivations: a writer's pending state over the base's kept corpus, and
+/// a commit's lineage step. Expanded and canonical readers, the identities interned in
+/// either order. Each IRI search equals an independent engine's holding the same statements
+/// (walked), and the corpus is derived.
+#[test]
+fn a_statement_about_a_non_iri_identity_changes_its_class_in_the_iri_corpus() {
+    use nrese_rdf::BlankNode;
+    let ex = |s: &str| NamedNode::new_unchecked(format!("http://example.com/{s}"));
+    // An engine with the class of `other` and `ex:needle` (inferred, `ex:needle` interned
+    // first where `needle_first`), `ex:filler ex:p ex:o` in `ex:g`, and `other ex:p ex:o`
+    // there where `with_held`; that statement and the scope of `ex:g`.
+    let setup = |other: &Term, needle_first: bool, with_held: bool| {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        engine.set_corpus_tuning(nrese_engine::CorpusTuning {
+            documents_per_probe: 1,
+            ..nrese_engine::CorpusTuning::DEFAULT
+        });
+        let mut tx = engine.transaction();
+        let needle: Term = ex("needle").into();
+        let (first, second) = match needle_first {
+            true => (&needle, other),
+            false => (other, &needle),
+        };
+        let (first, second) = (tx.intern(first.as_ref()), tx.intern(second.as_ref()));
+        // Stored as the reasoner stores a class: `identity sameAs representative`, the
+        // representative its smallest id.
+        let (rep, alias) = (first.min(second), first.max(second));
+        let same_as = tx.intern(
+            NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+                .as_ref()
+                .into(),
+        );
+        assert!(tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        }));
+        let held = EncodedQuad {
+            subject: tx.intern(other.as_ref()),
+            predicate: tx.intern(ex("p").as_ref().into()),
+            object: tx.intern(ex("o").as_ref().into()),
+            graph: tx.intern(ex("g").as_ref().into()),
+        };
+        assert!(tx.insert(Quad::new(ex("filler"), ex("p"), ex("o"), ex("g")).as_ref()));
+        if with_held {
+            assert!(tx.insert_encoded(held));
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let scope = TextScope::Graphs(GraphSelector::Exact(held.graph));
+        (engine, held, scope)
+    };
+    let read = |snapshot: &Snapshot, canonical: bool| match canonical {
+        true => snapshot.with_canonical_equality(),
+        false => snapshot.clone(),
+    };
+    let found = |snapshot: &Snapshot, scope: &TextScope| -> Vec<(String, f64)> {
+        let found = snapshot
+            .iri_search_in(MODEL, scope, &query("needle filler"), None)
+            .unwrap();
+        let mut found: Vec<_> = found
+            .iter()
+            .map(|m| match snapshot.decode(TermId::from_raw(m.id)) {
+                Some(Term::NamedNode(n)) => (n.as_str().to_owned(), m.relevance),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    };
+    let others: [(&str, Term); 2] = [
+        ("blank node", BlankNode::new_unchecked("b").into()),
+        ("literal", Literal::new_simple_literal("needle").into()),
+    ];
+    let mut failed = Vec::new();
+    for (other_name, other) in &others {
+        for needle_first in [true, false] {
+            for canonical in [false, true] {
+                for insert in [true, false] {
+                    let (truth, _, truth_scope) = setup(other, needle_first, insert);
+                    let want = found(&read(&truth.snapshot(), canonical), &truth_scope);
+                    for pending in [true, false] {
+                        let case = format!(
+                            "{other_name}, needle first {needle_first}, canonical {canonical}, \
+                             insert {insert}, pending {pending}"
+                        );
+                        let (engine, held, scope) = setup(other, needle_first, !insert);
+                        let published = engine.snapshot();
+                        found(&read(&published, canonical), &scope);
+                        let (walked, derived) = built(&published);
+                        let mut tx = engine.transaction();
+                        match insert {
+                            true => assert!(tx.insert_encoded(held)),
+                            false => assert!(tx.remove_encoded(held)),
+                        }
+                        let got = match pending {
+                            true => found(&read(&tx.pending_snapshot(), canonical), &scope),
+                            false => {
+                                tx.commit().unwrap();
+                                found(&read(&engine.snapshot(), canonical), &scope)
+                            }
+                        };
+                        if got != want {
+                            failed.push(format!("{case}: {got:?} != {want:?}"));
+                        }
+                        let (walked_after, derived_after) = built(&published);
+                        if walked_after != walked || derived_after <= derived {
+                            failed.push(format!(
+                                "{case}: walked {walked} -> {walked_after}, \
+                                 derived {derived} -> {derived_after}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} rows failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
