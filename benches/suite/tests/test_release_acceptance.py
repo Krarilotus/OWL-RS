@@ -21,8 +21,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import isolation
@@ -565,6 +567,79 @@ class AttemptRecords(Scratch):
         (out / "w3c.json").write_text(json.dumps(w3c), encoding="utf-8")
         done = verdict_on(self.repo.path, a, self.tmp, rounds(a), out / "w3c.json", out / "guards.json")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_overlapping_attempts_never_hide_the_newest_behind_a_reused_sequence(self):
+        # Spec: fix check r3, R2 (check_ordering.py): attempt A scans the records, is descheduled before
+        # it records itself; B and then C record theirs, C's result is published; A resumes and records
+        # its own. A's step never published. The verdict must refuse C's result: A's attempt is the newest.
+        # Today A takes the sequence B already holds, C's stays highest, and the verdict passes, exit 0.
+        a = self.repo.commit()
+        tree = self.repo.tree(a)
+        where = self.tmp / "ordering"
+        where.mkdir()
+        w3c_attempt = self.attempt("w3c", where)
+        self.attempt("guards", where)
+        scanned, resume, delayed = threading.Event(), threading.Event(), {}
+        real = gate_module.attempt_records
+
+        def scan(*args):
+            found = real(*args)
+            if threading.current_thread().name == "delayed":
+                scanned.set()
+                resume.wait(60)
+            return found
+
+        def allocate():
+            try:
+                delayed["attempt"] = gate_module.attempt_record("guards", where)
+            except BaseException as error:  # the test's thread reports, never swallows
+                delayed["error"] = repr(error)
+        launched = os.getcwd()
+        os.chdir(self.repo.path)  # the allocator names the tree of the checkout it runs in
+        try:
+            with patch.object(gate_module, "attempt_records", scan):
+                worker = threading.Thread(target=allocate, name="delayed")
+                worker.start()
+                try:
+                    self.assertTrue(scanned.wait(60), "A never reached its scan")
+                    self.attempt("guards", where)
+                    third = self.attempt("guards", where)
+                finally:
+                    resume.set()
+                    worker.join(60)
+        finally:
+            os.chdir(launched)
+        self.assertNotIn("error", delayed)
+        w3c, guards = checks(a, tree)
+        with_attempt(w3c, w3c_attempt)
+        with_attempt(guards, third)
+        done = verdict_on(self.repo.path, a, where, rounds(a), w3c, guards)
+        self.assertEqual(done.returncode, 1, f"SPEC A's attempt is the newest\n{done.stdout}")
+        self.assertIn("guards:", done.stdout)
+
+    def test_an_ambiguous_attempt_history_is_refused_at_any_position(self):
+        # Spec: fix check r3 (the 1, 1, 2 fixture): two records of sequence 1 under a third: the history
+        # doesn't order its attempts, so no result of it passes. Today only a doubled highest sequence
+        # is refused; 1, 1, 2 passes, exit 0. Guard (no red on the code before, which reads no other
+        # names): a name the verdict can't read, below the newest.
+        a = self.repo.commit()
+        tree = self.repo.tree(a)
+        ids = ["1" * 32, "2" * 32, "3" * 32]
+        for name, files in (("1, 1, 2", [f"guards.attempt.000000001-{ids[0]}.json",
+                                         f"guards.attempt.000000001-{ids[1]}.json",
+                                         f"guards.attempt.000000002-{ids[2]}.json"]),):
+            with self.subTest(name):
+                where = self.tmp / f"history-{name.replace(', ', '-')}"
+                where.mkdir()
+                w3c_attempt = self.attempt("w3c", where)
+                for file, attempt in zip(files, ids):
+                    (where / file).write_text(json.dumps(attempt_record("guards", attempt, tree)), encoding="utf-8")
+                w3c, guards = checks(a, tree)
+                with_attempt(w3c, w3c_attempt)
+                with_attempt(guards, ids[-1])
+                done = verdict_on(self.repo.path, a, where, rounds(a), w3c, guards)
+                self.assertEqual(done.returncode, 1, f"SPEC {name}: an ambiguous history\n{done.stdout}")
+                self.assertIn("guards: its attempt history is ambiguous", done.stdout)
 
     def test_a_result_of_another_attempt_or_none_is_refused(self):
         # Spec: the orchestrator's design, items 3 and 5, and 13:17: the result's own record, then a newer
