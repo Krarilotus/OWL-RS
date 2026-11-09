@@ -492,6 +492,12 @@ impl Quarantine {
     /// Records `resolution`: appended to the log, then in effect.
     fn record(&self, resolution: Resolution) -> StoreResult<()> {
         if let Some(dir) = &self.dir {
+            #[cfg(test)]
+            if tests::FAIL_RESOLUTION_APPEND.get() {
+                return Err(
+                    std::io::Error::other("the resolution's append failed (a test's)").into(),
+                );
+            }
             // Durably named, the directory and the log (DUR-3): the quarantine reads them at
             // open. The directory is synced after every append, not only when the log is made: a
             // log made by a call whose sync then failed is in place but not known durable, and
@@ -690,6 +696,8 @@ pub fn readmit(
         MutationCommitReport::Applied { revision } => revision,
         other => unreachable!("statements produced {other:?}"),
     };
+    #[cfg(test)]
+    tests::stop_at(tests::Stop::AfterCommit);
     let resolution = Resolution {
         id: id.to_owned(),
         outcome: Outcome::Readmitted { revision },
@@ -949,6 +957,351 @@ mod tests {
         /// The quarantine directory's sync after a resolution's append fails.
         pub(super) static FAIL_LOG_DIR_SYNC: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// A resolution's append fails before it writes anything.
+        pub(super) static FAIL_RESOLUTION_APPEND: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// The process stops (exits with [`STOPPED`], nothing unwound) at this point of a
+        /// readmission.
+        static STOP_AT: std::cell::Cell<Option<Stop>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Where a readmission can be stopped as by a crash.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Stop {
+        /// The readmission's commit has returned; its resolution is in whatever state the
+        /// readmission left it.
+        AfterCommit,
+        /// The readmission's resolution is durable, and its commit's record not yet written.
+        InNote,
+    }
+
+    /// The exit status of a process stopped at a [`Stop`].
+    const STOPPED: i32 = 86;
+
+    pub(super) fn stop_at(point: Stop) {
+        if STOP_AT.get() == Some(point) {
+            std::process::exit(STOPPED);
+        }
+    }
+
+    const P: &str = "<http://example.com/p>";
+    const O: &str = "<http://example.com/o>";
+
+    /// An on-disk store in `dir` whose quarantine holds two statements from one Turtle load:
+    /// one with a blank node, one without. Returns their ids, the blank node's first.
+    fn quarantined(store_dir: &Path, dir: &Path) -> [String; 2] {
+        let file = dir.join("bad.ttl");
+        fs::write(
+            &file,
+            "@prefix : <http://example.com/> .\n_:b :p :o :extra .\n<http://example.com/x> :p :q :extra .\n",
+        )
+        .unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(store_dir)).unwrap();
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let items = store
+            .quarantine()
+            .list(&QuarantineFilter::default())
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        let blank =
+            |item: &QuarantineItem| item.statement.text.as_deref().unwrap().starts_with("_:");
+        let first = items.iter().find(|item| blank(item)).unwrap();
+        let second = items.iter().find(|item| !blank(item)).unwrap();
+        [first.statement.id.clone(), second.statement.id.clone()]
+    }
+
+    /// Re-admits `id` as `_:b :p :o`, with fresh blank nodes: every admission writes a new one.
+    fn readmit_fresh(store: &crate::StoreService, id: &str) -> Result<Resolution, MutationError> {
+        let pipeline = crate::MutationPipeline::new(
+            std::sync::Arc::new(store.clone()),
+            std::sync::Arc::new(nrese_reasoner::ReasonerService::new(
+                nrese_reasoner::ReasonerConfig::default(),
+            )),
+        );
+        super::readmit(
+            &pipeline,
+            &crate::Requester::all(),
+            &MutationTicket::new(),
+            id,
+            &Readmission {
+                text: Some(format!("_:b {P} {O} .")),
+                fresh_blank_nodes: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// How many `?b :p :o` the data holds: the readmitted statement's copies.
+    fn copies(store: &crate::StoreService) -> u64 {
+        let result = store
+            .execute_query_str(&format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?b {P} {O} }}"))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+        json["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    const CHILD: &str = "NRESE_Q06_STOP_CHILD";
+
+    /// The child's part of [`a_readmission_stopped_as_by_a_crash_is_admitted_once`]: readmits
+    /// the statement and stops at the point its environment names.
+    fn readmit_and_stop(spec: &str) {
+        let mut parts = spec.split('\t');
+        let (point, store_dir, id) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        STOP_AT.set(Some(match point {
+            "after-commit" => Stop::AfterCommit,
+            "in-note" => Stop::InNote,
+            other => panic!("no stop point {other}"),
+        }));
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(store_dir)).unwrap();
+        // Where the point isn't reached, the readmission completes and the child passes.
+        readmit_fresh(&store, id).unwrap();
+    }
+
+    /// A readmission whose process stops at any point is admitted once: after the restart the
+    /// statement is either resolved with its data in, or open with its data out, and a
+    /// re-admission of an open one makes exactly one copy (`Readmission::fresh_blank_nodes`;
+    /// docs/design/quarantine.md). The child process (this test binary again) readmits `_:b :p
+    /// :o` with fresh blank nodes and exits, unwinding nothing, at the point; the parent
+    /// reopens, readmits it if it is open, and counts. Before the fix the resolution was
+    /// appended after the commit: stopped between them, the statement reopened open with its
+    /// data in, and the re-admission made a second copy. Row `in-note` is a guard on trees
+    /// without that point (the child completes, nothing stops).
+    #[test]
+    fn a_readmission_stopped_as_by_a_crash_is_admitted_once() {
+        if let Ok(spec) = std::env::var(CHILD) {
+            readmit_and_stop(&spec);
+            return;
+        }
+        let mut wrong = Vec::new();
+        for point in ["after-commit", "in-note"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store_dir = dir.path().join("store");
+            let [id, _] = quarantined(&store_dir, dir.path());
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "quarantine::tests::a_readmission_stopped_as_by_a_crash_is_admitted_once",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, format!("{point}\t{}\t{id}", store_dir.display()))
+                .status()
+                .unwrap();
+            let stopped = status.code() == Some(STOPPED);
+            if !stopped && !status.success() {
+                wrong.push(format!("row {point}: the child failed: {status}"));
+                continue;
+            }
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            let open = store
+                .quarantine()
+                .get(&id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_none();
+            let before = copies(&store);
+            if open && let Err(error) = readmit_fresh(&store, &id) {
+                wrong.push(format!("row {point}: the re-admission: {error}"));
+            }
+            let after = copies(&store);
+            eprintln!(
+                "row {point}: stopped {stopped}, reopened open {open} with {before} copies, \
+                 {after} after"
+            );
+            if after != 1 {
+                wrong.push(format!(
+                    "row {point}: {after} copies of the statement, not 1"
+                ));
+            }
+            if store
+                .quarantine()
+                .get(&id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_none()
+            {
+                wrong.push(format!("row {point}: still open at the end"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A readmission whose resolution can't be recorded doesn't stay committed: retried once
+    /// the fault is gone, the statement has exactly one copy. Rows: the append fails before it
+    /// writes; the quarantine directory's sync after it fails. Before the fix the commit came
+    /// first: the error left the statement open with its data in, and the retry made a second
+    /// copy.
+    #[test]
+    fn a_readmission_whose_resolution_fails_is_not_committed_twice() {
+        let rows: [(&str, &'static std::thread::LocalKey<std::cell::Cell<bool>>); 2] = [
+            ("the append fails", &FAIL_RESOLUTION_APPEND),
+            ("the directory sync fails", &FAIL_LOG_DIR_SYNC),
+        ];
+        let mut wrong = Vec::new();
+        for (row, fault) in rows {
+            let dir = tempfile::tempdir().unwrap();
+            let store_dir = dir.path().join("store");
+            let [id, _] = quarantined(&store_dir, dir.path());
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            fault.set(true);
+            let first = readmit_fresh(&store, &id);
+            fault.set(false);
+            if first.is_ok() {
+                wrong.push(format!(
+                    "row {row}: acknowledged though its resolution failed"
+                ));
+            }
+            let retried = readmit_fresh(&store, &id);
+            let copies = copies(&store);
+            eprintln!(
+                "row {row}: first ok {}, retry {retried:?}, {copies} copies",
+                first.is_ok()
+            );
+            if retried.is_err() {
+                wrong.push(format!("row {row}: the retry failed: {retried:?}"));
+            }
+            if copies != 1 {
+                wrong.push(format!(
+                    "row {row}: {copies} copies of the statement, not 1"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The resolutions log's line for `resolution`.
+    fn line(resolution: &Resolution) -> String {
+        format!("{}\n", serde_json::to_string(resolution).unwrap())
+    }
+
+    /// A readmission is in effect only where its revision is in the data (§ invariant D of the
+    /// Q06 remainder design): one logged for a revision the store doesn't hold (its commit lost
+    /// to a power loss under `OsBuffered`, or an older image under this quarantine) is open
+    /// again after a start, and stays open once later commits pass that revision. A discard
+    /// after it is kept. Before the fix the store listed it readmitted, its data never in.
+    #[test]
+    fn a_readmission_beyond_the_stores_revision_is_open_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let [readmitted, discarded] = quarantined(&store_dir, dir.path());
+        let revision = {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            store.engine().snapshot().revision()
+        };
+        let log = store_dir.join(DIR).join(RESOLUTIONS);
+        let mut text = fs::read_to_string(&log).unwrap_or_default();
+        text.push_str(&line(&Resolution {
+            id: readmitted.clone(),
+            outcome: Outcome::Readmitted {
+                revision: revision + 3,
+            },
+            at: 0,
+            repairs: Vec::new(),
+            text: None,
+            note: None,
+        }));
+        text.push_str(&line(&Resolution {
+            id: discarded.clone(),
+            outcome: Outcome::Discarded,
+            at: 0,
+            repairs: Vec::new(),
+            text: None,
+            note: None,
+        }));
+        fs::write(&log, text).unwrap();
+        let mut wrong = Vec::new();
+        let check = |store: &crate::StoreService, when: &str, wrong: &mut Vec<String>| {
+            let readmission = store.quarantine().get(&readmitted).unwrap().unwrap();
+            let discard = store.quarantine().get(&discarded).unwrap().unwrap();
+            eprintln!(
+                "{when}: readmission {:?}, discard {:?}",
+                readmission.resolution, discard.resolution
+            );
+            if readmission.resolution.is_some() {
+                wrong.push(format!(
+                    "{when}: listed readmitted, its revision not in the data"
+                ));
+            }
+            if discard.resolution.is_none() {
+                wrong.push(format!("{when}: the discard after it was lost"));
+            }
+        };
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        check(&store, "after a start", &mut wrong);
+        let pipeline = crate::MutationPipeline::new(
+            std::sync::Arc::new(store.clone()),
+            std::sync::Arc::new(nrese_reasoner::ReasonerService::new(
+                nrese_reasoner::ReasonerConfig::default(),
+            )),
+        );
+        for n in 0..4 {
+            pipeline
+                .execute_update_str(&format!(
+                    "INSERT DATA {{ <http://example.com/n{n}> {P} {O} }}"
+                ))
+                .unwrap();
+        }
+        drop(pipeline);
+        if store.engine().snapshot().revision() < revision + 3 {
+            wrong.push("the commits didn't pass the logged revision".to_owned());
+        }
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        check(&store, "after commits past it and a restart", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A complete last resolution followed only by zero bytes is kept (D16-322, Q06 r1 F2): a
+    /// crash after the newline repair's write but before its sync can leave `{record}\0` where a
+    /// filesystem extended the file before writing it. The record is an acknowledged
+    /// readmission whose data is in; after a start it is still resolved, and a re-admission is
+    /// refused. Before the fix the tail was taken for torn and cut: the statement reopened open
+    /// with its data in.
+    #[test]
+    fn a_complete_resolution_before_zero_bytes_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let [id, _] = quarantined(&store_dir, dir.path());
+        {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            readmit_fresh(&store, &id).unwrap();
+        }
+        let log = store_dir.join(DIR).join(RESOLUTIONS);
+        let mut bytes = fs::read(&log).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        bytes.push(0);
+        fs::write(&log, bytes).unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let mut wrong = Vec::new();
+        let resolution = store.quarantine().get(&id).unwrap().unwrap().resolution;
+        eprintln!("after a start: {resolution:?}, {} copies", copies(&store));
+        if resolution.is_none() {
+            wrong.push("the acknowledged readmission was cut as a torn tail".to_owned());
+        }
+        if readmit_fresh(&store, &id).is_ok() {
+            wrong.push("re-admitted a second time".to_owned());
+        }
+        if copies(&store) != 1 {
+            wrong.push(format!("{} copies of the statement, not 1", copies(&store)));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A discard is acknowledged only once its log's name is durable (DUR-3 fix check r1,
