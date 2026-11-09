@@ -17,8 +17,12 @@ use std::sync::Arc;
 use nrese_exec::{Budget, BudgetExceeded, Reservation};
 use rust_stemmers::Stemmer;
 
-use super::{Corpus, Indexed, Match, Scope, Source, TextIndex, Whole};
-use crate::term::TermKind;
+use super::{
+    Corpus, Indexed, Match, Scope, Source, TextIndex, Whole, local_name_text,
+    local_name_text_bytes, word_count,
+};
+use crate::term::dictionary::view_key;
+use crate::term::{TermId, TermKind, TermView};
 
 /// A private search's own documents: an index over them numbered `0..k`, local document `i`
 /// being overlay entry `members[i]` (ascending), with each one's text and kind. Built for one
@@ -31,31 +35,69 @@ pub(crate) struct Local {
     _charge: Reservation,
 }
 
-impl Local {
-    /// The bytes [`Self::build`] charges for documents of `text_bytes` bytes in all: an upper
-    /// estimate of their copies, the index's words and postings, and their numbers, kinds and
-    /// lengths (three bytes a text byte, 64 a document).
-    fn charged(documents: usize, text_bytes: usize) -> usize {
-        text_bytes.saturating_mul(3) + documents.saturating_mul(64)
-    }
+/// What [`Local::build`] charges before it allocates (sol-loop r1 B1), as upper bounds of
+/// what [`TextIndex`] and the build allocate, kept until `Local` drops (so transient and kept
+/// allocations both count):
+/// - before anything: the index's shard maps and stem tables (256 maps of 24 bytes, rounded
+///   up);
+/// - a document, before its text is made: its number, kind and text pointer with their
+///   vectors' doubling, and its length slot ([`PER_DOCUMENT`]); its text, as a copy or as
+///   an IRI's local-name text ([`local_name_text_bytes`]);
+/// - then, before it is indexed, each byte of the text ([`PER_BYTE`]: its lower-cased words,
+///   up to three bytes a byte, once while tokenised and once as keys, and their stem table
+///   copies), and each word ([`PER_WORD`]: a tokenising map slot with its `String` (88), a
+///   B-tree entry with its node's share at the minimum fill of five (170), a posting buffer
+///   at its doubling (34), a stem table slot with its `String` and vector (128); 420, rounded
+///   up).
+const UPFRONT: usize = 8 << 10;
+const PER_DOCUMENT: usize = 128;
+const PER_BYTE: usize = 12;
+const PER_WORD: usize = 512;
 
-    /// The index of `documents` (overlay entry, kind, text; entries ascending, each with a
-    /// word), stems prepared for `language`, each document charged to `budget` before it is
-    /// kept.
-    pub(crate) fn build(
-        documents: impl IntoIterator<Item = (u64, TermKind, String)>,
+impl Local {
+    /// The index of the overlay's own entries `own` (id and key, ascending) that `member`
+    /// takes, as documents of literals (`iris` false: their values) or of IRI names (their
+    /// local-name text), stems prepared for `language`; each charged to `budget` before it
+    /// is made ([`PER_WORD`] and the others). Entries of other kinds, or with no word, are
+    /// left out.
+    pub(crate) fn build<'k>(
+        own: impl IntoIterator<Item = (TermId, &'k [u8])>,
+        member: impl Fn(u64) -> bool,
+        iris: bool,
         language: Option<&str>,
         budget: &Arc<Budget>,
     ) -> Result<Self, BudgetExceeded> {
         let mut charge = Reservation::new(Arc::clone(budget));
+        charge.charge(UPFRONT)?;
         let mut index = TextIndex::default();
         let (mut members, mut texts, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
-        for (entry, kind, text) in documents {
-            charge.charge(Self::charged(1, text.len()))?;
+        for (id, key) in own {
+            if !member(id.payload()) {
+                continue;
+            }
+            let text = match (iris, id.kind(), view_key(key)) {
+                (false, _, TermView::String(value) | TermView::LangString { value, .. }) => {
+                    if word_count(value) == 0 {
+                        continue;
+                    }
+                    charge.charge(PER_DOCUMENT + value.len())?;
+                    value.to_owned()
+                }
+                (true, TermKind::Iri, TermView::Iri(iri)) => {
+                    charge.charge(PER_DOCUMENT + local_name_text_bytes(iri.len()))?;
+                    match local_name_text(iri) {
+                        Some(text) if word_count(&text) > 0 => text,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let words = word_count(&text);
+            charge.charge(PER_BYTE * text.len() + PER_WORD * words)?;
             index.add(members.len() as u64, &text);
-            members.push(entry);
+            members.push(id.payload());
             texts.push(text.into_boxed_str());
-            kinds.push(kind);
+            kinds.push(id.kind());
         }
         if let Some(language) = language {
             index.prepare_stems(language);

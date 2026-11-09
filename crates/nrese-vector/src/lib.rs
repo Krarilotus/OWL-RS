@@ -14,7 +14,7 @@ mod literal;
 
 pub use hnsw::{Hnsw, HnswParameters, HnswParts};
 pub use kernels::{Metric, dot, squared_l2};
-pub use literal::{DATATYPE, NAMESPACE, ParseError, lexical, parse};
+pub use literal::{DATATYPE, NAMESPACE, ParseError, lexical, parse, parse_bytes};
 
 use charged::Heap;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
@@ -62,10 +62,36 @@ impl Vectors {
         self.len == 0
     }
 
-    /// Appends `vector` (of this dimension) with `id`; its position.
+    /// Room for `capacity` vectors (at most [`CHUNK`]) allocated now, in the chunk of
+    /// positions `0..CHUNK`: until more are pushed, [`Self::memory_bytes`] is
+    /// [`Self::bytes_for`]`(dimension, capacity)`, what a caller charges first. Pushed past
+    /// it, that chunk grows in place up to [`CHUNK`] (chunk boundaries stay at its
+    /// multiples). No chunk for 0.
+    pub fn with_capacity(dimension: usize, capacity: usize) -> Self {
+        let capacity = capacity.min(CHUNK);
+        let mut vectors = Self::new(dimension);
+        if capacity > 0 {
+            vectors.chunks.push(std::sync::Arc::new(Chunk {
+                data: Vec::with_capacity(capacity * dimension),
+                norms: Vec::with_capacity(capacity),
+                ids: Vec::with_capacity(capacity),
+            }));
+        }
+        vectors
+    }
+
+    /// The bytes `capacity` vectors of `dimension` take as [`Self::memory_bytes`] counts
+    /// them (their values, norms and ids): what [`Self::with_capacity`] allocates.
+    pub const fn bytes_for(dimension: usize, capacity: usize) -> usize {
+        capacity * (dimension * 4 + 4 + 8)
+    }
+
+    /// Appends `vector` (of this dimension) with `id`; its position. A new chunk is made
+    /// where there is none or the last holds [`CHUNK`].
     pub fn push(&mut self, id: u64, vector: &[f32]) -> u32 {
         debug_assert_eq!(vector.len(), self.dimension);
-        if self.len.is_multiple_of(CHUNK) {
+        let full = |chunk: &std::sync::Arc<Chunk>| chunk.ids.len() == CHUNK;
+        if self.chunks.last().is_none_or(full) {
             self.chunks.push(std::sync::Arc::new(Chunk {
                 data: Vec::with_capacity(CHUNK * self.dimension),
                 norms: Vec::with_capacity(CHUNK),
@@ -361,6 +387,55 @@ mod tests {
             vectors.push(id as u64 * 3 + 1, &vector);
         }
         vectors
+    }
+
+    /// `Vectors::with_capacity` (V3; SRCH 9 Nov): `c` vectors pushed into room for `c` take
+    /// exactly `bytes_for(dim, c)`, nothing reallocated. Pushed past its room and past
+    /// `CHUNK`, positions `CHUNK - 1` and `CHUNK` answer as a `Vectors::new` holding the same
+    /// vectors, the chunk boundary at `CHUNK`; `exact` over both gives the same hits under
+    /// each metric. No chunk for 0.
+    #[test]
+    fn with_capacity_holds_what_it_charged_and_answers_as_new() {
+        let dimension = 3;
+        let source = random_vectors(CHUNK + 1, dimension, 7);
+        let room = 5;
+        let mut small = Vectors::with_capacity(dimension, room);
+        assert_eq!(small.memory_bytes(), Vectors::bytes_for(dimension, room));
+        let before = small.chunks[0].data.as_ptr();
+        for p in 0..room as u32 {
+            small.push(source.id(p), source.get(p));
+        }
+        assert_eq!(small.memory_bytes(), Vectors::bytes_for(dimension, room));
+        assert_eq!(small.chunks[0].data.as_ptr(), before, "reallocated");
+        let mut grown = Vectors::with_capacity(dimension, room);
+        for p in 0..source.len() as u32 {
+            grown.push(source.id(p), source.get(p));
+        }
+        assert_eq!(grown.chunks.len(), 2, "a chunk boundary at CHUNK");
+        assert_eq!(grown.chunks[0].ids.len(), CHUNK);
+        let query = Query::new(&[0.1, -0.2, 0.3]);
+        let metrics = [Metric::Cosine, Metric::Dot, Metric::L2];
+        for p in [CHUNK as u32 - 1, CHUNK as u32] {
+            assert_eq!(grown.get(p), source.get(p));
+            assert_eq!(grown.id(p), source.id(p));
+            assert_eq!(grown.norm(p), source.norm(p));
+            for metric in metrics {
+                assert_eq!(
+                    grown.distance(metric, &query, p),
+                    source.distance(metric, &query, p)
+                );
+            }
+        }
+        let unlimited = Budget::unlimited();
+        for metric in metrics {
+            let hits = |vectors: &Vectors| {
+                exact(vectors, query.vector, 10, metric, &|_| true, &unlimited)
+                    .unwrap()
+                    .to_vec()
+            };
+            assert_eq!(hits(&grown), hits(&source), "{metric:?}");
+        }
+        assert!(Vectors::with_capacity(dimension, 0).chunks.is_empty());
     }
 
     /// The exact scan agrees with sorting every distance, with and without a filter,

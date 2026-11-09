@@ -153,6 +153,14 @@ pub(crate) fn local_name_text(iri: &str) -> Option<String> {
     Some(format!("{spaced} {whole}"))
 }
 
+/// The most bytes [`local_name_text`] holds at once for an IRI of `iri_len` bytes: its
+/// spaced copy (at most twice the local name, as allocated), the whole name, and the result
+/// (at most three times and one more), with a byte of slack (for a caller that charges it
+/// first).
+pub(crate) const fn local_name_text_bytes(iri_len: usize) -> usize {
+    6 * iri_len + 2
+}
+
 /// The words of `text`: maximal runs of letters and digits, lower-cased.
 pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_alphanumeric())
@@ -327,9 +335,16 @@ fn tokens(text: &str) -> (HashMap<String, u16>, u16) {
 }
 
 /// How many words a document holding `text` has, as [`TextIndex::add`] counts them (0: it
-/// is not a document).
+/// is not a document), counted in place: nothing is allocated (sol-loop r1 B4).
 pub(crate) fn word_length(text: &str) -> u16 {
-    words(text).fold(0u16, |length, _| length.saturating_add(1))
+    u16::try_from(word_count(text)).unwrap_or(u16::MAX)
+}
+
+/// The words of `text` as [`words`] splits them, counted without making them.
+pub(crate) fn word_count(text: &str) -> usize {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .count()
 }
 
 /// The version of [`TextIndex::write`]'s layout.
