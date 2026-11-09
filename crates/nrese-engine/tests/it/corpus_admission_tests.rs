@@ -363,3 +363,133 @@ fn views_and_pending_states_answer_in_both_warming_orders() {
     }
     assert!(failed.is_empty(), "{failed:#?}");
 }
+
+/// A vector search's hits decoded (lexical form, distance) with its report's space.
+fn nearest(snapshot: &Snapshot, query: &nrese_engine::VectorQuery) -> (Vec<(String, f32)>, usize) {
+    let budget = Arc::new(nrese_exec::Budget::unlimited());
+    let (hits, report) = snapshot
+        .vector_search_in(MODEL, &TextScope::EVERY, query, &|_| true, &budget)
+        .unwrap();
+    let hits = hits
+        .iter()
+        .map(|&(id, distance)| match snapshot.decode(id) {
+            Some(nrese_rdf::Term::Literal(l)) => (l.value().to_owned(), distance),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    (hits, report.space)
+}
+
+/// Attack items 2, 3 and 7 (the design note's list), guards: a writer's pending state's
+/// derived views (as stored, canonical, restricted) and a pending state searched after its
+/// transaction was dropped and another commit published keep nothing, and answer text,
+/// IRI and vector searches as an engine holding their statements; vectors with the store
+/// warm in both orders (the published base first, the pending state first).
+#[test]
+fn pending_views_and_abandoned_pending_states_keep_nothing() {
+    let vectors = |tx: &mut nrese_engine::Transaction<'_>| {
+        tx.insert(label("v", "[1, 0]", None).as_ref());
+        tx.insert(label("w", "[0.6, 0.8]", None).as_ref());
+    };
+    let changes = |tx: &mut nrese_engine::Transaction<'_>| {
+        tx.insert(label("n", "alpha new", None).as_ref());
+        tx.insert(label("x", "[0, 1]", None).as_ref());
+        tx.remove(label("w", "[0.6, 0.8]", None).as_ref());
+    };
+    let truth = {
+        let engine = oracle(vectors);
+        let mut tx = engine.transaction();
+        changes(&mut tx);
+        tx.commit().unwrap();
+        engine.snapshot()
+    };
+    let near = nrese_engine::VectorQuery::new(vec![1.0, 1.0], 3);
+    let mut failed = Vec::new();
+    for base_first in [true, false] {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        base(&engine);
+        let mut tx = engine.transaction();
+        vectors(&mut tx);
+        tx.commit().unwrap();
+        let published = engine.snapshot();
+        let mut tx = engine.transaction();
+        changes(&mut tx);
+        let pending = tx.pending_snapshot();
+        let views = [
+            ("pending", pending.clone()),
+            ("stored", pending.stored()),
+            ("canonical", pending.with_canonical_equality()),
+            (
+                "restricted",
+                pending.with_inferred_subset(InferredSubset::Without(Vec::new())),
+            ),
+        ];
+        let warm = || {
+            scored(&published, &TextScope::EVERY, "alpha");
+            published
+                .iri_search_in(MODEL, &TextScope::EVERY, &query("n"), None)
+                .unwrap();
+            nearest(&published, &near);
+        };
+        if base_first {
+            warm();
+        }
+        let before = held(&published);
+        for (name, view) in &views {
+            let context = format!("{name}, base first {base_first}");
+            let (got, want) = (
+                scored(view, &TextScope::EVERY, "alpha"),
+                scored(&truth, &TextScope::EVERY, "alpha"),
+            );
+            if got != want {
+                failed.push(format!("{context}: text {got:?} != {want:?}"));
+            }
+            let iris = |s: &Snapshot| {
+                s.iri_search_in(MODEL, &TextScope::EVERY, &query("n"), None)
+                    .unwrap()
+                    .len()
+            };
+            if iris(view) != iris(&truth) {
+                failed.push(format!("{context}: IRIs"));
+            }
+            let (got, want) = (nearest(view, &near), nearest(&truth, &near));
+            if got != want {
+                failed.push(format!("{context}: vectors {got:?} != {want:?}"));
+            }
+            if held(&published) != before {
+                failed.push(format!(
+                    "{context}: store {before:?} -> {:?}",
+                    held(&published)
+                ));
+            }
+        }
+        if !base_first {
+            warm();
+        }
+        // The transaction dropped, another commit published: the pending state, searched
+        // again, still keeps nothing and answers with its own statements.
+        drop(tx);
+        let mut other = engine.transaction();
+        other.insert(label("o", "alpha other", None).as_ref());
+        other.commit().unwrap();
+        let before = held(&engine.snapshot());
+        let (got, want) = (
+            scored(&pending, &TextScope::EVERY, "alpha"),
+            scored(&truth, &TextScope::EVERY, "alpha"),
+        );
+        if got != want {
+            failed.push(format!(
+                "abandoned, base first {base_first}: {got:?} != {want:?}"
+            ));
+        }
+        if nearest(&pending, &near) != nearest(&truth, &near) {
+            failed.push(format!("abandoned vectors, base first {base_first}"));
+        }
+        if held(&engine.snapshot()) != before {
+            failed.push(format!(
+                "abandoned, base first {base_first}: the store changed"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
