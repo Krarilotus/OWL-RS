@@ -217,3 +217,130 @@ fn an_unchanged_transaction_keeps_its_pending_snapshot_per_budget() {
     let after = tx.pending_snapshot_within(&a).unwrap().asserted_identity();
     assert_ne!(first, after, "after a write: the same snapshot");
 }
+
+/// The statement `s{i} p o{i}` of [`store`] as the transaction's ids, a default-graph triple.
+fn triple(tx: &nrese_engine::Transaction<'_>, i: usize) -> nrese_engine::EncodedTriple {
+    let id = |name: &str| tx.lookup(node(name).as_ref().into()).unwrap();
+    nrese_engine::EncodedTriple {
+        subject: id(&format!("s{i}")),
+        predicate: id("p"),
+        object: id(&format!("o{i}")),
+    }
+}
+
+/// A transaction whose statements were retracted, inferred, then asserted again (sol-loop r1 on
+/// DUR-6, S1) shadows inferred inserts that aren't asserted inserts: a pending snapshot charges
+/// its scratch for them too, holding nothing beyond its charge. Before the fix the bound counted
+/// only the asserted inserts.
+#[test]
+fn a_pending_version_is_charged_for_inferred_statements_asserted_again() {
+    if !measure::alone() {
+        return;
+    }
+    let engine = store(1_000);
+    let other = pending(&engine, 0, &unlimited());
+    let mut tx = engine.speculative();
+    for i in 0..1_000 {
+        let quad = Quad::new(
+            node(&format!("s{i}")),
+            node("p"),
+            node(&format!("o{i}")),
+            GraphName::DefaultGraph,
+        );
+        let inferred = triple(&tx, i);
+        tx.remove(quad.as_ref());
+        tx.insert_inferred(inferred);
+        tx.insert(quad.as_ref());
+    }
+    tx.insert(named(1).as_ref());
+    let budget = unlimited();
+    let (snapshot, excess) =
+        measure::measure_within(&budget, || tx.pending_snapshot_within(&budget).unwrap());
+    assert!(excess == 0, "held {excess} bytes beyond its charge");
+    drop((snapshot, tx, other));
+}
+
+/// A term the transaction interns after a pending snapshot is kept (sol-loop r1 on DUR-6, S2):
+/// the next pending snapshot under the same budget knows it. Before the fix the kept snapshot
+/// came back with the old dictionary length, and its lookup of the new term answered nothing.
+#[test]
+fn a_kept_pending_snapshot_is_not_returned_after_an_intern() {
+    let engine = store(10);
+    let budget = unlimited();
+    let mut tx = engine.speculative();
+    tx.insert(named(0).as_ref());
+    drop(tx.pending_snapshot_within(&budget).unwrap());
+    let fresh = node("fresh");
+    let id = tx.intern(fresh.as_ref().into());
+    let snapshot = tx.pending_snapshot_within(&budget).unwrap();
+    assert_eq!(
+        snapshot.lookup(fresh.as_ref().into()),
+        Some(id),
+        "the term interned after the kept snapshot"
+    );
+}
+
+/// A pending snapshot refused at any point of what it makes (sol-loop r1 on DUR-6, S3: the
+/// inferred stack's run refused after the asserted one was made) holds nothing beyond its charge
+/// at any moment, and keeps nothing: budgets from nothing up, each a fiftieth of what the made
+/// snapshot keeps larger than the last, until one is enough (the scratch, charged first, needs
+/// more than the snapshot keeps, so the steps pass through every stage). Before the fix a
+/// refusal of the inferred run released the asserted run's charge while its arrays were still
+/// there.
+#[test]
+fn a_refused_pending_snapshot_releases_nothing_before_it_frees_it() {
+    if !measure::alone() {
+        return;
+    }
+    let engine = store(2_000);
+    let other = pending(&engine, 0, &unlimited());
+    // The asserted run large enough that the fixed charge made first (its version, lists and
+    // box, mostly not made yet when the inferred run is refused) can't cover it.
+    let changes = |tx: &mut nrese_engine::Transaction<'_>| {
+        for n in 1..=500 {
+            tx.insert(named(n).as_ref());
+        }
+        for i in 0..500 {
+            let inferred = nrese_engine::EncodedTriple {
+                object: triple(tx, i + 500).object,
+                ..triple(tx, i)
+            };
+            tx.insert_inferred(inferred);
+        }
+    };
+    let whole = {
+        let budget = unlimited();
+        let mut tx = engine.speculative();
+        changes(&mut tx);
+        let snapshot = tx.pending_snapshot_within(&budget).unwrap();
+        let used = budget.used();
+        drop((snapshot, tx));
+        used
+    };
+    assert!(whole > 0);
+    let step = (whole / 50).max(1);
+    let mut refused = 0;
+    for limit in (0..).step_by(step) {
+        assert!(refused < 10_000, "still refused at a budget of {limit}");
+        let budget = Arc::new(Budget::new(limit));
+        let mut tx = engine.speculative();
+        changes(&mut tx);
+        let (made, excess) =
+            measure::measure_within(&budget, || tx.pending_snapshot_within(&budget));
+        assert!(
+            excess == 0,
+            "a budget of {limit} held {excess} bytes beyond its charge"
+        );
+        let enough = made.is_ok();
+        if !enough {
+            refused += 1;
+            assert_eq!(budget.used(), 0, "a refusal kept a charge");
+        }
+        drop((made, tx));
+        if enough {
+            break;
+        }
+    }
+    assert!(refused > 0, "no budget refused");
+    drop(other);
+}
