@@ -292,13 +292,13 @@ pub(crate) fn apply_statements(
             StatementOp::Add { data, contexts } => {
                 for quad in data.quads(contexts)? {
                     requester.write.check(&quad.graph_name)?;
-                    tx.insert(quad.as_ref());
+                    tx.try_insert(quad.as_ref())?;
                 }
             }
             StatementOp::RemoveData { data, contexts } => {
                 for quad in data.quads(contexts)? {
                     requester.write.check(&quad.graph_name)?;
-                    tx.remove(quad.as_ref());
+                    tx.try_remove(quad.as_ref())?;
                 }
             }
             StatementOp::RemoveMatching(pattern) => {
@@ -321,7 +321,7 @@ pub(crate) fn apply_statements(
                     }
                 }
                 for engine_pattern in patterns {
-                    tx.remove_matching(&engine_pattern);
+                    tx.remove_matching(&engine_pattern)?;
                 }
             }
             StatementOp::Update(request) => update(tx, request)?,

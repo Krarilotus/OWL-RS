@@ -349,11 +349,13 @@ fn a_private_snapshot_refuses_every_search_and_leaves_the_shared_indexes() {
     );
 }
 
-/// B18 (§3): corpus lineage.
+/// B18 (§3): corpus lineage, re-specified by dictionary 3.2 against the contract's S3 and §5
+/// row 24 (lineage only at publication; DUR's condition 2).
 ///
-/// - Input: an engine whose reader-scoped search keeps a corpus. A write transaction's pending
-///   snapshot (the control), then a private transaction's pending snapshot and its pending view.
-/// - Expected: the write transaction's records a lineage step; the private ones record none.
+/// - Input: an engine whose reader-scoped search keeps a corpus. A write transaction's
+///   commit (the control), then a speculative writer's pending snapshot, then a private
+///   transaction's pending snapshot and its pending view.
+/// - Expected: the commit records a lineage step; neither pending state records one.
 #[test]
 fn a_private_transaction_records_no_corpus_lineage() {
     let engine = engine();
@@ -372,14 +374,24 @@ fn a_private_transaction_records_no_corpus_lineage() {
     let steps = || engine.snapshot().text_corpus_stats().steps;
     let start = steps();
 
-    let mut writer = engine.speculative();
-    writer.insert(quad("b", "label", literal("gamma")).as_ref());
-    let _control = writer.pending_snapshot();
+    // The control: a publication records its step.
+    let mut published = engine.transaction();
+    published.insert(quad("p", "label", literal("epsilon")).as_ref());
+    published.commit().unwrap();
     let after_writer = steps();
     assert_eq!(
         after_writer,
         start + 1,
-        "the measure sees a write transaction's step"
+        "the measure sees a publication's step"
+    );
+
+    let mut writer = engine.speculative();
+    writer.insert(quad("b", "label", literal("gamma")).as_ref());
+    let _pending_writer = writer.pending_snapshot();
+    assert_eq!(
+        steps(),
+        after_writer,
+        "no lineage step for a writer's pending state"
     );
 
     let mut private = engine.speculative_over(&base, budget()).unwrap();

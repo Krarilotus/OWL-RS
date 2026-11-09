@@ -154,9 +154,11 @@ pub(crate) fn apply_restore(
     let checksum_verified = verify_checksum(&request.payload)?;
     let quads = parse_dataset(request.format.rdf_format(), &request.payload)?;
     let replaced_existing = !tx.is_empty();
-    tx.remove_matching(&QuadPattern::all());
+    // The pending changes' growth is charged before it happens (D16-039); the parsed dataset
+    // is not (the restore's input owner).
+    tx.remove_matching(&QuadPattern::all())?;
     for quad in &quads {
-        tx.insert(quad.as_ref());
+        tx.try_insert(quad.as_ref())?;
     }
     Ok(DatasetRestoreReport {
         format: request.format,

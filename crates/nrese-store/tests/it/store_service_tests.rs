@@ -396,10 +396,13 @@ fn a_materialisation_stops_at_the_process_memory_limit() -> Result<(), Box<dyn s
         ..StoreConfig::in_memory()
     };
     let store = StoreService::new(config)?;
-    store.execute_update_str(
-        "INSERT DATA { <http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
-                       <http://e/a> a <http://e/C> }",
-    )?;
+    // Loaded past the pipeline: a write's pending changes draw on the process's memory, 1 byte
+    // here (D16-039), and the data is the materialisation's, not what this tests.
+    crate::support::load_past_the_pipeline(
+        &store,
+        "<http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
+         <http://e/a> a <http://e/C> .",
+    );
     let error = store
         .rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)
         .unwrap_err();

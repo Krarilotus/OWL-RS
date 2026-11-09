@@ -124,6 +124,19 @@ impl Context<'_> {
             return Ok((self.vector_service(inner, bound)?, None));
         }
         let variable = match name {
+            // A blank node or literal put in for the endpoint ([`super::substitute`]) is no
+            // IRI: as a variable endpoint without one, never called.
+            NamedNodePattern::NamedNode(endpoint)
+                if nrese_sparql_syntax::internal::is_constant(endpoint.as_str()) =>
+            {
+                if silent {
+                    return Ok((self.unit()?, None));
+                }
+                return Err(QueryEvaluationError::Service(
+                    "SERVICE: an endpoint must be an IRI".into(),
+                )
+                .into());
+            }
             NamedNodePattern::NamedNode(endpoint) => {
                 let found = self.call_silently(endpoint.as_str(), inner, bound, silent)?;
                 return Ok((found, None));
@@ -273,6 +286,9 @@ impl Context<'_> {
         let mut all: Option<Solutions> = None;
         for pattern in patterns {
             self.check()?;
+            // No made name goes out as it is (`internal`): renamed apart from the pattern's,
+            // and read back from the answer.
+            let (pattern, sent) = nrese_sparql_syntax::internal::printable(pattern);
             // Under the query's BASE: an `IRI()` the endpoint evaluates resolves as here.
             let query = Query::Select {
                 dataset: None,
@@ -304,7 +320,11 @@ impl Context<'_> {
                 })?,
             };
             let solutions = self.produced(Solutions {
-                vars: results.variables,
+                vars: results
+                    .variables
+                    .into_iter()
+                    .map(|v| sent.local(v))
+                    .collect(),
                 table,
                 ordered: false,
             })?;

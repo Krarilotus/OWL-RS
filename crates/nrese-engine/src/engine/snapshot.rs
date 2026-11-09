@@ -18,9 +18,13 @@ pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
+mod own_state;
+pub(crate) use own_state::OwnSlots;
+pub use own_state::{Admission, OwnState};
+
 mod reader_search;
-pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
+pub(crate) use reader_search::{CorpusAdmission, Documents};
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
@@ -376,7 +380,8 @@ impl std::fmt::Debug for Snapshot {
 
 impl Snapshot {
     /// A snapshot of `version`, not published: no [`SharedState`]. The bulk path's checkpoint
-    /// image is made so, before its version is installed.
+    /// image is made so, of a version that is never installed (one made from it is). Never of
+    /// an installed version: its own slots ([`OwnState`]) would be that version's.
     pub(super) fn new(
         version: Arc<Version>,
         dictionary: Arc<Dictionary>,
@@ -413,12 +418,25 @@ impl Snapshot {
         }
     }
 
+    /// Where what this snapshot derives may be kept (the lifecycle contract's S3): in state
+    /// other operations reach for a published snapshot ([`SharedState`]), in its own
+    /// version's slots for a pending, private, staged or added-to one ([`OwnState`]).
+    pub fn admission(&self) -> Admission<'_> {
+        match self.published {
+            true => Admission::Shared(SharedState { snapshot: self }),
+            false => Admission::Own(OwnState::new(self)),
+        }
+    }
+
     /// The capability to admit into state other operations reach, for a published snapshot
-    /// alone (the lifecycle contract's S3); `None` for a pending, private, staged or
-    /// added-to one, which computes for its request instead. Reading entries made from
-    /// published snapshots needs none.
+    /// alone ([`Self::admission`]'s `Shared`); `None` for a pending, private, staged or
+    /// added-to one, which computes for its request or keeps it in its own version instead.
+    /// Reading entries made from published snapshots needs none.
     pub fn shared_state(&self) -> Option<SharedState<'_>> {
-        self.published.then_some(SharedState { snapshot: self })
+        match self.admission() {
+            Admission::Shared(state) => Some(state),
+            Admission::Own(_) => None,
+        }
     }
 
     /// This snapshot reading the default graph expanded over the `owl:sameAs` classes of
@@ -820,6 +838,7 @@ impl Snapshot {
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {

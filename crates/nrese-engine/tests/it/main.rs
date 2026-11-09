@@ -2,6 +2,7 @@
 //! file. Each file is a module.
 
 mod bulk_load_tests;
+mod corpus_admission_tests;
 mod corpus_bounds_tests;
 mod corpus_isolation_tests;
 mod corpus_settings_tests;
