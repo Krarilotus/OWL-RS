@@ -708,6 +708,7 @@ fn query_held(engine: &Engine, query: &str, limit: usize) -> (Result<usize, Stri
 ///   pairs;
 /// - `?s p+ ?o` from 4,097 bound starts (past the 4,096 a closure probes the index from), each
 ///   leading into a 1,024-node cycle: 4,097 × 1,025 pairs from the bound values' closure.
+///
 /// Each must be refused before holding a quarter of what it refuses (4 MiB, 2 MiB, 16 MiB).
 #[test]
 fn a_closures_quadratic_parts_are_refused_before_they_are_allocated() {
