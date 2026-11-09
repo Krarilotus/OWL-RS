@@ -114,6 +114,13 @@ class LoadedInputs(unittest.TestCase):
             self.assertEqual(code, 1, out.getvalue())
             self.assertIn("answers differ", out.getvalue())
             self.assertNotIn("100.00x", out.getvalue())
+            # Guard: equal answers still refuse measurements, including the query sum.
+            write(new.parent, [load(), query("q", 1000)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = compare.main([str(base), str(new)])
+            self.assertEqual(code, 2, out.getvalue())
+            self.assertNotIn("sum of medians", out.getvalue())
 
     def report(self, ms, inputs=None, case="rdfs-full-lubm10"):
         record = {"case": case, "status": "ok", "samples": {"reason.p50_ms": [ms, ms]}, "metric": ms}
