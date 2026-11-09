@@ -10,6 +10,7 @@ use nrese_xsd::{
 };
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
 /// `[+-]?[0-9]+`
 fn is_integer(lexical: &str) -> bool {
@@ -50,7 +51,14 @@ fn integer_within(lexical: &str, min: Option<i128>, max: Option<i128>) -> bool {
 /// facts: what it calls ill-typed is ill-typed here. A form the map can't represent but
 /// doesn't reject (a number past 128 bits, more digits of a second than it keeps) is
 /// well-typed. Datatypes outside the map accept everything.
+///
+/// `rdf:langString` is matched by its datatype IRI alone, as before the map was read: the
+/// map's text model holds XML's Char only, while RDF 1.1 Concepts §3.3 gives language strings
+/// all of Unicode, so the map would call some valid ones ill-typed.
 pub(crate) fn well_formed(datatype: &str, lexical: &str, language: Option<&str>) -> bool {
+    if datatype == RDF_LANG_STRING {
+        return true;
+    }
     if language.is_none()
         && let Some(local) = datatype.strip_prefix(XSD)
         && let Some(checked) = xsd_lexical(local, lexical)
