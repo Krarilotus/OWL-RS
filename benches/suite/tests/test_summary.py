@@ -196,6 +196,28 @@ class LoadedInputs(unittest.TestCase):
             self.assertNotIn("input unknown", text)
             self.assertIn("faster", text)
 
+    def test_csv_different_inputs_refuse_before_correctness(self):
+        # Spec: master's r1 F1 direction: another dataset release -> Inputs/exit 2;
+        # statement counts and answers caused by the new input are not regressions.
+        for host in ("fixture", "other-fixture"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                base = self.suite_run(directory / "base", 100, {"/data/d.nt": 1}, {"/data/d.nt": self.OLD})
+                new = self.suite_run(directory / "new", 50, {"/data/d.nt": 1}, {"/data/d.nt": self.NEW})
+                write(new.parent, [row(task="load", rows=10, ms=10), query("q1", 50, rows=2)])
+                manifest = new.parent / "manifest.json"
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                data["invocations"][0]["machine"]["host"] = host
+                manifest.write_text(json.dumps(data), encoding="utf-8")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = compare.main([str(base), str(new)])
+                self.assertEqual(code, 2, out.getvalue())
+                self.assertIn("## Inputs", out.getvalue())
+                self.assertIn("different input", out.getvalue())
+                for verdict in ("statement counts differ", "answers differ", "regression(s)"):
+                    self.assertNotIn(verdict, out.getvalue())
+
     def test_a_perf_lab_case_compares_on_the_same_bytes_and_is_refused_on_others(self):
         """The orchestrator, 7 Nov 2026 (17:12): leads compare perf-lab runs (the `lab-*` cases, the
         perf lab through fast.py) for counts; their records say what they loaded like every case."""
