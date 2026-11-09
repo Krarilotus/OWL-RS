@@ -85,16 +85,16 @@ pub async fn operator_dataset_summary(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &authenticated).await?;
-    operator_api::dataset_summary(state, &authenticated).await
+    let identity = guard::enforce_operator_read(&state, &authenticated).await?;
+    operator_api::dataset_summary(state, &identity)
 }
 
 pub async fn operator_extended_health(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &authenticated).await?;
-    operator_api::extended_health(state, &authenticated).await
+    let identity = guard::enforce_operator_read(&state, &authenticated).await?;
+    operator_api::extended_health(state, &identity)
 }
 
 pub async fn operator_runtime_diagnostics(
@@ -180,9 +180,10 @@ pub async fn dataset_info(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
+    let identity = guard::enforce_service_description_read(&state, &authenticated).await?;
     Ok((
         StatusCode::OK,
-        Json(build_ready_response(&state, &authenticated).await?),
+        Json(build_ready_response(&state, &identity)?),
     )
         .into_response())
 }

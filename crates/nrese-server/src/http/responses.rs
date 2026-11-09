@@ -186,12 +186,12 @@ pub fn build_readiness_response(state: &AppState) -> StatusResponse {
     }
 }
 
-/// Every consumer of global figures must establish whole-dataset read access here.
-pub async fn build_ready_response(
+/// Every consumer of global figures checks scope here, after authorizing its action.
+pub fn build_ready_response(
     state: &AppState,
-    authenticated: &crate::auth::Authenticated,
+    identity: &crate::auth::Identity,
 ) -> Result<ReadyResponse, ApiError> {
-    super::guard::enforce_whole_read(state, authenticated).await?;
+    super::guard::whole_read_scope(state.access_view(identity))?;
     let stats = state
         .store()
         .stats()

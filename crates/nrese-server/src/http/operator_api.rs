@@ -16,22 +16,22 @@ pub fn capabilities(state: AppState) -> Response {
         .into_response()
 }
 
-pub async fn dataset_summary(
+pub fn dataset_summary(
     state: AppState,
-    authenticated: &crate::auth::Authenticated,
+    identity: &crate::auth::Identity,
 ) -> Result<Response, ApiError> {
     Ok((
         StatusCode::OK,
-        Json(build_ready_response(&state, authenticated).await?),
+        Json(build_ready_response(&state, identity)?),
     )
         .into_response())
 }
 
-pub async fn extended_health(
+pub fn extended_health(
     state: AppState,
-    authenticated: &crate::auth::Authenticated,
+    identity: &crate::auth::Identity,
 ) -> Result<Response, ApiError> {
-    let ready = build_ready_response(&state, authenticated).await?;
+    let ready = build_ready_response(&state, identity)?;
     let status = if state.is_ready() {
         StatusCode::OK
     } else {
