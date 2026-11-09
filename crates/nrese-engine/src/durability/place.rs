@@ -37,12 +37,19 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(kind) = super::fault::FAIL_DIR_SYNC_OF.with_borrow(|of| {
         of.as_ref()
-            .filter(|(failing, _)| failing.as_path() == dir)
+            .filter(|(failing, _)| super::fault::same_dir(failing, dir))
             .map(|&(_, kind)| kind)
     }) {
         return Err(std::io::Error::new(
             kind,
             format!("syncing {} failed (a test's)", dir.display()),
+        ));
+    }
+    #[cfg(feature = "fault-points")]
+    if let Some(kind) = crate::fault_points::dir_sync_fails(dir) {
+        return Err(std::io::Error::new(
+            kind,
+            format!("syncing {} failed (a fault point's)", dir.display()),
         ));
     }
     #[cfg(unix)]
@@ -106,39 +113,350 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The directories [`create_dir_all`] syncs for the levels of `dir` it finds, outermost first:
-/// each level's holder (`.` for a relative name with no parent; the root, or a Windows prefix,
-/// is held by nothing). A store's open that finds its root defers these syncs to the first
-/// durable write that relies on them (`Wal::settle_names`, deferred-sync design note of 8 Nov).
-pub(crate) fn holders(dir: &Path) -> Vec<PathBuf> {
-    let mut holders: Vec<PathBuf> = dir
-        .ancestors()
-        .filter(|level| !level.as_os_str().is_empty())
-        .filter_map(|level| level.parent())
-        .map(|holder| match holder.as_os_str().is_empty() {
-            true => PathBuf::from("."),
-            false => holder.to_path_buf(),
+/// A store's root as its open resolved it ([`resolve`]): the directories [`create_dir_all`]
+/// syncs for the levels it finds, the directory holding each entry the resolution reads
+/// (through links, the link's own entry and its target's chain). A store's open that finds its
+/// root defers these syncs to the first durable write that relies on them (`Wal::settle_names`,
+/// deferred-sync design note of 8 Nov). Kept so that a directory inside the root is resolved
+/// from where the root's resolution ended ([`Self::beyond`]): the root's chain is walked once,
+/// and a holder canonicalised only where its spelling may not name it uniquely
+/// ([`Resolution::exact`]; timing of DUR-4, 9 Nov).
+pub(crate) struct Named {
+    /// The root's resolution and those of the directories resolved in it since, together.
+    resolution: Resolution,
+    /// The physical directory the root's resolution reached.
+    root: PathBuf,
+    /// The links the root's resolution followed: each directory's resolution in it starts
+    /// from these, as a path through the root would.
+    root_links: usize,
+}
+
+impl Named {
+    /// Resolves the existing directory `dir`.
+    pub(crate) fn resolve(dir: &Path) -> std::io::Result<Self> {
+        let resolution = resolve(dir)?;
+        Ok(Self {
+            root: resolution.reached.clone(),
+            root_links: resolution.links,
+            resolution,
         })
-        .collect();
-    holders.reverse();
-    holders
+    }
+
+    /// Adds the holders that the resolution of `name`, an existing directory in the root, reads
+    /// past the root's: the root (the holder of `name`'s entry) and, if `name` is a link, its
+    /// target's chain (package review r1, R1-L1).
+    pub(crate) fn beyond(&mut self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        let path = self.root.join(name);
+        let start = Resolution {
+            reached: self.root.clone(),
+            missing: Vec::new(),
+            links: self.root_links,
+            ..self.resolution.clone()
+        };
+        let resolution = walk(start, [(Step::Name(name.to_owned()), false)].into(), &path)?;
+        if !resolution.missing.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} is not a directory", path.display()),
+            ));
+        }
+        self.resolution = resolution;
+        Ok(())
+    }
+
+    /// The key of the root (`name` none) or of the directory `name` in it, as the holders'
+    /// keys are made: one directory has one key among them.
+    pub(crate) fn key(&self, name: Option<&std::ffi::OsStr>) -> PathBuf {
+        let path = match name {
+            Some(name) => self.root.join(name),
+            None => spelled(&self.root),
+        };
+        key(self.resolution.exact, &path)
+    }
+
+    /// The holders, each with its key, outermost first.
+    pub(crate) fn into_holders(self) -> Vec<(PathBuf, PathBuf)> {
+        let Resolution { holders, keys, .. } = self.resolution;
+        holders.into_iter().zip(keys).collect()
+    }
+}
+
+/// Where the resolution of a path leads ([`resolve`]).
+#[derive(Clone, Default)]
+struct Resolution {
+    /// The directories holding each entry the resolution read, physical (no link in them),
+    /// outermost first, each once.
+    holders: Vec<PathBuf>,
+    /// Each holder's key, by which they are deduplicated ([`Self::exact`]).
+    keys: Vec<PathBuf>,
+    /// Whether the keys are canonical paths: since the walk followed a link (a link's target
+    /// may be spelled otherwise, `\\?\…` for a junction, and lead back to a directory already
+    /// held) or stepped above a relative start (`..` from `.`). Until then each holder's own
+    /// spelling is its key: the walk only went down from its start, so no two spellings in it
+    /// name one directory, and no holder is canonicalised (timing of DUR-4, 9 Nov).
+    exact: bool,
+    /// The physical directory the path's existing part leads to (empty: `.`).
+    reached: PathBuf,
+    /// The path's names past `reached` that aren't there, in order.
+    missing: Vec<std::ffi::OsString>,
+    /// The links followed so far.
+    links: usize,
+}
+
+/// Links one resolution follows at most, as Linux's `ELOOP`.
+const MAX_LINKS: usize = 40;
+
+/// One step of a resolution.
+enum Step {
+    /// A path's start: `/`, a Windows prefix and root.
+    Start(PathBuf),
+    Parent,
+    Name(std::ffi::OsString),
+}
+
+/// `path`'s steps, each marked with whether it comes from a link's target.
+fn steps(path: &Path, from_link: bool) -> Vec<(Step, bool)> {
+    use std::path::Component;
+    let mut start = PathBuf::new();
+    let mut steps = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => start.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => steps.push((Step::Parent, from_link)),
+            Component::Normal(name) => steps.push((Step::Name(name.to_owned()), from_link)),
+        }
+    }
+    if !start.as_os_str().is_empty() {
+        steps.insert(0, (Step::Start(start), from_link));
+    }
+    steps
+}
+
+/// Resolves `path`'s names as the kernel does when the path is used (DUR-4, fix check
+/// DEFER-F1-SYM): component by component from its start (`.` for a relative path), each entry
+/// read in the physical directory reached so far, which is that entry's holder. A link (a
+/// symbolic link; on Windows a junction too) is followed: its own entry's holder counted, then
+/// its target walked the same way (an absolute target from its start, a relative one from the
+/// link's directory), so a link's name and its target's whole chain are both in the holders.
+/// `..` steps to the physical parent on Unix; Windows takes `..` lexically first ([`as_walked`]).
+/// Refused: a link whose target isn't there (dangling), more than [`MAX_LINKS`] links (a loop),
+/// an entry that isn't a directory, a `..` past a missing name. Holders are deduplicated by
+/// their keys: their spellings, or their canonical paths once the walk followed a link (a
+/// junction's target is spelled `\\?\…`) or stepped above a relative start ([`Resolution::exact`]).
+fn resolve(path: &Path) -> std::io::Result<Resolution> {
+    walk(
+        Resolution::default(),
+        steps(&as_walked(path), false).into(),
+        path,
+    )
+}
+
+/// [`resolve`]'s walk: `queue`'s steps from where `resolution` stands (`path` names the walk in
+/// errors).
+fn walk(
+    resolution: Resolution,
+    mut queue: std::collections::VecDeque<(Step, bool)>,
+    path: &Path,
+) -> std::io::Result<Resolution> {
+    use std::io::{Error, ErrorKind};
+    let Resolution {
+        mut holders,
+        mut keys,
+        mut exact,
+        reached: mut current,
+        mut missing,
+        mut links,
+    } = resolution;
+    while let Some((step, from_link)) = queue.pop_front() {
+        if !missing.is_empty() {
+            match step {
+                Step::Name(name) => {
+                    missing.push(name);
+                    continue;
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "{}: leads back past a name that isn't there",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        match step {
+            Step::Start(start) => current = start,
+            Step::Parent => {
+                step_up(&mut current);
+                if let Some(std::path::Component::ParentDir) = current.components().next_back() {
+                    make_exact(&mut holders, &mut keys, &mut exact);
+                }
+            }
+            Step::Name(name) => {
+                let holder = spelled(&current);
+                let entry = current.join(&name);
+                match fs::symlink_metadata(&entry) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        links += 1;
+                        if links > MAX_LINKS {
+                            return Err(Error::other(format!(
+                                "{}: more than {MAX_LINKS} links",
+                                path.display()
+                            )));
+                        }
+                        let target = fs::read_link(&entry)?;
+                        // Windows resolves a relative target against the link's directory, `..`
+                        // taken lexically; Unix walks it from there physically. The joined
+                        // target holds the link's directory already: a relative one (from a
+                        // relative root) is walked from the start again (sol-loop round 2, S2).
+                        #[cfg(windows)]
+                        let target = as_walked(&current.join(&target));
+                        #[cfg(windows)]
+                        if target.is_relative() {
+                            current = PathBuf::new();
+                        }
+                        make_exact(&mut holders, &mut keys, &mut exact);
+                        hold(&mut holders, &mut keys, exact, holder);
+                        for step in steps(&target, true).into_iter().rev() {
+                            queue.push_front(step);
+                        }
+                    }
+                    Ok(meta) if meta.is_dir() => {
+                        hold(&mut holders, &mut keys, exact, holder);
+                        current = entry;
+                    }
+                    Ok(_) => {
+                        return Err(Error::new(
+                            ErrorKind::NotADirectory,
+                            format!("{} is not a directory", entry.display()),
+                        ));
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound && from_link => {
+                        return Err(Error::new(
+                            ErrorKind::NotFound,
+                            format!("{}: a link's target isn't there", entry.display()),
+                        ));
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => missing.push(name),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(Resolution {
+        holders,
+        keys,
+        exact,
+        reached: current,
+        missing,
+        links,
+    })
+}
+
+/// The path the file system walks for `path`. Unix: `path` as it is (its `..` taken physically
+/// as the walk reaches it). Windows: a path that isn't verbatim (`\\?\…`) has its `.` and `..`
+/// taken lexically first, as Windows normalises a path before the file system sees it, so
+/// `alias\..\x` is `x` whatever `alias` points to (sol-loop round 1, S1); a relative path keeps
+/// its leading `..`, and a root's `..` is the root.
+pub(super) fn as_walked(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let verbatim = matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(
+                prefix.kind(),
+                Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
+            )
+        );
+        if !verbatim {
+            let mut walked = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => step_up(&mut walked),
+                    other => walked.push(other.as_os_str()),
+                }
+            }
+            return walked;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// `path`'s parent, in place: its last name dropped; a root (`/`, `C:\`, `\\server\share\`) its
+/// own parent; and where neither is there to drop (an empty or relative start, a drive-relative
+/// `C:`, a `..` already) a `..` kept, which the file system resolves from the working directory
+/// (sol-loop round 2, S3: a drive-relative prefix doesn't absorb a `..` as a root does).
+fn step_up(path: &mut PathBuf) {
+    use std::path::Component;
+    match path.components().next_back() {
+        Some(Component::Normal(_)) => {
+            path.pop();
+        }
+        Some(Component::RootDir) => {}
+        _ => path.push(".."),
+    }
+}
+
+/// A walked directory as a path: `.` for the empty start.
+fn spelled(walked: &Path) -> PathBuf {
+    match walked.as_os_str().is_empty() {
+        true => PathBuf::from("."),
+        false => walked.to_path_buf(),
+    }
+}
+
+/// `dir`'s key in a resolution ([`Resolution::exact`]): its canonical path if `exact`, else
+/// its spelling.
+fn key(exact: bool, dir: &Path) -> PathBuf {
+    match exact {
+        true => dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+        false => dir.to_path_buf(),
+    }
+}
+
+/// Adds `holder` to `holders` unless it's there already under some spelling.
+fn hold(holders: &mut Vec<PathBuf>, seen: &mut Vec<PathBuf>, exact: bool, holder: PathBuf) {
+    let key = key(exact, &holder);
+    if !seen.contains(&key) {
+        seen.push(key);
+        holders.push(holder);
+    }
+}
+
+/// Turns a resolution's keys canonical, once: the holders so far re-keyed (and deduplicated
+/// again) by their canonical paths.
+fn make_exact(holders: &mut Vec<PathBuf>, keys: &mut Vec<PathBuf>, exact: &mut bool) {
+    if *exact {
+        return;
+    }
+    *exact = true;
+    keys.clear();
+    for holder in std::mem::take(holders) {
+        hold(holders, keys, true, holder);
+    }
 }
 
 /// Makes the names leading to the existing directory `dir` durable, as [`create_dir_all`] does
-/// for the levels it finds, and makes none: the holder of each level synced, outermost first
-/// (a holder this process may not open for the sync, `PermissionDenied`, is left as it is).
-/// `NotFound` if `dir` isn't a directory: a write into a directory gone meanwhile must not
-/// make it again. For writes under a store's directory that don't go through the engine (the
-/// store's metadata, DUR-3 fix check DEFER-F1): its open leaves these names to the first
-/// durable write.
+/// for the levels it finds, and makes none: the holder of each entry its resolution reads
+/// synced ([`resolve`]: through links, the link's own entry and its target's chain), outermost
+/// first (a holder this process may not open for the sync, `PermissionDenied`, is left as it
+/// is). `NotFound` if `dir` isn't there (or a link on its way is dangling): a write into a
+/// directory gone meanwhile must not make it again. For writes under a store's directory that
+/// don't go through the engine (the store's metadata, DUR-3 fix check DEFER-F1): its open
+/// leaves these names to the first durable write.
 pub fn name_existing(dir: &Path) -> std::io::Result<()> {
-    if !dir.is_dir() {
+    let resolution = resolve(dir)?;
+    if !resolution.missing.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("{} is not a directory", dir.display()),
         ));
     }
-    for holder in holders(dir) {
+    for holder in resolution.holders {
         match sync_dir(&holder) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
@@ -179,50 +497,55 @@ pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// [`create_dir_all`]'s levels, outermost first; those it makes are pushed to `made`.
-fn name_levels<'a>(dir: &'a Path, made: &mut Vec<&'a Path>) -> std::io::Result<()> {
-    let levels: Vec<&Path> = dir
-        .ancestors()
-        .filter(|level| !level.as_os_str().is_empty())
-        .collect();
-    for &level in levels.iter().rev() {
-        // The root (or a Windows prefix) is held by nothing.
-        let Some(holder) = level.parent() else {
-            continue;
+/// [`create_dir_all`]'s levels, outermost first; those it makes are pushed to `made`. The
+/// levels found are those [`resolve`] reads (through links, the link's own entry and its
+/// target's chain), their holders synced; the missing ones are made in the physical directory
+/// the resolution reached, never through a dangling link.
+fn name_levels(dir: &Path, made: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let Resolution {
+        holders,
+        reached,
+        missing,
+        ..
+    } = resolve(dir)?;
+    // Found levels aren't made again (an ancestor may be one this process can't write); a
+    // holder of one this process may not open for the sync was provisioned (the exception).
+    for holder in &holders {
+        match sync_dir(holder) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut at = reached;
+    for name in missing {
+        let holder = match at.as_os_str().is_empty() {
+            true => PathBuf::from("."),
+            false => at.clone(),
         };
-        let holder = match holder.as_os_str().is_empty() {
-            true => Path::new("."),
-            false => holder,
-        };
-        // Found levels aren't made again (an ancestor may be one this process can't write). A
-        // level is made only once its holder's sync is known to work (sol-loop round 2 on
+        let level = at.join(&name);
+        // A level is made only once its holder's sync is known to work (sol-loop round 2 on
         // review r1, S1): a level made under a holder no sync reaches would be in sight of
         // another process, which couldn't sync it either and would take it for one provisioned
-        // beforehand (the exception below). So a found level under such a holder wasn't made by
-        // an open, but provisioned.
-        let missing = !level.is_dir();
-        if missing {
-            sync_dir(holder)?;
-        }
-        let new = missing
-            && match fs::create_dir(level) {
-                Ok(()) => true,
-                // Made meanwhile by someone else.
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AlreadyExists && level.is_dir() =>
-                {
-                    false
-                }
-                Err(error) => return Err(error),
-            };
+        // beforehand (the exception above).
+        sync_dir(&holder)?;
+        let new = match fs::create_dir(&level) {
+            Ok(()) => true,
+            // Made meanwhile by someone else.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && level.is_dir() => {
+                false
+            }
+            Err(error) => return Err(error),
+        };
         if new {
-            made.push(level);
+            made.push(level.clone());
         }
-        match sync_dir(holder) {
+        match sync_dir(&holder) {
             Ok(()) => {}
             Err(error) if !new && error.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(error) => return Err(error),
         }
+        at = level;
     }
     Ok(())
 }

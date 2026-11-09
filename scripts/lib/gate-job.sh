@@ -14,8 +14,9 @@
 # (NRESE_HOST_CACHE_GB).
 #
 # Its tools: the tree's toolchain (rust-toolchain.toml), the pinned cargo-nextest and Miri
-# nightly (scripts/lib/gate-tools.txt) and the suite's Python packages, all installed once,
-# nextest and Python's under the cache directory. No step reaches a Docker daemon.
+# nightly (scripts/lib/gate-tools.txt), the suite's Python packages and, for a push that changes
+# the console, the pinned Node (scripts/lib/gate-node.sh), all installed once, nextest, Python's
+# and Node under the cache directory. No step reaches a Docker daemon.
 #
 # Results ($FLEET_OUT): gate.log, the run's output; check.log, check.sh's; attempt, this
 # attempt's name; gate.json, what it was (scripts/lib/gate-record.py).
@@ -126,10 +127,20 @@ fi
 pybin=$(suite_python "$cache" "$tool/benches/suite/requirements.txt" python3) || infra "no Python for the suite"
 py=${pybin%/*}
 export PATH="$pybin:$PATH"
+# The console's Node (scripts/lib/gate-node.sh), first on PATH, where the push changes the console:
+# its step runs with the pinned build, never the host's.
+node=""
+if grep -q '^apps/nrese-console/' "$files"; then
+  # shellcheck source=gate-node.sh
+  . "$tool/scripts/lib/gate-node.sh"
+  nodebin=$(gate_node "$cache" "$tool/scripts/lib/gate-tools.txt") || infra "no Node for the console"
+  node=${nodebin%/bin}
+  export PATH="$nodebin:$PATH"
+fi
 
 # shellcheck source=gate-key.sh
 . "$tool/scripts/lib/gate-key.sh"
-identity=$(gate_identity) || infra "no rustc"
+identity=$(gate_identity HEAD) || infra "no rustc"
 
 # The host's one cache (Harness/notes/2026-10-20-host-cache-contract.md, shared with /verify): a
 # target directory per toolchain release, each entry's last use recorded, one sweep for all, run
@@ -139,9 +150,9 @@ identity=$(gate_identity) || infra "no rustc"
 release=$(rustc -vV | sed -n 's/^release: //p')
 export CARGO_TARGET_DIR="$cache/target-gate-$release"
 export NRESE_TARGET_BUDGET_GB=${NRESE_GATE_BUDGET_GB:-40}
-used=("$CARGO_TARGET_DIR" "$py")
+used=("$CARGO_TARGET_DIR" "$py" ${node:+"$node"})
 for entry in "${used[@]}"; do mkdir -p "$entry" && echo "$EPOCHSECONDS" > "$entry/.last-used"; done
-# bin-* after 7 days unused, target-* and py-* after 14, then the least recently used until the
+# bin-* after 7 days unused, target-*, py-* and node-* after 14, then the least recently used until the
 # root fits NRESE_HOST_CACHE_GB; never what this run used (nor wt, bin, rustup, cargo). Miri's
 # build in the worktree (wt/target) is an entry too.
 sweep() {
@@ -166,7 +177,7 @@ def used(path):
         return float(open(os.path.join(path, ".last-used")).read())
     except (OSError, ValueError):
         return os.stat(path).st_mtime
-candidates = [p for pattern in ("bin-*", "target-*", "py-*") for p in glob.glob(os.path.join(cache, pattern))]
+candidates = [p for pattern in ("bin-*", "target-*", "py-*", "node-*") for p in glob.glob(os.path.join(cache, pattern))]
 candidates.append(os.path.join(cache, "wt", "target"))
 entries = sorted((p for p in candidates if os.path.isdir(p) and p not in keep), key=used)
 total = size(cache)

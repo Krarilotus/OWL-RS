@@ -83,8 +83,8 @@ use nrese_exec::join::{
     left_join, outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, ChargedVec, Grant, IdTable, Reservation, UNDEF, computed_id,
-    computed_index,
+    Budget, BudgetExceeded, ChargedMap, ChargedVec, Grant, IdTable, Reservation, UNDEF,
+    computed_id, computed_index,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
@@ -218,27 +218,6 @@ fn run(
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pre_bound = options
-        .pre_bound
-        .as_ref()
-        .map(|values| match &ctx.canonical {
-            Some(names) => Cow::Owned(names.values(values)),
-            None => Cow::Borrowed(&**values),
-        });
-    let pattern = match &pre_bound {
-        Some(values) => {
-            // A blank node is put in as a made constant that stands for the node.
-            for term in values.values() {
-                if let Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values::new(&ctx, values)?.top(&pattern)
-        }
-        None => pattern,
-    };
     let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
     ctx.check()?;
     let outcome = match form {
@@ -508,13 +487,12 @@ pub(crate) fn delete_insert(
             },
         };
         let graph = |g: &GraphNamePattern| match g {
-            GraphNamePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                Some(nrese_rdf::GraphName::DefaultGraph)
-            }
-            GraphNamePattern::NamedNode(n) => Some(nrese_rdf::GraphName::from(n.clone())),
+            GraphNamePattern::NamedNode(n) => Some(crate::compat::graph_named(n).into_owned()),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
+            // A value bound to the graph slot names a store graph as a constant does
+            // (review r1, S2-F2), whatever bound it: VALUES, BIND, SERVICE or GRAPH ?g.
             GraphNamePattern::Variable(v) => match value(v)? {
-                Term::NamedNode(n) => Some(n.into()),
+                Term::NamedNode(n) => Some(crate::compat::graph_named(&n).into_owned()),
                 Term::BlankNode(b) => Some(b.into()),
                 Term::Literal(_) | Term::Triple(_) => None,
             },
@@ -569,7 +547,10 @@ type NativePattern<'q> = (
 );
 
 /// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
-/// query form, and the rewrites that changed it.
+/// query form, and the rewrites that changed it: the one preparation every delivery of the
+/// answer reads (results, typed results, the direct writer, EXPLAIN and its plan), so a
+/// request option holds in all of them. Pre-bound variables are put in last
+/// ([`substitute::Values::top`]), their blank nodes registered on `ctx`.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
@@ -604,6 +585,27 @@ fn native_pattern<'q>(
             }
         }
         _ => pattern,
+    };
+    let pre_bound = options
+        .pre_bound
+        .as_ref()
+        .map(|values| match &ctx.canonical {
+            Some(names) => Cow::Owned(names.values(values)),
+            None => Cow::Borrowed(&**values),
+        });
+    let pattern = match &pre_bound {
+        Some(values) => {
+            // A blank node is put in as a made constant that stands for the node.
+            for term in values.values() {
+                if let Term::BlankNode(b) = term
+                    && let Some(id) = ctx.snapshot.lookup(term.as_ref())
+                {
+                    ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
+                }
+            }
+            substitute::Values::new(ctx, values)?.top(&pattern)
+        }
+        None => pattern,
     };
     Ok((pattern, form, rewrites, ql_report))
 }
@@ -2281,16 +2283,16 @@ impl<'a> Context<'a> {
             // Jena's name for the default graph (`compat`): the store's default graph, where
             // it is in reach; for a reader who may not read it, absent as an unreadable named
             // graph is (below).
-            NamedNodePattern::NamedNode(n)
-                if crate::compat::names_default_graph(n.as_str()) && self.store_default =>
-            {
-                return self.in_graph(GraphScope::Default, inner);
-            }
             NamedNodePattern::NamedNode(n) => {
-                let id = (!crate::compat::names_default_graph(n.as_str()))
-                    .then(|| self.lookup_const(n.as_ref().into()))
-                    .flatten()
-                    .filter(|&id| self.is_named_graph(id));
+                let id = match crate::compat::graph_named(n) {
+                    nrese_rdf::GraphNameRef::DefaultGraph if self.store_default => {
+                        return self.in_graph(GraphScope::Default, inner);
+                    }
+                    nrese_rdf::GraphNameRef::DefaultGraph => None,
+                    _ => self
+                        .lookup_const(n.as_ref().into())
+                        .filter(|&id| self.is_named_graph(id)),
+                };
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
                     // No such graph in the dataset: no solutions, whatever the pattern
@@ -3778,18 +3780,29 @@ impl<'a> Context<'a> {
             return Ok(Vec::new());
         };
         let table = &solutions.table;
-        let mut described: HashSet<u64> = HashSet::new();
-        let mut todo = Vec::new();
-        let mut out = Vec::new();
+        let mut described = ChargedMap::new(&*self.budget);
+        let mut todo = ChargedVec::new(&*self.budget);
+        // The decoded payloads stay charged with the output, just as CONSTRUCT's do.
+        // One thread, with no sibling payload grant: the whole spare.
+        // Declared before `out` so the triples are freed before their payload charge.
+        let mut kept = Grant::with_workers(&*self.budget, 1);
+        let mut out = ChargedVec::new(&*self.budget);
         for row in 0..table.len() {
             self.check()?;
             for column in 0..table.width() {
                 let id = table.get(row, column);
-                if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
-                    todo.push(id);
+                if id != UNDEF
+                    && computed_index(id).is_none()
+                    && described
+                        .get_or_insert_with(id, || ())
+                        .map_err(QueryEvaluationError::MemoryLimit)?
+                        .1
+                {
+                    todo.push(id).map_err(QueryEvaluationError::MemoryLimit)?;
                 }
             }
-            while let Some(node) = todo.pop() {
+            while let Some(node) = todo.last().copied() {
+                todo.truncate(todo.len() - 1);
                 self.check()?;
                 let Some(subject) = self
                     .term(node)
@@ -3821,15 +3834,27 @@ impl<'a> Context<'a> {
                     ) else {
                         continue;
                     };
-                    if o.is_blank_node() && described.insert(o_id) {
-                        todo.push(o_id);
+                    if o.is_blank_node()
+                        && described
+                            .get_or_insert_with(o_id, || ())
+                            .map_err(QueryEvaluationError::MemoryLimit)?
+                            .1
+                    {
+                        todo.push(o_id).map_err(QueryEvaluationError::MemoryLimit)?;
                     }
-                    out.push(nrese_rdf::Triple::new(subject.clone(), p, o));
+                    let triple = nrese_rdf::Triple::new(subject.clone(), p, o);
+                    kept.take(triple_heap(&triple))
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
+                    out.push(triple)
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
                 }
                 self.consumed(statements);
             }
         }
         self.check()?;
+        let (out, capacity) = out.into_parts();
+        capacity.transfer();
+        kept.transfer();
         Ok(out)
     }
 
