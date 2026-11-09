@@ -69,25 +69,32 @@ const SENT_CONSTANT: &str = "urn:nrese:substituted-blank-node:";
 
 /// `pattern` as another endpoint can read it: each made variable renamed to one the
 /// pattern doesn't use, each made constant in its previous spelling ([`SENT_CONSTANT`]);
-/// with the names to read the endpoint's answer by ([`Sent::local`]). Unchanged, and
-/// nothing renamed, when the pattern holds no made name.
+/// with the names to read the endpoint's answer by ([`Sent::local`]). A blank node whose
+/// made variable ([`blank_variable`]) the pattern names too is written as that renamed
+/// variable, so the two stay one node. Unchanged, and nothing renamed, when the pattern
+/// holds no made name.
 pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
     // First what the pattern names, then the renames: a new name is clear of every one.
-    let mut made = false;
+    let mut made: HashSet<Variable> = HashSet::new();
+    let mut constants = false;
     let mut taken: HashSet<String> = HashSet::new();
     walk_mut(NodeMut::Pattern(&mut pattern), &mut |slot| match slot {
-        SlotMut::Variable(v) if is_variable(v) => made = true,
+        SlotMut::Variable(v) if is_variable(v) => {
+            made.insert(v.clone());
+        }
         SlotMut::Variable(v) => {
             taken.insert(v.as_str().to_owned());
         }
-        SlotMut::Iri(n) => made |= is_constant(n.as_str()),
+        SlotMut::Iri(n) => constants |= is_constant(n.as_str()),
+        SlotMut::Blank(_) => {}
     });
     let mut names: HashMap<Variable, Variable> = HashMap::new();
-    if made {
+    if !made.is_empty() || constants {
         let mut next = 0usize;
-        walk_mut(NodeMut::Pattern(&mut pattern), &mut |slot| match slot {
-            SlotMut::Variable(v) if is_variable(v) => {
-                let name = names.entry(v.clone()).or_insert_with(|| {
+        let mut rename = |v: &Variable| -> Variable {
+            names
+                .entry(v.clone())
+                .or_insert_with(|| {
                     loop {
                         let name = format!("_m{next}");
                         next += 1;
@@ -95,8 +102,21 @@ pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
                             break Variable::new_unchecked(name);
                         }
                     }
-                });
-                *v = name.clone();
+                })
+                .clone()
+        };
+        walk_mut(NodeMut::Pattern(&mut pattern), &mut |slot| match slot {
+            SlotMut::Variable(v) if is_variable(v) => {
+                let sent = rename(v);
+                *v = sent;
+            }
+            SlotMut::Blank(t) => {
+                if let TermPattern::BlankNode(b) = t {
+                    let v = blank_variable(b);
+                    if made.contains(&v) {
+                        *t = TermPattern::Variable(rename(&v));
+                    }
+                }
             }
             SlotMut::Iri(n) if is_constant(n.as_str()) => {
                 let key = n.as_str().trim_start().replace(' ', "-");
@@ -124,10 +144,12 @@ impl Sent {
     }
 }
 
-/// A place in the algebra that holds a variable or an IRI.
+/// A place in the algebra that holds a variable, an IRI, or a pattern's blank node (the
+/// whole term, to write a variable there).
 enum SlotMut<'a> {
     Variable(&'a mut Variable),
     Iri(&'a mut NamedNode),
+    Blank(&'a mut TermPattern),
 }
 
 /// Every variable and IRI of `node` and the nodes in it ([`NodeMut`]'s walk reaches every
@@ -213,6 +235,9 @@ fn triple_mut(t: &mut TriplePattern, f: &mut impl FnMut(SlotMut<'_>)) {
 }
 
 fn term_mut(t: &mut TermPattern, f: &mut impl FnMut(SlotMut<'_>)) {
+    if matches!(t, TermPattern::BlankNode(_)) {
+        return f(SlotMut::Blank(t));
+    }
     match t {
         TermPattern::Variable(v) => f(SlotMut::Variable(v)),
         TermPattern::NamedNode(n) => f(SlotMut::Iri(n)),
