@@ -424,7 +424,7 @@ impl Snapshot {
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
     ) -> Result<Vec<crate::TextMatch>, super::SearchRefused> {
-        let request = request_budget(budget);
+        let request = self.search_budget(budget);
         let corpus = self.text_corpus(Documents::Literals, model, scope, &request)?;
         let known = self.version.dictionary_len;
         let mut matches = self.search_corpus(Documents::Literals, query, &corpus, &request)?;
@@ -489,7 +489,7 @@ impl Snapshot {
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
     ) -> Result<Vec<crate::TextMatch>, super::SearchRefused> {
-        let request = request_budget(budget);
+        let request = self.search_budget(budget);
         let corpus = self.text_corpus(Documents::Subjects, model, scope, &request)?;
         let known = self.version.dictionary_len;
         let mut found = self.search_corpus(Documents::Subjects, query, &corpus, &request)?;
@@ -1043,6 +1043,25 @@ impl Snapshot {
         Ok(Some(OwnLengths { start, lengths }))
     }
 
+    /// The budget a text or IRI search's work is charged to: the request's where its caller
+    /// brings one. For a private snapshot otherwise its reader's (the budget a query
+    /// attached with [`Self::reading_within`]), else its private transaction's (the
+    /// overlay's, which its view holds as long as it lives); each kept value holds its charge
+    /// there (V3 review r1 B1: the global entry points brought none, and the work went
+    /// uncharged). A published snapshot's caller that brings none is unbounded, as before.
+    fn search_budget(&self, budget: Option<&Arc<nrese_exec::Budget>>) -> Arc<nrese_exec::Budget> {
+        if let Some(budget) = budget {
+            return Arc::clone(budget);
+        }
+        let Some(view) = self.own_view() else {
+            return request_budget(None);
+        };
+        match self.reads.as_ref().and_then(|reads| reads.0.as_ref()) {
+            Some(reads) => Arc::clone(&reads.budget),
+            None => Arc::clone(view.budget()),
+        }
+    }
+
     /// The overlay view of a private snapshot (its own terms); `None` for a published one.
     fn own_view(&self) -> Option<&crate::term::overlay::OverlayView> {
         match &self.vocabulary {
@@ -1298,5 +1317,79 @@ impl Snapshot {
                 .map(|(value, count)| (TermId::from_raw(value), count as u64))
                 .collect(),
         )
+    }
+}
+
+/// The own slot's losing builds (V3 review r1 F1, deterministic): two readers miss one
+/// entry before either keeps it, both build, both keep; the second gets the first's value,
+/// and its own value and its entry's charge are gone by the time `keep` returns. For a
+/// corpus and for a private snapshot's own-document index. No lock is held between the miss
+/// and the keep (each call takes and leaves it).
+#[cfg(test)]
+mod own_corpora_tests {
+    use super::*;
+
+    fn corpus(budget: &Arc<nrese_exec::Budget>) -> Corpus {
+        let mut bits = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), 4).unwrap();
+        bits.resize(4, 0b1011).unwrap();
+        Corpus::finish(&Bits::counted(bits, |_| 1), 256, budget).unwrap()
+    }
+
+    #[test]
+    fn a_losing_build_is_dropped_with_its_charge() {
+        let budget = Arc::new(nrese_exec::Budget::new(1 << 20));
+        let slot = OwnCorpora::default();
+        let scope = TextScope::EVERY;
+        let kind = KindRef {
+            documents: Documents::Literals,
+            model: ReadModel::Materialised,
+            scope: &scope,
+            equality: None,
+            canonical: false,
+        };
+        let identity = super::super::SnapshotIdentity {
+            revision: 0,
+            content: crate::engine::Content::fresh(),
+            equality: None,
+            canonical: false,
+        };
+        // Both miss, both build.
+        assert!(slot.corpus(kind, identity).is_none());
+        assert!(slot.corpus(kind, identity).is_none());
+        let none = budget.used();
+        let first = corpus(&budget);
+        let second = corpus(&budget);
+        let one_value = (budget.used() - none) / 2;
+        let first = slot.keep(kind, identity, first, &budget).unwrap();
+        let one_kept = budget.used();
+        let second = slot.keep(kind, identity, second, &budget).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the first value kept is kept");
+        assert_eq!(
+            budget.used(),
+            one_kept - one_value,
+            "the loser's value and its entry's charge are released"
+        );
+        let found = slot.corpus(kind, identity).unwrap();
+        assert!(Arc::ptr_eq(&found, &first));
+
+        // A private snapshot's own-document index beside that corpus, the same way.
+        let local = || {
+            crate::term::text::Local::build(std::iter::empty(), |_| true, false, None, &budget)
+                .unwrap()
+        };
+        assert!(slot.local(&first, None).is_none());
+        let (a, b) = (local(), local());
+        let a = slot.keep_local(&first, None, a, &budget).unwrap();
+        let before = budget.used();
+        let alone = local();
+        let one_local = budget.used() - before;
+        drop(alone);
+        let b = slot.keep_local(&first, None, b, &budget).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "the first index kept is kept");
+        assert_eq!(
+            budget.used(),
+            before - one_local,
+            "the losing index and its entry's charge are released"
+        );
     }
 }
