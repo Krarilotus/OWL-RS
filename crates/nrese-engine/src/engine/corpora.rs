@@ -167,17 +167,9 @@ impl KindRef<'_> {
         [&touched[..start], &touched[end..]]
     }
 
-    /// Whether [`Self::probed`] keeps `raw`, for terms not yet sorted.
-    fn probes(&self, raw: u64) -> bool {
-        self.reads_classes() || tag(raw) != BLANK
-    }
-
-    /// Whether this kind's reader may expand equality classes of IRIs (as
-    /// `Snapshot::corpus_classes` does where a class of two or more exists).
+    /// Whether this kind's reader may expand equality classes of IRIs ([`reads_classes`]).
     fn reads_classes(&self) -> bool {
-        self.documents == Documents::Subjects
-            && self.model != ReadModel::Asserted
-            && self.equality.is_some()
+        reads_classes(self.documents, self.model, self.equality)
     }
 
     /// How many of `touched` [`Self::probed`] keeps.
@@ -261,14 +253,28 @@ fn key_bytes(kind: KindRef<'_>) -> usize {
     std::mem::size_of::<Kept>() + graphs
 }
 
+/// Whether a corpus of `documents` in `model`, read with `equality`, may expand equality
+/// classes of IRIs (as `Snapshot::corpus_classes` does where a class of two or more
+/// exists): then a statement about a blank node or literal of a class changes the
+/// membership of the class's IRIs (sol-loop r1 R1-S1).
+fn reads_classes(documents: Documents, model: ReadModel, equality: Option<TermId>) -> bool {
+    documents == Documents::Subjects && model != ReadModel::Asserted && equality.is_some()
+}
+
 /// One step of the lineage: the content it was made from, the terms it touched (string
-/// and typed literals as objects, IRIs as subjects; raw ids, sorted) and the predicates of
-/// the statements it added or removed (raw ids, sorted), each on the store's budget. Its
-/// slots in the map and the order are charged with their storage ([`State::slots`]).
+/// and typed literals as objects, IRIs as subjects, and every other subject where
+/// `subjects`; raw ids, sorted) and the predicates of the statements it added or removed
+/// (raw ids, sorted), each on the store's budget. Its slots in the map and the order are
+/// charged with their storage ([`State::slots`]).
 struct Step {
     parent: Content,
     touched: Vec<u64>,
     predicates: Vec<u64>,
+    /// Whether `touched` holds every subject, not only the IRIs: recorded while a corpus
+    /// that reads equality classes is kept, and needed by one to derive across this step
+    /// (sol-loop r2 P1, `dictlc-p32-count4`: holding them always cost a commit of blank-node
+    /// statements 5 % more).
+    subjects: bool,
     _charges: [Reservation; 2],
 }
 
@@ -332,19 +338,22 @@ const BLANK: u64 = TermKind::BlankNode as u64;
 
 /// The terms of a statement whose membership it may change (raw ids): its object if a
 /// string literal or a typed one (a vector, for the corpora of vector searches), and its
-/// subject of any kind. A blank node's or literal's class can hold IRIs, which a reader of
-/// equality classes shows as subjects of the statement: the derivation expands each term to
-/// its class and keeps the identities the corpus's documents hold (sol-loop r1 R1-S1).
+/// subject if an IRI, or of any kind with `subjects`. A blank node's or literal's class can
+/// hold IRIs, which a reader of equality classes shows as subjects of the statement: the
+/// derivation expands each term to its class and keeps the identities the corpus's
+/// documents hold (sol-loop r1 R1-S1). No other corpus holds them.
 fn terms(
     subject: TermId,
     object: TermId,
+    subjects: bool,
 ) -> std::iter::Chain<std::option::IntoIter<u64>, std::option::IntoIter<u64>> {
     let object = matches!(
         object.kind(),
         TermKind::String | TermKind::LangString | TermKind::TypedLiteral
     )
     .then_some(object.raw());
-    object.into_iter().chain(Some(subject.raw()))
+    let subject = (subjects || subject.kind() == TermKind::Iri).then_some(subject.raw());
+    object.into_iter().chain(subject)
 }
 
 /// The most touched terms worth probing to derive a corpus of `documents` rather than
@@ -452,11 +461,13 @@ impl CorpusStore {
             return;
         }
         let n = statements.clone().count();
-        let terms = statements
-            .clone()
-            .flat_map(|(subject, _, object)| terms(subject, object));
-        let predicates = statements.map(|(_, predicate, _)| predicate.raw());
-        self.record_terms(parent, child, 2 * n, terms, n, predicates);
+        let touched = |subjects: bool| {
+            statements
+                .clone()
+                .flat_map(move |(subject, _, object)| terms(subject, object, subjects))
+        };
+        let predicates = statements.clone().map(|(_, predicate, _)| predicate.raw());
+        self.record_terms(parent, child, 2 * n, touched, n, predicates);
     }
 
     /// A step's terms and predicates, sorted, on `budget`.
@@ -506,6 +517,7 @@ impl CorpusStore {
         parent: Content,
         child: Content,
         (touched, predicates): (ChargedVec<u64>, ChargedVec<u64>),
+        subjects: bool,
     ) {
         let (touched, touched_charge) = touched.into_parts();
         let (predicates, predicates_charge) = predicates.into_parts();
@@ -515,6 +527,7 @@ impl CorpusStore {
                 parent,
                 touched,
                 predicates,
+                subjects,
                 _charges: [touched_charge, predicates_charge],
             },
         );
@@ -526,16 +539,19 @@ impl CorpusStore {
         Self::prune(state);
     }
 
-    /// Records that `child` was made from `parent` touching `terms` (at most `bound`) and
-    /// statements of `predicates` (at most `predicate_bound`), raw ids: charged to the
-    /// budget before they are allocated, the oldest steps let go for room; not recorded
-    /// where they don't fit (a search there walks).
-    fn record_terms(
+    /// Records that `child` was made from `parent` touching `terms(subjects)` (at most
+    /// `bound`) and statements of `predicates` (at most `predicate_bound`), raw ids: charged
+    /// to the budget before they are allocated, the oldest steps let go for room; not
+    /// recorded where they don't fit (a search there walks). `subjects`, whether every
+    /// subject is among the terms, holds where a kept corpus reads equality classes, read
+    /// under the state's lock with the step's insertion: a corpus kept later finds the step
+    /// without them, and walks past it ([`Self::find`]).
+    fn record_terms<T: IntoIterator<Item = u64>>(
         &self,
         parent: Content,
         child: Content,
         bound: usize,
-        terms: impl IntoIterator<Item = u64> + Clone,
+        terms: impl Fn(bool) -> T,
         predicate_bound: usize,
         predicates: impl IntoIterator<Item = u64> + Clone,
     ) {
@@ -551,6 +567,10 @@ impl CorpusStore {
             Self::forget_lineage(&mut state, &budget);
             return;
         }
+        let subjects = state
+            .kept
+            .iter()
+            .any(|k| reads_classes(k.kind.0, k.kind.1, k.kind.3));
         // A slot for it first; the oldest steps let go for room (they free slots).
         while !Self::room_for_step(&mut state, &budget) {
             if !Self::drop_oldest_step(&mut state) {
@@ -561,7 +581,7 @@ impl CorpusStore {
             let attempt = Self::charged_step(
                 &budget,
                 bound,
-                terms.clone(),
+                terms(subjects),
                 predicate_bound,
                 predicates.clone(),
             );
@@ -571,7 +591,7 @@ impl CorpusStore {
                 Err(_) => return,
             }
         };
-        self.insert_step(&mut state, parent, child, built);
+        self.insert_step(&mut state, parent, child, built, subjects);
     }
 
     /// Lets the lineage go, its storage freed before its charge is released; the next
@@ -685,6 +705,11 @@ impl CorpusStore {
         let (mut terms, mut count) = (0, 0);
         for step in up(&state.steps, content) {
             if same_as.is_some_and(|same_as| step.predicates.binary_search(&same_as).is_ok()) {
+                break;
+            }
+            // A step recorded while no corpus read classes lacks the other subjects such
+            // a reader's members change by: walked.
+            if kind.reads_classes() && !step.subjects {
                 break;
             }
             terms += kind.probed_len(&step.touched);
@@ -885,10 +910,11 @@ impl CorpusStore {
             return None;
         }
         let bound: usize = extra.iter().map(|run| 2 * run.entries() as usize).sum();
+        // Every subject only for a reader of classes: no other corpus holds a blank node.
+        let subjects = kind.reads_classes();
         let all = extra.iter().flat_map(|run| {
             run.statements()
-                .flat_map(|[s, _, o, _]| terms(TermId::from_raw(s), TermId::from_raw(o)))
-                .filter(|&raw| kind.probes(raw))
+                .flat_map(|[s, _, o, _]| terms(TermId::from_raw(s), TermId::from_raw(o), subjects))
         });
         // Where the request has no room for the touched terms, the walk is the way left (it
         // charges what it needs itself).
