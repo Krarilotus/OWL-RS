@@ -3,7 +3,7 @@
 `verify.py` drives a real nrese-server through a scenario file and keeps the evidence: how agents
 prove HTTP-level behaviour instead of claiming it. The skill (when and where to run it, how to
 cite it): [../../.claude/skills/verify/SKILL.md](../../.claude/skills/verify/SKILL.md). The phases,
-the commands and the exit codes: `verify.py`'s docstring (`python scripts/verify/verify.py -h`).
+the commands and the exit codes: `verify.py`'s docstring (`uv run python scripts/verify/verify.py -h`).
 
 | File | What |
 |---|---|
