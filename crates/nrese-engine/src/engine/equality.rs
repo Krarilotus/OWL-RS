@@ -1319,13 +1319,13 @@ mod tests {
     /// finishing a class is split): a counted read's cold class build finishes its classes
     /// within its visitor's interval. One asserted chain of three intervals of identities, one
     /// class built one identity at a time, and one statement about its representative: between
-    /// two asks of the visitor, and after the last, the read handles at most two intervals of
-    /// scan steps, runs, copies and finished identities. Finishing the class after one count
-    /// of it (its members copied, checked for literals and indexed), it handled three times the
-    /// class unseen.
+    /// two asks of the visitor, and after the last, the read does at most an interval of work
+    /// (`work`: fix check r2 G2, the bound itself). Finishing the class after one count of it
+    /// (its members copied, checked for literals and indexed), it handled three times the class
+    /// unseen; with its scan and its unions counted on two credits, each within its own run,
+    /// both runs' work followed a yes (fix check r2 G1).
     #[test]
     fn a_counted_class_build_finishes_its_class_within_its_visitor_s_interval() {
-        use crate::witness::{self, Site};
         let interval = u64::from(nrese_exec::POLL_UNITS);
         let n = 3 * interval as usize;
         let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
@@ -1364,17 +1364,6 @@ mod tests {
             predicate: Some(p),
             ..QuadPattern::all()
         };
-        let work = || {
-            [
-                Site::ScanSteps,
-                Site::RunProbes,
-                Site::ExpandCopies,
-                Site::ClassFinish,
-            ]
-            .into_iter()
-            .map(witness::get)
-            .sum::<u64>()
-        };
         let last = std::cell::Cell::new(work());
         let largest = std::cell::Cell::new(0);
         let gap = || {
@@ -1395,15 +1384,15 @@ mod tests {
         );
         let largest = largest.get();
         assert!(
-            largest <= 2 * interval,
-            "{largest} units of work between two asks of the visitor: at most {}",
-            2 * interval
+            largest <= interval,
+            "{largest} units of work between two asks of the visitor: at most {interval}"
         );
     }
 
-    /// The work a counted class build does, counted where it is done: scan steps and runs,
-    /// copies, finished identities, sort work and the union kernel's member moves (fix check r1
-    /// F3: not what the build told its visitor).
+    /// The work a counted class build does, counted where it is done: scan steps and runs, their
+    /// searches' comparisons and their merges' work, copies, finished identities, sort work, and
+    /// the union kernel's member moves and the slots its enumeration walks (fix check r1 F3, r2
+    /// G2: not what the build told its visitor).
     fn work() -> u64 {
         use crate::witness::{self, Site};
         [
@@ -1412,11 +1401,14 @@ mod tests {
             Site::ExpandCopies,
             Site::ClassFinish,
             Site::SortWork,
+            Site::SearchWork,
+            Site::MergeWork,
         ]
         .into_iter()
         .map(witness::get)
         .sum::<u64>()
             + nrese_exec::classes::witness::moved()
+            + nrese_exec::classes::witness::examined()
     }
 
     /// A snapshot under equality whose default graph holds `same_as` statements between the
@@ -1490,7 +1482,8 @@ mod tests {
     /// Spec (`crate::visit`: after its visitor's last yes a counted read does at most a run of
     /// work, then stops at its next call; review r1 R1, fix check r1 F3): a counted read's cold
     /// class build, stopped after its visitor's k-th yes for every k until it finishes, answers
-    /// `Stopped` and does at most two intervals of work after any yes. Then, not stopped, it
+    /// `Stopped` and does at most an interval of work after any yes (fix check r2 G2: the
+    /// bound itself, `POLL_UNITS`). Then, not stopped, it
     /// answers every copy. Work is counted where it is done (`work`). Map initialisation, held
     /// for the owner (fix check r1 F2), is not counted.
     fn a_cold_class_build_stops_within_an_interval_of_any_yes(
@@ -1506,7 +1499,7 @@ mod tests {
         let mut over = Vec::new();
         for yeses in 0.. {
             let (answer, largest) = stopped_after(&snapshot, &pattern, yeses);
-            if largest > 2 * interval {
+            if largest > interval {
                 over.push((yeses, largest));
             }
             match answer {
@@ -1519,8 +1512,7 @@ mod tests {
         }
         assert!(
             over.is_empty(),
-            "units of work after a yes, past {} (stopped after, units): {over:?}",
-            2 * interval
+            "units of work after a yes, past {interval} (stopped after, units): {over:?}"
         );
     }
 
@@ -1550,6 +1542,29 @@ mod tests {
         );
     }
 
+    /// REAS-3a fix check r2 G3. Three intervals of classes of two, then each joined to a hub
+    /// interned last (so its statements come last in the scan): the union kernel's table of roots
+    /// held three intervals of classes and keeps one. Enumerating the classes walked the table's
+    /// slots, three intervals of them, before the finish's first ask.
+    #[test]
+    fn classes_joined_into_one_enumerate_within_an_interval_of_any_yes() {
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let names: Vec<String> = (0..n)
+            .flat_map(|i| [format!("c{i}"), format!("d{i}")])
+            .chain(["hub".to_owned()])
+            .collect();
+        let hub = 2 * n;
+        let same_as: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| [(2 * i, 2 * i + 1), (hub, 2 * i)])
+            .collect();
+        a_cold_class_build_stops_within_an_interval_of_any_yes(
+            &names,
+            &same_as,
+            0,
+            2 * n as u64 + 1,
+        );
+    }
+
     /// REAS-3a fix check r1 F3, the many-small-classes shape: three intervals of classes of two.
     #[test]
     fn many_small_classes_stop_within_an_interval_of_any_yes() {
@@ -1559,5 +1574,149 @@ mod tests {
             .collect();
         let same_as: Vec<(usize, usize)> = (0..n).map(|i| (2 * i, 2 * i + 1)).collect();
         a_cold_class_build_stops_within_an_interval_of_any_yes(&names, &same_as, 0, 2);
+    }
+
+    /// The most work `read` does between two asks of its visitor, which always answers yes, or
+    /// after the last until it returns.
+    fn largest_gap(read: impl FnOnce(crate::visit::Visitor<'_>)) -> u64 {
+        let last = std::cell::Cell::new(work());
+        let largest = std::cell::Cell::new(0);
+        let gap = || {
+            let now = work();
+            largest.set(largest.get().max(now - last.replace(now)));
+        };
+        read(&|_| {
+            gap();
+            true
+        });
+        gap();
+        largest.get()
+    }
+
+    fn node(name: &str) -> nrese_rdf::NamedNode {
+        nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"))
+    }
+
+    fn statement(s: &str, p: &str, o: &str) -> nrese_rdf::Quad {
+        nrese_rdf::Quad::new(
+            node(s),
+            node(p),
+            node(o),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+    }
+
+    /// REAS-3a fix check r2, G1's sibling in an expansion (`Expand`). Spec (`crate::visit`: at
+    /// most an interval of work after any yes): a counted sorted read under equality does at most
+    /// an interval of work between two asks of its visitor, its stored scan's steps and its
+    /// copies together, and answers as the plain read does. Every quad, read by SPOG: a class of
+    /// three first in the order (`rep`, then two aliases interned after it) and six intervals of
+    /// statements `rep p o_i`: every alias's copy waits for the input's end, so the expansion
+    /// asks for full runs. Its scan's ledger and its own credit each allowed a run after the
+    /// same yes.
+    #[test]
+    fn an_expanded_read_steps_and_copies_within_an_interval_of_any_yes() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 6 * interval as usize;
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let rep = tx.intern(node("rep").as_ref().into());
+        let aliases = ["alias1", "alias2"].map(|alias| tx.intern(node(alias).as_ref().into()));
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        for alias in aliases {
+            tx.insert_inferred(crate::EncodedTriple {
+                subject: alias,
+                predicate: same_as,
+                object: rep,
+            });
+        }
+        for i in 0..n {
+            tx.insert(statement("rep", "p", &format!("o{i}")).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
+        let plain: Vec<_> = snapshot
+            .scan_sorted_in(model, &pattern, Permutation::Spog)
+            .expect("SPOG answers it")
+            .collect();
+        assert!(plain.len() >= 3 * n, "each statement's three copies");
+        let mut read: Vec<EncodedQuad> = Vec::new();
+        let largest = largest_gap(|visit| {
+            read = snapshot
+                .counted()
+                .scan_sorted(model, &pattern, Permutation::Spog, visit)
+                .expect("SPOG answers it")
+                .collect::<Result<_, _>>()
+                .expect("never stopped");
+        });
+        assert_eq!(read, plain, "the plain read's quads, in its order");
+        assert!(
+            largest <= interval,
+            "{largest} units of work between two asks of the visitor: at most {interval}"
+        );
+    }
+
+    /// REAS-3a fix check r2, G1's sibling in a sorted read without equality. Spec
+    /// (`crate::visit`): a counted sorted read of both stacks does at most an interval of work
+    /// between two asks of its visitor, and answers as the plain read does. Every quad, read by
+    /// SPOG: three intervals of statements in each stack, their objects alternating, so the merge steps both scans in
+    /// turn. Each scan's ledger allowed a run after the same yes.
+    #[test]
+    fn a_sorted_read_of_both_stacks_steps_within_an_interval_of_any_yes() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 3 * interval as usize;
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let (s, p) = (
+            tx.intern(node("s").as_ref().into()),
+            tx.intern(node("p").as_ref().into()),
+        );
+        for i in 0..2 * n {
+            let o = tx.intern(node(&format!("o{i}")).as_ref().into());
+            match i % 2 {
+                0 => {
+                    tx.insert(statement("s", "p", &format!("o{i}")).as_ref());
+                }
+                _ => {
+                    tx.insert_inferred(crate::EncodedTriple {
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                    });
+                }
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
+        let plain: Vec<_> = snapshot
+            .scan_sorted_in(model, &pattern, Permutation::Spog)
+            .expect("SPOG answers it")
+            .collect();
+        assert_eq!(plain.len(), 2 * n, "both stacks' statements");
+        let mut read: Vec<EncodedQuad> = Vec::new();
+        let largest = largest_gap(|visit| {
+            read = snapshot
+                .counted()
+                .scan_sorted(model, &pattern, Permutation::Spog, visit)
+                .expect("SPOG answers it")
+                .collect::<Result<_, _>>()
+                .expect("never stopped");
+        });
+        assert_eq!(read, plain, "the plain read's quads, in its order");
+        assert!(
+            largest <= interval,
+            "{largest} units of work between two asks of the visitor: at most {interval}"
+        );
     }
 }

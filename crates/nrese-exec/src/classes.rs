@@ -23,15 +23,25 @@ pub mod witness {
 
     thread_local! {
         static MOVED: Cell<u64> = const { Cell::new(0) };
+        static EXAMINED: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(crate) fn add(n: u64) {
         MOVED.with(|moved| moved.set(moved.get() + n));
     }
 
+    pub(crate) fn examine(n: u64) {
+        EXAMINED.with(|examined| examined.set(examined.get() + n));
+    }
+
     /// The members unions have moved on this thread so far.
     pub fn moved() -> u64 {
         MOVED.with(Cell::get)
+    }
+
+    /// The slots enumerations of classes have walked on this thread so far (fix check r2 G3).
+    pub fn examined() -> u64 {
+        EXAMINED.with(Cell::get)
     }
 }
 
@@ -101,9 +111,16 @@ impl Classes {
     /// The classes of two or more ids: representative and members (in no particular
     /// order).
     pub fn classes(&self) -> impl Iterator<Item = (u64, &[u64])> {
-        self.roots
-            .values()
-            .map(|(representative, members)| (*representative, members.as_slice()))
+        // A hash map's iterator walks its whole table of slots, however few are full
+        // (hashbrown's `RawIterRange`): its capacity over its classes, slots per class yielded
+        // (fix check r2 G3).
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        let walked = self.roots.capacity().div_ceil(self.roots.len().max(1)) as u64;
+        self.roots.values().map(move |(representative, members)| {
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            witness::examine(walked);
+            (*representative, members.as_slice())
+        })
     }
 
     pub fn is_empty(&self) -> bool {
