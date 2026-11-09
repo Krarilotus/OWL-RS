@@ -249,6 +249,21 @@ console() {
   step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
 }
 
+# A full tier uses the declared cargo-deny release; installing it belongs to prerequisites.
+deny_version() {
+  local want got
+  want=$(sed -n 's/^cargo-deny //p' scripts/lib/gate-tools.txt | tr -d '\r')
+  got=$(cargo deny --version 2> /dev/null) || {
+    echo "cargo-deny unavailable; required ${want:-missing pin} (scripts/lib/gate-tools.txt)" >&2
+    return 1
+  }
+  got=$(printf '%s\n' "$got" | awk 'NR == 1 { print $2 }' | tr -d '\r')
+  if [ -z "$want" ] || [ "$got" != "$want" ]; then
+    echo "cargo-deny version ${got:-unknown}; required ${want:-missing pin} (scripts/lib/gate-tools.txt)" >&2
+    return 1
+  fi
+}
+
 # Whether nrese-exec differs from where this branch left refactor/engine-v2, committed or
 # not (Miri's step): the upstream or the last commit alone would miss earlier commits of a
 # branch that has none. Without that history, it is taken to differ.
@@ -320,7 +335,7 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   fi
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
-  identity=$(gate_identity) || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
+  identity=$(gate_identity "$push_commit") || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
   # The Windows part's pass belongs to the commit's inputs, not its tree: a later commit with the
   # same inputs carries it (scripts/lib/gate-key.sh windows_inputs), and its record names the commit.
   keyed=$tree on=""
@@ -466,13 +481,10 @@ case "$mode" in
     step locks bash scripts/check-locks.sh
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
     step names bash scripts/check-names.sh
-    if cargo deny --version > /dev/null 2>&1; then
-      step deny cargo deny --all-features check
-      step "deny (bench harness)" cargo deny --manifest-path benches/nrese-bench-harness/Cargo.toml \
-        --config deny.toml --all-features check
-    else
-      echo "=== cargo-deny isn't installed (cargo install --locked cargo-deny): skipped"
-    fi
+    step "cargo-deny version" deny_version
+    step deny cargo deny --all-features check
+    step "deny (bench harness)" cargo deny --manifest-path benches/nrese-bench-harness/Cargo.toml \
+      --config deny.toml --all-features check
     console
     ;;
   *)

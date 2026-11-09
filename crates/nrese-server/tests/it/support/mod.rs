@@ -124,11 +124,11 @@ pub async fn body_text(
     Ok(String::from_utf8(body.to_vec())?)
 }
 
-pub async fn readyz_text(app: axum::Router) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn dataset_info_text(app: axum::Router) -> Result<String, Box<dyn std::error::Error>> {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/readyz")
+                .uri("/dataset/info")
                 .method(Method::GET)
                 .body(Body::empty())?,
         )

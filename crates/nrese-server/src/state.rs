@@ -304,11 +304,23 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// The repository's settings and the reasoning mode in effect, as the catalogue
+    /// published them together ([`crate::repositories::Repository::observe`]): never a
+    /// change's new settings beside its old reasoning, or the reverse. `None` once it is
+    /// removed (or can't serve).
+    pub fn observe_repository(
+        &self,
+    ) -> Option<(crate::repository_config::RepositorySettings, &'static str)> {
+        self.repositories
+            .observe(self.repository_id())
+            .map(|(settings, pipeline)| (settings, pipeline.reasoner().mode_name()))
+    }
+
     /// Changes this state's repository's settings to what `edit` makes of those current
     /// when the change applies ([`crate::repositories::Catalog::patch`]): its title, and
     /// its reasoning, which takes effect at once (the inferences are recomputed). The
-    /// default repository's are kept in the data directory (on disk) and override the
-    /// configuration's reasoning at the next start.
+    /// default repository's are kept in the data directory (on disk) and are in effect for it
+    /// after a restart too; the configured reasoning stays the other repositories'.
     pub fn patch_repository_settings(
         &self,
         edit: impl FnOnce(

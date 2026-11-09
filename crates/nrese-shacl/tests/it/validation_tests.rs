@@ -64,6 +64,25 @@ fn compiled(snapshot: &Snapshot) -> Shapes {
 
 const DEFAULT: Selection = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
 
+// Spec: SHACL node kinds containing Literal do not accept an RDF 1.2 triple term.
+#[test]
+fn d066_f1_triple_term_is_not_a_literal_node_kind() {
+    for kind in ["Literal", "BlankNodeOrLiteral", "IRIOrLiteral"] {
+        let store = engine(
+            "ex:s ex:p <<( ex:a ex:b ex:c )>> .",
+            &format!("ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:nodeKind sh:{kind} ."),
+        );
+        let snapshot = store.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(!report.conforms(), "a triple term is not sh:{kind}");
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(
+            report.results[0].component.as_str(),
+            Component::NodeKind.iri()
+        );
+    }
+}
+
 fn ex(local: &str) -> String {
     format!("<http://example.com/{local}>")
 }
@@ -558,6 +577,53 @@ fn a_component_constrains_once_per_combination_of_its_parameter_values() {
     let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.results.len(), 3, "{:?}", report.results);
+}
+
+/// `Shapes::uses_sparql` (Q07): a store confines a restricted reader's validation to its
+/// graphs through the view's quad reads, which SHACL-SPARQL's queries bypass. Each form,
+/// nested and deactivated shapes say so; SHACL Core alone doesn't.
+#[test]
+fn shapes_tell_whether_any_constraint_is_a_sparql_query() {
+    let component = "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:p1 ] ;
+        sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK { FILTER (true) }''' ] .";
+    let select = "sh:sparql [ sh:select 'SELECT $this WHERE { FILTER (false) }' ]";
+    let cases = [
+        (
+            "core only",
+            "ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; sh:minCount 1 ] .".to_owned(),
+            false,
+        ),
+        (
+            "sh:sparql",
+            format!("ex:S sh:targetNode ex:a ; {select} ."),
+            true,
+        ),
+        (
+            "component",
+            format!("{component} ex:S sh:targetNode ex:a ; ex:p1 1 ."),
+            true,
+        ),
+        (
+            "nested in sh:node",
+            format!("ex:S sh:targetNode ex:a ; sh:node ex:N . ex:N {select} ."),
+            true,
+        ),
+        (
+            "nested in sh:property",
+            format!("ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; {select} ] ."),
+            true,
+        ),
+        (
+            "deactivated",
+            format!("ex:S sh:targetNode ex:a ; sh:deactivated true ; {select} ."),
+            true,
+        ),
+    ];
+    for (case, shapes, expected) in cases {
+        let engine = engine("ex:a ex:p ex:b .", &shapes);
+        let snapshot = engine.snapshot();
+        assert_eq!(compiled(&snapshot).uses_sparql(), expected, "{case}");
+    }
 }
 
 /// Shapes with a constraint component of `parameters` parameters, `values` values each on

@@ -17,7 +17,7 @@ pub(crate) fn graph_exists(
     model: ReadModel,
 ) -> StoreResult<bool> {
     let pattern = target.pattern_in(view)?;
-    Ok(matches!(target, GraphTarget::DefaultGraph)
+    Ok(matches!(target.resolved()?, GraphTarget::DefaultGraph)
         || pattern.is_some_and(|p| view.quads_for_pattern_in(model, &p).next().is_some()))
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn apply_graph_write(
         BlankNodes::Fresh,
     )?;
     let existing = request.target.pattern_in(&*tx)?;
-    let created = match (&request.target, existing) {
+    let created = match (request.target.resolved()?, existing) {
         (GraphTarget::DefaultGraph, _) => false,
         (GraphTarget::NamedGraph(_), Some(pattern)) => {
             tx.quads_for_pattern(&pattern).next().is_none()

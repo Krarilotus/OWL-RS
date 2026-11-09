@@ -49,8 +49,8 @@ use rayon::prelude::*;
 use self::found::Found;
 use super::batch::Store;
 use super::eval::{
-    GroundProgram, Grounding, Job, NEVER, OperationStop, Poller, Seg, Source, Stop, derivations,
-    instantiate_head, transitivity,
+    GroundProgram, Grounding, Job, NEVER, OperationStop, Poller, Probe, Seg, Source, Stop,
+    Stopped as ReadStopped, Visit, Visits, derivations, instantiate_head, transitivity,
 };
 use super::ir::{Head, Rule, Triple};
 
@@ -110,6 +110,18 @@ pub enum Stopped {
     /// Its working budget ([`Limits::scratch`]) had no room for a round's derivations: they
     /// weren't allocated.
     Refused(BudgetExceeded),
+}
+
+// A read its poller stopped ([`ReadStopped`]) has no `From` here: a run's pollers stop on
+// its caller's stop, the process's memory and another morsel's latched refusal alike
+// (`Run::fired`), so each such read takes the run's own cause, `Run::stopped` (REAS-2 fix
+// check r1, B11: a refusal read as a cancel would lose the store's `Unavailable::Memory`).
+
+/// A budget refusal keeps its cause through a lookup's `?` ([`Lookup::sets_of`]).
+impl From<BudgetExceeded> for Stopped {
+    fn from(exceeded: BudgetExceeded) -> Self {
+        Self::Refused(exceeded)
+    }
 }
 
 impl Stopped {
@@ -184,6 +196,12 @@ impl<'a> Run<'a> {
     /// ([`Poller`]).
     fn fired(&self) -> bool {
         self.refused.load(Ordering::Relaxed) || self.stop.fired()
+    }
+
+    /// Whether the run has stopped already (a latched stop or refusal): atomic loads only,
+    /// no poll, for a per-fact check ([`merge`]).
+    fn latched(&self) -> bool {
+        self.refused.load(Ordering::Relaxed) || self.stop.latched()
     }
 
     /// A charge to its working budget was refused: the run stops, its other morsels at
@@ -353,47 +371,83 @@ struct Changed<'a, S: ?Sized> {
     changed: &'a Store,
 }
 
-impl<S: Source + ?Sized> Source for Changed<'_, S> {
-    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+/// Reads count on the inner sources'.
+impl<S: Source + ?Sized> Visits for Changed<'_, S> {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
         match seg.plain() {
-            Seg::Old | Seg::All => self.all.scan(pattern, Seg::All, f),
-            _ => self.changed.scan(pattern, Seg::All, f),
+            // The inner scan counts each position it visits on this visit's poller; stopped,
+            // the read around this visit answers `Stopped` (the poller is latched).
+            Seg::Old | Seg::All => {
+                let scanned = self
+                    .all
+                    .scan(pattern, Seg::All, visit.poller(), &mut |fact| {
+                        visit.counted(fact)
+                    });
+                debug_assert!(scanned.is_ok() || visit.stopped());
+            }
+            _ => self.changed.visit(pattern, Seg::All, visit),
         }
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, ReadStopped> {
         match seg.plain() {
-            Seg::Old | Seg::All => self.all.estimate(pattern, Seg::All),
-            _ => self.changed.estimate(pattern, Seg::All),
+            Seg::Old | Seg::All => self.all.estimate(pattern, Seg::All, probe.poller()),
+            _ => self.changed.size(pattern, Seg::All, probe),
         }
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.all.contains(fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+        self.all.contains(fact, probe.poller())
     }
 }
 
 /// Where facts are asserted, as an evaluation asks it: read where it is kept, never copied
-/// into a list per question (fix check r2, C1.b residual).
+/// into a list per question (fix check r2, C1.b residual). Each question is read on the
+/// reading task's poller (REAS-2, sweep M16): the call is counted before any lookup, then
+/// each graph handed on; on a stopped poller nothing more is read and the read answers
+/// [`ReadStopped`], never a partial list or a "no" (fix check r1, rule 2).
 pub trait Graphs: Sync {
     /// Calls `graph` with each graph that asserts `fact` (none for a fact only inferred), in
-    /// any order, the same ones each time it is asked.
-    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32));
+    /// any order, the same ones each time it is asked; `Err` if its poller stopped it, the
+    /// graphs handed on so far a part of them.
+    fn each(
+        &self,
+        fact: Triple,
+        poll: &Poller<'_>,
+        graph: &mut dyn FnMut(u32),
+    ) -> Result<(), ReadStopped>;
 
     /// Whether `graph` asserts `fact`.
-    fn holds(&self, fact: Triple, graph: u32) -> bool;
+    fn holds(&self, fact: Triple, graph: u32, poll: &Poller<'_>) -> Result<bool, ReadStopped>;
 }
 
-/// At most one graph a fact (`None`: in none), as a function gives it.
+/// At most one graph a fact (`None`: in none), as a function gives it: one unit a call.
 impl<F: Fn(Triple) -> Option<u32> + Sync> Graphs for F {
-    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32)) {
+    fn each(
+        &self,
+        fact: Triple,
+        poll: &Poller<'_>,
+        graph: &mut dyn FnMut(u32),
+    ) -> Result<(), ReadStopped> {
+        if poll.tick() {
+            return Err(ReadStopped);
+        }
         if let Some(one) = self(fact) {
             graph(one);
         }
+        Ok(())
     }
 
-    fn holds(&self, fact: Triple, graph: u32) -> bool {
-        self(fact) == Some(graph)
+    fn holds(&self, fact: Triple, graph: u32, poll: &Poller<'_>) -> Result<bool, ReadStopped> {
+        if poll.tick() {
+            return Err(ReadStopped);
+        }
+        Ok(self(fact) == Some(graph))
     }
 }
 
@@ -410,24 +464,40 @@ impl InGraphs<'_> {
     }
 }
 
+/// The call counted, then the fact's entries as they are handed on (review r1 F1).
 impl Graphs for InGraphs<'_> {
-    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32)) {
-        self.of(fact).iter().for_each(|&(_, g)| graph(g));
+    fn each(
+        &self,
+        fact: Triple,
+        poll: &Poller<'_>,
+        graph: &mut dyn FnMut(u32),
+    ) -> Result<(), ReadStopped> {
+        if poll.tick() {
+            return Err(ReadStopped);
+        }
+        poll.counted(self.of(fact)).for_each(|&(_, g)| graph(g));
+        poll.ended()
     }
 
-    fn holds(&self, fact: Triple, graph: u32) -> bool {
-        self.of(fact)
+    /// One search in the fact's entries: the call's count is its work.
+    fn holds(&self, fact: Triple, graph: u32, poll: &Poller<'_>) -> Result<bool, ReadStopped> {
+        if poll.tick() {
+            return Err(ReadStopped);
+        }
+        Ok(self
+            .of(fact)
             .binary_search_by_key(&graph, |&(_, g)| g)
-            .is_ok()
+            .is_ok())
     }
 }
 
-/// `fact`'s graphs in a list: for the sets an evaluation keeps (its result, under the W1
-/// exemption of the module doc), never for a lookup's.
-fn listed(graphs: &dyn Graphs, fact: Triple) -> Vec<u32> {
+/// `fact`'s graphs in a list, read on `poll`: for the sets an evaluation keeps (its result,
+/// under the W1 exemption of the module doc), never for a lookup's. `Err`, the partial list
+/// dropped, where its poller stopped the read.
+fn listed(graphs: &dyn Graphs, fact: Triple, poll: &Poller<'_>) -> Result<Vec<u32>, ReadStopped> {
     let mut list = Vec::new();
-    graphs.each(fact, &mut |graph| list.push(graph));
-    list
+    graphs.each(fact, poll, &mut |graph| list.push(graph))?;
+    Ok(list)
 }
 
 /// A fact's sets where its caller keeps them, read by reference: a list, or the entries of
@@ -524,9 +594,11 @@ pub enum Previous<'k> {
 
 /// The sets of facts as an evaluation reads them: `None` for a fact without sets yet. Read
 /// where they are kept; made under the run's charge where nothing is kept ([`Looked`]),
-/// `Err` where that is refused.
+/// [`Stopped::Refused`] where that is refused. A store's answer is read on the reading
+/// task's poller (REAS-2, sweep M14): [`Stopped::Cancelled`] where that stopped it, never a
+/// "no sets" (fix check r1, rule 2).
 trait Lookup<'r>: Sync {
-    fn sets_of(&self, fact: &Triple) -> Result<Option<Looked<'_, 'r>>, BudgetExceeded>;
+    fn sets_of(&self, fact: &Triple, poll: &Poller<'_>) -> Result<Option<Looked<'_, 'r>>, Stopped>;
 }
 
 /// The sets a lookup found.
@@ -553,8 +625,9 @@ impl Looked<'_, '_> {
     }
 }
 
+/// An in-memory map: one lookup, which the reading derivation already counted.
 impl<'r> Lookup<'r> for HashMap<Triple, Annotation> {
-    fn sets_of(&self, fact: &Triple) -> Result<Option<Looked<'_, 'r>>, BudgetExceeded> {
+    fn sets_of(&self, fact: &Triple, _: &Poller<'_>) -> Result<Option<Looked<'_, 'r>>, Stopped> {
         Ok(self.get(fact).map(|found| Looked::Kept(Sets::of(found))))
     }
 }
@@ -565,7 +638,7 @@ impl<'r> Lookup<'r> for HashMap<Triple, Annotation> {
 struct Recomputing<'a, 'p, 'r> {
     now: &'a HashMap<Triple, Annotation>,
     affected: &'a HashSet<Triple>,
-    previous: &'a (dyn Fn(Triple) -> Previous<'p> + Sync),
+    previous: &'a (dyn Fn(Triple, &Poller<'_>) -> Result<Previous<'p>, ReadStopped> + Sync),
     graphs: &'a dyn Graphs,
     axioms: &'a [Triple],
     cap: usize,
@@ -573,13 +646,13 @@ struct Recomputing<'a, 'p, 'r> {
 }
 
 impl<'r> Lookup<'r> for Recomputing<'_, '_, 'r> {
-    fn sets_of(&self, fact: &Triple) -> Result<Option<Looked<'_, 'r>>, BudgetExceeded> {
+    fn sets_of(&self, fact: &Triple, poll: &Poller<'_>) -> Result<Option<Looked<'_, 'r>>, Stopped> {
         if self.affected.contains(fact) {
-            return self.now.sets_of(fact);
+            return self.now.sets_of(fact, poll);
         }
-        match (self.previous)(*fact) {
+        match (self.previous)(*fact, poll).map_err(|_| self.run.stopped())? {
             Previous::Sets(sets) => Ok((!sets.is_empty()).then_some(Looked::Kept(sets))),
-            Previous::Own => own_sets(*fact, self.graphs, self.axioms, self.cap, self.run),
+            Previous::Own => own_sets(*fact, self.graphs, self.axioms, self.cap, self.run, poll),
         }
     }
 }
@@ -592,14 +665,17 @@ const OWN_READ_ONCE: usize = 64;
 /// The sets `fact` starts with ([`initial_sets`] of its graphs; the empty set for an axiom,
 /// one of `axioms`, sorted), made for a lookup: one graph's set held inline is made with
 /// nothing allocated; any more are charged to `run` before they are made (fix check r2,
-/// C1.b residual). `None` where it has none.
+/// C1.b residual). `None` where it has none. Its graphs are read on `poll`; where that
+/// stopped a read, [`Stopped::Cancelled`], before any set is made from a partly read list
+/// (fix check r1, B11).
 fn own_sets<'k, 'r>(
     fact: Triple,
     graphs: &dyn Graphs,
     axioms: &[Triple],
     cap: usize,
     run: &Run<'r>,
-) -> Result<Option<Looked<'k, 'r>>, BudgetExceeded> {
+    poll: &Poller<'_>,
+) -> Result<Option<Looked<'k, 'r>>, Stopped> {
     if axioms.binary_search(&fact).is_ok() {
         return Ok(Some(Looked::One(GraphSet::default())));
     }
@@ -608,13 +684,15 @@ fn own_sets<'k, 'r>(
     // `p2c5-r4-memcount3-caded3cf`).
     let mut seen = [0u32; OWN_READ_ONCE];
     let (mut n, mut words) = (0usize, 0usize);
-    graphs.each(fact, &mut |graph| {
-        if let Some(slot) = seen.get_mut(n) {
-            *slot = graph;
-        }
-        n += 1;
-        words = words.saturating_add(GraphSet::heap_bytes_of(graph));
-    });
+    graphs
+        .each(fact, poll, &mut |graph| {
+            if let Some(slot) = seen.get_mut(n) {
+                *slot = graph;
+            }
+            n += 1;
+            words = words.saturating_add(GraphSet::heap_bytes_of(graph));
+        })
+        .map_err(|_| run.stopped())?;
     match n {
         0 => Ok(None),
         1 if words == 0 && cap > 0 => Ok(Some(Looked::One(GraphSet::of(seen[0])))),
@@ -625,11 +703,13 @@ fn own_sets<'k, 'r>(
                 Some(kept) => kept
                     .iter()
                     .for_each(|&graph| made.push(GraphSet::of(graph))),
-                None => graphs.each(fact, &mut |graph| {
-                    if made.sets.len() < n {
-                        made.push(GraphSet::of(graph));
-                    }
-                }),
+                None => graphs
+                    .each(fact, poll, &mut |graph| {
+                        if made.sets.len() < n {
+                            made.push(GraphSet::of(graph));
+                        }
+                    })
+                    .map_err(|_| run.stopped())?,
             }
             let held = made.minimal(cap, &|_| true)?;
             Ok((!held.is_empty()).then_some(Looked::Made(held)))
@@ -679,12 +759,18 @@ fn minimal(mut sets: Vec<GraphSet>, cap: usize, own: &dyn Fn(&GraphSet) -> bool)
 }
 
 /// Whether a set is one graph that asserts `fact` ([`minimal`]'s `own`): one question to
-/// `graphs` per set asked, no list of them made.
-fn own_graph_of(fact: Triple, graphs: &dyn Graphs) -> impl Fn(&GraphSet) -> bool + '_ {
+/// `graphs` per set asked, no list of them made, each counted on `poll`.
+fn own_graph_of<'a>(
+    fact: Triple,
+    graphs: &'a dyn Graphs,
+    poll: &'a Poller<'_>,
+) -> impl Fn(&GraphSet) -> bool + 'a {
+    // A stopped question reads as "not one's own": `minimal`'s loop over a fact's sets is
+    // bounded by its cap, and the stage's check after it ends the run.
     move |set: &GraphSet| {
         let mut members = set.graphs();
         matches!((members.next(), members.next()), (Some(graph), None)
-            if graphs.holds(fact, graph))
+            if graphs.holds(fact, graph, poll) == Ok(true))
     }
 }
 
@@ -713,19 +799,27 @@ fn support_sets_run(
     cap: usize,
     run: &Run<'_>,
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
+    let fired = || run.fired();
     let all = Store::new(facts.to_vec());
-    let initial: Vec<(Triple, Annotation)> = facts
+    // Each fact's graphs, a store read, on one poller per parallel task (sweep M16). The first
+    // read a stop ended ends them all, with the run's cause (fix check r1, rule 2).
+    let initial: Vec<Option<(Triple, Annotation)>> = facts
         .par_iter()
-        .filter_map(|&fact| {
-            let axiom = axioms.binary_search(&fact).is_ok();
-            let graphs = match axiom {
-                true => Vec::new(),
-                false => listed(graphs_of, fact),
-            };
-            let initial = initial_sets(graphs, axiom, cap);
-            (!initial.is_empty()).then_some((fact, initial))
-        })
-        .collect();
+        .map_init(
+            || Poller::new(&fired),
+            |poll, &fact| -> Result<Option<(Triple, Annotation)>, Stopped> {
+                let poll = Poller::live(poll).map_err(|_| run.stopped())?;
+                let axiom = axioms.binary_search(&fact).is_ok();
+                let graphs = match axiom {
+                    true => Vec::new(),
+                    false => listed(graphs_of, fact, poll).map_err(|_| run.stopped())?,
+                };
+                let initial = initial_sets(graphs, axiom, cap);
+                Ok((!initial.is_empty()).then_some((fact, initial)))
+            },
+        )
+        .collect::<Result<_, Stopped>>()?;
+    let initial: Vec<(Triple, Annotation)> = initial.into_iter().flatten().collect();
     // The heap bytes of the annotations the map holds, kept as they change.
     let mut annotations: usize = initial.iter().map(|(_, a)| a.heap_bytes()).sum();
     let mut sets: HashMap<Triple, Annotation> = HashMap::with_capacity(facts.len());
@@ -733,33 +827,33 @@ fn support_sets_run(
     let empty = Annotation::empty_set();
     // The sequential stages' poller (the premise maps, the bodiless and schema sets): each
     // premise alternative they read is attempted work (sol-loop r7, R7-1). The parallel
-    // morsels make their own.
-    let fired = || run.fired();
-    let mut poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
+    // morsels make their own. Made after the initial sets: a stop during them ends it here.
+    let poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
     // Facts without a body (ground from schema facts alone, `C subClassOf C` from
     // `C a owl:Class`): evaluated again whenever one of their premises changes.
     let mut bodiless_by_premise: HashMap<Triple, Vec<Triple>> = HashMap::new();
     for &fact in &program.bodiless {
         let grounding = Grounding::Bodiless(fact);
-        program.for_each_alternative(grounding, &mut poll, |premises, _| {
-            for &premise in premises {
-                bodiless_by_premise.entry(premise).or_default().push(fact);
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        if poll.stopped() {
-            return Err(run.stopped());
-        }
-        let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
-            .map_err(Stopped::Refused)?;
+        program
+            .for_each_alternative(grounding, &poll, |premises, _| {
+                for &premise in premises {
+                    bodiless_by_premise.entry(premise).or_default().push(fact);
+                }
+                Ok(ControlFlow::<()>::Continue(()))
+            })
+            .map_err(|_| run.stopped())?;
+        let from = grounding_sets(program, grounding, &sets, cap, &empty, &poll, run)?;
+        // A merge reads the head's own graphs: stopped there, it ends the run.
         merge(
+            run,
             &mut sets,
             fact,
             from.annotation.clone(),
             cap,
             graphs_of,
+            &poll,
             &mut annotations,
-        );
+        )?;
     }
     // The rules with their schema premises; transitivity as a rule here (the module's
     // closure has no instances to annotate).
@@ -785,15 +879,14 @@ fn support_sets_run(
     // its sets changed.
     let mut rules_by_premise: HashMap<Triple, Vec<usize>> = HashMap::new();
     for (k, &(_, grounding)) in rules.iter().enumerate() {
-        program.for_each_alternative(grounding, &mut poll, |premises, _| {
-            for &premise in premises {
-                rules_by_premise.entry(premise).or_default().push(k);
-            }
-            ControlFlow::<()>::Continue(())
-        });
-        if poll.stopped() {
-            return Err(run.stopped());
-        }
+        program
+            .for_each_alternative(grounding, &poll, |premises, _| {
+                for &premise in premises {
+                    rules_by_premise.entry(premise).or_default().push(k);
+                }
+                Ok(ControlFlow::<()>::Continue(()))
+            })
+            .map_err(|_| run.stopped())?;
     }
     // What the round doesn't change: the closure's store and the premise maps.
     let fixed = all.bytes().total()
@@ -834,11 +927,10 @@ fn support_sets_run(
         // jobs in parallel morsels, each emitting (head, set, whether the instance's sets
         // are truncated) triples, charged and reduced per head as they come ([`found`]).
         let mut bodiless_found = run.found();
-        for fact in delta_facts(&delta) {
+        for fact in delta_facts(&delta, &poll).map_err(|_| run.stopped())? {
             for &bodiless in bodiless_by_premise.get(&fact).into_iter().flatten() {
                 let grounding = Grounding::Bodiless(bodiless);
-                let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
-                    .map_err(Stopped::Refused)?;
+                let from = grounding_sets(program, grounding, &sets, cap, &empty, &poll, run)?;
                 bodiless_found
                     .add_all(bodiless, &from.sets, from.truncated)
                     .map_err(Stopped::Refused)?;
@@ -850,11 +942,13 @@ fn support_sets_run(
         for &(_, grounding) in &rules {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
-            let held = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
-                .map_err(Stopped::Refused)?;
+            let held = grounding_sets(program, grounding, &sets, cap, &empty, &poll, run)?;
             schemas.push(held);
         }
-        let jobs = round_jobs(&source, &rules, &schemas, &whole);
+        // Their construction reads on the sequential poller (sweep M01): stopped, it ends the
+        // run (fix check r2, R3-F1).
+        let jobs =
+            round_jobs(&source, &rules, &schemas, &whole, &poll).map_err(|_| run.stopped())?;
         let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
             .iter()
             .enumerate()
@@ -865,18 +959,20 @@ fn support_sets_run(
             })
             .collect();
         let sets_now = &sets;
+        // A morsel that stopped or refused fails the round, and none starts after it (fix
+        // check r2, R3-F2): each answered an empty part, and every later one started. A refusal
+        // is latched (`run.refuse`) before the error is made, so it stays `Refused`.
         let mut parts: Vec<Found> = tasks
             .par_iter()
-            .map(|(j, range)| {
+            .map(|(j, range)| -> Result<Found, Stopped> {
                 let (job, heads, k) = &jobs[*j];
                 let schema = &schemas[*k];
                 let mut out = run.found();
                 let mut body = Vec::with_capacity(job.rule.body.len());
-                let Some(mut poll) = Poller::new(&fired) else {
-                    return out;
-                };
+                let poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
+                // Refused, or a lookup stopped: the morsel's later bindings do nothing.
                 let mut refused = false;
-                job.run(&source, range.clone(), &mut poll, &mut |bindings| {
+                let ran = job.run(&source, range.clone(), &poll, &mut |bindings| {
                     if refused {
                         return;
                     }
@@ -887,10 +983,16 @@ fn support_sets_run(
                             .iter()
                             .map(|atom| super::eval::instantiate_head(atom, bindings)),
                     );
-                    let from = match premise_sets_from(&body, schema, sets_now, cap, run) {
+                    let from = match premise_sets_from(&body, schema, sets_now, cap, run, &poll) {
                         Ok(from) => from,
-                        Err(exceeded) => {
+                        Err(Stopped::Refused(exceeded)) => {
                             run.refuse(exceeded);
+                            refused = true;
+                            return;
+                        }
+                        // Stopped: the morsel ends, and the stage's check after it asks the
+                        // run's latched stop (its cause).
+                        Err(_) => {
                             refused = true;
                             return;
                         }
@@ -904,15 +1006,14 @@ fn support_sets_run(
                         }
                     }
                 });
-                // Stopped or refused part-way: nothing of it is kept; the round's check
-                // ends the run.
-                if poll.stopped() || refused {
-                    return run.found();
+                // Stopped or refused part-way: nothing of it is kept, and the run ends.
+                if ran.is_err() || poll.stopped() || refused {
+                    return Err(run.stopped());
                 }
                 // Reduced once, with the round's other parts ([`Run::gather`]).
-                out
+                Ok(out)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         parts.push(bodiless_found);
         // The round's peak beside the sets: its delta and its morsels (its derivations are
         // charged, [`Limits::scratch`]).
@@ -932,51 +1033,65 @@ fn support_sets_run(
         starts.push(found.len());
         // In parallel against the sets as they are; then the changes written back. A
         // change of the mark alone is news too: the facts derived from it are marked.
+        // A head's own graphs are a store read ([`own_graph_of`]): one poller per task. A task
+        // whose poller has stopped, or whose `minimal` it stopped, fails the pass, and no head
+        // starts after it (fix check r2, R3-F2: it answered "no change" for every later head).
         let updates: Vec<(Triple, Annotation)> = starts
             .par_windows(2)
-            .filter_map(|w| {
-                let group = &found[w[0]..w[1]];
-                let fact = group[0].0;
-                let (kept, truncated, beyond_own) =
-                    sets.get(&fact).map_or((&[][..], false, false), |a| {
-                        (a.sets.as_slice(), a.truncated, a.beyond_own)
-                    });
-                let marks = group.iter().any(|&(_, _, marked)| marked);
-                // Nothing new: every found set is covered by a kept one, no new mark (a
-                // derivation's mark is one beyond the head's own graphs, so both).
-                if (beyond_own || !marks)
-                    && group
-                        .iter()
-                        .all(|(_, set, _)| kept.iter().any(|k| k.is_subset(set)))
-                {
-                    return None;
-                }
-                // The copies `minimal` takes, charged first (sol-loop r1 S1).
-                let copied = words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
-                let chosen = Charged::with_capacity(run, kept.len() + group.len(), cap, copied)
-                    .and_then(|mut all| {
-                        kept.iter().for_each(|set| all.push(set.clone()));
-                        group.iter().for_each(|(_, set, _)| all.push(set.clone()));
-                        all.minimal(cap, &own_graph_of(fact, graphs_of))
-                    });
-                // Kept as the fact's sets: the retained sets' exemption (module doc).
-                let mut next = match chosen {
-                    Ok(chosen) => chosen.into_retained(),
-                    Err(exceeded) => {
-                        run.refuse(exceeded);
-                        return None;
+            .map_init(
+                || Poller::new(&fired),
+                |poll, w| -> Result<Option<(Triple, Annotation)>, Stopped> {
+                    #[cfg(test)]
+                    crate::witness::add(crate::witness::Site::HeadGroup, 1);
+                    let poll = Poller::live(poll).map_err(|_| run.stopped())?;
+                    let group = &found[w[0]..w[1]];
+                    let fact = group[0].0;
+                    let (kept, truncated, beyond_own) =
+                        sets.get(&fact).map_or((&[][..], false, false), |a| {
+                            (a.sets.as_slice(), a.truncated, a.beyond_own)
+                        });
+                    let marks = group.iter().any(|&(_, _, marked)| marked);
+                    // Nothing new: every found set is covered by a kept one, no new mark (a
+                    // derivation's mark is one beyond the head's own graphs, so both).
+                    if (beyond_own || !marks)
+                        && group
+                            .iter()
+                            .all(|(_, set, _)| kept.iter().any(|k| k.is_subset(set)))
+                    {
+                        return Ok(None);
                     }
-                };
-                next.truncated |= truncated || marks;
-                next.beyond_own |= beyond_own || marks;
-                (next.sets.as_slice() != kept
-                    || next.truncated != truncated
-                    || next.beyond_own != beyond_own)
-                    .then_some((fact, next))
-            })
-            .collect();
+                    // The copies `minimal` takes, charged first (sol-loop r1 S1).
+                    let copied = words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
+                    let chosen = Charged::with_capacity(run, kept.len() + group.len(), cap, copied)
+                        .and_then(|mut all| {
+                            kept.iter().for_each(|set| all.push(set.clone()));
+                            group.iter().for_each(|(_, set, _)| all.push(set.clone()));
+                            all.minimal(cap, &own_graph_of(fact, graphs_of, poll))
+                        });
+                    // Kept as the fact's sets: the retained sets' exemption (module doc). A
+                    // refusal is latched before the error is made, so it stays `Refused`.
+                    let mut next = match chosen {
+                        Ok(chosen) => chosen.into_retained(),
+                        Err(exceeded) => {
+                            run.refuse(exceeded);
+                            return Err(run.stopped());
+                        }
+                    };
+                    // `minimal`'s own-graph question stopped: its sets are a part.
+                    poll.ended().map_err(|_| run.stopped())?;
+                    next.truncated |= truncated || marks;
+                    next.beyond_own |= beyond_own || marks;
+                    Ok((next.sets.as_slice() != kept
+                        || next.truncated != truncated
+                        || next.beyond_own != beyond_own)
+                        .then_some((fact, next)))
+                },
+            )
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
         drop((gathered, starts));
-        // A refused copy cut the heads short: none of it is written back.
+        // A task the stop fired after (it read nothing more) still left heads out: the stop is
+        // the run's, latched, so asking it again tells; none of it is written back.
         if run.fired() {
             return Err(run.stopped());
         }
@@ -995,13 +1110,17 @@ fn support_sets_run(
 /// A support round's jobs over `source`: of each rule with fact heads and a schema part
 /// (`schemas[k]` for rule `k`), the instances with a changed premise (all of them where
 /// `whole[k]`), each with its heads and `k`. They refer to their schema part by index and
-/// never copy it: the one charged part serves them all (review r2 C1.b).
+/// never copy it: the one charged part serves them all (review r2 C1.b). Their construction
+/// reads on `poll` (sweep M01): [`ReadStopped`] where it stopped one, the list then ending
+/// (fix check r2, R3-F1).
+#[allow(clippy::type_complexity)]
 fn round_jobs<'s, S: Source + ?Sized>(
     source: &'s S,
     rules: &[(&'s Rule, Grounding)],
     schemas: &[Held<'_>],
     whole: &[bool],
-) -> Vec<(Job<'s>, &'s [super::ir::Atom], usize)> {
+    poll: &Poller<'_>,
+) -> Result<Vec<(Job<'s>, &'s [super::ir::Atom], usize)>, ReadStopped> {
     let mut jobs = Vec::new();
     for (k, &(rule, _)) in rules.iter().enumerate() {
         let Head::Facts(heads) = &rule.head else {
@@ -1012,20 +1131,17 @@ fn round_jobs<'s, S: Source + ?Sized>(
         }
         // Instances with a changed premise; all of them when a schema fact changed.
         if whole[k] {
-            jobs.extend(Job::full(source, rule).map(|job| (job, heads.as_slice(), k)));
+            let job = Job::full(source, rule, poll)?;
+            jobs.extend(job.map(|job| (job, heads.as_slice(), k)));
         } else {
             for i in 0..rule.body.len() {
-                let job = Job::new(
-                    source,
-                    rule,
-                    i,
-                    |j| if j == i { Seg::Delta } else { Seg::All },
-                );
+                let seg_of = |j| if j == i { Seg::Delta } else { Seg::All };
+                let job = Job::new(source, rule, i, seg_of, poll)?;
                 jobs.extend(job.map(|job| (job, heads.as_slice(), k)));
             }
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 /// The facts of the closure `facts` that hold for a reader of the statements `readable`
@@ -1038,14 +1154,37 @@ pub fn closure_within(
     facts: &[Triple],
     program: &GroundProgram,
     axioms: &[Triple],
-    readable: &(dyn Fn(Triple) -> bool + Sync),
+    readable: &(dyn Fn(Triple, &Poller<'_>) -> Result<bool, ReadStopped> + Sync),
     limits: Limits<'_>,
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
-    let one_graph = |fact: Triple| readable(fact).then_some(0);
+    let one_graph = OneGraph(readable);
     let mut sets = support_sets(facts, program, axioms, &one_graph, 1, limits)?;
     sets.retain(|_, annotation| !annotation.is_empty());
     debug_assert!(sets.values().all(|annotation| !annotation.truncated));
     Ok(sets)
+}
+
+/// The facts a store callback accepts (a reader's statements, the asserted ones) as one
+/// graph, 0, read on the asking task's poller: the callback, a store read, counts itself
+/// (REAS-2, sweep M14).
+struct OneGraph<'a>(&'a (dyn Fn(Triple, &Poller<'_>) -> Result<bool, ReadStopped> + Sync));
+
+impl Graphs for OneGraph<'_> {
+    fn each(
+        &self,
+        fact: Triple,
+        poll: &Poller<'_>,
+        graph: &mut dyn FnMut(u32),
+    ) -> Result<(), ReadStopped> {
+        if (self.0)(fact, poll)? {
+            graph(0);
+        }
+        Ok(())
+    }
+
+    fn holds(&self, fact: Triple, graph: u32, poll: &Poller<'_>) -> Result<bool, ReadStopped> {
+        Ok(graph == 0 && (self.0)(fact, poll)?)
+    }
 }
 
 /// Whether `fact` follows in one step from facts of `source` other than itself: it is an
@@ -1060,37 +1199,48 @@ pub fn closure_within(
 /// `a : C` back). [`independently_derived`] decides.
 ///
 /// It counts on `poll` ([`Poller`], one per parallel task) each unit it attempts, found or
-/// not: the fact, each producer, each search and each fact a search scans. Stopped, it
-/// answers false, decided by nothing, and the caller asks its (latched) stop again before
-/// it uses the answer.
+/// not: the fact, each producer, each search and each fact a search scans. [`ReadStopped`]
+/// where `poll` stopped it, never "not derived" (fix check r2, R3-F2: its callers' pass went
+/// on over every later candidate).
 pub fn derived_otherwise<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
     fact: Triple,
-    poll: &mut Poller<'_>,
-) -> bool {
+    poll: &Poller<'_>,
+) -> Result<bool, ReadStopped> {
     if poll.attempt(1) {
-        return false;
+        return Err(ReadStopped);
     }
     if axioms.binary_search(&fact).is_ok() {
-        return true;
+        return Ok(true);
     }
-    let holds = |premises: &[Triple]| premises.iter().all(|&p| p != fact && source.contains(p));
-    // Each premise alternative is attempted work (sol-loop r7, R7-1); stopped, the grounding
-    // reads as not holding, decided by nothing.
-    let grounded = |grounding: Grounding, poll: &mut Poller<'_>| {
-        program
-            .for_each_alternative(grounding, poll, |premises, _| match holds(premises) {
-                true => ControlFlow::Break(()),
-                false => ControlFlow::Continue(()),
-            })
-            .is_some()
+    // Each premise's probe counts too (REAS-2), in one loop with the check that the fact
+    // itself is no premise: a schema premise list can be long (a list path), and is read
+    // only as it is probed.
+    let holds = |premises: &[Triple], poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+        for &premise in premises {
+            if premise == fact || !source.contains(premise, poll)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     };
-    if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact), poll) {
-        return true;
+    // Each premise alternative is attempted work (sol-loop r7, R7-1).
+    let grounded = |grounding: Grounding, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+        Ok(program
+            .for_each_alternative(grounding, poll, |premises, poll| {
+                Ok(match holds(premises, poll)? {
+                    true => ControlFlow::Break(()),
+                    false => ControlFlow::Continue(()),
+                })
+            })?
+            .is_some())
+    };
+    if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact), poll)? {
+        return Ok(true);
     }
-    let derives = |rule: &Rule, poll: &mut Poller<'_>| {
+    let derives = |rule: &Rule, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
         let mut found = false;
         let mut body = Vec::with_capacity(rule.body.len());
         derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
@@ -1102,25 +1252,30 @@ pub fn derived_otherwise<S: Source + ?Sized>(
             );
             found = body.iter().all(|&premise| premise != fact);
             found
-        });
-        found
+        })?;
+        Ok(found)
     };
     // Each producer is attempted work before its schema check, an empty search or not
     // (review r1, F1).
     let by_rule = program.for_each_producer(fact, poll, |r, poll| {
-        match grounded(Grounding::Rule(r), poll) && derives(&program.rules[r], poll) {
-            true => ControlFlow::Break(()),
-            false => ControlFlow::Continue(()),
-        }
-    });
+        Ok(
+            match grounded(Grounding::Rule(r), poll)? && derives(&program.rules[r], poll)? {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            },
+        )
+    })?;
     if by_rule.is_some() {
-        return true;
+        return Ok(true);
     }
     let p = fact[1];
-    program.transitive.contains(&p)
-        && !poll.attempt(1)
-        && grounded(Grounding::Transitive(p), poll)
-        && derives(&transitivity(p), poll)
+    if !program.transitive.contains(&p) {
+        return Ok(false);
+    }
+    if poll.attempt(1) {
+        return Err(ReadStopped);
+    }
+    Ok(grounded(Grounding::Transitive(p), poll)? && derives(&transitivity(p), poll)?)
 }
 
 /// Whether the asserted `fact` of the closure `source` is in the least closure of the
@@ -1141,7 +1296,7 @@ pub fn independently_derived<S: Source + Sync + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
-    asserted: &(dyn Fn(Triple) -> bool + Sync),
+    asserted: &(dyn Fn(Triple, &Poller<'_>) -> Result<bool, ReadStopped> + Sync),
     fact: Triple,
     limit: usize,
     limits: Limits<'_>,
@@ -1155,7 +1310,7 @@ fn independently_derived_run<S: Source + Sync + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
-    asserted: &(dyn Fn(Triple) -> bool + Sync),
+    asserted: &(dyn Fn(Triple, &Poller<'_>) -> Result<bool, ReadStopped> + Sync),
     fact: Triple,
     limit: usize,
     run: &Run<'_>,
@@ -1166,16 +1321,19 @@ fn independently_derived_run<S: Source + Sync + ?Sized>(
     };
     let empty = Annotation::empty_set();
     // Lent, not copied per lookup.
-    let previous = |other: Triple| {
-        Previous::Sets(Sets::of(match axioms.binary_search(&other).is_ok() {
-            true => &empty,
-            false => &derivable,
-        }))
+    let previous = |other: Triple, _: &Poller<'_>| {
+        Ok(Previous::Sets(Sets::of(
+            match axioms.binary_search(&other).is_ok() {
+                true => &empty,
+                false => &derivable,
+            },
+        )))
     };
-    let one_graph = |other: Triple| (other != fact && asserted(other)).then_some(0);
+    let without = |other: Triple, poll: &Poller<'_>| Ok(other != fact && asserted(other, poll)?);
+    let one_graph = OneGraph(&without);
     let change = Change {
         source,
-        in_closure: &|other| source.contains(other),
+        in_closure: &|other, poll| source.contains(other, poll),
         touched: &[fact],
         previous: &previous,
         limit,
@@ -1196,7 +1354,7 @@ pub fn rederived<S: Source + Sync + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
-    asserted: &(dyn Fn(Triple) -> bool + Sync),
+    asserted: &(dyn Fn(Triple, &Poller<'_>) -> Result<bool, ReadStopped> + Sync),
     candidates: &[Triple],
     limit: usize,
     limits: Limits<'_>,
@@ -1205,19 +1363,24 @@ pub fn rederived<S: Source + Sync + ?Sized>(
     run.check(size_of_val(candidates))?;
     let fired = || run.fired();
     // One poller per parallel task, not per candidate: a candidate whose search scans
-    // nothing then costs no poll (a poll reads the process's memory limit).
+    // nothing then costs no poll (a poll reads the process's memory limit). A stopped task
+    // fails the pass, and no candidate starts after it (fix check r2, R3-F2).
     let one_step: Vec<Triple> = candidates
         .par_iter()
         .copied()
         .map_init(
             || Poller::new(&fired),
-            |poll, fact| {
-                let poll = poll.as_mut()?;
-                derived_otherwise(source, program, axioms, fact, poll).then_some(fact)
+            |poll, fact| -> Result<Option<Triple>, Stopped> {
+                #[cfg(test)]
+                crate::witness::add(crate::witness::Site::OneStepCandidate, 1);
+                let poll = Poller::live(poll).map_err(|_| run.stopped())?;
+                let derived = derived_otherwise(source, program, axioms, fact, poll)
+                    .map_err(|_| run.stopped())?;
+                Ok(derived.then_some(fact))
             },
         )
-        .flatten_iter()
-        .collect();
+        .filter_map(Result::transpose)
+        .collect::<Result<_, _>>()?;
     run.check((candidates.len() + 2 * one_step.capacity()) * size_of::<Triple>())?;
     let (mut found, mut undecided) = (Vec::with_capacity(one_step.len()), Vec::new());
     for fact in one_step {
@@ -1307,7 +1470,7 @@ fn forward_cone<S: Source + Sync + ?Sized>(
             changed: &delta,
         };
         // The heads, without sets: the reduction keeps each once.
-        let heads = instances(&changed, rules, run, &|k, bindings, out| {
+        let heads = instances(&changed, rules, run, &|k, bindings, _, out| {
             let rule = rules[k].0;
             if let Head::Facts(heads) = &rule.head {
                 for head in heads {
@@ -1337,14 +1500,16 @@ pub struct Change<'a, S: ?Sized> {
     /// The facts of the closure after the change, and those the change removed (joins
     /// must reach what was derived from them).
     pub source: &'a S,
-    /// Whether a fact is in the closure after the change.
-    pub in_closure: &'a (dyn Fn(Triple) -> bool + Sync),
+    /// Whether a fact is in the closure after the change, read on the reading task's
+    /// poller (as `previous` is: store reads, REAS-2 sweep M14); `Err` where that stopped it.
+    pub in_closure: &'a (dyn Fn(Triple, &Poller<'_>) -> Result<bool, ReadStopped> + Sync),
     /// Every fact whose own graphs changed, or that the change added to the closure or
     /// removed from it.
     pub touched: &'a [Triple],
     /// A fact's sets before the change, with its mark: lent from where the caller keeps them
-    /// for the whole update, never copied for it (fix check r2, C1.b residual).
-    pub previous: &'a (dyn Fn(Triple) -> Previous<'a> + Sync),
+    /// for the whole update, never copied for it (fix check r2, C1.b residual); `Err` where
+    /// the reading task's poller stopped it.
+    pub previous: &'a (dyn Fn(Triple, &Poller<'_>) -> Result<Previous<'a>, ReadStopped> + Sync),
     /// Past this many affected facts the update gives up (a recomputation is cheaper).
     pub limit: usize,
 }
@@ -1403,23 +1568,32 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     else {
         return Ok(None);
     };
-    let members: HashSet<Triple> = affected
-        .iter()
-        .copied()
-        .filter(|&fact| (change.in_closure)(fact))
-        .collect();
+    // The sequential stages' poller: the members' probes, their graphs, the schema sets,
+    // the merges (store reads, sweep M14); each stage's check comes before its output is
+    // used.
+    let fired = || run.fired();
+    let stage = Poller::new(&fired).ok_or_else(|| run.stopped())?;
+    // The first read its poller stopped ends the update with the run's cause (fix check r1,
+    // SW111: a stopped probe read as "not in the closure" walked every affected fact).
+    let mut members: HashSet<Triple> = HashSet::new();
+    for &fact in affected.iter() {
+        if (change.in_closure)(fact, &stage).map_err(|_| run.stopped())? {
+            members.insert(fact);
+        }
+    }
     let empty = Annotation::empty_set();
-    let mut now: HashMap<Triple, Annotation> = members
-        .iter()
-        .map(|&fact| {
-            let axiom = axioms.binary_search(&fact).is_ok();
-            let graphs = match axiom {
-                true => Vec::new(),
-                false => listed(graphs_of, fact),
-            };
-            (fact, initial_sets(graphs, axiom, cap))
-        })
-        .collect();
+    let mut now: HashMap<Triple, Annotation> = HashMap::with_capacity(members.len());
+    for &fact in &members {
+        let axiom = axioms.binary_search(&fact).is_ok();
+        let graphs = match axiom {
+            true => Vec::new(),
+            false => listed(graphs_of, fact, &stage).map_err(|_| run.stopped())?,
+        };
+        now.insert(fact, initial_sets(graphs, axiom, cap));
+    }
+    if stage.stopped() {
+        return Err(run.stopped());
+    }
     let mut annotations: usize = now.values().map(Annotation::heap_bytes).sum();
     let fixed = fixed
         + table_bytes::<Triple, ()>(affected.capacity())
@@ -1428,9 +1602,8 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
         fixed + table_bytes::<Triple, Annotation>(now.capacity()) + annotations
     };
     run.check(held(&now, annotations))?;
-    let fired = || run.fired();
     // The schema facts' part per rule: they aren't affected, so it is fixed. A sequential
-    // stage with its own poller (sol-loop r7, R7-1), checked before its sets are used.
+    // stage on the stage's poller (sol-loop r7, R7-1), checked before its sets are used.
     let schemas: Vec<Held<'_>> = {
         let lookup = Recomputing {
             now: &now,
@@ -1441,22 +1614,31 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
             cap,
             run,
         };
-        let mut poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
         rules
             .iter()
             .map(|&(_, grounding)| {
-                grounding_sets(program, grounding, &lookup, cap, &empty, &mut poll, run)
+                grounding_sets(program, grounding, &lookup, cap, &empty, &stage, run)
             })
-            .collect::<Result<_, _>>()
-            .map_err(Stopped::Refused)?
+            .collect::<Result<_, Stopped>>()?
     };
+    if stage.stopped() {
+        return Err(run.stopped());
+    }
     run.check(held(&now, annotations))?;
     let by_grounding: HashMap<Grounding, usize> = rules
         .iter()
         .enumerate()
         .map(|(k, &(_, grounding))| (grounding, k))
         .collect();
-    let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
+    // `Err` at the first premise its poller stopped.
+    let premises_in_closure = |body: &[Triple], poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+        for &premise in body {
+            if !(change.in_closure)(premise, poll)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
     // Every derivation of every affected fact, against the sets as they start: each fact's
     // sets charged and kept once as they come, moved in, not copied ([`Gathered`]), then held
     // as the base held them, a fact and its annotation, their charges in `pool` (declared
@@ -1480,31 +1662,33 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                 |poll, &fact| {
                     // The fact is attempted work before either prelude (its bodiless sets,
                     // its producers), and so is each grounding (review r1, F1; sol-loop r6,
-                    // R6-1). Stopped, or no poller (stopped before the task began): what it
-                    // found is incomplete (nothing), and the check after the pass ends the
-                    // run before it is read.
-                    let Some(poll) = poll.as_mut() else {
-                        return (fact, Annotation::default());
-                    };
+                    // R6-1). Stopped, or no poller (stopped before the task began): the run's
+                    // cause, which ends the pass (fix check r1, rule 2: an empty answer per
+                    // fact walked every member after the stop).
+                    let poll = poll.as_ref().ok_or_else(|| run.stopped())?;
                     if poll.attempt(1) {
-                        return (fact, Annotation::default());
+                        return Err(run.stopped());
                     }
                     // Charged and kept once per set as they come ([`Gathered`]); a refusal
                     // latches the run, which its pollers see. A derivation's mark counts
                     // where it gave a set (as an entry's did).
                     let mut from = Gathered::new(run.scratch);
                     let (mut marked, mut refused) = (false, false);
-                    let mut take = |found: Result<Held<'r>, BudgetExceeded>| {
+                    let mut take = |found: Result<Held<'r>, Stopped>| {
                         if refused {
                             return;
                         }
                         let added = found.and_then(|found| {
                             marked |= found.truncated && !found.is_empty();
-                            from.take(found)
+                            from.take(found).map_err(Stopped::Refused)
                         });
-                        if let Err(exceeded) = added {
-                            run.refuse(exceeded);
-                            refused = true;
+                        match added {
+                            Ok(()) => {}
+                            Err(Stopped::Refused(exceeded)) => {
+                                run.refuse(exceeded);
+                                refused = true;
+                            }
+                            Err(_) => refused = true,
                         }
                     };
                     if program.bodiless.contains(&fact) {
@@ -1519,13 +1703,15 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                         ));
                     }
                     // Each grounding's derivations of the fact, against its schema part.
-                    let mut search = |grounding: Grounding, poll: &mut Poller<'_>| {
+                    let mut search = |grounding: Grounding,
+                                      poll: &Poller<'_>|
+                     -> Result<(), ReadStopped> {
                         let Some(&k) = by_grounding.get(&grounding) else {
-                            return;
+                            return Ok(());
                         };
                         let (rule, schema) = (rules[k].0, &schemas[k]);
                         if schema.is_empty() {
-                            return;
+                            return Ok(());
                         }
                         let mut body = Vec::with_capacity(rule.body.len());
                         derivations(change.source, rule, fact, Seg::All, poll, &mut |bindings| {
@@ -1535,33 +1721,58 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                                     .iter()
                                     .map(|atom| instantiate_head(atom, bindings)),
                             );
-                            if premises_in_closure(&body) {
-                                take(premise_sets_from(&body, schema, &lookup, cap, run));
+                            // Stopped: no sets taken, and the search ends at its next read
+                            // with `Stopped`.
+                            if premises_in_closure(&body, poll) == Ok(true) {
+                                take(premise_sets_from(&body, schema, &lookup, cap, run, poll));
                             }
                             false
-                        });
+                        })
                     };
                     // Each producer is attempted work (for_each_producer), and so is the
                     // transitivity case.
-                    program.for_each_producer(fact, poll, |r, poll| {
-                        search(Grounding::Rule(r), poll);
-                        ControlFlow::<()>::Continue(())
-                    });
-                    if program.transitive.contains(&fact[1]) && !poll.attempt(1) {
-                        search(Grounding::Transitive(fact[1]), poll);
+                    program
+                        .for_each_producer(fact, poll, |r, poll| {
+                            search(Grounding::Rule(r), poll)?;
+                            Ok(ControlFlow::<()>::Continue(()))
+                        })
+                        .map_err(|_| run.stopped())?;
+                    if program.transitive.contains(&fact[1]) {
+                        if poll.attempt(1) {
+                            return Err(run.stopped());
+                        }
+                        search(Grounding::Transitive(fact[1]), poll).map_err(|_| run.stopped())?;
+                    }
+                    // A search its poller or a refusal cut short found a part (B9).
+                    if refused || poll.stopped() {
+                        return Err(run.stopped());
                     }
                     // Its copies are `minimal`'s to sort and drop, as before.
-                    (fact, from.into_annotation(marked, &pool))
+                    Ok((fact, from.into_annotation(marked, &pool)))
                 },
             )
-            .collect()
+            .collect::<Result<_, Stopped>>()?
     };
     run.check(held(&now, annotations) + found.capacity() * size_of::<(Triple, Annotation)>())?;
     let mut changed: Vec<Triple> = Vec::new();
     for (fact, from) in found {
-        if merge_owned(run, &mut now, fact, from, cap, graphs_of, &mut annotations)? {
+        let merged = merge_owned(
+            run,
+            &mut now,
+            fact,
+            from,
+            cap,
+            graphs_of,
+            &stage,
+            &mut annotations,
+        )?;
+        if merged {
             changed.push(fact);
         }
+    }
+    // A merge reads the head's own graphs: stopped there, the sets mean nothing.
+    if stage.stopped() {
+        return Err(run.stopped());
     }
     // Every fact's derivations merged (and freed, or kept as its sets): their charge goes.
     drop(pool);
@@ -1583,7 +1794,7 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                 cap,
                 run,
             };
-            instances(&source, &rules, run, &|k, bindings, out| {
+            instances(&source, &rules, run, &|k, bindings, poll, out| {
                 let rule = rules[k].0;
                 let Head::Facts(heads) = &rule.head else {
                     return Ok(());
@@ -1593,10 +1804,17 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                     .iter()
                     .map(|atom| instantiate_head(atom, bindings))
                     .collect();
-                if !premises_in_closure(&body) {
+                // This callback's own error is a refusal: a read its poller stopped ends the
+                // callback, and `instances`' morsel ends on the latched poller, the stage's
+                // check after it answering the run's cause.
+                if premises_in_closure(&body, poll) != Ok(true) {
                     return Ok(());
                 }
-                let from = premise_sets_from(&body, &schemas[k], &lookup, cap, run)?;
+                let from = match premise_sets_from(&body, &schemas[k], &lookup, cap, run, poll) {
+                    Ok(from) => from,
+                    Err(Stopped::Refused(exceeded)) => return Err(exceeded),
+                    Err(_) => return Ok(()),
+                };
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
                     if members.contains(&fact) && !from.is_empty() {
@@ -1624,11 +1842,15 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                 marked,
                 cap,
                 graphs_of,
+                &stage,
                 &mut annotations,
             )? {
                 changed.push(fact);
             }
             start = end;
+        }
+        if stage.stopped() {
+            return Err(run.stopped());
         }
     }
     Ok(Some(now))
@@ -1657,6 +1879,7 @@ fn merge_found<'s>(
     marked: bool,
     cap: usize,
     graphs_of: &dyn Graphs,
+    poll: &Poller<'_>,
     annotations: &mut usize,
 ) -> Result<bool, Stopped> {
     let _copy = run
@@ -1667,7 +1890,7 @@ fn merge_found<'s>(
         truncated: marked,
         beyond_own: false,
     };
-    merge_owned(run, now, fact, from, cap, graphs_of, annotations)
+    merge_owned(run, now, fact, from, cap, graphs_of, poll, annotations)
 }
 
 /// [`merge`] of one fact's derivations it holds, `from` (charged by its holder), into its
@@ -1675,7 +1898,8 @@ fn merge_found<'s>(
 /// the product's commit-2 peak, 1 MiB above the base's, phase `upd: first merge` of
 /// `p2c5-r4-memprof5-1809b4a9`): `merge`'s list, at its final capacity, of the fact's sets
 /// (copied: slots and words) with `from`'s (moved: slots only), charged first (sol-loop r1
-/// S1, r2 S1/S2).
+/// S1, r2 S1/S2). The fact's own graphs are read on `poll`.
+#[allow(clippy::too_many_arguments)]
 fn merge_owned(
     run: &Run<'_>,
     now: &mut HashMap<Triple, Annotation>,
@@ -1683,13 +1907,14 @@ fn merge_owned(
     from: Annotation,
     cap: usize,
     graphs_of: &dyn Graphs,
+    poll: &Poller<'_>,
     annotations: &mut usize,
 ) -> Result<bool, Stopped> {
     let kept = now.get(&fact).map_or(&[][..], |a| a.sets.as_slice());
     let _room = run
         .room(slots(kept.len() + from.sets.len()) + words(kept))
         .map_err(Stopped::Refused)?;
-    Ok(merge(now, fact, from, cap, graphs_of, annotations))
+    merge(run, now, fact, from, cap, graphs_of, poll, annotations)
 }
 
 /// An annotation of the support algebra and the charge of what its sets hold, on the run's
@@ -1985,6 +2210,7 @@ impl std::ops::Deref for Held<'_> {
 /// `source`'s delta facts, the instances in parallel morsels, each polling `run`'s stop and
 /// charged and reduced per fact ([`found`]); then all of them, sorted by fact. `Err` where
 /// `run` stopped (its caller, the process's memory, or a charge `emit` was refused).
+/// `emit` reads on the morsel's poller.
 fn instances<'r, S, E>(
     source: &S,
     rules: &[(&Rule, Grounding)],
@@ -1993,23 +2219,21 @@ fn instances<'r, S, E>(
 ) -> Result<Found<'r>, Stopped>
 where
     S: Source + Sync + ?Sized,
-    E: Fn(usize, &[Option<u64>], &mut Found<'r>) -> Result<(), BudgetExceeded> + Sync,
+    E: Fn(usize, &[Option<u64>], &Poller<'_>, &mut Found<'r>) -> Result<(), BudgetExceeded> + Sync,
 {
-    let jobs: Vec<(usize, Job<'_>)> = rules
-        .iter()
-        .enumerate()
-        .flat_map(|(k, &(rule, _))| {
-            (0..rule.body.len()).filter_map(move |i| {
-                Job::new(
-                    source,
-                    rule,
-                    i,
-                    |j| if j == i { Seg::Delta } else { Seg::All },
-                )
-                .map(|job| (k, job))
-            })
-        })
-        .collect();
+    let fired = || run.fired();
+    // The jobs' construction reads (estimates, collected drivers) on one sequential poller
+    // (sweep M01, M13).
+    let stage = Poller::new(&fired).ok_or_else(|| run.stopped())?;
+    // A stopped construction ends the list (fix check r2, R3-F1).
+    let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
+    for (k, &(rule, _)) in rules.iter().enumerate() {
+        for i in 0..rule.body.len() {
+            let seg_of = |j| if j == i { Seg::Delta } else { Seg::All };
+            let job = Job::new(source, rule, i, seg_of, &stage).map_err(|_| run.stopped())?;
+            jobs.extend(job.map(|job| (k, job)));
+        }
+    }
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
         .enumerate()
@@ -2019,41 +2243,40 @@ where
                 .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
         })
         .collect();
-    let fired = || run.fired();
+    // A morsel that stopped or refused fails the pass, and none starts after it (fix check
+    // r2, R3-F2); a refusal is latched before the error is made, so it stays `Refused`.
     let parts: Vec<Found> = tasks
         .par_iter()
-        .map(|(j, range)| {
+        .map(|(j, range)| -> Result<Found, Stopped> {
             let (k, job) = &jobs[*j];
             let mut out = run.found();
-            let Some(mut poll) = Poller::new(&fired) else {
-                return out;
-            };
+            let poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
             let mut refused = false;
-            job.run(source, range.clone(), &mut poll, &mut |bindings| {
+            let ran = job.run(source, range.clone(), &poll, &mut |bindings| {
                 if refused {
                     return;
                 }
-                if let Err(exceeded) = emit(*k, bindings, &mut out) {
+                if let Err(exceeded) = emit(*k, bindings, &poll, &mut out) {
                     run.refuse(exceeded);
                     refused = true;
                 }
             });
-            // Stopped or refused part-way: nothing of it is kept; `gather` ends the run.
-            if poll.stopped() || refused {
-                return run.found();
+            // Stopped or refused part-way: nothing of it is kept, and the run ends.
+            if ran.is_err() || poll.stopped() || refused {
+                return Err(run.stopped());
             }
             // Reduced once, with the other parts ([`Run::gather`]).
-            out
+            Ok(out)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     run.gather(parts)
 }
 
-/// Every fact of `store`.
-fn delta_facts(store: &Store) -> Vec<Triple> {
+/// Every fact of `store`, read on `poll`; `Err` where that stopped the read, never a part.
+fn delta_facts(store: &Store, poll: &Poller<'_>) -> Result<Vec<Triple>, ReadStopped> {
     let mut out = Vec::new();
-    store.scan([None, None, None], Seg::All, &mut |f| out.push(f));
-    out
+    store.scan([None, None, None], Seg::All, poll, &mut |f| out.push(f))?;
+    Ok(out)
 }
 
 /// The sets of the schema facts `grounding` was grounded on: over its alternatives, the
@@ -2073,26 +2296,28 @@ fn grounding_sets<'a, L: Lookup<'a> + ?Sized>(
     sets: &L,
     cap: usize,
     empty: &Annotation,
-    poll: &mut Poller<'_>,
+    poll: &Poller<'_>,
     run: &Run<'a>,
-) -> Result<Held<'a>, BudgetExceeded> {
+) -> Result<Held<'a>, Stopped> {
     let mut all = Gathered::new(run.scratch);
-    let (mut truncated, mut refused) = (false, None);
-    program.for_each_alternative(grounding, poll, |premises, _| {
-        let added = premise_sets_from(premises, empty, sets, cap, run).and_then(|found| {
-            truncated |= found.truncated;
-            all.take(found)
-        });
-        match added {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(exceeded) => {
-                refused = Some(exceeded);
-                ControlFlow::Break(())
-            }
-        }
-    });
-    if let Some(exceeded) = refused {
-        return Err(exceeded);
+    let mut truncated = false;
+    // Alternatives its poller cut short are a part of them (fix check r1, B9): the run's
+    // cause; a refusal or a stopped lookup breaks with its own.
+    let ended = program
+        .for_each_alternative(grounding, poll, |premises, poll| {
+            let added =
+                premise_sets_from(premises, empty, sets, cap, run, poll).and_then(|found| {
+                    truncated |= found.truncated;
+                    all.take(found).map_err(Stopped::Refused)
+                });
+            Ok(match added {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(stopped) => ControlFlow::Break(stopped),
+            })
+        })
+        .map_err(|_| run.stopped())?;
+    if let Some(stopped) = ended {
+        return Err(stopped);
     }
     let mut held = all.choose(cap, run)?;
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
@@ -2108,14 +2333,18 @@ fn grounding_sets<'a, L: Lookup<'a> + ?Sized>(
 /// `run`'s working budget before it is built and held until `minimal` has consumed it: its
 /// slots, and at most the longer operand's words per union (review r1 C1); `Err` where it
 /// has no room. Exact: `minimal` sees the whole product, as before. A premise's sets are read
-/// where they are kept ([`Lookup`]), never copied first (fix check r2, C1.b residual).
+/// where they are kept ([`Lookup`]), never copied first (fix check r2, C1.b residual), on
+/// `poll`.
 fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
     body: &[Triple],
     start: &Annotation,
     sets: &L,
     cap: usize,
     run: &Run<'a>,
-) -> Result<Held<'a>, BudgetExceeded> {
+    poll: &Poller<'_>,
+) -> Result<Held<'a>, Stopped> {
+    // A budget refusal is `Stopped::Refused` (its `From`), a lookup its poller stopped the
+    // run's cause (`Lookup::sets_of`).
     // The usual case, one set everywhere: a single union, nothing to minimise. Its copies
     // charged before they are made (review r2 C1.a); held inline, nothing is charged, so a
     // derivation makes no budget call.
@@ -2124,7 +2353,7 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
         let mut truncated = start.truncated;
         let mut single = true;
         for premise in body {
-            let Some(found) = sets.sets_of(premise)? else {
+            let Some(found) = sets.sets_of(premise, poll)? else {
                 return Ok(Held::uncharged(Annotation::default(), run));
             };
             let own = found.sets();
@@ -2140,7 +2369,7 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
             }
         }
         if single {
-            return one.into_held(truncated);
+            return Ok(one.into_held(truncated)?);
         }
     }
     // The product as it stands, with its charge, until the next replaces it (sol-loop r5 S1).
@@ -2157,7 +2386,7 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
         }
     };
     for premise in body {
-        let Some(found) = sets.sets_of(premise)? else {
+        let Some(found) = sets.sets_of(premise, poll)? else {
             return Ok(Held::uncharged(Annotation::default(), run));
         };
         let own = found.sets();
@@ -2189,29 +2418,46 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
 }
 
 /// Adds `from` (derivations of `fact`) to `fact`'s sets, `annotations` following the heap
-/// bytes; whether its sets or its marks changed (news for the facts derived from it).
+/// bytes; whether its sets or its marks changed (news for the facts derived from it). The
+/// fact's own graphs are read on `poll`. `Err` with the run's cause where that read stopped
+/// or the run has stopped since (its latched stop, a refusal included: atomic loads, no
+/// poll, [`Run::latched`]), before the fact's sets are written: a merge `minimal` cut short
+/// is a part (fix check r2, R3-F3: it answered an ordinary "changed", and the loop merged
+/// every later fact).
+#[allow(clippy::too_many_arguments)]
 fn merge(
+    run: &Run<'_>,
     sets: &mut HashMap<Triple, Annotation>,
     fact: Triple,
     from: Annotation,
     cap: usize,
     graphs_of: &dyn Graphs,
+    poll: &Poller<'_>,
     annotations: &mut usize,
-) -> bool {
-    let current = sets.entry(fact).or_default();
+) -> Result<bool, Stopped> {
+    #[cfg(test)]
+    crate::witness::add(crate::witness::Site::Merge, 1);
+    let current = sets.get(&fact);
+    let (kept, truncated, beyond_own) = current.map_or((&[][..], false, false), |a| {
+        (a.sets.as_slice(), a.truncated, a.beyond_own)
+    });
     // At its final capacity ([`merge_found`] charges it so).
-    let mut all = Vec::with_capacity(current.sets.len() + from.sets.len());
-    all.extend_from_slice(&current.sets);
+    let mut all = Vec::with_capacity(kept.len() + from.sets.len());
+    all.extend_from_slice(kept);
     all.extend(from.sets);
-    let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of));
-    next.truncated |= current.truncated || from.truncated;
-    next.beyond_own |= current.beyond_own || from.truncated;
+    let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of, poll));
+    if poll.stopped() || run.latched() {
+        return Err(run.stopped());
+    }
+    next.truncated |= truncated || from.truncated;
+    next.beyond_own |= beyond_own || from.truncated;
+    let current = sets.entry(fact).or_default();
     if next == *current {
-        return false;
+        return Ok(false);
     }
     *annotations = (*annotations + next.heap_bytes()).saturating_sub(current.heap_bytes());
     *current = next;
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2257,7 +2503,8 @@ mod tests {
             let budget = Arc::new(Budget::new(limit));
             let (got, excess) = measure::measure_within(&budget, || {
                 let run = Run::new(Limits::unlimited(&budget));
-                premise_sets_from(&body, &start, &sets, 8, &run).map(|held| held.sets.len())
+                let never = crate::eval::Poller::never();
+                premise_sets_from(&body, &start, &sets, 8, &run, &never).map(|held| held.sets.len())
             });
             if got.is_err() != refused || excess != 0 || budget.used() != 0 {
                 failed.push(format!(
@@ -2322,10 +2569,12 @@ mod tests {
             let entries: Vec<([u64; 3], u32)> = (0..pool.len() as u32).map(|i| (x, i)).collect();
             let placed: Vec<([u64; 3], u32)> = graphs.iter().map(|&g| (x, g)).collect();
             // The store's callback (`nrese-store` support.rs, `SupportSets::updated`).
-            let previous = |fact: [u64; 3]| match (fact == x, own) {
-                (false, _) => Previous::Sets(Sets::NONE),
-                (true, false) => Previous::Sets(Sets::pooled(&entries, &pool, false)),
-                (true, true) => Previous::Own,
+            let previous = |fact: [u64; 3], _: &crate::eval::Poller<'_>| {
+                Ok(match (fact == x, own) {
+                    (false, _) => Previous::Sets(Sets::NONE),
+                    (true, false) => Previous::Sets(Sets::pooled(&entries, &pool, false)),
+                    (true, true) => Previous::Own,
+                })
             };
             let asserted = InGraphs(&placed);
             let budget = Arc::new(Budget::new(limit));
@@ -2340,7 +2589,8 @@ mod tests {
                     cap,
                     run: &run,
                 };
-                premise_sets_from(&[x, a], &start, &lookup, cap, &run)
+                let never = crate::eval::Poller::never();
+                premise_sets_from(&[x, a], &start, &lookup, cap, &run, &never)
             });
             let got = got.map(|held| {
                 let mut sets: Vec<Vec<u32>> =
@@ -2448,19 +2698,31 @@ mod tests {
     #[test]
     fn own_sets_read_their_graphs_once() {
         use super::{Graphs, InGraphs, Limits, Run, initial_sets, own_sets};
+        use crate::eval::Poller;
         use nrese_exec::Budget;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Counted<'a>(InGraphs<'a>, AtomicUsize);
         impl Graphs for Counted<'_> {
-            fn each(&self, fact: [u64; 3], graph: &mut dyn FnMut(u32)) {
+            fn each(
+                &self,
+                fact: [u64; 3],
+                poll: &Poller<'_>,
+                graph: &mut dyn FnMut(u32),
+            ) -> Result<(), super::ReadStopped> {
                 self.1.fetch_add(1, Ordering::Relaxed);
-                self.0.each(fact, graph);
+                self.0.each(fact, poll, graph)
             }
-            fn holds(&self, fact: [u64; 3], graph: u32) -> bool {
-                self.0.holds(fact, graph)
+            fn holds(
+                &self,
+                fact: [u64; 3],
+                graph: u32,
+                poll: &Poller<'_>,
+            ) -> Result<bool, super::ReadStopped> {
+                self.0.holds(fact, graph, poll)
             }
         }
+        let never = Poller::never();
         let fact = [1, 2, 3];
         let budget = Arc::new(Budget::unlimited());
         let run = Run::new(Limits::unlimited(&budget));
@@ -2470,7 +2732,7 @@ mod tests {
             let placed: Vec<([u64; 3], u32)> = (0..k).map(|g| (fact, 200 + g)).collect();
             let graphs = Counted(InGraphs(&placed), AtomicUsize::new(0));
             let cap = 16;
-            let got = own_sets(fact, &graphs, &[], cap, &run)
+            let got = own_sets(fact, &graphs, &[], cap, &run, &never)
                 .expect("an unlimited budget")
                 .map(|looked| {
                     let sets = looked.sets();
@@ -2561,7 +2823,10 @@ mod tests {
                 })
                 .collect();
             let (live, excess) = measure::measure_within(&budget, || {
-                round_jobs(&source, &rule_refs, &schemas, &whole).len()
+                let never = crate::eval::Poller::never();
+                round_jobs(&source, &rule_refs, &schemas, &whole, &never)
+                    .expect("never stopped")
+                    .len()
             });
             assert!(live >= 2, "several live jobs: {live}");
             beyond.push(excess);
@@ -2698,7 +2963,8 @@ mod tests {
             let budget = Arc::new(Budget::unlimited());
             let (kept, excess) = measure::measure_within(&budget, || {
                 let run = Run::new(Limits::unlimited(&budget));
-                let held = premise_sets_from(&[p, q], &start, &sets, cap, &run).unwrap();
+                let never = crate::eval::Poller::never();
+                let held = premise_sets_from(&[p, q], &start, &sets, cap, &run, &never).unwrap();
                 held.sets.len()
             });
             assert_eq!(kept, cap, "{what}: every union kept");
@@ -2734,6 +3000,40 @@ mod tests {
         assert_eq!(
             Stopped::of_process(MemoryStopCause::OverLimit),
             Stopped::ProcessMemory
+        );
+    }
+
+    /// REAS-2 review r1 F1 (the reviewer's witness): a fact's graphs as the support sets read
+    /// them ([`super::InGraphs`], the store's `SupportSets::compute` and the own lookups) are
+    /// handed on as they are counted. One fact asserted in 3 × `POLL_UNITS` graphs, the stop
+    /// set from the first graph handed on: at most `POLL_UNITS` plus one run more are handed
+    /// on after it (REAS-2's bound; the run counted at once is at most `POLL_UNITS`). Counted
+    /// all at once, every one of them was.
+    #[test]
+    fn a_fact_s_graphs_are_handed_on_within_a_run_of_the_stop() {
+        use super::{Graphs, InGraphs};
+        use crate::eval::Poller;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let fact = [1, 2, 3];
+        let placed: Vec<([u64; 3], u32)> = (0..3 * interval as u32).map(|g| (fact, g)).collect();
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = Poller::new(&stop).expect("not stopped yet");
+        let (mut handed, mut after) = (0usize, 0usize);
+        let read = InGraphs(&placed).each(fact, &poll, &mut |_| {
+            handed += 1;
+            match fired.load(Ordering::Relaxed) {
+                true => after += 1,
+                false => fired.store(true, Ordering::Relaxed),
+            }
+        });
+        assert!(read.is_err(), "a read its poller stopped says so");
+        assert!(handed > 0, "the first graph is handed on before the stop");
+        let run = interval;
+        assert!(
+            after <= interval + run,
+            "{after} graphs handed on after the stop (at most {interval} plus one run of {run})"
         );
     }
 }

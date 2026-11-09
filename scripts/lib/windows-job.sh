@@ -83,7 +83,7 @@ run() {
       || infra "no toolchain $channel (rustup toolchain install)"
     windows_job_toolchain_ready || infra "toolchain $channel installed, yet its compiler or clippy doesn't run"
   fi
-  identity=$(gate_identity) || infra "no toolchain here for the tree's rust-toolchain.toml"
+  identity=$(gate_identity HEAD) || infra "no toolchain here for the tree's rust-toolchain.toml"
   # The Python runtime the tree declares for the suite, in the identity as in the pass's key
   # (scripts/check.sh windows).
   runtime=$(gate_runtime HEAD) \

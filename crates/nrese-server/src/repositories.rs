@@ -3,7 +3,7 @@
 //! settings ([`crate::repository_config`]).
 
 pub use nrese_store::catalog::{
-    Catalog, CatalogError, DEFAULT_REPOSITORY, PipelineSlot, Removal, Repository, check,
+    Catalog, CatalogError, DEFAULT_REPOSITORY, Effective, PipelineSlot, Removal, Repository, check,
     default_settings_file, stored_default_settings, write_settings,
 };
 
