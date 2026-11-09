@@ -289,3 +289,25 @@ fn a_service_pattern_keeps_a_triple_term_apart_from_a_variable_spelt_like_its_lo
     );
     assert_rows(&engine(&[]), &text, &options, &["<urn:s> <urn:z>"]);
 }
+
+/// A blank node of a SERVICE pattern is one node in what the endpoint gets, where the
+/// executor's reading of a triple term pattern beside it names the node too: `_:x` is
+/// `<urn:s>` in both triples (SPARQL 1.1 §18.3, one blank node, one variable).
+#[test]
+fn a_service_pattern_keeps_a_blank_node_one_node_beside_a_triple_term() {
+    let triple = Triple::new(iri("urn:s"), iri("urn:p"), iri("urn:o"));
+    let remote = engine(&[
+        (iri("urn:s").into(), "urn:p", iri("urn:o").into()),
+        (iri("urn:r").into(), REIFIES, triple.into()),
+    ]);
+    let endpoint = Arc::new(Endpoint(remote, Mutex::default()));
+    let options = QueryOptions {
+        services: Some(Services(endpoint.clone())),
+        ..QueryOptions::default()
+    };
+    let text = format!(
+        "SELECT ?o WHERE {{ SERVICE <http://remote.example/sparql> {{ \
+         _:x <urn:p> ?o . ?r <{REIFIES}> <<( _:x <urn:p> ?o )>> }} }}"
+    );
+    assert_rows(&engine(&[]), &text, &options, &["<urn:o>"]);
+}
