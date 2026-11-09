@@ -7,8 +7,8 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 
 use nrese_engine::{TermId, TermKind};
-use nrese_exec::Reservation;
-use nrese_rdf::Term;
+use nrese_exec::{Budget, Reservation};
+use nrese_rdf::{BlankNode, NamedNode, NamedOrBlankNode, Term, Triple};
 use nrese_sparql::value::{Value, compare, lang_matches};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
@@ -24,12 +24,102 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 
-/// A validation result over term ids.
+/// A term a result names: one of the dictionary, or one a SHACL-SPARQL query computed
+/// (`CONCAT(…) AS ?value`, `BNODE()`), owned here and never interned, so a validation leaves
+/// the dictionary as it found it.
+///
+/// Which one is decided against a *frontier* view ([`Validator::with_frontier`]): the view
+/// validated, or for a comparison of two states the later one, for both. The dictionary only
+/// grows, so what the earlier view knows the later knows by the same id, and every id a
+/// result holds otherwise (a focus or value node, a shape's path) is the later dictionary's
+/// too: one RDF term has one form in both states, whatever made it. Blank nodes and triple
+/// terms holding them are the exception ([`Validator::result_term`]). Equality and order are
+/// the comparison's: a computed term by its [`Computed::key`], so fresh blank nodes compare
+/// up to their names; a stored and a computed term are never equal.
+#[derive(Debug, Clone)]
+pub(crate) enum ResultTerm {
+    Stored(TermId),
+    Computed(Box<Computed>),
+}
+
+/// A term a query computed: as the report shows it, and as it is compared.
+#[derive(Debug, Clone)]
+pub(crate) struct Computed {
+    /// The term as the query made it: its blank nodes keep the query's names, so one node
+    /// of a query is one node of the report, however many results name it.
+    pub(crate) term: Term,
+    /// The term as it is compared, where that differs from `term`: its fresh blank nodes
+    /// named by their place in it and its stored ones by id ([`Validator::triple_key`]).
+    key: Option<Term>,
+}
+
+impl Computed {
+    fn key(&self) -> &Term {
+        self.key.as_ref().unwrap_or(&self.term)
+    }
+
+    /// The heap it holds.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + crate::report::term_bytes(&self.term)
+            + self.key.as_ref().map_or(0, crate::report::term_bytes)
+    }
+}
+
+impl ResultTerm {
+    fn order(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Stored(a), Self::Stored(b)) => a.cmp(b),
+            (Self::Stored(_), Self::Computed(_)) => Ordering::Less,
+            (Self::Computed(_), Self::Stored(_)) => Ordering::Greater,
+            (Self::Computed(a), Self::Computed(b)) => a.key().cmp(b.key()),
+        }
+    }
+}
+
+impl PartialEq for ResultTerm {
+    fn eq(&self, other: &Self) -> bool {
+        self.order(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ResultTerm {}
+
+impl PartialOrd for ResultTerm {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ResultTerm {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order(other)
+    }
+}
+
+impl std::hash::Hash for ResultTerm {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Stored(id) => (0_u8, id).hash(state),
+            Self::Computed(computed) => (1_u8, computed.key()).hash(state),
+        }
+    }
+}
+
+/// A result's path: the shape's (or a closed shape's predicate, or a stored IRI a query
+/// returned as `?path`), or an IRI a query computed, owned as [`Computed`] terms are.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ResultPath {
+    Path(Path),
+    Computed(Box<NamedNode>),
+}
+
+/// A validation result over term ids, with the terms SHACL-SPARQL computed owned.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RawResult {
     pub(crate) focus: TermId,
-    pub(crate) path: Option<Path>,
-    pub(crate) value: Option<TermId>,
+    pub(crate) path: Option<ResultPath>,
+    pub(crate) value: Option<ResultTerm>,
     pub(crate) shape: ShapeRef,
     pub(crate) component: Component,
     /// `sh:sourceConstraint` (SHACL-SPARQL).
@@ -40,10 +130,21 @@ pub(crate) struct RawResult {
 
 impl RawResult {
     /// What keeping this result can hold, at most: its slot in the vector of its focus node
-    /// and in the collected one (each up to twice its items while it grows), and its heap.
+    /// and in the collected one (each up to twice its items while it grows), and its heap,
+    /// the terms a query computed (owned here) included.
     pub(crate) fn retained_bytes(&self) -> usize {
         4 * std::mem::size_of::<Self>()
-            + self.path.as_ref().map_or(0, path_bytes)
+            + match &self.path {
+                None => 0,
+                Some(ResultPath::Path(path)) => path_bytes(path),
+                Some(ResultPath::Computed(predicate)) => {
+                    std::mem::size_of::<NamedNode>() + predicate.as_str().len()
+                }
+            }
+            + match &self.value {
+                Some(ResultTerm::Computed(computed)) => computed.bytes(),
+                _ => 0,
+            }
             + self.messages.as_ref().map_or(0, |messages| {
                 messages.capacity() * std::mem::size_of::<TermId>()
             })
@@ -77,19 +178,51 @@ pub(crate) struct Failures {
 /// their charge, and the results' charge (free the results, then drop it).
 pub(crate) type Kept = (Vec<RawResult>, Failures, Reservation);
 
+/// The results one task keeps ([`Validator::validate_all`]), with their charge: the task's
+/// own, so the tasks of a validation charge without sharing a lock. The fields drop in this
+/// order: the results are freed, then their charge returned.
+pub(crate) struct TaskResults {
+    list: Vec<RawResult>,
+    held: Reservation,
+}
+
+impl TaskResults {
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            list: Vec::new(),
+            held: Reservation::new(Arc::clone(budget)),
+        }
+    }
+
+    /// Drops the results from `start` on, then returns their charge.
+    fn truncate(&mut self, start: usize) {
+        let dropped: usize = self.list[start..]
+            .iter()
+            .map(RawResult::retained_bytes)
+            .sum();
+        self.list.truncate(start);
+        self.held.release(dropped);
+    }
+}
+
 /// Validates the data in `data` against every targeted shape: the results, and the
 /// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
 /// `resources`' envelope. Focus nodes are validated in parallel; the results keep the
 /// sequential order. A stop of `resources` is the outcome instead
-/// ([`Validator::into_failures`]).
+/// ([`Validator::into_failures`]). `compares`: the results will be compared with another
+/// state's ([`Validator::comparing`]).
 pub(crate) fn validate_raw<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
     resources: &Resources,
+    compares: bool,
 ) -> Result<Kept, QueryEvaluationError> {
     resources.check()?;
-    let validator = Validator::new(view, shapes, data, resources);
+    let mut validator = Validator::new(view, shapes, data, resources);
+    if compares {
+        validator = validator.comparing();
+    }
     let results = validate_every_focus(&validator, shapes);
     let (failures, held) = validator.into_failures()?;
     Ok((results, failures, held))
@@ -97,15 +230,19 @@ pub(crate) fn validate_raw<V: ReadView + Sync>(
 
 /// [`validate_raw`]'s results alone, with their charge, for a validation whose failures are
 /// thrown away (the state before a change, compared with the state after): its failures
-/// are neither kept nor charged, so they can't refuse it.
-pub(crate) fn validate_raw_results<V: ReadView + Sync>(
-    view: &V,
-    shapes: &Shapes,
+/// are neither kept nor charged, so they can't refuse it. Its terms are told stored or
+/// computed against `frontier`, the state after's dictionary ([`ResultTerm`]).
+pub(crate) fn validate_raw_results<'a, V: ReadView + Sync>(
+    view: &'a V,
+    shapes: &'a Shapes,
     data: Selection,
-    resources: &Resources,
+    resources: &'a Resources,
+    frontier: &'a Frontier<'a>,
 ) -> Result<(Vec<RawResult>, Reservation), QueryEvaluationError> {
     resources.check()?;
-    let validator = Validator::discarding_failures(view, shapes, data, resources);
+    let validator = Validator::discarding_failures(view, shapes, data, resources)
+        .with_frontier(frontier)
+        .comparing();
     let results = validate_every_focus(&validator, shapes);
     let (_, held) = validator.into_failures()?;
     Ok((results, held))
@@ -248,12 +385,20 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// The charge, to the request's envelope, for the failures kept: made before each is
     /// kept; it goes with them ([`Failures`]). Declared after them: freed, then returned.
     held_failures: std::sync::Mutex<Reservation>,
-    /// The charge for the results kept: made before each is kept, held until they are
-    /// dropped ([`Validator::keep`]).
+    /// The charge for the results kept: made before each is kept, by its task
+    /// ([`TaskResults`]), and taken over here when the task ends; held until they are dropped.
     held_results: std::sync::Mutex<Reservation>,
+    /// The budget the results are charged to (`held_results`' and the tasks').
+    results_budget: Arc<Budget>,
     /// Whether failures are kept: not where they are thrown away ([`validate_raw_results`]),
     /// so they are neither made nor charged there.
     keep_failures: bool,
+    /// The view whose dictionary decides whether a term a query bound is stored or computed
+    /// ([`ResultTerm`]); `None`: this validator's own.
+    frontier: Option<&'a Frontier<'a>>,
+    /// Whether its results are compared with another state's ([`Validator::comparing`]): only
+    /// then do blank nodes a query bound need their comparison form.
+    compares: bool,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -261,6 +406,38 @@ pub(crate) struct Validator<'a, V: ReadView> {
 
 /// The shapes and nodes being validated further up: recursion stops there.
 type Stack = Vec<(ShapeRef, TermId)>;
+
+/// A frontier view's lookup ([`ResultTerm`]): the id of a term it knows.
+pub(crate) type Frontier<'a> = dyn Fn(&Term) -> Option<TermId> + Sync + 'a;
+
+/// The comparison form of a stored blank node inside a computed term: an IRI no data can
+/// hold (its salt is drawn once per process), naming the node by id, so it is never taken
+/// for a fresh blank node nor renamed with them.
+fn stored_blank(id: TermId) -> NamedNode {
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), 0_u8)
+    });
+    NamedNode::new_unchecked(format!("urn:nrese-shacl:{salt:016x}:blank:{}", id.raw()))
+}
+
+/// The comparison form of a lone fresh blank node: every fresh node is the same up to its
+/// name. (A computed term's other keys are triple terms or hold no blank node.)
+fn fresh_blank() -> Term {
+    BlankNode::new_unchecked("fresh").into()
+}
+
+/// Whether `term` is a blank node or a triple term holding one, at any depth.
+fn holds_blank_node(term: &Term) -> bool {
+    match term {
+        Term::BlankNode(_) => true,
+        Term::Triple(triple) => {
+            matches!(triple.subject, NamedOrBlankNode::BlankNode(_))
+                || holds_blank_node(&triple.object)
+        }
+        _ => false,
+    }
+}
 
 fn is_literal(id: TermId) -> bool {
     !matches!(
@@ -297,6 +474,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         keep_failures: bool,
     ) -> Self {
         let graph = GraphView::new(view, data);
+        let results_budget = Arc::new(resources.memory.part());
         let mut validator = Self {
             rdf_type: graph.iri(RDF_TYPE),
             graph,
@@ -307,10 +485,11 @@ impl<'a, V: ReadView> Validator<'a, V> {
             held_failures: std::sync::Mutex::new(Reservation::new(Arc::new(
                 resources.memory.part(),
             ))),
-            held_results: std::sync::Mutex::new(Reservation::new(Arc::new(
-                resources.memory.part(),
-            ))),
+            held_results: std::sync::Mutex::new(Reservation::new(Arc::clone(&results_budget))),
+            results_budget,
             keep_failures,
+            frontier: None,
+            compares: false,
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -360,6 +539,131 @@ impl<'a, V: ReadView> Validator<'a, V> {
         validator
     }
 
+    /// The validator, deciding stored and computed terms against `frontier`'s dictionary: the
+    /// later state's, where this one (the earlier) is compared with it ([`ResultTerm`]).
+    pub(crate) fn with_frontier(mut self, frontier: &'a Frontier<'a>) -> Self {
+        self.frontier = Some(frontier);
+        self
+    }
+
+    /// The validator, its results to be compared with another state's ([`validate_changes`],
+    /// [`validate_shapes_change`]): blank nodes a query bound get their comparison form
+    /// ([`Validator::result_term`]). Without it (a report alone) they are kept as the query
+    /// made them, which is what the report shows either way.
+    ///
+    /// [`validate_changes`]: crate::validate_changes
+    /// [`validate_shapes_change`]: crate::validate_shapes_change
+    pub(crate) fn comparing(mut self) -> Self {
+        self.compares = true;
+        self
+    }
+
+    /// The id of `term` in the frontier's dictionary.
+    fn known(&self, term: &Term) -> Option<TermId> {
+        match self.frontier {
+            Some(frontier) => frontier(term),
+            None => self.graph.lookup(term),
+        }
+    }
+
+    /// A term a query bound, as a result holds it: its id where the frontier knows it; else
+    /// owned, with its comparison form. A blank node is stored where this view knows it (a node
+    /// of this state's data, compared by id), else fresh (one the query made): the frontier
+    /// isn't asked, since a later state may store a node under a fresh node's name. A triple
+    /// term holding a fresh blank node can't be stored (the dictionary knows a triple term only
+    /// with its parts): computed, compared by [`Validator::triple_key`]. One holding only this
+    /// state's blank nodes goes through the frontier as any other term. Where nothing compares
+    /// the results ([`Validator::comparing`]), a blank node or a triple term holding one is the
+    /// query's term as it is: no lookup, no comparison form (the report shows the same term).
+    fn result_term(&self, term: Term) -> ResultTerm {
+        if !self.compares && holds_blank_node(&term) {
+            return ResultTerm::Computed(Box::new(Computed { term, key: None }));
+        }
+        if let Term::BlankNode(_) = term {
+            return match self.graph.lookup(&term) {
+                Some(id) => ResultTerm::Stored(id),
+                None => ResultTerm::Computed(Box::new(Computed {
+                    term,
+                    key: Some(fresh_blank()),
+                })),
+            };
+        }
+        let key = match &term {
+            Term::Triple(_) if holds_blank_node(&term) => {
+                let mut fresh = Vec::new();
+                let key = self.triple_key(&term, &mut fresh);
+                if !fresh.is_empty() {
+                    return ResultTerm::Computed(Box::new(Computed {
+                        term,
+                        key: Some(key),
+                    }));
+                }
+                Some(key)
+            }
+            _ => None,
+        };
+        match self.known(&term) {
+            Some(id) => ResultTerm::Stored(id),
+            None => ResultTerm::Computed(Box::new(Computed { term, key })),
+        }
+    }
+
+    /// The comparison form of a triple term holding blank nodes: each this view knows named by
+    /// its [`stored_blank`] IRI, each fresh one (gathered in `fresh`) by its place among them in
+    /// order of first appearance, subject before object, depth first. A triple term is an
+    /// ordered tree, so a renaming of fresh blank nodes that maps one term onto another maps
+    /// each place to the same place: two terms are the same up to their fresh nodes' names
+    /// exactly when their forms are equal. One walk over the term.
+    fn triple_key(&self, term: &Term, fresh: &mut Vec<BlankNode>) -> Term {
+        let mut blank = |node: &BlankNode| -> Term {
+            match self.graph.lookup(&Term::BlankNode(node.clone())) {
+                Some(id) => stored_blank(id).into(),
+                None => {
+                    let place = match fresh.iter().position(|seen| seen == node) {
+                        Some(place) => place,
+                        None => {
+                            fresh.push(node.clone());
+                            fresh.len() - 1
+                        }
+                    };
+                    BlankNode::new_unchecked(format!("f{place}")).into()
+                }
+            }
+        };
+        match term {
+            Term::BlankNode(node) => blank(node),
+            Term::Triple(triple) => {
+                let subject = match &triple.subject {
+                    NamedOrBlankNode::BlankNode(node) => match blank(node) {
+                        Term::NamedNode(stored) => NamedOrBlankNode::NamedNode(stored),
+                        Term::BlankNode(renamed) => NamedOrBlankNode::BlankNode(renamed),
+                        _ => unreachable!("a blank node's form is an IRI or a blank node"),
+                    },
+                    NamedOrBlankNode::NamedNode(_) => triple.subject.clone(),
+                };
+                let object = self.triple_key(&triple.object, fresh);
+                Term::Triple(Box::new(Triple::new(
+                    subject,
+                    triple.predicate.clone(),
+                    object,
+                )))
+            }
+            _ => term.clone(),
+        }
+    }
+
+    /// An IRI a query bound as `?path`, as a result holds it (as [`Validator::result_term`]).
+    fn result_path(&self, path: NamedNode) -> ResultPath {
+        let path = Term::NamedNode(path);
+        match self.known(&path) {
+            Some(id) => ResultPath::Path(Path::Predicate(id)),
+            None => match path {
+                Term::NamedNode(path) => ResultPath::Computed(Box::new(path)),
+                _ => unreachable!("made a named node above"),
+            },
+        }
+    }
+
     /// The failures recorded while validating, with their charge, and the charge for the
     /// results kept; or the stop that ended it: then no result it produced may be used (drop
     /// them first: [`Validator::has_stopped`]).
@@ -388,12 +692,6 @@ impl<'a, V: ReadView> Validator<'a, V> {
         self.stop.get().is_some()
     }
 
-    /// Charges `bytes` for a result to the request's envelope, or records its refusal as
-    /// the stop.
-    fn charge(&self, bytes: usize) -> bool {
-        charge_to(&self.held_results, &self.stop, bytes)
-    }
-
     /// Returns `bytes` charged for results that have been dropped.
     pub(crate) fn release(&self, bytes: usize) {
         self.held_results
@@ -402,11 +700,30 @@ impl<'a, V: ReadView> Validator<'a, V> {
             .release(bytes);
     }
 
-    /// Keeps `result` in `results`, charged first; a refusal is the validation's stop.
-    fn keep(&self, results: &mut Vec<RawResult>, result: RawResult) {
-        if self.charge(result.retained_bytes()) {
-            results.push(result);
+    /// Keeps `result` in `results`, charged first to the task's own reservation (no lock); a
+    /// refusal is the validation's stop.
+    fn keep(&self, results: &mut TaskResults, result: RawResult) {
+        match results.held.charge(result.retained_bytes()) {
+            Ok(()) => results.list.push(result),
+            Err(refused) => {
+                let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+            }
         }
+    }
+
+    /// A task's results, its charge taken over by the validation's (one lock a task): the
+    /// charge is never returned in between, so the results stay charged throughout.
+    fn adopt(&self, task: TaskResults) -> Vec<RawResult> {
+        let TaskResults { list, held } = task;
+        let bytes = held.transfer();
+        let mut shared = self
+            .held_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let empty = Reservation::new(Arc::clone(&self.results_budget));
+        let total = std::mem::replace(&mut *shared, empty).transfer() + bytes;
+        *shared = Reservation::adopt(Arc::clone(&self.results_budget), total);
+        list
     }
 
     /// Whether the validation has stopped: a stop was met, or the cancellation fires now
@@ -425,7 +742,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// The results of validating each `(shape, focus node)` of `work`, in that order: in
-    /// parallel, a few dozen nodes per task.
+    /// parallel, a few dozen nodes per task, each task charging its own reservation, taken
+    /// over by the validation's when it ends ([`Validator::adopt`]).
     pub(crate) fn validate_all(&self, work: &[(ShapeRef, TermId)]) -> Vec<RawResult>
     where
         V: Sync,
@@ -433,11 +751,15 @@ impl<'a, V: ReadView> Validator<'a, V> {
         use rayon::prelude::*;
         work.par_iter()
             .with_min_len(32)
-            .flat_map_iter(|&(shape, focus)| {
-                let mut results = Vec::new();
-                self.validate_node(shape, focus, &mut results, &mut Vec::new());
-                results
-            })
+            .fold(
+                || TaskResults::new(&self.results_budget),
+                |mut task, &(shape, focus)| {
+                    self.validate_node(shape, focus, &mut task, &mut Vec::new());
+                    task
+                },
+            )
+            .map(|task| self.adopt(task))
+            .flat_map_iter(|list| list)
             .collect()
     }
 
@@ -478,21 +800,17 @@ impl<'a, V: ReadView> Validator<'a, V> {
 
     /// Whether `node` conforms to `shape`: validating it produces no result.
     fn conforms(&self, shape: ShapeRef, node: TermId, stack: &mut Stack) -> bool {
-        let mut results = Vec::new();
+        let mut results = TaskResults::new(&self.results_budget);
         self.validate_node(shape, node, &mut results, stack);
-        let conforms = results.is_empty();
-        // Only their existence counts: they are dropped, then their charge returned.
-        let charged: usize = results.iter().map(RawResult::retained_bytes).sum();
-        drop(results);
-        self.release(charged);
-        conforms
+        // Only their existence counts: dropped, they are freed, then their charge returned.
+        results.list.is_empty()
     }
 
     pub(crate) fn validate_node(
         &self,
         shape_ref: ShapeRef,
         focus: TermId,
-        results: &mut Vec<RawResult>,
+        results: &mut TaskResults,
         stack: &mut Stack,
     ) {
         // Every validation of a node against a shape, nested ones included, looks at the
@@ -553,7 +871,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 } else {
                     literal.datatype().as_str()
                 };
-                actual == datatype && well_formed(datatype, literal.value())
+                actual == datatype && well_formed(datatype, literal.value(), literal.language())
             }
             _ => false,
         }
@@ -566,14 +884,14 @@ impl<'a, V: ReadView> Validator<'a, V> {
         focus: TermId,
         values: &[TermId],
         constraint: &Constraint,
-        results: &mut Vec<RawResult>,
+        results: &mut TaskResults,
         stack: &mut Stack,
     ) {
         let shape = &self.shapes.shapes[shape_ref];
         let result = |component: Component, value: Option<TermId>| RawResult {
             focus,
-            path: shape.path.clone(),
-            value,
+            path: shape.path.clone().map(ResultPath::Path),
+            value: value.map(ResultTerm::Stored),
             shape: shape_ref,
             component,
             source: None,
@@ -763,8 +1081,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
                                 results,
                                 RawResult {
                                     focus,
-                                    path: Some(Path::Predicate(predicate)),
-                                    value: Some(object),
+                                    path: Some(ResultPath::Path(Path::Predicate(predicate))),
+                                    value: Some(ResultTerm::Stored(object)),
                                     shape: shape_ref,
                                     component: Component::Closed,
                                     source: None,
@@ -793,11 +1111,11 @@ impl<'a, V: ReadView> Validator<'a, V> {
         focus: TermId,
         values: &[TermId],
         check: &SparqlCheck,
-        results: &mut Vec<RawResult>,
+        results: &mut TaskResults,
     ) {
         let shape = &self.shapes.shapes[shape_ref];
         let (view, data) = self.graph.parts();
-        let raw = |value: Option<TermId>, path: Option<Path>| RawResult {
+        let raw = |value: Option<ResultTerm>, path: Option<ResultPath>| RawResult {
             focus,
             path,
             value,
@@ -854,47 +1172,54 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 Err(sparql::Problem::Failed(error)) => failure(&error),
                 Ok(sparql::Outcome::Failed(failed)) => {
                     for value in failed {
-                        self.keep(results, raw(Some(value), shape.path.clone()));
+                        self.keep(
+                            results,
+                            raw(
+                                Some(ResultTerm::Stored(value)),
+                                shape.path.clone().map(ResultPath::Path),
+                            ),
+                        );
                     }
                 }
                 Ok(sparql::Outcome::Solutions(solutions)) => {
                     // Each solution is decoded, made a result (by id) and dropped before the
                     // next: only the kept results, charged, stay. An evaluation error part way
                     // makes the combination a failure with no results, as when it was read whole.
-                    let start = results.len();
+                    let start = results.list.len();
                     for solution in solutions {
                         if self.stopped() {
                             return ControlFlow::Break(());
                         }
                         let solution = match solution.map_err(sparql::Problem::from) {
-                            Ok(solution) => sparql::found(&solution),
+                            Ok(solution) => solution,
                             Err(sparql::Problem::Stopped(stop)) => {
                                 let _ = self.stop.set(stop);
                                 return ControlFlow::Break(());
                             }
                             Err(sparql::Problem::Failed(error)) => {
-                                let dropped: usize =
-                                    results[start..].iter().map(RawResult::retained_bytes).sum();
                                 results.truncate(start);
-                                self.release(dropped);
                                 failure(&error);
                                 break;
                             }
                         };
-                        if solution.failure {
+                        // The solution's terms are moved into the result, not copied; a
+                        // `?failure` row's are dropped unread.
+                        let found = sparql::found(solution);
+                        if found.failure {
                             failure("the query reported ?failure");
                             continue;
                         }
-                        let value = match &solution.value {
-                            Some(term) => self.graph.lookup(term),
+                        // The bound value and path are the result's (SHACL §5.3.2), stored or
+                        // computed ([`ResultTerm`]).
+                        let value = match found.value {
+                            Some(term) => Some(self.result_term(term)),
                             // A node shape's value is its focus node.
-                            None => shape.path.is_none().then_some(focus),
+                            None => shape.path.is_none().then_some(ResultTerm::Stored(focus)),
                         };
-                        let path = solution
+                        let path = found
                             .path
-                            .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
-                            .map(Path::Predicate)
-                            .or_else(|| shape.path.clone());
+                            .map(|path| self.result_path(path))
+                            .or_else(|| shape.path.clone().map(ResultPath::Path));
                         self.keep(results, raw(value, path));
                     }
                 }

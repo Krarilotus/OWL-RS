@@ -171,12 +171,61 @@ pub(crate) struct Wal {
     magic: &'static [u8; 8],
     /// Where released segments go instead of being deleted.
     archive: Option<PathBuf>,
+    /// The names the store's open left to sync before the first durable write.
+    pending_names: PendingNames,
+}
+
+/// The names a store's open leaves to be synced before the first durable write that relies on
+/// them (deferred-sync design note of 8 Nov): the directories holding the levels of the
+/// store's path it found, then the WAL's directory and the store's own. Each is synced once;
+/// a found level's holder this process may not open for its sync is left as it is, as
+/// `place::create_dir_all` leaves it.
+pub(crate) struct PendingNames {
+    /// In the order synced (outermost first), each with whether `PermissionDenied` leaves it.
+    dirs: Vec<(PathBuf, bool)>,
+}
+
+impl PendingNames {
+    /// `holders` (found levels' holders, outermost first), then `own` (the store's
+    /// directories), each once.
+    pub(crate) fn new(holders: Vec<PathBuf>, own: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+        let named = holders
+            .into_iter()
+            .map(|dir| (dir, true))
+            .chain(own.into_iter().map(|dir| (dir, false)));
+        for (dir, found) in named {
+            match dirs.iter_mut().find(|(seen, _)| *seen == dir) {
+                // Both a holder and the store's own (a relative root): the stricter.
+                Some((_, tolerant)) => *tolerant &= found,
+                None => dirs.push((dir, found)),
+            }
+        }
+        Self { dirs }
+    }
+
+    /// Syncs each, removing it once synced; the first failure is returned, leaving it and the
+    /// rest for the next call.
+    pub(crate) fn settle(&mut self) -> std::io::Result<()> {
+        use std::io::ErrorKind::PermissionDenied;
+        while let Some((dir, tolerant)) = self.dirs.first() {
+            match super::place::sync_dir(dir) {
+                Ok(()) => {}
+                Err(error) if *tolerant && error.kind() == PermissionDenied => {}
+                Err(error) => return Err(error),
+            }
+            self.dirs.remove(0);
+        }
+        Ok(())
+    }
 }
 
 impl Wal {
     /// Opens the log for appending after recovery. Appends to the newest segment, or starts
     /// one for `next_revision` if there is none. New segments are of the store's encoding
-    /// (`integers_in_dictionary`: version 4).
+    /// (`integers_in_dictionary`: version 4). `dir` and `archive` exist, named by the store's
+    /// open (`place::create_store_dir`); `pending_names` are synced before the first record is
+    /// acknowledged ([`Self::settle_names`]).
     pub(crate) fn open(
         dir: &Path,
         next_revision: u64,
@@ -184,15 +233,12 @@ impl Wal {
         sync: SyncPolicy,
         integers_in_dictionary: bool,
         archive: Option<PathBuf>,
+        pending_names: PendingNames,
     ) -> EngineResult<Self> {
         let magic = match integers_in_dictionary {
             true => SEGMENT_MAGIC_V4,
             false => SEGMENT_MAGIC,
         };
-        fs::create_dir_all(dir)?;
-        if let Some(archive) = &archive {
-            fs::create_dir_all(archive)?;
-        }
         // A segment a crash left under its temporary name was never part of the log.
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
@@ -235,7 +281,15 @@ impl Wal {
             buffer: Vec::new(),
             magic,
             archive,
+            pending_names,
         })
+    }
+
+    /// Syncs the names the store's open left pending, before a durable write that relies on
+    /// them and doesn't go through [`Self::append`] (a checkpoint, a bulk publication, the log
+    /// served). A failure is only returned: nothing was written, and the next call tries again.
+    pub(crate) fn settle_names(&mut self) -> EngineResult<()> {
+        Ok(self.pending_names.settle()?)
     }
 
     pub(crate) fn bytes_since_checkpoint(&self) -> u64 {
@@ -272,13 +326,19 @@ impl Wal {
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
         encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
+        // The names the open left pending are synced after the record, before it is
+        // acknowledged: the record's sync commits the journal and flushes the device, and the
+        // directories' syncs after it find nothing left to flush (measured on the timing host:
+        // in the other order the record's sync paid a second flush; deferred-sync design note).
+        // A failure there leaves the record written, its outcome unknown: it poisons the log.
         let result = self
             .active
             .write_all(&self.buffer)
             .and_then(|()| match self.sync {
                 SyncPolicy::EveryCommit => self.active.sync_data(),
                 SyncPolicy::OsBuffered => Ok(()),
-            });
+            })
+            .and_then(|()| self.pending_names.settle());
         if let Err(error) = result {
             self.poisoned = true;
             return Err(error.into());
@@ -361,9 +421,10 @@ impl Wal {
 /// Moves a segment into `archive` (a copy where a rename can't cross file systems).
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
-    if fs::rename(path, &target).is_err() {
-        fs::copy(path, &target)?;
-        File::open(&target)?.sync_all()?;
+    if super::place::rename(path, &target).is_err() {
+        // Synced through a writable handle (the read-only one this took before can't be
+        // flushed on Windows), and in place before the original goes.
+        super::place::copy(path, &target)?;
         fs::remove_file(path)?;
     }
     super::sync_dir(archive)?;
@@ -394,7 +455,7 @@ fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineRes
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
-    fs::rename(&temporary, &path)?;
+    super::place::rename(&temporary, &path)?;
     #[cfg(test)]
     super::fault::check(&super::fault::FAIL_SEGMENT_PLACED, "segment directory sync")?;
     super::sync_dir(dir)?;
