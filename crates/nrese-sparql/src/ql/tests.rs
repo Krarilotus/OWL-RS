@@ -460,6 +460,72 @@ fn probes_are_kept_per_default_graph_mode() {
     }
 }
 
+/// A probe's answer depends on whether GeoSPARQL relations are computed from the geometries
+/// or only read as stated (sol-loop r2 S2): `ann` intersects `acme` by their points, and
+/// states no relation. A published and a pending snapshot, read computing, stated only,
+/// then computing again with one rewriting, each answer as a fresh rewriting does on a
+/// snapshot of its own; stated only, the existential gives `ann` alone.
+#[test]
+fn probes_are_kept_per_geosparql_mode() {
+    let engine = engine(
+        "@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        :Worker rdfs:subClassOf [ a owl:Restriction ; owl:onProperty geo:sfIntersects ;
+            owl:someValuesFrom :Site ] .
+        :ann a :Worker ; geo:hasGeometry :ga .
+        :ga geo:asWKT \"POINT(1 1)\"^^geo:wktLiteral .
+        :acme a :Site ; geo:hasGeometry :gb .
+        :gb geo:asWKT \"POINT(1 1)\"^^geo:wktLiteral .",
+    );
+    let query = SparqlParser::new()
+        .parse_query(
+            "SELECT ?x WHERE { ?x <http://www.opengis.net/ont/geosparql#sfIntersects> ?y }",
+        )
+        .unwrap();
+    let answers = |snapshot: &Snapshot, options: &QueryOptions| {
+        let QueryResults::Solutions(rows) = evaluate_query(snapshot, &query, options).unwrap()
+        else {
+            panic!("solutions expected");
+        };
+        let mut got: Vec<String> = rows
+            .map(|row| row.unwrap().get("x").unwrap().to_string())
+            .collect();
+        got.sort();
+        got.dedup();
+        got
+    };
+    let mut tx = engine.transaction();
+    tx.insert(quad("bob", &format!("{EX}knows"), "acme").as_ref());
+    let pending = tx.pending_snapshot();
+    let published = engine.snapshot();
+    for (name, snapshot) in [("published", &published), ("pending", &pending)] {
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        for stated_only in [false, true, false] {
+            let options = QueryOptions {
+                geosparql_stated_only: stated_only,
+                ..sharing(&ql)
+            };
+            // A fresh rewriting on a snapshot of its own: a pending one is a new version.
+            let own = match name {
+                "published" => published.clone(),
+                _ => tx.pending_snapshot(),
+            };
+            let fresh = QueryOptions {
+                geosparql_stated_only: stated_only,
+                ..sharing(&Arc::new(QlRewriting::new(Closure { lists: true })))
+            };
+            let expected = answers(&own, &fresh);
+            if stated_only {
+                assert_eq!(expected, ["<http://example.org/ann>"], "{name}");
+            }
+            assert_eq!(
+                answers(snapshot, &options),
+                expected,
+                "{name}, stated only {stated_only}"
+            );
+        }
+    }
+}
+
 /// A mask of a published snapshot is published (dictionary 3.0): changing only its
 /// inferred mask, the schema read reuses the kept TBox, and its answers and probes are what
 /// a fresh rewriting gives it (review r0 §5 item 4).
