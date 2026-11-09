@@ -1013,18 +1013,15 @@ impl<L: Step, R: Step> Step for Merged<L, R> {
     #[inline]
     fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         let permutation = self.permutation;
-        let left = self
-            .left
-            .peek(account)?
-            .map(|quad| permutation.to_key(quad));
-        let right = self
-            .right
-            .peek(account)?
-            .map(|quad| permutation.to_key(quad));
-        match (left, right) {
-            (Some(left), Some(right)) if right < left => self.right.next(account),
-            (Some(_), _) => self.left.next(account),
-            (None, _) => self.right.next(account),
+        // Keys are made only where both sides have a quad (`p2-reas3-abl6`: made for one
+        // side alone, they cost a plain load 0.6 % of its instructions).
+        let right_first = match (self.left.peek(account)?, self.right.peek(account)?) {
+            (Some(left), Some(right)) => permutation.to_key(right) < permutation.to_key(left),
+            (left, _) => left.is_none(),
+        };
+        match right_first {
+            true => self.right.next(account),
+            false => self.left.next(account),
         }
     }
 }
