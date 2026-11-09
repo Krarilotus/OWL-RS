@@ -312,11 +312,22 @@ impl IndexVersion {
                 false => Ok(false),
             };
         };
-        let has_tombstones = self.runs.iter().any(|run| {
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            crate::witness::add(crate::witness::Site::RunProbes, 1);
-            !run.permutation(adapted.permutation).tombstones.is_empty()
-        });
+        // Whether a run holds tombstones (then the exact count decides): each run looked at a
+        // unit, counted a chunk at a time before it is looked at (REAS-3a sol-loop r1 S2).
+        let mut has_tombstones = false;
+        for runs in self.runs.chunks(nrese_exec::POLL_UNITS as usize) {
+            if has_tombstones {
+                break;
+            }
+            if !visit(runs.len() as u64) {
+                return Err(Stopped);
+            }
+            has_tombstones = runs.iter().any(|run| {
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::RunProbes, 1);
+                !run.permutation(adapted.permutation).tombstones.is_empty()
+            });
+        }
         if adapted.exclude_default_graph || has_tombstones {
             let count = self.count_plan_visiting(plan, visit);
             return count.map(|count| count > 0).ok_or(Stopped);

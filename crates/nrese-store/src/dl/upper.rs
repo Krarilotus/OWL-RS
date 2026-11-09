@@ -641,6 +641,16 @@ impl GaveUp {
     }
 }
 
+/// U1's give-up for an evaluation the reasoner interrupted: refused where the process's
+/// memory stopped it (`Interrupted::memory`, the reasoner's own memory fallback), never kept;
+/// otherwise as `why` says (REAS-3a sol-loop r1 S3).
+fn gave_up(interrupted: &delta::Interrupted, why: &str) -> GaveUp {
+    match interrupted.memory {
+        Some(_) => GaveUp::refused(format!("{why}: the process's memory is past its limit")),
+        None => GaveUp::new(why),
+    }
+}
+
 /// Poll the caller's store watch as well as the process owner's safety fallback; the latter
 /// is the process's memory, so a U1 it stops is refused, never kept (REAS-3, C17).
 fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
@@ -833,7 +843,7 @@ impl Upper {
             nrese_reasoner::batch::Listing::Stored,
             stop,
         )
-        .map_err(|_| GaveUp::new("the upper bound's evaluation was stopped"))?;
+        .map_err(|stopped| gave_up(&stopped, "the upper bound's evaluation was stopped"))?;
         let same_as = program.names.same_as;
         // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
         // evaluation's own working set is watched (`stop`), as the support sets' is.
@@ -983,7 +993,7 @@ impl Upper {
             self.ground.as_ref(),
             stop,
         )
-        .map_err(|_| GaveUp::new("the upper bound's maintenance was stopped"))?;
+        .map_err(|stopped| gave_up(&stopped, "the upper bound's maintenance was stopped"))?;
         change.program = update.program;
         // An equality the commit brings (the RL closure's, say: a functional property is
         // OWL 2 RL) or U1 derives: U1 then has classes.
