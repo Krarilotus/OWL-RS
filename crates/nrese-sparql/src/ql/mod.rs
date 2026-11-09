@@ -587,6 +587,8 @@ impl QlRewriting {
         expressions: &[u64],
         members: &Members,
     ) -> Arc<Tbox> {
+        #[cfg(test)]
+        building();
         let statements = with_members(
             &reader_core(snapshot, &schema.core, access),
             expressions.iter().map(|e| &members.of[e]),
@@ -802,6 +804,8 @@ fn fresh_members(
     core: &[nrese_owl::Statement],
     access: Option<&GraphAccess>,
 ) -> (Vec<u64>, Members) {
+    #[cfg(test)]
+    building();
     let keep = |graph: u64| {
         access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
     };
@@ -967,6 +971,22 @@ thread_local! {
 #[cfg(test)]
 fn count(cell: &'static std::thread::LocalKey<std::cell::Cell<usize>>, n: usize) {
     cell.set(cell.get() + n);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called on this thread as a schema read starts its membership build or its compile
+    /// (the lock tests look at which locks are held then).
+    static BUILDING: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn building() {
+    BUILDING.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
 }
 
 /// What an expression's membership is ([`schema_statements`]): one statement, or none.
