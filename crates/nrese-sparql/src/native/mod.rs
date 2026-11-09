@@ -4715,7 +4715,7 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
-        let (decodes, budget) = (&self.decodes, &self.budget);
+        let decodes = &self.decodes;
         // A part's aggregates and their charge; `Err(None)` once cancelled.
         type Part = Result<(Vec<Vec<Agg>>, usize), Option<BudgetExceeded>>;
         let parts: Vec<Part> = bounds
@@ -4724,7 +4724,7 @@ impl<'a> Context<'a> {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return Err(None);
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes, budget);
+                let decoder = Decoder::new(snapshot, computed, decodes, shared);
                 let term = |id: u64| decoder.term(id);
                 let kept = aggregate::Kept::new(shared);
                 let aggregator = Aggregator {
