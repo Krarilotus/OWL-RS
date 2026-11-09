@@ -1250,6 +1250,8 @@ struct Context<'a> {
     model: ReadModel,
     /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
     aliases: RefCell<HashMap<String, u64>>,
+    /// An alias reservation refused; checked before any answer is delivered.
+    aliases_refused: Cell<Option<nrese_exec::BudgetExceeded>>,
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
@@ -1488,6 +1490,7 @@ impl<'a> Context<'a> {
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
+            aliases_refused: Cell::new(None),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
@@ -1554,10 +1557,18 @@ impl<'a> Context<'a> {
         self.snapshot.lookup(term)
     }
 
-    /// Makes `alias` stand for the blank node `id` in patterns and expressions.
+    /// Retains one typed alias, reserved before either map keeps it. Refusal is sticky,
+    /// like a refused read during preparation, and every delivery checks it.
     fn register_alias(&self, alias: &str, id: u64) {
-        self.aliases.borrow_mut().insert(alias.to_owned(), id);
+        if self.aliases_refused.get().is_some() || self.aliases.borrow().get(alias) == Some(&id) {
+            return;
+        }
         if let Some(term) = self.term(id) {
+            if let Err(refused) = self.kept.borrow_mut().charge(alias_bytes(alias, &term)) {
+                self.aliases_refused.set(Some(refused));
+                return;
+            }
+            self.aliases.borrow_mut().insert(alias.to_owned(), id);
             self.evaluator.register_alias(alias, term);
         }
     }
@@ -1587,7 +1598,12 @@ impl<'a> Context<'a> {
     /// Fails a cancelled query, and one a read refused memory to: what it read since may
     /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
-        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
+        if let Some(refused) = self
+            .aliases_refused
+            .get()
+            .or(self.reads_refused)
+            .or_else(|| self.snapshot.read_refused())
+        {
             return Err(QueryEvaluationError::MemoryLimit(refused).into());
         }
         Ok(self
@@ -6029,6 +6045,40 @@ fn computed_bytes(term: &Term) -> usize {
     (2 * slot)
         .saturating_add(2 * entry * 8 / 7 + 2)
         .saturating_add(heap.saturating_mul(2))
+}
+
+/// Both alias maps and the one possible canonical child's name-map copy (late.rs);
+/// that child has late expansion disabled and lives within this query. Four slots per
+/// entry and two control words per slot cover growth and the first allocation.
+/// Size without formatting.
+fn alias_bytes(alias: &str, term: &Term) -> usize {
+    fn heap(term: &Term) -> usize {
+        match term {
+            Term::NamedNode(n) => n.as_str().len(),
+            Term::BlankNode(b) => b.as_str().len(),
+            Term::Literal(l) => {
+                l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+            }
+            Term::Triple(t) => {
+                let subject = match &t.subject {
+                    nrese_rdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    nrese_rdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                std::mem::size_of::<nrese_rdf::Triple>()
+                    + subject
+                    + t.predicate.as_str().len()
+                    + heap(&t.object)
+            }
+        }
+    }
+    let slots = 2 * std::mem::size_of::<(String, u64)>()
+        + std::mem::size_of::<(String, Term)>()
+        + 6 * std::mem::size_of::<usize>();
+    alias
+        .len()
+        .saturating_mul(3)
+        .saturating_add(slots * 4)
+        .saturating_add(heap(term))
 }
 
 /// What a number [`Context::numeric_pass`] remembers holds in its map: the id and the
