@@ -685,7 +685,7 @@ pub fn upload(
     let graph = || nrese_rdf::NamedNode::new_unchecked(GRAPH);
     let payload = std::fs::read(file)?;
     let data = || RdfPayload {
-        payload: payload.clone(),
+        payload: payload.clone().into(),
         format,
         base_iri: None,
     };
@@ -694,7 +694,7 @@ pub fn upload(
             target: GraphTarget::NamedGraph(GRAPH.to_owned()),
             format,
             base_iri: None,
-            payload: payload.clone(),
+            payload: payload.clone().into(),
             replace: true,
         })
     };

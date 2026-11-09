@@ -83,7 +83,7 @@ fn apply(pipeline: &MutationPipeline, command: MutationCommand) -> Outcome {
 
 fn payload(text: &str) -> RdfPayload {
     RdfPayload {
-        payload: text.as_bytes().to_vec(),
+        payload: text.as_bytes().to_vec().into(),
         format: GraphResultFormat::NTriples,
         base_iri: None,
     }
@@ -111,7 +111,7 @@ fn routes() -> Vec<(&'static str, Route)> {
                         target: named(),
                         format: GraphResultFormat::NTriples,
                         base_iri: None,
-                        payload: text.as_bytes().to_vec(),
+                        payload: text.as_bytes().to_vec().into(),
                         replace: true,
                     }),
                 )

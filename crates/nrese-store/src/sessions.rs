@@ -380,7 +380,7 @@ mod tests {
     fn filled(byte: u8, bytes: usize) -> Vec<StatementOp> {
         vec![StatementOp::Add {
             data: crate::RdfPayload {
-                payload: vec![byte; bytes],
+                payload: vec![byte; bytes].into(),
                 format: crate::query::GraphResultFormat::Turtle,
                 base_iri: None,
             },

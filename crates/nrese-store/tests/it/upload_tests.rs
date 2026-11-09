@@ -78,7 +78,7 @@ fn late_error() -> Vec<u8> {
 fn a_late_syntax_error_changes_nothing() {
     let named = GraphTarget::NamedGraph("http://e/g".to_owned());
     let payload = |payload: Vec<u8>| RdfPayload {
-        payload,
+        payload: payload.into(),
         format: GraphResultFormat::Turtle,
         base_iri: None,
     };
@@ -90,7 +90,7 @@ fn a_late_syntax_error_changes_nothing() {
                 target: named.clone(),
                 format: GraphResultFormat::Turtle,
                 base_iri: None,
-                payload: late_error(),
+                payload: late_error().into(),
                 replace: true,
             }),
         ),
@@ -100,7 +100,7 @@ fn a_late_syntax_error_changes_nothing() {
                 target: GraphTarget::DefaultGraph,
                 format: GraphResultFormat::Turtle,
                 base_iri: None,
-                payload: late_error(),
+                payload: late_error().into(),
                 replace: true,
             }),
         ),
@@ -142,7 +142,7 @@ fn a_late_syntax_error_changes_nothing() {
             &pipeline,
             MutationCommand::Statements(StatementsRequest::new(vec![StatementOp::Add {
                 data: RdfPayload {
-                    payload: before.into_bytes(),
+                    payload: before.into_bytes().into(),
                     format: GraphResultFormat::NQuads,
                     base_iri: None,
                 },
@@ -169,7 +169,7 @@ fn a_blank_node_is_one_node_throughout_its_document() {
             target: GraphTarget::DefaultGraph,
             format: GraphResultFormat::NTriples,
             base_iri: None,
-            payload: document.as_bytes().to_vec(),
+            payload: document.as_bytes().to_vec().into(),
             replace: true,
         }),
     )

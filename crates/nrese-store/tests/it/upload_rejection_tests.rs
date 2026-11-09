@@ -67,7 +67,7 @@ fn apply(pipeline: &MutationPipeline, command: MutationCommand) -> Result<(), St
 
 fn payload(text: &str) -> RdfPayload {
     RdfPayload {
-        payload: text.as_bytes().to_vec(),
+        payload: text.as_bytes().to_vec().into(),
         format: GraphResultFormat::NTriples,
         base_iri: None,
     }
@@ -78,7 +78,7 @@ fn graph_write(text: &str, target: GraphTarget) -> MutationCommand {
         target,
         format: GraphResultFormat::NTriples,
         base_iri: None,
-        payload: text.as_bytes().to_vec(),
+        payload: text.as_bytes().to_vec().into(),
         replace: true,
     })
 }

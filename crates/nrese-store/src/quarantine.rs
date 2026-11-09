@@ -588,7 +588,7 @@ impl Quarantine {
         };
         let command = MutationCommand::Statements(StatementsRequest::new(vec![StatementOp::Add {
             data: RdfPayload {
-                payload: document.into_bytes(),
+                payload: document.into_bytes().into(),
                 format,
                 base_iri: statement.base.clone(),
             },

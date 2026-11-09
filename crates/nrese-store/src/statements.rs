@@ -92,7 +92,8 @@ impl StatementPattern {
 /// An RDF document in a request.
 #[derive(Debug, Clone)]
 pub struct RdfPayload {
-    pub payload: Vec<u8>,
+    /// The request's body as it came, shared, never copied (D16-039 S12).
+    pub payload: bytes::Bytes,
     pub format: GraphResultFormat,
     pub base_iri: Option<String>,
 }
@@ -283,13 +284,11 @@ impl StatementOp {
     /// charges ([`crate::sessions`]).
     pub fn heap_bytes(&self) -> usize {
         match self {
-            Self::Add { data, contexts } | Self::RemoveData { data, contexts } => {
-                data.payload.capacity()
-                    + data.base_iri.as_ref().map_or(0, String::capacity)
-                    + graphs_bytes(contexts)
-            }
-            Self::RemovePatterns { data, contexts, .. } => {
-                data.payload.capacity()
+            // The body it holds is shared with the request's (`bytes::Bytes`): its length.
+            Self::Add { data, contexts }
+            | Self::RemoveData { data, contexts }
+            | Self::RemovePatterns { data, contexts, .. } => {
+                data.payload.len()
                     + data.base_iri.as_ref().map_or(0, String::capacity)
                     + graphs_bytes(contexts)
             }

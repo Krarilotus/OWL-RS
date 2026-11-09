@@ -117,10 +117,10 @@ fn infer(pairs: &[(String, String)]) -> bool {
     param(pairs, "infer") != Some("false")
 }
 
-/// An RDF request body.
+/// An RDF request body, shared, not copied.
 pub(crate) fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
     Ok(RdfPayload {
-        payload: body.to_vec(),
+        payload: body.clone(),
         format: parse_graph_content_format(header_value_str(headers.get(header::CONTENT_TYPE)))?,
         base_iri: parse_rdf_base_iri(headers),
     })
