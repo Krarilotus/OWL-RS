@@ -94,8 +94,8 @@ fn a_global_engine_keeps_no_corpora() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     base(&engine);
     let snapshot = engine.snapshot();
-    assert_eq!(snapshot.text_search(&query("alpha beta")).len(), 3);
-    assert_eq!(snapshot.iri_search(&query("alpha")).len(), 0);
+    assert_eq!(snapshot.text_search(&query("alpha beta")).unwrap().len(), 3);
+    assert_eq!(snapshot.iri_search(&query("alpha")).unwrap().len(), 0);
     let mut tx = engine.transaction();
     tx.insert(label("c", "gamma", None).as_ref());
     let _pending = tx.pending_snapshot();
@@ -402,14 +402,14 @@ fn check(
         }
     }
     let typed: Vec<u64> = typed.into_iter().collect();
-    let vectors = snapshot.vector_corpus_members(model, scope);
+    let vectors = snapshot.vector_corpus_members(model, scope).unwrap();
     if vectors != typed {
         failed.push(format!(
             "{context}, {model:?}, {scope:?}, vectors: {vectors:?} != {typed:?}"
         ));
     }
     for iris in [false, true] {
-        let (members, documents, _) = snapshot.text_corpus_members(model, scope, iris);
+        let (members, documents, _) = snapshot.text_corpus_members(model, scope, iris).unwrap();
         let expected = visible(snapshot, model, scope, iris);
         if members != expected || documents != expected.len() as u64 {
             failed.push(format!(

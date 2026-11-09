@@ -197,8 +197,11 @@ impl MutationPipeline {
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
-        // The request's one envelope: its WHERE clauses and its DL gate draw from it.
+        // The request's one envelope: its WHERE clauses and its DL gate draw from it, and so
+        // does what a transfer reserves of the pending changes, for as long as they live.
         let envelope = self.store.envelope(None);
+        tx.charge_pending_to(Arc::new(envelope.part()))
+            .map_err(|error| store_error(error.into()))?;
         let context = crate::mutation::command::UpdateContext {
             memory: envelope.clone(),
             cancellation: ticket.evaluation_token(),

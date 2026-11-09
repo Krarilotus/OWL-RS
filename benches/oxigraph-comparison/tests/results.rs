@@ -75,16 +75,16 @@ fn w3c_result_files_read_alike() {
         let bytes = file.bytes.as_slice();
         let (a, b) = match file.path.extension().and_then(|e| e.to_str()) {
             Some("srj") => (
-                ours(nrese_sparql_results::QueryResultsFormat::Json, &bytes),
-                theirs(sparesults::QueryResultsFormat::Json, &bytes),
+                ours(nrese_sparql_results::QueryResultsFormat::Json, bytes),
+                theirs(sparesults::QueryResultsFormat::Json, bytes),
             ),
             Some("srx") => (
-                ours(nrese_sparql_results::QueryResultsFormat::Xml, &bytes),
-                theirs(sparesults::QueryResultsFormat::Xml, &bytes),
+                ours(nrese_sparql_results::QueryResultsFormat::Xml, bytes),
+                theirs(sparesults::QueryResultsFormat::Xml, bytes),
             ),
             _ => (
-                ours(nrese_sparql_results::QueryResultsFormat::Tsv, &bytes),
-                theirs(sparesults::QueryResultsFormat::Tsv, &bytes),
+                ours(nrese_sparql_results::QueryResultsFormat::Tsv, bytes),
+                theirs(sparesults::QueryResultsFormat::Tsv, bytes),
             ),
         };
         match (&a, &b) {

@@ -1,7 +1,7 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
@@ -9,7 +9,7 @@ use parking_lot::MutexGuard;
 
 mod pending;
 
-use self::pending::{Pending, SnapshotChanges};
+pub(super) use self::pending::{Pending, SnapshotChanges};
 use super::{Inner, ReadModel, Snapshot, Version};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
@@ -319,9 +319,34 @@ impl<'e> Transaction<'e> {
         }
     }
 
+    /// Pays for the pending changes' growth from `budget` for their life: what
+    /// [`Self::try_reserve_inserts`] reserves is charged to it before it is allocated, and held
+    /// until the transaction is dropped or its commit has freed the changes. The mutation
+    /// pipeline attaches the request's envelope here. Attaching the same budget again changes
+    /// nothing; another one is refused ([`crate::EngineError::Configuration`]).
+    pub fn charge_pending_to(&mut self, budget: Arc<nrese_exec::Budget>) -> EngineResult<()> {
+        self.pending.charge_to(budget)
+    }
+
+    /// Whether a budget pays for the pending changes' growth ([`Self::charge_pending_to`]): a
+    /// caller that reserves only where one does, as one without a budget has nothing to reserve
+    /// from (an engine user's own transaction, a test).
+    pub fn charges_pending(&self) -> bool {
+        self.pending.charged()
+    }
+
+    /// Room for `more` asserted inserts, charged to the attached budget
+    /// ([`Self::charge_pending_to`]) before the pending table grows: the next `more` inserts
+    /// allocate nothing. Refused ([`crate::EngineError::MemoryLimit`]), nothing changes;
+    /// without a budget attached it is an error ([`crate::EngineError::Configuration`]).
+    pub fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()> {
+        self.pending.try_reserve_inserts(more)
+    }
+
     /// Asserts an already-encoded quad. Its ids must come from this engine's dictionary.
     /// Returns `false` if it was already asserted; asserting an inferred quad returns `true`
-    /// (it becomes explicit).
+    /// (it becomes explicit). Growth past the room [`Self::try_reserve_inserts`] reserved is
+    /// uncharged, as it is for every insert without a reserve: only a reserve charges.
     pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
         let changed = self.pending.insert_asserted(quad);
         self.assert_unanswered(changed)
@@ -404,7 +429,9 @@ impl<'e> Transaction<'e> {
             pending,
             after,
         } = self;
-        let (base, asserted, inferred) = pending.into_parts();
+        // The pending changes' charge, bound first so it drops last: after the sets are freed,
+        // and after the record made of them is published.
+        let (_charge, base, asserted, inferred) = pending.into_parts();
         let promised = after.into_inner();
         let count = |set: &HashSet<EncodedQuad>| set.len() as u64;
         let summary = |revision, asserted_identity| CommitSummary {
