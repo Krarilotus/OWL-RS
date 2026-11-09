@@ -10,6 +10,8 @@
 //! are decided: elements, attributes, text, references, CDATA sections, and namespace
 //! declarations (rendered where visibly used, as exclusive canonicalisation does).
 
+use std::collections::HashMap;
+
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -41,11 +43,12 @@ pub fn classify(text: &str) -> Result<String, NotCanonical> {
         s: text.as_bytes(),
         at: 0,
         out: String::new(),
-        scopes: Vec::new(),
-        rendered: Vec::new(),
+        open: Vec::new(),
+        bound: HashMap::new(),
+        rendered: HashMap::new(),
         undecided: false,
     };
-    if p.content(None).is_none() || p.at != p.s.len() {
+    if p.content().is_none() || p.at != p.s.len() {
         return Err(NotCanonical::Malformed);
     }
     if p.undecided {
@@ -54,14 +57,26 @@ pub fn classify(text: &str) -> Result<String, NotCanonical> {
     Ok(p.out)
 }
 
+/// An open element: its name, and the prefixes it binds and renders (each pushed on
+/// [`Parser::bound`] and [`Parser::rendered`], popped when it closes).
+struct Open {
+    name: String,
+    declared: Vec<String>,
+    rendered: Vec<String>,
+}
+
+/// The parser keeps its open elements on the heap ([`Parser::open`]), not on the call
+/// stack: nesting depth costs memory linear in the input, never stack.
 struct Parser<'a> {
     s: &'a [u8],
     at: usize,
     out: String,
-    /// Per open element: its namespace declarations (prefix, IRI).
-    scopes: Vec<Vec<(String, String)>>,
-    /// Per open element: the declarations its canonical form renders.
-    rendered: Vec<Vec<(String, String)>>,
+    /// The open elements, innermost last.
+    open: Vec<Open>,
+    /// Per prefix: the IRIs the open elements bind it to, innermost last.
+    bound: HashMap<String, Vec<String>>,
+    /// Per prefix: the IRIs the open elements' canonical forms render for it, innermost last.
+    rendered: HashMap<String, Vec<String>>,
     /// A comment or processing instruction was read: well-formed so far, but not decided.
     undecided: bool,
 }
@@ -178,21 +193,22 @@ impl Parser<'_> {
         }
     }
 
-    /// Content up to the end tag of `element` (or the end of the input).
-    fn content(&mut self, element: Option<&str>) -> Option<()> {
+    /// The whole fragment: content, each end tag closing the innermost open element, every
+    /// element closed at the end of the input. One loop, whatever the nesting.
+    fn content(&mut self) -> Option<()> {
         loop {
             match self.peek() {
-                None => return element.is_none().then_some(()),
+                None => return self.open.is_empty().then_some(()),
                 Some(b'<') if self.starts("</") => {
-                    let name = element?;
+                    let open = self.open.pop()?;
                     self.at += 2;
                     let end = self.name()?;
                     self.space();
-                    if end != name || self.peek() != Some(b'>') {
+                    if end != open.name || self.peek() != Some(b'>') {
                         return None;
                     }
                     self.at += 1;
-                    return Some(());
+                    self.close(open);
                 }
                 Some(b'<') if self.starts("<![CDATA[") => {
                     self.at += 9;
@@ -310,7 +326,11 @@ impl Parser<'_> {
         // Exclusive canonicalisation renders a declaration on each element that visibly
         // uses its prefix (in its name or an attribute's), unless an output ancestor
         // already rendered the same; declarations nothing uses are left out.
-        self.scopes.push(declarations);
+        let mut declared = Vec::with_capacity(declarations.len());
+        for (prefix, iri) in declarations {
+            self.bound.entry(prefix.clone()).or_default().push(iri);
+            declared.push(prefix);
+        }
         let prefix_of = |qname: &str| qname.split_once(':').map_or("", |(p, _)| p).to_owned();
         let mut used = vec![prefix_of(&name)];
         for (a, _) in &attributes {
@@ -365,7 +385,11 @@ impl Parser<'_> {
             self.escape_attribute(iri);
             self.out.push('"');
         }
-        self.rendered.push(rendered);
+        let mut rendered_prefixes = Vec::with_capacity(rendered.len());
+        for (prefix, iri) in rendered {
+            self.rendered.entry(prefix.clone()).or_default().push(iri);
+            rendered_prefixes.push(prefix);
+        }
         for (_, _, a, v) in &keyed {
             self.out.push(' ');
             self.out.push_str(a);
@@ -374,25 +398,40 @@ impl Parser<'_> {
             self.out.push('"');
         }
         self.out.push('>');
-        if !empty {
-            self.content(Some(&name))?;
+        let open = Open {
+            name,
+            declared,
+            rendered: rendered_prefixes,
+        };
+        // Its content is read by the loop that read this tag ([`Parser::content`]).
+        if empty {
+            self.close(open);
+        } else {
+            self.open.push(open);
         }
-        self.out.push_str("</");
-        self.out.push_str(&name);
-        self.out.push('>');
-        self.scopes.pop();
-        self.rendered.pop();
         Some(())
+    }
+
+    /// Ends `open`: its end tag, and its bindings and rendered declarations go out of scope.
+    fn close(&mut self, open: Open) {
+        self.out.push_str("</");
+        self.out.push_str(&open.name);
+        self.out.push('>');
+        for prefix in open.declared {
+            if let Some(iris) = self.bound.get_mut(&prefix) {
+                iris.pop();
+            }
+        }
+        for prefix in open.rendered {
+            if let Some(iris) = self.rendered.get_mut(&prefix) {
+                iris.pop();
+            }
+        }
     }
 
     /// The value the nearest output ancestor rendered for `prefix`.
     fn rendered_value(&self, prefix: &str) -> Option<String> {
-        self.rendered
-            .iter()
-            .rev()
-            .flat_map(|s| s.iter())
-            .find(|(p, _)| p == prefix)
-            .map(|(_, iri)| iri.clone())
+        self.rendered.get(prefix)?.last().cloned()
     }
 
     /// The namespace IRI `prefix` is bound to; `xml`'s binding needs no declaration.
@@ -400,12 +439,7 @@ impl Parser<'_> {
         if prefix == "xml" {
             return Some(XML_NAMESPACE.to_owned());
         }
-        self.scopes
-            .iter()
-            .rev()
-            .flat_map(|s| s.iter())
-            .find(|(p, _)| p == prefix)
-            .map(|(_, iri)| iri.clone())
+        self.bound.get(prefix)?.last().cloned()
     }
 
     fn escape_attribute(&mut self, v: &str) {

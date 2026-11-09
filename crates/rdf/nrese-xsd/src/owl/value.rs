@@ -68,15 +68,11 @@ impl Value {
         };
         if let Some(tag) = language {
             return match datatype {
-                Datatype::LangString | Datatype::PlainLiteral if !tag.is_empty() => {
-                    if !lexical.chars().all(text::is_xml_char) {
-                        return Err(ill("a character XML doesn't allow"));
-                    }
-                    Ok(Value::LangString(
-                        lexical.to_owned(),
-                        tag.to_ascii_lowercase(),
-                    ))
-                }
+                // A language-tagged string is any lexical form with a tag (RDF 1.1 Concepts
+                // §3.3): XML's character restriction is xsd:string's, not its.
+                Datatype::LangString | Datatype::PlainLiteral if !tag.is_empty() => Ok(
+                    Value::LangString(lexical.to_owned(), tag.to_ascii_lowercase()),
+                ),
                 _ => Err(ill("a language tag on a datatype without one")),
             };
         }
