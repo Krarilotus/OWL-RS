@@ -1,0 +1,462 @@
+"""Release acceptance (benches/fast/release_gate.py verdict, w3c, guards; scripts/release-gate.sh):
+the gate passes only the exact candidate, with every required outcome present and only approved
+exceptions (Harness notes 2026-11-09-g1-release-acceptance-design.md).
+
+The audit of 8 Nov 2026 (tests-tooling T01-T03; catalogue D16-130, D16-126, D16-125) found the
+final join pass a candidate it must refuse, each reproduced on engine-v2 3a4e0a21e:
+- checks of another candidate, or naming none, joined to a candidate's timed parts (D16-130);
+- a launched W3C kit that died without a libtest summary left no trace in the verdict (D16-126);
+- a wrong answer the case catalogue declares as known passed without any owner exception, and the
+  verdict didn't name it (D16-125).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+
+import isolation
+import test_release_gate as fixtures  # the gate's pass and round fixtures (a module: its tests aren't rerun here)
+
+ROOT = Path(__file__).resolve().parents[3]
+GATE = ROOT / "benches/fast/release_gate.py"
+gate_module = fixtures.gate_module
+POLICY = "benches/release-tradeoffs.toml"
+IDENTITY = "rustc-1.98.1-0123456789ab flags=-C_target-cpu=native tools=abcdef012345"
+QUOTE = 'quote = "accept it for v1.5"\nsource = "OWL-RS master thread, 9 Nov 2026 10:11"\n'
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True,
+                          timeout=60, env=isolation.inherit()).stdout.strip()
+
+
+class Repository:
+    """A repository of the test's own: commits whose trees differ only by their policy file."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        path.mkdir(parents=True, exist_ok=True)
+        git(path, "init", "-q")
+
+    def commit(self, policy: str = "", message: str = "a candidate", files: dict[str, str] | None = None) -> str:
+        for rel, text in {POLICY: policy, **(files or {})}.items():
+            (self.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.path / rel).write_text(text, encoding="utf-8", newline="\n")
+        git(self.path, "add", "-A")
+        git(self.path, "commit", "-q", "--allow-empty", "-m", message)
+        return git(self.path, "rev-parse", "HEAD")
+
+    def tree(self, rev: str) -> str:
+        return git(self.path, "rev-parse", f"{rev}^{{tree}}")
+
+    def same_tree(self, rev: str) -> str:
+        """Another commit of REV's tree (a merge commit that changed nothing, say)."""
+        return git(self.path, "commit-tree", self.tree(rev), "-p", rev, "-m", "the same tree")
+
+
+def receipt(kind: str, commit: str, tree: str, **changes) -> dict:
+    """A check's receipt as release_gate.py w3c/guards --run write it."""
+    return {"kind": kind, "commit": commit, "tree": tree, "dirty": False, "identity": IDENTITY,
+            "host": "office-pc", "job": "rg-cand-checks",
+            "outcomes": [{"unit": "nrese-sparql:w3c_sparql11" if kind == "w3c" else "guards", "exit": 0,
+                          "log_sha256": "0" * 64, "summary": True}], **changes}
+
+
+def checks(commit: str, tree: str) -> tuple[dict, dict]:
+    """Passed W3C and guard results, each with its receipt for COMMIT at TREE."""
+    return ({"counts": {}, "expected": {}, "errors": [], "passed": True, "receipt": receipt("w3c", commit, tree)},
+            {"guards": 81, "results": {}, "errors": [], "passed": True, "receipt": receipt("guards", commit, tree)})
+
+
+def rounds(candidate: str, records_of=None) -> list[dict]:
+    """Two timed rounds of one part whose candidate side is CANDIDATE: a gate's first run and its
+    confirmation (a verdict decides over both)."""
+    out = []
+    for k in (0, 1):
+        summary = fixtures.run_gate(fixtures.passes(records_of), context={**fixtures.CONTEXT, "round": k})
+        summary["candidate"]["revision"] = candidate
+        out.append(summary)
+    return out
+
+
+def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: dict) -> subprocess.CompletedProcess:
+    """`release_gate.py verdict` on these parts, CANDIDATE resolved in REPO."""
+    tmp = Path(tempfile.mkdtemp(prefix="acceptance-", dir=isolation.SCRATCH))
+    files = []
+    for i, part in enumerate([*timed, w3c, guards]):
+        files.append(tmp / f"part-{i}.json")
+        files[-1].write_text(json.dumps(part), encoding="utf-8")
+    args = [a for f in files[:-2] for a in ("--timed", str(f))]
+    try:
+        return subprocess.run([sys.executable, str(GATE), "verdict", "--checkout", str(repo), "--candidate", candidate,
+                               *args, "--w3c", str(files[-2]), "--guards", str(files[-1])],
+                              capture_output=True, text=True, timeout=120,
+                              env=isolation.inherit("NRESE_", "FLEET_", PYTHONIOENCODING="utf-8"))
+    finally:
+        shutil.rmtree(tmp, True)
+
+
+class Scratch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="release-acceptance-", dir=isolation.SCRATCH))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = Repository(self.tmp / "repo")
+
+
+class CandidateJoin(Scratch):
+    """D16-130 (audit T01): every input of the verdict is evidence of the one candidate tree named."""
+
+    def test_checks_of_another_candidate_never_pass(self):
+        # Spec: T01 / the design's invariant 1: the candidate's timed parts with genuine passed checks of
+        # another tree, or checks naming no candidate (results from before receipts), are NOT PASSED,
+        # the receipt's mismatch named.
+        a = self.repo.commit(message="candidate A")
+        b = self.repo.commit(policy="# another tree\n", message="candidate B")
+        w3c, guards = checks(b, self.repo.tree(b))
+        done = verdict(self.repo.path, a, rounds(a), w3c, guards)
+        self.assertEqual(done.returncode, 1, f"SPEC checks of B joined to A's timed parts\n{done.stdout}{done.stderr}")
+        self.assertIn(f"ran tree {self.repo.tree(b)}", done.stdout)
+        bare = ({"counts": {}, "expected": {}, "errors": [], "passed": True},
+                {"guards": 81, "results": {}, "errors": [], "passed": True})
+        done = verdict(self.repo.path, a, rounds(a), *bare)
+        self.assertEqual(done.returncode, 1, f"SPEC checks naming no candidate\n{done.stdout}{done.stderr}")
+        self.assertIn("no receipt", done.stdout)
+
+    def test_a_timed_part_of_another_candidate_never_passes(self):
+        # Spec: T01: the candidate's checks with a timed part (one of several) that timed another tree.
+        a = self.repo.commit(message="candidate A")
+        b = self.repo.commit(policy="# another tree\n", message="candidate B")
+        done = verdict(self.repo.path, a, [rounds(a)[0], rounds(b)[1]], *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, f"SPEC a timed round of B joined to A\n{done.stdout}{done.stderr}")
+        self.assertIn(f"timed {b[:12]}", done.stdout)
+
+    def test_the_candidate_s_own_evidence_passes_under_any_commit_of_its_tree(self):
+        # Guard (the positive side; red on the parent only for want of --candidate): a verdict belongs
+        # to a tree (rule.owl-rs-results-keyed-by-tree): checks run at a merge commit of the candidate's
+        # tree are the candidate's. A receipt whose commit isn't of the tree it names is refused.
+        a = self.repo.commit(message="candidate A")
+        merged = self.repo.same_tree(a)
+        done = verdict(self.repo.path, a, rounds(a), *checks(merged, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("PASSED", done.stdout)
+        b = self.repo.commit(policy="# another tree\n", message="candidate B")
+        done = verdict(self.repo.path, a, rounds(a), *checks(b, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f"{b[:12]} isn't of tree", done.stdout)
+
+
+class CheckDirectory(Scratch):
+    """D16-130 at the shell (scripts/release-gate.sh verdict): the checks' directory holds one result of each."""
+
+    def test_two_w3c_results_in_the_checks_directory_are_refused_not_the_first_taken(self):
+        # Spec: T01 ("selecting a result directory with two incompatible checks fails"): today the step
+        # takes `ls | head -1` of the W3C and guard results; a rerun beside the first leaves two.
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        candidate = self.repo.commit(message="candidate", files={
+            rel: (ROOT / rel).read_text(encoding="utf-8") for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py",
+                                                                     ".gitignore")})
+        for directory in ("scripts/lib", "benches/suite/suitekit"):
+            shutil.copytree(ROOT / directory, self.repo.path / directory, ignore=shutil.ignore_patterns("__pycache__"))
+        candidate = self.repo.commit(message="the gate")
+        tree = self.repo.tree(candidate)
+        timed, results = self.tmp / "timed", self.tmp / "checks"
+        (results / "rerun").mkdir(parents=True)
+        timed.mkdir()
+        (timed / "release-gate.json").write_text(json.dumps(rounds(candidate)[0]), encoding="utf-8")
+        w3c, guards = checks(candidate, tree)
+        (results / "w3c.json").write_text(json.dumps(w3c), encoding="utf-8")
+        (results / "rerun" / "w3c.json").write_text(json.dumps(w3c), encoding="utf-8")
+        (results / "guards.json").write_text(json.dumps(guards), encoding="utf-8")
+        shim = self.tmp / "shim"
+        shim.mkdir()
+        (shim / "python3").write_text(f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
+                                      encoding="utf-8", newline="\n")
+        (shim / "python3").chmod(0o755)
+        env = isolation.inherit("NRESE_", "FLEET_", NRESE_GATE_DIR=(self.tmp / "gate").as_posix(),
+                                GATE_BIN=(self.tmp / "bin").as_posix(), FLEET_OUT=(self.tmp / "out").as_posix(),
+                                PATH=shim.as_posix() + os.pathsep + os.environ["PATH"])
+        done = subprocess.run([bash, "scripts/release-gate.sh", "verdict", candidate, timed.as_posix(), results.as_posix()],
+                              cwd=self.repo.path, env=env, capture_output=True, text=True, timeout=300)
+        output = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 2, f"SPEC two W3C results: refused\n{output}")
+        self.assertIn("2 w3c.json", output)
+        self.assertNotIn("PASSED", output.replace("NOT PASSED", ""))
+
+
+def kits_toml(*kits: tuple[str, list[str]], suites: str = "") -> str:
+    lines = [suites]
+    for kit, names in kits:
+        lines.append(f'[kit."{kit}"]\nsuites = {json.dumps(names)}\n')
+    return "\n".join(lines)
+
+
+RL_SUITE = '[suite."OWL 2 RL"]\npassed = 86\nskipped = 3\n'
+RL_LOG = ("W3C OWL 2 RL test cases (RDF-based semantics): 86 passed, 0 failed (0 expected), 3 skipped\n"
+          "test result: ok. 1 passed; 0 failed; 0 ignored\n")
+KITS = (("nrese-store:w3c_owl2_rl", ["OWL 2 RL"]), ("nrese-owl:w3c_owl2", []),
+        ("nrese-reasoner:w3c_n3_reasoner", []))
+
+
+class KitOutcomes(Scratch):
+    """D16-126 (audit T02): every declared W3C kit has one recorded launch outcome; a kit that
+    didn't run whole is no pass, whatever its log says or doesn't."""
+
+    def w3c(self, logs: Path, *extra: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+        expected = self.tmp / "w3c-expected.toml"
+        if not expected.exists():
+            expected.write_text(kits_toml(*KITS, suites=RL_SUITE), encoding="utf-8")
+        return subprocess.run([sys.executable, str(GATE), "w3c", str(logs), "--expected", str(expected),
+                               "--json", str(self.tmp / "w3c.json"), *extra], cwd=cwd, capture_output=True,
+                              text=True, timeout=120, env=isolation.inherit("NRESE_", "FLEET_", "CARGO_",
+                                                                            PYTHONIOENCODING="utf-8"))
+
+    def test_logs_without_a_recorded_launch_of_every_declared_kit_fail(self):
+        # Spec: T02's witness: w3c_owl2 failed to compile (no libtest summary) and w3c_n3_reasoner was
+        # killed before writing anything; every suite with an expectation is fine. Exit 1, both kits named.
+        logs = self.tmp / "logs"
+        logs.mkdir()
+        (logs / "w3c_owl2_rl.log").write_text(RL_LOG, encoding="utf-8")
+        (logs / "w3c_owl2.log").write_text("error[E0425]: cannot find value `x` in this scope\n"
+                                           "error: could not compile `nrese-owl` (test \"w3c_owl2\")\n", encoding="utf-8")
+        (logs / "w3c_n3_reasoner.log").write_text("", encoding="utf-8")
+        done = self.w3c(logs)
+        self.assertEqual(done.returncode, 1, f"SPEC kits that didn't run whole\n{done.stdout}{done.stderr}")
+        for kit in ("nrese-owl:w3c_owl2", "nrese-reasoner:w3c_n3_reasoner"):
+            self.assertIn(kit, done.stdout)
+
+    def cargo_guarded(self, behaviour: dict[str, str]) -> Path:
+        """A checkout whose scripts/cargo-guarded.sh plays each kit (its --test name) as BEHAVIOUR says,
+        committed: the receipt names its commit and tree."""
+        checkout = self.tmp / "checkout"
+        cases = "\n".join(f"  {name}) {body} ;;" for name, body in behaviour.items())
+        stub = checkout / "scripts" / "cargo-guarded.sh"
+        stub.parent.mkdir(parents=True)
+        stub.write_text(f'#!/usr/bin/env bash\n# test --release --locked -p CRATE --test NAME -- --nocapture\n'
+                        f'case "$7" in\n{cases}\n  *) echo "unexpected $*"; exit 3 ;;\nesac\n',
+                        encoding="utf-8", newline="\n")
+        git(checkout.parent, "init", "-q", str(checkout))
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-q", "-m", "the checks' checkout")
+        return checkout
+
+    def run_kits(self, behaviour: dict[str, str]) -> tuple[subprocess.CompletedProcess, dict]:
+        checkout = self.cargo_guarded(behaviour)
+        logs = self.tmp / "out-w3c"
+        done = self.w3c(logs, "--run", "--identity", IDENTITY, cwd=checkout)
+        result = json.loads((self.tmp / "w3c.json").read_text(encoding="utf-8")) if (self.tmp / "w3c.json").exists() else {}
+        return done, result
+
+    RL_OK = f"printf '%s' '{RL_LOG}'; exit 0"
+    OK = "echo 'test result: ok. 1 passed; 0 failed; 0 ignored'; exit 0"
+
+    def test_a_kit_that_exits_non_zero_or_without_its_summary_fails_and_each_launch_is_recorded(self):
+        # Spec: T02's proof list: exit 101 without a summary, death by a signal, an empty or truncated log,
+        # the guard's 75: each NOT PASSED with the kit named; all ran whole: passed, and the receipt holds
+        # every launch (its exit, its log's SHA-256) and the checkout's commit and tree.
+        for name, body in {"compile error, exit 101": "echo 'error: could not compile'; exit 101",
+                           "killed (exit 137)": "kill -9 $$",
+                           "summary missing, exit 0": "echo 'running 1 test'; exit 0",
+                           "a failed summary, exit 0": "echo 'test result: FAILED. 0 passed; 1 failed'; exit 0",
+                           "the guard held the build (75)": "exit 75"}.items():
+            with self.subTest(name):
+                shutil.rmtree(self.tmp / "checkout", True)
+                shutil.rmtree(self.tmp / "out-w3c", True)
+                (self.tmp / "w3c.json").unlink(missing_ok=True)
+                done, result = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": body, "w3c_n3_reasoner": self.OK})
+                self.assertEqual(done.returncode, 1, f"SPEC {name}\n{done.stdout}{done.stderr}")
+                self.assertIn("nrese-owl:w3c_owl2", " ".join(result.get("errors", [])), result)
+        shutil.rmtree(self.tmp / "checkout", True)
+        shutil.rmtree(self.tmp / "out-w3c", True)
+        done, result = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OK, "w3c_n3_reasoner": self.OK})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        checkout = self.tmp / "checkout"
+        r = result["receipt"]
+        self.assertEqual((r["kind"], r["commit"], r["tree"], r["identity"]),
+                         ("w3c", git(checkout, "rev-parse", "HEAD"), git(checkout, "rev-parse", "HEAD^{tree}"), IDENTITY))
+        self.assertEqual([(o["unit"], o["exit"], o["summary"]) for o in r["outcomes"]],
+                         [(k, 0, True) for k, _ in KITS])
+        log = (self.tmp / "out-w3c" / "w3c_owl2_rl.log").read_bytes()
+        self.assertEqual(r["outcomes"][0]["log_sha256"], hashlib.sha256(log).hexdigest())
+
+    def test_a_suite_s_counts_come_from_its_own_kit_s_log(self):
+        # Spec: the design's attack 8: the RL counts printed by another kit's log don't stand for the RL kit.
+        done, result = self.run_kits({"w3c_owl2_rl": self.OK, "w3c_owl2": self.RL_OK, "w3c_n3_reasoner": self.OK})
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("OWL 2 RL", " ".join(result["errors"]))
+
+    def test_the_gate_s_kits_are_declared_once_and_claim_every_expected_suite(self):
+        # Spec: T02 ("the expectation table still omits the two extra kits"): release-gate.sh's w3c step
+        # launches what w3c-expected.toml declares (no list of its own), every kit the step ran before
+        # this change among them, and every suite with an expectation belongs to exactly one kit.
+        listed = subprocess.run([sys.executable, str(GATE), "w3c", "--list-kits", "--expected",
+                                 str(ROOT / "benches/fast/w3c-expected.toml")], capture_output=True, text=True,
+                                timeout=60, env=isolation.inherit("NRESE_", "FLEET_"))
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout.split(), [
+            "nrese-sparql:w3c_sparql11", "nrese-sparql:geosparql_compliance", "nrese-shacl:w3c_shacl",
+            "nrese-store:w3c_owl2_rl", "nrese-dl:tableau_w3c", "nrese-owl:w3c_owl2", "nrese-reasoner:w3c_n3_reasoner"])
+        declared = tomllib.loads((ROOT / "benches/fast/w3c-expected.toml").read_text(encoding="utf-8"))
+        owners = [s for kit in declared["kit"].values() for s in kit["suites"]]
+        self.assertEqual(sorted(owners), sorted(declared["suite"]))
+        step = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8").split("\nw3c)", 1)[1].split("\n  ;;", 1)[0]
+        self.assertNotIn("w3c_sparql11", step, "SPEC the step's kits are the declared ones, never a list of its own")
+
+
+class GuardRun(Scratch):
+    """D16-126's guard half: the guards' test run keeps its exit code; a guard reported ok under a run
+    that failed is no pass."""
+
+    def test_guards_under_a_failed_test_run_do_not_pass(self):
+        checkout = self.tmp / "checkout"
+        stub = checkout / "scripts" / "cargo-guarded.sh"
+        stub.parent.mkdir(parents=True)
+        stub.write_text("#!/usr/bin/env bash\necho 'test a::first_guard_name_here ... ok'\n"
+                        "echo 'test b::other_matched_test_failing ... FAILED'\nexit 101\n", encoding="utf-8", newline="\n")
+        git(checkout.parent, "init", "-q", str(checkout))
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-q", "-m", "checks")
+        (self.tmp / "names").write_text("first_guard_name_here\n", encoding="utf-8")
+        out = self.tmp / "guards.json"
+        done = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--names", str(self.tmp / "names"),
+                               "--log", str(self.tmp / "test.log"), "--identity", IDENTITY, "--json", str(out)],
+                              cwd=checkout, capture_output=True, text=True, timeout=120,
+                              env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
+        self.assertEqual(done.returncode, 1, f"SPEC a guard ok under a run that exited 101\n{done.stdout}{done.stderr}")
+        result = json.loads(out.read_text(encoding="utf-8"))
+        self.assertIn("exited 101", " ".join(result["errors"]))
+        self.assertEqual([(o["unit"], o["exit"]) for o in result["receipt"]["outcomes"]], [("guards", 101)])
+
+
+def wrong_everywhere(side, n):
+    return [fixtures.record(status="wrong", expected="wrong")]
+
+
+def exception(case: str = "lab-olympics", outcome: str = "wrong", by: str = "Johannes", extra: str = QUOTE) -> str:
+    return (f'[[exception]]\ncase = "{case}"\noutcome = "{outcome}"\napproved = "2026-11-09"\nby = "{by}"\n'
+            f'reason = "the fixture\'s inherited answer"\n{extra}')
+
+
+class Authority(Scratch):
+    """D16-125 (audit T03): a known issue explains evidence; only Johannes grants a release exception,
+    named and scoped, in the candidate tree's one policy file."""
+
+    def test_a_declared_wrong_answer_without_an_owner_exception_blocks_and_is_named(self):
+        # Spec: T03: both sides wrong, the case declares `outcome = "wrong"` with its `known` issue, the
+        # policy holds no exception: NOT PASSED, the case and its wrong answer named.
+        a = self.repo.commit()
+        done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, f"SPEC an unapproved wrong answer\n{done.stdout}{done.stderr}")
+        self.assertIn("lab-olympics: wrong, no owner exception", done.stdout)
+
+    def test_a_named_exception_covers_its_case_and_outcome_only_and_is_listed(self):
+        # Spec: T03's proof list: a named approved exception is disclosed and accepted within its scope;
+        # a mismatched one blocks.
+        a = self.repo.commit(policy=exception())
+        done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("owner exception: lab-olympics wrong, approved 2026-11-09 by Johannes", done.stdout)
+        for policy in (exception(case="kernel-intersect"), exception(outcome="memory-limit")):
+            b = self.repo.commit(policy=policy)
+            done = verdict(self.repo.path, b, rounds(b, wrong_everywhere), *checks(b, self.repo.tree(b)))
+            self.assertEqual(done.returncode, 1, f"SPEC out of scope: {policy}\n{done.stdout}")
+
+    def test_an_entry_without_johannes_s_word_is_refused(self):
+        # Spec: role.owners (bar exceptions are Johannes's) and rule.record-owner-intent-verbatim: an entry
+        # by anyone else, or without the quote and its source, is a policy error: NOT PASSED.
+        for policy in (exception(by="the owner"), exception(extra="")):
+            a = self.repo.commit(policy=policy)
+            done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
+            self.assertEqual(done.returncode, 1, f"SPEC {policy}\n{done.stdout}")
+            self.assertIn("release-tradeoffs.toml", done.stdout)
+
+    def test_the_policy_is_the_candidate_tree_s_never_a_report_s_or_another_tree_s(self):
+        # Spec: the design's attack 4: a timed report carries what its harness tree held; the verdict reads
+        # the policy at the candidate's commit only.
+        other = self.repo.commit(policy=exception(), message="a tree with the exception")
+        a = self.repo.commit(message="the candidate, without it")
+        timed = rounds(a, wrong_everywhere)
+        for summary in timed:
+            summary["exceptions"] = [{"case": "lab-olympics", "outcome": "wrong", "by": "Johannes"}]
+        done = verdict(self.repo.path, a, timed, *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, f"SPEC {other[:8]}'s exception doesn't cover {a[:8]}\n{done.stdout}")
+
+    def test_a_limit_every_side_stops_at_is_named_never_silent(self):
+        # Guard (the master's decision 1 of 9 Nov; red on the parent only for want of --candidate): a
+        # declared capability limit (memory-limit) where every side stops is no wrong answer and no loss:
+        # it passes, listed. One where a baseline completes blocks, as before.
+        a = self.repo.commit()
+        limit = lambda side, n: [fixtures.record(status="memory-limit", expected="memory-limit")]  # noqa: E731
+        done = verdict(self.repo.path, a, rounds(a, limit), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("known issue: lab-olympics: memory-limit", done.stdout)
+
+
+class Tradeoffs(Scratch):
+    """Only an owner-approved trade-off accepts a loss (benches/release-tradeoffs.toml at the
+    candidate's tree). Moved from test_release_gate.py: the verdict reads its policy from the
+    candidate commit, no longer from what each timed report embedded."""
+
+    def rounds(self, candidate: str) -> list[dict]:
+        def records_of(side, n):
+            cand = side == "cand"
+            return [fixtures.record(samples={"q01": [10.0, 10.1, 9.9],
+                                             "q06": [v * (fixtures.worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
+                    fixtures.record(case="kernel-intersect",
+                                    samples={"triangles": [v * (fixtures.worse(0.36, n) if cand else 1)
+                                                           for v in [140.0, 140.5]]})]
+        # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
+        # 0.0083), and which runs a side got in the block's order decided it.
+        out = []
+        for k in (0, 1):
+            summary = fixtures.run_gate(fixtures.passes(records_of, blocks=3), context={**fixtures.CONTEXT, "round": k})
+            summary["candidate"]["revision"] = candidate
+            out.append(summary)
+        return out
+
+    def entry(self, **changes) -> str:
+        fields = {"case": "lab-olympics", "dimension": "time/q06", "max_ratio": 1.12, "approved": "2026-10-20",
+                  "by": "Johannes", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
+                  "quote": "accept the filters' loss for the triangles", "source": "OWL-RS master thread, 20 Oct 2026",
+                  "pays_with": {"case": "kernel-intersect", "dimension": "time/triangles"}, **changes}
+        lines = ["[[tradeoff]]"]
+        for key, value in fields.items():
+            if isinstance(value, dict):
+                value = "{ " + ", ".join(f'{k} = "{v}"' for k, v in value.items()) + " }"
+            elif isinstance(value, str):
+                value = json.dumps(value)
+            lines.append(f"{key} = {value}")
+        return "\n".join(lines) + "\n"
+
+    def verdict(self, policy: str = "") -> subprocess.CompletedProcess:
+        a = self.repo.commit(policy=policy)
+        return verdict(self.repo.path, a, self.rounds(a), *checks(a, self.repo.tree(a)))
+
+    def test_a_confirmed_loss_blocks_unless_an_approved_trade_off_with_its_win_covers_it(self):
+        self.assertEqual(self.verdict().returncode, 1)
+        done = self.verdict(self.entry())
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("accepted trade-off", done.stdout)
+        for entry in (self.entry(max_ratio=1.05), self.entry(pays_with={"case": "lab-olympics", "dimension": "time/q01"}),
+                      self.entry(dimension="time/q01"), self.entry(by="the owner")):
+            self.assertEqual(self.verdict(entry).returncode, 1, entry)
+
+    def test_the_list_starts_empty_and_a_malformed_entry_is_refused(self):
+        policy = gate_module.load_policy((ROOT / POLICY).read_text(encoding="utf-8"))
+        self.assertEqual((policy.tradeoffs, policy.exceptions, policy.errors), ([], [], []))
+        bad = gate_module.load_policy('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n')
+        self.assertEqual(bad.tradeoffs, [])
+        self.assertIn("missing approved, by, pays_with, quote, reason, source", bad.errors[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
