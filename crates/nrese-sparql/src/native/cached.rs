@@ -29,7 +29,11 @@ use crate::results::{CancellationToken, QueryEvaluationError};
 
 /// The cache and what every key of a context starts with.
 pub(super) struct CacheScope {
+    /// The cache the context's snapshot admits into: the store's for a published snapshot,
+    /// its version's own for an unpublished one ([`ResultCache::for_admission`]).
     cache: Arc<ResultCache>,
+    /// The store's, for the contexts this one makes ([`Context::child_cache`]).
+    shared: Arc<ResultCache>,
     snapshot: SnapshotIdentity,
     /// What doesn't change between a context and the ones it makes (the base IRI, the
     /// user's access), for [`Context::child_cache`].
@@ -40,15 +44,16 @@ pub(super) struct CacheScope {
 
 impl Context<'_> {
     /// The cache scope of this context: `fixed` (the base IRI, the access) and the
-    /// options that decide its results. `None` unless the context's own snapshot is
-    /// published (the lifecycle contract's S3): unpublished state is computed for its
-    /// request and kept nowhere, its parts and answer alike.
+    /// options that decide its results, in the cache the context's own snapshot admits into
+    /// beside the store's `shared` one (the lifecycle contract's S3): the store's for a
+    /// published snapshot, its version's own for an unpublished one.
     pub(super) fn cache_scope(
         &self,
-        cache: Arc<ResultCache>,
+        shared: Arc<ResultCache>,
         fixed: Arc<[u8]>,
-    ) -> Option<Arc<CacheScope>> {
-        let state = self.snapshot.shared_state()?;
+    ) -> Arc<CacheScope> {
+        let admission = self.snapshot.admission();
+        let cache = ResultCache::for_admission(&shared, admission, &self.memory);
         let mut encoder = Encoder::default();
         encoder.bytes.extend_from_slice(&fixed);
         encoder.tag(self.model as u8);
@@ -91,25 +96,26 @@ impl Context<'_> {
         if self.search_scope == crate::SearchScope::Reader {
             encoder.tag(b'R');
         }
-        Some(Arc::new(CacheScope {
+        Arc::new(CacheScope {
             cache,
-            snapshot: state.snapshot().identity(),
+            shared,
+            snapshot: self.snapshot.identity(),
             fixed,
             context: encoder.bytes,
-        }))
+        })
     }
 
     /// The cache scope of a context made from this one (with its own snapshot, whose
-    /// publication decides, and options).
+    /// admission decides its cache, and options).
     pub(super) fn child_cache(&self, child: &Context<'_>) -> Option<Arc<CacheScope>> {
         let scope = self.cache.as_ref()?;
-        child.cache_scope(Arc::clone(&scope.cache), Arc::clone(&scope.fixed))
+        Some(child.cache_scope(Arc::clone(&scope.shared), Arc::clone(&scope.fixed)))
     }
 
-    /// The cache scope with the token of the snapshot it was made for: what an admission
-    /// takes. `None` without a scope (no cache, or unpublished state).
-    fn admission(&self) -> Option<(&CacheScope, nrese_engine::SharedState<'_>)> {
-        Some((self.cache.as_deref()?, self.snapshot.shared_state()?))
+    /// The cache scope with the admission of the snapshot it was made for: what an
+    /// admission takes. `None` without a cache.
+    fn admission(&self) -> Option<(&CacheScope, nrese_engine::Admission<'_>)> {
+        Some((self.cache.as_deref()?, self.snapshot.admission()))
     }
 
     /// An encoder holding the start of every key of this context: its options and the
@@ -329,7 +335,10 @@ impl Context<'_> {
         pin: Option<&PinRequest>,
     ) -> NativeResult<Solutions> {
         if let Some(pin) = pin {
-            if self.cache.is_none() {
+            // Pins live in the store's cache alone: unpublished state can't pin (S3), as a
+            // transaction view, whose cache is off, can't.
+            let unpublished = matches!(self.snapshot.admission(), nrese_engine::Admission::Own(_));
+            if self.cache.is_none() || unpublished {
                 return Err(QueryEvaluationError::Argument(
                     "the result cache is off: nothing can be pinned".to_owned(),
                 )
@@ -347,10 +356,10 @@ impl Context<'_> {
 /// template, and its pattern as parsed (the answer is the query's, however it is planned);
 /// for a SELECT, the names its answer shows, in order: the pattern numbers its variables
 /// (parts of renamed queries share answers), but these bytes hold the names in their header.
-/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables). The
-/// key's snapshot is the token's: these are its part bytes.
+/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables). These
+/// are its part bytes: the cache keys them by the admission's snapshot.
 pub(crate) fn output_key(
-    state: nrese_engine::SharedState<'_>,
+    snapshot: &nrese_engine::Snapshot,
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
     format: &str,
@@ -361,7 +370,7 @@ pub(crate) fn output_key(
         return None;
     }
     let ctx = Context::new(
-        state.snapshot(),
+        snapshot,
         options,
         super::query_dataset(query),
         super::query_base(query),
