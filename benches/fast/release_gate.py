@@ -390,7 +390,9 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     if state(base) == "known" and state(cand) == "known":
         return {**row, "comparable": False, "reason": "a known issue on both sides (no timing verdict)"}
     if state(cand) == "known":
-        if base_state == "ok":
+        # A wrong answer is the owner's policy's to accept or block (verdict(), BAR_OUTCOMES), wherever
+        # the baselines stand; a declared limit where a baseline completed blocks here.
+        if base_state == "ok" and not set(cand["status"]) & BAR_OUTCOMES:
             row["blocks"].append(f"stops at its declared outcome ({', '.join(sorted(set(cand['status'])))}) "
                                  f"where {side} completed")
         return {**row, "comparable": False, "reason": "the candidate's known issue"}
@@ -946,8 +948,10 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                          for side, rows in summary["comparisons"].items()}
     # One round decides nothing alone: a loss needs two (verdict()). This round passes on its
     # own only when nothing is flagged, failed or missing.
+    # A wrong answer the case declares passes no round alone: only the verdict's policy accepts one.
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
-                         and not summary["flagged"])
+                         and not summary["flagged"]
+                         and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
     return summary
 
 
@@ -2933,12 +2937,22 @@ def main() -> int:
             p.error("w3c: LOGDIR, and with --run its --identity")
         recorded = args.logs / "receipt.json"
         if args.run:
+            # An earlier run's receipt and result go before any log is replaced: a run stopped midway
+            # leaves neither, never one that speaks for logs it didn't write.
+            for earlier in (recorded, args.json):
+                if earlier is not None:
+                    earlier.unlink(missing_ok=True)
             receipt = run_w3c(args.logs, kits, args.identity)
             recorded.write_text(json.dumps(receipt.as_json(), indent=1), encoding="utf-8")
         else:
             receipt = CheckReceipt.of(json.loads(recorded.read_text(encoding="utf-8"))) if recorded.is_file() else None
         counts = kit_counts(args.logs, kits)
         errors = outcome_errors(receipt.outcomes if receipt else (), [kit.name for kit in kits]) + w3c_check(counts, expected)
+        # Each recorded launch's log is the one it wrote (a re-check reads logs a later run may have replaced).
+        logs_of = {kit.name: args.logs / f"{kit.test}.log" for kit in kits}
+        errors += [f"{o.unit}: its log isn't the one its launch recorded" for o in (receipt.outcomes if receipt else ())
+                   if o.unit in logs_of and (not logs_of[o.unit].is_file()
+                                             or hashlib.sha256(logs_of[o.unit].read_bytes()).hexdigest() != o.log_sha256)]
         out = {"counts": counts, "expected": expected, "errors": errors, "passed": not errors,
                **({"receipt": receipt.as_json()} if receipt else {})}
         print(json.dumps(out, indent=1))

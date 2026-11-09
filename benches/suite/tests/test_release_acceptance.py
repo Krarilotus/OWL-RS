@@ -288,6 +288,16 @@ class KitOutcomes(Scratch):
         log = (self.tmp / "out-w3c" / "w3c_owl2_rl.log").read_bytes()
         self.assertEqual(r["outcomes"][0]["log_sha256"], hashlib.sha256(log).hexdigest())
 
+    def test_a_re_check_refuses_a_receipt_whose_logs_a_later_run_replaced(self):
+        # Spec: sol-loop r1 S1: a run passed and left its receipt; a later run stopped midway, having
+        # replaced w3c_owl2's log with a compile failure; a re-check (no --run) reads the logs as they are.
+        done, _ = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OK, "w3c_n3_reasoner": self.OK})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        (self.tmp / "out-w3c" / "w3c_owl2.log").write_text("error: could not compile `nrese-owl`\n", encoding="utf-8")
+        again = self.w3c(self.tmp / "out-w3c")
+        self.assertEqual(again.returncode, 1, f"SPEC a replaced log\n{again.stdout}{again.stderr}")
+        self.assertIn("nrese-owl:w3c_owl2: its log isn't the one its launch recorded", again.stdout)
+
     def test_a_suite_s_counts_come_from_its_own_kit_s_log(self):
         # Spec: the design's attack 8: the RL counts printed by another kit's log don't stand for the RL kit.
         done, result = self.run_kits({"w3c_owl2_rl": self.OK, "w3c_owl2": self.RL_OK, "w3c_n3_reasoner": self.OK})
@@ -369,6 +379,22 @@ class Authority(Scratch):
             b = self.repo.commit(policy=policy)
             done = verdict(self.repo.path, b, rounds(b, wrong_everywhere), *checks(b, self.repo.tree(b)))
             self.assertEqual(done.returncode, 1, f"SPEC out of scope: {policy}\n{done.stdout}")
+
+    def test_an_exception_governs_its_wrong_answer_where_a_baseline_answers_right(self):
+        # Spec: sol-loop r1 S2: the candidate wrong, as the case declares, every baseline right. Without an
+        # exception: NOT PASSED, and the round alone never passes; with Johannes's for that case and outcome:
+        # PASSED, no other blocker left standing for the same outcome.
+        def records_of(side, n):
+            return [fixtures.record(status="wrong" if side == "cand" else "ok", expected="wrong")]
+        a = self.repo.commit()
+        timed = rounds(a, records_of)
+        self.assertFalse(timed[0]["passed"], "SPEC a declared wrong answer passes no round alone")
+        done = verdict(self.repo.path, a, timed, *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("lab-olympics: wrong, no owner exception", done.stdout)
+        b = self.repo.commit(policy=exception())
+        done = verdict(self.repo.path, b, rounds(b, records_of), *checks(b, self.repo.tree(b)))
+        self.assertEqual(done.returncode, 0, f"SPEC the exception governs its wrong answer\n{done.stdout}")
 
     def test_an_entry_without_johannes_s_word_is_refused(self):
         # Spec: role.owners (bar exceptions are Johannes's) and rule.record-owner-intent-verbatim: an entry

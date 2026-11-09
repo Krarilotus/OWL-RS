@@ -398,10 +398,13 @@ accepts a loss: it names a case, a dimension, optionally the baseline, the large
 loss's interval may reach, and the win that pays for it, which must show as *better* in the same
 report. A covered loss is reported as an *accepted trade-off*; anything beyond its bound, without
 its win, or on another dimension blocks. An *exception* accepts one case's wrong answer: a
-candidate's `wrong` outcome blocks unless one names that case and outcome, even where the case
-declares the outcome and every baseline is wrong too; a declared `outcome` and `known` issue
-explain evidence and grant nothing. A declared limit (memory-limit, gave-up, timeout,
-unsupported) blocks where a baseline completes and is named where none does. The verdict reads
+candidate's `wrong` outcome blocks unless one names that case and outcome, wherever the baselines
+stand, even where the case declares the outcome and every baseline is wrong too; a declared
+`outcome` and `known` issue explain evidence and grant nothing. Only `wrong`, plus confirmed
+losses as now, needs a named Johannes exception. A declared `memory-limit`, `gave-up`, `timeout`
+or `unsupported` blocks where a baseline completes. Where every side stops, it's listed in the
+verdict and doesn't block (the orchestrator, 9 Nov 2026: only wrong answers disqualify, and the
+bar's time and memory loss rule). The verdict reads
 the file at the candidate's commit, never from a report, and lists every entry it applied and
 every exception the candidate didn't need. The list starts empty.
 
