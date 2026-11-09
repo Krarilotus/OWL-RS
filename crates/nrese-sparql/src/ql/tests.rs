@@ -406,6 +406,45 @@ fn views_of_one_version_in_other_equality_modes_keep_their_own_entries() {
     }
 }
 
+/// A version's schema is read and compiled with none of QL's locks held (DICT2, 9 Nov): a
+/// lock held across a membership build or a compile serialises the version's other views,
+/// and deadlocks once that work reaches a pool that can run another read on this thread.
+/// The version's entries and the store's are free whenever a pending snapshot's read
+/// builds its memberships or compiles; looked at with `try_lock`, so the test can't hang.
+#[test]
+fn a_versions_schema_is_read_and_compiled_outside_qls_locks() {
+    let engine = engine("");
+    let published = engine.snapshot();
+    let member = membership(&published, "ann", restriction(&published));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(member);
+    let pending = tx.pending_snapshot();
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (looked, view, store) = (std::rc::Rc::clone(&seen), pending.clone(), Arc::clone(&ql));
+    BUILDING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let nrese_engine::Admission::Own(own) = view.admission() else {
+                panic!("a pending snapshot is unpublished");
+            };
+            let version = own
+                .get::<QlOwn>()
+                .is_none_or(|mine| mine.entries.try_lock().is_ok());
+            let shared = store.cached.try_lock().is_ok();
+            looked.borrow_mut().push((version, shared));
+        }))
+    });
+    let tbox = ql.tbox(&pending, None);
+    BUILDING.with(|hook| *hook.borrow_mut() = None);
+    let seen = seen.borrow();
+    assert!(!seen.is_empty(), "the read built its memberships");
+    assert!(
+        seen.iter().all(|&(version, shared)| version && shared),
+        "locks held (version's, store's) at each build: {seen:?}"
+    );
+    assert!(Arc::ptr_eq(&tbox, &ql.tbox(&pending, None)));
+}
+
 /// What the TBox compiles to depends on the closure, so two rewritings with other closures
 /// reading one pending snapshot never get each other's TBox from its version.
 #[test]
