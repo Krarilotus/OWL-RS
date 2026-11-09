@@ -43,6 +43,10 @@ exit 0
 ''',
                 "python": 'case "$1" in benches/suite/tests/isolation.py) exit 0 ;; esac\n'
                           'exec "$REAL_PYTHON" "$@"\n',
+                # The full tier's console steps (check.sh console): the console's npm and npx,
+                # as the fake cargo stands in for cargo; the host's would install nothing here.
+                "npm": 'echo "npm $*" >> "$CONSOLE_SEEN"\n',
+                "npx": 'echo "npx $*" >> "$CONSOLE_SEEN"\n',
             }
             for name, body in scripts.items():
                 path = binaries / name
@@ -53,11 +57,13 @@ exit 0
             for state in ("missing", "workspace", "harness", "older", "newer", "ok"):
                 with self.subTest(state=state):
                     seen = root / f"seen-{state}"
+                    console_seen = root / f"console-{state}"
                     version = {"older": "0.20.1", "newer": "0.20.3"}.get(state, "0.20.2")
                     env = isolation.inherit("NRESE_", "FLEET_", "CARGO_",
                         PATH=binaries.as_posix() + os.pathsep + os.environ["PATH"],
                         REAL_PYTHON=Path(sys.executable).as_posix(), NRESE_ON_BUILD_HOST="1",
-                        DENY=state, DENY_VERSION=version, SEEN=seen.as_posix())
+                        DENY=state, DENY_VERSION=version, SEEN=seen.as_posix(),
+                        CONSOLE_SEEN=console_seen.as_posix())
                     done = subprocess.run([shutil.which("bash"), "scripts/check.sh", "all"],
                                           cwd=root, env=env, capture_output=True, text=True, timeout=60)
                     self.assertEqual(done.returncode, 0 if state == "ok" else 1,
@@ -70,3 +76,13 @@ exit 0
                             "deny --all-features check",
                             "deny --manifest-path benches/nrese-bench-harness/Cargo.toml "
                             "--config deny.toml --all-features check"], done.stdout + done.stderr)
+                    if state == "ok":
+                        # The full tier checks the console too: installed from its lockfile,
+                        # typechecked and tested, each a step of its own.
+                        self.assertEqual(console_seen.read_text().splitlines(), [
+                            "npm --prefix apps/nrese-console ci --no-audit --no-fund",
+                            "npm --prefix apps/nrese-console run typecheck",
+                            "npx --prefix apps/nrese-console vitest run --root apps/nrese-console"],
+                            done.stdout + done.stderr)
+                        for step in ("console dependencies", "console typecheck", "console tests"):
+                            self.assertRegex(done.stdout, rf"(?m)^  0  {step} \(", done.stdout)
