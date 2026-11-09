@@ -167,8 +167,8 @@ pub(crate) fn path_expression(
     })
 }
 
-/// A solution of a SELECT check, as a result: the value and path it names, if any, and
-/// whether it reports a failure.
+/// A solution of a SELECT check, as a result: the value and path it names, if any (taken out
+/// of the solution, not copied), and whether it reports a failure.
 pub(crate) struct Found {
     pub(crate) value: Option<Term>,
     pub(crate) path: Option<NamedNode>,
@@ -281,18 +281,32 @@ pub(crate) fn run<'a, V: ReadView>(
 }
 
 /// A SELECT check's solution, as a result ([`Outcome::Solutions`] yields them as they are
-/// read: each is decoded, used and dropped before the next).
-pub(crate) fn found(solution: &QuerySolution) -> Found {
-    let failure = matches!(
-        solution.get("failure"),
-        Some(Term::Literal(l)) if l.value() == "true"
-    );
-    let path = match solution.get("path") {
-        Some(Term::NamedNode(path)) => Some(path.clone()),
+/// read: each is decoded, used and dropped before the next). Its terms are moved out of it,
+/// not copied; a row that reports `?failure` has its value and path dropped with it.
+pub(crate) fn found(solution: QuerySolution) -> Found {
+    let at = |name: &str| {
+        solution
+            .variables()
+            .iter()
+            .position(|variable| variable.as_str() == name)
+    };
+    let (failure_at, path_at, value_at) = (at("failure"), at("path"), at(VALUE));
+    let mut values = solution.into_values();
+    let mut take = |at: Option<usize>| at.and_then(|at| values.get_mut(at)?.take());
+    let failure = matches!(take(failure_at), Some(Term::Literal(l)) if l.value() == "true");
+    if failure {
+        return Found {
+            value: None,
+            path: None,
+            failure,
+        };
+    }
+    let path = match take(path_at) {
+        Some(Term::NamedNode(path)) => Some(path),
         _ => None,
     };
     Found {
-        value: solution.get(VALUE).cloned(),
+        value: take(value_at),
         path,
         failure,
     }

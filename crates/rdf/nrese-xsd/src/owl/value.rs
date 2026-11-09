@@ -68,6 +68,9 @@ impl Value {
         };
         if let Some(tag) = language {
             return match datatype {
+                // XML's Char only: the map's text model has no other strings (`text`, the
+                // regular alphabet). RDF 1.1 Concepts §3.3 gives rdf:langString all of Unicode,
+                // rdf:PlainLiteral XML's Char; telling the two apart needs that model widened.
                 Datatype::LangString | Datatype::PlainLiteral if !tag.is_empty() => {
                     if !lexical.chars().all(text::is_xml_char) {
                         return Err(ill("a character XML doesn't allow"));
@@ -291,6 +294,10 @@ mod tests {
             Value::parse("a", Datatype::LangString, Some("EN")),
             Ok(Value::LangString("a".into(), "en".into()))
         );
+        assert!(matches!(
+            Value::parse("a\u{1}b", Datatype::String, None),
+            Err(LiteralError::IllTyped(_))
+        ));
         assert_eq!(
             v("a@En", Datatype::PlainLiteral),
             Value::LangString("a".into(), "en".into())

@@ -457,12 +457,14 @@ impl StoreService {
             return Ok(());
         }
         if let Some(path) = self.marker_path() {
-            match std::fs::remove_file(&path) {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            match crate::metadata::remove(&path) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    // The file may still be there: the next invalidation tries again (the
-                    // review of 3 October 2026, A4).
+                    // The file may still be there, or its removal not durable: the next
+                    // invalidation tries again (the review of 3 October 2026, A4).
                     self.marker.store(true, Ordering::Release);
                     return Err(crate::error::StoreError::Io(error));
                 }
@@ -478,11 +480,15 @@ impl StoreService {
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, text).map_err(crate::error::StoreError::Io)?;
-        std::fs::rename(&temporary, &path).map_err(crate::error::StoreError::Io)?;
+        // "A marker may be in place", before anything is written (fix check r1, R2-F2): a
+        // publication that fails after its rename leaves the marker under its name, and the
+        // next invalidation must remove it, or refuse, not skip it.
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
+        // Synced and durably named, the store's path included (DUR-3; fix check DEFER-F1): read
+        // at open, a marker lost or short after a power loss would misstate what the inferred
+        // stack is exact for.
+        crate::metadata::write(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -2113,6 +2119,75 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::StoreService;
+    use crate::StoreConfig;
+    // The reasoning marker is written as the store's metadata: its directory sync, after the
+    // rename, fails through metadata's fault (`metadata::tests::FAIL_DIR_SYNC`).
+    use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
+
+    /// A reasoning marker whose publication failed after its rename is still cleared by the
+    /// next clear of the inferences (DUR-3 fix check r1, R2-F2). A rematerialisation under RDFS
+    /// of `a a C . C subClassOf D` publishes its inferences, renames its marker into place, and
+    /// the marker's directory sync then fails: `InferencesNotRecorded`. The inferences are
+    /// cleared; the store must no longer claim them current, then or after a reopen, and a later
+    /// RDFS rematerialisation derives `a a D`. Before the fix the marker stayed while the store
+    /// took it for gone, so the clear left it: after it, the store claimed RDFS current with no
+    /// inferences (a wrong `NotEntailed` for `a a D`).
+    #[test]
+    fn a_marker_whose_placement_failed_is_still_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.nt");
+        std::fs::write(
+            &data,
+            "<http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.com/C> .\n<http://example.com/C> \
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> .\n",
+        )
+        .unwrap();
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        // A bulk load invalidates the reasoning: the store takes no marker to be in place.
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![data],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let program = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
+            .materialised_program()
+            .expect("RDFS reasons");
+        FAIL_MARKER_SYNC.set(true);
+        let refused = store.rematerialise(&program);
+        FAIL_MARKER_SYNC.set(false);
+        assert!(
+            matches!(refused, Err(crate::StoreError::InferencesNotRecorded(_))),
+            "{refused:?}"
+        );
+        store.clear_inferred().unwrap();
+        let mut wrong = Vec::new();
+        if store.reasoning_state().is_some() {
+            wrong.push("after the clear, the inferences are claimed current");
+        }
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.reasoning_state().is_some() {
+            wrong.push("after a reopen, the inferences are claimed current");
+        }
+        store.rematerialise(&program).unwrap();
+        let answer = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        if !String::from_utf8_lossy(&answer.payload).contains("true") {
+            wrong.push("a later RDFS rematerialisation doesn't derive a a D");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
 
 #[cfg(test)]

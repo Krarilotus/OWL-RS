@@ -31,7 +31,10 @@ mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
+mod private;
 mod replication;
+#[cfg(test)]
+mod shared_state_tests;
 mod snapshot;
 pub(crate) mod spill;
 mod statistics;
@@ -56,10 +59,11 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
+pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot,
-    SnapshotIdentity, TextScope,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
+    SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -542,8 +546,10 @@ impl Shared {
         stamp
     }
 
+    /// The installed version, published: the one constructor of a snapshot that grants a
+    /// [`snapshot::SharedState`].
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(
+        Snapshot::published(
             self.versions.load(),
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
@@ -574,6 +580,9 @@ impl Shared {
                     self.dictionary.save_derived();
                     return Ok(snapshot.revision());
                 }
+                // The names a reopen left pending, before anything is written (deferred-sync
+                // design note of 8 Nov): a failure leaves the log as it was.
+                wal.settle_names()?;
                 wal.rotate(snapshot.revision() + 1)?;
                 (snapshot, clock)
             };
@@ -1102,6 +1111,18 @@ impl Engine {
     /// (as an aborted transaction's are). [`Transaction::commit`] fails on it.
     pub fn speculative(&self) -> Transaction<'_> {
         Transaction::new(&self.inner, None)
+    }
+
+    /// A private transaction over `snapshot`: speculative changes that read its statements,
+    /// with terms of their own past its dictionary length, charged to `budget`, which never
+    /// enter the dictionary. It never commits and doesn't take the writer slot. Refused
+    /// ([`EngineError::Configuration`]) for a private snapshot or another engine's.
+    pub fn speculative_over(
+        &self,
+        snapshot: &Snapshot,
+        budget: Arc<nrese_exec::Budget>,
+    ) -> EngineResult<PrivateTransaction<'_>> {
+        PrivateTransaction::over(&self.inner, snapshot, budget)
     }
 
     /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`]; on a Rayon pool

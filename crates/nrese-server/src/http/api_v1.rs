@@ -1243,23 +1243,29 @@ pub async fn repository_patch(
     let repository = state.for_repository(&id)?;
     let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&body)
         .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
-    let mut merged = serde_json::to_value(repository.repository_settings())
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let fields = merged.as_object_mut().expect("settings are an object");
-    for (key, value) in changes {
-        match value {
-            serde_json::Value::Null => {
-                fields.remove(&key);
-            }
-            value => {
-                fields.insert(key, value);
+    // Merged into the settings current when the change applies, not into a copy read
+    // here: a change made meanwhile stays (C-1001).
+    let merge = move |current: &crate::repository_config::RepositorySettings| {
+        let invalid = |error: serde_json::Error| {
+            crate::repositories::CatalogError::Invalid(format!("repository settings: {error}"))
+        };
+        let mut merged = serde_json::to_value(current)
+            .map_err(|error| crate::repositories::CatalogError::Store(error.to_string()))?;
+        let fields = merged.as_object_mut().expect("settings are an object");
+        for (key, value) in changes {
+            match value {
+                serde_json::Value::Null => {
+                    fields.remove(&key);
+                }
+                value => {
+                    fields.insert(key, value);
+                }
             }
         }
-    }
-    let settings: crate::repository_config::RepositorySettings = serde_json::from_value(merged)
-        .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
+        serde_json::from_value(merged).map_err(invalid)
+    };
     let changing = repository.clone();
-    tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
+    tokio::task::spawn_blocking(move || changing.patch_repository_settings(merge))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))??;
     repository_get(authenticated, State(state), Path(id)).await
@@ -1375,18 +1381,23 @@ pub async fn rules_put(
     };
     let text = String::from_utf8(body.to_vec())
         .map_err(|_| ApiError::bad_request("the rules are not UTF-8"))?;
-    let mut settings = repository.repository_settings();
-    if settings.reasoning.is_none() {
-        settings.reasoning = Some(match (format.as_str(), repository.reasoner_mode_name()) {
-            ("pie", _) | (_, "disabled") => "custom".to_owned(),
-            (_, mode) => mode.to_owned(),
-        });
-    }
-    settings.rules = Some(crate::repository_config::RepositoryRules { name, format, text });
     let changing = repository.clone();
-    tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))??;
+    tokio::task::spawn_blocking(move || {
+        changing.patch_repository_settings(|current| {
+            let mut settings = current.clone();
+            if settings.reasoning.is_none() {
+                // The mode in effect now, under the change's lock.
+                settings.reasoning = Some(match (format.as_str(), changing.reasoner_mode_name()) {
+                    ("pie", _) | (_, "disabled") => "custom".to_owned(),
+                    (_, mode) => mode.to_owned(),
+                });
+            }
+            settings.rules = Some(crate::repository_config::RepositoryRules { name, format, text });
+            Ok(settings)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
     repository_get(authenticated, State(state), Path(id)).await
 }
 
@@ -1401,16 +1412,22 @@ pub async fn rules_delete(
     Repository(state): Repository,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_admin_write(&state, &authenticated).await?;
-    let mut settings = state.repository_settings();
-    if settings.rules.take().is_none() {
-        return Err(ApiError::not_found("the repository has no user rules"));
-    }
-    // `custom` is the rules alone: without them, the server's reasoning.
-    if settings.reasoning.as_deref() == Some("custom") {
-        settings.reasoning = None;
-    }
-    tokio::task::spawn_blocking(move || state.change_repository_settings(settings))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))??;
+    tokio::task::spawn_blocking(move || {
+        state.patch_repository_settings(|current| {
+            let mut settings = current.clone();
+            if settings.rules.take().is_none() {
+                return Err(crate::repositories::CatalogError::NotFound(
+                    "the repository has no user rules".to_owned(),
+                ));
+            }
+            // `custom` is the rules alone: without them, the server's reasoning.
+            if settings.reasoning.as_deref() == Some("custom") {
+                settings.reasoning = None;
+            }
+            Ok(settings)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
 }

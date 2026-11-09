@@ -824,3 +824,46 @@ async fn saved_queries_are_kept_per_space() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+/// Rounds of [`settings_changes_at_once_keep_each_other`]: without its fix, whether a round
+/// loses a change depends on how its two requests interleave.
+const SETTINGS_ROUNDS: usize = 20;
+
+/// Two administrators change different access settings at once (C-1001, SYN-63): neither
+/// change undoes the other. Specified: a settings change carries only the fields its
+/// request names, so turning enforcement on is never undone by a change of another
+/// setting. Each round resets both, sends the two changes concurrently, and reads the
+/// settings back; the rounds that lost a change are reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_changes_at_once_keep_each_other() {
+    let app = app();
+    let change = |body: Value| {
+        let app = app.clone();
+        tokio::spawn(async move { put(&app, ADMIN, "/api/v1/access/settings", body).await })
+    };
+    let mut lost = Vec::new();
+    for round in 0..SETTINGS_ROUNDS {
+        let reset = json!({ "enforced": false, "inferred": "hidden", "reason": "reset" });
+        let (status, body) = change(reset).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let on = change(json!({ "enforced": true, "reason": "go live" }));
+        let shown = change(json!({ "inferred": "visible", "reason": "show inferences" }));
+        let (on, shown) = (on.await.unwrap(), shown.await.unwrap());
+        assert_eq!(
+            (on.0, shown.0),
+            (StatusCode::OK, StatusCode::OK),
+            "{on:?} {shown:?}"
+        );
+        let (status, overview) = get(&app, ADMIN, "/api/v1/access").await;
+        assert_eq!(status, StatusCode::OK, "{overview}");
+        let settings = &overview["settings"];
+        if settings["enforced"] != true || settings["inferred"] != "visible" {
+            lost.push(format!("round {round}: {settings}"));
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {SETTINGS_ROUNDS} rounds lost a change: {lost:#?}",
+        lost.len()
+    );
+}
