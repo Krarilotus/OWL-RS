@@ -33,6 +33,7 @@ mod equality;
 mod lock_tests;
 #[cfg(test)]
 mod own_state_tests;
+mod pending_traits;
 mod private;
 mod replication;
 #[cfg(test)]
@@ -61,6 +62,7 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
+pub use pending_traits::{PendingView, PendingWrite};
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
