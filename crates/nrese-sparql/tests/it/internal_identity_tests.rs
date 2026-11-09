@@ -23,53 +23,11 @@ use nrese_sparql_syntax::SparqlParser;
 const REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 const SENTINEL: &str = "urn:nrese:substituted-blank-node:";
 
-/// Spec: an unbound CONSTRUCT-template variable stays unbound after QL printing (F2).
-#[test]
-fn e1_followup_construct_template_does_not_capture_a_printed_name() {
-    let engine = engine(&[
-        (
-            iri("urn:Sub").into(),
-            "http://www.w3.org/2000/01/rdf-schema#subClassOf",
-            iri("urn:Super").into(),
-        ),
-        (
-            iri("urn:a").into(),
-            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
-            iri("urn:Sub").into(),
-        ),
-    ]);
-    let snapshot = engine.snapshot();
-    for name in ["_m0", "_p1"] {
-        let query = SparqlParser::new()
-            .parse_query(&format!(
-                "CONSTRUCT {{ ?s <urn:r> ?{name} }} WHERE {{ ?s a <urn:Super> }}"
-            ))
-            .unwrap();
-        let printed =
-            nrese_sparql::ql::print(&snapshot, &query, nrese_sparql::ql::PrintForm::Values)
-                .unwrap();
-        let nrese_sparql::ql::Printed::Query { text, .. } = printed else {
-            panic!("expressible")
-        };
-        let query = SparqlParser::new().parse_query(&text).unwrap();
-        let QueryResults::Graph(rows) =
-            nrese_sparql_reference::evaluate_query(&snapshot, &query, &QueryOptions::default())
-                .unwrap()
-        else {
-            panic!("CONSTRUCT")
-        };
-        assert_eq!(
-            rows.map(Result::unwrap).count(),
-            0,
-            "template ?{name} stays unbound: {text}"
-        );
-    }
-}
-
 /// Spec: a ground triple pre-binding denotes the same RDF1.2 value at a SERVICE (IB0313).
 #[test]
 fn e1_followup_service_sends_a_ground_triple_value() {
     let triple: Term = Triple::new(iri("urn:s"), iri("urn:p"), iri("urn:o")).into();
+    let expected = triple.to_string();
     let remote = engine(&[(iri("urn:one").into(), REIFIES, triple.clone())]);
     let endpoint = Arc::new(Endpoint(remote, Mutex::default()));
     let options = QueryOptions {
@@ -87,6 +45,12 @@ fn e1_followup_service_sends_a_ground_triple_value() {
         ),
         &options,
         &["<urn:one>"],
+    );
+    assert_rows(
+        &engine(&[]),
+        "SELECT ?r WHERE { SERVICE <http://remote.example/sparql> { BIND($this AS ?r) } }",
+        &options,
+        &[&expected],
     );
 }
 

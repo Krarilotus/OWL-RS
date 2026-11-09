@@ -13,9 +13,6 @@ use nrese_sparql_syntax::algebra::PropertyPathExpression;
 #[test]
 fn e1_followup_alias_retention_is_charged_once() {
     let engine = store([]);
-    let snapshot = engine.snapshot();
-    let options = QueryOptions::default();
-    let ctx = Context::new(&snapshot, &options, None, None);
     let payload = "x".repeat(65_536);
     let term: Term = nrese_rdf::Triple::new(
         node("s"),
@@ -23,6 +20,12 @@ fn e1_followup_alias_retention_is_charged_once() {
         nrese_rdf::Literal::from(payload.as_str()),
     )
     .into();
+    let mut tx = engine.transaction();
+    tx.insert(Quad::new(node("r"), node("p"), term.clone(), GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
     let id = ctx.id(&term).ok().unwrap();
     let alias = internal::class_constant(id);
     let before = ctx.budget.used();
@@ -34,6 +37,24 @@ fn e1_followup_alias_retention_is_charged_once() {
     );
     ctx.register_alias(alias.as_str(), id);
     assert_eq!(ctx.budget.used(), after, "same alias retains no new value");
+    let options = QueryOptions {
+        resources: crate::Resources {
+            memory: Envelope::new(Some(payload.len() - 1), None),
+            ..crate::Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let limited = Context::new(&snapshot, &options, None, None);
+    assert!(
+        limited.check().is_ok(),
+        "reader state fits before the alias"
+    );
+    limited.register_alias(alias.as_str(), id);
+    assert!(limited.check().is_err(), "the copied payload cannot fit");
+    assert!(
+        limited.aliases.borrow().is_empty(),
+        "nothing kept on refusal"
+    );
 }
 
 fn node(local: &str) -> NamedNode {
