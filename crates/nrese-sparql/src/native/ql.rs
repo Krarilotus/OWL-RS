@@ -705,8 +705,8 @@ impl Rewriter<'_> {
             let snapshot = self.snapshot;
             let asked = &mut self.report.checks;
             let budget = self.limits.checks;
-            let union = data.options.union_default_graph;
-            let has = data.ql.realised(snapshot, union, &key, || {
+            let mode = crate::ql::ProbeMode::of(&data.options);
+            let has = data.ql.realised(snapshot, mode, &key, || {
                 if *asked >= budget || data.options.resources.check().is_err() {
                     return None;
                 }
