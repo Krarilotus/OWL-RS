@@ -605,6 +605,9 @@ fn native_pattern<'q>(
         }
         _ => pattern,
     };
+    if let Some(refused) = ctx.aliases_refused.get() {
+        return Err(QueryEvaluationError::MemoryLimit(refused));
+    }
     Ok((pattern, form, rewrites, ql_report))
 }
 
