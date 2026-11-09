@@ -461,6 +461,109 @@ impl Parser<'_> {
 mod tests {
     use super::{NotCanonical, classify};
 
+    /// Spec: Namespaces in XML 1.0 §§2.1, 3 and RFC 3986 §4.1 require a URI
+    /// reference in every declaration, including unused ones. RDF 1.1 XMLLiteral
+    /// requires namespace-conforming content; comments/PIs cannot hide malformedness.
+    #[test]
+    fn namespace_names_are_checked_before_use_or_comments() {
+        use crate::owl::{Datatype, LiteralError, Value};
+
+        let mut wrong = Vec::new();
+        for uri in [
+            " ",
+            "urn:x y",
+            "&#x20;",
+            "\t",
+            "&#x9;",
+            "%",
+            "%2",
+            "%GG",
+            "http://[bad]/",
+            "http://x:bad/",
+            "1:relative",
+            "urn:x[",
+            "urn:x#x#y",
+            "urn:é",
+            "urn:x&#x7F;",
+        ] {
+            for fragment in [
+                format!("<a xmlns:p='{uri}'/>"),
+                format!("<a xmlns:p='{uri}'><p:b/></a>"),
+                format!("<a xmlns:p='{uri}' p:b='x'/>"),
+                format!("<a xmlns='{uri}'/>"),
+            ] {
+                for text in [
+                    fragment.clone(),
+                    format!("<!--c-->{fragment}"),
+                    format!("{fragment}<!--c-->"),
+                    format!("<?pi x?>{fragment}"),
+                    format!("<outer><!--c-->{fragment}</outer>"),
+                ] {
+                    let classified = classify(&text);
+                    let parsed = Value::parse(&text, Datatype::XmlLiteral, None);
+                    if classified != Err(NotCanonical::Malformed)
+                        || !matches!(parsed, Err(LiteralError::IllTyped(_)))
+                    {
+                        wrong.push(format!("{text:?}: {classified:?}, {parsed:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Spec: Namespaces §§2.2–2.3, 3, 6.2 permit relative references, compare
+    /// normalized strings verbatim, and constrain empty/default/reserved bindings.
+    /// Guards: valid comments stay Undecided; these controls hold on the base too.
+    #[test]
+    fn namespace_reference_and_reserved_binding_controls() {
+        let valid = [
+            (
+                "<a xmlns:p='../ns'><p:b/></a>",
+                "<a><p:b xmlns:p=\"../ns\"></p:b></a>",
+            ),
+            ("<a xmlns='?q#f'/>", "<a xmlns=\"?q#f\"></a>"),
+            ("<a xmlns='//host/ns'/>", "<a xmlns=\"//host/ns\"></a>"),
+            ("<a xmlns='urn:x%20y'/>", "<a xmlns=\"urn:x%20y\"></a>"),
+            ("<a xmlns='urn:x&#x2F;y'/>", "<a xmlns=\"urn:x/y\"></a>"),
+            (
+                "<a xmlns='urn:x?y&amp;z'/>",
+                "<a xmlns=\"urn:x?y&amp;z\"></a>",
+            ),
+            (
+                "<a xmlns='urn:x'><b xmlns=''/></a>",
+                "<a xmlns=\"urn:x\"><b xmlns=\"\"></b></a>",
+            ),
+            ("<a xmlns=''/>", "<a></a>"),
+            ("<a xmlns:p='#f'/>", "<a></a>"),
+            ("<a xml:lang='en'/>", "<a xml:lang=\"en\"></a>"),
+            (
+                "<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+                "<a></a>",
+            ),
+            ("<a xmlns:xmlfoo='urn:x'/>", "<a></a>"),
+        ];
+        for (text, expected) in valid {
+            assert_eq!(classify(text).as_deref(), Ok(expected), "{text}");
+            for text in [format!("<!--c-->{text}"), format!("{text}<!--c-->")] {
+                assert_eq!(classify(&text), Err(NotCanonical::Undecided), "{text}");
+            }
+        }
+        for text in [
+            "<a xmlns:p=''/>",
+            "<a xmlns:xml='urn:x'/>",
+            "<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns:xmlns='urn:x'/>",
+            "<a xmlns:p='http://www.w3.org/2000/xmlns/'/>",
+            "<a xmlns='http://www.w3.org/2000/xmlns/'/>",
+        ] {
+            for text in [text.to_owned(), format!("<!--c-->{text}")] {
+                assert_eq!(classify(&text), Err(NotCanonical::Malformed), "{text}");
+            }
+        }
+    }
+
     /// The canonical form where there is one (malformed and undecided alike: `None`).
     fn canonical(text: &str) -> Option<String> {
         classify(text).ok()
