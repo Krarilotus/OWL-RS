@@ -219,27 +219,6 @@ fn run(
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pre_bound = options
-        .pre_bound
-        .as_ref()
-        .map(|values| match &ctx.canonical {
-            Some(names) => Cow::Owned(names.values(values)),
-            None => Cow::Borrowed(&**values),
-        });
-    let pattern = match &pre_bound {
-        Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
-            for term in values.values() {
-                if let Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values { terms: values }.top(&pattern)
-        }
-        None => pattern,
-    };
     let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
     ctx.check()?;
     let outcome = match form {
@@ -540,7 +519,10 @@ type NativePattern<'q> = (
 );
 
 /// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
-/// query form, and the rewrites that changed it.
+/// query form, and the rewrites that changed it: the one preparation every delivery of the
+/// answer reads (results, typed results, the direct writer, EXPLAIN and its plan), so a
+/// request option holds in all of them. Pre-bound variables are put in last
+/// ([`substitute::Values::top`]), their blank nodes registered on `ctx`.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
@@ -575,6 +557,27 @@ fn native_pattern<'q>(
             }
         }
         _ => pattern,
+    };
+    let pre_bound = options
+        .pre_bound
+        .as_ref()
+        .map(|values| match &ctx.canonical {
+            Some(names) => Cow::Owned(names.values(values)),
+            None => Cow::Borrowed(&**values),
+        });
+    let pattern = match &pre_bound {
+        Some(values) => {
+            // A blank node is put in as an alias IRI that stands for the node.
+            for term in values.values() {
+                if let Term::BlankNode(b) = term
+                    && let Some(id) = ctx.snapshot.lookup(term.as_ref())
+                {
+                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
+                }
+            }
+            substitute::Values { terms: values }.top(&pattern)
+        }
+        None => pattern,
     };
     Ok((pattern, form, rewrites, ql_report))
 }
