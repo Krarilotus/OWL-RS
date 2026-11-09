@@ -51,6 +51,7 @@ use nrese_engine::{
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF};
 use nrese_rdf::{Literal, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, Function};
+use nrese_sparql_syntax::internal::blank_variable;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use rayon::prelude::*;
 
@@ -1616,7 +1617,7 @@ impl Context<'_> {
                 None => Side::Free(v.clone()),
             },
             TermPattern::BlankNode(b) => {
-                let v = Variable::new_unchecked(format!("_bnode_{}", b.as_str()));
+                let v = blank_variable(b);
                 match solutions.column(&v) {
                     Some(c) => Side::Bound(c),
                     None => Side::Free(v),
@@ -1649,7 +1650,7 @@ impl Context<'_> {
         // the columns, at most two wider than the rows joined.
         let named = |term: &TermPattern| match term {
             TermPattern::Variable(v) => size_of::<Variable>() + v.as_str().len(),
-            TermPattern::BlankNode(b) => size_of::<Variable>() + "_bnode_".len() + b.as_str().len(),
+            TermPattern::BlankNode(b) => size_of::<Variable>() + blank_variable(b).as_str().len(),
             _ => 0,
         };
         let most = solutions.vars.len() + 2;

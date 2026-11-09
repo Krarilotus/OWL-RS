@@ -17,6 +17,7 @@ mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
 mod canonical;
+mod decode_cache;
 mod equality;
 mod equijoin;
 mod estimate;
@@ -91,6 +92,7 @@ use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
+use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::Integer;
 use numeric::Numeric;
@@ -433,8 +435,43 @@ pub(crate) fn write_results(
     )
 }
 
-/// The quads an update removes and adds, in that order.
-pub(crate) type QuadChanges = (Vec<nrese_rdf::Quad>, Vec<nrese_rdf::Quad>);
+/// The quads an update removes and adds, in that order, decoded, and charged to the request's
+/// envelope while they live (D16-039): their room ([`ChargedVec`]) before it grows, and their
+/// terms' text ([`Grant`], [`nrese_rdf::Term::heap_bytes`]) before each quad is kept, as
+/// CONSTRUCT and DESCRIBE charge theirs. Dropped, the quads are freed and then their charge.
+pub(crate) struct QuadChanges {
+    pub(crate) deletes: ChargedVec<nrese_rdf::Quad>,
+    pub(crate) inserts: ChargedVec<nrese_rdf::Quad>,
+    /// After the quads: fields drop in order, the terms freed before their charge goes.
+    terms: Grant,
+}
+
+impl QuadChanges {
+    /// No changes yet, charged to `budget`. One thread fills them, with no sibling grant: the
+    /// whole spare.
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            deletes: ChargedVec::new(Arc::clone(budget)),
+            inserts: ChargedVec::new(Arc::clone(budget)),
+            terms: Grant::with_workers(Arc::clone(budget), 1),
+        }
+    }
+
+    /// Keeps `quad` among the deletes, or the inserts, its terms charged first.
+    fn keep(&mut self, quad: nrese_rdf::Quad, delete: bool) -> Result<(), BudgetExceeded> {
+        self.terms.take(
+            quad.subject.heap_bytes()
+                + quad.predicate.heap_bytes()
+                + quad.object.heap_bytes()
+                + quad.graph_name.heap_bytes(),
+        )?;
+        if delete {
+            self.deletes.push(quad)
+        } else {
+            self.inserts.push(quad)
+        }
+    }
+}
 
 /// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated on
 /// `snapshot`. `using`
@@ -466,10 +503,14 @@ pub(crate) fn delete_insert(
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
     let solutions = ctx.eval(&pattern)?;
-    let computed = ctx.computed.into_inner();
+    let mut changes = QuadChanges::new(&ctx.budget);
+    let memory = QueryEvaluationError::MemoryLimit;
+    let computed = std::mem::take(&mut *ctx.computed.borrow_mut());
     let table = &solutions.table;
-    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     for row in 0..table.len() {
+        if row % 256 == 0 {
+            ctx.check()?;
+        }
         let value = |v: &Variable| -> Option<Term> {
             decode(snapshot, &computed, table.get(row, solutions.column(v)?))
         };
@@ -506,7 +547,9 @@ pub(crate) fn delete_insert(
                     graph(&quad.graph_name)?,
                 ))
             })();
-            deletes.extend(filled);
+            if let Some(quad) = filled {
+                changes.keep(quad, true).map_err(memory)?;
+            }
         }
         let mut fresh: HashMap<String, nrese_rdf::BlankNode> = HashMap::new();
         let mut term = |t: &TermPattern| fill_template(t, &value, &mut fresh);
@@ -520,10 +563,13 @@ pub(crate) fn delete_insert(
             let (Some(p), Some(g)) = (predicate(&quad.predicate), graph(&quad.graph_name)) else {
                 continue;
             };
-            inserts.push(nrese_rdf::Quad::new(s, p, o, g));
+            changes
+                .keep(nrese_rdf::Quad::new(s, p, o, g), false)
+                .map_err(memory)?;
         }
     }
-    Ok((deletes, inserts))
+    ctx.check()?;
+    Ok(changes)
 }
 
 /// What a query returns.
@@ -594,15 +640,15 @@ fn native_pattern<'q>(
         });
     let pattern = match &pre_bound {
         Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
+            // A blank node is put in as a made constant that stands for the node.
             for term in values.values() {
                 if let Term::BlankNode(b) = term
                     && let Some(id) = ctx.snapshot.lookup(term.as_ref())
                 {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
+                    ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
                 }
             }
-            substitute::Values { terms: values }.top(&pattern)
+            substitute::Values::new(ctx, values)?.top(&pattern)
         }
         None => pattern,
     };
@@ -1254,7 +1300,8 @@ struct Context<'a> {
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
-    decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// Stored terms decoded once, charged to `budget` while kept ([`decode_cache`]).
+    decoded: RefCell<decode_cache::DecodeCache>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
     decodes: AtomicU64,
@@ -1491,7 +1538,12 @@ impl<'a> Context<'a> {
             aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
-            decoded: RefCell::default(),
+            // One thread fills it, with no sibling grant: the whole spare.
+            decoded: RefCell::new(decode_cache::DecodeCache::new(
+                &budget,
+                DECODE_CACHE_ENTRIES,
+                1,
+            )),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
@@ -1524,8 +1576,8 @@ impl<'a> Context<'a> {
         ctx
     }
 
-    /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
-    /// blank node.
+    /// The id of a constant of a pattern: a made constant ([`substitute`]) stands for the
+    /// term registered for it, every IRI for itself.
     /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
     /// ([`Snapshot::lookup_charged`]).
     fn lookup_const_charged(
@@ -1534,7 +1586,7 @@ impl<'a> Context<'a> {
         held: &mut Reservation<&nrese_exec::Budget>,
     ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return Ok(self.lookup_const(term));
         }
@@ -1544,7 +1596,7 @@ impl<'a> Context<'a> {
 
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return self
                 .aliases
@@ -1747,15 +1799,14 @@ impl<'a> Context<'a> {
             return self.computed.borrow().get(index as usize).cloned();
         }
         let mut decoded = self.decoded.borrow_mut();
-        if let Some(term) = decoded.get(&id) {
+        if let Some(term) = decoded.get(id) {
             return term.clone();
         }
         self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
-        if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
-        }
+        // Bounded: a scan over millions of distinct labels must not keep them all; and charged
+        // while kept (D16-039).
+        decoded.keep(id, &term);
         term
     }
 
@@ -2373,9 +2424,7 @@ impl<'a> Context<'a> {
     fn path_end(&self, term: &TermPattern) -> NativeResult<Result<Variable, u64>> {
         Ok(match term {
             TermPattern::Variable(v) => Ok(v.clone()),
-            TermPattern::BlankNode(b) => {
-                Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-            }
+            TermPattern::BlankNode(b) => Ok(internal::blank_variable(b)),
             TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())?),
             TermPattern::Literal(l) => Err(self.id(&l.clone().into())?),
             // A triple term at a path's end matches nothing a path reaches.
@@ -3774,8 +3823,8 @@ impl<'a> Context<'a> {
         graph_tests::checkpoint();
         self.check()?;
         let (predicate, object) = (
-            Variable::new_unchecked("described predicate"),
-            Variable::new_unchecked("described object"),
+            internal::variable("described", "predicate"),
+            internal::variable("described", "object"),
         );
         let Some(graph) = self.graph_slot() else {
             return Ok(Vec::new());
@@ -3875,9 +3924,7 @@ impl<'a> Context<'a> {
         let slot = |term: &TermPattern| -> Option<Slot> {
             Some(match term {
                 TermPattern::Variable(v) => Slot::Var(v.clone()),
-                TermPattern::BlankNode(b) => {
-                    Slot::Var(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-                }
+                TermPattern::BlankNode(b) => Slot::Var(internal::blank_variable(b)),
                 TermPattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
                 TermPattern::Literal(l) => Slot::Const(self.lookup_const(l.as_ref().into())?),
                 TermPattern::Triple(t) => {
@@ -4507,14 +4554,14 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let snapshot: &Snapshot = &self.snapshot;
-        let decodes = &self.decodes;
+        let (decodes, budget) = (&self.decodes, &self.budget);
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes);
+                let decoder = Decoder::new(snapshot, computed, decodes, budget);
                 let range =
                     i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
                 Some(mask.rows(range, &|id| decoder.term(id)))
@@ -4674,7 +4721,7 @@ impl<'a> Context<'a> {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return Err(None);
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes);
+                let decoder = Decoder::new(snapshot, computed, decodes, shared);
                 let term = |id: u64| decoder.term(id);
                 let kept = aggregate::Kept::new(shared);
                 let aggregator = Aggregator {
@@ -5469,11 +5516,11 @@ impl<'a> Context<'a> {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
                 let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
-                let decodes = &self.decodes;
+                let (decodes, budget) = (&self.decodes, &self.budget);
                 missing
                     .par_chunks(PARALLEL_EXPRESSION_ROWS)
                     .flat_map_iter(|part| {
-                        let decoder = Decoder::new(snapshot, computed, decodes);
+                        let decoder = Decoder::new(snapshot, computed, decodes, budget);
                         let term = |id: u64| decoder.term(id);
                         let aggregator = Aggregator {
                             evaluator,
@@ -5723,37 +5770,45 @@ const PARALLEL_EXPRESSION_ROWS: usize = 1 << 13;
 const DECODER_CACHE_ENTRIES: usize = 1 << 12;
 
 /// Term decoding for one task of a parallel operator: the snapshot, the query's computed
-/// terms (read-only meanwhile), and a small cache of its own.
+/// terms (read-only meanwhile), and a small cache of its own, charged to the query's budget
+/// while kept ([`decode_cache`]).
 struct Decoder<'a> {
     snapshot: &'a Snapshot,
     computed: &'a [Term],
-    cache: RefCell<HashMap<u64, Option<Term>>>,
+    cache: RefCell<decode_cache::DecodeCache>,
     /// The query's count of decoded terms ([`Context::decodes`]).
     decodes: &'a AtomicU64,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(snapshot: &'a Snapshot, computed: &'a [Term], decodes: &'a AtomicU64) -> Self {
+    fn new(
+        snapshot: &'a Snapshot,
+        computed: &'a [Term],
+        decodes: &'a AtomicU64,
+        budget: &Arc<Budget>,
+    ) -> Self {
         Self {
             snapshot,
             computed,
-            cache: RefCell::default(),
+            // As many fill theirs at once as the pool has threads.
+            cache: RefCell::new(decode_cache::DecodeCache::new(
+                budget,
+                DECODER_CACHE_ENTRIES,
+                rayon::current_num_threads(),
+            )),
             decodes,
         }
     }
 
     fn term(&self, id: u64) -> Option<Term> {
-        if let Some(term) = self.cache.borrow().get(&id) {
+        if let Some(term) = self.cache.borrow().get(id) {
             return term.clone();
         }
         if id != UNDEF && computed_index(id).is_none() {
             self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let term = decode(self.snapshot, self.computed, id);
-        let mut cache = self.cache.borrow_mut();
-        if cache.len() < DECODER_CACHE_ENTRIES {
-            cache.insert(id, term.clone());
-        }
+        self.cache.borrow_mut().keep(id, &term);
         term
     }
 }
@@ -6284,9 +6339,7 @@ fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
     let term = |t: &TermPattern| match t {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(internal::blank_variable(b)),
         _ => None,
     };
     let predicate = match &triple.predicate {

@@ -136,6 +136,7 @@ impl<'e> PrivateTransaction<'e> {
             // cell is the published version's.
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         };
         Ok(self.pending.base().with_version(version).private(view))
     }
@@ -163,6 +164,7 @@ impl<'e> PrivateTransaction<'e> {
             // Its own, as `pending_snapshot`'s.
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         };
         Ok(view.with_version(version).private(vocabulary))
     }

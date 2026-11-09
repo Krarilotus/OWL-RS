@@ -1510,6 +1510,26 @@ fn a_stored_triple_term_is_the_same_value_bound_or_not() {
     );
 }
 
+/// Spec: SHACL §5.6.2 pre-binds a targetObjectsOf triple focus as $this; an inner
+/// BIND copies it, preserving the blank subject's stored identity (D16-067).
+#[test]
+fn triple_focus_is_copied_by_inner_bind() {
+    let store = engine(
+        "ex:s ex:p <<( _:b ex:q ex:o )>> .",
+        "ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:sparql [ sh:select '''
+            SELECT $this ?value WHERE {
+                BIND($this AS ?value) FILTER(BOUND(?value))
+            }''' ] .",
+    );
+    let snapshot = store.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(report.results.len(), 1, "BIND exposes the triple focus");
+    let result = &report.results[0];
+    assert!(matches!(result.value, Some(nrese_rdf::Term::Triple(_))));
+    assert_eq!(result.value.as_ref(), Some(&result.focus_node));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+}
+
 /// The same across a change of the shapes (sol r2 S3): a constraint component's property
 /// validator, a SELECT reporting each value of the path, becomes an ASK that every value
 /// fails. ex:s's one value, the stored `<<( _:b ex:q ex:o )>>`, is reported by both: the same
