@@ -584,6 +584,13 @@ impl Dictionary {
         Ok((held, inner.view()))
     }
 
+    /// Test support: whether no thread holds the dictionary's key lock now, read or write
+    /// (taken and let go, never waited for).
+    #[cfg(test)]
+    pub(crate) fn unlocked(&self) -> bool {
+        self.inner.try_write().is_some()
+    }
+
     /// Test support: [`Self::view`], held ([`HeldView`]).
     #[cfg(test)]
     pub(crate) fn held_view(&self) -> HeldView {

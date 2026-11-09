@@ -866,4 +866,54 @@ mod tests {
         let (low, high) = derived_range(-5, 7).unwrap();
         assert!(ids[1] >= low && ids[4] <= high && ids[0] < low && ids[5] > high);
     }
+
+    /// Package C3: a charged decode charges [`inline_bound`] before [`inline_to_literal`]
+    /// allocates, so the bound is what the literal holds (its strings' capacities), exactly, for
+    /// every inline kind and any payload: the longest fields, each field at its largest (a year
+    /// of 14 bits, milliseconds of 10, the last timezone code, the widest mantissa and scale),
+    /// and payloads no lexical form encodes. `None` exactly where no literal is decoded.
+    #[test]
+    fn an_inline_bound_is_what_its_literal_holds() {
+        let kinds = [
+            TermKind::Integer,
+            TermKind::Boolean,
+            TermKind::Decimal,
+            TermKind::Date,
+            TermKind::DateTime,
+            TermKind::DerivedInteger,
+            TermKind::String,
+            TermKind::Triple,
+        ];
+        let all = (1u64 << super::super::PAYLOAD_BITS) - 1;
+        let mut payloads = vec![0, 1, all, all >> 1, all >> 4, 0x3ff << TIMEZONE_BITS];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payloads.push(state & all);
+        }
+        let canonical = [
+            inline("-576460752303423488", xsd::INTEGER),
+            inline("-36028797018963.967", xsd::DECIMAL),
+            inline("9999-12-31-14:00", xsd::DATE),
+            inline("9999-12-31T23:59:59.999+14:00", xsd::DATE_TIME),
+            inline("-128", xsd::BYTE),
+        ];
+        let mut decoded = 0;
+        let ids = kinds
+            .iter()
+            .flat_map(|&kind| payloads.iter().map(move |&p| TermId::new(kind, p)))
+            .chain(canonical.into_iter().map(Option::unwrap));
+        for id in ids {
+            let literal = inline_to_literal(id);
+            assert_eq!(
+                inline_bound(id),
+                literal.as_ref().map(Literal::heap_bytes),
+                "{id:?}: {literal:?}"
+            );
+            decoded += usize::from(literal.is_some());
+        }
+        assert!(decoded > 100_000, "{decoded} decoded");
+    }
 }
