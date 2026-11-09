@@ -107,6 +107,35 @@ class Abba(unittest.TestCase):
         code, text, _ = abba.report(self.family, list(rounds))
         return code, text
 
+    def test_baseline_routes_keep_answers_and_the_aa_control(self):
+        """Master 9 Nov21:38: a baseline may use its own optimizer, with checked answers;
+        B's route and the interleaved A-A' control remain required (PROTOCOL section5)."""
+        for name, side, scale, wrong, expected in (
+            ("baseline", "a", 1.0, False, abba.NO_LOSS),
+            ("aa-differs", "a", 1.8, False, abba.NO_VERDICT),
+            ("candidate", "b", 1.0, False, abba.NO_VERDICT),
+            ("wrong-answer", "a", 1.0, True, abba.NO_VERDICT),
+        ):
+            with self.subTest(name=name):
+                base = records(a2=scale)
+
+                def own_route(s, n):
+                    out = base(s, n)
+                    if s == side or (side == "a" and s == "a2"):
+                        out[0].update(status="off-route", routes=[{
+                            "path": "q.q01-point-lookup.operators", "expected": "has group count",
+                            "got": ["project", "bind", "group"], "ok": False}])
+                        if wrong:
+                            for check in out[0]["checks"]:
+                                check["ok"] = False
+                            for o in out[0]["observations"]:
+                                for check in o["checks"]:
+                                    check["ok"] = False
+                    return out
+
+                code, _ = self.verdict(self.round_(own_route, name=name))
+                self.assertEqual(code, expected)
+
     def test_hypotheses_nothing_compared_never_read_as_no_loss(self):
         """SHACL lead, 8 Nov 2026 (orchestrator 04:31): A's answers differ from the pinned ones and B's
         match, so the gate takes neither side's time there (release_gate.compare_case, not_compared);
