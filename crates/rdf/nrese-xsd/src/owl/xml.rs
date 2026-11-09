@@ -303,6 +303,10 @@ impl Parser<'_> {
                     || prefix == "xmlns"
                     || value == XMLNS_NAMESPACE
                     || (!prefix.is_empty() && value.is_empty())
+                    // Check every normalized declaration, including unused ones, before
+                    // storing it. URI references may be relative (Namespaces §§2.2–3);
+                    // validate without resolving or changing their string identity.
+                    || iri_string::types::UriReferenceStr::new(&value).is_err()
                 {
                     return None;
                 }
