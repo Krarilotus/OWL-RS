@@ -460,6 +460,22 @@ mod tests {
         assert_eq!(kept.used(), 0);
     }
 
+    /// Spec (D16-039 S12, charged by length): a body that is a slice of a larger request
+    /// buffer is kept as a copy of its own, never holding that buffer past the request.
+    #[test]
+    fn a_session_keeps_a_body_slice_as_its_own_copy() {
+        let sessions = Sessions::within(Arc::new(Budget::new(100_000)), SESSION_IDLE);
+        let id = sessions.begin(None).unwrap();
+        let buffer = bytes::Bytes::from(vec![b'#'; 64 * 1024]);
+        let mut add = body(0);
+        if let StatementOp::Add { data, .. } = &mut add[0] {
+            data.payload = buffer.slice(..10);
+        }
+        assert!(sessions.add(&id, None, add).unwrap());
+        assert!(buffer.is_unique(), "the session holds the request's buffer");
+        assert_eq!(bytes_of(&sessions.pending(&id, None).unwrap()), b"#");
+    }
+
     /// Spec (design note N3, I5; triage N3's expiry control): a session idle past its
     /// lifetime is gone for its owner's every call, which returns its charge; a stranger's
     /// call ends nothing; and an add refused room first drops expired sessions and tries
