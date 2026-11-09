@@ -517,10 +517,12 @@ pub fn components(n: usize, edges: &[(u32, u32)]) -> Components {
     components_csr(&offsets, &targets, &|| false).expect("never stopped")
 }
 
-/// `work` over the indices `0..len` in runs of at most [`crate::POLL_UNITS`], each run ticked
-/// once before it: a stop is seen within that many units of a linear pass, at one tick a run
-/// (a tick an element cost the count-only closure +5.5 % instructions: the graph closure
-/// package's counts).
+/// `work` over the indices `0..len` in runs, each as long as the ticker's allowance left
+/// ([`Ticker::left`]) and ticked once after it: the tick then spends the allowance and polls,
+/// so a stop is seen within [`crate::POLL_UNITS`] units of work, counted across passes, at one
+/// tick a run (a tick an element cost the count-only closure +5.5 % instructions: the graph
+/// closure package's counts; a run ticked before its work reset the allowance and let the
+/// next run go unpolled: sol-loop r4 S5).
 fn in_runs(
     ticker: &Ticker<StopFn<'_>>,
     len: usize,
@@ -528,9 +530,9 @@ fn in_runs(
 ) -> Result<(), Stop> {
     let mut at = 0;
     while at < len {
-        let end = at.saturating_add(crate::POLL_UNITS as usize).min(len);
-        ticker.tick((end - at) as u32)?;
+        let end = at.saturating_add(ticker.left().max(1) as usize).min(len);
         work(at..end);
+        ticker.tick((end - at) as u32)?;
         at = end;
     }
     Ok(())
