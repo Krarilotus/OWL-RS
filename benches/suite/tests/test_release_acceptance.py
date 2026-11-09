@@ -112,8 +112,20 @@ def with_attempt(result: dict, attempt: str) -> dict:
 
 
 def attempt_record(kind: str, attempt: str, tree: str) -> dict:
-    """KIND's attempt record as `release_gate.py attempt` writes it (KIND.attempt.json beside its result)."""
+    """KIND's attempt record as `release_gate.py attempt` writes it (KIND.attempt.SEQUENCE-ID.json beside
+    its result)."""
     return {"kind": kind, "attempt": attempt, "tree": tree}
+
+
+def write_attempts(where: Path, kind: str, records: list) -> list[Path]:
+    """RECORDS as KIND's attempt records in WHERE, oldest first (sequence 1, 2, ...): a dict as its
+    content, a str as a record's raw text that isn't one. Their paths."""
+    paths = []
+    for sequence, record in enumerate(records, start=1):
+        attempt = record["attempt"] if isinstance(record, dict) else "f" * 32
+        paths.append(where / f"{kind}.attempt.{sequence:09d}-{attempt}.json")
+        paths[-1].write_text(json.dumps(record) if isinstance(record, dict) else record, encoding="utf-8")
+    return paths
 
 
 def rounds(candidate: str, records_of=None) -> list[dict]:
@@ -129,14 +141,14 @@ def rounds(candidate: str, records_of=None) -> list[dict]:
 
 def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: dict,
             attempts: dict | None = None) -> subprocess.CompletedProcess:
-    """`release_gate.py verdict` on these parts, CANDIDATE resolved in REPO; each check's attempt record
-    beside its result: the one its result names (ATTEMPTS: others, or None for none)."""
+    """`release_gate.py verdict` on these parts, CANDIDATE resolved in REPO; each check's attempt records
+    beside its result: the one its result names (ATTEMPTS: a kind's records instead, oldest first, or
+    None for none)."""
     tmp = Path(tempfile.mkdtemp(prefix="acceptance-", dir=isolation.SCRATCH))
     tree = git(repo, "rev-parse", f"{candidate}^{{tree}}")
     for kind, result in (("w3c", w3c), ("guards", guards)):
-        record = (attempts or {}).get(kind, attempt_record(kind, str(result.get("attempt")), tree))
-        if record is not None:
-            (tmp / f"{kind}.attempt.json").write_text(json.dumps(record), encoding="utf-8")
+        records = (attempts or {}).get(kind, [attempt_record(kind, str(result.get("attempt")), tree)])
+        write_attempts(tmp, kind, records or [])
     try:
         return verdict_on(repo, candidate, tmp, timed, w3c, guards)
     finally:
@@ -494,7 +506,9 @@ class GuardRun(Scratch):
         script = self.tmp / "guards-step.sh"
         script.write_text('set -uo pipefail\nOUT="$1"\nGATE="$1"\nlog() { echo "$*"; }\n'
                           'gate_identity() { echo identity; }\n'
-                          'py() { echo "the checker failed before publishing" >&2; return 1; }\n' + body + "\n",
+                          # The step's attempt record is made (AttemptRecords tests it); its checker fails.
+                          'py() { [ "${2:-}" != attempt ] || { echo attempt-id; return 0; }; '
+                          'echo "the checker failed before publishing" >&2; return 1; }\n' + body + "\n",
                           encoding="utf-8", newline="\n")
         out = self.tmp / "out"
         out.mkdir()
@@ -507,8 +521,8 @@ class GuardRun(Scratch):
 
 class AttemptRecords(Scratch):
     """Fix check r2, R2 (the orchestrator's design of 13:01): each check step writes a fresh attempt record
-    first (KIND.attempt.json: a random id and the tree); its result and receipt carry that id; the verdict
-    takes a result only beside a record of the same id."""
+    first, under a name of its own (KIND.attempt.SEQUENCE-ID.json: a random id and the tree; 13:17); its
+    result and receipt carry that id; the verdict takes a result only of the newest record's id."""
 
     def attempt(self, kind: str, where: Path) -> str:
         done = subprocess.run([sys.executable, str(GATE), "attempt", kind, str(where)], cwd=self.repo.path,
@@ -530,8 +544,15 @@ class AttemptRecords(Scratch):
         attempts = {kind: self.attempt(kind, out) for kind in ("w3c", "guards")}
         self.assertNotEqual(attempts["w3c"], attempts["guards"])
         for kind in attempts:
-            record = json.loads((out / f"{kind}.attempt.json").read_text(encoding="utf-8"))
+            [path] = out.glob(f"{kind}.attempt.*.json")
+            self.assertEqual(path.name, f"{kind}.attempt.000000001-{attempts[kind]}.json")
+            record = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(record, attempt_record(kind, attempts[kind], self.repo.tree(a)))
+        # A second attempt of a kind is a new file, one sequence higher; the first stays.
+        again = self.attempt("w3c", out)
+        self.assertEqual(sorted(p.name for p in out.glob("w3c.attempt.*.json")),
+                         [f"w3c.attempt.000000001-{attempts['w3c']}.json", f"w3c.attempt.000000002-{again}.json"])
+        attempts["w3c"] = again
         made = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--log", str(out / "test.log"),
                                "--identity", IDENTITY, "--attempt", attempts["guards"], "--json", str(out / "guards.json")],
                               cwd=self.repo.path, capture_output=True, text=True, timeout=120,
@@ -546,16 +567,18 @@ class AttemptRecords(Scratch):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_a_result_of_another_attempt_or_none_is_refused(self):
-        # Spec: the orchestrator's design, items 3 and 5: a result beside a newer attempt record (its
-        # producer never published), beside no record, or an attempt record with no result: each refused
-        # with its named reason.
+        # Spec: the orchestrator's design, items 3 and 5, and 13:17: the result's own record, then a newer
+        # one without its result (that attempt's producer never published); a result beside no record; a
+        # malformed newest record; an attempt record with no result: each refused with its named reason.
         a = self.repo.commit()
         tree = self.repo.tree(a)
         w3c, guards = checks(a, tree)
+        own = attempt_record("guards", ATTEMPT, tree)
         for name, attempts, text in (
-                ("a newer attempt", {"guards": attempt_record("guards", "b" * 32, tree)},
+                ("a newer record without its result", {"guards": [own, attempt_record("guards", "b" * 32, tree)]},
                  "guards: stale result from an earlier attempt"),
-                ("no attempt record", {"w3c": None}, "w3c: no attempt record")):
+                ("no attempt record", {"w3c": None}, "w3c: no attempt record"),
+                ("a malformed newest record", {"guards": [own, "{not a record"]}, "guards: its newest attempt record")):
             with self.subTest(name):
                 done = verdict(self.repo.path, a, rounds(a), copy.deepcopy(w3c), copy.deepcopy(guards), attempts)
                 self.assertEqual(done.returncode, 1, f"SPEC {name}\n{done.stdout}")
@@ -563,8 +586,8 @@ class AttemptRecords(Scratch):
         with self.subTest("an attempt record without its result"):
             where = self.tmp / "no-result"
             where.mkdir()
-            (where / "guards.attempt.json").write_text(json.dumps(attempt_record("guards", "c" * 32, tree)),
-                                                       encoding="utf-8")
+            write_attempts(where, "guards", [attempt_record("guards", "c" * 32, tree)])
+            write_attempts(where, "w3c", [attempt_record("w3c", ATTEMPT, tree)])
             done = verdict_on(self.repo.path, a, where, rounds(a), w3c, where / "guards.json")
             self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
             self.assertIn("guards: no result for its latest attempt", done.stdout)
@@ -647,10 +670,11 @@ class ResultInvalidation(Scratch):
                 self.assertIn(f"{name}: the earlier result", done.stdout + done.stderr)
 
     def test_a_locked_earlier_result_is_refused_by_the_verdict_after_its_step_fails(self):
-        # Spec: fix check r2, R2 (IB1254-0ebf; the orchestrator's design of 13:01): an earlier complete
-        # passing result of this very candidate, held by a reader without delete sharing; its step fails
-        # before anything runs; the actual verdict CLI on what the results directory then holds refuses
-        # it: a stale result from an earlier attempt. Today it passes, exit 0.
+        # Spec: fix check r2, R2 (IB1254-0ebf; the orchestrator's design of 13:01 and 13:17): an earlier
+        # complete passing result of this very candidate and its attempt record, both held by a reader
+        # without delete sharing (the record too: a fixed-name record, replaced in place, could not be
+        # renewed then); its step fails before anything runs; the actual verdict CLI on what the results
+        # directory then holds refuses it: a stale result from an earlier attempt. Today it passes, exit 0.
         a = self.repo.commit()
         tree = self.repo.tree(a)
         earlier = "0" * 32
@@ -659,14 +683,21 @@ class ResultInvalidation(Scratch):
                          ("w3c", 'w3c "$OUT/w3c" --expected "$OUT/no-expected" --run --identity identity '
                                  '--attempt x --json "$OUT/w3c.json"')):
             with self.subTest(name):
+                self.out = self.tmp / f"out-{name}"
+                (self.out / "guards").mkdir(parents=True)
+                (self.out / "w3c").mkdir()
                 w3c, guards = checks(a, tree)
+                held = []
                 for kind, result in (("w3c", w3c), ("guards", guards)):
                     if kind == name:
                         with_attempt(result, earlier)
                     (self.out / f"{kind}.json").write_text(json.dumps(result), encoding="utf-8")
-                    (self.out / f"{kind}.attempt.json").write_text(
-                        json.dumps(attempt_record(kind, result["attempt"], tree)), encoding="utf-8")
-                with undeletable(self.out / f"{name}.json"):
+                    records = write_attempts(self.out, kind, [attempt_record(kind, result["attempt"], tree)])
+                    if kind == name:
+                        held = [self.out / f"{kind}.json", *records]
+                with contextlib.ExitStack() as stack:
+                    for path in held:
+                        stack.enter_context(undeletable(path))
                     done = self.step(name, py)
                 self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
                 judged = verdict_on(self.repo.path, a, self.tmp, rounds(a), self.out / "w3c.json",
