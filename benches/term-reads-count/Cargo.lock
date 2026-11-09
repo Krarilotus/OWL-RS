@@ -244,6 +244,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "iri-string"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1663ee7d8cf2900cc1414b1e1eec9f348d6eaa3bcab07579f4726a4b8499f447"
+
+[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,6 +398,7 @@ dependencies = [
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
+ "iri-string",
  "regex-syntax",
  "thiserror",
 ]
