@@ -95,19 +95,45 @@ impl Documents {
     }
 }
 
-/// The text an own term (an overlay entry: `id`, `key`) is a document of `documents` by: a
-/// literal's value, an IRI's local name ([`crate::term::text::local_name_text`]); `None` for
-/// a term of another kind, and for vectors (whose corpus counts each member once).
-fn own_text(documents: Documents, id: TermId, key: &[u8]) -> Option<String> {
+/// The words an own term (an overlay entry: `id`, `key`) has as a document of `documents`,
+/// as the shared index counts them: a literal's value counted in place, an IRI's local-name
+/// text ([`crate::term::text::local_name_text`]) made on `scratch`'s charge and let go; 0
+/// for a term of another kind, and for vectors (whose corpus counts each member once).
+fn own_length(
+    documents: Documents,
+    id: TermId,
+    key: &[u8],
+    scratch: &mut nrese_exec::Reservation,
+) -> Result<u16, nrese_exec::BudgetExceeded> {
     use crate::term::TermView;
     if !documents.holds(id.kind()) {
+        return Ok(0);
+    }
+    Ok(match (documents, crate::term::dictionary::view_key(key)) {
+        (Documents::Literals, TermView::String(value) | TermView::LangString { value, .. }) => {
+            word_length(value)
+        }
+        (Documents::Subjects, TermView::Iri(iri)) => {
+            let bytes = crate::term::text::local_name_text_bytes(iri.len());
+            scratch.charge(bytes)?;
+            let length = crate::term::text::local_name_text(iri).map_or(0, |t| word_length(&t));
+            scratch.release(bytes);
+            length
+        }
+        _ => 0,
+    })
+}
+
+/// The lexical form of an own term (an overlay entry: `id`, `key`) if it is a vector
+/// literal among `corpus`'s members.
+fn vector_lexical<'k>(id: TermId, key: &'k [u8], corpus: &Corpus) -> Option<&'k str> {
+    if id.kind() != TermKind::TypedLiteral || !corpus.contains(id.payload()) {
         return None;
     }
-    match (documents, crate::term::dictionary::view_key(key)) {
-        (Documents::Literals, TermView::String(value) | TermView::LangString { value, .. }) => {
-            Some(value.to_owned())
+    match crate::term::dictionary::view_key(key) {
+        crate::term::TermView::Typed { value, datatype } if datatype == nrese_vector::DATATYPE => {
+            Some(value)
         }
-        (Documents::Subjects, TermView::Iri(iri)) => crate::term::text::local_name_text(iri),
         _ => None,
     }
 }
@@ -347,31 +373,47 @@ impl Snapshot {
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b Arc<nrese_exec::Budget>,
     ) -> Result<super::VectorHits<'b>, super::SearchRefused> {
-        use crate::term::TermView;
         let input = self.underlying().vector_input(query);
         let corpus = self.text_corpus(Documents::Vectors, model, scope, budget)?;
         let start = view.start();
-        // The own vectors of the dimension among the corpus's members: parsed, charged first.
+        // The own vectors of the dimension among the corpus's members (sol-loop r1 B2): each
+        // parse charged first (`parse_bytes`) and let go; counted, their storage charged as
+        // nrese-vector counts it (`bytes_for`, whole chunks past the first), then filled.
         let dimension = query.vector.len();
-        let mut own = nrese_vector::Vectors::new(dimension);
-        let mut charge = nrese_exec::Reservation::new(Arc::clone(budget));
+        let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+        let mut count = 0;
         for (id, key) in view.own_entries() {
-            if id.kind() != TermKind::TypedLiteral || !corpus.contains(id.payload()) {
-                continue;
-            }
-            let TermView::Typed { value, datatype } = crate::term::dictionary::view_key(key) else {
+            let Some(value) = vector_lexical(id, key, &corpus) else {
                 continue;
             };
-            if datatype != nrese_vector::DATATYPE {
-                continue;
-            }
-            let Ok(vector) = nrese_vector::parse(value) else {
+            let bytes = nrese_vector::parse_bytes(value.len());
+            scratch.charge(bytes)?;
+            let vector = nrese_vector::parse(value).ok();
+            count += usize::from(vector.is_some_and(|vector| vector.len() == dimension));
+            scratch.release(bytes);
+        }
+        let chunks = count.div_ceil(nrese_vector::CHUNK);
+        let room = match chunks {
+            0 | 1 => count,
+            _ => chunks * nrese_vector::CHUNK,
+        };
+        // The chunks' shared allocations and the list of them, beside their values.
+        let mut charge = nrese_exec::Reservation::new(Arc::clone(budget));
+        charge.charge(nrese_vector::Vectors::bytes_for(dimension, room) + 128 * chunks + 64)?;
+        let mut own = nrese_vector::Vectors::with_capacity(dimension, count);
+        for (id, key) in view.own_entries() {
+            let Some(value) = vector_lexical(id, key, &corpus) else {
                 continue;
             };
-            if vector.len() == dimension {
-                charge.charge(dimension * 4 + 16)?;
-                own.push(id.raw(), &vector);
+            let bytes = nrese_vector::parse_bytes(value.len());
+            scratch.charge(bytes)?;
+            match nrese_vector::parse(value) {
+                Ok(vector) if vector.len() == dimension => {
+                    own.push(id.raw(), &vector);
+                }
+                _ => {}
             }
+            scratch.release(bytes);
         }
         if input.is_none() && own.is_empty() {
             let none = crate::VectorSearchReport {
@@ -765,12 +807,13 @@ impl Snapshot {
         };
         let start = view.start();
         let count = (view.end() - start) as usize;
-        let lengths = nrese_exec::ChargedVec::collect(
-            Arc::clone(budget),
-            count,
-            view.own_entries()
-                .map(|(id, key)| own_text(documents, id, key).map_or(0, |t| word_length(&t))),
-        )?;
+        let mut lengths = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), count)?;
+        // An IRI's local-name text is made to be counted: its bytes charged first, let go
+        // after (sol-loop r1 B4). Literals are counted in place.
+        let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+        for (id, key) in view.own_entries() {
+            lengths.push(own_length(documents, id, key, &mut scratch)?)?;
+        }
         Ok(Some(OwnLengths { start, lengths }))
     }
 
@@ -792,14 +835,13 @@ impl Snapshot {
         language: Option<&str>,
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<crate::term::text::Local, nrese_exec::BudgetExceeded> {
-        let own = view
-            .own_entries()
-            .filter(|(id, _)| corpus.contains(id.payload()))
-            .filter_map(|(id, key)| {
-                let text = own_text(documents, id, key)?;
-                (word_length(&text) > 0).then_some((id.payload(), id.kind(), text))
-            });
-        crate::term::text::Local::build(own, language, budget)
+        crate::term::text::Local::build(
+            view.own_entries(),
+            |entry| corpus.contains(entry),
+            documents == Documents::Subjects,
+            language,
+            budget,
+        )
     }
 
     /// Extends the index of `documents` (the vectors, for vector literals) over the

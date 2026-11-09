@@ -2016,8 +2016,27 @@ impl Snapshot {
         budget: &'b nrese_exec::Budget,
     ) -> Result<VectorHits<'b>, SearchRefused> {
         if self.is_private() {
-            // The reader path charges an `Arc`'d budget: one of what `budget` has left, that
-            // room held on `budget` until the search is done, then the hits charged there.
+            // A snapshot reading within this very budget (a query's envelope): the reader
+            // path charges it through its own `Arc`, as its reads do (sol-loop r1 B3: a
+            // bridge holding the budget's room would refuse those reads).
+            let reading = self.reads.as_ref().and_then(|reads| reads.0.as_ref());
+            if let Some(reads) = reading.filter(|reads| std::ptr::eq(&*reads.budget, budget)) {
+                let (hits, report) = self.vector_search_in(
+                    ReadModel::Materialised,
+                    &TextScope::EVERY,
+                    query,
+                    accept,
+                    &reads.budget,
+                )?;
+                // Handed over on `budget`: charged there before they are copied.
+                let found =
+                    nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+                drop(hits);
+                return Ok((found?, report));
+            }
+            // Otherwise an `Arc`'d budget of what `budget` has left, that room held on
+            // `budget` until the search is done, then the hits charged there. The snapshot's
+            // reads, where it has any, charge their own budget, not this one.
             let (inner, held) = match budget.is_bounded() {
                 true => {
                     let room = budget.remaining();
@@ -2035,10 +2054,12 @@ impl Snapshot {
                 accept,
                 &inner,
             )?;
-            let found: Vec<(TermId, f32)> = hits.iter().copied().collect();
-            drop((hits, held));
-            let found = nrese_exec::ChargedVec::collect(budget, found.len(), found)?;
-            return Ok((found, report));
+            // The held room first, then the hits charged on `budget` before they are copied
+            // (the inner ones are the inner budget's until they drop).
+            drop(held);
+            let found = nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+            drop(hits);
+            return Ok((found?, report));
         }
         let (hits, report) =
             self.underlying()
