@@ -143,6 +143,28 @@ fn a_cached_term_never_crowds_out_the_answer() {
     assert_eq!(rows.map(Result::unwrap).count(), 1);
 }
 
+// Spec (D16-039, sol-loop r2 S2): a term kept early gives way once the answer needs its room.
+// DESCRIBE of three statements with distinct 1 MiB literals under a 3.5 MiB envelope holds
+// the three in its output, which fits; the first literal, kept for reuse while there was
+// room, must not stay kept once the output needs that room.
+#[test]
+fn a_term_kept_early_gives_way_to_the_answer() {
+    let engine = distinct(3, 1 << 20);
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new().parse_query("DESCRIBE <urn:a>").unwrap();
+    let options = QueryOptions {
+        resources: Resources {
+            memory: Envelope::new(Some(7 << 19), None),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let QueryResults::Graph(rows) = evaluate_query(&snapshot, &query, &options).unwrap() else {
+        panic!("DESCRIBE returns a graph")
+    };
+    assert_eq!(rows.map(Result::unwrap).count(), 3);
+}
+
 // Guard (D16-039): a decode cache is never needed for an answer. A filter over 16,384
 // distinct 1 KiB literals (16 MiB of text, decoded to be tested) under a 4 MiB envelope, far
 // more than its rows of ids need, still answers, every row.
