@@ -31,6 +31,8 @@ mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(test)]
+mod own_state_tests;
 mod private;
 mod replication;
 #[cfg(test)]
@@ -62,8 +64,8 @@ pub use equality::Classes as EqualityClasses;
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
-    SharedState, Snapshot, SnapshotIdentity, TextScope,
+    Admission, Count, HeavyGroups, InferredMask, InferredSubset, OwnState, ProbeCursor,
+    SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -246,6 +248,9 @@ pub(crate) struct Version {
     pub(crate) asserted_content: AssertedIdentity,
     /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
     pub(crate) canonical: equality::CanonicalCache,
+    /// What readers of its unpublished snapshots keep ([`OwnState`]): empty at every
+    /// construction, never copied.
+    pub(crate) own: snapshot::OwnSlots,
 }
 
 /// The identity of a snapshot's asserted statements ([`Snapshot::asserted_identity`]
@@ -304,6 +309,7 @@ impl Version {
             content: Content::fresh(),
             asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -334,6 +340,7 @@ impl Version {
             content: self.content,
             asserted_content: self.asserted_content,
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -350,6 +357,7 @@ impl Version {
             asserted_content: self.asserted_content,
             // A canonical view of the old runs would hold them: made afresh.
             canonical: Default::default(),
+            own: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -390,8 +398,10 @@ impl Versions {
     /// Replaces the current version with a prebuilt one. The caller must hold the writer slot,
     /// so that no statement changed since `version` was built from the latest content (a merge
     /// or a mapped checkpoint published meanwhile changed runs only, and is replaced), and the
-    /// compaction slot, so that none is published while it is replaced.
-    fn install(&self, version: Arc<Version>) {
+    /// compaction slot, so that none is published while it is replaced. A value, never an
+    /// `Arc`: no snapshot can have held it, so its own slots ([`OwnState`]) are empty.
+    fn install(&self, version: Version) {
+        let version = Arc::new(version);
         *self.current.write() = version;
     }
 
@@ -638,6 +648,7 @@ impl Shared {
                     // A checkpoint mapped: the same statements.
                     asserted_content: current.asserted_content,
                     canonical: Default::default(),
+                    own: Default::default(),
                 }
             });
         }
