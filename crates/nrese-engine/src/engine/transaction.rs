@@ -104,6 +104,28 @@ impl<'e> Transaction<'e> {
         self.pending.base()
     }
 
+    /// [`Self::pending_snapshot`], what it makes charged to `budget` and held by the snapshot
+    /// (DUR-6). Not yet charged: the tests come first.
+    pub fn pending_snapshot_within(
+        &self,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> EngineResult<Snapshot> {
+        let _ = budget;
+        Ok(self.pending_snapshot())
+    }
+
+    /// [`Self::pending_over`], what it makes charged to `budget` and held by the snapshot
+    /// (DUR-6). Not yet charged: the tests come first.
+    pub fn pending_over_within(
+        &self,
+        view: &Snapshot,
+        hidden: &[EncodedQuad],
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> EngineResult<Snapshot> {
+        let _ = budget;
+        Ok(self.pending_over(view, hidden))
+    }
+
     /// The state the transaction would commit, as a snapshot: the base with the pending
     /// changes of each stack as one more run, as a commit publishes them, but not
     /// published. It sees the terms the transaction interned. Costs O(d log d) for d
