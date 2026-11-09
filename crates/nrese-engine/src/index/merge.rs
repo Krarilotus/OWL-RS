@@ -39,6 +39,15 @@ pub(crate) fn scan_bytes(runs: usize) -> usize {
 /// A range at least this long left in the current block is decoded block-wise.
 const BUFFER_FROM: usize = 16;
 
+/// `n` units of a merge's work, counted where they are done in a build with the work
+/// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
+#[inline(always)]
+fn worked(n: usize) {
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    crate::witness::add(crate::witness::Site::MergeWork, n as u64);
+    let _ = n;
+}
+
 impl Cursor<'_> {
     #[inline]
     fn key(&self) -> &Key {
@@ -48,6 +57,7 @@ impl Cursor<'_> {
     /// Moves to the next entry; false at the end.
     #[inline]
     fn advance(&mut self) -> bool {
+        worked(1);
         self.pos += 1;
         if self.pos == self.end {
             return false;
@@ -59,6 +69,7 @@ impl Cursor<'_> {
         }
         let block_end = self.end.min((self.pos / BLOCK + 1) * BLOCK);
         if block_end - self.pos >= BUFFER_FROM {
+            worked(block_end - self.pos);
             self.buffer.clear();
             self.run
                 .keys
@@ -113,6 +124,7 @@ impl<'a> SignedMerge<'a> {
                 .into_iter()
                 .filter(|&(_, start, end)| start < end)
                 .map(|(run, pos, end)| {
+                    worked(1);
                     left += end - pos;
                     Cursor {
                         run,
@@ -154,9 +166,11 @@ impl Iterator for SignedMerge<'_> {
             return Some(item);
         }
         let key = *self.cursors.iter().map(Cursor::key).min()?;
+        worked(self.cursors.len());
         let mut sign = 0;
         let mut i = 0;
         while i < self.cursors.len() {
+            worked(1);
             let cursor = &mut self.cursors[i];
             if *cursor.key() == key {
                 sign += cursor.sign();

@@ -77,6 +77,15 @@ fn current_encoding() -> IndexEncoding {
 /// Keys per block.
 pub(crate) const BLOCK: usize = 128;
 
+/// A search's key comparison, `outcome`, counted where it is made in a build with the work
+/// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
+#[inline(always)]
+fn compared(outcome: bool) -> bool {
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    crate::witness::add(crate::witness::Site::SearchWork, 1);
+    outcome
+}
+
 const TAG_SHIFT: u32 = 60;
 const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 
@@ -1002,12 +1011,13 @@ impl PackedKeys {
         let block = from / BLOCK;
         // Blocks after `block` whose first key is below `key`: gallop to a failing one.
         let (mut below, mut step) = (block, 1);
-        while below + step < blocks && self.firsts[below + step] < *key {
+        while below + step < blocks && compared(self.firsts[below + step] < *key) {
             below += step;
             step *= 2;
         }
         let until = (below + step).min(blocks);
-        let failing = below + 1 + self.firsts[below + 1..until].partition_point(|k| k < key);
+        let failing =
+            below + 1 + self.firsts[below + 1..until].partition_point(|k| compared(k < key));
         let start = if failing - 1 == block {
             from
         } else {
@@ -1026,12 +1036,12 @@ impl PackedKeys {
         let blocks = self.firsts.len();
         let (mut from, mut step) = (start / BLOCK + 1, 1);
         // Blocks before `from` start at or below `high` (or hold `start`).
-        while from + step - 1 < blocks && self.firsts[from + step - 1] <= *high {
+        while from + step - 1 < blocks && compared(self.firsts[from + step - 1] <= *high) {
             from += step;
             step *= 2;
         }
         let until = (from + step - 1).min(blocks);
-        let failing = from + self.firsts[from..until].partition_point(|k| k <= high);
+        let failing = from + self.firsts[from..until].partition_point(|k| compared(k <= high));
         self.bound_in(start, (failing * BLOCK).min(self.len), high, true)
     }
 
@@ -1043,7 +1053,7 @@ impl PackedKeys {
         if start >= end {
             return start;
         }
-        let below = |k: &Key| if inclusive { k <= key } else { k < key };
+        let below = |k: &Key| compared(if inclusive { k <= key } else { k < key });
         let (first_block, last_block) = (start / BLOCK, (end - 1) / BLOCK);
         let failing =
             first_block + 1 + self.firsts[first_block + 1..=last_block].partition_point(below);
@@ -1053,6 +1063,7 @@ impl PackedKeys {
         let base = block * BLOCK;
         let (mut low, mut high) = (start.max(base), end.min(failing * BLOCK));
         while low < high {
+            compared(true);
             let mid = low + (high - low) / 2;
             let mut ordering = std::cmp::Ordering::Equal;
             for (c, &wanted) in key.iter().enumerate() {
