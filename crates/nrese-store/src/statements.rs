@@ -284,7 +284,7 @@ impl StatementOp {
     /// charges ([`crate::sessions`]).
     pub fn heap_bytes(&self) -> usize {
         match self {
-            // The body it holds is shared with the request's (`bytes::Bytes`): its length.
+            // The body's length: a holder keeps it as its own allocation ([`Self::kept`]).
             Self::Add { data, contexts }
             | Self::RemoveData { data, contexts }
             | Self::RemovePatterns { data, contexts, .. } => {
@@ -300,6 +300,18 @@ impl StatementOp {
             }
             Self::Update(update) => update.heap_bytes(),
         }
+    }
+
+    /// Itself as a holder keeps it, once charged: its body in an allocation exactly its
+    /// length, not the request's receive buffer that the body may be a slice of.
+    fn kept(mut self) -> Self {
+        if let Self::Add { data, .. }
+        | Self::RemoveData { data, .. }
+        | Self::RemovePatterns { data, .. } = &mut self
+        {
+            data.payload = bytes::Bytes::copy_from_slice(&data.payload);
+        }
+        self
     }
 }
 
@@ -372,7 +384,7 @@ impl StatementOps {
                 nested.release(bytes);
                 return Err((refused, more));
             }
-            push_reserved(ops, more);
+            push_reserved(ops, more.into_iter().map(StatementOp::kept));
             return Ok(());
         }
         let old: &[StatementOp] = self;
@@ -387,7 +399,7 @@ impl StatementOps {
             Err(refused) => return Err((refused, more)),
         };
         push_reserved(&mut ops, old.iter().cloned());
-        push_reserved(&mut ops, more);
+        push_reserved(&mut ops, more.into_iter().map(StatementOp::kept));
         self.0 = Arc::new(Held::Kept { ops, nested });
         Ok(())
     }

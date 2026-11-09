@@ -286,10 +286,6 @@ impl StagedQuads {
         contexts: &[GraphName],
         check: &mut dyn FnMut(GraphNameRef<'_>) -> StoreResult<()>,
     ) -> StoreResult<bool> {
-        let contexts: Vec<GraphNameRef<'_>> = contexts
-            .iter()
-            .map(|graph| stored_graph_ref(graph.as_ref()))
-            .collect();
         if contexts.is_empty() {
             let mut last = None;
             for &[.., graph] in self.statements.iter() {
@@ -299,15 +295,18 @@ impl StagedQuads {
                 }
             }
         } else {
-            contexts.iter().try_for_each(|&graph| check(graph))?;
+            contexts
+                .iter()
+                .try_for_each(|graph| check(stored_graph_ref(graph.as_ref())))?;
         }
         if tx.charges_pending() {
             // Statements are charged 16 bytes each and contexts are a request's own list: a
             // product past the address space can't be staged.
             tx.try_reserve_inserts(self.statements.len().saturating_mul(contexts.len().max(1)))?;
         }
+        // Each staged term's id, then each context's.
         let mut ids: ChargedVec<TermId> = ChargedVec::new(Arc::clone(&self.budget));
-        ids.reserve_exact(self.terms.len())?;
+        ids.reserve_exact(self.terms.len() + contexts.len())?;
         for (id, term) in self.terms.iter().enumerate() {
             ids.push(match term {
                 // Never a term of its own (`TermId::DEFAULT_GRAPH` stands in, unread).
@@ -315,14 +314,14 @@ impl StagedQuads {
                 _ => tx.intern(self.term_ref(id as u32)),
             })?;
         }
-        let graphs: Vec<TermId> = contexts
-            .iter()
-            .map(|&graph| match graph {
+        for graph in contexts {
+            ids.push(match stored_graph_ref(graph.as_ref()) {
                 GraphNameRef::DefaultGraph => TermId::DEFAULT_GRAPH,
                 GraphNameRef::NamedNode(node) => tx.intern(node.into()),
                 GraphNameRef::BlankNode(node) => tx.intern(node.into()),
-            })
-            .collect();
+            })?;
+        }
+        let (ids, graphs) = ids.split_at(self.terms.len());
         for &[subject, predicate, object, graph] in self.statements.iter() {
             let id = |local: u32| ids[local as usize];
             let quad = |graph| EncodedQuad::new(id(subject), id(predicate), id(object), graph);
@@ -333,7 +332,7 @@ impl StagedQuads {
                     _ => id(graph),
                 }))?;
             } else {
-                for &graph in &graphs {
+                for &graph in graphs {
                     tx.try_insert_encoded(quad(graph))?;
                 }
             }
