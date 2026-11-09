@@ -149,14 +149,14 @@ fn apply_operation(
             for quad in data {
                 let quad = fresh_quad(quad, &mut fresh);
                 options.check_writable(&quad.graph_name)?;
-                tx.insert(quad.as_ref());
+                tx.try_insert(quad.as_ref()).map_err(pending_error)?;
             }
         }
         GraphUpdateOperation::DeleteData { data } => {
             for quad in data {
                 let quad = ground_quad(quad);
                 options.check_writable(&quad.graph_name)?;
-                tx.remove(quad.as_ref());
+                tx.try_remove(quad.as_ref()).map_err(pending_error)?;
             }
         }
         GraphUpdateOperation::DeleteInsert {
@@ -189,7 +189,8 @@ fn apply_operation(
                 search_scope: options.search_scope,
                 ..crate::query::QueryOptions::default()
             };
-            let (deletes, inserts) = crate::native::delete_insert(
+            // Charged while they live, dropped once applied (D16-039).
+            let changes = crate::native::delete_insert(
                 state,
                 pattern,
                 delete,
@@ -198,16 +199,16 @@ fn apply_operation(
                 update.base_iri.as_ref(),
                 &query_options,
             )?;
-            for quad in deletes.iter().chain(&inserts) {
+            for quad in changes.deletes.iter().chain(changes.inserts.iter()) {
                 options.check_writable(&quad.graph_name)?;
             }
             // Every deletion before any insertion (SPARQL 1.1 Update 3.1.3): a quad one
             // solution deletes and another inserts is present afterwards.
-            for quad in &deletes {
-                tx.remove(quad.as_ref());
+            for quad in changes.deletes.iter() {
+                tx.try_remove(quad.as_ref()).map_err(pending_error)?;
             }
-            for quad in &inserts {
-                tx.insert(quad.as_ref());
+            for quad in changes.inserts.iter() {
+                tx.try_insert(quad.as_ref()).map_err(pending_error)?;
             }
         }
         GraphUpdateOperation::Load { silent, source, .. } => {
@@ -296,13 +297,7 @@ fn add(
     let to = graph_name(to);
     options.check_writable(&to)?;
     if tx.charges_pending() {
-        tx.try_reserve_inserts(quads.len())
-            .map_err(|error| match error {
-                nrese_engine::EngineError::MemoryLimit(error) => memory(error),
-                error => {
-                    UpdateError::Evaluation(QueryEvaluationError::Unexpected(error.to_string()))
-                }
-            })?;
+        tx.try_reserve_inserts(quads.len()).map_err(pending_error)?;
     }
     let target = match &to {
         OxGraphName::DefaultGraph => TermId::DEFAULT_GRAPH,
@@ -333,11 +328,14 @@ fn clear(
     target: &GraphTarget,
     options: &UpdateOptions,
 ) -> Result<(), UpdateError> {
+    // The retractions are charged as they grow (D16-039).
     let remove = |tx: &mut Transaction<'_>, graph| {
         tx.remove_matching(&QuadPattern {
             graph,
             ..QuadPattern::all()
-        });
+        })
+        .map(drop)
+        .map_err(pending_error)
     };
     let restricted = options.access.is_some() || options.writable.is_some();
     let graphs: Vec<TermId> = match target {
@@ -346,14 +344,8 @@ fn clear(
             None => return Ok(()),
         },
         GraphTarget::DefaultGraph => vec![TermId::DEFAULT_GRAPH],
-        GraphTarget::NamedGraphs if !restricted => {
-            remove(tx, GraphSelector::AnyNamed);
-            return Ok(());
-        }
-        GraphTarget::AllGraphs if !restricted => {
-            remove(tx, GraphSelector::Any);
-            return Ok(());
-        }
+        GraphTarget::NamedGraphs if !restricted => return remove(tx, GraphSelector::AnyNamed),
+        GraphTarget::AllGraphs if !restricted => return remove(tx, GraphSelector::Any),
         GraphTarget::NamedGraphs => tx.named_graphs(),
         GraphTarget::AllGraphs => {
             let mut graphs = tx.named_graphs();
@@ -389,9 +381,20 @@ fn clear(
         options.check_writable(&graph)?;
     }
     for id in graphs {
-        remove(tx, GraphSelector::Exact(id));
+        remove(tx, GraphSelector::Exact(id))?;
     }
     Ok(())
+}
+
+/// A refused change to the pending changes as the update's error: the typed memory error where
+/// their growth is past the request's envelope, anything else unexpected.
+fn pending_error(error: nrese_engine::EngineError) -> UpdateError {
+    match error {
+        nrese_engine::EngineError::MemoryLimit(error) => {
+            UpdateError::Evaluation(QueryEvaluationError::MemoryLimit(error))
+        }
+        error => UpdateError::Evaluation(QueryEvaluationError::Unexpected(error.to_string())),
+    }
 }
 
 /// The store graph an operation's graph name names ([`crate::compat::graph_named`]).

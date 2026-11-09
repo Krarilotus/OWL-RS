@@ -433,8 +433,43 @@ pub(crate) fn write_results(
     )
 }
 
-/// The quads an update removes and adds, in that order.
-pub(crate) type QuadChanges = (Vec<nrese_rdf::Quad>, Vec<nrese_rdf::Quad>);
+/// The quads an update removes and adds, in that order, decoded, and charged to the request's
+/// envelope while they live (D16-039): their room ([`ChargedVec`]) before it grows, and their
+/// terms' text ([`Grant`], [`nrese_rdf::Term::heap_bytes`]) before each quad is kept, as
+/// CONSTRUCT and DESCRIBE charge theirs. Dropped, the quads are freed and then their charge.
+pub(crate) struct QuadChanges {
+    pub(crate) deletes: ChargedVec<nrese_rdf::Quad>,
+    pub(crate) inserts: ChargedVec<nrese_rdf::Quad>,
+    /// After the quads: fields drop in order, the terms freed before their charge goes.
+    terms: Grant,
+}
+
+impl QuadChanges {
+    /// No changes yet, charged to `budget`. One thread fills them, with no sibling grant: the
+    /// whole spare.
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            deletes: ChargedVec::new(Arc::clone(budget)),
+            inserts: ChargedVec::new(Arc::clone(budget)),
+            terms: Grant::with_workers(Arc::clone(budget), 1),
+        }
+    }
+
+    /// Keeps `quad` among the deletes, or the inserts, its terms charged first.
+    fn keep(&mut self, quad: nrese_rdf::Quad, delete: bool) -> Result<(), BudgetExceeded> {
+        self.terms.take(
+            quad.subject.heap_bytes()
+                + quad.predicate.heap_bytes()
+                + quad.object.heap_bytes()
+                + quad.graph_name.heap_bytes(),
+        )?;
+        if delete {
+            self.deletes.push(quad)
+        } else {
+            self.inserts.push(quad)
+        }
+    }
+}
 
 /// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated on
 /// `snapshot`. `using`
@@ -466,10 +501,14 @@ pub(crate) fn delete_insert(
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
     let solutions = ctx.eval(&pattern)?;
-    let computed = ctx.computed.into_inner();
+    let mut changes = QuadChanges::new(&ctx.budget);
+    let memory = QueryEvaluationError::MemoryLimit;
+    let computed = std::mem::take(&mut *ctx.computed.borrow_mut());
     let table = &solutions.table;
-    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     for row in 0..table.len() {
+        if row % 256 == 0 {
+            ctx.check()?;
+        }
         let value = |v: &Variable| -> Option<Term> {
             decode(snapshot, &computed, table.get(row, solutions.column(v)?))
         };
@@ -506,7 +545,9 @@ pub(crate) fn delete_insert(
                     graph(&quad.graph_name)?,
                 ))
             })();
-            deletes.extend(filled);
+            if let Some(quad) = filled {
+                changes.keep(quad, true).map_err(memory)?;
+            }
         }
         let mut fresh: HashMap<String, nrese_rdf::BlankNode> = HashMap::new();
         let mut term = |t: &TermPattern| fill_template(t, &value, &mut fresh);
@@ -520,10 +561,13 @@ pub(crate) fn delete_insert(
             let (Some(p), Some(g)) = (predicate(&quad.predicate), graph(&quad.graph_name)) else {
                 continue;
             };
-            inserts.push(nrese_rdf::Quad::new(s, p, o, g));
+            changes
+                .keep(nrese_rdf::Quad::new(s, p, o, g), false)
+                .map_err(memory)?;
         }
     }
-    Ok((deletes, inserts))
+    ctx.check()?;
+    Ok(changes)
 }
 
 /// What a query returns.
