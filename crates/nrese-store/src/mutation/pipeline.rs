@@ -200,6 +200,8 @@ impl MutationPipeline {
                 Err(error) => return Err(store_error(error)),
             }
         }
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_PREFLIGHT);
         let mut tx = self.store.engine().transaction();
         if let Some(note) = note {
             tx.note_commit(note);
