@@ -100,8 +100,16 @@ async fn run() -> Result<()> {
         );
     }
     if cli.command == CliCommand::CheckConfig {
-        // Loading validated everything; show what takes effect.
+        // Loading validated everything; show what takes effect. `reasoner.mode` is the
+        // server's, for the repositories that name none; the default repository's own, if its
+        // stored settings choose one, is its line.
         print!("{}", config.summary());
+        if default.reasoning.is_some() {
+            println!(
+                "default repository reasoning: {} (its stored settings)",
+                default_reasoner.mode().as_str()
+            );
+        }
         println!("cpu: {}", nrese_store::cpu::summary());
         println!("configuration is valid");
         return Ok(());
@@ -243,6 +251,7 @@ async fn run() -> Result<()> {
         deployment_posture = config.deployment_posture.as_str(),
         data_dir = %store.config().data_dir.display(),
         reasoning_mode = ?reasoner.config().mode(),
+        default_reasoning_mode = ?default_reasoner.mode(),
         reasoner_profile = reasoner.profile_name(),
         reasoner_capabilities = reasoner.capabilities().len(),
         ontology_path = ontology_path.as_ref().map(|path| path.display().to_string()),
