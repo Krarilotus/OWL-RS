@@ -500,6 +500,208 @@ fn crash_between_checkpoint_and_wal_release_skips_covered_records() {
     assert_eq!(contents(&engine), states[9]);
 }
 
+/// Damage in a segment the checkpoint wholly covers, one a failed release left behind,
+/// neither refuses the open nor costs a record after it (F7): its records are all in the
+/// checkpoint. Here records 1 to 10 are in a leftover segment, the checkpoint is at 10, and
+/// records 11 and 12 are in the next segment; the leftover's middle is garbled. Before the fix
+/// the open refused it as damage outside the last segment, and the repair that refusal named
+/// (`recover_until`) cut away the later segments.
+#[test]
+fn damage_in_a_covered_leftover_segment_costs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved_wal = tempfile::tempdir().unwrap();
+    let states = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let mut states = commit_all(&engine, &batches(0..10));
+        copy_dir(&dir.path().join("wal"), saved_wal.path());
+        engine.checkpoint().unwrap();
+        states.extend(commit_all(&engine, &batches(10..12)));
+        states
+    };
+    // The covered segment back, as if its release had failed, garbled in the middle.
+    for entry in fs::read_dir(saved_wal.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(
+            dir.path().join("wal").join(path.file_name().unwrap()),
+            bytes,
+        )
+        .unwrap();
+    }
+    assert!(segments(dir.path()).len() >= 2);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.stats().revision, 12);
+    assert_eq!(contents(&engine), states[11]);
+}
+
+/// A store closed and reopened while another thread of the process starts a child process
+/// opens again (open row IB1312-8ba4, the store lock's). On Linux the child is forked holding a
+/// copy of every open descriptor, the store's `LOCK` among them, until it execs; here it is held
+/// in that window (a `pre_exec` hook that marks it is there and sleeps 3 s) while the store
+/// is dropped and reopened. A lock held by the descriptor's open file description (`flock`)
+/// is then still held by the child, and the reopen fails with `Locked`. On Windows the same
+/// sequence with a child that just lives a while (handles are not inherited unless marked).
+#[test]
+fn a_reopen_is_not_locked_out_by_a_child_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let marks = tempfile::tempdir().unwrap();
+    let mark = marks.path().join("forked");
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &batches(0..1));
+    let spawner = {
+        let marker = fs::File::create(&mark).unwrap();
+        std::thread::spawn(move || child_in_its_window(marker))
+    };
+    // The child exists, holding what it inherited, before the store is dropped.
+    let started = std::time::Instant::now();
+    while fs::metadata(&mark).unwrap().len() == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the child never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config());
+    let ended = spawner.join().unwrap();
+    assert!(
+        reopened.is_ok(),
+        "reopened while a child process was starting: {:?}",
+        reopened.err()
+    );
+    assert!(ended, "the child ran");
+}
+
+/// Guard (right on the base too): a store an earlier binary has open is refused. An earlier
+/// binary holds `flock` on `LOCK` for as long as it runs; here a second open file description
+/// in this process holds it (`flock` locks of two descriptions conflict, in one process too).
+/// Released, the store opens.
+#[test]
+fn a_store_an_earlier_binary_has_open_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Engine::open(dir.path(), config()).unwrap());
+    let earlier = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("LOCK"))
+        .unwrap();
+    earlier.try_lock().unwrap();
+    let refused = Engine::open(dir.path(), config());
+    assert!(
+        matches!(refused, Err(EngineError::Locked(_))),
+        "opened beside an earlier binary: {:?}",
+        refused.err()
+    );
+    earlier.unlock().unwrap();
+    drop(earlier);
+    Engine::open(dir.path(), config()).unwrap();
+}
+
+/// The variable that makes [`a_second_process_opens`] act: the store it opens.
+const SECOND_OPEN: &str = "NRESE_TEST_SECOND_OPEN";
+
+/// Run in a second process of this test binary ([`second_process_open`]): opens the store
+/// named by [`SECOND_OPEN`] and exits 3 if it is `Locked`, 0 if it opens holding `quad(0)`, 4
+/// otherwise. In a test run (no variable) it does nothing.
+#[test]
+fn a_second_process_opens() {
+    let Ok(dir) = std::env::var(SECOND_OPEN) else {
+        return;
+    };
+    let code = match Engine::open(Path::new(&dir), config()) {
+        Err(EngineError::Locked(_)) => 3,
+        Ok(engine) if contents(&engine).contains(&quad(0)) => 0,
+        other => {
+            eprintln!(
+                "the second open: {:?}",
+                other.map(|engine| contents(&engine))
+            );
+            4
+        }
+    };
+    std::process::exit(code);
+}
+
+/// What a second process of this test binary gets opening the store in `dir`: 3 `Locked`,
+/// 0 opened with `quad(0)` ([`a_second_process_opens`]).
+fn second_process_open(dir: &Path) -> Option<i32> {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durability_tests::a_second_process_opens",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(SECOND_OPEN, dir)
+        .status()
+        .unwrap()
+        .code()
+}
+
+/// A store stays locked against another process whatever else this process does with its
+/// lock file (review r1, R1-F1): here `LOCK` is read, so opened and closed, while the store is
+/// open. Before the fix the store's lock was a record lock, which any close of the file by the
+/// process drops: a second process opened the store too, and both could commit the same
+/// revision, one of them lost at the next reopen. Once the first engine is dropped, the second
+/// process opens and recovers its commit. Windows: a guard (a handle's lock is its own).
+#[test]
+fn a_store_stays_locked_when_its_lock_file_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &[(vec![quad(0)], Vec::new())]);
+    // Opened and closed; read where the platform lets it (Windows refuses a read of the
+    // locked range, which leaves the open and the close).
+    {
+        use std::io::Read as _;
+        let mut lock = fs::File::open(dir.path().join("LOCK")).unwrap();
+        let _ = lock.read_to_end(&mut Vec::new());
+    }
+    assert_eq!(
+        second_process_open(dir.path()),
+        Some(3),
+        "a second process opened the store beside a live engine"
+    );
+    drop(engine);
+    assert_eq!(
+        second_process_open(dir.path()),
+        Some(0),
+        "the released store didn't open in a second process with its commit"
+    );
+}
+
+/// Starts a child that marks `marker` once it exists and holds the process's descriptors
+/// for 3 s before it runs (Linux: in its fork-to-exec window); whether it ran.
+#[cfg(unix)]
+fn child_in_its_window(marker: fs::File) -> bool {
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut command = std::process::Command::new("true");
+    // SAFETY: the hook runs in the forked child before exec and only writes to an already
+    // open file and sleeps (system calls, no allocation and no lock), which is safe there.
+    unsafe {
+        command.pre_exec(move || {
+            (&marker).write_all(b"x")?;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(())
+        });
+    }
+    command.status().is_ok_and(|status| status.success())
+}
+
+/// Windows: a child that lives 3 s, started while the store is open.
+#[cfg(windows)]
+fn child_in_its_window(marker: fs::File) -> bool {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping -n 4 127.0.0.1 > NUL"])
+        .spawn()
+        .unwrap();
+    (&marker).write_all(b"x").unwrap();
+    child.wait().is_ok_and(|status| status.success())
+}
+
 #[test]
 fn terms_from_aborted_transactions_keep_the_dictionary_contiguous() {
     let dir = tempfile::tempdir().unwrap();
@@ -1183,4 +1385,93 @@ fn a_checkpoint_orders_equal_long_texts() {
     };
     assert!(snapshot.text_order_ready());
     assert_eq!(snapshot.matching_strings(&test).len(), 2);
+}
+
+/// A reopen gives a new asserted identity (P2-C1, DUR's condition): it is never persisted,
+/// so a cache keyed by it can't take one process's state for another's.
+#[test]
+fn a_reopen_gives_a_new_asserted_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_all(&engine, &batches(0..2));
+        engine.snapshot().asserted_identity()
+    };
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_ne!(engine.snapshot().asserted_identity(), before);
+}
+
+/// A change a transaction makes, for a table of rows.
+type Change = dyn Fn(&mut nrese_engine::Transaction<'_>);
+
+/// `Transaction::asserted_identity_after` names what the commit publishes (P2-C1, DUR's
+/// conditions of 8 Nov): a new id for a commit that changes asserted statements, the
+/// base's for an inferred-only one, an empty one, and one inserting and then removing the
+/// same statement (no net change); the same on every call; equal to the commit's summary
+/// and to the published snapshot's. In memory and durable.
+#[test]
+fn the_asserted_identity_after_a_transaction_is_what_its_commit_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engines = [
+        ("in memory", Engine::new(config()).unwrap()),
+        ("durable", Engine::open(dir.path(), config()).unwrap()),
+    ];
+    let mut wrong = Vec::new();
+    for (kind, engine) in &engines {
+        let rows: [(&str, &Change, bool); 4] = [
+            (
+                "asserted",
+                &|tx| {
+                    tx.insert(quad(1).as_ref());
+                },
+                true,
+            ),
+            (
+                "inferred only",
+                &|tx| {
+                    let [s, p, o] = ["s", "p", "o"].map(|n| {
+                        tx.intern(
+                            NamedNode::new_unchecked(format!("http://example.com/{n}"))
+                                .as_ref()
+                                .into(),
+                        )
+                    });
+                    tx.insert_inferred(nrese_engine::EncodedTriple::new(s, p, o));
+                },
+                false,
+            ),
+            ("empty", &|_| {}, false),
+            (
+                "inserted, then removed",
+                &|tx| {
+                    tx.insert(quad(2).as_ref());
+                    tx.remove(quad(2).as_ref());
+                },
+                false,
+            ),
+        ];
+        for (name, change, new) in rows {
+            let base = engine.snapshot().asserted_identity();
+            let mut tx = engine.transaction();
+            change(&mut tx);
+            let after = tx.asserted_identity_after();
+            let again = tx.asserted_identity_after();
+            let summary = tx.commit().unwrap();
+            let published = engine.snapshot().asserted_identity();
+            let row = format!("{kind}, {name}");
+            if after != again {
+                wrong.push(format!("{row}: {after:?}, then {again:?}"));
+            }
+            if (after != base) != new {
+                wrong.push(format!("{row}: new {}, expected {new}", after != base));
+            }
+            if summary.asserted != after || published != after {
+                wrong.push(format!(
+                    "{row}: said {after:?}, summary {:?}, published {published:?}",
+                    summary.asserted
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

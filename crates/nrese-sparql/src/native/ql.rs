@@ -20,8 +20,8 @@ use nrese_owl::ObjProp;
 use nrese_owl::ql::{
     Atom, Basic, Branch, Budget, Cq, Limits, Outcome, Part, Probe, QTerm, Tbox, rewrite_with,
 };
-use nrese_rdf::{NamedNode, NamedNodeRef, Term, Variable};
-use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
+use nrese_rdf::{Literal, NamedNode, Term, Variable};
+use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::visit::Node;
 
@@ -136,9 +136,7 @@ pub(crate) fn rewrite_query(
         limits,
         budget: Budget::new(limits.query_work),
         data,
-        rdf_type: snapshot
-            .lookup(NamedNodeRef::new_unchecked(RDF_TYPE).into())
-            .map(TermId::raw),
+        unseen: std::cell::RefCell::new(Vec::new()),
         report: QlReport::default(),
     };
     let needed = match needed {
@@ -156,8 +154,24 @@ struct Rewriter<'a> {
     /// The steps the query's patterns have left together.
     budget: Budget,
     data: Option<&'a DataCheck<'a>>,
-    rdf_type: Option<u64>,
+    /// Constants the query names that the store has no id for (an IRI no statement has):
+    /// still individuals and classes the axioms speak of (`⊤ ⊑ A` makes `:zzz` an `A`).
+    /// The `k`-th has the id `UNSEEN - k`, which no [`TermId`] has (tag 15 is no kind:
+    /// `an_unseen_constants_id_is_no_term_id`).
+    unseen: std::cell::RefCell<Vec<Term>>,
     report: QlReport,
+}
+
+/// The first id of a constant the store hasn't seen ([`Rewriter::unseen`]).
+const UNSEEN: u64 = u64::MAX;
+
+/// The term an id stands for: one of `unseen` ([`Rewriter::unseen`]), or the store's.
+fn decode(unseen: &std::cell::RefCell<Vec<Term>>, snapshot: &Snapshot, id: u64) -> Option<Term> {
+    let unseen = unseen.borrow();
+    match usize::try_from(UNSEEN - id) {
+        Ok(k) if k < unseen.len() => Some(unseen[k].clone()),
+        _ => snapshot.decode(TermId::from_raw(id)),
+    }
 }
 
 impl Rewriter<'_> {
@@ -507,6 +521,16 @@ impl Rewriter<'_> {
             }
             Outcome::Rewritten(r) => r,
         };
+        for &term in &rewriting.unlisted {
+            let name = self.name(term);
+            self.report.completeness.incomplete(
+                "ql",
+                format!(
+                    "answers on {name} are every individual (owl:Thing on the left of an \
+                     axiom): those the data doesn't state may be missing"
+                ),
+            );
+        }
         self.report.patterns += 1;
         self.report.witnesses += rewriting.witnesses;
         self.report.branches += rewriting.branches.len();
@@ -566,10 +590,12 @@ impl Rewriter<'_> {
         if data.options.resources.check().is_err() {
             return false;
         }
+        // The fields, not `self`: the questions below count into `self.report`.
+        let (unseen, snapshot) = (&self.unseen, self.snapshot);
         let term = |t: QTerm| -> Option<TermPattern> {
             Some(match t {
                 QTerm::Var(v) => TermPattern::Variable(Variable::new_unchecked(format!("_qlr{v}"))),
-                QTerm::Const(id) => match self.snapshot.decode(TermId::from_raw(id))? {
+                QTerm::Const(id) => match decode(unseen, snapshot, id)? {
                     Term::NamedNode(n) => TermPattern::NamedNode(n),
                     Term::Literal(l) => TermPattern::Literal(l),
                     Term::BlankNode(b) => TermPattern::BlankNode(b),
@@ -577,7 +603,7 @@ impl Rewriter<'_> {
                 },
             })
         };
-        let property = |p: u64| match self.snapshot.decode(TermId::from_raw(p)) {
+        let property = |p: u64| match decode(unseen, snapshot, p) {
             Some(Term::NamedNode(n)) => Some(n),
             _ => None,
         };
@@ -700,23 +726,45 @@ impl Rewriter<'_> {
         true
     }
 
+    /// The id a constant of the query stands for: the store's, or one of
+    /// [`Self::unseen`].
+    fn constant(&self, term: Term) -> u64 {
+        if let Some(id) = self.snapshot.lookup(term.as_ref()) {
+            return id.raw();
+        }
+        let mut unseen = self.unseen.borrow_mut();
+        let k = match unseen.iter().position(|t| *t == term) {
+            Some(k) => k,
+            None => {
+                unseen.push(term);
+                unseen.len() - 1
+            }
+        };
+        UNSEEN - k as u64
+    }
+
+    /// The term an id stands for: one of [`Self::unseen`], or the store's.
+    fn decode(&self, id: u64) -> Option<Term> {
+        decode(&self.unseen, self.snapshot, id)
+    }
+
     /// A term as a reason names it.
     fn name(&self, t: u64) -> String {
-        match self.snapshot.decode(TermId::from_raw(t)) {
+        match self.decode(t) {
             Some(term) => term.to_string(),
             None => format!("term {t}"),
         }
     }
 
     /// Notes that patterns under `node` (`place` says where) run without the rewriting,
-    /// if they read a term it would change, or a variable predicate or class.
+    /// if they read a term it would change or whose answers through anonymous individuals
+    /// may be missing (a concern, as a read atom's), or a variable predicate or class.
     fn unread(&mut self, node: Node<'_>, place: &str) {
         let tbox = self.tbox;
         let snapshot = self.snapshot;
         let rewritten = |n: &NamedNode| {
-            snapshot
-                .lookup(n.as_ref().into())
-                .is_some_and(|id| tbox.rewrites_term(id.raw()))
+            let id = snapshot.lookup(n.as_ref().into()).map(TermId::raw);
+            id.is_some_and(|t| tbox.rewrites_term(t) || tbox.concern(t).is_some())
         };
         let mut hit: Option<String> = None;
         let mut look = |n: Node<'_>| {
@@ -766,7 +814,8 @@ impl Rewriter<'_> {
             self.report.completeness.incomplete(
                 "ql",
                 format!(
-                    "a pattern inside {place} runs without the rewriting, which changes {what}"
+                    "a pattern inside {place} runs without the rewriting; answers on {what} \
+                     may be missing"
                 ),
             );
         }
@@ -791,19 +840,21 @@ impl Rewriter<'_> {
                     TermPattern::Variable(_) | TermPattern::BlankNode(_) => {
                         Some(QTerm::Var(var(t, terms)))
                     }
-                    TermPattern::NamedNode(n) => self
-                        .snapshot
-                        .lookup(n.as_ref().into())
-                        .map(|id| QTerm::Const(id.raw())),
-                    TermPattern::Literal(l) => self
-                        .snapshot
-                        .lookup(l.as_ref().into())
-                        .map(|id| QTerm::Const(id.raw())),
+                    TermPattern::NamedNode(n) => {
+                        Some(QTerm::Const(self.constant(Term::NamedNode(n.clone()))))
+                    }
+                    TermPattern::Literal(l) => {
+                        Some(QTerm::Const(self.constant(Term::Literal(l.clone()))))
+                    }
                     TermPattern::Triple(_) => None,
                 }
             };
             let s = term(&triple.subject, &mut terms);
             let o = term(&triple.object, &mut terms);
+            // `rdf:type` by its IRI: a store with no type statement has no id for it, and its
+            // class atoms still read the schema (P2-C1 review r1 F1: `⊤ ⊑ A`, no data).
+            let typed = matches!(&triple.predicate,
+                NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE);
             let predicate = match &triple.predicate {
                 NamedNodePattern::NamedNode(p) => {
                     self.snapshot.lookup(p.as_ref().into()).map(TermId::raw)
@@ -811,10 +862,8 @@ impl Rewriter<'_> {
                 NamedNodePattern::Variable(_) => None,
             };
             let atom = match (s, predicate, o) {
-                (Some(s), Some(p), Some(QTerm::Const(class))) if Some(p) == self.rdf_type => {
-                    Atom::Class(s, class)
-                }
-                (Some(s), Some(p), Some(o)) if Some(p) != self.rdf_type => Atom::Role(s, p, o),
+                (Some(s), _, Some(QTerm::Const(class))) if typed => Atom::Class(s, class),
+                (Some(s), Some(p), Some(o)) if !typed => Atom::Role(s, p, o),
                 _ => {
                     let mut vars = Vec::new();
                     for t in [&triple.subject, &triple.object] {
@@ -872,8 +921,22 @@ impl Rewriter<'_> {
         let merged = |v: u32| branch.merged.iter().find(|(m, _)| *m == v).map(|(_, t)| *t);
         let mut triples = Vec::new();
         let mut unions = Vec::new();
+        // Terms that must be individuals: no literal (`Part::Top`).
+        let mut individuals: Vec<Expression> = Vec::new();
         for part in &branch.parts {
             match part {
+                Part::Top(t) => match self.term(*t, names) {
+                    TermPattern::Variable(v) => {
+                        individuals.push(Expression::Not(Box::new(Expression::FunctionCall(
+                            Function::IsLiteral,
+                            vec![Expression::Variable(v)],
+                        ))))
+                    }
+                    TermPattern::Literal(_) => {
+                        individuals.push(Expression::Literal(Literal::from(false)))
+                    }
+                    _ => {}
+                },
                 Part::Atom(Atom::Other(n, _)) => {
                     // Kept as written, with the variables this branch made one replaced.
                     let replace = |t: &TermPattern| -> TermPattern {
@@ -920,6 +983,12 @@ impl Rewriter<'_> {
                 .chain(unions)
                 .collect(),
         );
+        for expr in individuals {
+            pattern = GraphPattern::Filter {
+                expr,
+                inner: Box::new(pattern),
+            };
+        }
         // The variables the context reads that this branch made one with another term.
         for &(v, to) in &branch.merged {
             if cq.existential[v as usize] {
@@ -948,7 +1017,7 @@ impl Rewriter<'_> {
             },
             Atom::Role(s, p, o) => TriplePattern {
                 subject: self.term(*s, names),
-                predicate: match self.snapshot.decode(TermId::from_raw(*p)) {
+                predicate: match self.decode(*p) {
                     Some(Term::NamedNode(n)) => NamedNodePattern::NamedNode(n),
                     _ => unreachable!("properties are IRIs the store knows"),
                 },
@@ -961,11 +1030,11 @@ impl Rewriter<'_> {
     fn term(&self, t: QTerm, names: &Names<'_>) -> TermPattern {
         match t {
             QTerm::Var(v) => names.term(v),
-            QTerm::Const(id) => match self.snapshot.decode(TermId::from_raw(id)) {
+            QTerm::Const(id) => match self.decode(id) {
                 Some(Term::NamedNode(n)) => TermPattern::NamedNode(n),
                 Some(Term::Literal(l)) => TermPattern::Literal(l),
                 Some(Term::BlankNode(b)) => TermPattern::BlankNode(b),
-                _ => unreachable!("constants are terms the store knows"),
+                _ => unreachable!("constants are the query's terms"),
             },
         }
     }
@@ -1017,8 +1086,8 @@ fn path_names(
     Some(())
 }
 
-/// How the variables of a rewritten pattern are written: the query's own, and new ones
-/// (`_ql<pattern>_<n>`, also for the pattern's blank nodes, which the branches share).
+/// How the variables of a rewritten pattern are written: the query's own, and made ones
+/// (`ql <pattern>.<n>`, also for the pattern's blank nodes, which the branches share).
 struct Names<'a> {
     terms: &'a [TermPattern],
     pattern: usize,
@@ -1028,7 +1097,28 @@ impl Names<'_> {
     fn term(&self, v: u32) -> TermPattern {
         match self.terms.get(v as usize) {
             Some(TermPattern::Variable(variable)) => TermPattern::Variable(variable.clone()),
-            _ => TermPattern::Variable(Variable::new_unchecked(format!("_ql{}_{v}", self.pattern))),
+            _ => TermPattern::Variable(nrese_sparql_syntax::internal::variable(
+                "ql",
+                format_args!("{}.{v}", self.pattern),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UNSEEN;
+    use nrese_engine::{TermId, TermKind};
+
+    /// An unseen constant's id ([`super::Rewriter::unseen`]) is no term's: its tag (15) is
+    /// no [`TermKind`], which reads as the default graph's tag, and it isn't the default
+    /// graph's id. A kind given tag 15 fails this, before ids could be confused.
+    #[test]
+    fn an_unseen_constants_id_is_no_term_id() {
+        for k in [0, 1, 1 << 20] {
+            let id = TermId::from_raw(UNSEEN - k);
+            assert_eq!(id.kind(), TermKind::DefaultGraph, "{k}");
+            assert!(!id.is_default_graph(), "{k}");
         }
     }
 }

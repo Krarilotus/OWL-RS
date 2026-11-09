@@ -143,6 +143,40 @@ api_key = "replace-me"
   - `stated`: the asserted statements only (the topology vocabulary without the rewrite), for data whose relations are curated, or where computing them from geometries is unwanted
 - the filter functions (`geof:sfWithin(?a, ?b)`) compute from geometries in both modes
 
+- file key: `store.search_scope`
+- env override: `NRESE_SEARCH_SCOPE`
+- a repository's `search_scope` in its settings overrides it for that repository
+- values: `global` (the default), `reader`
+- what full-text relevance (`bds:search`, `text:query`, `luc:`), IRI autocompletion and vector selection (`nrv:search`) are computed over:
+  - `global`: search uses the dictionary-wide text and IRI statistics and the existing vector-search strategy (the shared HNSW graph for large spaces). Returned data respects graph access, but relevance scores and approximate selection may depend on data outside the reader's graphs. The fastest.
+  - `reader`: search ranks text and IRIs, and selects vectors, from the reader's snapshot, read model and active dataset only: a graph the reader may not read, an open transaction's terms, a later version or a term no statement uses changes no score, rank or selection. Vectors are compared exactly (recall 1) among the visible ones. Costs: the first search of a scope at a version walks its statements to build its corpus (kept, and after a small commit derived from the kept one by probing what the commit touched); a vector search scans the space's vectors, testing each for visibility. Admission may still depend on the dictionary's span, the index walk's scratch, the touched terms charged before the scope check and the shared corpus cache's retention (approved R2-F2 exception, [http-api.md](http-api.md)): a refusal can reveal hidden volume, a score can't.
+- measured cost of `reader` against `global`, per query once the corpus is kept, median of 6 passes a side; one A-B-B-A round, 3 blocks, on a Ryzen 9 5950X (fleet `abba-syn24-reader-a64451b3`):
+  - full-text search over 1,000,000 short documents (`text-search`) shows no loss on four of its five series: 69.2 against 70.0 ms for a common word, 4.89 against 4.95 ms, 0.375 against 0.375 ms, and 99.7 against 100.4 ms for a prefix. The rarest word (8 against 8 µs) is unresolved at one round.
+  - k-NN (k = 10) with a one-in-ten filter over 200,000 64-dimensional vectors (`vector-knn-filtered`) takes 3.7–4.0 ms against 2.4–2.6 ms, about 1.5×. `reader` compares every visible vector exactly; `global` searches the shared HNSW graph, which is approximate.
+  - memory: no change shown in either case.
+- graph access, EXPLAIN and refusal sanitising are the same in both modes
+
+- file key: `store.reader_corpus_bytes`
+- env override: `NRESE_READER_CORPUS_BYTES`
+- a repository's `reader_corpus_bytes` in its settings overrides it for that repository
+- default: 256 MiB; a size such as `1GiB`
+- what the corpora a `reader` search scope keeps (one per scope and version, with the lineage that derives the next version's from it) may take, within the memory the queries draw on. Past it the least recently used go first; a corpus that still doesn't fit is built for its search alone, on that request's memory. This is the only bound on how many corpora and lineage steps are kept
+- why 256 MiB: a corpus of 1,000,000 documents takes 250,336 bytes, so about a thousand of that size fit (measured, fleet `syn24-lineage-probe-8faeb458`)
+- unused under `global`: nothing is allocated until a `reader` search runs
+
+- file key: `store.reader_walk_slice`
+- env override: `NRESE_READER_WALK_SLICE`
+- default: 1024; at least 1
+- words of bits (64 terms each) one slice of a corpus walk covers at most; a slice also holds a group count of 16 bytes a term, so the default slice holds at most 1 MiB of counts. Smaller slices hold less scratch per thread, larger ones split the walk less
+- why 1,024: a walk of 1,000,000 documents in slices of 256, 1,024 and 4,096 words does 111.7, 110.4 and 111.9 million instructions (fleet `syn24-work-probe-2-06961a4e`) and takes 20.8, 9.1 and 9.4 ms on 12 threads (fleet `syn24-tuning-probe-f4b4dd86`); 1,024 holds no more scratch than 4,096
+
+- file key: `store.reader_documents_per_probe`
+- env override: `NRESE_READER_DOCUMENTS_PER_PROBE`
+- default: 10; at least 1
+- after commits, a `reader` search derives its corpus from a kept ancestor's by probing the terms the commits touched, while there are at most the corpus's documents divided by this; past that it walks the scope's statements again. Larger values walk sooner, smaller ones probe longer
+- why 10: measured in work (single-threaded instructions), so it holds whatever the core count. At 1,000,000 documents a probe does about 1,100 instructions and a walk about 110 million: they cost the same at about 100,000 touched terms, which is 10 documents per probe. A walk has no fixed cost in work (1,000 documents: 157,000–203,000 instructions), so small corpora get no floor (fleet `syn24-work-probe-2-06961a4e`)
+- the trade-off: a walk runs on every core, a derivation on one. On 12 threads the walk's wall time matches 90–190 documents per probe (fleet `syn24-tuning-probe-f4b4dd86`), so just below the crossover a derivation can take up to about 10× the parallel walk's wall time. Under concurrent readers and shared hosts, throughput and the other tenants pay for work, which is why the default counts work. A latency-first deployment with one tenant can raise it toward the wall-time crossover
+
 - file key: `shacl.shapes_graph`
 - env override: `NRESE_SHACL_SHAPES_GRAPH`
 - default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)
@@ -280,6 +314,9 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 - file key `replication.token`, env `NRESE_REPLICATION_TOKEN`: the bearer token a replica presents to its primary (an administrator's); a secret, never printed
 - file key `replication.poll`, env `NRESE_REPLICATION_POLL_MS`: how long a replica waits before asking again once caught up (default `500ms`)
 - file key `replication.batch_bytes`, env `NRESE_REPLICATION_BATCH_BYTES`: about how much log a replica asks for at once (default `8MiB`)
+- file key `replication.round_timeout`, env `NRESE_REPLICATION_ROUND_TIMEOUT_MS`: the longest one round of following the primary's log may take, its answer whole (default `5min`; `0` or `unlimited`: no total limit)
+- file key `replication.image_timeout`, env `NRESE_REPLICATION_IMAGE_TIMEOUT_MS`: the longest a replica waits for its primary to prepare an image (the primary writes and checks it before its answer begins; default `1h`; `0` or `unlimited`: no limit)
+- fixed limits on every exchange with the primary: a log answer must begin within 30 s, and every answer's body may pause at most 30 s between pieces (an image streams as long as it keeps coming, however large); a round past a limit is an error, retried with a growing pause and shown in the status
 
 ## Federation (`SERVICE`)
 
@@ -293,11 +330,13 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 
 Every limit on memory, time and request size is in one table, `[budgets]`. Values are plain numbers (bytes, milliseconds) or numbers with a unit: `"4GiB"`, `"512MiB"`, `"2GB"`, `"30s"`, `"2min"`, and for memory a share of the machine, `"50%"`. `nrese-server check-config` prints the values in effect, and `/version` reports them under `budgets`.
 
+Memory shares range from `0%` to `100%` and use the process's capacity (including container limits), read once when configuration loads. `budgets.query_memory = "50%"` gives each query half of that capacity; `0%` has the same meaning as `0`.
+
 | Key | Environment | Default | What it bounds |
 |---|---|---|---|
 | `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | One query's memory envelope: its intermediate and retained results and, under `owl2-dl`, its DL work (the exact services' compilation scratch and engines). A query whose evaluation needs more is answered `413`; DL candidates past it are left unresolved, the status says so (`422` under `dl.answers = exact`). `0` = unlimited |
 | `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Every running request's envelope across the catalog: queries, updates (their WHERE evaluation and `owl2-dl` commit gate), DL entailment checks and explanations. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
-| `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. A size (`48 GiB`) or a share (`60%`); `0` = unlimited |
+| `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. A size (`48 GiB`) or a share (`60%`); `0` = unlimited. The default is refused at startup where the memory the process may use can't be read, Linux before 3.15 among them (its kernel doesn't show which mount a file was opened on): set this there. On cgroup v2 a limit set above the container's cgroup namespace (Docker's `--cgroup-parent`, a Kubernetes pod without a limit of its own under a node's cap) isn't visible to it: set this there. Likewise on Windows only the job object the server runs in directly is visible, not an enclosing one: when a launcher or service wrapper caps a parent job, set this there |
 | `budgets.huge_pages` | `NRESE_HUGE_PAGES` | `on` | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. See [server-setup.md](server-setup.md) §12.1 |
 | `budgets.reasoning_release` | `NRESE_REASONING_RELEASE` | `off` | Whether a materialisation gives back between its rounds, after the last one and before the inferred stack what the last round freed. `on`: a lower and steadier peak, as the allocator keeps a freed large block about a round's time (office PC, LUBM 100: 2,074 → 1,776 MiB, 5.6 % more reasoning time; OWL2Bench RL-1: −25 % for 6.6 %; a small RDFS materialisation: −28 % for 14 %). `off`: the fastest materialisation. For a memory budget near its limit, or for peaks that must compare between runs |
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
@@ -354,6 +393,8 @@ schema reading, normalisation and compilation are not all internally interruptib
 Two rule-reasoning steps also don't poll the deadline:
 - the one-off full materialisation that runs when no current reasoning state is recorded;
 - closing a newly declared transitive property.
+
+A fixed limit comes before every authenticated request: a body of known length up to 64 KiB is read whole before the answer (clients that send the headers and the body apart need that), and that read waits at most 10 s. A body still missing then gets 401 if authentication refused the request's credentials, else 408.
 
 ## SPARQL Parse Error Profile
 
@@ -417,7 +458,7 @@ The rules are the server's access state (users, workspaces, personal spaces, rol
 - `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form.
 - `auth.local_logins` -> `NRESE_AUTH_LOCAL_LOGINS` (default `true`): whether users of the access state with a password log in (`Basic` credentials, or a session from `POST /api/v1/access/login`) besides the authentication mode; for standalone and desktop installations without an identity provider.
 - `auth.trusted_proxies` -> `NRESE_AUTH_TRUSTED_PROXIES` (addresses or ranges, comma-separated; default loopback): the reverse proxies whose `X-Forwarded-For` names the client. Failed local logins are counted per user name and client address (past 10, each further attempt waits, from one second doubling up to five minutes) and per client address over all names (past 100); behind a proxy that isn't listed here, every client has the proxy's address, so list it
-- `auth.workspace_base` -> `NRESE_WORKSPACE_BASE`: what workspace graph prefixes start with (default `urn:nrese:`): a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
+- `auth.workspace_base` -> `NRESE_WORKSPACE_BASE`: what workspace graph prefixes start with (default `urn:nrese:`): a personal space is `{base}space/{user}/` (a local user's `{base}space/{user}~{id}/`), a workspace `{base}workspace/{name}~{id}/` ([HTTP interface](http-api.md#users-workspaces-and-policies-apiv1access)).
 - the file (TOML), per role:
 
 ```toml

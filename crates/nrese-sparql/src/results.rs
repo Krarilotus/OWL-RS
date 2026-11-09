@@ -43,8 +43,24 @@ pub enum QueryEvaluationError {
         "the count is more than this engine can count exactly (at least {at_least}): a limit of this engine, not an error in the query"
     )]
     CountBeyondRange { at_least: u64 },
+    /// A table the query needs has more rows or groups than this engine's row numbers or
+    /// group ids name (joins and grouping keep them as `u32`). A limit of the engine, not
+    /// an error in the query.
+    #[error("{0}: a limit of this engine, not an error in the query")]
+    TooLarge(#[from] nrese_exec::RepresentationLimit),
     #[error("{0}")]
     Unexpected(String),
+}
+
+impl From<nrese_engine::SearchRefused> for QueryEvaluationError {
+    /// A search's refusal: its memory as any other memory refusal; a private snapshot's as
+    /// an error of its own, never an empty answer and never the client's.
+    fn from(refused: nrese_engine::SearchRefused) -> Self {
+        match refused {
+            nrese_engine::SearchRefused::Memory(exceeded) => Self::MemoryLimit(exceeded),
+            nrese_engine::SearchRefused::Private => Self::Unexpected(refused.to_string()),
+        }
+    }
 }
 
 /// A flag a running query checks; cancelling it stops the query at its next check.
@@ -210,6 +226,12 @@ impl QuerySolution {
         &self.values
     }
 
+    /// The values, taken out of the solution: one per variable, in the order of
+    /// [`QuerySolution::variables`] (`None`: unbound).
+    pub fn into_values(self) -> Vec<Option<Term>> {
+        self.values
+    }
+
     /// How many variables the solution binds.
     pub fn len(&self) -> usize {
         self.values.iter().filter(|v| v.is_some()).count()
@@ -351,6 +373,17 @@ mod tests {
         assert_eq!(solution.get("c"), None);
         assert_eq!(solution.iter().count(), 1);
         assert_eq!(solution.len(), 1);
+    }
+
+    /// A solution gives up its values in the order of its variables, unbound ones as `None`.
+    #[test]
+    fn a_solution_gives_up_its_values_in_variable_order() {
+        let variables: Arc<[Variable]> =
+            vec![Variable::new_unchecked("a"), Variable::new_unchecked("b")].into();
+        let b: Term = NamedNode::new_unchecked("http://e/b").into();
+        let solution = QuerySolution::new(variables, vec![None, Some(b.clone())]);
+        assert_eq!(solution.variables()[1].as_str(), "b");
+        assert_eq!(solution.into_values(), vec![None, Some(b)]);
     }
 
     #[test]

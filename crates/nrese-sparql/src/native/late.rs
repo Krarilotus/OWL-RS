@@ -116,11 +116,18 @@ impl super::Context<'_> {
             evaluator: super::Evaluator::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
-            decoded: RefCell::default(),
+            decoded: RefCell::new(super::decode_cache::DecodeCache::new(
+                &self.budget,
+                super::DECODE_CACHE_ENTRIES,
+                1,
+            )),
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
+            kept: RefCell::new(nrese_exec::Reservation::new(std::sync::Arc::clone(
+                &self.budget,
+            ))),
             memory: self.memory.clone(),
             trace: None,
             depth: Cell::new(0),
@@ -134,6 +141,7 @@ impl super::Context<'_> {
             index_joins: self.index_joins,
             merge_set: self.merge_set.clone(),
             named: self.named.clone(),
+            store_default: self.store_default,
             synthetic: Cell::new(self.synthetic.get()),
             services: self.services.clone(),
             service_denied: self.service_denied,
@@ -144,6 +152,7 @@ impl super::Context<'_> {
             reads_refused: self.reads_refused,
             cache: None,
             pin: RefCell::default(),
+            search_scope: self.search_scope,
         };
         child.cache = self.child_cache(&child);
         child
@@ -288,7 +297,8 @@ mod tests {
     /// without columns, each cut to a limit or not. Beyond its charge it holds no more than
     /// a table's list of columns, which a table's charge leaves out
     /// (`IdTable::memory_bytes`). Each input is charged before it is made, inside the
-    /// measurement.
+    /// measurement, and consuming what it answers releases its own charge, never another
+    /// holder's.
     #[test]
     fn an_expansion_holds_no_more_than_it_charges() {
         if !alone() {
@@ -318,6 +328,10 @@ mod tests {
         let mut options = QueryOptions::default();
         options.resources.memory = envelope.clone();
         let ctx = Context::new(&snapshot, &options, None, None);
+        // Another holder's charge, held across every expansion: more than any input's, so
+        // releasing an input's bytes it never charged shows.
+        let mut other = Reservation::new(&*ctx.budget);
+        other.charge(1 << 20).unwrap();
         // What expanding `rows` rows, each `row`, holds beyond its charge, and the rows it
         // answers.
         let expand = |row: &[u64], rows: usize, limit: Option<usize>| -> (usize, usize) {
@@ -325,9 +339,12 @@ mod tests {
             let vars: Vec<Variable> = (0..width)
                 .map(|i| Variable::new_unchecked(format!("v{i}")))
                 .collect();
+            let before = ctx.budget.used();
             let (expanded, excess) = measure_within(&envelope, || {
                 let mut charged = Reservation::new(&*ctx.budget);
-                charged.charge(rows * width * 8).unwrap();
+                // One id a column of each row; without columns, one id a row after the first.
+                let ids = if width == 0 { rows - 1 } else { rows * width };
+                charged.charge(ids * 8).unwrap();
                 let mut table = IdTable::with_capacity(width, rows);
                 for _ in 0..rows {
                     table.push_row(row);
@@ -344,6 +361,11 @@ mod tests {
             });
             let answered = expanded.table.len();
             ctx.consumed(expanded);
+            assert_eq!(
+                ctx.budget.used(),
+                before,
+                "{width} columns, {rows} rows: consuming the answer moved another holder's charge"
+            );
             (excess, answered)
         };
         for (path, row, per_row) in [

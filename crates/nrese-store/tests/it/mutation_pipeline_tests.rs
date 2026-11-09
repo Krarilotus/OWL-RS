@@ -202,9 +202,10 @@ fn owl2_rl_rejects_inconsistent_commits() {
 
 /// The G3 safety audit (7 October 2026): a commit the OWL 2 RL gate rejects listed its
 /// premises whatever the committer could read. A committer who may read and write `open`
-/// only is rejected for what the secret schema makes inconsistent, and the rejection shows
-/// the premises asserted in the graphs it may read: not the secret disjointness, nor the
-/// type the secret subclass axiom infers. A committer who reads everything sees them all.
+/// only is rejected for what the secret schema makes inconsistent. Its own graphs violate
+/// nothing by themselves, so the rejection shows no premise (Q07: even its own statement
+/// would tell that the secret schema relates `:A` to what it committed). A committer who
+/// reads everything sees them all.
 #[test]
 fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
     use nrese_sparql::GraphAccess;
@@ -239,26 +240,31 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
         let Err(MutationError::Rejected(reject)) = result else {
             panic!("expected a rejection, got {result:?}");
         };
-        let explanation = reject.explanation.expect("an explanation");
-        let shown: Vec<String> = explanation
-            .evidence
-            .iter()
-            .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
-            .collect();
         let secret = |text: &str| text.contains("disjointWith") || text.contains(&format!("{EX}B"));
         if restricted {
-            // The committer's own statement, nothing of the secret graph or inferred from it.
-            assert!(
-                shown
-                    .iter()
-                    .any(|s| s.contains(&format!("{EX}x")) && s.contains(&format!("{EX}A"))),
-                "{shown:#?}"
-            );
-            assert!(!shown.iter().any(|s| secret(s)), "{shown:#?}");
-            assert!(!secret(&explanation.summary), "{}", explanation.summary);
+            // Nothing of the secret graph, nor what it relates to the committer's statement.
+            assert!(reject.explanation.is_none(), "{reject:?}");
+            assert!(reject.attribution.is_none(), "{reject:?}");
             assert!(!secret(&reject.detail), "{}", reject.detail);
-            assert!(reject.detail.contains("not shown"), "{}", reject.detail);
+            assert!(
+                !reject.detail.contains(&format!("{EX}A")),
+                "{}",
+                reject.detail
+            );
+            assert!(
+                reject
+                    .detail
+                    .contains("Only statements in graphs you can read are shown"),
+                "{}",
+                reject.detail
+            );
         } else {
+            let explanation = reject.explanation.expect("an explanation");
+            let shown: Vec<String> = explanation
+                .evidence
+                .iter()
+                .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
+                .collect();
             assert_eq!(shown.len(), 3, "{shown:#?}");
             assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
         }
@@ -1178,6 +1184,16 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("dt-not-type"), "{error}");
+    // An ill-typed value has no data value, so it is in no range (RDF 1.2 Concepts §3.4, OWL 2
+    // Profiles table 8): rejected under owl2-rl.
+    let error = pipeline
+        .apply(
+            insert(&format!("<{ex}b> <{ex}age> \"abc\"^^<{xsd}integer>")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect_err("an ill-typed value under a range is an inconsistency");
+    assert!(error.to_string().contains("dt-not-type"), "{error}");
     pipeline
         .apply(
             insert(&format!("<{ex}b> <{ex}age> \"5\"^^<{xsd}integer>")),
@@ -1185,6 +1201,132 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
             &MutationTicket::new(),
         )
         .unwrap();
+}
+
+/// A ranged owl2-rl commit is judged by the datatype's whole lexical space (XSDVAL review
+/// r1): a dateTimeStamp needs its timezone whatever its precision (XML Schema 1.1 Part 2
+/// §3.4.28.1, R1-W1), and hexBinary is hex digit pairs without a sign (§3.3.15.2, R1-W3):
+/// both are rejected with dt-not-type. The review's controls commit: the long fraction with
+/// a timezone, the long fraction as a dateTime (beyond what is represented: not judged), and
+/// valid hexBinary in either case or empty; an ordinary dateTimeStamp without a timezone is
+/// rejected. Every row is reported.
+#[test]
+fn ranged_commits_are_judged_by_the_whole_lexical_space() {
+    let ex = "http://example.com/";
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let range = "http://www.w3.org/2000/01/rdf-schema#range";
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ <{ex}stamp> <{range}> <{xsd}dateTimeStamp> .
+                               <{ex}when> <{range}> <{xsd}dateTime> .
+                               <{ex}hex> <{range}> <{xsd}hexBinary> .
+                               <{ex}xml> <{range}> <{rdf}XMLLiteral> }}"
+            ))),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let fraction = "2000-01-01T00:00:00.1234567890123456789";
+    let rows = [
+        (
+            "stamp",
+            format!("\"{fraction}\"^^<{xsd}dateTimeStamp>"),
+            true,
+        ),
+        ("hex", format!("\"+F\"^^<{xsd}hexBinary>"), true),
+        (
+            "stamp",
+            format!("\"2000-01-01T00:00:00\"^^<{xsd}dateTimeStamp>"),
+            true,
+        ),
+        (
+            "stamp",
+            format!("\"{fraction}Z\"^^<{xsd}dateTimeStamp>"),
+            false,
+        ),
+        ("when", format!("\"{fraction}\"^^<{xsd}dateTime>"), false),
+        ("hex", format!("\"0f\"^^<{xsd}hexBinary>"), false),
+        ("hex", format!("\"0F\"^^<{xsd}hexBinary>"), false),
+        ("hex", format!("\"\"^^<{xsd}hexBinary>"), false),
+        // rdf:XMLLiteral: well-balanced, self-contained XML content (RDF 1.1 Concepts); a
+        // character reference is unsigned digits (XML 1.0 §4.1); a tag ends in `>` or `/>`.
+        ("xml", format!("\"&#x+41;\"^^<{rdf}XMLLiteral>"), true),
+        ("xml", format!("\"<a /x></a>\"^^<{rdf}XMLLiteral>"), true),
+        (
+            "xml",
+            format!("\"<b>&#x41;</b>\"^^<{rdf}XMLLiteral>"),
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (property, literal, rejected)) in rows.iter().enumerate() {
+        let result = pipeline.apply(
+            insert(&format!("<{ex}s{n}> <{ex}{property}> {literal}")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        );
+        let ok = match &result {
+            Err(e) => *rejected && e.to_string().contains("dt-not-type"),
+            Ok(_) => !*rejected,
+        };
+        if !ok {
+            wrong.push(format!("{property} {literal}: {result:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The reasoning marker engine-v2 621bf318 (`SEMANTICS_VERSION` 3) wrote for the store of
+/// [`a_marker_from_older_datatype_semantics_is_rechecked`] after rematerialising it under
+/// owl2-rl: 0 violations (fleet probe xsdval-probe-marker-56fd5f94).
+const OLD_MARKER: &str =
+    "ruleset owl2-rl\nfingerprint a94cf90230548146\nviolations 0\nlists nil-class\n";
+
+/// A store whose reasoning marker a build with older datatype semantics wrote (engine-v2
+/// 621bf318, which didn't judge an ill-typed literal under a range, so recorded this data
+/// consistent) isn't current once the semantics change (rulesets::SEMANTICS_VERSION): on
+/// reopen it is rechecked, and the inconsistency is reported (XSDVAL review r1, R1-W2).
+#[test]
+fn a_marker_from_older_datatype_semantics_is_rechecked() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = nrese_store::StoreConfig {
+        mode: nrese_store::StoreMode::OnDisk,
+        data_dir: dir.path().to_path_buf(),
+        query_cache_bytes: 0,
+        ..nrese_store::StoreConfig::default()
+    };
+    let ruleset = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    {
+        let store = StoreService::new(config.clone()).expect("store");
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ <{EX}age> <http://www.w3.org/2000/01/rdf-schema#range> <{xsd}nonNegativeInteger> .
+                               <{EX}b> <{EX}age> \"abc\"^^<{xsd}integer> }}"
+            )))
+            .expect("import");
+    }
+    // The marker 621bf318 wrote for this store after rematerialising it (fleet probe
+    // xsdval-probe-marker-56fd5f94).
+    std::fs::write(dir.path().join("reasoning.state"), OLD_MARKER).expect("write marker");
+    let store = StoreService::new(config).expect("reopen");
+    assert!(
+        !store
+            .reasoning_state()
+            .is_some_and(|state| state.is_current_for(ruleset)),
+        "an older build's marker is current"
+    );
+    let report = store.rematerialise(ruleset).expect("rematerialise");
+    assert!(report.violations >= 1, "{report:?}");
+    assert_eq!(
+        store.consistency(),
+        nrese_store::ConsistencyStatus::Inconsistent {
+            violations: report.violations
+        }
+    );
 }
 
 /// A full OWL 2 RL materialisation by representatives of the `owl:sameAs` classes

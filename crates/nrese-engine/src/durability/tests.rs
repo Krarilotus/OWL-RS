@@ -153,6 +153,741 @@ fn a_rotation_that_fails_before_its_segment_is_placed_leaves_the_log_usable() {
     assert_eq!(contents(&engine), [quad(1), quad(2)].into_iter().collect());
 }
 
+/// One time-restore row: commits of `quad(0)`, `quad(1)`, … made at the clock times given, a
+/// checkpoint after the first `checkpointed` of them (0: none), then an open restoring the
+/// commits made up to `until`. What the restored store holds, or `None` if the open refused.
+fn time_restore(times: &[u64], checkpointed: usize, until: u64) -> Option<HashSet<Quad>> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        for (n, &at) in times.iter().enumerate() {
+            fault::CLOCK.set(Some(at));
+            commit(&engine, n as u64).unwrap();
+            if n + 1 == checkpointed {
+                engine.checkpoint().unwrap();
+            }
+        }
+        fault::CLOCK.set(None);
+    }
+    let restore = EngineConfig {
+        durability: DurabilityConfig {
+            recover_until_micros: Some(until),
+            ..config().durability
+        },
+        ..config()
+    };
+    Engine::open(dir.path(), restore)
+        .ok()
+        .map(|engine| contents(&engine))
+}
+
+/// A time restore never serves a commit made after its time (EEV-06): it holds exactly the
+/// commits made up to it, or refuses. Before the fix, a checkpoint made after the time was
+/// used whole: its commits after the time came back. Rows:
+/// - an image after the time, the log empty: must refuse (it can't hold less);
+/// - a clock stepped back before the image (commits at 1000, then 500): the second commit
+///   was made after the first, so the image is after 750 too, though its own clock said
+///   500; commit times never going back makes it refuse;
+/// - guards (right on the base too): an image before the time with the log across it, and
+///   an image whose last commit is at the time exactly, both restore what was made by then.
+///
+/// Each row is judged on its own.
+#[test]
+fn a_time_restore_never_serves_commits_made_after_its_time() {
+    let held = |n: u64| (0..n).map(quad).collect::<HashSet<_>>();
+    // (row, times, checkpointed after, until, what it may hold: None = refuse only)
+    type Row<'a> = (&'a str, &'a [u64], usize, u64, Option<HashSet<Quad>>);
+    let rows: [Row; 4] = [
+        ("an image after the time", &[1000, 2000], 2, 1500, None),
+        (
+            "a clock stepped back before the image",
+            &[1000, 500],
+            2,
+            750,
+            None,
+        ),
+        (
+            "an image before the time, the log across it (guard)",
+            &[1000, 2000, 3000],
+            1,
+            2500,
+            Some(held(2)),
+        ),
+        (
+            "an image at the time exactly (guard)",
+            &[1000, 2000],
+            2,
+            2000,
+            Some(held(2)),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, times, checkpointed, until, expected) in rows {
+        let restored = time_restore(times, checkpointed, until);
+        let ok = restored == expected;
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: held {restored:?}, expected {expected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A store's commit times never go back and are never 0 (a checkpoint's "unknown"), whatever
+/// the clock does: commits under a clock reading 1000, then 500, then 0 (before 1970) are
+/// logged at 1000, 1000 and 1000. Before the fix they were logged at the clock's times.
+#[test]
+fn commit_times_never_go_back() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        for (n, at) in [1000, 500, 0].into_iter().enumerate() {
+            fault::CLOCK.set(Some(at));
+            commit(&engine, n as u64).unwrap();
+        }
+        fault::CLOCK.set(None);
+    }
+    let mut times = Vec::new();
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir.path())).unwrap() {
+        let contents = super::wal::read_segment(&path).unwrap();
+        times.extend(
+            contents
+                .records
+                .iter()
+                .map(|record| record.committed_micros),
+        );
+    }
+    assert_eq!(times, [Some(1000), Some(1000), Some(1000)]);
+}
+
+/// Opens `dir` restoring the commits made up to `until`: what it holds, or `None` if it
+/// refused.
+fn restored(dir: &std::path::Path, until: u64) -> Option<HashSet<Quad>> {
+    let restore = EngineConfig {
+        durability: DurabilityConfig {
+            recover_until_micros: Some(until),
+            ..config().durability
+        },
+        ..config()
+    };
+    Engine::open(dir, restore)
+        .ok()
+        .map(|engine| contents(&engine))
+}
+
+/// The commit times of the log's records in `dir`, in order.
+fn logged_times(dir: &std::path::Path) -> Vec<Option<u64>> {
+    let mut times = Vec::new();
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir)).unwrap() {
+        let contents = super::wal::read_segment(&path).unwrap();
+        times.extend(
+            contents
+                .records
+                .iter()
+                .map(|record| record.committed_micros),
+        );
+    }
+    times
+}
+
+/// A copy of the store in `dir` (a restore changes what it opens).
+fn copied(dir: &std::path::Path) -> tempfile::TempDir {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy(&path, &target);
+            } else if path.file_name().is_some_and(|name| name != "LOCK") {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+    let copy_dir = tempfile::tempdir().unwrap();
+    copy(dir, copy_dir.path());
+    copy_dir
+}
+
+/// A transaction is stamped when its record goes to the log, its preparation done (review
+/// r1, R1-F1): the clock reads 1000 when it commits and 2000 once its runs are built, its
+/// layout converted or the log rotated (`fault::CLOCK_AT_APPEND`). Its record and its version
+/// take 2000: a restore at 1500 leaves it out, and a checkpoint after it is refused at 1999,
+/// used at 2000. Before the fix both took 1000, so a restore at 1500 kept a commit made at
+/// 2000. Rows, judged apart: an insert; a store's first named graph (its layout converted);
+/// a commit that starts a segment.
+#[test]
+fn a_transaction_is_stamped_at_its_log_append() {
+    let named = |n: u64| {
+        let node = |name: String| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        Quad::new(
+            node(format!("s{n}")),
+            node("p".into()),
+            node(format!("o{n}")),
+            node("g".into()),
+        )
+    };
+    let rows: [(&str, Quad, EngineConfig); 3] = [
+        ("an insert", quad(1), config()),
+        ("a first named graph", named(1), config()),
+        ("a rotation", quad(1), small_segments()),
+    ];
+    let mut failures = Vec::new();
+    for (row, inserted, open) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = Engine::open(dir.path(), open.clone()).unwrap();
+            fault::CLOCK.set(Some(500));
+            commit(&engine, 0).unwrap();
+            engine.checkpoint().unwrap();
+            fault::CLOCK.set(Some(1000));
+            fault::CLOCK_AT_APPEND.set(Some(2000));
+            let mut tx = engine.transaction();
+            tx.insert(inserted.as_ref());
+            tx.commit().unwrap();
+            fault::CLOCK_AT_APPEND.set(None);
+            fault::CLOCK.set(None);
+        }
+        let mut wrong = Vec::new();
+        let logged = logged_times(dir.path());
+        if logged.last() != Some(&Some(2000)) {
+            wrong.push(format!("logged at {logged:?}"));
+        }
+        let held = restored(copied(dir.path()).path(), 1500);
+        if held != Some([quad(0)].into_iter().collect()) {
+            wrong.push(format!("restored at 1500: {held:?}"));
+        }
+        // The version's time, as the checkpoint after it keeps it.
+        Engine::open(dir.path(), open)
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+        if restored(copied(dir.path()).path(), 1999).is_some() {
+            wrong.push("its checkpoint used at 1999".into());
+        }
+        if restored(copied(dir.path()).path(), 2000).is_none() {
+            wrong.push("its checkpoint refused at 2000".into());
+        }
+        eprintln!(
+            "row {row}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{row}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Commits of unknown time leave the store's clock where it was (review r1, R1-F2): a version
+/// holding them has no known time, but the commits after them still never go back. Each row
+/// starts from such a history and steps the clock back from 2000 to 1000:
+/// - two commits after a format 11 checkpoint are logged at 2000 and 2000;
+/// - a replacement after a commit at 2000 is stamped no earlier, so a restore at 1500 refuses
+///   its checkpoint;
+/// - the clock survives a checkpoint of unknown time and a reopen: the commit after is logged
+///   at 2000;
+/// - an untimed record replayed, a commit at 2000, then a replacement: refused at 1500.
+///
+/// Before the fix the clock was the version's time, unknown there, so it started again.
+#[test]
+fn the_store_clock_never_goes_back_over_an_unknown_history() {
+    // A store whose only content is of unknown time: a format 11 checkpoint of a commit.
+    let unknown = || {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = Engine::open(dir.path(), config()).unwrap();
+            fault::CLOCK.set(Some(3000));
+            commit(&engine, 0).unwrap();
+            engine.checkpoint().unwrap();
+            fault::CLOCK.set(None);
+        }
+        as_format_11(dir.path());
+        dir
+    };
+    let at = |engine: &Engine, clock: u64, n: u64| {
+        fault::CLOCK.set(Some(clock));
+        commit(engine, n).unwrap();
+        fault::CLOCK.set(None);
+    };
+    let replace = |engine: &Engine, clock: u64| {
+        fault::CLOCK.set(Some(clock));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(9)]);
+        load.finish().unwrap();
+        fault::CLOCK.set(None);
+    };
+    let mut failures = Vec::new();
+    let mut check = |row: &str, ok: bool, got: String| {
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: {got}"));
+        }
+    };
+
+    let dir = unknown();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        at(&engine, 1000, 2);
+    }
+    let logged = logged_times(dir.path());
+    check(
+        "two commits after a format 11 checkpoint",
+        logged == [Some(2000), Some(2000)],
+        format!("logged at {logged:?}"),
+    );
+
+    let dir = unknown();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        replace(&engine, 1000);
+    }
+    let held = restored(dir.path(), 1500);
+    check(
+        "a replacement after them",
+        held.is_none(),
+        format!("restored at 1500: {held:?}"),
+    );
+
+    let dir = unknown();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        engine.checkpoint().unwrap();
+    }
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 1000, 2);
+    }
+    let logged = logged_times(dir.path());
+    check(
+        "across a checkpoint and a reopen",
+        logged.last() == Some(&Some(2000)),
+        format!("logged at {logged:?}"),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 3000, 0);
+    }
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir.path())).unwrap() {
+        let file = std::fs::read(&path).unwrap();
+        let contents = super::wal::read_segment(&path).unwrap();
+        let mut bytes = file[..8].to_vec();
+        for record in contents.records {
+            let record = super::codec::CommitRecord {
+                committed_micros: None,
+                ..record
+            };
+            super::codec::encode_record(&record, &mut bytes).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        replace(&engine, 1000);
+    }
+    let held = restored(dir.path(), 1500);
+    check(
+        "an untimed record replayed",
+        held.is_none(),
+        format!("restored at 1500: {held:?}"),
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A primary's log of one commit, `quad(1)`, its record's time replaced by `at`: what a
+/// replica is sent ([`Engine::apply_log`]).
+fn primary_log(at: u64) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    log_after(dir.path(), at)
+}
+
+/// The log of one commit, `quad(1)`, made on the store in `dir`, its record's time replaced
+/// by `at`.
+fn log_after(dir: &std::path::Path, at: u64) -> Vec<u8> {
+    let engine = Engine::open(dir, config()).unwrap();
+    let after = engine.stats().revision;
+    commit(&engine, 1).unwrap();
+    let batch = engine.log_since(after, usize::MAX).unwrap();
+    let (mut frames, mut pos) = (Vec::new(), 0);
+    while let super::codec::Frame::Record(record, used) =
+        super::codec::decode_frame(&batch.frames[pos..])
+    {
+        pos += used;
+        let record = super::codec::CommitRecord {
+            committed_micros: Some(at),
+            ..record
+        };
+        super::codec::encode_record(&record, &mut frames).unwrap();
+    }
+    frames
+}
+
+/// Applies `frames`, one record after `replica`'s revision ([`log_after`]), as a replica
+/// does ([`Engine::apply_log`]).
+fn apply_one(replica: &Engine, frames: &[u8]) -> EngineResult<crate::Applied> {
+    let after = replica.stats().revision;
+    let expected = crate::LogExpectation {
+        after,
+        records: 1,
+        last: after + 1,
+    };
+    replica.apply_log(frames, &expected, &nrese_exec::stop::StopSource::none())
+}
+
+/// A replicated commit's time moves the store's clock in memory as on disk (sol-loop, review
+/// fix S1): an in-memory replica applies a primary's commit made at 2000, then replaces its
+/// data under a clock reading 1000. The replacement is stamped no earlier than 2000, so an
+/// image of it is refused by a restore at 1500. Before the fix it was stamped 1000.
+#[test]
+fn a_replicated_time_moves_the_clock_in_memory_too() {
+    let replica = Engine::new(config()).unwrap();
+    apply_one(&replica, &primary_log(2000)).unwrap();
+    fault::CLOCK.set(Some(1000));
+    let load = replica.bulk_load(BulkMode::Replace);
+    load.add(&[quad(9)]);
+    load.finish().unwrap();
+    fault::CLOCK.set(None);
+    let image = tempfile::tempdir().unwrap();
+    replica.write_image(image.path()).unwrap();
+    let held = restored(image.path(), 1500);
+    assert!(
+        held.is_none(),
+        "the replacement's image restored at 1500: {held:?}"
+    );
+}
+
+/// A commit time is below 2^63 (sol-loop, review fix S2): a checkpoint keeps it in 63 bits.
+/// A replicated record at 2^63 or `u64::MAX` is refused, nothing applied; one at 2^63 - 1 is
+/// applied, and its checkpoint keeps the time exactly (refused by a restore at 2^63 - 2,
+/// used at 2^63 - 1; a guard). Before the fix the top bit was dropped when checkpointed,
+/// making a commit look 2^63 earlier.
+#[test]
+fn commit_times_past_their_range_are_refused() {
+    let top = 1u64 << 63;
+    let mut failures = Vec::new();
+    for (row, at, applied) in [
+        ("u64::MAX", u64::MAX, false),
+        ("2^63", top, false),
+        ("2^63 - 1 (guard)", top - 1, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wrong = Vec::new();
+        {
+            let replica = Engine::open(dir.path(), config()).unwrap();
+            let result = apply_one(&replica, &primary_log(at));
+            if result.is_ok() != applied {
+                wrong.push(format!("applied: {result:?}"));
+            }
+            if replica.stats().revision != u64::from(applied) {
+                wrong.push(format!("at revision {}", replica.stats().revision));
+            }
+            if applied {
+                replica.checkpoint().unwrap();
+            }
+        }
+        if applied {
+            if restored(copied(dir.path()).path(), top - 2).is_some() {
+                wrong.push("its checkpoint used at 2^63 - 2".into());
+            }
+            if restored(copied(dir.path()).path(), top - 1).is_none() {
+                wrong.push("its checkpoint refused at 2^63 - 1".into());
+            }
+        }
+        eprintln!(
+            "row {row}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{row}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The newest checkpoint in `dir`, rewritten as format 11 (no commit time), as an earlier
+/// binary would have written it: format 12 is format 11 with the time before the checksum.
+fn as_format_11(dir: &std::path::Path) {
+    let path = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "nck"))
+        .max()
+        .unwrap();
+    let file = std::fs::read(&path).unwrap();
+    assert_eq!(&file[..8], b"NRESECKC");
+    let mut old = b"NRESECKB".to_vec();
+    old.extend_from_slice(&file[8..file.len() - 12]);
+    let crc = crc32fast::hash(&old);
+    old.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, old).unwrap();
+}
+
+/// A version's time bounds every commit in it, whatever history it was recovered from
+/// (sol-loop r1 S1, S2). Rows, each a restore at 1500 that must refuse, judged apart:
+/// - a log an earlier binary wrote under a clock that stepped back (commits logged at 2000,
+///   then 1000), replayed and checkpointed: the checkpoint's commits include one at 2000;
+/// - a format 11 checkpoint (no time) of a commit made at 2000, then a commit at 1000 and a
+///   checkpoint: what it holds from before is still of unknown time;
+/// - a bulk replacement at 3000 after that, restored at 3500: it holds nothing from before,
+///   but a commit of unknown time may have been made after any time this store would stamp
+///   (review r2, R1-F2: a legacy log loses its times), so no later time is certified. This
+///   row expected the replacement's time known until that review.
+///
+/// And a guard: a bulk replacement after a history of known time keeps its time, and a
+/// restore after it opens.
+#[test]
+fn a_version_time_bounds_every_commit_in_it() {
+    let mut failures = Vec::new();
+    let mut check = |row: &str, got: Option<HashSet<Quad>>, expected: Option<HashSet<Quad>>| {
+        let ok = got == expected;
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: held {got:?}, expected {expected:?}"));
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit(&engine, 0).unwrap();
+        commit(&engine, 1).unwrap();
+    }
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir.path())).unwrap() {
+        let file = std::fs::read(&path).unwrap();
+        let contents = super::wal::read_segment(&path).unwrap();
+        let mut bytes = file[..8].to_vec();
+        for (record, at) in contents.records.into_iter().zip([2000, 1000]) {
+            let record = super::codec::CommitRecord {
+                committed_micros: Some(at),
+                ..record
+            };
+            super::codec::encode_record(&record, &mut bytes).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+    Engine::open(dir.path(), config())
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+    check(
+        "a stepped-back log replayed and checkpointed",
+        restored(dir.path(), 1500),
+        None,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(2000));
+        commit(&engine, 0).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    as_format_11(dir.path());
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(1000));
+        commit(&engine, 1).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    check(
+        "a commit after a format 11 checkpoint",
+        restored(dir.path(), 1500),
+        None,
+    );
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(3000));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(7)]);
+        load.finish().unwrap();
+    }
+    fault::CLOCK.set(None);
+    check("a replacement after it", restored(dir.path(), 3500), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(2000));
+        commit(&engine, 0).unwrap();
+        fault::CLOCK.set(Some(3000));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(7)]);
+        load.finish().unwrap();
+    }
+    fault::CLOCK.set(None);
+    check(
+        "a replacement after a known history (guard)",
+        restored(dir.path(), 3500),
+        Some([quad(7)].into_iter().collect()),
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A legacy store (integer-derived literals in its dictionary): the format 11 checkpoint an
+/// earlier binary wrote of one commit, flagged so, its log released. New segments are then
+/// version 4, which keep no commit times (`format_4_checkpoints_are_read` in `tests/it`).
+fn legacy() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit(&engine, 0).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    as_format_11(dir.path());
+    let path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "nck"))
+        .max()
+        .unwrap();
+    let mut file = std::fs::read(&path).unwrap();
+    // `magic | revision | flags`: flag bit 0, integers in the dictionary.
+    file[16] |= 1;
+    let body = file.len() - 4;
+    let crc = crc32fast::hash(&file[..body]);
+    file[body..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, file).unwrap();
+    std::fs::remove_dir_all(super::wal::wal_dir(dir.path())).unwrap();
+    dir
+}
+
+/// A time a legacy store's log couldn't keep is never certified by a later commit (review r2,
+/// R1-F2): its version 4 segments keep no times, so a reopen replays its commits untimed.
+/// Rows, judged apart, each refused by a restore at 1500 for its time (`Configuration`), the
+/// store opening plainly with the replacement:
+/// - a bulk replacement at 500, a transaction at 2000, a reopen, a replacement at 1000;
+/// - the replica route: a primary's commit made at 2000 applied, a reopen, a replacement at
+///   1000.
+///
+/// Before the fix the reopened clock was the checkpoint's (500, or 0), the last replacement
+/// was stamped 1000 and certified, and the restore at 1500 served it.
+#[test]
+fn a_time_a_legacy_log_lost_is_never_certified() {
+    let replace = |engine: &Engine, clock: u64, n: u64| {
+        fault::CLOCK.set(Some(clock));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(n)]);
+        load.finish().unwrap();
+        fault::CLOCK.set(None);
+    };
+    let mut failures = Vec::new();
+    let mut check = |row: &str, dir: &std::path::Path, replacement: u64| {
+        let mut wrong = Vec::new();
+        let segments = super::wal::list_segments(&super::wal::wal_dir(dir)).unwrap();
+        let newest = &segments.last().unwrap().1;
+        if std::fs::read(newest).unwrap()[..8] != *b"NRESEWL4" {
+            wrong.push("its log isn't of version 4".to_string());
+        }
+        let restore = EngineConfig {
+            durability: DurabilityConfig {
+                recover_until_micros: Some(1500),
+                ..config().durability
+            },
+            ..config()
+        };
+        match Engine::open(copied(dir).path(), restore) {
+            Err(EngineError::Configuration(_)) => {}
+            Err(error) => wrong.push(format!("restore at 1500 failed otherwise: {error}")),
+            Ok(engine) => wrong.push(format!("restored at 1500: {:?}", contents(&engine))),
+        }
+        let held = contents(&Engine::open(dir, config()).unwrap());
+        if held != [quad(replacement)].into_iter().collect() {
+            wrong.push(format!("opened holding {held:?}"));
+        }
+        eprintln!(
+            "row {row}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{row}: {w}")));
+    };
+
+    let dir = legacy();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        replace(&engine, 500, 10);
+        fault::CLOCK.set(Some(2000));
+        commit(&engine, 11).unwrap();
+        fault::CLOCK.set(None);
+    }
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        replace(&engine, 1000, 12);
+    }
+    check("a transaction at 2000", dir.path(), 12);
+
+    let dir = legacy();
+    let frames = log_after(copied(dir.path()).path(), 2000);
+    {
+        let replica = Engine::open(dir.path(), config()).unwrap();
+        apply_one(&replica, &frames).unwrap();
+    }
+    {
+        let replica = Engine::open(dir.path(), config()).unwrap();
+        replace(&replica, 1000, 12);
+    }
+    check("a replicated commit at 2000", dir.path(), 12);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A bulk publication is stamped when it commits, at its checkpoint's end, not when its
+/// version was built before the (long) write (sol-loop r1 S3). The clock reads 1000 while the
+/// load is built and 2000 once its checkpoint is written (`fault::CLOCK_AT_TRAILER`); a
+/// restore at 1500 must refuse it. Rows, judged apart: an append (built in memory), a
+/// replacement (streamed into the checkpoint) and a rematerialisation.
+#[test]
+fn a_bulk_publication_is_stamped_when_it_commits() {
+    type Publish = fn(&Engine);
+    let rows: [(&str, Publish); 3] = [
+        ("an append", |engine| {
+            let load = engine.bulk_load(BulkMode::Append);
+            load.add(&[quad(10)]);
+            load.finish().unwrap();
+        }),
+        ("a replacement", |engine| {
+            let load = engine.bulk_load(BulkMode::Replace);
+            load.add(&[quad(10)]);
+            load.finish().unwrap();
+        }),
+        ("a rematerialisation", |engine| {
+            let rematerialisation = engine.rematerialisation();
+            let id = |n: &str| {
+                rematerialisation.intern(nrese_rdf::TermRef::NamedNode(
+                    NamedNode::new_unchecked(format!("http://example.com/{n}")).as_ref(),
+                ))
+            };
+            let inferred = vec![crate::EncodedTriple {
+                subject: id("s0"),
+                predicate: id("q"),
+                object: id("o0"),
+            }];
+            rematerialisation.finish(inferred).unwrap();
+        }),
+    ];
+    let mut failures = Vec::new();
+    for (row, publish) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = Engine::open(dir.path(), config()).unwrap();
+            fault::CLOCK.set(Some(500));
+            commit(&engine, 0).unwrap();
+            fault::CLOCK.set(Some(1000));
+            fault::CLOCK_AT_TRAILER.set(Some(2000));
+            publish(&engine);
+            fault::CLOCK_AT_TRAILER.set(None);
+            fault::CLOCK.set(None);
+        }
+        let got = restored(dir.path(), 1500);
+        let ok = got.is_none();
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: held {got:?}, expected a refusal"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// The bytes a torn tail's cut removes are kept under a durable name before the cut (sol-loop
 /// r2 S3): an open whose `wal-cut/` can't be synced after the copy is placed fails, the log
 /// uncut; so does the next open while that sync still fails, though it finds the copy
@@ -206,4 +941,653 @@ fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
     let engine = Engine::open(dir.path(), small_segments()).unwrap();
     assert_eq!(contents(&engine), [quad(1)].into_iter().collect());
     commit(&engine, 4).unwrap();
+}
+
+/// A directory sync is a real one on every platform (F2): syncing a directory that isn't
+/// there fails. Before the fix it was a no-op on Windows, so a checkpoint's or segment's
+/// rename there wasn't durable when its commit was acknowledged. (A guard on Unix, where the
+/// sync was always real; red on Windows.)
+#[test]
+fn a_directory_sync_is_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("not-there");
+    assert!(
+        super::sync_dir(&missing).is_err(),
+        "synced a missing directory"
+    );
+    super::sync_dir(dir.path()).unwrap();
+}
+
+/// The directories an open creates for its store are durably named before it takes commits
+/// (review r1, R1-F2): each new one's entry in the directory holding it is synced, so a power
+/// loss can't take the store's name with every commit acknowledged in it. Here the sync of
+/// that holding directory fails (`fault::FAIL_DIR_SYNC_OF`), and the open must refuse. Before
+/// the fix only the store's own directory was synced, so it opened. Rows, judged apart:
+/// - two missing levels, the sync of the existing directory above them failing;
+/// - one missing level, the same;
+/// - a relative single directory, the sync of `.` failing (made in the working directory,
+///   removed after);
+/// - the same open tried again, the sync still failing (sol-loop on review r1, S1): the first
+///   refusal mustn't leave a directory the retry takes for durably named;
+/// - a directory that exists, made by someone else (another attempt, another process) and not
+///   known to be named durably: its holder's sync failing, the open refuses (it makes the
+///   store's WAL directory in it, so it syncs every name at once);
+/// - an existing store, its holder's sync failing: the open succeeds, as it changes nothing and
+///   leaves its names to the first durable write, and the first commit is refused
+///   (deferred-sync design note of 8 Nov);
+/// - guards: an existing directory whose holder can't be opened for the sync (no permission)
+///   opens, as nothing more can be done for its name there; two missing levels open with every
+///   sync working.
+#[test]
+fn an_open_names_every_directory_it_creates() {
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
+    let base = tempfile::tempdir().unwrap();
+    let relative = PathBuf::from(format!("dur3-relative-{}", std::process::id()));
+    std::fs::create_dir(base.path().join("made")).unwrap();
+    // A store made and closed while every sync works.
+    drop(Engine::open(base.path().join("kept"), config()).unwrap());
+    // What the last attempt must do.
+    #[derive(Clone, Copy, Debug)]
+    enum Must {
+        Open,
+        RefuseTheOpen,
+        RefuseTheFirstCommit,
+    }
+    // (row, store directory, the directory whose sync fails and how, attempts, what the last
+    // must do)
+    type Row<'a> = (&'a str, PathBuf, Option<(PathBuf, ErrorKind)>, usize, Must);
+    let failing = |dir: &std::path::Path| Some((dir.to_path_buf(), ErrorKind::Other));
+    let rows: [Row; 8] = [
+        (
+            "two missing levels",
+            base.path().join("a").join("b"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "one missing level",
+            base.path().join("c"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "a relative single directory",
+            relative.clone(),
+            failing(std::path::Path::new(".")),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "tried again",
+            base.path().join("r").join("s"),
+            failing(base.path()),
+            2,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "a directory someone else made",
+            base.path().join("made"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "an existing store",
+            base.path().join("kept"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheFirstCommit,
+        ),
+        (
+            "an existing directory, its holder not to be opened (guard)",
+            base.path().to_path_buf(),
+            base.path()
+                .parent()
+                .map(|parent| (parent.to_path_buf(), ErrorKind::PermissionDenied)),
+            1,
+            Must::Open,
+        ),
+        (
+            "two missing levels, every sync working (guard)",
+            base.path().join("d").join("e"),
+            None,
+            1,
+            Must::Open,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, dir, failing, attempts, must) in rows {
+        fault::FAIL_DIR_SYNC_OF.set(failing);
+        let mut opened = Err(EngineError::Configuration("not tried".to_owned()));
+        for _ in 0..attempts {
+            opened = Engine::open(&dir, config()).map(|engine| commit(&engine, 0).map(drop));
+        }
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        let ok = match must {
+            Must::Open => matches!(opened, Ok(Ok(()))),
+            Must::RefuseTheOpen => opened.is_err(),
+            Must::RefuseTheFirstCommit => matches!(opened, Ok(Err(_))),
+        };
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: {:?}", opened.map(|_| "opened")));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&relative);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A directory is made only where its name can be made durable (sol-loop round 2 on review r1,
+/// S1): made first and its holder's sync then refused (`PermissionDenied`), it is in sight of
+/// another process opening the same path, which finds it, can't sync its holder either, takes
+/// it for one provisioned beforehand and commits into a name never made durable. Here the
+/// holder's sync is refused that way: when it is tried, the new directory must not exist yet,
+/// and the open refuses. Before the fix it was made first. Guard: once the sync works, it is
+/// made and opens.
+#[test]
+fn a_directory_is_made_only_where_its_name_can_be_made_durable() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("q");
+    let in_sight = Rc::new(Cell::new(false));
+    let (seen, holder, level) = (Rc::clone(&in_sight), base.path().to_path_buf(), dir.clone());
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |synced: &std::path::Path| {
+        if synced == holder && level.exists() {
+            seen.set(true);
+        }
+    })));
+    fault::FAIL_DIR_SYNC_OF.set(Some((
+        base.path().to_path_buf(),
+        std::io::ErrorKind::PermissionDenied,
+    )));
+    let opened = Engine::open(&dir, config());
+    fault::FAIL_DIR_SYNC_OF.set(None);
+    fault::ON_DIR_SYNC.set(None);
+    let mut wrong = Vec::new();
+    if opened.is_ok() {
+        wrong.push("opened though its holder can't be synced".to_owned());
+    }
+    drop(opened);
+    if in_sight.get() {
+        wrong.push("the new directory was in sight while its holder couldn't be synced".to_owned());
+    }
+    if let Err(error) = Engine::open(&dir, config()) {
+        wrong.push(format!(
+            "guard: once its holder syncs, the open fails: {error}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Every directory a store, its log or archive, a restore, a backup or a replica's bootstrap
+/// places what recovery reads in is made through the placement owner (sol-loop round 3 on review
+/// r1, S1): a directory made elsewhere, then found by `place::create_dir_all`, is taken for one
+/// provisioned beforehand where its holder can't be synced, and its name is never made durable
+/// (replica bootstrap made its data directory that way). Files recovery reads are renamed into
+/// place through it too (round 5, S3: the quarantine's, and the reasoning marker). A source scan
+/// of those callers, their test modules left out.
+#[test]
+fn store_directories_are_made_through_the_placement_owner() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let files = [
+        "nrese-engine/src/durability/mod.rs",
+        "nrese-engine/src/durability/wal.rs",
+        "nrese-engine/src/durability/tail.rs",
+        "nrese-engine/src/durability/checkpoint.rs",
+        "nrese-store/src/image_backup.rs",
+        "nrese-store/src/catalog.rs",
+        "nrese-store/src/metadata.rs",
+        "nrese-server/src/replication.rs",
+        "nrese-server/src/http/admin_dataset.rs",
+        // DUR-3 sol-loop round 5, S3, and the sweep after it: the quarantine and the reasoning
+        // marker are read at open too.
+        "nrese-store/src/quarantine.rs",
+        "nrese-store/src/service.rs",
+    ];
+    // A rename recovery doesn't read: the catalogue moves a removed repository aside to delete
+    // it (a lost move leaves it to its tombstone, which is synced).
+    let exempt = ["std::fs::rename(&dir, &trash)"];
+    let mut found = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(crates.join(file)).unwrap();
+        let lines = match product_lines(&text) {
+            Ok(lines) => lines,
+            Err(error) => {
+                found.push(format!("{file}: {error}"));
+                continue;
+            }
+        };
+        for (n, line) in lines {
+            let makes = ["create_dir_all(", "create_dir(", "fs::rename("]
+                .into_iter()
+                .any(|call| {
+                    line.contains(call)
+                        && !line.contains(&format!("place::{}", call.trim_start_matches("fs::")))
+                });
+            // A raw write may only make a temporary, which is then synced and placed (fix check
+            // r1: the backup manifest was written under its own name, unsynced).
+            let writes = ["fs::write(", "File::create("]
+                .iter()
+                .any(|call| line.contains(call))
+                && !["tmp", "temporary", "staged", "partial", "placing"]
+                    .iter()
+                    .any(|temporary| line.contains(temporary));
+            if (makes || writes) && !exempt.iter().any(|exempt| line.contains(exempt)) {
+                found.push(format!("{file}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "made outside durability::place: {found:#?}"
+    );
+}
+
+/// The product code of a Rust source file, with each line's index: every line but those of its
+/// inline test modules. A test module is `#[cfg(test)]` at column 0 followed by a `mod … {`
+/// line at column 0 (any name; an out-of-line `mod tests;` is none: sol-loop round 4, S2), and
+/// it ends at a bare `}` at column 0. Any other line at column 0 that starts with `}` inside one,
+/// or a file ending inside one, is refused rather than guessed (fix check r2, N4: a close like
+/// `} // comment` skipped the product code after it).
+fn product_lines(text: &str) -> Result<Vec<(usize, &str)>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut product = Vec::new();
+    let mut in_tests: Option<usize> = None;
+    for (n, line) in lines.iter().enumerate() {
+        if let Some(start) = in_tests {
+            if *line == "}" {
+                in_tests = None;
+            } else if line.starts_with('}') {
+                return Err(format!(
+                    "the test module at line {} closes as {line:?} at line {}: only a bare `}}` is read",
+                    start + 1,
+                    n + 1
+                ));
+            }
+            continue;
+        }
+        let module = *line == "#[cfg(test)]"
+            && lines.get(n + 1).is_some_and(|next| {
+                !next.starts_with(char::is_whitespace)
+                    && next.contains("mod ")
+                    && next.trim_end().ends_with('{')
+            });
+        if module {
+            in_tests = Some(n);
+            continue;
+        }
+        product.push((n, *line));
+    }
+    match in_tests {
+        Some(start) => Err(format!(
+            "the test module at line {} never closes",
+            start + 1
+        )),
+        None => Ok(product),
+    }
+}
+
+/// [`product_lines`] reads the shapes it is given, and refuses others (fix check r2, N4). Rows:
+/// a test module named anything, closed by a bare `}`, then product code; an out-of-line
+/// `mod tests;` (no module: the code after it is read); a `#[cfg(test)]` seam inside a function
+/// (indented: read); a module closed by `} // comment` (refused); a module never closed
+/// (refused).
+#[test]
+fn the_scan_reads_product_code_only_in_the_shapes_it_knows() {
+    fn read(text: &str) -> Result<Vec<&str>, String> {
+        product_lines(text).map(|lines| lines.into_iter().map(|(_, line)| line).collect())
+    }
+    let mut wrong = Vec::new();
+    let module = "fn a() {}\n#[cfg(test)]\nmod checks {\n    fn t() {}\n}\nfn b() {}\n";
+    if read(module) != Ok(vec!["fn a() {}", "fn b() {}"]) {
+        wrong.push(format!("a test module: {:?}", read(module)));
+    }
+    let out_of_line = "#[cfg(test)]\nmod tests;\nfn b() {}\n";
+    if read(out_of_line) != Ok(vec!["#[cfg(test)]", "mod tests;", "fn b() {}"]) {
+        wrong.push(format!("out of line: {:?}", read(out_of_line)));
+    }
+    let seam = "fn a() {\n    #[cfg(test)]\n    if seam() {\n    }\n}\n";
+    if read(seam).map(|lines| lines.len()) != Ok(5) {
+        wrong.push(format!("a seam: {:?}", read(seam)));
+    }
+    let commented = "#[cfg(test)]\nmod tests {\n} // tests\nfn b() {}\n";
+    if read(commented).is_ok() {
+        wrong.push(format!("a commented close: {:?}", read(commented)));
+    }
+    let unclosed = "#[cfg(test)]\nmod tests {\n    fn t() {}\n";
+    if read(unclosed).is_ok() {
+        wrong.push(format!("never closed: {:?}", read(unclosed)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// What an open replayed is durable before it takes new commits (F5): the segments it
+/// replayed records from are synced. Before the fix nothing was, so under `OsBuffered` (or an
+/// `EveryCommit` record written but not synced when the process died) a power loss after the
+/// reopen could take the replayed tail, though commits acknowledged after it were in a new
+/// segment.
+#[test]
+fn an_open_syncs_what_it_replayed() {
+    let buffered = || EngineConfig {
+        durability: DurabilityConfig {
+            sync: SyncPolicy::OsBuffered,
+            ..config().durability
+        },
+        ..config()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), buffered()).unwrap();
+        commit(&engine, 1).unwrap();
+        commit(&engine, 2).unwrap();
+    }
+    let segments: Vec<std::path::PathBuf> =
+        super::wal::list_segments(&super::wal::wal_dir(dir.path()))
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+    fault::SYNCED.with_borrow_mut(Vec::clear);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let synced = fault::SYNCED.take();
+    assert_eq!(contents(&engine), [quad(1), quad(2)].into_iter().collect());
+    for segment in &segments {
+        assert!(
+            synced.contains(segment),
+            "{} replayed but not synced (synced: {synced:?})",
+            segment.display()
+        );
+    }
+}
+
+/// The names a reopen of the store in `root` makes durable (R1-F2 and F5): each directory
+/// holding a level of its path (the root, or a Windows prefix, holds nothing), the WAL's
+/// directory and the store's own, each once.
+fn names_of(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    let mut names: std::collections::BTreeMap<_, _> = root
+        .ancestors()
+        .skip(1)
+        .filter(|level| !level.as_os_str().is_empty())
+        .map(|level| (level.to_path_buf(), 1))
+        .collect();
+    names.insert(super::wal::wal_dir(root), 1);
+    names.insert(root.to_path_buf(), 1);
+    names
+}
+
+/// What `step` returns, and the directories it synced, each with how often.
+fn dir_syncs_of<T>(
+    step: impl FnOnce() -> T,
+) -> (T, std::collections::BTreeMap<std::path::PathBuf, usize>) {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    let synced = Rc::new(std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new()));
+    let seen = Rc::clone(&synced);
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |dir: &Path| {
+        *seen.borrow_mut().entry(dir.to_path_buf()).or_default() += 1;
+    })));
+    let out = step();
+    fault::ON_DIR_SYNC.set(None);
+    (out, synced.take())
+}
+
+/// A store at `<base>/store` with one commit in its log and no checkpoint, closed.
+fn a_closed_store(config: EngineConfig) -> (tempfile::TempDir, std::path::PathBuf) {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("store");
+    let engine = Engine::open(&root, config).unwrap();
+    commit(&engine, 1).unwrap();
+    (base, root)
+}
+
+/// A reopen syncs its names once, by its first commit (timing of 8 Nov, the master's decisions
+/// of 12:15 and 14:37): the open itself syncs no directory, as the first sync an open does pays
+/// the journal's commit and a device flush (+0.5 ms a reopen on the timing host); the first
+/// commit syncs each of its names (`names_of`) once, before it is acknowledged; the second
+/// syncs none. Before the fix the open synced them all and the commit none. Rows, judged
+/// apart: a reopen; a reopen with the WAL archive.
+#[test]
+fn a_reopen_syncs_its_names_once_by_its_first_commit() {
+    let mut wrong = Vec::new();
+    for (row, wal_archive) in [("a reopen", false), ("a reopen with the WAL archive", true)] {
+        let archived = || EngineConfig {
+            durability: DurabilityConfig {
+                wal_archive,
+                ..config().durability
+            },
+            ..config()
+        };
+        let (_base, root) = a_closed_store(archived());
+        let (opened, at_open) = dir_syncs_of(|| Engine::open(&root, archived()));
+        let engine = match opened {
+            Ok(engine) => engine,
+            Err(error) => {
+                wrong.push(format!("{row}: the reopen failed: {error}"));
+                continue;
+            }
+        };
+        let (first, at_first) = dir_syncs_of(|| commit(&engine, 2));
+        let (second, at_second) = dir_syncs_of(|| commit(&engine, 3));
+        eprintln!("row {row}: open {at_open:?}; first commit {at_first:?}; second {at_second:?}");
+        if !at_open.is_empty() {
+            wrong.push(format!("{row}: the open synced {at_open:#?}"));
+        }
+        if let Err(error) = first.and(second) {
+            wrong.push(format!("{row}: a commit failed: {error}"));
+        }
+        if at_first != names_of(&root) {
+            wrong.push(format!(
+                "{row}: the first commit synced {at_first:#?}, expected each name once: {:#?}",
+                names_of(&root)
+            ));
+        }
+        if !at_second.is_empty() {
+            wrong.push(format!("{row}: the second commit synced {at_second:#?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Whatever relies on a reopened store's names first syncs them (the deferred-sync design
+/// note's invariant): a checkpoint, a bulk publication and the log served to a follower each
+/// sync every name (`names_of`) before they return, when no commit came first. Before the fix
+/// the open had synced them, and none of these did again. Rows, judged apart.
+#[test]
+fn a_reopen_syncs_its_names_before_anything_relies_on_them() {
+    type Step = fn(&Engine) -> Result<(), String>;
+    let steps: [(&str, Step); 3] = [
+        ("a checkpoint", |engine| {
+            engine.checkpoint().map(drop).map_err(|e| e.to_string())
+        }),
+        ("a bulk publication", |engine| {
+            let load = engine.bulk_load(BulkMode::Append);
+            load.add(&[quad(10)]);
+            load.finish().map(drop).map_err(|e| e.to_string())
+        }),
+        ("the log served", |engine| {
+            engine
+                .log_since(0, usize::MAX)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (row, step) in steps {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        let (done, synced) = dir_syncs_of(|| step(&engine));
+        eprintln!("row {row}: {synced:?}");
+        if let Err(error) = done {
+            wrong.push(format!("{row}: failed: {error}"));
+        }
+        let missing: Vec<_> = names_of(&root)
+            .into_keys()
+            .filter(|name| !synced.contains_key(name))
+            .collect();
+        if !missing.is_empty() {
+            wrong.push(format!("{row}: returned with {missing:?} not synced"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Naming an existing directory (`place::name_existing`, which the store's metadata writes go
+/// through: fix check DEFER-F1) syncs the holder of each level of its path, each once, and
+/// makes nothing. Rows, judged apart: an existing directory; one that isn't there (refused,
+/// `NotFound`, and not made: a write into a directory gone meanwhile mustn't make it again); a
+/// holder whose sync fails (refused); a holder this process may not open (`PermissionDenied`:
+/// left as it is, as for any found level). Written with the function (no earlier code to fail).
+#[test]
+fn naming_a_directory_syncs_its_holders_and_makes_nothing() {
+    use std::io::ErrorKind;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("a").join("b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut wrong = Vec::new();
+    let (named, synced) = dir_syncs_of(|| super::place::name_existing(&dir));
+    let holders: std::collections::BTreeMap<_, _> = dir
+        .ancestors()
+        .skip(1)
+        .filter(|level| !level.as_os_str().is_empty())
+        .map(|level| (level.to_path_buf(), 1))
+        .collect();
+    if let Err(error) = named {
+        wrong.push(format!("an existing directory: {error}"));
+    }
+    if synced != holders {
+        wrong.push(format!(
+            "an existing directory: synced {synced:#?}, expected each holder once: {holders:#?}"
+        ));
+    }
+    let gone = base.path().join("gone");
+    match super::place::name_existing(&gone) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        other => wrong.push(format!("a directory not there: {other:?}")),
+    }
+    if gone.exists() {
+        wrong.push("a directory not there was made".to_owned());
+    }
+    for (kind, refused) in [
+        (ErrorKind::Other, true),
+        (ErrorKind::PermissionDenied, false),
+    ] {
+        fault::FAIL_DIR_SYNC_OF.set(Some((base.path().to_path_buf(), kind)));
+        let named = super::place::name_existing(&dir);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if named.is_err() != refused {
+            wrong.push(format!("a holder failing with {kind:?}: {named:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A first commit whose names can't be synced is not acknowledged (the design note's attack
+/// 2): the store's directory sync failing, the commit returns an error and publishes nothing,
+/// and the log takes no more commits (the record is written, its outcome unknown, as for a
+/// record whose own sync failed); reopened, the store opens, with or without that commit.
+/// Before the fix the commit didn't sync the names, and succeeded. Second row: a checkpoint
+/// whose names can't be synced fails before it writes anything, and the log stays usable.
+#[test]
+fn a_first_commit_whose_names_cant_be_synced_is_refused() {
+    let mut wrong = Vec::new();
+    {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        fault::FAIL_DIR_SYNC_OF.set(Some((root.clone(), std::io::ErrorKind::Other)));
+        let first = commit(&engine, 2);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if first.is_ok() {
+            wrong.push("commit: acknowledged though the store's name wasn't synced".to_owned());
+        }
+        if engine.snapshot().revision() != 1 {
+            wrong.push("commit: the refused commit was published".to_owned());
+        }
+        if !matches!(commit(&engine, 3), Err(EngineError::WalPoisoned)) {
+            wrong.push("commit: the log took a commit after an unknown outcome".to_owned());
+        }
+        drop(engine);
+        match Engine::open(&root, config()) {
+            Ok(engine) if [1, 2].contains(&engine.snapshot().revision()) => {}
+            other => wrong.push(format!(
+                "commit: the reopen: {:?}",
+                other.map(|engine| engine.snapshot().revision())
+            )),
+        }
+    }
+    {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        fault::FAIL_DIR_SYNC_OF.set(Some((root.clone(), std::io::ErrorKind::Other)));
+        let checkpointed = engine.checkpoint();
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if checkpointed.is_ok() {
+            wrong.push("checkpoint: written though the store's name wasn't synced".to_owned());
+        }
+        if super::checkpoint::exists(&root, 1) {
+            wrong.push("checkpoint: a checkpoint was placed".to_owned());
+        }
+        if let Err(error) = commit(&engine, 2) {
+            wrong.push(format!(
+                "checkpoint: the log refused the next commit: {error}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A commit that fails leaves the asserted identity it was to publish
+/// (`Transaction::asserted_identity_after`) unused (P2-C1, DUR's condition 5 of 8 Nov):
+/// a rotation that fails before it changes anything, one whose segment may be placed
+/// (which poisons the log), and a commit on that poisoned log. Expected: neither the
+/// snapshot after the failure, nor the next commit's summary and snapshot, nor the store
+/// reopened has it.
+#[test]
+fn a_failed_commit_never_publishes_its_asserted_identity() {
+    let mut wrong = Vec::new();
+    for (step, point, poisoned_first) in [
+        ("rotation", &fault::FAIL_ROTATE, false),
+        ("segment placed", &fault::FAIL_SEGMENT_PLACED, false),
+        ("poisoned log", &fault::FAIL_SEGMENT_PLACED, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), small_segments()).unwrap();
+        commit(&engine, 1).unwrap();
+        if poisoned_first {
+            point.set(true);
+            assert!(commit(&engine, 2).is_err());
+            point.set(false);
+        }
+        let mut tx = engine.transaction();
+        tx.insert(quad(3).as_ref());
+        let reserved = tx.asserted_identity_after();
+        point.set(!poisoned_first);
+        let failed = tx.commit();
+        point.set(false);
+        if failed.is_ok() {
+            wrong.push(format!("{step}: the commit succeeded"));
+            continue;
+        }
+        let mut seen = vec![("after the failure", engine.snapshot().asserted_identity())];
+        if let Ok(next) = commit(&engine, 4) {
+            seen.push(("the next commit's summary", next.asserted));
+            seen.push((
+                "the next commit's snapshot",
+                engine.snapshot().asserted_identity(),
+            ));
+        }
+        drop(engine);
+        let engine = Engine::open(dir.path(), small_segments()).unwrap();
+        seen.push(("reopened", engine.snapshot().asserted_identity()));
+        wrong.extend(
+            seen.iter()
+                .filter(|(_, identity)| *identity == reserved)
+                .map(|(at, _)| format!("{step}: {at} has the failed commit's identity")),
+        );
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

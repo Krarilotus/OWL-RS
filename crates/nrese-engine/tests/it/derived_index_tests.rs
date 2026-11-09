@@ -42,6 +42,7 @@ fn search(engine: &Engine, text: &str) -> Vec<String> {
             prefix: false,
             stem: None,
         })
+        .unwrap()
         .into_iter()
         .filter_map(|m| snapshot.decode(nrese_engine::TermId::from_raw(m.id)))
         .map(|t| t.to_string())
@@ -78,7 +79,9 @@ fn text_and_vector_indexes_survive_a_reopen() {
         assert_eq!(text.len(), 2);
         let snapshot = engine.snapshot();
         snapshot.prepare_vector_graph(&query);
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
+        let (found, report) = snapshot
+            .vector_search(&query, &|_| true, crate::unlimited())
+            .unwrap();
         assert!(report.graph);
         engine.checkpoint().unwrap();
         assert!(dir.path().join("derived/text.index").exists());
@@ -89,18 +92,23 @@ fn text_and_vector_indexes_survive_a_reopen() {
     assert_eq!(engine.stats().dictionary.derived_loaded, 0);
     assert_eq!(search(&engine, "bridge*"), before_text);
     let snapshot = engine.snapshot();
-    let (found, report) = snapshot.vector_search(&query, &|_| true);
+    let (found, report) = snapshot
+        .vector_search(&query, &|_| true, crate::unlimited())
+        .unwrap();
     assert!(
         report.graph && report.scanned == 0,
         "the graph read back: {report:?}"
     );
-    assert_eq!(found, before_vectors);
+    assert_eq!(*found, *before_vectors);
     assert_eq!(engine.stats().dictionary.derived_loaded, 2);
     // Terms interned since extend what was read.
     insert(&engine, "c", Literal::new_simple_literal("Bridge of Sighs"));
     assert_eq!(search(&engine, "bridge*").len(), 3);
     insert(&engine, "near", vector(&[1.0, 0.0001]));
-    let (found, _) = engine.snapshot().vector_search(&query, &|_| true);
+    let (found, _) = engine
+        .snapshot()
+        .vector_search(&query, &|_| true, crate::unlimited())
+        .unwrap();
     assert!(found[0].1 < 1e-6, "{found:?}");
 }
 
@@ -172,7 +180,9 @@ fn large_graphs_are_built_in_the_background() {
         strategy: VectorStrategy::Exact,
         ..query.clone()
     };
-    let (nearest, _) = snapshot.vector_search(&exact, &|_| true);
+    let (nearest, _) = snapshot
+        .vector_search(&exact, &|_| true, crate::unlimited())
+        .unwrap();
     let scanned = VectorSearchReport {
         space: 60_000,
         graph: false,
@@ -180,14 +190,18 @@ fn large_graphs_are_built_in_the_background() {
     };
     // Pending: every search scans and answers exactly; the first started the one build.
     for search in ["first", "second"] {
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
+        let (found, report) = snapshot
+            .vector_search(&query, &|_| true, crate::unlimited())
+            .unwrap();
         assert_eq!(report, scanned, "{search} search");
-        assert_eq!(found, nearest, "{search} search");
+        assert_eq!(*found, *nearest, "{search} search");
     }
     let build = builds.try_recv().expect("the first search started a build");
     assert!(builds.try_recv().is_err(), "one build while it is pending");
     build.run();
-    let (found, report) = snapshot.vector_search(&query, &|_| true);
+    let (found, report) = snapshot
+        .vector_search(&query, &|_| true, crate::unlimited())
+        .unwrap();
     assert_eq!(
         report,
         VectorSearchReport {

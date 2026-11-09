@@ -139,8 +139,42 @@ pub(crate) fn each_graph_quad_once(
     each_of(quads, each)
 }
 
-/// The quads of a request payload, in the graphs it names (the default graph for triples),
-/// to `each` (as `consumer` needs them).
+/// The store graph `graph` names: the default graph for another store's name for it
+/// (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`: [`nrese_sparql::compat`]), which every
+/// SPARQL name of it reads; otherwise `graph`. The store's one placement of a graph name: a
+/// document's graphs, an explicit context or target, a restore's and a bulk load's graphs all
+/// pass through here, after any protocol override and before any permission check.
+pub(crate) fn stored_graph(graph: GraphName) -> GraphName {
+    match &graph {
+        GraphName::NamedNode(name) if nrese_sparql::compat::names_default_graph(name.as_str()) => {
+            GraphName::DefaultGraph
+        }
+        _ => graph,
+    }
+}
+
+/// [`stored_graph`] of a borrowed name, for a quad read as it goes.
+pub(crate) fn stored_graph_ref(graph: GraphNameRef<'_>) -> GraphNameRef<'_> {
+    match graph {
+        GraphNameRef::NamedNode(name)
+            if nrese_sparql::compat::names_default_graph(name.as_str()) =>
+        {
+            GraphNameRef::DefaultGraph
+        }
+        _ => graph,
+    }
+}
+
+/// `quad` in the graph the store keeps it in ([`stored_graph`]).
+pub(crate) fn stored(mut quad: Quad) -> Quad {
+    quad.graph_name = stored_graph(quad.graph_name);
+    quad
+}
+
+/// The quads of a request payload, in the graphs it names as written (the default graph for
+/// triples): a protocol can still tell a graph left out from one named, an alias of the
+/// default graph included; where they are placed, they pass through [`stored_graph_ref`].
+/// Each to `each` (as `consumer` needs them).
 pub(crate) fn each_payload_quad(
     format: RdfFormat,
     base_iri: Option<&str>,
@@ -156,7 +190,7 @@ pub(crate) fn each_payload_quad(
 /// The quads of a request payload that must be kept (a repository's configuration, read in
 /// several passes), in the graphs it names, with fresh blank nodes: each charged to
 /// `memory` before it is copied, its slot and every string and triple term it owns. A
-/// refusal is a memory error, with nothing copied past it.
+/// refusal is a memory error, with nothing copied past it. The graphs are as written.
 pub fn parse_payload(
     format: GraphResultFormat,
     base_iri: Option<&str>,

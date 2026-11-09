@@ -82,25 +82,34 @@ async fn run() -> Result<()> {
         )?;
         return print_query(&store, print.clone());
     }
-    let mut config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
+    let config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
     config.install_process_memory_policy()?;
-    // The default repository's reasoning as changed through the engine API overrides the
-    // configuration's (it is kept in the data directory).
-    if let Some(settings) = nrese_server::repositories::stored_default_settings(&config.store)
-        .map_err(|error| anyhow::anyhow!(error))?
-        && let Some(reasoner) = settings
-            .reasoner_config()
-            .map_err(|error| anyhow::anyhow!(error))?
-    {
+    // The default repository's settings as changed through the engine API (kept in the data
+    // directory) are in effect for it: its reasoning and its store's modes. The configured
+    // reasoning stays the server's, for the repositories that name none.
+    let default = nrese_server::repositories::Effective::of_default(&config.store)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let default_reasoner = default
+        .reasoning
+        .clone()
+        .unwrap_or_else(|| config.reasoner.clone());
+    if default.reasoning.is_some() {
         tracing::info!(
-            reasoning = ?reasoner.mode(),
+            reasoning = ?default_reasoner.mode(),
             "the default repository's stored settings choose its reasoning"
         );
-        config.reasoner = reasoner;
     }
     if cli.command == CliCommand::CheckConfig {
-        // Loading validated everything; show what takes effect.
+        // Loading validated everything; show what takes effect. `reasoner.mode` is the
+        // server's, for the repositories that name none; the default repository's own, if its
+        // stored settings choose one, is its line.
         print!("{}", config.summary());
+        if default.reasoning.is_some() {
+            println!(
+                "default repository reasoning: {} (its stored settings)",
+                default_reasoner.mode().as_str()
+            );
+        }
         println!("cpu: {}", nrese_store::cpu::summary());
         println!("configuration is valid");
         return Ok(());
@@ -141,6 +150,7 @@ async fn run() -> Result<()> {
         }
     }
     let store = StoreService::new(config.store.clone())?;
+    default.apply(&store);
     if let CliCommand::Backup(dir) = &cli.command {
         let manifest = store
             .backup_image(dir)
@@ -154,7 +164,7 @@ async fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let program = config.reasoner.materialised_program();
+    let program = default_reasoner.materialised_program();
     if let CliCommand::Query(query) = cli.command {
         bring_inferences_up_to_date(&store, program.as_ref(), replica)?;
         return query_once(&store, query);
@@ -217,10 +227,14 @@ async fn run() -> Result<()> {
         config.deployment_posture,
     )?;
     let state = state.with_replication(config.replication.clone());
-    if replica {
-        nrese_server::replication::follow(state.clone())?;
+    // Held for as long as the server serves; stopped when it ends.
+    let follower = if replica {
+        let follower = nrese_server::replication::follow(state.clone())?;
         tracing::info!(primary = ?config.replication.primary, "following the primary's log");
-    }
+        Some(follower)
+    } else {
+        None
+    };
     state.mark_ready();
     let app = build_app(state);
 
@@ -237,6 +251,7 @@ async fn run() -> Result<()> {
         deployment_posture = config.deployment_posture.as_str(),
         data_dir = %store.config().data_dir.display(),
         reasoning_mode = ?reasoner.config().mode(),
+        default_reasoning_mode = ?default_reasoner.mode(),
         reasoner_profile = reasoner.profile_name(),
         reasoner_capabilities = reasoner.capabilities().len(),
         ontology_path = ontology_path.as_ref().map(|path| path.display().to_string()),
@@ -252,12 +267,15 @@ async fn run() -> Result<()> {
         }
     });
     // Peer addresses for the mtls mode's trusted proxies.
-    axum::serve(
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    .context("nrese-server terminated unexpectedly")
+    .await;
+    if let Some(follower) = follower {
+        follower.stop().await;
+    }
+    served.context("nrese-server terminated unexpectedly")
 }
 
 /// Reasoner v2: brings the inferred stack in line with the configured rules, unless the

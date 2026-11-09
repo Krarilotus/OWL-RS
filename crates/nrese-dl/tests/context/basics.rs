@@ -41,7 +41,7 @@ fn pericarditis_is_a_heart_disease() {
     assert!(holds(&mut table, &c, "Pericarditis", "Disease"));
     assert!(holds(&mut table, &c, "Pericardium", "Tissue"));
     assert!(!holds(&mut table, &c, "HeartDisease", "Pericarditis"));
-    assert!(c.unsatisfiable.is_empty() && c.consistent);
+    assert!(c.unsatisfiable.is_empty() && c.consistency == nrese_dl::verdict::Verdict::Consistent);
 }
 
 /// Inverse roles and universals: what a successor knows travels back through Pred.
@@ -141,6 +141,41 @@ fn conjunctive_fillers_and_bottom_propagation() {
     assert!(unsat(&mut table, &c, "Z"));
 }
 
+/// An axiom the reader left out (a fatal diagnostic): a model of the rest says nothing of
+/// the whole, so the verdict is undecided; a clash in the rest still stands (sol-loop S2).
+#[test]
+fn a_left_out_axiom_leaves_consistency_undecided() {
+    use nrese_dl::verdict::Verdict;
+    let malformed = |b: &mut Build| nrese_owl::Diagnostic::Malformed {
+        node: b.t("r"),
+        what: "a restriction without a property",
+    };
+    let mut table = Table::default();
+    let mut b = Build::new(&mut table);
+    let (a, bb) = (b.c("A"), b.c("B"));
+    b.sub(a, bb);
+    let fatal = malformed(&mut b);
+    let mut o = b.done();
+    o.diagnostics.push(fatal);
+    let c = classify(&o, 1).expect("Horn");
+    assert!(
+        matches!(c.consistency, Verdict::Unknown(_)),
+        "{:?}",
+        c.consistency
+    );
+
+    let mut b = Build::new(&mut table);
+    let (a, bot) = (b.c("A"), b.e(ClassExpr::Nothing));
+    let thing = b.e(ClassExpr::Thing);
+    b.sub(thing, a);
+    b.sub(a, bot);
+    let fatal = malformed(&mut b);
+    let mut o = b.done();
+    o.diagnostics.push(fatal);
+    let c = classify(&o, 1).expect("Horn");
+    assert_eq!(c.consistency, Verdict::Inconsistent);
+}
+
 /// Classes equivalent to `owl:Thing`, and an inconsistent TBox and ABox.
 #[test]
 fn top_and_inconsistency() {
@@ -162,7 +197,10 @@ fn top_and_inconsistency() {
     b.sub(thing, a);
     b.sub(a, bot);
     let c = classify(&b.done(), 1).expect("Horn");
-    assert!(!c.consistent && c.unsatisfiable.len() == c.classes.len());
+    assert!(
+        c.consistency == nrese_dl::verdict::Verdict::Inconsistent
+            && c.unsatisfiable.len() == c.classes.len()
+    );
 
     let mut b = Build::new(&mut table);
     let (a, bb, cc) = (b.c("A"), b.c("B"), b.c("C"));
@@ -173,10 +211,10 @@ fn top_and_inconsistency() {
     b.axiom(Axiom::ClassAssertion(a, ind));
     b.axiom(Axiom::ClassAssertion(cc, ind));
     let consistent = classify(&b.o.clone(), 1).expect("Horn");
-    assert!(consistent.consistent);
+    assert!(consistent.consistency == nrese_dl::verdict::Verdict::Consistent);
     b.axiom(Axiom::ClassAssertion(bb, ind));
     let c = classify(&b.done(), 1).expect("Horn");
-    assert!(!c.consistent);
+    assert!(c.consistency == nrese_dl::verdict::Verdict::Inconsistent);
 }
 
 /// Fuzz case 8414 of the EL gate, where the EL classifier (ELK's handling of ranges,
@@ -213,7 +251,7 @@ fn assertions_along_named_edges() {
     let consistent = |table: &mut Table, build: &dyn Fn(&mut Build)| {
         let mut b = Build::new(table);
         build(&mut b);
-        classify(&b.done(), 1).expect("Horn").consistent
+        classify(&b.done(), 1).expect("Horn").consistency == nrese_dl::verdict::Verdict::Consistent
     };
     // A ⊑ ∀r.B, B ⊓ C ⊑ ⊥, A(a), r(a, b): C(b) clashes.
     let forward = |b: &mut Build, clash: bool| {

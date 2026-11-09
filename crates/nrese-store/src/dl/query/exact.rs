@@ -61,15 +61,17 @@ pub(super) fn decide_until(
         return unresolved(&Limit::Time.reached("the deadline passed"));
     }
     let config = &store.config().dl;
-    let base = ontology_at(store, snapshot);
+    let Ok(base) = ontology_at(store, snapshot) else {
+        return unresolved(nrese_dl::memory::EXHAUSTED);
+    };
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
     if scratch
-        .charge(|| nrese_dl::memory::ontology_bytes(&base))
+        .charge(|| nrese_dl::memory::ontology_bytes(base.value()))
         .is_err()
     {
         return unresolved(nrese_dl::memory::EXHAUSTED);
     }
-    let mut ontology = (*base).clone();
+    let mut ontology = (**base.value()).clone();
     let ids = Ids::of(snapshot);
     let data_properties = data_properties(&ontology);
     let mut paths = Vec::new();
@@ -287,14 +289,6 @@ impl Ids {
     }
 }
 
-fn is_literal(t: u64) -> bool {
-    use nrese_engine::TermKind;
-    !matches!(
-        TermId::from_raw(t).kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
-}
-
 /// The tests that decide one instantiated query: each ground atom not in L, and each
 /// tree of existential variables rolled up.
 fn tests_of(
@@ -376,7 +370,7 @@ pub(crate) fn ground_axiom(
     if Some(p) == ids.same_as {
         return Ok(Axiom::SameIndividual(vec![s, v]));
     }
-    if is_literal(v) {
+    if TermId::from_raw(v).kind().is_literal() {
         note_literal(o, snapshot, v);
         return Ok(Axiom::DataPropertyAssertion(p, s, v));
     }

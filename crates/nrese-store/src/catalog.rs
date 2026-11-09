@@ -95,6 +95,15 @@ pub struct RepositorySettings {
     /// docs/design/ql-rewriting.md §4); the server's `reasoner.ql_rewriting` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ql_rewriting: Option<String>,
+    /// What searches rank and select among (`global`, `reader`;
+    /// [`crate::StoreConfig::search_scope`]); the server's `store.search_scope` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_scope: Option<String>,
+    /// Bytes a `reader` search scope's corpora may take
+    /// ([`crate::StoreConfig::reader_corpus_bytes`]); the server's
+    /// `store.reader_corpus_bytes` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_corpus_bytes: Option<u64>,
 }
 
 /// The longest per-repository query timeout: one hour.
@@ -111,6 +120,19 @@ impl RepositorySettings {
         self.ql_rewriting
             .as_deref()
             .and_then(crate::QlRewritingMode::from_name)
+    }
+
+    /// The search scope, if the settings choose one.
+    pub fn search_scope_mode(&self) -> Option<crate::SearchScope> {
+        self.search_scope
+            .as_deref()
+            .and_then(crate::SearchScope::from_name)
+    }
+
+    /// The bytes a `reader` search scope's corpora may take, if the settings give them.
+    pub fn reader_corpus_bytes(&self) -> Option<usize> {
+        self.reader_corpus_bytes
+            .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
     }
 
     /// The reasoning mode, if the settings choose one.
@@ -141,6 +163,64 @@ impl RepositorySettings {
     }
 }
 
+/// What a repository runs with: its settings resolved against the server's (the store
+/// template's modes, and the server's reasoning where it names none). The one resolution of
+/// a repository's settings: its start, a change of them and what it reports use it, so a
+/// setting saved is the setting in effect, also after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effective {
+    /// The repository's own reasoning; `None`: the server's.
+    pub reasoning: Option<ReasonerConfig>,
+    pub ql_rewriting: crate::QlRewritingMode,
+    pub search_scope: crate::SearchScope,
+    pub reader_corpus_bytes: usize,
+}
+
+impl Effective {
+    /// `settings` resolved against `template`'s modes.
+    pub fn of(settings: &RepositorySettings, template: &StoreConfig) -> Result<Self, CatalogError> {
+        Ok(Self {
+            reasoning: settings.reasoner_config().map_err(CatalogError::Invalid)?,
+            ql_rewriting: settings
+                .ql_rewriting_mode()
+                .unwrap_or(template.ql_rewriting),
+            search_scope: settings
+                .search_scope_mode()
+                .unwrap_or(template.search_scope),
+            reader_corpus_bytes: settings
+                .reader_corpus_bytes()
+                .unwrap_or(template.reader_corpus_bytes),
+        })
+    }
+
+    /// The default repository's, from the settings stored for it in `template`'s data
+    /// directory (none stored: the template's own). Also the server's start uses it, for the
+    /// reasoning it brings the default store's inferences in line with.
+    pub fn of_default(template: &StoreConfig) -> Result<Self, CatalogError> {
+        let settings = stored_default_settings(template)
+            .map_err(CatalogError::Store)?
+            .unwrap_or_default();
+        Self::of(&settings, template)
+    }
+
+    /// The reasoning in effect: the repository's own, else `server`'s.
+    pub fn reasoner(&self, server: &ReasonerService) -> ReasonerService {
+        match &self.reasoning {
+            Some(config) => ReasonerService::new(config.clone()),
+            None => server.clone(),
+        }
+    }
+
+    /// Sets `store`'s modes to these: every one, whatever it had (a setting is never taken
+    /// as applied because the saved value didn't change). The setters do nothing for a
+    /// value they already have.
+    pub fn apply(&self, store: &StoreService) {
+        store.set_ql_rewriting(self.ql_rewriting);
+        store.set_search_scope(self.search_scope);
+        store.set_reader_corpus_bytes(self.reader_corpus_bytes);
+    }
+}
+
 /// A repository's settings, in its directory.
 const SETTINGS_FILE: &str = "repository.json";
 
@@ -166,6 +246,25 @@ impl Repository {
             settings: Arc::new(RwLock::new(settings)),
             lifecycle: Arc::default(),
         }
+    }
+
+    /// Its settings and its write path as one observation: both before a change or both
+    /// after it, never one of each (C1001-R1-O1). Lock order, here and in [`Self::publish`]:
+    /// the write path, then the settings.
+    pub fn observe(&self) -> (RepositorySettings, Arc<MutationPipeline>) {
+        let pipeline = self.pipeline.read();
+        let settings = self.settings.read();
+        (settings.clone(), Arc::clone(&pipeline))
+    }
+
+    /// Publishes `settings`, and `pipeline` if it changes too, at once ([`Self::observe`]).
+    fn publish(&self, pipeline: Option<Arc<MutationPipeline>>, settings: RepositorySettings) {
+        let mut slot = self.pipeline.write();
+        let mut saved = self.settings.write();
+        if let Some(pipeline) = pipeline {
+            *slot = pipeline;
+        }
+        *saved = settings;
     }
 }
 
@@ -302,22 +401,27 @@ const TRASH: &str = "~trash-";
 
 impl Catalog {
     /// The repositories of a server whose default store is `store`, reasoning with
-    /// `reasoner` where a repository's settings name none: the default with its stored
-    /// settings (those changed through the engine API), and on disk the others found under
-    /// `repositories/` of its data directory (one that fails to open is logged and left
-    /// out).
+    /// `reasoner` (the server's, as configured) where a repository's settings name none: the
+    /// default with its stored settings (those changed through the engine API) in effect
+    /// ([`Effective`]: its own reasoning, and its store's modes), and on disk the others found
+    /// under `repositories/` of its data directory (one that fails to open is logged and left
+    /// out). The default's own reasoning is the default's alone: the others keep the
+    /// server's.
     pub fn open(store: StoreService, reasoner: ReasonerService) -> Result<Self, CatalogError> {
         let template = store.config().clone();
         let runtime = Arc::clone(store.runtime());
         let default_settings = stored_default_settings(&template)
             .map_err(CatalogError::Store)?
             .unwrap_or_default();
-        if let Err(error) = check(&default_settings) {
-            let file = default_settings_file(&template).unwrap_or_default();
-            return Err(CatalogError::Store(repair(&file, &error.to_string())));
-        }
+        let effective = check(&default_settings)
+            .and_then(|()| Effective::of(&default_settings, &template))
+            .map_err(|error| {
+                let file = default_settings_file(&template).unwrap_or_default();
+                CatalogError::Store(repair(&file, &error.to_string()))
+            })?;
+        effective.apply(&store);
         let default = Repository::new(
-            MutationPipeline::new(Arc::new(store), Arc::new(reasoner.clone())),
+            MutationPipeline::new(Arc::new(store), Arc::new(effective.reasoner(&reasoner))),
             default_settings,
         );
         let root = matches!(template.mode, StoreMode::OnDisk)
@@ -410,19 +514,18 @@ impl Catalog {
     /// Opens (or creates) repository `id`'s store and brings its inferences in line with
     /// its reasoning, as the server does for the default store at start.
     fn start(&self, id: &str, settings: RepositorySettings) -> Result<Repository, String> {
-        let reasoner = match settings.reasoner_config()? {
-            Some(config) => ReasonerService::new(config),
-            None => self.reasoner.clone(),
-        };
+        let effective =
+            Effective::of(&settings, &self.template).map_err(|error| error.to_string())?;
+        let reasoner = effective.reasoner(&self.reasoner);
         let config = StoreConfig {
             data_dir: self
                 .root
                 .as_ref()
                 .map_or_else(|| self.template.data_dir.clone(), |root| root.join(id)),
             ontology_path: None,
-            ql_rewriting: settings
-                .ql_rewriting_mode()
-                .unwrap_or(self.template.ql_rewriting),
+            ql_rewriting: effective.ql_rewriting,
+            search_scope: effective.search_scope,
+            reader_corpus_bytes: effective.reader_corpus_bytes,
             ..self.template.clone()
         };
         let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
@@ -447,16 +550,6 @@ impl Catalog {
             MutationPipeline::new(Arc::new(store), Arc::new(reasoner)),
             settings,
         ))
-    }
-
-    /// The reasoning of `settings`: theirs, else the server's.
-    fn reasoner_for(&self, settings: &RepositorySettings) -> Result<ReasonerService, CatalogError> {
-        Ok(
-            match settings.reasoner_config().map_err(CatalogError::Invalid)? {
-                Some(config) => ReasonerService::new(config),
-                None => self.reasoner.clone(),
-            },
-        )
     }
 
     /// Where repository `id`'s settings are kept (`None` in memory).
@@ -593,14 +686,26 @@ impl Catalog {
     }
 
     /// Changes repository `id`'s settings: its title, and its reasoning, which takes effect
-    /// at once. Kept in its directory on disk; the default repository's override the
-    /// configuration's reasoning at the next start.
+    /// at once. Kept in its directory on disk, and in effect again after a restart
+    /// ([`Effective`]); the default repository's are its own: the configured reasoning stays
+    /// that of the repositories that name none.
     ///
     /// A new reasoning is prepared with the old write path retired (its writes are refused,
     /// retryable, until the new one is published): compiled, the inferences recomputed,
     /// the settings written, then a write path over the store with it published. A failure
     /// publishes the old reasoning again, its inferences recomputed if they had changed.
     pub fn change(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
+        self.patch(id, |_| Ok(settings))
+    }
+
+    /// [`Self::change`] to the settings `edit` makes of the current ones, read under the
+    /// repository's lifecycle lock: a change made meanwhile is kept (C-1001), never undone
+    /// by a copy read before it. `edit` must not call the catalog (that lock is held).
+    pub fn patch(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&RepositorySettings) -> Result<RepositorySettings, CatalogError>,
+    ) -> Result<(), CatalogError> {
         let missing = || CatalogError::NotFound(format!("no repository '{id}'"));
         let repository = self.get(id).ok_or_else(missing)?;
         let _lifecycle = repository.lifecycle.lock();
@@ -614,8 +719,10 @@ impl Catalog {
         {
             return Err(missing());
         }
-        check(&settings)?;
         let before = repository.settings.read().clone();
+        let settings = edit(&before)?;
+        check(&settings)?;
+        let effective = Effective::of(&settings, &self.template)?;
         // A settings file in place but not made durable: neither the old state nor the new
         // one is known to survive, so the repository serves nothing until a restart, which
         // reads the file again.
@@ -641,8 +748,10 @@ impl Catalog {
             None => Ok(()),
         }
         };
-        if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
-            let reasoner = self.reasoner_for(&settings)?;
+        let pipeline = if (&before.reasoning, &before.rules)
+            != (&settings.reasoning, &settings.rules)
+        {
+            let reasoner = effective.reasoner(&self.reasoner);
             let previous = Arc::clone(&*repository.pipeline.read());
             let store = Arc::clone(previous.store());
             // First: the old write path would otherwise recompute its own inferences over
@@ -685,19 +794,23 @@ impl Catalog {
                 Err((error, true)) => return Err(error),
                 Err((error, false)) => return Err(roll_back(error)),
             }
-            *repository.pipeline.write() =
-                Arc::new(MutationPipeline::new(store, Arc::new(reasoner)));
+            effective.apply(&store);
+            Some(Arc::new(MutationPipeline::new(store, Arc::new(reasoner))))
         } else {
             persist().map_err(|(error, _)| error)?;
-        }
-        if before.ql_rewriting != settings.ql_rewriting {
-            let mode = settings
-                .ql_rewriting_mode()
-                .unwrap_or(self.template.ql_rewriting);
-            repository.pipeline.read().store().set_ql_rewriting(mode);
-        }
-        *repository.settings.write() = settings;
+            effective.apply(repository.pipeline.read().store());
+            None
+        };
+        #[cfg(test)]
+        tests::publishing();
+        repository.publish(pipeline, settings);
         Ok(())
+    }
+
+    /// Repository `id`'s settings and its write path, as published together
+    /// ([`Repository::observe`]); `None` as [`Self::get`].
+    pub fn observe(&self, id: &str) -> Option<(RepositorySettings, Arc<MutationPipeline>)> {
+        self.get(id).map(|repository| repository.observe())
     }
 
     /// The server's reasoning, for repositories whose settings name none.
@@ -719,6 +832,13 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     {
         return Err(CatalogError::Invalid(format!(
             "ql_rewriting must be 'auto', 'on' or 'off', not '{name}'"
+        )));
+    }
+    if let Some(name) = &settings.search_scope
+        && settings.search_scope_mode().is_none()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "search_scope must be 'global' or 'reader', not '{name}'"
         )));
     }
     if let Some(ms) = settings.query_timeout_ms
@@ -825,7 +945,8 @@ impl Catalog {
             // could bring it back, and the next start would reclaim the new repository. A sync
             // of the directory makes every such unlink durable, else nothing is created.
             // (A new directory holds no tombstone: its first sync is as good.)
-            let synced = std::fs::create_dir_all(root).and_then(|()| crate::metadata::sync(root));
+            let synced = nrese_engine::place::create_dir_all(root)
+                .and_then(|()| crate::metadata::sync(root));
             if let Err(error) = synced {
                 return Err(CatalogError::Store(format!(
                     "{}: {error}; no repository is created until the directory can be synced (a removal's tombstone may not be durably gone)",
@@ -844,7 +965,7 @@ impl Catalog {
                     dir.display()
                 )));
             }
-            std::fs::create_dir_all(&dir)
+            nrese_engine::place::create_dir_all(&dir)
                 .map_err(|error| CatalogError::Store(format!("{}: {error}", dir.display())))?;
             write_settings(&dir.join(SETTINGS_FILE), &settings)?;
         }
@@ -919,6 +1040,64 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::{TRASH, existing, valid};
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        /// What a test runs on the changing thread just before a change publishes its
+        /// settings ([`super::Catalog::patch`]).
+        static PUBLISHING: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The hook [`PUBLISHING`] holds, if a test set one.
+    pub(super) fn publishing() {
+        if let Some(hook) = PUBLISHING.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// A change of reasoning publishes its settings and its write path together
+    /// (C1001-R1-O1): a reader, just before the change publishes its settings, sees the old
+    /// reasoning beside the old settings, never the new write path beside the old settings.
+    /// Red without the fix, which published the write path first.
+    #[test]
+    fn a_change_publishes_its_settings_and_its_reasoning_together() {
+        use super::{DEFAULT_REPOSITORY, RepositorySettings};
+        let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+        let catalog = super::Catalog::open(
+            store,
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap();
+        let repository = catalog.get(DEFAULT_REPOSITORY).unwrap();
+        let mode = || repository.pipeline.read().reasoner().mode_name();
+        let before = (mode(), repository.settings.read().reasoning.clone());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (observer, record) = (repository.clone(), std::sync::Arc::clone(&seen));
+        PUBLISHING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mode = observer.pipeline.read().reasoner().mode_name();
+                let saved = observer.settings.read().reasoning.clone();
+                *record.lock().unwrap() = Some((mode, saved));
+            }))
+        });
+        let rdfs = RepositorySettings {
+            reasoning: Some("rdfs".to_owned()),
+            ..RepositorySettings::default()
+        };
+        catalog.change(DEFAULT_REPOSITORY, rdfs).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            Some(before),
+            "a reader just before the settings publish"
+        );
+        assert_eq!(
+            (mode(), repository.settings.read().reasoning.clone()),
+            ("rdfs", Some("rdfs".to_owned())),
+            "after the change"
+        );
+    }
 
     fn on_disk(dir: &std::path::Path) -> super::Catalog {
         let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir)).unwrap();

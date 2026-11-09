@@ -81,6 +81,21 @@ A dropped transaction does not undo dictionary interning (`crates/nrese-engine/s
 one index → inner → order → derived bookkeeping, never two locks of one level. Rayon workers use fallible slot admission rather than waiting;
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
 
+**A version's own slots** (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
+value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
+the snapshot and its other slots. The engine takes it under none of its own locks: an installed version is a value no snapshot held
+(`Versions::install`), so nothing drains it.
+
+**The `owl2-dl` bounds (U1):** `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145` (P2-C6b). Its `state` and `view` mutexes guard
+serial work only: taking what a read or a commit needs, a revision check, publishing, applying a computed change. The engine's writer slot and
+the mutation pipeline's ground cache (`crates/nrese-store/src/mutation/pipeline.rs:227`) come before the mutation-side `state`, which `install`
+takes after the commit returns (:363). A build cell's `building` mutex (`crates/nrese-exec/src/cell.rs:145`) comes before the `state`/`view`
+check its `kept` closure makes. No path that holds a bounds guard enters the Rayon pool, the engine or the dictionary: U1's change, its
+builds, the taxonomy and a view's runs hold none, and a revision's builds go through the `BuildCell` under the bounded rule (a Rayon worker
+builds its own instead of waiting). "Before the dictionary" is the guards' place in the hierarchy, not permission to call the dictionary or a
+dictionary callback under one. Until P2-C6b, `state` was held across that parallel work. At pool widths 1 and 2 the cycle with pool readers
+was reproduced on `a3453435` (red proof `c6b-u1-red-3-94d752b7`).
+
 Known bypasses and gaps:
 
 - `crates/nrese-engine/src/term/dictionary.rs:1437`: Public with_view runs a caller closure while inner.read is held (:1441–1445), beyond the module's named callback exceptions.
@@ -88,7 +103,6 @@ Known bypasses and gaps:
 - `crates/nrese-engine/src/term/dictionary.rs:1252`: Prefix path retains inner and order guards through order::extend (:1266), which can enter parallel ordering.
 - `crates/nrese-engine/src/term/dictionary.rs:1294`: text_order retains inner/order while sorted_within (:1313) enters parallel work (`crates/nrese-engine/src/term/order.rs:131`).
 - `crates/nrese-engine/src/term/dictionary.rs:1533`: Pending numbering and remap execute under upgradable inner read (:1536–1540); numbering is parallel (`crates/nrese-engine/src/term/pending.rs:220`).
-- `crates/nrese-store/src/dl/bounds.rs:65`: the state/view mutexes have no documented place in the combined hierarchy. This is not a reproduced deadlock; speculative transactions do not acquire the writer slot.
 
 ## Durability
 
@@ -164,18 +178,15 @@ Known bypasses:
 
 ## Reasoner verdicts
 
-**Owners:** store `Verdict/Checked` (`crates/nrese-store/src/dl/consistency.rs:14`, :42), query `Completeness/Regime`
-(`crates/nrese-sparql/src/completeness.rs:12`, :50), tableau `Answer` (`crates/nrese-dl/src/tableau/mod.rs:229`) and beyond `Verdict`
-(`crates/nrese-dl/src/beyond/mod.rs:65`). Consistent requires established consistency; unknown includes unsupported or exhausted runs. Completeness
-means all certain answers under the regime; soundness means each returned answer is certain. `ReasonerRunStatus::Completed`
-(`crates/nrese-reasoner/src/capability.rs:33`) is lifecycle telemetry. Preserve reasons and revision/regime identity; map tableau Unsupported/GaveUp to
-Unknown (:158 in consistency.rs), lower guarantees for unknown consistency, and refuse exact answers without completeness. See [reasoning
-semantics](../spec/reasoning-semantics.md).
-
-Known bypasses:
-
-- `crates/nrese-store/src/draft_check.rs:441`: Draft reasoning derives `consistent` solely from RL violation count, then emits logical_consistent at :445 while separately carrying unsupported reasons.
-- `crates/nrese-dl/src/classify/driver.rs:230`: Classification finish initializes consistent=true, while undecided classes are recorded separately at :249–262.
+**Owners:** nrese-dl `Verdict` (`crates/nrese-dl/src/verdict.rs:8`), re-exported as store `dl::Verdict`; store `Checked`
+(`crates/nrese-store/src/dl/consistency.rs:18`); query `Completeness/Regime` (`crates/nrese-sparql/src/completeness.rs:12`, :50), tableau `Answer`
+(`crates/nrese-dl/src/tableau/mod.rs:229`) and beyond `Verdict` (`crates/nrese-dl/src/beyond/mod.rs:65`, converted by `consistency()`). The verdict has
+no default: classification states `Consistent`, `Inconsistent` or `Unknown(why)`, and its reports (`crates/nrese-store/src/classification.rs`) list
+nothing for an inconsistent ontology and always carry a reason for an undecided one (`reasons`, :72). Consistent requires established consistency;
+unknown includes unsupported or exhausted runs and parts left out of the reading. Completeness means all certain answers under the regime; soundness
+means each returned answer is certain. `ReasonerRunStatus::Completed` (`crates/nrese-reasoner/src/capability.rs:33`) is lifecycle telemetry. Preserve
+reasons and revision/regime identity; map tableau Unsupported/GaveUp to Unknown (:138 in consistency.rs), lower guarantees for unknown consistency,
+and refuse exact answers without completeness. See [reasoning semantics](../spec/reasoning-semantics.md).
 
 ## Dataset and bench inputs
 

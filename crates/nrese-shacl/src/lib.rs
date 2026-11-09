@@ -30,7 +30,7 @@ mod validate;
 
 pub use compile::{ShapeError, compile};
 pub use graph::Selection;
-pub use incremental::validate_changes;
+pub use incremental::{validate_changes, validate_shapes_change};
 pub use model::{Component, SH, Severity, ShapeRef, Shapes};
 pub use report::{PropertyPath, ValidationReport, ValidationResult};
 
@@ -58,6 +58,9 @@ pub fn validate<V: ReadView + Sync>(
     data: Selection,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
-    let (raw, failures) = validate::validate_raw(view, shapes, data, resources)?;
-    Ok(report::decode(view, shapes, &raw, failures))
+    let (raw, failures, held) = validate::validate_raw(view, shapes, data, resources, false)?;
+    // The raw results are freed as they are decoded, then their charge returned.
+    let report = report::decode(view, shapes, raw, failures, resources);
+    drop(held);
+    report
 }

@@ -68,6 +68,9 @@ impl Value {
         };
         if let Some(tag) = language {
             return match datatype {
+                // XML's Char only: the map's text model has no other strings (`text`, the
+                // regular alphabet). RDF 1.1 Concepts §3.3 gives rdf:langString all of Unicode,
+                // rdf:PlainLiteral XML's Char; telling the two apart needs that model widened.
                 Datatype::LangString | Datatype::PlainLiteral if !tag.is_empty() => {
                     if !lexical.chars().all(text::is_xml_char) {
                         return Err(ill("a character XML doesn't allow"));
@@ -94,8 +97,18 @@ impl Value {
             Datatype::Rational => Value::Real(number(Rational::parse_rational(lexical))?),
             Datatype::Decimal => Value::Real(number(Rational::parse_decimal(lexical))?),
             d if d.integer_bounds().is_some() => {
-                let r = number(Rational::parse_integer(lexical))?;
                 let (lo, hi) = d.integer_bounds().unwrap_or((None, None));
+                let r = match Rational::parse_integer(lexical) {
+                    // Past 128 bits, its sign alone puts it outside a bound the type has.
+                    Err(NumberError::Range) => {
+                        let negative = lexical.starts_with('-');
+                        if (negative && lo.is_some()) || (!negative && hi.is_some()) {
+                            return Err(ill("out of the datatype's range"));
+                        }
+                        number(Err(NumberError::Range))?
+                    }
+                    r => number(r)?,
+                };
                 let i = r.numerator();
                 if lo.is_some_and(|lo| i < lo) || hi.is_some_and(|hi| i > hi) {
                     return Err(ill("out of the datatype's range"));
@@ -143,23 +156,39 @@ impl Value {
             }
             Datatype::AnyUri => Value::AnyUri(string(lexical)?),
             Datatype::DateTime | Datatype::DateTimeStamp => {
-                let d = DateTime::from_str(lexical).map_err(|e| ill(&e.to_string()))?;
+                // A valid form past what is represented is unsupported, never ill-typed; a
+                // dateTimeStamp without its timezone is ill-typed whatever its year.
+                let d = DateTime::from_str(lexical).map_err(|e| match e.unrepresented() {
+                    Some(false) if datatype == Datatype::DateTimeStamp => {
+                        ill("a dateTimeStamp needs a timezone")
+                    }
+                    Some(_) => LiteralError::Unsupported(format!("{lexical:?}: {e}")),
+                    None => ill(&e.to_string()),
+                })?;
+                // The lexical space first (XML Schema 1.1 Part 2 §3.4.28.1), then what is
+                // represented.
+                let (instant, timezone) = d.timeline();
+                if datatype == Datatype::DateTimeStamp && timezone.is_none() {
+                    return Err(ill("a dateTimeStamp needs a timezone"));
+                }
                 if fraction_digits(lexical) > 18 {
                     return Err(LiteralError::Unsupported(format!(
                         "{lexical:?}: more than 18 fractional digits of a second"
                     )));
                 }
-                let (instant, timezone) = d.timeline();
-                if datatype == Datatype::DateTimeStamp && timezone.is_none() {
-                    return Err(ill("a dateTimeStamp needs a timezone"));
-                }
                 Value::DateTime(instant, timezone)
             }
-            Datatype::XmlLiteral => {
-                Value::XmlLiteral(super::xml::canonical(lexical).ok_or_else(|| {
-                    LiteralError::Unsupported(format!("{lexical:?}: an XML literal not decided"))
-                })?)
-            }
+            Datatype::XmlLiteral => match super::xml::classify(lexical) {
+                Ok(form) => Value::XmlLiteral(form),
+                Err(super::xml::NotCanonical::Malformed) => {
+                    return Err(ill("not well-balanced, self-contained XML content"));
+                }
+                Err(super::xml::NotCanonical::Undecided) => {
+                    return Err(LiteralError::Unsupported(format!(
+                        "{lexical:?}: an XML literal not decided"
+                    )));
+                }
+            },
             _ => return Err(ill("not a datatype of the map")),
         })
     }
@@ -181,8 +210,10 @@ fn fraction_digits(lexical: &str) -> usize {
     digits.trim_end_matches('0').len()
 }
 
+/// XML Schema's `hexBinary`: pairs of hexadecimal digits, nothing else (§3.3.15.2; Rust's
+/// `from_str_radix` alone would also take a sign).
 fn hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
@@ -263,6 +294,10 @@ mod tests {
             Value::parse("a", Datatype::LangString, Some("EN")),
             Ok(Value::LangString("a".into(), "en".into()))
         );
+        assert!(matches!(
+            Value::parse("a\u{1}b", Datatype::String, None),
+            Err(LiteralError::IllTyped(_))
+        ));
         assert_eq!(
             v("a@En", Datatype::PlainLiteral),
             Value::LangString("a".into(), "en".into())
@@ -286,7 +321,8 @@ mod tests {
 
     #[test]
     fn ill_typed_and_unsupported_literals() {
-        for (lexical, d) in [
+        // Every row is checked and the wrong ones reported together.
+        let ill_typed: Vec<String> = [
             ("128", Datatype::Byte),
             ("-1", Datatype::NonNegativeInteger),
             ("1.5", Datatype::Integer),
@@ -295,19 +331,28 @@ mod tests {
             (" a", Datatype::Token),
             ("1a", Datatype::Name),
             ("2000-01-01T00:00:00", Datatype::DateTimeStamp),
+            ("2000-13-01T00:00:00Z", Datatype::DateTime),
+            // A year past what is represented doesn't excuse the rest of the form (XML
+            // Schema 1.1 Part 2 §3.3.7.2, §3.4.28.1): every other part is still checked.
+            ("100000000001-13-01T00:00:00Z", Datatype::DateTime),
+            ("100000000001-01-01T00:00:00", Datatype::DateTimeStamp),
+            ("100000000000-12-31T24:00:00", Datatype::DateTimeStamp),
+            // Leap years by the year itself: 100000000001 and 100000000100 aren't.
+            ("100000000001-02-29T00:00:00Z", Datatype::DateTime),
+            ("100000000100-02-29T00:00:00Z", Datatype::DateTime),
             ("yes", Datatype::Boolean),
             ("F", Datatype::HexBinary),
             ("TQ=", Datatype::Base64Binary),
             ("TR==", Datatype::Base64Binary),
-        ] {
-            assert!(
-                matches!(
-                    Value::parse(lexical, d, None),
-                    Err(LiteralError::IllTyped(_))
-                ),
-                "{lexical} {d:?}"
-            );
-        }
+        ]
+        .into_iter()
+        .filter_map(|(lexical, d)| {
+            let got = Value::parse(lexical, d, None);
+            (!matches!(got, Err(LiteralError::IllTyped(_))))
+                .then(|| format!("{lexical} as {d:?}: {got:?}"))
+        })
+        .collect();
+        assert!(ill_typed.is_empty(), "{ill_typed:#?}");
         assert!(matches!(
             Value::parse("1".repeat(50).as_str(), Datatype::Integer, None),
             Err(LiteralError::Unsupported(_))
@@ -320,5 +365,115 @@ mod tests {
             ),
             Err(LiteralError::Unsupported(_))
         ));
+        // A year has no bound (XML Schema 1.1 Part 2 §3.3.7.2): one past what is represented
+        // is valid, so unsupported, never ill-typed. Every row is checked.
+        let wrong: Vec<String> = [
+            ("100000000001-01-01T00:00:00Z", Datatype::DateTime),
+            ("100000000001-01-01T00:00:00Z", Datatype::DateTimeStamp),
+            ("-100000000001-01-01T00:00:00", Datatype::DateTime),
+            ("99999999999999999999-01-01T00:00:00Z", Datatype::DateTime),
+            ("100000000000-12-31T24:00:00Z", Datatype::DateTime),
+            ("100000000000-12-31T24:00:00", Datatype::DateTime),
+            // 100000000400 is a leap year (divisible by 400), and so is its negation.
+            ("100000000400-02-29T00:00:00Z", Datatype::DateTime),
+            ("-100000000400-02-29T00:00:00Z", Datatype::DateTime),
+        ]
+        .into_iter()
+        .filter_map(|(lexical, d)| {
+            let got = Value::parse(lexical, d, None);
+            (!matches!(got, Err(LiteralError::Unsupported(_))))
+                .then(|| format!("{lexical} as {d:?}: {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Each datatype's lexical space is checked whole before a value is decided or found
+    /// beyond what is represented (XSDVAL review r1): a form outside it is ill-typed, never
+    /// unsupported, and a std parser's wider grammar decides nothing. Sources: XML Schema 1.1
+    /// Part 2 §3.4.28.1 (dateTimeStamp needs a timezone), §3.3.15.2 (hexBinary: hex digit
+    /// pairs), §3.4.13 ff. (an integer type's bounds), OWL 2 Structural Specification §4.1
+    /// (owl:rational: a nonzero denominator), RDF 1.1 Concepts (rdf:XMLLiteral:
+    /// well-balanced, self-contained XML content). Every row is checked.
+    #[test]
+    fn the_lexical_space_is_checked_before_what_is_represented() {
+        #[derive(Debug, PartialEq)]
+        enum Is {
+            Ill,
+            Unsupported,
+            Valid,
+        }
+        let big = "9".repeat(50);
+        let long_fraction = "2000-01-01T00:00:00.1234567890123456789";
+        let rows: Vec<(String, Datatype, Is)> = vec![
+            // An early representation-only return.
+            (long_fraction.to_owned(), Datatype::DateTimeStamp, Is::Ill),
+            (
+                format!("{long_fraction}Z"),
+                Datatype::DateTimeStamp,
+                Is::Unsupported,
+            ),
+            (
+                long_fraction.to_owned(),
+                Datatype::DateTime,
+                Is::Unsupported,
+            ),
+            (format!("{big}/x"), Datatype::Rational, Is::Ill),
+            (format!("{big}/0"), Datatype::Rational, Is::Ill),
+            (format!("{big}/1"), Datatype::Rational, Is::Unsupported),
+            (big.clone(), Datatype::Byte, Is::Ill),
+            (big.clone(), Datatype::UnsignedLong, Is::Ill),
+            (big.clone(), Datatype::NonPositiveInteger, Is::Ill),
+            (format!("-{big}"), Datatype::NonNegativeInteger, Is::Ill),
+            (big.clone(), Datatype::NonNegativeInteger, Is::Unsupported),
+            (format!("-{big}"), Datatype::Integer, Is::Unsupported),
+            ("<!-- c --><a".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<a>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("&nbsp;".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<p:a/>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            (
+                "<!-- c --><a/>".to_owned(),
+                Datatype::XmlLiteral,
+                Is::Unsupported,
+            ),
+            ("<a/>".to_owned(), Datatype::XmlLiteral, Is::Valid),
+            ("&#x+41;".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<!--c-->&#x+41;".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<a /x></a>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<:a/>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            (
+                "<a xmlns:p=''><p:b/></a>".to_owned(),
+                Datatype::XmlLiteral,
+                Is::Ill,
+            ),
+            ("&#x41;".to_owned(), Datatype::XmlLiteral, Is::Valid),
+            // A std parser's grammar wider than the datatype's.
+            ("+F".to_owned(), Datatype::HexBinary, Is::Ill),
+            ("00+F".to_owned(), Datatype::HexBinary, Is::Ill),
+            ("0f".to_owned(), Datatype::HexBinary, Is::Valid),
+            ("0F".to_owned(), Datatype::HexBinary, Is::Valid),
+            (String::new(), Datatype::HexBinary, Is::Valid),
+            ("inf".to_owned(), Datatype::Double, Is::Ill),
+            ("Infinity".to_owned(), Datatype::Double, Is::Ill),
+            ("nan".to_owned(), Datatype::Float, Is::Ill),
+            ("1_0".to_owned(), Datatype::Double, Is::Ill),
+            (" 1".to_owned(), Datatype::Double, Is::Ill),
+            ("+INF".to_owned(), Datatype::Double, Is::Valid),
+            ("-INF".to_owned(), Datatype::Float, Is::Valid),
+            ("NaN".to_owned(), Datatype::Double, Is::Valid),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|(lexical, d, expected)| {
+                let got = Value::parse(lexical, *d, None);
+                let is = match &got {
+                    Ok(_) => Is::Valid,
+                    Err(LiteralError::IllTyped(_)) => Is::Ill,
+                    Err(LiteralError::Unsupported(_)) => Is::Unsupported,
+                };
+                (is != *expected).then(|| format!("{lexical:.60} as {d:?}: {got:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

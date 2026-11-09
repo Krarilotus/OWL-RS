@@ -72,7 +72,11 @@ pub const ALL: [Ruleset; 6] = [
 /// 3 (28 Oct 2026): version 2's maintenance could recompute a split without what schema
 /// statements alone derive (`C owl:equivalentClass C` from `C rdfs:subClassOf C` once
 /// `C owl:sameAs D` went), so a closure it wrote is no longer read as current.
-pub const SEMANTICS_VERSION: u32 = 3;
+///
+/// 4 (7 Nov 2026): the datatype checks (dt-not-type, dt-diff) read literals as OWL 2's
+/// datatype map does (`engine::datatypes`): an ill-typed literal under a range, and values
+/// version 3 didn't judge, can now be inconsistencies, so a version 3 verdict is rechecked.
+pub const SEMANTICS_VERSION: u32 = 4;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -34,7 +34,7 @@ fn a_subsumption_through_a_union_is_found_by_the_tableau_driver() {
         .expect("classification");
     assert_eq!(report.engine, "tableau");
     assert!(report.complete(), "{:?}", report.incomplete);
-    assert!(report.consistent);
+    assert_eq!(report.consistency, nrese_store::dl::Verdict::Consistent);
     assert!(has(&report.subsumptions, "A", "D"));
     assert!(has(&report.subsumptions, "E", "D"));
     assert!(!has(&report.subsumptions, "A", "B"));
@@ -115,15 +115,16 @@ fn classification_needs_a_scope_that_reads_everything() {
     }
 }
 
-/// Term ids for a generated ontology, with their N-Triples text.
+/// Term ids for a generated ontology, with their N-Triples text (the DL-oracle
+/// differential's cases too).
 #[derive(Default)]
-struct Table {
-    text: Vec<String>,
-    ids: HashMap<String, Term>,
+pub(crate) struct Table {
+    pub(crate) text: Vec<String>,
+    pub(crate) ids: HashMap<String, Term>,
 }
 
 impl Table {
-    fn id(&mut self, text: String) -> Term {
+    pub(crate) fn id(&mut self, text: String) -> Term {
         if let Some(&id) = self.ids.get(&text) {
             return id;
         }
@@ -196,11 +197,18 @@ fn the_store_classifies_as_the_tableau_driver_on_random_ontologies() {
             continue;
         }
         compared += 1;
+        assert_eq!(
+            report.consistency, reference.classification.consistency,
+            "seed {seed}: consistency"
+        );
+        // An inconsistent ontology's report lists no class (every one is unsatisfiable).
+        let listed = report.consistency != nrese_store::dl::Verdict::Inconsistent;
         let iri = |t: Term| table.text[t as usize].trim_matches(['<', '>']).to_owned();
         let expected: BTreeSet<(String, String)> = reference
             .classification
             .subsumptions
             .iter()
+            .filter(|_| listed)
             .map(|&(a, b)| (iri(a), iri(b)))
             .collect();
         let got: BTreeSet<(String, String)> = report.subsumptions.iter().cloned().collect();
@@ -209,14 +217,11 @@ fn the_store_classifies_as_the_tableau_driver_on_random_ontologies() {
             .classification
             .unsatisfiable
             .iter()
+            .filter(|_| listed)
             .map(|&c| iri(c))
             .collect();
         let got: BTreeSet<String> = report.unsatisfiable.iter().cloned().collect();
         assert_eq!(got, expected, "seed {seed}: unsatisfiable classes");
-        assert_eq!(
-            report.consistent, reference.classification.consistent,
-            "seed {seed}: consistency"
-        );
     }
     assert!(compared >= 30, "only {compared} seeds compared");
 }

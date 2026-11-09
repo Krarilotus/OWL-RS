@@ -13,13 +13,16 @@
 //! absent), and a write fails as a whole if it would add or remove a statement in a graph
 //! its requester may not write, whether the statement is there or not.
 
+use std::sync::Arc;
+
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{GraphName, GraphNameRef, NamedNode, Quad, QuadRef, Term, TermRef};
 use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad};
+use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad, stored_graph_ref};
 use crate::update::SparqlUpdateRequest;
 use crate::view::decoded_quads;
 
@@ -64,11 +67,14 @@ impl StatementPattern {
             (_, false) => self
                 .contexts
                 .iter()
-                .filter_map(|context| match context {
-                    GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
-                    GraphName::NamedNode(n) => view.lookup(n.as_ref().into()),
-                    GraphName::BlankNode(b) => view.lookup(b.as_ref().into()),
-                })
+                // Each context as the store places it (`rdf_io::stored_graph`).
+                .filter_map(
+                    |context| match crate::rdf_io::stored_graph(context.clone()) {
+                        GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                        GraphName::NamedNode(n) => view.lookup(n.as_ref().into()),
+                        GraphName::BlankNode(b) => view.lookup(b.as_ref().into()),
+                    },
+                )
                 .collect(),
         };
         if let Some(access) = access {
@@ -92,8 +98,10 @@ pub struct RdfPayload {
 }
 
 impl RdfPayload {
-    /// The payload's statements placed per `contexts` (module docs), each to `each` as it
-    /// is read (as `consumer` needs them: [`Consumer`]): once per context if any are given.
+    /// The payload's statements placed per `contexts` (module docs), each in the graph the
+    /// store keeps it in (`rdf_io::stored_graph_ref`), after the contexts replace the
+    /// payload's own: each to `each` as it is read (as `consumer` needs them:
+    /// [`Consumer`]), once per context if any are given.
     fn each_quad(
         &self,
         contexts: &[GraphName],
@@ -101,31 +109,47 @@ impl RdfPayload {
         consumer: Consumer,
         mut each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
     ) -> StoreResult<()> {
+        self.each_as_written(blank_nodes, consumer, |quad| {
+            if contexts.is_empty() {
+                return each(QuadRef::new(
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                    stored_graph_ref(quad.graph_name),
+                ));
+            }
+            contexts.iter().try_for_each(|graph| {
+                each(QuadRef::new(
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                    stored_graph_ref(graph.as_ref()),
+                ))
+            })
+        })
+    }
+
+    /// The payload's statements in the graphs they name as written (a protocol can still
+    /// tell a graph left out from one named), each to `each` as it is read.
+    fn each_as_written(
+        &self,
+        blank_nodes: BlankNodes,
+        consumer: Consumer,
+        each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
+    ) -> StoreResult<()> {
         each_payload_quad(
             self.format.rdf_format(),
             self.base_iri.as_deref(),
             &self.payload,
             blank_nodes,
             consumer,
-            |quad| {
-                if contexts.is_empty() {
-                    return each(quad);
-                }
-                contexts.iter().try_for_each(|graph| {
-                    each(QuadRef::new(
-                        quad.subject,
-                        quad.predicate,
-                        quad.object,
-                        graph.as_ref(),
-                    ))
-                })
-            },
+            each,
         )
     }
 
     /// Whether the payload is RDF in its format: read to its end, nothing kept.
     fn check(&self, blank_nodes: BlankNodes) -> StoreResult<()> {
-        self.each_quad(&[], blank_nodes, Consumer::Local, |_| Ok(()))
+        self.each_as_written(blank_nodes, Consumer::Local, |_| Ok(()))
     }
 }
 
@@ -209,8 +233,9 @@ fn remove_matching(
             }
         }
     }
+    // The pending changes' growth is charged before it happens (D16-039).
     for engine_pattern in patterns {
-        tx.remove_matching(&engine_pattern);
+        tx.remove_matching(&engine_pattern)?;
     }
     Ok(())
 }
@@ -247,19 +272,146 @@ pub enum StatementOp {
     Update(SparqlUpdateRequest),
 }
 
+impl StatementOp {
+    /// The heap bytes it holds beside its own slot, by capacity: what a holder that keeps it
+    /// charges ([`crate::sessions`]).
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Add { data, contexts } | Self::RemoveData { data, contexts } => {
+                data.payload.capacity()
+                    + data.base_iri.as_ref().map_or(0, String::capacity)
+                    + graphs_bytes(contexts)
+            }
+            Self::RemovePatterns { data, contexts, .. } => {
+                data.payload.capacity()
+                    + data.base_iri.as_ref().map_or(0, String::capacity)
+                    + graphs_bytes(contexts)
+            }
+            Self::RemoveMatching(pattern) => {
+                pattern.subject.as_ref().map_or(0, Term::heap_bytes)
+                    + pattern.predicate.as_ref().map_or(0, NamedNode::heap_bytes)
+                    + pattern.object.as_ref().map_or(0, Term::heap_bytes)
+                    + graphs_bytes(&pattern.contexts)
+            }
+            Self::Update(update) => update.heap_bytes(),
+        }
+    }
+}
+
+/// The heap bytes of a list of graphs: its slots and their names.
+fn graphs_bytes(graphs: &Vec<GraphName>) -> usize {
+    graphs.capacity() * std::mem::size_of::<GraphName>()
+        + graphs.iter().map(GraphName::heap_bytes).sum::<usize>()
+}
+
+/// A request's operations, shared without copying: a client transaction's reads and its
+/// commit hold the one history its session keeps ([`crate::sessions`]), and with it the
+/// charge of what the history holds, returned when its last holder lets it go.
+#[derive(Debug, Clone, Default)]
+pub struct StatementOps(Arc<Held>);
+
+#[derive(Debug)]
+enum Held {
+    /// One request's own operations, uncharged (they live as long as the request).
+    Plain(Vec<StatementOp>),
+    /// Kept between requests: their slots charged by the vector, the bytes they hold by
+    /// `nested`, both on the keeper's budget.
+    Kept {
+        ops: ChargedVec<StatementOp>,
+        nested: Reservation,
+    },
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self::Plain(Vec::new())
+    }
+}
+
+impl std::ops::Deref for StatementOps {
+    type Target = [StatementOp];
+
+    fn deref(&self) -> &[StatementOp] {
+        match &*self.0 {
+            Held::Plain(ops) => ops,
+            Held::Kept { ops, .. } => ops,
+        }
+    }
+}
+
+impl From<Vec<StatementOp>> for StatementOps {
+    fn from(ops: Vec<StatementOp>) -> Self {
+        Self(Arc::new(Held::Plain(ops)))
+    }
+}
+
+/// An append the budget had no room for, and the operations it would have appended.
+pub(crate) type Refused = (BudgetExceeded, Vec<StatementOp>);
+
+impl StatementOps {
+    /// `more` appended, everything kept charged to `budget` first (the one budget these were
+    /// kept on, if they were): in place where nobody else holds these, else as a copy
+    /// charged anew, so that a reader holding these keeps them with their own charge. A
+    /// refusal changes nothing and hands `more` back.
+    pub(crate) fn append_within(
+        &mut self,
+        more: Vec<StatementOp>,
+        budget: &Arc<Budget>,
+    ) -> Result<(), Refused> {
+        let bytes: usize = more.iter().map(StatementOp::heap_bytes).sum();
+        if let Some(Held::Kept { ops, nested }) = Arc::get_mut(&mut self.0) {
+            if let Err(refused) = nested.charge(bytes) {
+                return Err((refused, more));
+            }
+            if let Err(refused) = ops.reserve(more.len()) {
+                nested.release(bytes);
+                return Err((refused, more));
+            }
+            push_reserved(ops, more);
+            return Ok(());
+        }
+        let old: &[StatementOp] = self;
+        let mut nested = Reservation::new(Arc::clone(budget));
+        if let Err(refused) =
+            nested.charge(old.iter().map(StatementOp::heap_bytes).sum::<usize>() + bytes)
+        {
+            return Err((refused, more));
+        }
+        let mut ops = match ChargedVec::with_capacity(Arc::clone(budget), old.len() + more.len()) {
+            Ok(ops) => ops,
+            Err(refused) => return Err((refused, more)),
+        };
+        push_reserved(&mut ops, old.iter().cloned());
+        push_reserved(&mut ops, more);
+        self.0 = Arc::new(Held::Kept { ops, nested });
+        Ok(())
+    }
+}
+
+/// `items` pushed onto `ops`, which has the room for them reserved.
+fn push_reserved(ops: &mut ChargedVec<StatementOp>, items: impl IntoIterator<Item = StatementOp>) {
+    // No room to reserve beyond the length, so nothing to refuse; a push past the room
+    // panics before it allocates.
+    let filled = ops.fill(0, |room| items.into_iter().for_each(|op| room.push(op)));
+    debug_assert!(filled.is_ok());
+}
+
 /// Writes applied in order in one transaction: an RDF4J transaction's operations, or one
 /// request to `/statements`.
 #[derive(Debug, Clone, Default)]
 pub struct StatementsRequest {
-    pub ops: Vec<StatementOp>,
+    pub ops: StatementOps,
     /// The session ([`crate::sessions`]) the operations were collected in, if any: reads on
     /// them keep the data they see there until the session or the store changes.
     pub session: Option<String>,
 }
 
 impl StatementsRequest {
-    pub fn new(ops: Vec<StatementOp>) -> Self {
-        Self { ops, session: None }
+    pub fn new(ops: impl Into<StatementOps>) -> Self {
+        Self {
+            ops: ops.into(),
+            session: None,
+        }
     }
 }
 
@@ -271,24 +423,25 @@ pub(crate) fn apply_statements(
     requester: &crate::Requester,
     update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
-    for op in &request.ops {
+    for op in request.ops.iter() {
         // Each statement of a payload as it is read; one that fails part-way fails the
         // request, whose transaction is then discarded with all it changed. Inserts intern
         // into the shared dictionary, which a discarded transaction doesn't undo: their
         // payload is read whole and found valid first ([`Consumer::Interning`]). Removals
-        // only look terms up.
+        // only look terms up. The pending changes' growth is charged before it happens
+        // (D16-039).
         match op {
             StatementOp::Add { data, contexts } => {
                 data.each_quad(contexts, BlankNodes::Fresh, Consumer::Interning, |quad| {
                     check_write(requester, quad.graph_name)?;
-                    tx.insert(quad);
+                    tx.try_insert(quad)?;
                     Ok(())
                 })?;
             }
             StatementOp::RemoveData { data, contexts } => {
                 data.each_quad(contexts, BlankNodes::Fresh, Consumer::Local, |quad| {
                     check_write(requester, quad.graph_name)?;
-                    tx.remove(quad);
+                    tx.try_remove(quad)?;
                     Ok(())
                 })?;
             }
@@ -298,8 +451,10 @@ pub(crate) fn apply_statements(
                 contexts,
                 preserve_blank_nodes,
             } => {
+                // A statement's graph as written (`rdf4j:nil`, none); its pattern's
+                // contexts are placed as the store places them (`StatementPattern::patterns`).
                 let blank_nodes = blank_nodes(*preserve_blank_nodes);
-                data.each_quad(&[], blank_nodes, Consumer::Local, |quad| {
+                data.each_as_written(blank_nodes, Consumer::Local, |quad| {
                     remove_matching(tx, &removal_pattern(quad, contexts), requester)
                 })?;
             }

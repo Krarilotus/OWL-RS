@@ -468,3 +468,27 @@ fn a_load_without_errors_or_that_fails_leaves_no_quarantine() {
     assert_eq!(store.quarantine().open_count(), 0);
     assert_eq!(store.stats().unwrap().quad_count, 5997);
 }
+
+/// A load of only invalid statements, into a new store, keeps them after a reopen (DUR-3
+/// sol-loop round 5, S3): the engine publishes nothing for it, so the quarantine's own
+/// directory and file are all that hold them. A guard: without a power cut it passes before the
+/// fix too; the fix makes their names durable (`nrese_engine::place`), which the source scan of
+/// the placement owner's callers checks.
+#[test]
+fn a_load_of_only_invalid_statements_keeps_them_across_a_reopen() {
+    let dir = tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    let file = dir.path().join("bad.nt");
+    fs::write(
+        &file,
+        "<http://example.com/a> <http://example.com/p> .\n<http://example.com/b> \"no predicate\" .\n",
+    )
+    .unwrap();
+    let store = StoreService::new(on_disk(&store_dir)).expect("store");
+    let report = load(&store, &[&file], GraphTarget::DefaultGraph);
+    assert_eq!(store.quarantine().open_count(), 2, "{report:?}");
+    assert_eq!(store.stats().unwrap().quad_count, 0);
+    drop(store);
+    let store = StoreService::new(on_disk(&store_dir)).expect("reopen");
+    assert_eq!(store.quarantine().open_count(), 2);
+}

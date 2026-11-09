@@ -29,28 +29,82 @@
 //! facts as stored, and a class that may split is never maintained.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use nrese_dl::bounds;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Normalised, Ontology};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
-use nrese_reasoner::delta::{self, Base};
-use nrese_reasoner::eval::{GroundProgram, Schema, Stop};
+use nrese_reasoner::delta::{self, Base, VisitsBase};
+use nrese_reasoner::eval::{GroundProgram, Poller, Probe, Schema, Stop, Stopped, Visit};
 use nrese_reasoner::ir::{self, Triple};
 
-/// U1's own facts beyond its input, indexed for every bound pattern.
-#[derive(Debug, Default, Clone)]
+/// U1's own facts beyond its input, indexed for every bound pattern. What it holds is charged
+/// to `held` before it grows ([`Self::try_insert`], SYN-61); a fact's share is released once
+/// it is removed and the trees have freed what they free.
+#[derive(Debug, Default)]
 pub struct Stack {
     spo: BTreeSet<[u64; 3]>,
     pos: BTreeSet<[u64; 3]>,
     osp: BTreeSet<[u64; 3]>,
     /// Facts per predicate, for the delta executor's estimates.
     per_predicate: std::collections::HashMap<u64, usize>,
+    /// Last: released after the trees and table it covers are freed.
+    held: Option<nrese_exec::Reservation>,
 }
 
+/// The largest node of the stack's trees: std's B-tree (B = 6) internal node, 11 keys, 12
+/// child links, a parent link and two 16-bit counts, aligned.
+const TREE_NODE: usize =
+    (11 * size_of::<[u64; 3]>() + 13 * size_of::<usize>() + 4).next_multiple_of(8);
+/// An upper bound on what one fact takes in each tree: every node but the root holds at
+/// least 5 keys, after an insert and after a remove alike (std's B-tree rebalances an
+/// underfull node), so the nodes number at most one per 5 keys, the root aside.
+const TREE_FACT: usize = TREE_NODE.div_ceil(5);
+/// An upper bound on what one more predicate takes in the per-predicate table: an entry and
+/// its control byte at a load of 7/8 rounded up to a power of two (so at most 16/7 slots an
+/// entry), the old table beside the new one while it grows (half as many again).
+const PREDICATE: usize = (16 + 1) * 16 * 3 / (7 * 2) + 1;
+/// What the stack takes once it holds anything: each tree's root, which may hold fewer than 5
+/// keys, and the table's smallest allocation (4 slots and its control group), twice over while
+/// it grows.
+const FIRST: usize = 3 * TREE_NODE + 2 * (4 * (16 + 1) + 16);
+
 impl Stack {
+    /// An empty stack charging what it holds to `budget`.
+    pub fn within(budget: &std::sync::Arc<nrese_exec::Budget>) -> Self {
+        Self {
+            held: Some(nrese_exec::Reservation::new(std::sync::Arc::clone(budget))),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::insert`], charging what the fact takes first; nothing is inserted where the
+    /// budget can't take it.
+    pub fn try_insert(&mut self, t: Triple) -> Result<bool, nrese_exec::BudgetExceeded> {
+        if self.spo.contains(&t) {
+            return Ok(false);
+        }
+        if let Some(held) = &mut self.held {
+            // Charged once and kept: the roots and the table, which removes don't shrink.
+            let first = if held.bytes() == 0 { FIRST } else { 0 };
+            let predicate = match self.per_predicate.contains_key(&t[1]) {
+                true => 0,
+                false => PREDICATE,
+            };
+            held.charge(3 * TREE_FACT + first + predicate)?;
+        }
+        Ok(self.insert(t))
+    }
+
+    /// [`Self::remove`], releasing the fact's share of the trees once they have freed it.
+    pub fn remove_charged(&mut self, t: Triple) -> bool {
+        let removed = self.remove(t);
+        if removed && let Some(held) = &mut self.held {
+            held.release(3 * TREE_FACT);
+        }
+        removed
+    }
     pub fn len(&self) -> usize {
         self.spo.len()
     }
@@ -63,7 +117,8 @@ impl Stack {
         self.spo.contains(t)
     }
 
-    pub fn insert(&mut self, [s, p, o]: Triple) -> bool {
+    /// Uncharged: [`Self::try_insert`] outside this module.
+    fn insert(&mut self, [s, p, o]: Triple) -> bool {
         if !self.spo.insert([s, p, o]) {
             return false;
         }
@@ -73,7 +128,8 @@ impl Stack {
         true
     }
 
-    pub fn remove(&mut self, [s, p, o]: Triple) -> bool {
+    /// Uncharged: [`Self::remove_charged`] outside this module.
+    fn remove(&mut self, [s, p, o]: Triple) -> bool {
         if !self.spo.remove(&[s, p, o]) {
             return false;
         }
@@ -91,6 +147,13 @@ impl Stack {
 
     /// An upper bound on the facts matching `pattern`, zero only if none does. O(log n).
     pub fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
+        self.estimate_counted(pattern, &|| true)
+    }
+
+    /// [`Self::estimate`], each fact its search for a match passes over counted with
+    /// `visited` (false once the reader's poller has stopped: then 0, an answer that means
+    /// nothing; REAS-2, sol-loop r1 S3).
+    pub fn estimate_counted(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool) -> usize {
         let bound = match pattern[1] {
             Some(p) => self.per_predicate.get(&p).copied().unwrap_or(0),
             None => self.len(),
@@ -99,18 +162,29 @@ impl Stack {
             return 0;
         }
         let mut any = false;
-        self.first(pattern, &mut any);
+        self.first(pattern, visited, &mut any);
         if any { bound } else { 0 }
     }
 
-    /// Whether a fact matches `pattern`, by the index whose prefix it binds.
-    fn first(&self, pattern: [Option<u64>; 3], any: &mut bool) {
+    /// Whether a fact matches `pattern`, by the index whose prefix it binds, each fact it
+    /// passes over counted with `visited`.
+    fn first(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool, any: &mut bool) {
         let hit = |set: &BTreeSet<[u64; 3]>, prefix: &[u64], test: &dyn Fn(&[u64; 3]) -> bool| {
             let mut low = [0u64; 3];
             let mut high = [u64::MAX; 3];
             low[..prefix.len()].copy_from_slice(prefix);
             high[..prefix.len()].copy_from_slice(prefix);
-            set.range(low..=high).any(test)
+            let mut found = false;
+            for t in set.range(low..=high) {
+                if !visited() {
+                    return false;
+                }
+                if test(t) {
+                    found = true;
+                    break;
+                }
+            }
+            found
         };
         *any = match pattern {
             [Some(s), Some(p), o] => hit(&self.spo, &[s, p], &|t| o.is_none_or(|o| t[2] == o)),
@@ -124,39 +198,57 @@ impl Stack {
 
     /// The facts matching `pattern`, by the index whose prefix it binds. O(log n + k).
     pub fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        let range = |set: &BTreeSet<[u64; 3]>, prefix: &[u64]| {
+        self.visit(pattern, &mut |t| {
+            if let Some(t) = t {
+                f(t);
+            }
+            true
+        });
+    }
+
+    /// Hands each fact of the index range `pattern` binds to `f` as it reads it: `Some` for
+    /// a match, `None` for one it passes over; ends once `f` returns false (the reader's
+    /// poller stopped: REAS-2, sol-loop r1 S3).
+    pub fn visit(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Option<Triple>) -> bool) {
+        fn range<'s>(
+            set: &'s BTreeSet<[u64; 3]>,
+            prefix: &[u64],
+        ) -> impl Iterator<Item = [u64; 3]> + use<'s> {
             let mut low = [0u64; 3];
             let mut high = [u64::MAX; 3];
             low[..prefix.len()].copy_from_slice(prefix);
             high[..prefix.len()].copy_from_slice(prefix);
-            set.range(low..=high).copied().collect::<Vec<_>>()
-        };
+            set.range(low..=high).copied()
+        }
         let matches = |t: &Triple| {
             pattern
                 .iter()
                 .zip(t)
                 .all(|(bound, value)| bound.is_none_or(|b| b == *value))
         };
-        let found: Vec<Triple> = match pattern {
-            [Some(s), Some(p), _] => range(&self.spo, &[s, p]),
-            [Some(s), None, _] => range(&self.spo, &[s]),
-            [None, Some(p), Some(o)] => range(&self.pos, &[p, o])
-                .into_iter()
-                .map(|[p, o, s]| [s, p, o])
-                .collect(),
-            [None, Some(p), None] => range(&self.pos, &[p])
-                .into_iter()
-                .map(|[p, o, s]| [s, p, o])
-                .collect(),
-            [None, None, Some(o)] => range(&self.osp, &[o])
-                .into_iter()
-                .map(|[o, s, p]| [s, p, o])
-                .collect(),
-            [None, None, None] => self.spo.iter().copied().collect(),
+        let mut hand = |t: Triple| f(matches(&t).then_some(t));
+        let _ = match pattern {
+            [Some(s), Some(p), _] => range(&self.spo, &[s, p]).try_for_each(|t| go(hand(t))),
+            [Some(s), None, _] => range(&self.spo, &[s]).try_for_each(|t| go(hand(t))),
+            [None, Some(p), Some(o)] => {
+                range(&self.pos, &[p, o]).try_for_each(|[p, o, s]| go(hand([s, p, o])))
+            }
+            [None, Some(p), None] => {
+                range(&self.pos, &[p]).try_for_each(|[p, o, s]| go(hand([s, p, o])))
+            }
+            [None, None, Some(o)] => {
+                range(&self.osp, &[o]).try_for_each(|[o, s, p]| go(hand([s, p, o])))
+            }
+            [None, None, None] => self.spo.iter().try_for_each(|&t| go(hand(t))),
         };
-        for t in found.into_iter().filter(matches) {
-            f(t);
-        }
+    }
+}
+
+/// `try_for_each`'s step: go on while `true`.
+fn go(on: bool) -> std::ops::ControlFlow<()> {
+    match on {
+        true => std::ops::ControlFlow::Continue(()),
+        false => std::ops::ControlFlow::Break(()),
     }
 }
 
@@ -192,7 +284,7 @@ pub(crate) struct Values {
 impl Values {
     /// Notes `id` if it is a literal: its value's representative from now on.
     fn add(&mut self, view: &Snapshot, id: u64) {
-        if !is_literal(id) || !self.seen.insert(id) {
+        if !TermId::from_raw(id).kind().is_literal() || !self.seen.insert(id) {
             return;
         }
         let Some(value) = value_of(view, id) else {
@@ -238,13 +330,82 @@ impl Values {
         [s, p, self.of(o)]
     }
 
-    /// Every term `rep` stands for: the literals with its value, or `rep` alone.
+    /// Keeps what a commit's change noted ([`Noting`]), its commit done.
+    fn absorb(&mut self, noted: Values) {
+        self.rep.extend(noted.rep);
+        for (rep, new) in noted.members {
+            self.members
+                .entry(rep)
+                .or_insert_with(|| vec![rep])
+                .extend(new);
+        }
+        self.by_value.extend(noted.by_value);
+        self.seen.extend(noted.seen);
+    }
+}
+
+/// U1's literals by value as a commit's change reads them: U1's own ([`Values`]), unchanged,
+/// and those the change meets first, `added`, which U1 keeps only when the commit happens
+/// ([`Upper::apply`]). `added.members` holds only the literals the change adds to a value.
+struct Noting<'a> {
+    base: &'a Values,
+    added: Values,
+}
+
+impl Noting<'_> {
+    fn add(&mut self, view: &Snapshot, id: u64) {
+        if !TermId::from_raw(id).kind().is_literal()
+            || self.base.seen.contains(&id)
+            || !self.added.seen.insert(id)
+        {
+            return;
+        }
+        let Some(value) = value_of(view, id) else {
+            return;
+        };
+        let known = self.base.by_value.get(&value);
+        match known.or_else(|| self.added.by_value.get(&value)).copied() {
+            None => {
+                self.added.by_value.insert(value, id);
+            }
+            Some(rep) => {
+                self.added.rep.insert(id, rep);
+                self.added.members.entry(rep).or_default().push(id);
+            }
+        }
+    }
+
+    fn add_objects<'t>(
+        &mut self,
+        view: &Snapshot,
+        facts: impl IntoIterator<Item = &'t Triple>,
+        compared: &HashSet<u64>,
+    ) {
+        for t in facts {
+            if compared.contains(&t[1]) {
+                self.add(view, t[2]);
+            }
+        }
+    }
+
+    fn of(&self, id: u64) -> u64 {
+        let rep = self.added.rep.get(&id).or_else(|| self.base.rep.get(&id));
+        rep.copied().unwrap_or(id)
+    }
+
+    fn map(&self, [s, p, o]: Triple) -> Triple {
+        [s, p, self.of(o)]
+    }
+
+    /// Every term `rep` stands for: the literals with its value (`rep` first), or `rep`
+    /// alone, and those of its value the change met.
     fn members(&self, rep: u64) -> impl Iterator<Item = u64> + '_ {
-        let all = self.members.get(&rep);
-        all.into_iter()
+        let base = self.base.members.get(&rep);
+        base.into_iter()
             .flatten()
             .copied()
-            .chain(all.is_none().then_some(rep))
+            .chain(base.is_none().then_some(rep))
+            .chain(self.added.members.get(&rep).into_iter().flatten().copied())
     }
 }
 
@@ -265,13 +426,22 @@ struct UpperBase<'a> {
     view: &'a Snapshot,
     facts: &'a HashSet<Triple>,
     stack: &'a Stack,
-    values: &'a Values,
+    values: &'a Noting<'a>,
 }
 
 impl UpperBase<'_> {
-    /// Whether the view has `s p o`, `o` standing for every literal of its value.
-    fn in_view(&self, [s, p, o]: Triple) -> bool {
-        self.values.members(o).any(|o| {
+    /// Whether the view has `s p o`, `o` standing for every literal of its value: the call
+    /// counted before its value's members are looked up (one probe), each member's lookup
+    /// counted before it is made (review r1 F3: a value can be written in many ways).
+    /// [`Stopped`] once `poll` has stopped before a member was found, never a "not in the
+    /// view" that would keep the fact (fix check r1, rule 2).
+    fn in_view(&self, [s, p, o]: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+        #[cfg(test)]
+        crate::witness::add(crate::witness::Site::InView, 1);
+        if poll.tick() {
+            return Err(Stopped);
+        }
+        let found = poll.counted(self.values.members(o)).any(|o| {
             self.view
                 .quads_for_pattern_in(
                     ReadModel::Materialised,
@@ -279,54 +449,87 @@ impl UpperBase<'_> {
                 )
                 .next()
                 .is_some()
-        })
+        });
+        match found || !poll.stopped() {
+            true => Ok(found),
+            false => Err(Stopped),
+        }
     }
 }
 
-impl Base for UpperBase<'_> {
-    fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+/// Reads count as `Base` says: the call, each object member it looks up, each quad and
+/// program fact a scan visits, and each stack fact it delivers.
+impl VisitsBase for UpperBase<'_> {
+    fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         let [s, p, o] = bound;
-        let objects: Vec<Option<u64>> = match o {
-            Some(o) => self.values.members(o).map(Some).collect(),
-            None => vec![None],
-        };
+        // A bound object's members read as they are visited, never copied first (review r1
+        // F3: a value can be written in many ways).
+        let objects = o
+            .map(|o| self.values.members(o))
+            .into_iter()
+            .flatten()
+            .map(Some)
+            .chain(o.is_none().then_some(None));
         for o in objects {
+            // Each member's lookup is a unit.
+            if !visit.skip() {
+                return;
+            }
             for q in self
                 .view
                 .quads_for_pattern_in(ReadModel::Materialised, &pattern([s, p, o]))
             {
-                f(self
+                let fact = self
                     .values
-                    .map([q.subject.raw(), q.predicate.raw(), q.object.raw()]));
+                    .map([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
+                if !visit.fact(fact) {
+                    return;
+                }
             }
         }
         for t in self.facts {
-            if bound.iter().zip(t).all(|(b, v)| b.is_none_or(|b| b == *v)) {
-                f(*t);
+            let going = match bound.iter().zip(t).all(|(b, v)| b.is_none_or(|b| b == *v)) {
+                true => visit.fact(*t),
+                false => visit.skip(),
+            };
+            if !going {
+                return;
             }
         }
-        self.stack.scan(bound, f);
+        // Each stack fact the index range holds is a position, the ones it passes over too.
+        self.stack.visit(bound, &mut |t| match t {
+            Some(t) => visit.fact(t),
+            None => visit.skip(),
+        });
     }
 
-    fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
+    /// The view's count's work counted on `probe` as it goes (review r1 F2); [`Stopped`]
+    /// where that, or the stack's estimate, stopped.
+    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         let view = self
             .view
-            .count_in(ReadModel::Materialised, &pattern(bound))
+            .count_in_visiting(ReadModel::Materialised, &pattern(bound), &mut |n| {
+                probe.visited(n)
+            })
+            .ok_or(Stopped)?
             .at_least();
+        let stack = self.stack.estimate_counted(bound, &|| probe.units(1));
+        probe.ended()?;
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
-        usize::try_from(view)
+        Ok(usize::try_from(view)
             .unwrap_or(usize::MAX)
-            .saturating_add(self.stack.estimate(bound))
-            .saturating_add(self.facts.len())
+            .saturating_add(stack)
+            .saturating_add(self.facts.len()))
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.stack.contains(&fact) || self.is_asserted(fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.stack.contains(&fact) || self.asserts(fact, probe)?)
     }
 
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.facts.contains(&fact) || self.in_view(fact)
+    /// Each literal member the view is asked about is a unit, counted as it is asked.
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.facts.contains(&fact) || self.in_view(fact, probe.poller())?)
     }
 }
 
@@ -373,6 +576,8 @@ pub struct Change {
     insert: Vec<Triple>,
     remove: Vec<Triple>,
     program: Option<GroundProgram>,
+    /// The literals the change read by value first ([`Noting`]).
+    noted: Values,
     pub elapsed: Duration,
     /// The change derives an equality between two terms: U1 then has classes, which it
     /// keeps by representatives, so it is evaluated afresh instead.
@@ -386,16 +591,37 @@ impl Change {
     }
 }
 
-/// Why U1 isn't available: its evaluation ran out of its budget.
+/// Why U1 isn't available: its evaluation ran out of its budget, or (`refused`) the queries'
+/// memory couldn't hold what it reads or keeps. A refused U1 is never kept: once memory is
+/// free again the next read builds it (SYN-61); one that gave up stays so for its revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GaveUp(pub String);
+pub struct GaveUp {
+    pub why: String,
+    pub refused: bool,
+}
+
+impl GaveUp {
+    /// Gave up within its budgets (time, the memory watch, a missing term).
+    pub fn new(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            refused: false,
+        }
+    }
+
+    /// A budget refused what U1 reads or keeps.
+    pub fn refused(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            refused: true,
+        }
+    }
+}
 
 /// Poll the caller's store watch as well as the process owner's safety fallback.
 fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
     if stop() || nrese_reasoner::eval::over_memory_limit() {
-        Err(GaveUp(
-            "the upper bound's evaluation was stopped".to_owned(),
-        ))
+        Err(GaveUp::new("the upper bound's evaluation was stopped"))
     } else {
         Ok(())
     }
@@ -421,9 +647,9 @@ pub struct Upper {
     /// predicates [`bounds::Program::compared_predicates`] names. Other literals are never
     /// compared, so they needn't be read by value (LUBM's names, e-mail addresses and
     /// telephone numbers: 107,410 literals at LUBM(10)). A commit's new literals are noted
-    /// when its change is computed: a representative stays one whether the commit happens
-    /// or not.
-    values: Mutex<Values>,
+    /// as its change is computed and kept with the change ([`Self::apply`]): U1 is read,
+    /// never changed, while the change is computed.
+    values: Values,
     /// The `owl:sameAs` classes, by representative: the stack is over them.
     classes: nrese_reasoner::representatives::EqualityClasses,
     rdf_type: u64,
@@ -474,17 +700,40 @@ fn reasoner_rules(program: &bounds::Program, values: &Values) -> Vec<ir::Rule> {
 }
 
 /// The materialised view's facts (every graph, each once).
-fn view_facts(view: &Snapshot, stop: Stop<'_>) -> Result<Vec<Triple>, GaveUp> {
-    let mut facts = Vec::new();
+/// The materialised view's facts (every graph, each once), charged to `budget` as they are
+/// collected (SYN-61: the whole view, U1's build's largest scratch).
+fn view_facts(
+    view: &Snapshot,
+    stop: Stop<'_>,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<nrese_exec::ChargedVec<Triple>, GaveUp> {
+    let mut facts = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
     for q in view.quads_for_pattern_in(ReadModel::Materialised, &pattern([None, None, None])) {
         if facts.len() % 1024 == 0 {
             check_stop(stop)?;
         }
-        facts.push([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
+        facts
+            .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
+            .map_err(|_| GaveUp::refused(SCRATCH_REFUSED))?;
     }
-    facts.sort_unstable();
-    facts.dedup();
+    sort_dedup(&mut facts);
     Ok(facts)
+}
+
+/// Why U1 isn't available when its build's scratch doesn't fit.
+const SCRATCH_REFUSED: &str = "its evaluation's input doesn't fit the queries' memory";
+
+/// `facts` sorted, each once; in place, allocating nothing.
+pub(crate) fn sort_dedup(facts: &mut nrese_exec::ChargedVec<Triple>) {
+    facts.sort_unstable();
+    let mut kept = 0;
+    for i in 0..facts.len() {
+        if i == 0 || facts[i] != facts[kept - 1] {
+            facts[kept] = facts[i];
+            kept += 1;
+        }
+    }
+    facts.truncate(kept);
 }
 
 impl Upper {
@@ -498,6 +747,7 @@ impl Upper {
         view: &Snapshot,
         resolve: &dyn Fn(TermRef<'_>) -> Option<TermId>,
         stop: Stop<'_>,
+        kept: &std::sync::Arc<nrese_exec::Budget>,
     ) -> Result<Self, GaveUp> {
         check_stop(stop)?;
         let started = Instant::now();
@@ -510,16 +760,15 @@ impl Upper {
         });
         let schema = Schema::owl(&mut vocabulary);
         if vocabulary.missing {
-            return Err(GaveUp(
-                "its terms haven't reached this replica yet: the primary interns them in a commit"
-                    .to_owned(),
+            return Err(GaveUp::new(
+                "its terms haven't reached this replica yet: the primary interns them in a commit",
             ));
         }
         // The literals U1 compares, by value: of the view, the program's facts, its rules.
         let compared = program.compared_predicates();
         let mut values = Values::default();
-        let mut input = view_facts(view, stop)?;
-        values.add_objects(view, &input, compared);
+        let mut input = view_facts(view, stop, kept)?;
+        values.add_objects(view, input.iter(), compared);
         let program_facts: Vec<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
         values.add_objects(view, &program_facts, compared);
         for rule in &program.rules {
@@ -533,12 +782,17 @@ impl Upper {
         }
         let rules = reasoner_rules(&program, &values);
         let facts: HashSet<Triple> = program_facts.iter().map(|&f| values.map(f)).collect();
-        for t in &mut input {
+        for t in input.iter_mut() {
             *t = values.map(*t);
         }
-        input.extend(facts.iter().copied());
-        input.sort_unstable();
-        input.dedup();
+        for &fact in &facts {
+            input
+                .push(fact)
+                .map_err(|_| GaveUp::refused(SCRATCH_REFUSED))?;
+        }
+        sort_dedup(&mut input);
+        // The input's charge is held until the evaluation that consumes it returns.
+        let (input, input_held) = input.into_parts();
         // Equality by representatives: the closure over one term per class, the input's
         // facts that mention a class rewritten beside it, each other identity placed in
         // its class.
@@ -550,21 +804,28 @@ impl Upper {
             nrese_reasoner::batch::Listing::Stored,
             stop,
         )
-        .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
+        .map_err(|_| GaveUp::new("the upper bound's evaluation was stopped"))?;
         let same_as = program.names.same_as;
-        let mut stack = Stack::default();
+        // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
+        // evaluation's own working set is watched (`stop`), as the support sets' is.
+        let mut stack = Stack::within(kept);
+        let refused = |_| GaveUp::refused("its facts don't fit the queries' memory");
         for (i, t) in m.derived.into_iter().enumerate() {
             if i % 1024 == 0 {
                 check_stop(stop)?;
             }
-            stack.insert(t);
+            stack.try_insert(t).map_err(refused)?;
         }
+        // The input is consumed and the derived facts (which may have reused it) freed.
+        drop(input_held);
         for (representative, members) in m.classes.classes() {
             for (i, &member) in members.iter().filter(|&&m| m != representative).enumerate() {
                 if i % 1024 == 0 {
                     check_stop(stop)?;
                 }
-                stack.insert([member, same_as, representative]);
+                stack
+                    .try_insert([member, same_as, representative])
+                    .map_err(refused)?;
             }
         }
         let s = &program.signature;
@@ -583,7 +844,7 @@ impl Upper {
             object_properties,
             data_properties,
             ground: None,
-            values: Mutex::new(values),
+            values,
             classes: m.classes,
             elapsed: started.elapsed(),
         })
@@ -607,14 +868,15 @@ impl Upper {
             return named(o);
         }
         (named(o) && self.object_properties.contains(&p))
-            || (is_literal(o) && self.data_properties.contains(&p))
+            || (TermId::from_raw(o).kind().is_literal() && self.data_properties.contains(&p))
     }
 
     /// The stack's change for a commit, computed before it and applied after it
     /// ([`Self::apply`]), so a commit that doesn't happen leaves U1 as it was: `view` is
     /// the materialised view after the commit, `inserted` the facts new to the view,
     /// `deleted` those gone from it (each checked here against the view and the
-    /// program's facts). Cost: the change's.
+    /// program's facts). U1 is only read, so it is shared while this runs. Cost: the
+    /// change's.
     pub fn change(
         &self,
         view: &Snapshot,
@@ -624,7 +886,10 @@ impl Upper {
     ) -> Result<Change, GaveUp> {
         check_stop(stop)?;
         let started = Instant::now();
-        let mut values = self.values.lock().unwrap_or_else(|p| p.into_inner());
+        let mut values = Noting {
+            base: &self.values,
+            added: Values::default(),
+        };
         values.add_objects(view, inserted, self.program.compared_predicates());
         let mut inserted: Vec<Triple> = inserted
             .iter()
@@ -654,12 +919,26 @@ impl Upper {
             stack: &self.stack,
             values: &values,
         };
-        deleted.retain(|t| !base.in_view(*t));
+        // Each deleted fact's lookups in the view, counted on the commit's stop (review r1 F3);
+        // the first that finds it stopped ends the change (fix check r1, R2-F3: read as "not
+        // in the view", a stopped lookup kept every fact after it, each looked up).
+        let stopped = || GaveUp::new("the upper bound's maintenance was stopped");
+        let prep = Poller::new(stop).ok_or_else(stopped)?;
+        let mut kept = 0;
+        for i in 0..deleted.len() {
+            let fact = deleted[i];
+            if !base.in_view(fact, &prep).map_err(|Stopped| stopped())? {
+                deleted[kept] = fact;
+                kept += 1;
+            }
+        }
+        deleted.truncate(kept);
         let mut change = Change {
             moved,
             ..Change::default()
         };
         if inserted.is_empty() && deleted.is_empty() {
+            change.noted = values.added;
             return Ok(change);
         }
         let rules = delta::Rules {
@@ -675,7 +954,7 @@ impl Upper {
             self.ground.as_ref(),
             stop,
         )
-        .map_err(|_| GaveUp("the upper bound's maintenance was stopped".to_owned()))?;
+        .map_err(|_| GaveUp::new("the upper bound's maintenance was stopped"))?;
         change.program = update.program;
         // An equality the commit brings (the RL closure's, say: a functional property is
         // OWL 2 RL) or U1 derives: U1 then has classes.
@@ -683,27 +962,35 @@ impl Upper {
         let equates = |t: &Triple| t[1] == same_as && t[0] != t[2];
         change.merges = inserted.iter().any(equates) || update.insert.iter().any(equates);
         change.remove = update.remove;
-        change.insert = update
-            .insert
-            .into_iter()
-            .filter(|t| !base.is_asserted(*t))
-            .collect();
+        // A probe per inserted fact, on the commit's stop as the update's reads are; the first
+        // that finds it stopped ends the change (fix check r1, rule 2).
+        let poll = Poller::new(stop).ok_or_else(stopped)?;
+        for t in update.insert {
+            if !base.is_asserted(t, &poll).map_err(|Stopped| stopped())? {
+                change.insert.push(t);
+            }
+        }
+        change.noted = values.added;
         change.elapsed = started.elapsed();
         Ok(change)
     }
 
-    /// Applies a commit's change ([`Self::change`]) once the commit is done.
-    pub fn apply(&mut self, change: Change) {
+    /// Applies a commit's change ([`Self::change`]) once the commit is done, the literals
+    /// it read by value first among them. Refused where the stack's budget can't take its
+    /// new facts: U1 is then partly changed, and not to be kept.
+    pub fn apply(&mut self, change: Change) -> Result<(), nrese_exec::BudgetExceeded> {
         for t in change.moved.into_iter().chain(change.remove) {
-            self.stack.remove(t);
+            self.stack.remove_charged(t);
         }
         for t in change.insert {
-            self.stack.insert(t);
+            self.stack.try_insert(t)?;
         }
         if let Some(program) = change.program {
             self.ground = Some(program);
         }
+        self.values.absorb(change.noted);
         self.elapsed = change.elapsed;
+        Ok(())
     }
 
     /// The clashes the stack would have after `change`.
@@ -754,11 +1041,7 @@ impl Upper {
 
     /// How many literals U1 reads by value ([`Values`]).
     pub fn literals_by_value(&self) -> usize {
-        self.values
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .seen
-            .len()
+        self.values.seen.len()
     }
 
     /// Whether `term` is one of U1's own (a Skolem constant, a fresh class, the clash).
@@ -767,18 +1050,198 @@ impl Upper {
     }
 }
 
-/// Whether a term is a literal (of any of the engine's literal kinds).
-fn is_literal(t: u64) -> bool {
-    use nrese_engine::TermKind;
-    !matches!(
-        TermId::from_raw(t).kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::Stack;
+
+    /// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): U1's base counts
+    /// the program facts its scan passes over, not only those it delivers. Over three poll
+    /// intervals of facts, none matching, a poller whose stop has fired polls within the scan
+    /// and is stopped by it; uncounted, it would never poll.
+    #[test]
+    fn the_upper_base_counts_the_facts_it_passes_over() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let n = 3 * u64::from(nrese_exec::POLL_UNITS);
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..nrese_engine::EngineConfig::default()
+        })
+        .unwrap();
+        let view = engine.snapshot();
+        let facts: std::collections::HashSet<[u64; 3]> = (0..n).map(|i| [i, 5, i]).collect();
+        let (stack, values) = (Stack::default(), super::Values::default());
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let mut delivered = 0;
+        let scanned = base.scan([None, Some(6), None], &poll, &mut |_| delivered += 1);
+        assert!(scanned.is_err(), "a scan its poller stopped says so");
+        assert_eq!(delivered, 0, "no fact matches");
+        assert!(
+            poll.stopped(),
+            "{n} facts passed over without the poller polling"
+        );
+    }
+
+    /// The same for U1's stack (sol-loop r1 S3): a scan of `x type B` reads the index range
+    /// of `x type`, three poll intervals of other types, and passes over each; uncounted,
+    /// the poller would never poll.
+    #[test]
+    fn the_upper_base_counts_the_stack_facts_it_passes_over() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let n = 3 * u64::from(nrese_exec::POLL_UNITS);
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..nrese_engine::EngineConfig::default()
+        })
+        .unwrap();
+        let view = engine.snapshot();
+        let facts = std::collections::HashSet::new();
+        let mut stack = Stack::default();
+        for c in 0..n {
+            stack.insert([1, 2, 1_000 + c]);
+        }
+        let values = super::Values::default();
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let mut delivered = 0;
+        let scanned = base.scan([Some(1), Some(2), Some(7)], &poll, &mut |_| delivered += 1);
+        assert!(scanned.is_err(), "a scan its poller stopped says so");
+        assert_eq!(delivered, 0, "no stack fact has the object");
+        assert!(
+            poll.stopped(),
+            "{n} stack facts passed over without the poller polling"
+        );
+    }
+
+    /// U1's base over one literal value written `n` ways (`Values`: one representative, its
+    /// lexical members): an empty view, no program facts, an empty stack.
+    fn one_value_written(n: u64) -> (nrese_engine::Engine, super::Values, u64) {
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..nrese_engine::EngineConfig::default()
+        })
+        .unwrap();
+        let rep = 1_000_000;
+        let mut values = super::Values::default();
+        values.members.insert(rep, (rep..rep + n).collect());
+        (engine, values, rep)
+    }
+
+    /// REAS-2 review r1 F3: U1's base reads a value's lexical members as it visits them, each
+    /// counted: a scan bound to a value written 64 × `POLL_UNITS` ways, its stop fired since
+    /// its poller was made, stops within a poll interval of members and holds no copy of the
+    /// member list (at most a quarter of its bytes at any time). Copied first, the whole list
+    /// was copied before the first member was counted.
+    #[test]
+    fn the_upper_base_reads_a_value_s_members_as_it_visits_them() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let n = 64 * u64::from(nrese_exec::POLL_UNITS);
+        let (engine, values, rep) = one_value_written(n);
+        let view = engine.snapshot();
+        let (facts, stack) = (std::collections::HashSet::new(), Stack::default());
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let (delivered, held) = nrese_exec::measure::measure(|| {
+            let mut delivered = 0;
+            let scanned = base.scan([None, Some(5), Some(rep)], &poll, &mut |_| delivered += 1);
+            assert!(scanned.is_err(), "a scan its poller stopped says so");
+            delivered
+        });
+        assert_eq!(delivered, 0, "the view holds nothing");
+        assert!(
+            poll.stopped(),
+            "{n} members visited without the poller polling"
+        );
+        let list = n as usize * size_of::<u64>();
+        assert!(
+            held <= list / 4,
+            "{held} bytes held by a stopped scan: the {list}-byte member list was copied"
+        );
+    }
+
+    /// REAS-2 review r1 F3: a negative lookup of a fact whose object is a value written
+    /// 8 × `POLL_UNITS` ways asks the view about each member, each counted as it is asked:
+    /// the stop at least once every `POLL_UNITS` plus one run (the longest run counted at
+    /// once, `POLL_UNITS`) of members. Counted all at once, the whole list was one ask.
+    #[test]
+    fn a_negative_upper_base_lookup_asks_its_stop_within_a_run() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let n = 8 * interval as u64;
+        let (engine, values, rep) = one_value_written(n);
+        let view = engine.snapshot();
+        let (facts, stack) = (std::collections::HashSet::new(), Stack::default());
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let asks = AtomicUsize::new(0);
+        let stop = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("never stopped");
+        assert!(
+            !base.contains([1, 5, rep], &poll).expect("never stopped"),
+            "the view asserts no member"
+        );
+        let run = interval;
+        let asks = asks.load(Ordering::Relaxed);
+        assert!(
+            asks >= n as usize / (interval + run),
+            "{asks} asks of the stop for {n} members asked about: more than {interval} plus one \
+             run of {run} between two of them"
+        );
+    }
 
     /// The delta executor reads estimates per job: they must be upper bounds, and zero
     /// only where nothing matches (a zero skips the job), and cost an index probe, not a
