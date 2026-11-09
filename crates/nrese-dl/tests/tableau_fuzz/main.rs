@@ -442,6 +442,18 @@ fn a_disjunction_left_undecided_by_a_retraction_is_reopened() {
     assert_eq!(tally.inconsistent, 1, "{tally:?}");
 }
 
+/// Guard (dynamic backtracking): seed 710126, case 7 is consistent, and no model leaves a
+/// pending disjunction undecided (`check_retraction`'s check at a model's end). A choice
+/// re-decided on top kept the retraction queues of its first opening; a truncation to it
+/// restored those, and the disjunctions the retraction had reopened since were lost (one
+/// stayed undecided in the model). It failed the D16-058 seed sweep at the model-end
+/// check.
+#[test]
+fn a_truncation_to_a_redecided_choice_keeps_what_its_retraction_reopened() {
+    let tally = campaign(710126, 8, Some(7), &|_| true);
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+}
+
 /// The number module's family (docs/design/owl2-dl.md#number-reasoning-layers):
 /// `(n, m, n·m)` is consistent by a validated compressed model, with no tableau node; that
 /// model, expanded to an explicit interpretation, is a model by the semantics' own check
