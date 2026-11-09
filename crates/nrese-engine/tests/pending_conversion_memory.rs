@@ -5,6 +5,9 @@
 //! them lets it go; what a pending version makes for itself is charged to its reader's budget
 //! before it is made. Measured (`nrese_exec::measure`), so this file is a test binary of its
 //! own.
+// On the old shared speculative transaction until V1b moves these guards to the private kind
+// and removes it (dictionary V1, the workspace `clippy.toml`).
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Barrier};
 

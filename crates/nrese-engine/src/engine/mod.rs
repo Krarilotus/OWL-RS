@@ -1142,8 +1142,9 @@ impl Engine {
     }
 
     /// The old speculative transaction: the shared kind without the writer slot, whose terms
-    /// enter the dictionary. Only for the two callers that read it through SPARQL until a
-    /// private transaction can be (dictionary lifecycle V2), and removed with them.
+    /// enter the dictionary. Temporary: until V1b, for the RL refutation's rule constants
+    /// (`nrese-store/src/entailment.rs`), the one caller the workspace `clippy.toml` allows;
+    /// removed with V1b (the reasoner's maintenance over either transaction kind).
     /// [`Transaction::commit`] fails on it.
     #[doc(hidden)]
     pub fn speculative_shared(&self) -> Transaction<'_> {

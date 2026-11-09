@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId};
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{GraphName, NamedNode, Quad, Term, TermRef};
 use nrese_sparql::ReadView;
@@ -280,12 +280,16 @@ impl StatementsRequest {
 }
 
 /// Applies the operations to `tx` for `requester`, the updates through `update` (the
-/// pipeline's SPARQL update path, with its dataset and cancellation).
-pub(crate) fn apply_statements(
-    tx: &mut Transaction<'_>,
+/// pipeline's SPARQL update path, with its dataset and cancellation). Either transaction kind:
+/// a writer's, or a private one's (a session's read, dictionary lifecycle V1), whose writes
+/// its budget can refuse, as the request's memory limit. The checks read `tx` as SPARQL does,
+/// through `budget`, the request's ([`nrese_sparql::PendingRead`]).
+pub(crate) fn apply_statements<T: nrese_sparql::UpdateTarget>(
+    tx: &mut T,
     request: &StatementsRequest,
     requester: &crate::Requester,
-    update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
+    budget: &Arc<nrese_exec::Budget>,
+    update: &mut dyn FnMut(&mut T, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
     for op in request.ops.iter() {
         match op {
@@ -298,12 +302,13 @@ pub(crate) fn apply_statements(
             StatementOp::RemoveData { data, contexts } => {
                 for quad in data.quads(contexts)? {
                     requester.write.check(&quad.graph_name)?;
-                    tx.try_remove(quad.as_ref())?;
+                    tx.remove(quad.as_ref())?;
                 }
             }
             StatementOp::RemoveMatching(pattern) => {
+                let view = nrese_sparql::PendingRead::new(&*tx, budget);
                 // The removal matches in the graphs the requester reads.
-                let patterns = pattern.patterns(&*tx, &requester.read);
+                let patterns = pattern.patterns(&view, &requester.read);
                 if let Some(writable) = requester.write.access() {
                     // Every graph the removal would change must be writable.
                     let mut allowed = std::collections::HashSet::new();
@@ -312,8 +317,8 @@ pub(crate) fn apply_statements(
                             if allowed.contains(&quad.graph) {
                                 continue;
                             }
-                            if !writable.allows_id(&*tx, quad.graph) {
-                                let graph = crate::mutation::command::graph_name(tx, quad.graph);
+                            if !writable.allows_id(&view, quad.graph) {
+                                let graph = crate::mutation::command::graph_name(&*tx, quad.graph);
                                 return requester.write.check(&graph);
                             }
                             allowed.insert(quad.graph);
