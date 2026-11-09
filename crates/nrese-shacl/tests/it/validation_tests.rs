@@ -64,6 +64,25 @@ fn compiled(snapshot: &Snapshot) -> Shapes {
 
 const DEFAULT: Selection = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
 
+// Spec: SHACL node kinds containing Literal do not accept an RDF 1.2 triple term.
+#[test]
+fn d066_f1_triple_term_is_not_a_literal_node_kind() {
+    for kind in ["Literal", "BlankNodeOrLiteral", "IRIOrLiteral"] {
+        let store = engine(
+            "ex:s ex:p <<( ex:a ex:b ex:c )>> .",
+            &format!("ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:nodeKind sh:{kind} ."),
+        );
+        let snapshot = store.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(!report.conforms(), "a triple term is not sh:{kind}");
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(
+            report.results[0].component.as_str(),
+            Component::NodeKind.iri()
+        );
+    }
+}
+
 fn ex(local: &str) -> String {
     format!("<http://example.com/{local}>")
 }
