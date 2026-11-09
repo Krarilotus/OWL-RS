@@ -798,3 +798,59 @@ fn a_closures_buffers_are_charged_while_they_live() {
     .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Spec (the graph closure package's review r1, R1-F1): a closure searched from a bound end
+/// charges what it holds while it searches (the nodes seen, the order, the frontiers), so a
+/// request whose limit they don't fit is refused while it holds little. Over a 131,072-node
+/// chain under a 1 MiB limit, the search reaches every node:
+/// - `<n0> p+ ?o`, forwards;
+/// - `?s p+ <n131071>`, backwards;
+/// - `?s t c . ?s p+ ?o`, one bound start in a join (the bound values' search per start).
+///
+/// Each must be refused while holding less than 2 MiB: the order of 131,072 ids alone is 1 MiB,
+/// and a set of the nodes seen more. Searched uncharged and charged on arrival, both were held
+/// before the refusal.
+#[test]
+fn a_search_from_a_bound_end_is_charged_while_it_searches() {
+    if !alone() {
+        return;
+    }
+    const LIMIT: usize = 1 << 20;
+    const N: usize = 1 << 17;
+    let engine = default_store(
+        (0..N - 1)
+            .map(|i| (format!("n{i}"), "p".to_owned(), format!("n{}", i + 1)))
+            .chain([
+                ("s".to_owned(), "p".to_owned(), "n0".to_owned()),
+                ("s".to_owned(), "t".to_owned(), "c".to_owned()),
+            ]),
+    );
+    let last = format!("SELECT ?s WHERE {{ ?s <urn:p>+ <urn:n{}> }}", N - 1);
+    let cases = [
+        (
+            "forwards from a bound start",
+            "SELECT ?o WHERE { <urn:n0> <urn:p>+ ?o }",
+        ),
+        ("backwards from a bound end", last.as_str()),
+        (
+            "one bound start in a join",
+            "SELECT ?s ?o WHERE { ?s <urn:t> <urn:c> . ?s <urn:p>+ ?o }",
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(name, query)| {
+            let (rows, held) = query_held(&engine, query, LIMIT);
+            eprintln!("{name}: {rows:?}, held {held} bytes at most");
+            let refused = matches!(&rows, Err(refusal) if refusal.contains("MemoryLimit"));
+            match refused && held < 2 * LIMIT {
+                true => None,
+                false => Some(format!(
+                    "{name}: {rows:?} holding {held} bytes, not refused under {}",
+                    2 * LIMIT
+                )),
+            }
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
