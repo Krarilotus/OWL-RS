@@ -398,7 +398,10 @@ unsafe fn handed_out(base: *mut u8, header: usize, tag: u64) -> *mut u8 {
 
 // SAFETY: every block is `A`'s, with the header added to its layout (same alignment) and
 // handed out past it; the counting touches only atomics and the slots (no allocation).
+// Never inlined: inlined, the header's reads fall outside the block LLVM takes
+// `__rust_alloc` to return, and fat LTO dropped the code around them (UCG#442).
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
+    #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some((outer, header)) = with_header(layout) else {
             return std::ptr::null_mut();
@@ -412,6 +415,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         pointer
     }
 
+    #[inline(never)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let Some((outer, header)) = with_header(layout) else {
             return std::ptr::null_mut();
@@ -425,6 +429,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         pointer
     }
 
+    #[inline(never)]
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         let (outer, header) = with_header(layout).expect("the layout it was allocated with");
         // SAFETY: a block of this allocator, allocated with `layout`.
@@ -434,6 +439,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         }
     }
 
+    #[inline(never)]
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let (outer, header) = with_header(layout).expect("the layout it was allocated with");
         let Some(grown) = size.checked_add(header) else {
