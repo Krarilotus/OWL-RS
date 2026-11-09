@@ -2594,6 +2594,71 @@ mod certificate_tests {
         );
     }
 
+    /// Spec (Q06 fix check r2): an open certificate transition refuses without waiting;
+    /// once settled and certified, the RDFS subclass conclusion still holds.
+    #[test]
+    fn an_entailment_refuses_an_open_certificate_transition_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let conclusion = [nrese_rdf::Triple::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/a"),
+            nrese_rdf::vocab::rdf::TYPE.into_owned(),
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/D"),
+        )];
+        let racer = store.clone();
+        let during = conclusion.clone();
+        hooks::INSIDE_INVALIDATION.set(Some(Box::new(move || {
+            // Synchronous: the transition cannot settle until this call returns.
+            // The fleet red's external timeout witnesses the old unbounded loop.
+            assert!(matches!(
+                racer.entails(rdfs(), &during),
+                Err(crate::StoreError::Configuration(message))
+                    if message == "the inferred statements aren't rdfs's closure: rematerialise first"
+            ));
+        })));
+        store.invalidate_reasoning().unwrap();
+        store.rematerialise(rdfs()).unwrap();
+        assert_eq!(
+            store.entails(rdfs(), &conclusion).unwrap(),
+            crate::Entailment::Entailed
+        );
+    }
+
+    /// Spec (Q06 fix check r2): a certificate changed during reads refuses even when
+    /// the replacement is certified, instead of retrying to an answer.
+    #[test]
+    fn an_entailment_refuses_a_certificate_changed_during_its_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let racer = store.clone();
+        hooks::AFTER_CERTIFIED.set(Some(Box::new(move || {
+            racer.invalidate_reasoning().unwrap();
+            racer.rematerialise(rdfs()).unwrap();
+        })));
+        let conclusion = [nrese_rdf::Triple::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/a"),
+            nrese_rdf::vocab::rdf::TYPE.into_owned(),
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/D"),
+        )];
+        assert!(matches!(
+            store.entails(rdfs(), &conclusion),
+            Err(crate::StoreError::Configuration(message))
+                if message == "the inferred statements aren't rdfs's closure: rematerialise first"
+        ));
+        assert_eq!(
+            store.entails(rdfs(), &conclusion).unwrap(),
+            crate::Entailment::Entailed
+        );
+    }
+
     const INVERSE: &str = "<http://example.com/p> <http://www.w3.org/2002/07/owl#inverseOf> \
                            <http://example.com/q> .\n<http://example.com/a> <http://example.com/p> \
                            <http://example.com/b> .\n";
