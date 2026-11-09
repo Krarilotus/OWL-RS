@@ -262,9 +262,10 @@ fn counted_reads_answer_as_the_uncounted_ones() {
 /// it moves): a counted read's cold equality class build counts in proportion to its input.
 /// An asserted chain of `n` identities (`s_i sameAs s_i+1`, one class) and materialisation's
 /// inferred star over it (`s_i sameAs s_0`, each pair already in that class, which a union
-/// leaves as it is): a count's visitor is told of at most a small multiple of `n` units.
-/// Charging a union by the smaller side's size whatever it does, each star statement counted
-/// the whole class: about `n` squared.
+/// leaves as it is): a count's visitor is told of at most a small multiple of `n` units, plus
+/// the class sort's `n · log2 n` comparisons (counted since fix check r1 R1). Charging a union
+/// by the smaller side's size whatever it does, each star statement counted the whole class:
+/// about `n` squared.
 #[test]
 fn a_counted_class_build_counts_in_proportion_to_its_statements() {
     let n = 2 * nrese_exec::POLL_UNITS as usize;
@@ -317,7 +318,8 @@ fn a_counted_class_build_counts_in_proportion_to_its_statements() {
         Ok(Count::Exact(n as u64)),
         "the statement's copy for each identity"
     );
-    let (units, bound) = (units.get(), 16 * n as u64);
+    let sort = n as u64 * u64::from(usize::BITS - n.leading_zeros());
+    let (units, bound) = (units.get(), 16 * n as u64 + sort);
     assert!(
         units <= bound,
         "{units} units counted for {n} identities: at most {bound}"
