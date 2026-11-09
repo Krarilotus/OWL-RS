@@ -113,17 +113,51 @@ fn request_budget(budget: Option<&Arc<nrese_exec::Budget>>) -> Arc<nrese_exec::B
     }
 }
 
+/// What the corpus store admits by (contract S3): the version of a snapshot with the
+/// shared-state capability, made only from its token ([`Admission::of`]), so that an
+/// admission works on the token's own snapshot and never on one passed beside it.
+pub(crate) struct Admission<'s> {
+    version: &'s Arc<crate::engine::Version>,
+}
+
+impl<'s> Admission<'s> {
+    /// The admission of the snapshot `token` was taken from.
+    fn of(token: &super::SharedState<'s>) -> Self {
+        Self {
+            version: &token.snapshot().version,
+        }
+    }
+
+    /// The version admitted.
+    pub(crate) fn version(&self) -> &'s Arc<crate::engine::Version> {
+        self.version
+    }
+
+    /// A version admitted without a snapshot: the corpus store's own unit tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(version: &'s Arc<crate::engine::Version>) -> Self {
+        Self { version }
+    }
+}
+
 impl Snapshot {
-    /// The engine's store of corpora, made at the first reader-scoped search; `None` for
-    /// statistics without an engine's cell (a search then keeps nothing).
-    fn corpora(&self) -> Option<&CorpusStore> {
-        self.statistics.corpora.get_or_init()
+    /// The engine's store of corpora, made at the first reader-scoped search of a published
+    /// snapshot (`admitted`: a snapshot without the capability makes none, contract S3);
+    /// `None` for statistics without an engine's cell, and where none was made yet for a
+    /// search without the capability (a search then keeps nothing).
+    fn corpora(&self, admitted: bool) -> Option<&CorpusStore> {
+        match admitted {
+            true => self.statistics.corpora.get_or_init(),
+            false => self.statistics.corpora.get(),
+        }
     }
 
     /// The most words of bits a slice of a corpus walk covers: the engine's setting, or the
-    /// default for statistics without an engine's cell.
+    /// default where there is no store.
     fn walk_slice_words(&self) -> usize {
-        self.corpora()
+        self.statistics
+            .corpora
+            .get()
             .map_or(crate::CorpusTuning::DEFAULT, CorpusStore::tuning)
             .walk_slice_words
     }
@@ -355,7 +389,11 @@ impl Snapshot {
                 &budgeted
             }
         };
-        let store = self.corpora();
+        // Only a published snapshot, or a restriction of one, admits into the store; any
+        // other derives what it can from a kept corpus, reading it, and keeps nothing.
+        let token = self.shared_state();
+        let admitted = token.as_ref().map(Admission::of);
+        let store = self.corpora(admitted.is_some());
         let kind = KindRef {
             documents,
             model,
@@ -363,9 +401,13 @@ impl Snapshot {
             equality: self.equality,
             canonical: self.canonical,
         };
-        let found = match store {
-            Some(store) => store.find(&self.version, kind, request)?,
-            None => Found::Build {
+        let found = match (store, &admitted) {
+            (Some(store), Some(admitted)) => store.find(admitted, kind, request)?,
+            (Some(store), None) => Found::Build {
+                from: store.derive_unadmitted(&self.version, kind, request),
+                keep: false,
+            },
+            (None, _) => Found::Build {
                 from: None,
                 keep: false,
             },
@@ -382,19 +424,20 @@ impl Snapshot {
             Ok(built) => built,
             Err(refused) => {
                 // The entry `find` made for it is let go: nothing will fill it.
-                if let Some(store) = store.filter(|_| keep) {
-                    store.abandon(&self.version, kind);
+                if let (Some(store), Some(admitted)) = (store.filter(|_| keep), &admitted) {
+                    store.abandon(admitted, kind);
                 }
                 return Err(refused);
             }
         };
         // Kept: built on the store's budget. Else the search's, on its own.
         let (_, bytes) = Corpus::finished_bytes(built.documents, span);
-        let kept = store.filter(|_| keep).and_then(|store| {
-            store.keep_built(&self.version, kind, bytes, |budget| {
+        let kept = match (store.filter(|_| keep), &admitted) {
+            (Some(store), Some(admitted)) => store.keep_built(admitted, kind, bytes, |budget| {
                 Corpus::finish(&built, span, budget)
-            })
-        });
+            }),
+            _ => None,
+        };
         Ok(match kept {
             Some(corpus) => CorpusRef::Kept(corpus),
             None => CorpusRef::Own(Corpus::finish(&built, span, request)?),
