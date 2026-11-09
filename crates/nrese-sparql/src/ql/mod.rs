@@ -268,6 +268,9 @@ struct Cached {
     access: Option<GraphAccess>,
     /// The exact snapshot view it was read from, including pending changes and masks.
     key: SnapshotIdentity,
+    /// The compiling snapshot's [`Snapshot::shared_bound`]: every id the entry holds is
+    /// below it.
+    bound: u64,
     /// The schema without its memberships, in every graph ([`read_core`]): what a new
     /// snapshot's must equal for the entry to stand. Equality is linear in its size, as
     /// hashing was; a hash collision must never select another TBox.
@@ -530,7 +533,14 @@ impl QlRewriting {
             state,
             &mut cached,
             at,
-            schema.entry(access, key, expressions, members, Arc::clone(&tbox)),
+            schema.entry(
+                access,
+                key,
+                snapshot.shared_bound(),
+                expressions,
+                members,
+                Arc::clone(&tbox),
+            ),
         );
         tbox
     }
@@ -538,7 +548,10 @@ impl QlRewriting {
     /// [`Self::tbox`] of the unpublished snapshot `own` gives, kept in its version alone.
     /// An entry is this rewriting's (its closure), its reader's and its view's: views of one
     /// version in other equality modes share the slot, never an entry. A first read reuses
-    /// a TBox its schema matches, the version's or the store's (read only), or compiles.
+    /// a TBox its schema matches, the version's or the store's (read only), or compiles. A
+    /// private snapshot reads only the store's entries compiled at or below its overlay's
+    /// start ([`Snapshot::shared_bound`]): above it, a publication after the overlay opened
+    /// gives its new terms the overlay's own numbers (review dict-v1c r2, R2).
     ///
     /// The version's entries are locked only to look up and to install: the schema is read
     /// and compiled outside the lock (DICT2, 9 Nov), and a read of the same view installed
@@ -576,6 +589,7 @@ impl QlRewriting {
             shared
                 .iter()
                 .filter(|c| c.access.as_ref() == access)
+                .filter(|c| !snapshot.is_private() || c.bound <= snapshot.shared_bound())
                 .find(|c| schema.reuses(c, &members))
                 .map(|c| Arc::clone(&c.tbox))
         });
@@ -589,7 +603,8 @@ impl QlRewriting {
         if entries.len() == READERS {
             entries.remove(0);
         }
-        let entry = schema.entry(access, key, expressions, members, Arc::clone(&tbox));
+        let bound = snapshot.shared_bound();
+        let entry = schema.entry(access, key, bound, expressions, members, Arc::clone(&tbox));
         entries.push((self.closure, entry));
         tbox
     }
@@ -797,6 +812,7 @@ impl Schema {
         self,
         access: Option<&GraphAccess>,
         key: SnapshotIdentity,
+        bound: u64,
         expressions: Vec<u64>,
         members: Members,
         tbox: Arc<Tbox>,
@@ -804,6 +820,7 @@ impl Schema {
         Cached {
             access: access.cloned(),
             key,
+            bound,
             core: self.core.into_boxed_slice(),
             expressions: expressions.into_boxed_slice(),
             thing: self.thing,
