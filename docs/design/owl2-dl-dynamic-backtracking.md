@@ -188,6 +188,13 @@ Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
   alternative) comes from its first opening. With the queues of its first opening, a
   truncation to it lost the disjunctions its own retraction had reopened (fuzz seed
   710126, case 7, found by the model-end check).
+- **The reopening window reaches down to the lowest disjunction ever taken from the
+  reopen list.** A disjunction a killed fact satisfied was looked at after the fact's level
+  opened: by the scan, at or after that level's saved cursor, or taken from `reopen`, at
+  any index below it. A reopened disjunction passed over as satisfied by a newer choice
+  sat below that choice's window, and retracting the choice left it undecided: a wrong
+  answer (review D16-058 r1, a hand-made case). `Engine::reopened_low` is the run's lowest
+  reopened index, and a retraction's window starts at the smaller of the two.
 
 **Measured** (662 to 664, lab profile):
 - Truncating backjumps fall to 0 and rebuilt levels to 0. Branch points fall from millions

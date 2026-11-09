@@ -132,6 +132,11 @@ pub struct Engine<'a> {
     pub refire: Vec<u32>,
     /// Pending disjunctions behind the scan that a retraction may have opened again.
     pub reopen: Vec<u32>,
+    /// The lowest pending index ever taken from `reopen` in the run (`u32::MAX`: none). The
+    /// scan only looks at its cursor or beyond, but `reopen` brings back older disjunctions,
+    /// which a later choice may then satisfy: a retraction's window reaches down to here
+    /// (`retract.rs`, review D16-058 r1).
+    pub reopened_low: u32,
     pub bindings: Vec<u32>,
     pub pending_open: u32,
     pub frames: Vec<Frame>,
@@ -190,6 +195,7 @@ impl<'a> Engine<'a> {
             pending_dead: Vec::new(),
             refire: Vec::new(),
             reopen: Vec::new(),
+            reopened_low: u32::MAX,
             bindings: Vec::new(),
             pending_open: 0,
             frames: Vec::new(),

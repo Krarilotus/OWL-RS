@@ -251,6 +251,7 @@ impl<'p> Engine<'p> {
     /// The first open disjunction: asserted if one disjunct is left, else a branch point.
     fn choose(&mut self) -> Step<bool> {
         while let Some(at) = self.reopen.pop() {
+            self.reopened_low = self.reopened_low.min(at);
             if (at as usize) < self.pending.len()
                 && let Some(step) = self.decide(at as usize)
             {
