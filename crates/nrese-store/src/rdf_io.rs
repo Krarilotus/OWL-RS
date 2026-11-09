@@ -20,6 +20,9 @@ use url::Url;
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
 
+mod staged;
+pub(crate) use staged::StagedQuads;
+
 impl GraphResultFormat {
     pub(crate) fn rdf_format(self) -> RdfFormat {
         match self {
@@ -58,11 +61,14 @@ fn parser(
     }
 }
 
-// Uploads are read as they go: each statement goes to its consumer borrowed from the
-// parser's buffers (a write's transaction, a validation's speculative one, a check) and is
-// gone before the next. A document's statements are never kept as owned copies uncharged:
-// with one long namespace and many short statements, those copies cost thousands of times
-// the document (the upload sizing). A caller that must keep them gets [`ChargedQuads`].
+// Uploads are read once, as they go: each statement goes to its consumer borrowed from the
+// parser's buffers and is gone before the next. A consumer that only looks terms up (a
+// removal, a check) uses it there. A write stages it ([`StagedQuads`]): the dictionary is
+// shared and never rolls back, so nothing is interned before the whole document has been read
+// without an error, and what is kept until then is charged to the request first. A
+// document's statements are never kept as owned copies uncharged: with one long namespace and
+// many short statements, those copies cost thousands of times the document (the upload
+// sizing). A caller that must keep them as quads gets [`ChargedQuads`].
 
 /// Gives `each` every quad of `quads` in order, borrowed until the next; the first error,
 /// the parser's or `each`'s, ends it.
@@ -76,49 +82,21 @@ fn each_of<R: Read>(
     Ok(())
 }
 
-/// What a consumer of an upload's quads does that an error part-way can't undo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Consumer {
-    /// It interns terms into the engine's dictionary (an insert, even into a transaction
-    /// that is then discarded): the dictionary is shared and keeps them. It is given the
-    /// document's quads only once the whole document has been read and found valid, by a
-    /// first pass that borrows each quad and keeps nothing.
-    Interning,
-    /// Its effects end with the operation: lookups, a scan of its own.
-    Local,
-}
-
-/// The parser's quads of `payload` to `each` as `consumer` needs them: for an interning
-/// consumer, only after a first pass has read the whole payload without an error.
-fn each_valid<'p>(
-    quads: impl Fn() -> StoreResult<QuadParser<'p, std::io::Empty>>,
-    consumer: Consumer,
-    each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
-) -> StoreResult<()> {
-    if consumer == Consumer::Interning {
-        each_of(quads()?, |_| Ok(()))?;
-    }
-    each_of(quads()?, each)
-}
-
-/// The quads of a single-graph payload, in `graph`, to `each` (as `consumer` needs them).
-/// Named-graph content in the payload (possible in N-Quads, TriG and JSON-LD) is an error.
+/// The quads of a single-graph payload, in `graph`, to `each`. Named-graph content in the
+/// payload (possible in N-Quads, TriG and JSON-LD) is an error.
 pub(crate) fn each_graph_quad(
     format: GraphResultFormat,
     base_iri: Option<&str>,
     payload: &[u8],
     graph: GraphName,
     blank_nodes: BlankNodes,
-    consumer: Consumer,
     each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
 ) -> StoreResult<()> {
-    let quads = || {
-        Ok(parser(format.rdf_format(), base_iri, blank_nodes)?
-            .without_named_graphs()
-            .with_default_graph(graph.clone())
-            .for_slice(payload))
-    };
-    each_valid(quads, consumer, each)
+    let quads = parser(format.rdf_format(), base_iri, blank_nodes)?
+        .without_named_graphs()
+        .with_default_graph(graph)
+        .for_slice(payload);
+    each_of(quads, each)
 }
 
 /// [`each_graph_quad`] in one pass, from a reader: for a consumer whose interned terms go
@@ -174,17 +152,16 @@ pub(crate) fn stored(mut quad: Quad) -> Quad {
 /// The quads of a request payload, in the graphs it names as written (the default graph for
 /// triples): a protocol can still tell a graph left out from one named, an alias of the
 /// default graph included; where they are placed, they pass through [`stored_graph_ref`].
-/// Each to `each` (as `consumer` needs them).
+/// Each to `each`.
 pub(crate) fn each_payload_quad(
     format: RdfFormat,
     base_iri: Option<&str>,
     payload: &[u8],
     blank_nodes: BlankNodes,
-    consumer: Consumer,
     each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
 ) -> StoreResult<()> {
-    let quads = || Ok(parser(format, base_iri, blank_nodes)?.for_slice(payload));
-    each_valid(quads, consumer, each)
+    let quads = parser(format, base_iri, blank_nodes)?.for_slice(payload);
+    each_of(quads, each)
 }
 
 /// The quads of a request payload that must be kept (a repository's configuration, read in
@@ -207,7 +184,6 @@ pub fn parse_payload(
         base_iri,
         payload,
         BlankNodes::Fresh,
-        Consumer::Local,
         |quad| {
             kept.terms.charge(owned_quad_bytes(quad))?;
             kept.quads.push(quad.into_owned())?;

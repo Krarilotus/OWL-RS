@@ -16,13 +16,13 @@
 use std::sync::Arc;
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
-use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_rdf::{GraphName, GraphNameRef, NamedNode, Quad, QuadRef, Term, TermRef};
 use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad, stored_graph_ref};
+use crate::rdf_io::{BlankNodes, StagedQuads, each_payload_quad, stored_graph_ref};
 use crate::update::SparqlUpdateRequest;
 use crate::view::decoded_quads;
 
@@ -100,16 +100,15 @@ pub struct RdfPayload {
 impl RdfPayload {
     /// The payload's statements placed per `contexts` (module docs), each in the graph the
     /// store keeps it in (`rdf_io::stored_graph_ref`), after the contexts replace the
-    /// payload's own: each to `each` as it is read (as `consumer` needs them:
-    /// [`Consumer`]), once per context if any are given.
+    /// payload's own: each to `each` as it is read, once per context if any are given. For a
+    /// consumer that only looks terms up (a write stages them: [`Self::stage`]).
     fn each_quad(
         &self,
         contexts: &[GraphName],
         blank_nodes: BlankNodes,
-        consumer: Consumer,
         mut each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
     ) -> StoreResult<()> {
-        self.each_as_written(blank_nodes, consumer, |quad| {
+        self.each_as_written(blank_nodes, |quad| {
             if contexts.is_empty() {
                 return each(QuadRef::new(
                     quad.subject,
@@ -134,7 +133,6 @@ impl RdfPayload {
     fn each_as_written(
         &self,
         blank_nodes: BlankNodes,
-        consumer: Consumer,
         each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
     ) -> StoreResult<()> {
         each_payload_quad(
@@ -142,14 +140,22 @@ impl RdfPayload {
             self.base_iri.as_deref(),
             &self.payload,
             blank_nodes,
-            consumer,
             each,
         )
     }
 
+    /// The payload read whole and staged, charged to `memory` ([`StagedQuads`]), with fresh
+    /// blank nodes; with `contexts`, without its own graphs, which they replace.
+    fn stage(&self, contexts: &[GraphName], memory: &Envelope) -> StoreResult<StagedQuads> {
+        let mut staged = StagedQuads::new(memory);
+        let graphs = contexts.is_empty();
+        self.each_as_written(BlankNodes::Fresh, |quad| staged.stage(quad, graphs))?;
+        Ok(staged)
+    }
+
     /// Whether the payload is RDF in its format: read to its end, nothing kept.
     fn check(&self, blank_nodes: BlankNodes) -> StoreResult<()> {
-        self.each_as_written(blank_nodes, Consumer::Local, |_| Ok(()))
+        self.each_as_written(blank_nodes, |_| Ok(()))
     }
 }
 
@@ -416,30 +422,29 @@ impl StatementsRequest {
 }
 
 /// Applies the operations to `tx` for `requester`, the updates through `update` (the
-/// pipeline's SPARQL update path, with its dataset and cancellation).
+/// pipeline's SPARQL update path, with its dataset and cancellation); what a payload's
+/// inserts keep until they are written is charged to `memory`.
 pub(crate) fn apply_statements(
     tx: &mut Transaction<'_>,
     request: &StatementsRequest,
     requester: &crate::Requester,
+    memory: &Envelope,
     update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
     for op in request.ops.iter() {
-        // Each statement of a payload as it is read; one that fails part-way fails the
-        // request, whose transaction is then discarded with all it changed. Inserts intern
-        // into the shared dictionary, which a discarded transaction doesn't undo: their
-        // payload is read whole and found valid first ([`Consumer::Interning`]). Removals
-        // only look terms up. The pending changes' growth is charged before it happens
-        // (D16-039).
+        // A payload is read once; one that fails part-way fails the request, whose
+        // transaction is then discarded with all it changed. Inserts intern into the shared
+        // dictionary, which a discarded transaction doesn't undo: their payload is read whole
+        // and staged, charged to `memory`, first ([`StagedQuads`]). Removals only look terms
+        // up, each statement as it is read. The pending changes' growth is charged before it
+        // happens (D16-039).
         match op {
             StatementOp::Add { data, contexts } => {
-                data.each_quad(contexts, BlankNodes::Fresh, Consumer::Interning, |quad| {
-                    check_write(requester, quad.graph_name)?;
-                    tx.try_insert(quad)?;
-                    Ok(())
-                })?;
+                data.stage(contexts, memory)?
+                    .write(tx, contexts, &mut |graph| check_write(requester, graph))?;
             }
             StatementOp::RemoveData { data, contexts } => {
-                data.each_quad(contexts, BlankNodes::Fresh, Consumer::Local, |quad| {
+                data.each_quad(contexts, BlankNodes::Fresh, |quad| {
                     check_write(requester, quad.graph_name)?;
                     tx.try_remove(quad)?;
                     Ok(())
@@ -454,7 +459,7 @@ pub(crate) fn apply_statements(
                 // A statement's graph as written (`rdf4j:nil`, none); its pattern's
                 // contexts are placed as the store places them (`StatementPattern::patterns`).
                 let blank_nodes = blank_nodes(*preserve_blank_nodes);
-                data.each_as_written(blank_nodes, Consumer::Local, |quad| {
+                data.each_as_written(blank_nodes, |quad| {
                     remove_matching(tx, &removal_pattern(quad, contexts), requester)
                 })?;
             }

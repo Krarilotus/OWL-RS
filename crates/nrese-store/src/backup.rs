@@ -9,12 +9,12 @@
 use std::io::Write;
 
 use nrese_engine::{QuadPattern, ReadModel, Snapshot, Transaction};
-use nrese_rdf::QuadRef;
+use nrese_exec::Envelope;
 use nrese_rdf_io::{RdfFormat, RdfParseError};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
-use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad, stored_graph_ref, write_quads};
+use crate::rdf_io::{BlankNodes, StagedQuads, each_payload_quad, write_quads};
 
 /// The closing comment of an export, before its checksum's 64 hex digits.
 pub const DIGEST_PREFIX: &str = "# nrese-sha256 ";
@@ -146,36 +146,30 @@ pub fn export_dataset(
     })
 }
 
-/// Replaces the whole dataset with the artifact's quads, each as it is read once the whole
-/// artifact is known valid ([`Consumer::Interning`]). An invalid artifact changes nothing: a
-/// damaged one fails its checksum first, one that isn't N-Quads fails before its first
-/// insert (interning nothing), and the restore's transaction is then discarded (the
-/// mutation pipeline commits only a write that ends).
+/// Replaces the whole dataset with the artifact's quads, each in the graph the store keeps it
+/// in. The artifact is read whole first, staged and charged to `memory` ([`StagedQuads`]). An
+/// invalid artifact changes nothing: a damaged one fails its checksum first, one that isn't
+/// N-Quads, or is too large for the request's memory, fails before anything is removed or
+/// interned, and the restore's transaction is then discarded (the mutation pipeline commits
+/// only a write that ends).
 pub(crate) fn apply_restore(
     tx: &mut Transaction<'_>,
     request: &DatasetRestoreRequest,
+    memory: &Envelope,
 ) -> StoreResult<DatasetRestoreReport> {
     let checksum_verified = verify_checksum(&request.payload)?;
-    let replaced_existing = !tx.is_empty();
-    // The pending changes' growth is charged before it happens (D16-039).
-    tx.remove_matching(&QuadPattern::all())?;
+    let mut staged = StagedQuads::new(memory);
     each_payload_quad(
         request.format.rdf_format(),
         None,
         &request.payload,
         BlankNodes::Fresh,
-        Consumer::Interning,
-        // Each in the graph the store keeps it in.
-        |quad| {
-            tx.try_insert(QuadRef::new(
-                quad.subject,
-                quad.predicate,
-                quad.object,
-                stored_graph_ref(quad.graph_name),
-            ))?;
-            Ok(())
-        },
+        |quad| staged.stage(quad, true),
     )?;
+    let replaced_existing = !tx.is_empty();
+    // The pending changes' growth is charged before it happens (D16-039).
+    tx.remove_matching(&QuadPattern::all())?;
+    staged.write(tx, &[], &mut |_| Ok(()))?;
     Ok(DatasetRestoreReport {
         format: request.format,
         checksum_sha256: sha256_hex(&request.payload),

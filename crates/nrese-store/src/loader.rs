@@ -28,8 +28,8 @@ pub(crate) fn preload_ontology(
     }
     // Each statement into the transaction as it is read, in one pass; committed only once
     // the file is read to its end. An error fails the store's opening, which drops this
-    // engine with its dictionary: the terms a failed file interned go with it, so no first
-    // validating pass is needed (unlike uploads, `Consumer::Interning`).
+    // engine with its dictionary: the terms a failed file interned go with it, so nothing is
+    // staged first (unlike uploads, `rdf_io::StagedQuads`).
     let mut tx = engine.transaction();
     each_graph_quad_once(
         infer_ontology_format(&ontology_path)?,

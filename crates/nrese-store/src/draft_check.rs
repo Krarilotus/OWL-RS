@@ -263,7 +263,6 @@ fn check_shacl(
         None,
         shapes.as_bytes(),
         crate::rdf_io::BlankNodes::Fresh,
-        crate::rdf_io::Consumer::Local,
         |quad| {
             if let Some((_, feature)) = UNSUPPORTED_SHACL
                 .iter()

@@ -16,7 +16,7 @@ use nrese_sparql::{CancellationToken, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, Consumer, each_graph_quad, serialize_triples};
+use crate::rdf_io::{BlankNodes, StagedQuads, each_graph_quad, serialize_triples};
 use crate::service::StoreService;
 
 /// Where a request's shapes stay while it runs (never committed): this graph, or the first
@@ -425,10 +425,10 @@ impl StoreService {
                 // The shapes go into a graph of a speculative transaction, never committed:
                 // their statements leave no trace, but valid shapes' terms stay in the
                 // repository's dictionary, as stored shapes' do (shared, never rolled back).
-                // So they are inserted only once the whole payload is known valid
-                // (`Consumer::Interning`): shapes that aren't valid intern nothing. It takes
-                // no writer slot, so commits go on meanwhile. The graph holds no stored
-                // statement (SYN-58).
+                // So they are read whole first, staged and charged to the request's memory
+                // ([`StagedQuads`]): shapes that aren't valid, or too large for it, intern
+                // nothing. It takes no writer slot, so commits go on meanwhile. The graph
+                // holds no stored statement (SYN-58).
                 let mut tx = self.engine().speculative();
                 let revision = tx.base().revision();
                 let validated = match &request.graphs {
@@ -437,18 +437,16 @@ impl StoreService {
                 };
                 let graph = request_shapes_graph(tx.base(), validated.as_ref());
                 let scratch = graph.as_ref();
+                let mut staged = StagedQuads::new(&resources.memory);
                 each_graph_quad(
                     *format,
                     base_iri.as_deref(),
                     payload.as_slice(),
                     GraphName::NamedNode(scratch.into_owned()),
                     BlankNodes::Fresh,
-                    Consumer::Interning,
-                    |quad| {
-                        tx.insert(quad);
-                        Ok(())
-                    },
+                    |quad| staged.stage(quad, true),
                 )?;
+                staged.write(&mut tx, &[], &mut |_| Ok(()))?;
                 let (report, shapes, applicable) = validate_view(
                     &tx,
                     tx.lookup(scratch.into()),
