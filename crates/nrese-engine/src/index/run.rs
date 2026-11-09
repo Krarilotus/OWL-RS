@@ -454,13 +454,24 @@ impl Run {
 
     /// Sign of `quad` in this run: +1 insert, -1 tombstone, 0 absent. O(log n).
     pub(crate) fn sign_of(&self, quad: &EncodedQuad) -> i64 {
+        self.sign_of_counted(quad, &mut crate::visit::Free)
+            .expect("nothing is counted")
+    }
+
+    /// [`Self::sign_of`], its searches counted on `account` before they are made: `None`
+    /// once the account has stopped (REAS-3a fix check r1 F1).
+    pub(crate) fn sign_of_counted(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl crate::visit::Account,
+    ) -> Option<i64> {
         let perm = self.permutation(Permutation::Spog);
         let key = Permutation::Spog.to_key(quad);
-        match perm.range(&key, &key) {
+        Some(match perm.keys.range_counted(&key, &key, account)? {
             (start, end) if start == end => 0,
             (start, _) if perm.is_tombstone(start) => -1,
             _ => 1,
-        }
+        })
     }
 }
 
