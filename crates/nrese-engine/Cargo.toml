@@ -13,7 +13,7 @@ license.workspace = true
 fault-points = []
 # The work counters of src/witness.rs, for other crates' tests (REAS-3: the work an adapter's
 # read does in the engine, after its stop): a dev-dependency with this feature. Never in product
-# builds; the count jobs check that none of theirs has it.
+# builds (scripts/check-features.sh); the count jobs check that none of theirs has it.
 witness = []
 
 [dependencies]
