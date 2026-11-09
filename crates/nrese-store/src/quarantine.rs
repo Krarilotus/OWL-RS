@@ -1079,6 +1079,74 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// The first resolution through a log that is a link to a file not made yet (sol-loop r1 on
+    /// DUR-5, S2): the append makes the target, as it did before naming linked logs, and the
+    /// resolution is acknowledged and kept after a reopen. Windows runs it on a file symlink
+    /// where the host may make one, else "not run". Before the fix the naming ahead of the
+    /// append found no target and refused every resolution.
+    #[test]
+    fn a_first_discard_through_a_log_link_makes_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let file = dir.path().join("bad.nt");
+        fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> .\n\
+             <http://example.com/b> \"no predicate\" .\n",
+        )
+        .unwrap();
+        let ids: Vec<String> = {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            store
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .unwrap();
+            store
+                .quarantine()
+                .list(&QuarantineFilter::default())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.statement.id)
+                .collect()
+        };
+        assert_eq!(ids.len(), 2);
+        let log = store_dir.join(DIR).join(RESOLUTIONS);
+        assert!(!log.exists(), "no resolution yet, no log");
+        let parent = dir.path().join("data").join("new-parent");
+        fs::create_dir_all(&parent).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(parent.join(RESOLUTIONS), &log).unwrap();
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_file(parent.join(RESOLUTIONS), &log) {
+            Ok(()) => {}
+            // ERROR_PRIVILEGE_NOT_HELD
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("not run (no privilege to make a file symlink on this host)");
+                return;
+            }
+            Err(error) => panic!("symlink {}: {error}", log.display()),
+        }
+        let mut wrong = Vec::new();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let discarded = store.quarantine().discard(&ids[..1], None);
+        if !matches!(discarded, Ok(1)) {
+            wrong.push(format!("the first discard: {discarded:?}"));
+        }
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.quarantine().open_count() != 1 {
+            wrong.push(format!(
+                "after a reopen {} are open, not 1",
+                store.quarantine().open_count()
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn repairs_encode_inside_iris_only() {
         let repaired = percent_encode_iris(

@@ -750,6 +750,45 @@ fn naming_a_file_reaches_through_links() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A file link with a relative target in a directory reached through a link (sol-loop r1 on
+/// DUR-5, S1): its target is taken from the directory the link is in, as reached, not as
+/// spelled. `p` links to `real/q`, and `real/q/f` links to `../data/new/h`: naming `p/f`
+/// syncs `real/data/new` and its holders, where the file is (`data/new/h`, which the spelling
+/// `p/../data/new/h` reads lexically on Windows, is a decoy there). Rows for each link kind.
+/// Before the fix Windows named the decoy's chain; Unix walked `..` physically and was right.
+#[test]
+fn a_relative_file_link_in_a_linked_directory_is_taken_from_where_it_is() {
+    let mut wrong = Vec::new();
+    for kind in kinds() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        for dir in ["real/q", "real/data/new", "data/new"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("real/data/new/h"), b"held").unwrap();
+        std::fs::write(base.join("data/new/h"), b"decoy").unwrap();
+        if !link(kind, &base.join("real/q"), &base.join("p"))
+            || !link_file(Path::new("../data/new/h"), &base.join("real/q/f"))
+        {
+            eprintln!("{kind:?} row: not run (no privilege to make one on this host)");
+            continue;
+        }
+        let row = format!("{kind:?}, a relative file link in a linked directory");
+        let (named, synced) = syncs_of(|| place::name_existing_file(&base.join("p/f")));
+        if let Err(error) = named {
+            wrong.push(format!("{row}: {error}"));
+        }
+        let needed = [
+            base.join("real"),
+            base.join("real/data"),
+            base.join("real/data/new"),
+        ];
+        let needed: Vec<&Path> = needed.iter().map(PathBuf::as_path).collect();
+        wrong.extend(judge(&row, &synced, &needed, true));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The newest file in `dir` named `<prefix><revision><suffix>`.
 fn newest_file(dir: &Path, prefix: &str, suffix: &str) -> PathBuf {
     std::fs::read_dir(dir)
