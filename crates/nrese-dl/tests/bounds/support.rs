@@ -41,6 +41,11 @@ impl Table {
         self.id(NamedNode::new_unchecked(iri).into())
     }
 
+    /// Reads `iri` as the term `id` from now on (a text's name for a term it can't spell).
+    pub fn alias(&mut self, iri: &str, id: u64) {
+        self.ids.insert(NamedNode::new_unchecked(iri).into(), id);
+    }
+
     /// The N-Triples form of a term.
     pub fn text(&self, id: u64) -> String {
         match &self.terms[id as usize] {

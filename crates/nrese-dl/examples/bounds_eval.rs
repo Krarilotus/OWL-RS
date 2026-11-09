@@ -161,7 +161,11 @@ fn main() {
         eprintln!("diagnostics: {:?}", ontology.diagnostics);
     }
     if let Some(path) = flag("--n3") {
-        let text = program.to_n3(&|t| table.text(t));
+        // U1's own terms (no IRIs) under a namespace of this file's own.
+        let text = program.to_n3(&|t| match program.is_internal(t) {
+            true => format!("<urn:nrese:bounds-eval:own:{t}>"),
+            false => table.text(t),
+        });
         let text = text.unwrap_or_else(|e| format!("# {e}\n"));
         std::fs::write(path, text).expect("the N3 file writes");
     }
