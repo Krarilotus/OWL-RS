@@ -115,13 +115,20 @@ impl Account for Visitor<'_> {
 /// is twice the one before, at least the portion and at most `POLL_UNITS`, so a short read
 /// asks for little and a long one for full runs. A portion that doesn't fit what a run has
 /// left asks for a new run, and the rest is dropped: after a yes, at most `POLL_UNITS` units
-/// follow.
+/// follow. A refusal is final: nothing is taken after it (fix check r3 H2).
+///
+/// Its users do each portion's work before they take the next portion, so no work counted
+/// before a yes is done after it (fix check r3 H1).
 pub(crate) struct Ledger<'v> {
     visit: Visitor<'v>,
-    /// Units asked for and not yet taken, and the last run asked for.
+    /// Units asked for and not yet taken, and the last run asked for; `run` is `u64::MAX`
+    /// once refused.
     pub(crate) left: u64,
     pub(crate) run: u64,
 }
+
+/// A [`Ledger`]'s `run` once its visitor has refused one.
+const REFUSED: u64 = u64::MAX;
 
 impl<'v> Ledger<'v> {
     /// A ledger on `visit` with nothing asked for yet.
@@ -139,8 +146,12 @@ impl Account for Ledger<'_> {
     fn take(&mut self, n: u64) -> bool {
         debug_assert!(n <= PORTION, "a portion of {n} units: at most {PORTION}");
         if self.left < n {
+            if self.run == REFUSED {
+                return false;
+            }
             let run = (2 * self.run).clamp(n, u64::from(nrese_exec::POLL_UNITS));
             if !(self.visit)(run) {
+                (self.left, self.run) = (0, REFUSED);
                 return false;
             }
             (self.left, self.run) = (run, run);

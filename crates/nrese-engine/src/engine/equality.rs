@@ -744,43 +744,18 @@ fn sort_counted(ids: &mut Vec<u64>, mut take: impl FnMut(u64) -> bool) -> bool {
 /// `SORT_RUN · log2 SORT_RUN` comparisons, a fraction of `POLL_UNITS`.
 const SORT_RUN: usize = 256;
 
-/// A meter's count taken a portion at a time and asked for a run at a time: one call of the
-/// visitor per run of at most `POLL_UNITS` units, a decrement per portion (REAS-2's r8 form:
-/// a call per unit cost +0.6 % on replicate, the run form noise). Nothing for an unmetered
-/// read.
-#[derive(Default)]
-struct Credit(u64);
-
-impl Credit {
-    /// Takes `n` units at once (a chunk of units, or a step that can't be split), asking
-    /// `meter` for a run when fewer are left: `POLL_UNITS`, or `n` where that is more (counted
-    /// in runs of at most `POLL_UNITS`, the step done whole once counted); what was left of the
-    /// last run is dropped, so between two asks there is at most one run of work. False once
-    /// the meter has stopped.
-    #[inline]
-    pub(crate) fn take_many<M: Metering>(&mut self, meter: M, n: u64) -> bool {
-        if !M::COUNTED {
-            return true;
-        }
-        if self.0 < n {
-            let run = n.max(u64::from(nrese_exec::POLL_UNITS));
-            if !meter.units(run) {
-                return false;
-            }
-            self.0 = run;
-        }
-        self.0 -= n;
-        true
-    }
-}
-
-/// A [`Credit`] on its meter as an [`Account`]: the one account of an equality read for all
-/// its work, its scans' steps, its probes and its own (fix check r2 G1 and its siblings: a
-/// class build, an expanded count, an expansion; [`Read`]). Its portions may be up to
-/// `POLL_UNITS` (a union's chunk, a sort's run), each taken whole, after a yes at most
-/// `POLL_UNITS` of them ([`Credit::take_many`]). Nothing for an unmetered read.
+/// A meter as an [`Account`]: the one account of an equality read for all its work, its
+/// scans' steps, its probes and its own (fix check r2 G1 and its siblings: a class build, an
+/// expanded count, an expansion; [`Read`]). Portions are taken from a run asked of the meter:
+/// `POLL_UNITS`, or a portion where that is more (a union's chunk, a sort's run), counted in
+/// runs of at most `POLL_UNITS` and then done whole. What a run has left when a portion doesn't
+/// fit is dropped, so between two asks there is at most one run of work (REAS-2's r8 form: a
+/// call per unit cost +0.6 % on replicate, the run form noise). A refusal is final (fix check
+/// r3 H2). Nothing for an unmetered read.
 pub(crate) struct OnMeter<M: Metering> {
-    credit: Credit,
+    /// Units asked for and not yet taken.
+    left: u64,
+    refused: bool,
     meter: M,
 }
 
@@ -788,7 +763,8 @@ impl<M: Metering> OnMeter<M> {
     /// An account on `meter` with nothing asked for yet.
     pub(crate) fn new(meter: M) -> Self {
         Self {
-            credit: Credit::default(),
+            left: 0,
+            refused: false,
             meter,
         }
     }
@@ -799,7 +775,22 @@ impl<M: Metering> Account for OnMeter<M> {
 
     #[inline(always)]
     fn take(&mut self, n: u64) -> bool {
-        self.credit.take_many(self.meter, n)
+        if !M::COUNTED {
+            return true;
+        }
+        if self.left < n {
+            if self.refused {
+                return false;
+            }
+            let run = n.max(u64::from(nrese_exec::POLL_UNITS));
+            if !self.meter.units(run) {
+                (self.left, self.refused) = (0, true);
+                return false;
+            }
+            self.left = run;
+        }
+        self.left -= n;
+        true
     }
 }
 
@@ -982,6 +973,7 @@ impl<S: Step> Ahead<S> {
     }
 
     /// The next quad, not taken.
+    #[inline]
     fn peek(&mut self, account: &mut impl Account) -> Result<Option<&EncodedQuad>, Stopped> {
         if self.head.is_none() {
             self.head = Some(self.step.step(account)?);
@@ -989,6 +981,7 @@ impl<S: Step> Ahead<S> {
         Ok(self.head.as_ref().and_then(Option::as_ref))
     }
 
+    #[inline]
     fn next(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         match self.head.take() {
             Some(head) => Ok(head),
@@ -997,8 +990,9 @@ impl<S: Step> Ahead<S> {
     }
 }
 
-/// Two steps, each sorted by `permutation`, merged in that order: the snapshot's `SortedMerge`
-/// for a read whose parts share its one account.
+/// Two steps, each sorted by `permutation`, merged in that order, the left first where their
+/// keys are equal: the snapshot's one merge of two sorted streams. A counted read's parts share
+/// its one account; a plain read's are [`Plain`] iterators (fix check r3 S1).
 pub(crate) struct Merged<L, R> {
     left: Ahead<L>,
     right: Ahead<R>,
@@ -1016,6 +1010,7 @@ impl<L: Step, R: Step> Merged<L, R> {
 }
 
 impl<L: Step, R: Step> Step for Merged<L, R> {
+    #[inline]
     fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         let permutation = self.permutation;
         let left = self
@@ -1031,6 +1026,19 @@ impl<L: Step, R: Step> Step for Merged<L, R> {
             (Some(_), _) => self.left.next(account),
             (None, _) => self.right.next(account),
         }
+    }
+}
+
+impl<L, R> Iterator for Merged<Plain<L>, Plain<R>>
+where
+    L: Iterator<Item = EncodedQuad>,
+    R: Iterator<Item = EncodedQuad>,
+{
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step(&mut Free).unwrap_or(None)
     }
 }
 
@@ -1202,24 +1210,21 @@ impl<'a, S: Step> Expand<'a, S> {
         let pending = &mut self.pending;
         let mut stopped = false;
         self.classes.expand(&raw, &self.pattern, &mut |quad| {
-            // Each copy a unit, counted before it is made (SW013), its probe after it.
-            if !account.take(1) {
-                stopped = true;
-                return std::ops::ControlFlow::Break(());
-            }
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            crate::witness::add(crate::witness::Site::ExpandCopies, 1);
+            // Its probe, counting its own work, then the copy, a unit counted before it is
+            // kept (SW013): each portion done before the next is taken (fix check r3 H1).
             let shown = match all {
                 true => Ok(true),
                 false => visibility.shows_with(&quad, touching, account),
             };
-            match shown {
-                Ok(true) => pending.push(Reverse(permutation.to_key(&quad))),
-                Ok(false) => {}
-                Err(Stopped) => {
-                    stopped = true;
-                    return std::ops::ControlFlow::Break(());
-                }
+            let Ok(shown) = shown.and_then(|shown| account.take(1).then_some(shown).ok_or(Stopped))
+            else {
+                stopped = true;
+                return std::ops::ControlFlow::Break(());
+            };
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::ExpandCopies, 1);
+            if shown {
+                pending.push(Reverse(permutation.to_key(&quad)));
             }
             std::ops::ControlFlow::Continue(())
         });
@@ -1252,16 +1257,15 @@ impl<S: Step> Drop for Expand<'_, S> {
 }
 
 impl<S: Step> Step for Expand<'_, S> {
+    #[inline]
     fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         if self.refused {
             return Ok(None);
         }
         loop {
-            // A step, a copy handed on or an input quad pulled: a unit.
-            if !account.take(1) {
-                return Err(Stopped);
-            }
-            // What the heap holds may go out once no later input can sort before it.
+            // What the heap holds may go out once no later input can sort before it. The
+            // input's peek counts its own work; the copy handed on is a unit, counted after
+            // it, just before it is done (fix check r3 H1).
             if let Some(Reverse(first)) = self.pending.peek() {
                 let (pattern, permutation) = (&self.pattern, self.permutation);
                 let safe = match self.input.peek(account)? {
@@ -1269,6 +1273,9 @@ impl<S: Step> Step for Expand<'_, S> {
                     Some(next) => *first <= Self::least_key(pattern, permutation, next),
                 };
                 if safe {
+                    if !account.take(1) {
+                        return Err(Stopped);
+                    }
                     let Reverse(key) = self.pending.pop().expect("peeked");
                     return Ok(Some(self.permutation.key_to_quad(&key)));
                 }
@@ -1646,10 +1653,11 @@ mod tests {
         );
     }
 
-    /// REAS-3a fix check r2 G3. Three intervals of classes of two, then each joined to a hub
-    /// interned last (so its statements come last in the scan): the union kernel's table of roots
-    /// held three intervals of classes and keeps one. Enumerating the classes walked the table's
-    /// slots, three intervals of them, before the finish's first ask.
+    /// REAS-3a fix check r2, a class build whose classes are joined into one. Three intervals of
+    /// classes of two, then each joined to a hub interned last (so its statements come last in
+    /// the scan): the build's scans, unions, listing and finish stay within an interval of any
+    /// yes. It covers the combined build and G1 (red at G1's 5,480); G3, listing the classes
+    /// from the kernel's dense list, has no red of its own (fix check r3 H3).
     #[test]
     fn classes_joined_into_one_enumerate_within_an_interval_of_any_yes() {
         let n = 3 * nrese_exec::POLL_UNITS as usize;

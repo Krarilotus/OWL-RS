@@ -5,7 +5,8 @@ use std::sync::Arc;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
 use super::equality::{
-    Classes as EqualityClasses, Expand, Metering, OnMeter, Unmetered, Visibility as CopyVisibility,
+    Classes as EqualityClasses, Expand, Merged, Metering, OnMeter, Plain, Unmetered,
+    Visibility as CopyVisibility,
 };
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
@@ -975,11 +976,11 @@ impl Snapshot {
             true => Some(AccessPlan::in_permutation(pattern, permutation)?),
             false => None,
         };
-        let stored = SortedMerge {
-            left: data.asserted.scan_plan(&plan).peekable(),
-            right: data.inferred.scan_plan(&plan).peekable(),
+        let stored = Merged::new(
+            Plain(data.asserted.scan_plan(&plan)),
+            Plain(data.inferred.scan_plan(&plan)),
             permutation,
-        };
+        );
         let expanded = Expand::new(
             stored,
             classes,
@@ -994,11 +995,7 @@ impl Snapshot {
             .into_iter()
             .flat_map(move |plan| data.asserted.scan_plan(&plan))
             .filter(|quad| !quad.graph.is_default_graph());
-        Some(SortedMerge {
-            left: expanded.peekable(),
-            right: named.peekable(),
-            permutation,
-        })
+        Some(Merged::new(Plain(expanded), Plain(named), permutation))
     }
 
     /// The expanded matches of `pattern` in `model`, in the order of its access plan,
@@ -1069,11 +1066,16 @@ impl Snapshot {
                         let (mut copies, wanted) = (0, limit - count);
                         let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
-                            // Each copy a unit, counted before it is made, its probe after it.
-                            let shown = match account.take(1) {
-                                true => visibility.shows_with(&copy, touching, &mut account),
-                                false => Err(crate::visit::Stopped),
-                            };
+                            // Its probe, counting its own work, then the copy, a unit counted
+                            // before it is counted in (fix check r3 H1).
+                            let shown = visibility
+                                .shows_with(&copy, touching, &mut account)
+                                .and_then(|shown| {
+                                    account
+                                        .take(1)
+                                        .then_some(shown)
+                                        .ok_or(crate::visit::Stopped)
+                                });
                             let Ok(shown) = shown else {
                                 stopped = true;
                                 return std::ops::ControlFlow::Break(());
@@ -1570,11 +1572,11 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(Either::Right(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
+        Some(Either::Right(Merged::new(
+            Plain(scan(Stack::Asserted)),
+            Plain(scan(Stack::Inferred)),
             permutation,
-        }))
+        )))
     }
 
     /// Like [`scan_sorted_in`](Self::scan_sorted_in), with the first unbound component of the
@@ -1596,11 +1598,11 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
+        Some(Merged::new(
+            Plain(scan(Stack::Asserted)),
+            Plain(scan(Stack::Inferred)),
             permutation,
-        })
+        ))
     }
 
     /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
@@ -2368,37 +2370,6 @@ impl std::error::Error for SearchRefused {
         match self {
             Self::Memory(exceeded) => Some(exceeded),
             Self::Private => None,
-        }
-    }
-}
-
-/// Two quad streams sorted by one permutation, merged into one sorted stream. The inputs
-/// come from disjoint stacks, so equal keys never occur.
-struct SortedMerge<L: Iterator<Item = EncodedQuad>, R: Iterator<Item = EncodedQuad>> {
-    left: std::iter::Peekable<L>,
-    right: std::iter::Peekable<R>,
-    permutation: Permutation,
-}
-
-impl<L, R> Iterator for SortedMerge<L, R>
-where
-    L: Iterator<Item = EncodedQuad>,
-    R: Iterator<Item = EncodedQuad>,
-{
-    type Item = EncodedQuad;
-
-    #[inline]
-    fn next(&mut self) -> Option<EncodedQuad> {
-        match (self.left.peek(), self.right.peek()) {
-            (Some(l), Some(r)) => {
-                if self.permutation.to_key(l) <= self.permutation.to_key(r) {
-                    self.left.next()
-                } else {
-                    self.right.next()
-                }
-            }
-            (Some(_), None) => self.left.next(),
-            (None, _) => self.right.next(),
         }
     }
 }
