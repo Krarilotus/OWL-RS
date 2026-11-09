@@ -2352,23 +2352,25 @@ impl Supports {
         };
         let mut updated = None;
         if let Some((earlier, touched)) = earlier {
-            let in_closure = |fact: Triple, poll: &Poller<'_>| {
+            // A store probe, one unit on the query's poller; `Err` once that has stopped, which
+            // ends the loop (fix check r2, R3-F3: "not in the closure" kept every later
+            // touched fact as removed).
+            let in_closure = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
                 #[cfg(test)]
                 crate::witness::add(crate::witness::Site::FallbackProbe, 1);
-                !poll.tick()
-                    && (axioms.binary_search(&fact).is_ok()
-                        || snapshot
-                            .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any)))
+                if poll.tick() {
+                    return Err(ReadStopped);
+                }
+                Ok(axioms.binary_search(&fact).is_ok()
+                    || snapshot
+                        .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any)))
             };
             let mut removed: Kept<Triple> =
                 ChargedVec::with_capacity(Arc::clone(working), touched.len())?;
             for &fact in touched.iter() {
-                if !in_closure(fact, &prep) {
+                if !in_closure(fact, &prep).map_err(|ReadStopped| Unavailable::Cancelled)? {
                     removed.push(fact)?;
                 }
-            }
-            if prep.stopped() {
-                return Err(Unavailable::Cancelled);
             }
             let after = After {
                 snapshot,

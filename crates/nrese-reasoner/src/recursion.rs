@@ -55,12 +55,15 @@ fn node(atom: &Atom, rdf_type: u64, head: bool) -> Node {
 
 /// Which rules of a ground program are non-recursive (by index into `rules`).
 /// `partners` gives the `owl:sameAs` partners of a term (other than itself): classes and
-/// properties with partners are linked to them (see the module docs).
-pub fn non_recursive(
+/// properties with partners are linked to them (see the module docs). Its error ends the
+/// answer: the keys it is asked about come from the grounded rules, one class pair per
+/// subclass edge, so they grow with the schema (fix check r2, R3-F1: a stopped read as "no
+/// partners" let it read every later key's).
+pub fn non_recursive<E>(
     rules: &[Rule],
     rdf_type: u64,
-    partners: &dyn Fn(u64) -> Vec<u64>,
-) -> Vec<bool> {
+    partners: &dyn Fn(u64) -> Result<Vec<u64>, E>,
+) -> Result<Vec<bool>, E> {
     let counted = |rule: &Rule| !super::batch::is_replacement_rule(rule);
     let mut index: HashMap<Node, usize> = HashMap::new();
     let id = |n: Node, index: &mut HashMap<Node, usize>| {
@@ -143,7 +146,7 @@ pub fn non_recursive(
             continue;
         };
         let n = index[&k];
-        for partner in partners(t) {
+        for partner in partners(t)? {
             let other = match k {
                 Node::Class(_) => Node::Class(partner),
                 _ => Node::Predicate(partner),
@@ -153,7 +156,7 @@ pub fn non_recursive(
         }
     }
     let component = components(index.len(), &edges);
-    atoms_of
+    Ok(atoms_of
         .iter()
         .zip(rules)
         .map(|((body, head), rule)| {
@@ -164,7 +167,7 @@ pub fn non_recursive(
                     .iter()
                     .all(|h| body.iter().all(|b| component[*b] != component[*h]))
         })
-        .collect()
+        .collect())
 }
 
 /// Strongly connected components: the component of each node (the shared kernel,
@@ -218,6 +221,11 @@ mod tests {
         Atom([s, Term::Const(p), o])
     }
 
+    /// No term has partners.
+    fn no_partners(_: u64) -> Result<Vec<u64>, ()> {
+        Ok(Vec::new())
+    }
+
     fn rule(body: Vec<Atom>, head: Vec<Atom>) -> Rule {
         Rule {
             name: "r".to_owned(),
@@ -250,18 +258,20 @@ mod tests {
             ),
         ];
         assert_eq!(
-            non_recursive(&rules, ty, &|_| Vec::new()),
-            [true, true, false, false, true, false]
+            non_recursive(&rules, ty, &no_partners),
+            Ok(vec![true, true, false, false, true, false])
         );
         // C sameAs D: C and D are one component, so C ⊑ D is recursive.
-        let same = |term: u64| match term {
-            10 => vec![11],
-            11 => vec![10],
-            _ => Vec::new(),
+        let same = |term: u64| -> Result<Vec<u64>, ()> {
+            Ok(match term {
+                10 => vec![11],
+                11 => vec![10],
+                _ => Vec::new(),
+            })
         };
         assert_eq!(
             non_recursive(&rules[..2], ty, &same),
-            [false, true],
+            Ok(vec![false, true]),
             "D ⊑ E stays non-recursive"
         );
     }
@@ -280,8 +290,8 @@ mod tests {
             ),
         ];
         assert_eq!(
-            non_recursive(&rules, ty, &|_| Vec::new()),
-            [false, false, false]
+            non_recursive(&rules, ty, &no_partners),
+            Ok(vec![false, false, false])
         );
     }
 }

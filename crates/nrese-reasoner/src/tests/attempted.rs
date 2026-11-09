@@ -473,7 +473,7 @@ fn producer_discovery_counts_each_reference_read() {
     references_read::take();
     let derived: Vec<bool> = candidates
         .iter()
-        .map(|&c| derived_otherwise(&source, &ground, &[], c, &poll))
+        .map(|&c| derived_otherwise(&source, &ground, &[], c, &poll) == Ok(true))
         .collect();
     let read = references_read::take();
     // Guard: the witness is the successful prefix (each candidate's first producer derives it).

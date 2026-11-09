@@ -1319,9 +1319,9 @@ impl Relation {
         }
     }
 
-    /// Whether the delta has a pair with object `o`, counting what it reads on `poll`
-    /// (false once that has stopped: an answer that means nothing).
-    pub(crate) fn delta_has_object(&self, o: u64, poll: &Poller<'_>) -> bool {
+    /// Whether the delta has a pair with object `o`, counting what it reads on `poll`;
+    /// [`Stopped`] once that has stopped (fix check r2, B9: never a "no").
+    pub(crate) fn delta_has_object(&self, o: u64, poll: &Poller<'_>) -> Result<bool, Stopped> {
         let mut found = false;
         let all = |_: u64, _: u64| true;
         self.delta
@@ -1329,18 +1329,23 @@ impl Relation {
                 found |= matches!(at, At::Pair(..));
                 !poll.tick()
             });
-        found && !poll.stopped()
+        poll.ended()?;
+        Ok(found)
     }
 
     /// Calls `f` with each distinct object of the delta, counting each pair it reads on
-    /// `poll` and ending once that has stopped.
-    pub(crate) fn delta_objects(&self, poll: &Poller<'_>, f: &mut dyn FnMut(u64)) {
+    /// `poll`; [`Stopped`] once that has stopped, the objects handed on then a part.
+    pub(crate) fn delta_objects(
+        &self,
+        poll: &Poller<'_>,
+        f: &mut dyn FnMut(u64),
+    ) -> Result<(), Stopped> {
         match &self.delta.os {
             Some(os) => {
                 let mut last = None;
                 for &(o, _) in os.iter() {
                     if poll.tick() {
-                        return;
+                        return Err(Stopped);
                     }
                     if last != Some(o) {
                         f(o);
@@ -1354,14 +1359,18 @@ impl Relation {
                     .counted(self.delta.so.iter())
                     .map(|&(_, o)| o)
                     .collect();
-                if poll.stopped() {
-                    return;
-                }
+                poll.ended()?;
                 objects.sort_unstable();
                 objects.dedup();
-                objects.into_iter().for_each(f);
+                // `f` counts its own work on `poll`: a stop there ends the objects (sol-loop
+                // r1 S1). The objects it passes over uncounted are REAS-3's (SW038).
+                for o in objects {
+                    f(o);
+                    poll.ended()?;
+                }
             }
         }
+        poll.ended()
     }
 
     /// Keeps the runs' `(object, subject)` orders if `objects`, else drops them (see
@@ -1801,20 +1810,24 @@ impl Store {
     }
 
     /// Every stored fact mentioning one of `terms`, in any position (some more than once);
-    /// `None` if `stop` (latched) fired. By the subject and object orders where a run has
+    /// [`Stopped`] if `stop` (latched) fired. By the subject and object orders where a run has
     /// them; a run without its object order is read whole for the objects. Each relation is
     /// a task with its own poller, counting each lookup (a term in a run's order) and each
-    /// position read (sweep M17: relations × terms lookups).
-    fn mentioning(&self, terms: &HashSet<u64>, stop: super::eval::Stop<'_>) -> Option<Vec<Triple>> {
-        let facts = self
+    /// position read (sweep M17: relations × terms lookups). A stopped task fails the pass,
+    /// and no relation's task starts after it (fix check r2, R3-F2: each later relation
+    /// made its poller and answered an empty list).
+    fn mentioning(
+        &self,
+        terms: &HashSet<u64>,
+        stop: super::eval::Stop<'_>,
+    ) -> Result<Vec<Triple>, Stopped> {
+        let parts: Vec<Vec<Triple>> = self
             .relations
             .par_iter()
             .zip(self.predicates.par_iter())
-            .flat_map_iter(|(relation, &p)| {
+            .map(|(relation, &p)| -> Result<Vec<Triple>, Stopped> {
                 let mut out = Vec::new();
-                let Some(poll) = Poller::new(stop) else {
-                    return out;
-                };
+                let poll = Poller::new(stop).ok_or(Stopped)?;
                 // The pairs of `slices`, each counted as it is read (review r1 F1: a slice is
                 // a whole chunk, or the whole input); false once stopped.
                 let read = |out: &mut Vec<Triple>,
@@ -1838,20 +1851,20 @@ impl Store {
                             &mut run.so.chunks.iter().map(Vec::as_slice),
                             false,
                         ) {
-                            return Vec::new();
+                            return Err(Stopped);
                         }
                         continue;
                     }
                     for &t in terms {
                         if !read(&mut out, &mut run.so.range(t), false) {
-                            return Vec::new();
+                            return Err(Stopped);
                         }
                     }
                     match &run.os {
                         Some(os) => {
                             for &t in terms {
                                 if !read(&mut out, &mut os.range(t), true) {
-                                    return Vec::new();
+                                    return Err(Stopped);
                                 }
                             }
                         }
@@ -1861,17 +1874,19 @@ impl Store {
                                     .filter(|(_, o)| terms.contains(o))
                                     .map(|&(s, o)| [s, p, o]),
                             );
-                            if poll.stopped() {
-                                return Vec::new();
-                            }
+                            poll.ended()?;
                         }
                     }
                 }
-                out
+                Ok(out)
             })
-            .collect();
-        // A task that stopped left facts out; the stop is latched, so asking it again tells.
-        (!stop()).then_some(facts)
+            .collect::<Result<_, _>>()?;
+        // A task the stop fired after (it read nothing more) still left facts out: the stop is
+        // latched, so asking it again tells.
+        if stop() {
+            return Err(Stopped);
+        }
+        Ok(parts.concat())
     }
 
     /// Makes `news` (per relation: the open part, the closed part) the relations' deltas.
@@ -2452,19 +2467,19 @@ impl Representatives {
         lost
     }
 
-    /// The facts the merge that took the places of `lost` makes stale, rewritten; `None`
-    /// if `stop` (latched) fired ([`Store::mentioning`]).
+    /// The facts the merge that took the places of `lost` makes stale, rewritten;
+    /// [`Stopped`] if `stop` (latched) fired ([`Store::mentioning`]).
     fn rewrites(
         &self,
         store: &Store,
         lost: &HashSet<u64>,
         stop: super::eval::Stop<'_>,
-    ) -> Option<Vec<Triple>> {
+    ) -> Result<Vec<Triple>, Stopped> {
         let mut facts = store.mentioning(lost, stop)?;
         facts
             .par_iter_mut()
             .for_each(|fact| *fact = self.classes.rewrite(*fact));
-        Some(facts)
+        Ok(facts)
     }
 }
 
@@ -3051,7 +3066,7 @@ fn run_body(
         if !lost.is_empty() {
             pending = reps
                 .rewrites(&store, &lost, stop)
-                .ok_or_else(Interrupted::default)?;
+                .map_err(|Stopped| Interrupted::default())?;
             if rules.iter().any(|rule| names_any(rule, &lost)) {
                 rules = rules
                     .iter()
@@ -3158,19 +3173,23 @@ fn run_body(
         let mut families: Vec<Option<u64>> = Vec::new();
         // After a merge, the rules whose guards see the classes run in full.
         let again = |rule: &Rule| reevaluate && sees_classes(rule);
-        for (r, i) in program.variants(&store, &stage) {
+        // A stopped read ends the round's job list (fix check r2, R3-F1).
+        let stopped = |Stopped| Interrupted::default();
+        for (r, i) in program.variants(&store, &stage).map_err(stopped)? {
             if r < evaluated && !again(&program.rules[r]) {
                 let family = program.closed_family(r);
                 let delta = family.map_or(Seg::Delta, Seg::DeltaNotBy);
                 let rule = &program.rules[r];
-                if let Some(job) = Job::variant_reading(&current, rule, i, delta, &stage) {
+                if let Some(job) =
+                    Job::variant_reading(&current, rule, i, delta, &stage).map_err(stopped)?
+                {
                     jobs.push(job);
                     families.push(family);
                 }
             }
         }
         for (r, rule) in program.rules.iter().enumerate().skip(evaluated) {
-            if let Some(job) = Job::full(&current, rule, &stage) {
+            if let Some(job) = Job::full(&current, rule, &stage).map_err(stopped)? {
                 jobs.push(job);
                 families.push(program.closed_family(r));
             }
@@ -3178,7 +3197,7 @@ fn run_body(
         if reevaluate {
             for (r, rule) in program.rules.iter().enumerate().take(evaluated) {
                 if sees_classes(rule)
-                    && let Some(job) = Job::full(&current, rule, &stage)
+                    && let Some(job) = Job::full(&current, rule, &stage).map_err(stopped)?
                 {
                     jobs.push(job);
                     families.push(program.closed_family(r));
@@ -3189,21 +3208,24 @@ fn run_body(
         let probes = Probes::for_jobs(jobs.len());
         let starts = std::sync::atomic::AtomicU64::new(0);
         // One probe per fact, counted as they are made ([`Store::retain_new`]). A stopped keep
-        // leaves nothing, and the morsel's latched check after it ends the stage.
-        let keep = |facts: &mut Vec<Triple>, poll: &Poller<'_>| {
-            if let Ok(n) = store.retain_new(facts, poll) {
-                starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            }
+        // leaves nothing, and ends the round.
+        let keep = |facts: &mut Vec<Triple>, poll: &Poller<'_>| -> Result<(), Stopped> {
+            let n = store.retain_new(facts, poll)?;
+            starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         };
-        candidates.extend(run_jobs_by_morsel(
-            &current,
-            &jobs,
-            &keep,
-            rewrite,
-            stop,
-            &probes,
-            &|job, facts| (families[job], split(facts)),
-        ));
+        candidates.extend(
+            run_jobs_by_morsel(
+                &current,
+                &jobs,
+                &keep,
+                rewrite,
+                stop,
+                &probes,
+                &|job, facts| (families[job], split(facts)),
+            )
+            .map_err(stopped)?,
+        );
         let counters = &mut result.counters;
         counters.driver_bytes_copied += jobs.iter().map(Job::copied_bytes).sum::<usize>();
         let asked = probes.probes.into_inner();
@@ -3278,7 +3300,7 @@ fn run_body(
                 }
                 moved.extend(
                     reps.rewrites(&store, &lost, stop)
-                        .ok_or_else(Interrupted::default)?,
+                        .map_err(|Stopped| Interrupted::default())?,
                 );
                 moved
                     .par_iter_mut()
@@ -3515,47 +3537,55 @@ fn list(
                             Poller::new(stop),
                         )
                     },
-                    |(mut copies, mut scratch, poll), fact| {
+                    // The fold's error: `Some` a refusal, `None` a stop. Either ends the
+                    // thread's fold before it touches the next fact (fix check r2, R3-F2: a
+                    // stopped thread looked up every later fact's classes), as the equality
+                    // fold's does.
+                    |(mut copies, mut scratch, poll), fact| -> Result<_, Option<BudgetExceeded>> {
                         #[cfg(test)]
                         crate::witness::add(crate::witness::Site::ExpandedFact, 1);
+                        let live = Poller::live(&poll).map_err(|Stopped| None)?;
                         let [ms, mp, mo] = fact.each_ref().map(|id| {
                             reps.classes
                                 .class_of(*id)
                                 .unwrap_or(std::slice::from_ref(id))
                         });
                         let bound = copies_at_most([ms, mp, mo]);
-                        // Stopped, the thread makes no more copies. A fact's copies are
-                        // counted as they are made, a run of at most POLL_UNITS objects at a
-                        // time ([`Visit::ahead`]'s rule): a product counted whole ran its
-                        // full length past a stop that fired while it was made.
-                        if let Some(poll) = poll.as_ref().filter(|poll| !poll.stopped()) {
-                            append_copies(&mut copies, &mut scratch, bound, |out| {
-                                for &s in ms {
-                                    for &p in mp {
-                                        let relation = store.relation(p);
-                                        for objects in mo.chunks(RUN) {
-                                            if poll.attempt(objects.len()) {
-                                                return;
-                                            }
-                                            for &o in objects {
-                                                let input = relation.is_some_and(|relation| {
-                                                    relation.input.contains(s, o)
-                                                });
-                                                if !input {
-                                                    out.push([s, p, o]);
-                                                }
+                        // A fact's copies are counted as they are made, a run of at most
+                        // POLL_UNITS objects at a time ([`Visit::ahead`]'s rule): a product
+                        // counted whole ran its full length past a stop that fired while it
+                        // was made.
+                        append_copies(&mut copies, &mut scratch, bound, |out| {
+                            for &s in ms {
+                                for &p in mp {
+                                    let relation = store.relation(p);
+                                    for objects in mo.chunks(RUN) {
+                                        if live.attempt(objects.len()) {
+                                            return;
+                                        }
+                                        for &o in objects {
+                                            let input = relation.is_some_and(|relation| {
+                                                relation.input.contains(s, o)
+                                            });
+                                            if !input {
+                                                out.push([s, p, o]);
                                             }
                                         }
                                     }
                                 }
-                            })?;
-                        }
+                            }
+                        })
+                        .map_err(Some)?;
+                        live.ended().map_err(|Stopped| None)?;
                         Ok((copies, scratch, poll))
                     },
                 )
                 .map(|folded| folded.map(|(copies, _scratch, _poll)| copies))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(refused)?;
+                .map_err(|ended| match ended {
+                    Some(exceeded) => refused(exceeded),
+                    None => operation.interrupted(),
+                })?;
             // A thread that stopped left copies out; the stop is latched, so asking it tells.
             if stop() {
                 return Err(operation.interrupted());
@@ -3672,21 +3702,29 @@ pub(crate) fn check<S: Source + ?Sized>(
     let Some(poll) = Poller::new(stop) else {
         return Err(Interrupted::default());
     };
+    // A stopped read ends the job list (fix check r2, R3-F1); each rule is a unit of work,
+    // a bodiless one recorded included.
+    let stopped = |Stopped| Interrupted::default();
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
     for c in full {
         let ground_rule = &program.consistency[c].1.rule;
         if ground_rule.body.is_empty() {
+            if poll.tick() {
+                return Err(Interrupted::default());
+            }
             if guards_hold(&ground_rule.guards, &program.consistency[c].1.substitution) {
                 let Some(id) = group_of(c, found) else { break };
                 found.record(id, words(program, c, &[]));
             }
         } else {
-            jobs.extend(Job::full(source, ground_rule, &poll).map(|job| (c, job)));
+            let job = Job::full(source, ground_rule, &poll).map_err(stopped)?;
+            jobs.extend(job.map(|job| (c, job)));
         }
     }
     for &(c, i) in variants {
         let ground_rule = &program.consistency[c].1.rule;
-        jobs.extend(Job::variant(source, ground_rule, i, &poll).map(|job| (c, job)));
+        let job = Job::variant(source, ground_rule, i, &poll).map_err(stopped)?;
+        jobs.extend(job.map(|job| (c, job)));
     }
     'jobs: for (c, job) in jobs {
         // A list that refused (an empty-body rule above, or an earlier job) ends the

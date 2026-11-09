@@ -1049,64 +1049,62 @@ enum Drivers {
 }
 
 impl<'r> Job<'r> {
-    /// The variant driven by `first` (read from `seg_of(first)`), or `None` if it can't
-    /// match. Its reads (estimates, the drivers) count on `poll`: on a stopped one it is
-    /// `None`, which means nothing (sweep M01).
+    /// The variant driven by `first` (read from `seg_of(first)`): `Ok(None)` if it can't
+    /// match. Its reads (estimates, the drivers) count on `poll`; [`Stopped`] where one of
+    /// them stopped, never "no job" (sweep M01; fix check r2, R3-F1: a program's grounded
+    /// rules grow with its schema, so the loop over them must end there too).
     pub fn new<S: Source + ?Sized>(
         source: &S,
         rule: &'r Rule,
         first: usize,
         seg_of: impl Fn(usize) -> Seg,
         poll: &Poller<'_>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::JobConstruction, 1);
-        // An atom over a predicate without facts can't match. A stopped read makes no job,
-        // never one over a part of its drivers: a program's rules bound the loop that asks
-        // (fix check r1 triage, BOUNDED), and the stage's latched check ends it.
+        // An atom over a predicate without facts can't match.
         for (i, atom) in rule.body.iter().enumerate() {
             if let Term::Const(p) = atom.0[1]
-                && !source
-                    .estimate([None, Some(p), None], seg_of(i), poll)
-                    .is_ok_and(|size| size > 0)
+                && source.estimate([None, Some(p), None], seg_of(i), poll)? == 0
             {
-                return None;
+                return Ok(None);
             }
         }
         let atoms: Vec<usize> = (0..rule.body.len()).collect();
+        // The plan's estimates only order the body's atoms (their bounded exception): a stop
+        // among them ends the job here, before its drivers are read.
         let order = plan(source, rule, &atoms, first, &seg_of, poll);
+        poll.ended()?;
         let (pattern, seg) = (constants(&rule.body[first]), seg_of(first));
-        let drivers = match source.matches_len(pattern, seg, poll).ok()? {
-            Some(0) => return None,
+        let drivers = match source.matches_len(pattern, seg, poll)? {
+            Some(0) => return Ok(None),
             Some(len) => Drivers::InPlace(len),
             None => {
                 let mut drivers = Vec::new();
-                source
-                    .scan(pattern, seg, poll, &mut |fact| drivers.push(fact))
-                    .ok()?;
+                source.scan(pattern, seg, poll, &mut |fact| drivers.push(fact))?;
                 if drivers.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 Drivers::Collected(drivers)
             }
         };
-        Some(Self {
+        Ok(Some(Self {
             rule,
             order,
             pattern,
             seg,
             drivers,
-        })
+        }))
     }
 
     /// The semi-naive variant with atom `i` on the delta: atoms before it read the old
-    /// facts, atoms after it all facts.
+    /// facts, atoms after it all facts. As [`Job::new`].
     pub fn variant<S: Source + ?Sized>(
         source: &S,
         rule: &'r Rule,
         i: usize,
         poll: &Poller<'_>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, Stopped> {
         Self::variant_reading(source, rule, i, Seg::Delta, poll)
     }
 
@@ -1118,7 +1116,7 @@ impl<'r> Job<'r> {
         i: usize,
         delta: Seg,
         poll: &Poller<'_>,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, Stopped> {
         let seg_of = |j: usize| match j.cmp(&i) {
             std::cmp::Ordering::Less => Seg::Old,
             std::cmp::Ordering::Equal => delta,
@@ -1127,10 +1125,15 @@ impl<'r> Job<'r> {
         Self::new(source, rule, i, seg_of, poll)
     }
 
-    /// The full evaluation over all facts, driven by the most selective atom.
-    pub fn full<S: Source + ?Sized>(source: &S, rule: &'r Rule, poll: &Poller<'_>) -> Option<Self> {
-        // A stopped estimate sorts last (ordering only, a body's atoms); `new` then makes no
-        // job.
+    /// The full evaluation over all facts, driven by the most selective atom. As
+    /// [`Job::new`].
+    pub fn full<S: Source + ?Sized>(
+        source: &S,
+        rule: &'r Rule,
+        poll: &Poller<'_>,
+    ) -> Result<Option<Self>, Stopped> {
+        // A stopped estimate sorts last (ordering only, a body's atoms: their bounded
+        // exception); the stop then ends the job before `new` reads anything.
         let first = (0..rule.body.len())
             .min_by_key(|&i| {
                 source
@@ -1138,6 +1141,7 @@ impl<'r> Job<'r> {
                     .unwrap_or(usize::MAX)
             })
             .expect("a rule with a body");
+        poll.ended()?;
         Self::new(source, rule, first, |_| Seg::All, poll)
     }
 
@@ -1313,6 +1317,19 @@ impl<'a> Poller<'a> {
         match self.stopped() {
             true => Err(Stopped),
             false => Ok(()),
+        }
+    }
+
+    /// A parallel task's poller (made by `map_init` or a fold's init, `None` where its stop had
+    /// fired already), if it can still work: [`Stopped`] where it couldn't be made or has
+    /// stopped since. A task over several items asks it for each, so the pass fails at its
+    /// first stopped item instead of answering "nothing" for every later one (fix check r2,
+    /// R3-F2).
+    #[inline]
+    pub fn live(slot: &Option<Self>) -> Result<&Self, Stopped> {
+        match slot {
+            Some(poll) if !poll.stopped() => Ok(poll),
+            _ => Err(Stopped),
         }
     }
 
@@ -1502,6 +1519,13 @@ impl<'a> OperationStop<'a> {
         self.interrupted()
     }
 
+    /// Whether the operation has stopped already, as an earlier [`Self::fired`] or
+    /// [`Self::refuse`] latched it: one atomic load, no poll of the caller or the memory (for
+    /// per-item checks that must not poll: a poll reads the process's memory).
+    pub fn latched(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
     /// Whether the operation is to stop: an atomic load once it has.
     pub fn fired(&self) -> bool {
         use nrese_exec::memory::MemoryStopCause;
@@ -1545,10 +1569,13 @@ impl<'a> OperationStop<'a> {
 pub type Keep<'k> = &'k (dyn Fn(Triple, &Poller<'_>) -> Result<bool, Stopped> + Sync);
 
 /// Keeps the facts `keep` accepts, in order, until it answers [`Stopped`]: then `facts` is
-/// emptied and no fact after it looked at (fix check r1, rule 2: a stopped filter read as
-/// "drop" still walked a morsel's whole output, which a morsel doesn't bound). The morsel's
-/// latched check after it ends the stage.
-fn keep_until_stopped(facts: &mut Vec<Triple>, keep: impl Fn(Triple) -> Result<bool, Stopped>) {
+/// emptied, no fact after it looked at, and the stop handed on (fix check r1, rule 2: a
+/// stopped filter read as "drop" still walked a morsel's whole output, which a morsel
+/// doesn't bound).
+fn keep_until_stopped(
+    facts: &mut Vec<Triple>,
+    keep: impl Fn(Triple) -> Result<bool, Stopped>,
+) -> Result<(), Stopped> {
     let mut kept = 0;
     for i in 0..facts.len() {
         match keep(facts[i]) {
@@ -1559,23 +1586,23 @@ fn keep_until_stopped(facts: &mut Vec<Triple>, keep: impl Fn(Triple) -> Result<b
             Ok(false) => {}
             Err(Stopped) => {
                 facts.clear();
-                return;
+                return Err(Stopped);
             }
         }
     }
     facts.truncate(kept);
+    Ok(())
 }
 
 /// Every fact `jobs` derive that `keep` accepts (its reads count on the morsel's poller).
-/// If `stop` fires, the morsels under way end within their poll interval and the rest are
-/// skipped: the result is incomplete, and the caller must ask its (latched,
-/// [`OperationStop`]) `stop` again and discard it.
+/// [`Stopped`] once `stop` has fired in a morsel: the morsels under way end within their
+/// poll interval, and none starts after it (fix check r2, R3-F2).
 pub fn run_jobs<S: Source + ?Sized>(
     source: &S,
     jobs: &[Job<'_>],
     keep: Keep<'_>,
     stop: Stop<'_>,
-) -> Vec<Triple> {
+) -> Result<Vec<Triple>, Stopped> {
     run_jobs_with(source, jobs, keep, false, stop, None)
 }
 
@@ -1610,16 +1637,16 @@ impl Probes {
 /// once (a store reads its runs forward across them), reading with the morsel's poller.
 /// Counts the probes into `probes` (once per morsel). `rewrite`, if given, maps each
 /// derived fact before it is checked (equality by representatives: to its
-/// representatives).
+/// representatives). [`Stopped`] as [`run_jobs`], `keep`'s included.
 pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
-    keep: &(dyn Fn(&mut Vec<Triple>, &Poller<'_>) + Sync),
+    keep: &MorselKeep<'_>,
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: &Probes,
     finish: &(dyn Fn(usize, Vec<Triple>) -> T + Sync),
-) -> Vec<T> {
+) -> Result<Vec<T>, Stopped> {
     run_morsels(
         source,
         jobs,
@@ -1643,7 +1670,7 @@ pub fn run_jobs_acyclic<S: Source + ?Sized>(
     jobs: &[Job<'_>],
     keep: Keep<'_>,
     stop: Stop<'_>,
-) -> Vec<Triple> {
+) -> Result<Vec<Triple>, Stopped> {
     run_jobs_with(source, jobs, keep, true, stop, None)
 }
 
@@ -1654,8 +1681,8 @@ fn run_jobs_with<S: Source + ?Sized>(
     acyclic: bool,
     stop: Stop<'_>,
     probes: Option<&Probes>,
-) -> Vec<Triple> {
-    run_morsels(
+) -> Result<Vec<Triple>, Stopped> {
+    Ok(run_morsels(
         source,
         jobs,
         &|facts: &mut Vec<Triple>, poll: &Poller<'_>| {
@@ -1666,21 +1693,31 @@ fn run_jobs_with<S: Source + ?Sized>(
         stop,
         probes,
         &|_, facts| facts,
-    )
-    .concat()
+    )?
+    .concat())
 }
 
+/// What a morsel's derived facts are filtered with, all at once ([`run_jobs_by_morsel`]),
+/// reading with the morsel's poller: [`Stopped`] once that has stopped, the facts then
+/// meaning nothing.
+pub type MorselKeep<'k> = dyn Fn(&mut Vec<Triple>, &Poller<'_>) -> Result<(), Stopped> + Sync + 'k;
+
+/// The morsels of `jobs`, in parallel, each one's facts handed to `finish`, in the morsels'
+/// order. A morsel that stopped (its poller couldn't be made, its run or its `keep` was cut
+/// short) fails the pass: rayon's collect into `Result` starts no morsel after it (fix
+/// check r2, R3-F2: a stopped morsel finished as an ordinary empty one, and every later one
+/// started).
 #[allow(clippy::too_many_arguments)]
 fn run_morsels<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
-    keep: &(dyn Fn(&mut Vec<Triple>, &Poller<'_>) + Sync),
+    keep: &MorselKeep<'_>,
     acyclic: bool,
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: Option<&Probes>,
     finish: &(dyn Fn(usize, Vec<Triple>) -> T + Sync),
-) -> Vec<T> {
+) -> Result<Vec<T>, Stopped> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
         .enumerate()
@@ -1696,12 +1733,11 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             #[cfg(test)]
             crate::witness::add(crate::witness::Site::MorselTask, 1);
             let job = &jobs[*j];
+            // A rule without fact heads derives nothing: a whole, empty morsel.
             let Head::Facts(heads) = &job.rule.head else {
-                return finish(*j, Vec::new());
+                return Ok(finish(*j, Vec::new()));
             };
-            let Some(poll) = Poller::new(stop) else {
-                return finish(*j, Vec::new());
-            };
+            let poll = Poller::new(stop).ok_or(Stopped)?;
             let mut out = Vec::new();
             let mut enumerated = 0u64;
             let ran = job.run(source, range.clone(), &poll, &mut |bindings| {
@@ -1719,11 +1755,8 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                     }
                 }
             });
-            // Stopped part-way: nothing of it is kept or probed. The stop is the operation's
-            // and stays fired, so its caller discards the round when it asks again.
-            if ran.is_err() {
-                return finish(*j, Vec::new());
-            }
+            // Stopped part-way: nothing of it is kept or probed, and the pass ends.
+            ran?;
             // The morsel's duplicates go before `keep` probes the source, and the probes
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes let a store read a relation's
@@ -1737,12 +1770,10 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 .windows(2)
                 .filter(|w| (w[0][1], w[0][0], w[0][2]) > (w[1][1], w[1][0], w[1][2]))
                 .count() as u64;
-            keep(&mut out, &poll);
             // `keep`'s reads count on the morsel's poller: stopped in them, its answers mean
-            // nothing, and nothing of the morsel is kept.
-            if poll.stopped() {
-                return finish(*j, Vec::new());
-            }
+            // nothing, nothing of the morsel is kept, and the pass ends.
+            keep(&mut out, &poll)?;
+            poll.ended()?;
             // What `keep` removed goes back now, not when every morsel is done: a round's
             // morsels are all held until their results are collected. A commit whose
             // round derived nothing new held 30,876 emptied buffers of 400 heads each,
@@ -1758,15 +1789,16 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 }
                 probes.emitted.fetch_add(emitted, Relaxed);
             }
-            finish(*j, out)
+            Ok(finish(*j, out))
         })
         .collect()
 }
 
 /// Calls `emit` with every binding of `rule`'s body under which its head derives `fact`,
 /// reading `seg` (a backward, one-step derivation check: DRed's rederivation, and
-/// explanations later). It polls `poll` as [`walk_until`] does: once that has stopped, the
-/// bindings emitted so far are not all there are.
+/// explanations later). It polls `poll` as [`walk_until`] does: [`Stopped`] once that has
+/// stopped, the bindings emitted so far not all there are (fix check r2, B9: the leaf says
+/// so, not each caller). `Ok` where it ran out, or `emit` stopped it.
 pub fn derivations<S: Source + ?Sized>(
     source: &S,
     rule: &Rule,
@@ -1774,15 +1806,15 @@ pub fn derivations<S: Source + ?Sized>(
     seg: Seg,
     poll: &Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
-) {
+) -> Result<(), Stopped> {
     let Head::Facts(heads) = &rule.head else {
-        return;
+        return Ok(());
     };
     // The search is a unit of attempted work, whether it finds anything or not; on a poller
     // that has stopped (one shared by several searches) it opens no scan at all, not even
     // the first (sol-loop r4, R4-1; review r1, F1).
     if poll.attempt(1) {
-        return;
+        return Err(Stopped);
     }
     let mut bindings = vec![None; rule.variables()];
     for head in heads {
@@ -1817,10 +1849,28 @@ pub fn derivations<S: Source + ?Sized>(
             )
         };
         unbind(head, newly, &mut bindings);
-        if stop || poll.stopped() {
-            return;
+        // `emit` had what it asked for: its bindings are real, whatever came after.
+        if stop {
+            return Ok(());
+        }
+        poll.ended()?;
+    }
+    Ok(())
+}
+
+/// Whether `source` holds every one of `facts`, each a probe on `poll`, the first that
+/// doesn't ending it; [`Stopped`] where a probe stopped, never "not held" (fix check r2).
+fn all_hold<S: Source + ?Sized>(
+    source: &S,
+    facts: &[Triple],
+    poll: &Poller<'_>,
+) -> Result<bool, Stopped> {
+    for &fact in facts {
+        if !source.contains(fact, poll)? {
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 /// The predicate `p` of a transitivity rule `(?x p ?y), (?y p ?z) -> (?x p ?z)`: `prp-trp`
@@ -2020,17 +2070,19 @@ impl Dispatch {
 
     /// The (rule, atom) pairs whose atom can match a fact of `delta`'s delta, sorted. Each
     /// relation it opens, reference it copies and probe it makes of the delta counts on
-    /// `poll` (sweep M04): stopped, the pairs are incomplete and mean nothing.
+    /// `poll` (sweep M04): [`Stopped`] once that has stopped, never the pairs found before
+    /// (fix check r2, B9: an empty list read as "no variant", and the rounds' job loops went
+    /// on).
     pub(crate) fn matching(
         &self,
         delta: &super::batch::Store,
         poll: &Poller<'_>,
-    ) -> Vec<(usize, usize)> {
+    ) -> Result<Vec<(usize, usize)>, Stopped> {
         let mut out: Vec<AtomRef> = Vec::new();
         let mut any_delta = false;
         for (p, relation) in delta.delta_relations() {
             if poll.tick() {
-                return Vec::new();
+                return Err(Stopped);
             }
             any_delta = true;
             // Each reference copied as it is counted; a stop ends the matching, whatever was
@@ -2038,44 +2090,36 @@ impl Dispatch {
             if let Some(entries) = self.by_predicate.get(&p) {
                 out.extend(poll.counted(entries).copied());
             }
-            if poll.stopped() {
-                return Vec::new();
-            }
+            poll.ended()?;
             let Some(objects) = self.by_object.get(&p) else {
                 continue;
             };
             // Probe whichever side is smaller: the indexed objects or the delta's.
             if objects.len() <= relation.delta_len() {
                 for (&o, entries) in objects {
-                    if relation.delta_has_object(o, poll) {
+                    if relation.delta_has_object(o, poll)? {
                         out.extend(poll.counted(entries).copied());
                     }
-                    if poll.stopped() {
-                        return Vec::new();
-                    }
+                    poll.ended()?;
                 }
             } else {
                 relation.delta_objects(poll, &mut |o| {
                     if let Some(entries) = objects.get(&o) {
                         out.extend(poll.counted(entries).copied());
                     }
-                });
-                if poll.stopped() {
-                    return Vec::new();
-                }
+                })?;
             }
         }
         if any_delta {
             out.extend(poll.counted(&self.any).copied());
         }
-        if poll.stopped() {
-            return Vec::new();
-        }
+        poll.ended()?;
         out.sort_unstable();
         out.dedup();
-        out.into_iter()
+        Ok(out
+            .into_iter()
             .map(|(r, a)| (r as usize, usize::from(a)))
-            .collect()
+            .collect())
     }
 }
 
@@ -2105,6 +2149,7 @@ impl<'a> Unpolled<'a> {
     ) -> Vec<(String, Vec<Triple>)> {
         self.0
             .named_derivations(source, fact, limit, &Poller::never())
+            .expect("never stopped")
     }
 
     /// [`Self::named_derivations`] with every set of schema facts each ground rule (and
@@ -2147,7 +2192,8 @@ impl<'a> Unpolled<'a> {
                     bodies.push((rule.name.clone(), full));
                 }
                 bodies.len() >= limit
-            });
+            })
+            .expect("never stopped");
             if bodies.len() >= limit {
                 break;
             }
@@ -2301,7 +2347,8 @@ impl GroundProgram {
     /// Visits every set of schema facts `grounding` was grounded on (the first, then the
     /// others), each a unit of attempted work on `poll`, counted before `body` reads it; `body`
     /// gets the poller back for its own work. `Some` with what `body` broke with; `None` once
-    /// every alternative was visited, or `poll` stopped ([`Poller::stopped`] says which).
+    /// every alternative was visited; [`Stopped`] where `poll` stopped first (fix check r2:
+    /// "all visited" and "stopped" were one answer).
     ///
     /// The one way to enumerate them during an operation that has a stop: a read that no
     /// poller counts can't be written (REAS review r1, sol-loop r6/r7). Explanations, which
@@ -2310,17 +2357,17 @@ impl GroundProgram {
         &self,
         grounding: Grounding,
         poll: &Poller<'p>,
-        mut body: impl FnMut(&[Triple], &Poller<'p>) -> ControlFlow<B>,
-    ) -> Option<B> {
+        mut body: impl FnMut(&[Triple], &Poller<'p>) -> Result<ControlFlow<B>, Stopped>,
+    ) -> Result<Option<B>, Stopped> {
         for premises in self.alternatives(grounding) {
             if poll.attempt(1) {
-                return None;
+                return Err(Stopped);
             }
-            if let ControlFlow::Break(out) = body(premises, poll) {
-                return Some(out);
+            if let ControlFlow::Break(out) = body(premises, poll)? {
+                return Ok(Some(out));
             }
         }
-        None
+        poll.ended().map(|()| None)
     }
 
     /// Visits each rule (by index, ascending) whose head can give `fact`, once each, as
@@ -2331,12 +2378,12 @@ impl GroundProgram {
         &self,
         fact: Triple,
         poll: &Poller<'p>,
-        mut body: impl FnMut(usize, &Poller<'p>) -> ControlFlow<B>,
-    ) -> Option<B> {
+        mut body: impl FnMut(usize, &Poller<'p>) -> Result<ControlFlow<B>, Stopped>,
+    ) -> Result<Option<B>, Stopped> {
         let mut last = None;
         for r in self.heads.rules_matching(fact) {
             if poll.attempt(1) {
-                return None;
+                return Err(Stopped);
             }
             if last == Some(r) {
                 continue;
@@ -2346,11 +2393,11 @@ impl GroundProgram {
                 "producers in ascending rule order"
             );
             last = Some(r);
-            if let ControlFlow::Break(out) = body(r, poll) {
-                return Some(out);
+            if let ControlFlow::Break(out) = body(r, poll)? {
+                return Ok(Some(out));
             }
         }
-        None
+        poll.ended().map(|()| None)
     }
 
     /// Reads that no stop bounds, for work that runs to its end (explanations) and tests.
@@ -2512,22 +2559,22 @@ impl GroundProgram {
     }
 
     /// The (rule, atom) variants that can match the delta of `delta`, read on `poll`
-    /// ([`Dispatch::matching`]).
+    /// ([`Dispatch::matching`]: [`Stopped`] where that stopped them).
     pub(crate) fn variants(
         &self,
         delta: &super::batch::Store,
         poll: &Poller<'_>,
-    ) -> Vec<(usize, usize)> {
+    ) -> Result<Vec<(usize, usize)>, Stopped> {
         self.dispatch.matching(delta, poll)
     }
 
     /// The (consistency rule, atom) variants that can match the delta of `delta`, read on
-    /// `poll`.
+    /// `poll`, as [`Self::variants`].
     pub(crate) fn consistency_variants(
         &self,
         delta: &super::batch::Store,
         poll: &Poller<'_>,
-    ) -> Vec<(usize, usize)> {
+    ) -> Result<Vec<(usize, usize)>, Stopped> {
         self.consistency_dispatch.matching(delta, poll)
     }
 
@@ -2563,24 +2610,25 @@ impl GroundProgram {
     /// schema facts first, then up to `limit` by rules whose head matches it and
     /// transitivity (instantiated premises, plus the schema facts the instance was grounded
     /// on). Each alternative, producer and search is attempted work on `poll` (DRed's
-    /// proofs run under the update's stop); stopped, the bodies found are incomplete.
+    /// proofs run under the update's stop); [`Stopped`] where it stopped them, never the
+    /// bodies found so far (fix check r2, B9).
     pub fn derivation_bodies<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         limit: usize,
         poll: &Poller<'_>,
-    ) -> Vec<Vec<Triple>> {
+    ) -> Result<Vec<Vec<Triple>>, Stopped> {
         let mut bodies: Vec<Vec<Triple>> = Vec::new();
         if self.bodiless.contains(&fact) {
             self.for_each_alternative(Grounding::Bodiless(fact), poll, |premises, _| {
                 bodies.push(premises.to_vec());
-                ControlFlow::<()>::Continue(())
-            });
+                Ok(ControlFlow::<()>::Continue(()))
+            })?;
         }
-        let named = self.named_derivations(source, fact, limit, poll);
+        let named = self.named_derivations(source, fact, limit, poll)?;
         bodies.extend(named.into_iter().map(|(_, body)| body));
-        bodies
+        Ok(bodies)
     }
 
     /// [`Self::derivation_bodies`] by rules, each with the name of the rule it instantiates
@@ -2592,35 +2640,39 @@ impl GroundProgram {
         fact: Triple,
         limit: usize,
         poll: &Poller<'_>,
-    ) -> Vec<(String, Vec<Triple>)> {
+    ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
         let mut bodies = Vec::new();
-        let mut search = |rule: &Rule, premises: &[Triple], poll: &Poller<'_>| {
-            derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
-                let mut body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                body.extend_from_slice(premises);
-                bodies.push((rule.name.clone(), body));
-                bodies.len() >= limit
-            });
-            bodies.len() >= limit
-        };
+        let mut search =
+            |rule: &Rule, premises: &[Triple], poll: &Poller<'_>| -> Result<bool, Stopped> {
+                derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
+                    let mut body: Vec<Triple> = rule
+                        .body
+                        .iter()
+                        .map(|atom| instantiate_head(atom, bindings))
+                        .collect();
+                    body.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), body));
+                    bodies.len() >= limit
+                })?;
+                Ok(bodies.len() >= limit)
+            };
         let full = self.for_each_producer(fact, poll, |r, poll| {
-            match search(&self.rules[r], &self.premises[r], poll) {
+            Ok(match search(&self.rules[r], &self.premises[r], poll)? {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
+            })
+        })?;
+        if full.is_none() && self.transitive.contains(&fact[1]) {
+            if poll.attempt(1) {
+                return Err(Stopped);
             }
-        });
-        if full.is_none() && self.transitive.contains(&fact[1]) && !poll.attempt(1) {
             search(
                 &transitivity(fact[1]),
                 self.transitive_premises(fact[1]),
                 poll,
-            );
+            )?;
         }
-        bodies
+        Ok(bodies)
     }
 
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`): a
@@ -2656,17 +2708,15 @@ impl GroundProgram {
     ) -> Result<bool, Stopped> {
         // Before the bodiless and producer prelude (review r1, F2).
         let poll = Poller::new(stop).ok_or(Stopped)?;
-        // A premise its poller stopped counts as not held: the alternatives' next step finds
-        // the poller stopped, and the answer below is `Stopped`.
         if bodiless_too
             && self.bodiless.contains(&fact)
             && self
                 .for_each_alternative(Grounding::Bodiless(fact), &poll, |body, poll| {
-                    match body.iter().all(|&g| source.contains(g, poll) == Ok(true)) {
+                    Ok(match all_hold(source, body, poll)? {
                         true => ControlFlow::Break(()),
                         false => ControlFlow::Continue(()),
-                    }
-                })
+                    })
+                })?
                 .is_some()
         {
             return Ok(true);
@@ -2677,13 +2727,13 @@ impl GroundProgram {
                 derivations(source, &self.rules[r], fact, Seg::All, poll, &mut |_| {
                     found = true;
                     true
-                });
+                })?;
             }
-            match found {
+            Ok(match found {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
-            }
-        });
+            })
+        })?;
         if by_rule.is_some() {
             return Ok(true);
         }
@@ -2698,10 +2748,7 @@ impl GroundProgram {
                     found = true;
                     true
                 },
-            );
-        }
-        if !found {
-            poll.ended()?;
+            )?;
         }
         Ok(found)
     }
@@ -2870,6 +2917,7 @@ mod tests {
             head: Head::Facts(vec![Atom([Term::Var(0), Term::Const(12), Term::Var(1)])]),
         };
         let jobs: Vec<Job<'_>> = Job::full(&source, &rule, &Poller::never())
+            .expect("never stopped")
             .into_iter()
             .collect();
         let probes = Probes::default();
@@ -2883,7 +2931,8 @@ mod tests {
             &|| false,
             &probes,
             &|_, facts| (facts.len(), facts.capacity()),
-        );
+        )
+        .expect("never stopped");
         assert!(capacities.len() > 1, "several morsels");
         assert_eq!(probes.emitted.load(Ordering::Relaxed), 10_000);
         assert!(capacities.iter().all(|&c| c == (0, 0)), "{capacities:?}");
@@ -2917,7 +2966,8 @@ mod tests {
         derivations(&source, &rule, [1, 13, 2], Seg::All, &poll, &mut |_| {
             emitted += 1;
             true
-        });
+        })
+        .expect("never stopped");
         assert_eq!(emitted, 1);
         assert_eq!(
             source.scans.load(Ordering::Relaxed),
@@ -2934,7 +2984,8 @@ mod tests {
         derivations(&source, &rule, [1, 13, 2], Seg::All, &poll, &mut |_| {
             all += 1;
             false
-        });
+        })
+        .expect("never stopped");
         assert_eq!(all, 10_000);
     }
 
@@ -2966,11 +3017,13 @@ mod tests {
         let asks = AtomicUsize::new(0);
         let stop = || asks.fetch_add(1, Ordering::Relaxed) >= 1;
         let poll = Poller::new(&stop).expect("not stopped yet");
-        derivations(&source, &rule, [1, 13, 2], Seg::All, &poll, &mut |_| false);
+        let first = derivations(&source, &rule, [1, 13, 2], Seg::All, &poll, &mut |_| false);
         assert!(poll.stopped(), "the first search outlived POLL_UNITS facts");
+        assert_eq!(first, Err(Stopped), "a search its poller stopped says so");
         source.scans.store(0, Ordering::Relaxed);
         source.matches.store(0, Ordering::Relaxed);
-        derivations(&source, &rule, [1, 13, 2], Seg::All, &poll, &mut |_| false);
+        let again = derivations(&source, &rule, [1, 13, 2], Seg::All, &poll, &mut |_| false);
+        assert_eq!(again, Err(Stopped), "a search on a stopped poller says so");
         assert_eq!(
             (
                 source.scans.load(Ordering::Relaxed),
@@ -3007,6 +3060,7 @@ mod tests {
             head: Head::Facts(vec![Atom([Term::Var(0), Term::Const(12), Term::Var(1)])]),
         };
         let jobs: Vec<Job<'_>> = Job::full(&source, &rule, &Poller::never())
+            .expect("never stopped")
             .into_iter()
             .collect();
         assert_eq!(jobs.len(), 1, "one job");
