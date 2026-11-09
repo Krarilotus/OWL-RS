@@ -35,6 +35,12 @@ tracing.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
+[features]
+# The work counters of src/witness.rs, for other crates' tests (REAS-3: the work an adapter's
+# read does in the engine, after its stop): a dev-dependency with this feature. Never in product
+# builds; the count jobs check that none of theirs has it.
+witness = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs),

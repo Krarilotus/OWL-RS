@@ -270,6 +270,8 @@ impl IndexVersion {
 
     /// True if `quad` is visible. O(r log n).
     pub(crate) fn contains(&self, quad: &EncodedQuad) -> bool {
+        #[cfg(any(test, feature = "witness"))]
+        crate::witness::add(crate::witness::Site::RunProbes, self.runs.len() as u64);
         self.runs.iter().map(|run| run.sign_of(quad)).sum::<i64>() > 0
     }
 
@@ -544,6 +546,8 @@ impl IndexVersion {
             };
         };
         let parts = self.runs.iter().map(|run| {
+            #[cfg(any(test, feature = "witness"))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
             let perm = run.permutation(plan.permutation);
             let (start, end) = perm.range(&plan.low, &plan.high);
             (perm, start, end)
@@ -693,7 +697,7 @@ impl Iterator for QuadScan<'_> {
     fn next(&mut self) -> Option<EncodedQuad> {
         loop {
             let (key, sign) = self.merge.next()?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "witness"))]
             crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
@@ -733,7 +737,7 @@ impl QuadScan<'_> {
             let Some((key, sign)) = self.merge.next() else {
                 return Ok(None);
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "witness"))]
             crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;

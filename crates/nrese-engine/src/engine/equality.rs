@@ -752,6 +752,8 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
         let all = visibility.shows_all(touching);
         let pending = &mut self.pending;
         self.classes.expand(&raw, &self.pattern, &mut |quad| {
+            #[cfg(any(test, feature = "witness"))]
+            crate::witness::add(crate::witness::Site::ExpandCopies, 1);
             if all || visibility.shows(&quad, touching) {
                 pending.push(Reverse(permutation.to_key(&quad)));
             }

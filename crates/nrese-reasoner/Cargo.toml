@@ -32,6 +32,8 @@ oracle = []
 nrese-reasoner = { path = ".", features = ["oracle"] }
 # The consistency report's memory guard measures against budgets (tests/violations_memory.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
+# The engine's work counters, for the tests of the work a read does after its stop (REAS-3).
+nrese-engine = { path = "../nrese-engine", features = ["witness"] }
 
 [lints]
 workspace = true
