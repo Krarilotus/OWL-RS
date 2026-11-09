@@ -320,18 +320,20 @@ impl Engine<'_> {
     }
 
     /// Opens a branch point over the disjuncts of `clause` (`heads`: each alternative's
-    /// head atom) and takes the first.
+    /// head atom), the pending disjunction at `disjunction`, and takes the first.
     pub fn branch_on_clause(
         &mut self,
         alternatives: Vec<Lit>,
         premise: DepSetId,
         clause: u32,
         heads: Vec<u8>,
+        disjunction: u32,
     ) -> Step<()> {
         self.branch_with(alternatives, premise, true)?;
         if let Some(frame) = self.frames.last_mut() {
             frame.clause = clause;
             frame.heads = heads;
+            frame.disjunction = disjunction;
         }
         Ok(())
     }
@@ -368,6 +370,7 @@ impl Engine<'_> {
             alternatives,
             clause: NONE,
             heads: Vec::new(),
+            disjunction: NONE,
             next: 0,
             premise,
             failed: DepSetId::EMPTY,

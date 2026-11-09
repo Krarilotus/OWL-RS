@@ -184,7 +184,12 @@ impl<'p> Engine<'p> {
                 Some(stop) => stop,
                 None => match self.step(&mut checkpoint) {
                     Ok(true) => continue,
-                    Ok(false) => return End::Model,
+                    Ok(false) => {
+                        if self.config.check_retraction {
+                            self.check_decided();
+                        }
+                        return End::Model;
+                    }
                     Err(stop) => stop,
                 },
             };
@@ -246,6 +251,7 @@ impl<'p> Engine<'p> {
     /// The first open disjunction: asserted if one disjunct is left, else a branch point.
     fn choose(&mut self) -> Step<bool> {
         while let Some(at) = self.reopen.pop() {
+            self.reopened_low = self.reopened_low.min(at);
             if (at as usize) < self.pending.len()
                 && let Some(step) = self.decide(at as usize)
             {
@@ -308,7 +314,7 @@ impl<'p> Engine<'p> {
             _ => {
                 self.order_disjuncts(pend.clause, &mut open);
                 let (alternatives, heads) = open.into_iter().unzip();
-                self.branch_on_clause(alternatives, dep, pend.clause, heads)
+                self.branch_on_clause(alternatives, dep, pend.clause, heads, at as u32)
                     .map(|()| true)
             }
         })
@@ -408,6 +414,18 @@ impl<'p> Engine<'p> {
                 self.activity.resize(c + 1, 0);
             }
             self.activity[c] = self.activity[c].saturating_add(1);
+        }
+    }
+
+    /// `frame` leaves the stack with its disjunction undecided (exhausted, or retracted
+    /// with a culprit): the disjunction is open again. The scan can't be relied on to find
+    /// it: a frame decided again on top keeps its disjunction's old place, behind the scan
+    /// position it saved (fuzz seed 700160, case 144: popped exhausted, and the retraction
+    /// below reopened only the disjunctions binding the nodes it touched). `decide` passes
+    /// over one that is satisfied, dead or merged away.
+    pub(super) fn abandon_frame(&mut self, frame: &super::engine::Frame) {
+        if frame.disjunction != NONE {
+            self.reopen.push(frame.disjunction);
         }
     }
 
@@ -517,6 +535,9 @@ impl<'p> Engine<'p> {
                 self.deps.prefix(k - 1)
             };
             self.frames.pop();
+            // A truncation further back restores a queue from before it; a retraction
+            // (dynamic backtracking) keeps this one.
+            self.abandon_frame(&frame);
         };
         self.stats.search += started.elapsed();
         out
@@ -538,6 +559,7 @@ impl<'p> Engine<'p> {
             alternatives: Vec::new(),
             clause: NONE,
             heads: Vec::new(),
+            disjunction: NONE,
             next: 0,
             premise: DepSetId::EMPTY,
             failed: DepSetId::EMPTY,
