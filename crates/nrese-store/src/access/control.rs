@@ -94,7 +94,7 @@ pub(super) fn now() -> String {
 }
 
 /// A statement as a line of the history: N-Triples, password hashes left out.
-fn line(quad: &Quad) -> String {
+pub(super) fn line(quad: &Quad) -> String {
     let object = match quad.predicate.as_str() {
         p if p == format!("{}passwordHash", rdf::NS) => "\"(not kept)\"".to_owned(),
         _ => quad.object.to_string(),
@@ -376,7 +376,7 @@ impl AccessControl {
 }
 
 /// A change's record as statements of the history graph.
-fn record_quads(record: &ChangeRecord) -> Vec<Quad> {
+pub(super) fn record_quads(record: &ChangeRecord) -> Vec<Quad> {
     let graph = nrese_rdf::GraphName::NamedNode(iri(HISTORY_GRAPH));
     let subject: NamedNode = iri(&format!("{CHANGE}{}", record.number));
     let literal = |value: &str| -> Term { Literal::new_simple_literal(value).into() };
