@@ -126,6 +126,11 @@ impl<'e> Transaction<'e> {
         {
             return Ok(kept.snapshot.clone());
         }
+        // Not current: let go before its replacement is charged. Held through the build, a stale
+        // one would count twice against the same budget (sol-loop r2, S4); a caller still holding
+        // it keeps its own share.
+        let stale = self.pending.memo().lock().take();
+        drop(stale);
         let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
         scratch.charge(self.pending.snapshot_changes_bound())?;
         // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
