@@ -691,18 +691,17 @@ impl Dictionary {
     /// the new while it grows), and where the base's keys are compressed the compressor's
     /// output (twice the key) and the stored key it is copied into, grown past the key's
     /// length; a triple term's, its components' looked up one after another and then its key
-    /// of ids. The bound and the lookup read one state of the dictionary, under one read
-    /// guard: a checkpoint can't publish a compressed base between them.
+    /// of ids. `charge` is called with no lock of the dictionary held, so at the larger of a
+    /// plain and a compressed base's bounds: a checkpoint may publish a compressed base
+    /// before the lookup's guard is taken (as [`super::overlay::OverlayView::lookup_charged`]).
     pub fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
         limit: u64,
         charge: impl FnOnce(usize) -> Result<(), E>,
     ) -> Result<Option<TermId>, E> {
-        let inner = self.inner.read_recursive();
-        let compressed = inner.base.as_ref().is_some_and(|base| base.codec.is_some());
-        charge(lookup_bytes(term, compressed))?;
-        Ok(self.lookup_in(&inner, term, limit))
+        charge(lookup_bytes(term, false).max(lookup_bytes(term, true)))?;
+        Ok(self.lookup_in(&self.inner.read_recursive(), term, limit))
     }
 
     pub fn lookup_bounded(&self, term: TermRef<'_>, limit: u64) -> Option<TermId> {
@@ -1320,18 +1319,22 @@ impl Dictionary {
         self.terms(None).decode(id)
     }
 
-    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, once, for
-    /// the whole term: an inline literal's text, a dictionary term's text and for a key stored
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, for the
+    /// whole term: an inline literal's text, a dictionary term's text and for a key stored
     /// compressed the buffers it is decompressed through, a triple term's components so and
-    /// its boxes. The bound and the decoding read one state of the dictionary, under one read
-    /// guard. `Ok(None)` for an id that isn't a term of the dictionary (charged first if only
-    /// its decode tells, as for a triple term whose predicate isn't an IRI).
+    /// its boxes. `Ok(None)` for an id that isn't a term of the dictionary (charged first if
+    /// only its decode tells, as for a triple term whose predicate isn't an IRI).
+    ///
+    /// `charge` is called with no lock of the dictionary held, once, or again where a rebase
+    /// came between the bound and the decode: each call charges an increment, and what the
+    /// decode holds is covered by their sum. A refusal ends it, nothing decoded; what was
+    /// charged before stays the caller's to release.
     pub fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        self.terms(None).decode_charged(id, charge)
+        self.decode_charged_in(None, id, charge)
     }
 
     /// [`Self::decode_charged`]'s bound for `id`, as the dictionary stores it now; `None` for
@@ -2109,7 +2112,7 @@ pub(super) fn decode_key(key: &[u8]) -> Term {
             Literal::new_directional_language_tagged_literal_unchecked(lexical, language, direction)
                 .into()
         }
-        TAG_TRIPLE => parse_triple_term(&text()),
+        TAG_TRIPLE => super::text_triple::decode(std::str::from_utf8(rest).unwrap_or_default()),
         _ => {
             let (datatype, lexical) = split_sep(rest);
             Literal::new_typed_literal(lexical, NamedNode::new_unchecked(datatype)).into()
@@ -2177,14 +2180,6 @@ enum Entry<'k> {
 /// isn't a triple term's by ids.
 const TRIPLE_KEY_ROOM: usize = 512;
 
-/// What a triple term keyed by its text (the first RDF 1.2 version's) holds while its text
-/// is parsed beyond the key's own bound, per byte of that bound: the line it is parsed as,
-/// the parser's buffers and the term it makes.
-const TEXT_TRIPLE_BYTES_PER_KEY_BYTE: usize = 16;
-
-/// And beside that, the parser's own state.
-const TEXT_TRIPLE_PARSER: usize = 4096;
-
 impl Terms<'_> {
     fn inner(&self) -> &Inner {
         self.inner
@@ -2249,11 +2244,10 @@ impl Terms<'_> {
     /// The most bytes [`Self::decode`] of `id` holds at once, allocating nothing; `None`
     /// where it decodes nothing, as an unknown id or component.
     pub(super) fn bound(&self, id: TermId) -> Option<usize> {
+        // A triple term's key not of its components' ids is its text, read back: the key's
+        // bound (its plain length at least), and what reading a text of that length holds.
         let key_bound = |bound: usize| match id.kind() {
-            TermKind::Triple => TEXT_TRIPLE_BYTES_PER_KEY_BYTE
-                .saturating_mul(bound)
-                .saturating_add(TEXT_TRIPLE_PARSER)
-                .saturating_add(bound),
+            TermKind::Triple => bound.saturating_add(super::text_triple::bound(bound)),
             _ => bound,
         };
         Some(match self.entry(id)? {
@@ -2267,17 +2261,47 @@ impl Terms<'_> {
         })
     }
 
-    /// [`Self::decode`] of `id`, [`Self::bound`] charged first through `charge`.
-    pub(super) fn decode_charged<E>(
+    /// The generation of the dictionary state these reads hold, if they read one: `None`
+    /// while no shared entry was read (a private view's own, or an inline literal).
+    fn generation(&self) -> Option<u64> {
+        self.inner.get().map(|inner| inner.generation)
+    }
+}
+
+impl Dictionary {
+    /// [`Terms::decode`] of `id`, [`Terms::bound`] charged first through `charge`, which is
+    /// called with no lock of the dictionary held: the bound is read under the read guard,
+    /// the guard let go, the bound charged, and the term decoded under a new guard. A rebase
+    /// between them (the one change of a key's storage, [`Self::rebase`]) may store the
+    /// term's keys compressed, with a larger bound: the decode then reads the bound again and
+    /// charges only the difference, again with no lock held, until a guard sees the state it
+    /// was charged for. Ids never change meaning, so only the bound can differ.
+    pub(super) fn decode_charged_in<E>(
         &self,
+        own: Option<&dyn OwnKeys>,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        mut charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        let Some(bound) = self.bound(id) else {
-            return Ok(None);
-        };
-        charge(bound)?;
-        Ok(self.decode(id))
+        let mut charged = 0;
+        loop {
+            let (bound, generation) = {
+                let terms = self.terms(own);
+                let Some(bound) = terms.bound(id) else {
+                    return Ok(None);
+                };
+                (bound, terms.generation())
+            };
+            if bound > charged {
+                charge(bound - charged)?;
+                charged = bound;
+            }
+            let terms = self.terms(own);
+            // A decode that read no shared entry for its bound reads none now: own entries
+            // are frozen.
+            if generation.is_none_or(|generation| terms.inner().generation == generation) {
+                return Ok(terms.decode(id));
+            }
+        }
     }
 }
 
@@ -2296,19 +2320,6 @@ fn stored_triple_ids(inner: &Inner, index: u64) -> Option<[TermId; 3]> {
             triple_ids(codec.decompress_in(stored, &mut room)?)
         }
     }
-}
-
-/// A triple term from the N-Triples text of a key the first RDF 1.2 version wrote.
-fn parse_triple_term(text: &str) -> Term {
-    let line = format!("<urn:x> <urn:x> {text} .");
-    nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::NTriples)
-        .for_slice(line.as_bytes())
-        .next()
-        .and_then(Result::ok)
-        .map_or_else(
-            || Literal::new_simple_literal(text).into(),
-            |quad| quad.object,
-        )
 }
 
 fn validate_key(key: &[u8]) -> EngineResult<()> {
@@ -3080,6 +3091,190 @@ mod tests {
                 search(&reopened);
                 none("no build C beside B");
                 drop(b);
+            }
+        }
+    }
+
+    /// Package C3: a triple term keyed by its text (the first RDF 1.2 version's, restored as a
+    /// checkpoint of that version holds it) is read back by `text_triple`, whose bound comes
+    /// from the text's length ([`super::super::text_triple::bound`]). Over every shape its
+    /// writer makes, and the densest text a key could hold: each, alone and under a triple
+    /// term keyed by ids, decodes charged under an unlimited budget as the plain decode does,
+    /// holding no byte beyond its charge, and that charge is the budget's use while it lives
+    /// and nothing after; under a budget a byte short of the bound, it is refused, nothing
+    /// allocated. Each shape's key length, bound and the plain decode's peak are printed.
+    #[test]
+    fn a_triple_term_keyed_by_its_text_holds_no_more_than_its_bound() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        use nrese_exec::{Budget, measure};
+        use nrese_rdf::{BaseDirection, BlankNode, Literal, Triple};
+        let iri = |s: &str| NamedNode::new_unchecked(format!("urn:{s}"));
+        let long = |n: usize| NamedNode::new_unchecked(format!("urn:{}", "x".repeat(n)));
+        let escaped = "a\"b\\c\nd\te\r\u{8}\u{c}\u{1}\u{7f}\u{fffe}é".repeat(300);
+        // `depth` triple terms, one in the next.
+        let nested = |depth: usize| {
+            let mut term: Term = iri("o").into();
+            for level in 0..depth {
+                term = Triple::new(iri(&format!("s{level}")), iri("p"), term).into();
+            }
+            term
+        };
+        // As densely nested as text gets: a blank node and a short IRI a level.
+        let dense = |depth: usize| {
+            let mut term: Term = BlankNode::new_unchecked("o").into();
+            for _ in 0..depth {
+                let p = NamedNode::new_unchecked("u:p");
+                term = Triple::new(BlankNode::new_unchecked("b"), p, term).into();
+            }
+            term
+        };
+        // Past the 64 levels the parser took, the text decodes as its fallback, a literal of
+        // the text, as the parser's did: this test checks only that its charge covers it.
+        let past = "nested 65, past the parser";
+        // A private-use tag of 32,768 subtags (sol-loop r1 S1: the parser's tag check held 16
+        // bytes for each).
+        let long_tag = format!("x{}", "-a".repeat(32_768));
+        let shapes: Vec<(&str, Term)> = vec![
+            ("plain", Triple::new(iri("s"), iri("p"), iri("o")).into()),
+            (
+                "long IRIs",
+                Triple::new(long(4096), long(4096), long(4096)).into(),
+            ),
+            (
+                "blank node",
+                Triple::new(
+                    BlankNode::new_unchecked("b0"),
+                    iri("p"),
+                    BlankNode::new_unchecked("b1"),
+                )
+                .into(),
+            ),
+            (
+                "escaped literal",
+                Triple::new(iri("s"), iri("p"), Literal::new_simple_literal(&escaped)).into(),
+            ),
+            (
+                "tagged literal",
+                Triple::new(
+                    iri("s"),
+                    iri("p"),
+                    Literal::new_language_tagged_literal_unchecked(&escaped, "en-gb"),
+                )
+                .into(),
+            ),
+            (
+                "directional literal",
+                Triple::new(
+                    iri("s"),
+                    iri("p"),
+                    Literal::new_directional_language_tagged_literal_unchecked(
+                        &escaped,
+                        "ar",
+                        BaseDirection::Rtl,
+                    ),
+                )
+                .into(),
+            ),
+            (
+                "typed literal",
+                Triple::new(
+                    iri("s"),
+                    iri("p"),
+                    Literal::new_typed_literal("x".repeat(65_536), long(1024)),
+                )
+                .into(),
+            ),
+            (
+                "64 KiB literal",
+                Triple::new(
+                    iri("s"),
+                    iri("p"),
+                    Literal::new_simple_literal("y".repeat(65_536)),
+                )
+                .into(),
+            ),
+            ("nested 2", nested(2)),
+            ("nested 9", nested(9)),
+            ("nested 32", nested(32)),
+            ("nested 64", nested(64)),
+            ("dense 64", dense(64)),
+            (past, nested(65)),
+            (
+                "long private-use tag",
+                Triple::new(
+                    iri("s"),
+                    iri("p"),
+                    Literal::new_language_tagged_literal_unchecked("", long_tag.as_str()),
+                )
+                .into(),
+            ),
+        ];
+        // The densest text: "dense 64" without the spaces the writer puts between tokens,
+        // which no key of the writer's has but a damaged one might.
+        let unspaced = "dense 64 unspaced";
+        let shapes = shapes.into_iter().chain([(unspaced, dense(64))]);
+        for (shape, text) in shapes {
+            let mut key = Vec::new();
+            assert_eq!(
+                encode_key(text.as_ref(), &mut key),
+                TermKind::Triple,
+                "{shape}"
+            );
+            assert_eq!(key[0], TAG_TRIPLE, "{shape}");
+            if shape == unspaced {
+                key.retain(|&b| b != b' ');
+            }
+            // Entries 1 and 2 IRIs, 3 a triple term keyed by ids holding entry 0 as its object.
+            let (mut t, mut p, mut over_key) = (Vec::new(), Vec::new(), Vec::new());
+            encode_key(TermRef::NamedNode(iri("t").as_ref()), &mut t);
+            encode_key(TermRef::NamedNode(iri("p").as_ref()), &mut p);
+            let id = TermId::new(TermKind::Triple, 0);
+            let ids = [
+                TermId::new(TermKind::Iri, 1),
+                TermId::new(TermKind::Iri, 2),
+                id,
+            ];
+            triple_key(ids, &mut over_key);
+            let dictionary = Dictionary::default();
+            dictionary.restore_keys(&[&key, &t, &p, &over_key]).unwrap();
+            let over = TermId::new(TermKind::Triple, 3);
+            let with_over: Term = Triple::new(iri("t"), iri("p"), text.clone()).into();
+            for (id, written) in [(id, &text), (over, &with_over)] {
+                let bound = dictionary.decode_bound(id).unwrap();
+                let (plain, peak) = measure::measure(|| dictionary.decode(id));
+                let plain = plain.expect("a term");
+                if shape != past {
+                    assert_eq!(&plain, written, "{shape}: plain decode");
+                }
+                let expected = &plain;
+                println!(
+                    "{shape}: key {} bytes, bound {bound}, plain decode's peak {peak}",
+                    key.len()
+                );
+                let unlimited = Budget::unlimited();
+                let (decoded, excess) = measure::measure_within(&unlimited, || {
+                    let decoded = dictionary.decode_charged(id, |bytes| unlimited.charge(bytes));
+                    assert_eq!(unlimited.used(), bound, "{shape}: the use while it lives");
+                    decoded
+                });
+                assert_eq!(decoded.as_ref(), Ok(&Some(expected.clone())), "{shape}");
+                assert_eq!(
+                    excess, 0,
+                    "{shape}: held {excess} bytes beyond its charge of {bound}"
+                );
+                drop(decoded);
+                unlimited.release(bound);
+                assert_eq!((unlimited.used(), unlimited.peak()), (0, bound), "{shape}");
+                let short = Budget::new(bound - 1);
+                let (refused, excess) = measure::measure_within(&short, || {
+                    dictionary
+                        .decode_charged(id, |bytes| short.charge(bytes))
+                        .is_err()
+                });
+                assert!(refused, "{shape}: a budget short of its bound");
+                assert_eq!((excess, short.used()), (0, 0), "{shape}: refused");
             }
         }
     }
