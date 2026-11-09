@@ -152,6 +152,7 @@ impl<'e> Transaction<'e> {
                 false => std::sync::Arc::clone(&base.equality),
             },
             canonical: Default::default(),
+            own: Default::default(),
         };
         self.pending.base().with_version(version)
     }
@@ -197,6 +198,7 @@ impl<'e> Transaction<'e> {
                 false => std::sync::Arc::clone(&seen.equality),
             },
             canonical: Default::default(),
+            own: Default::default(),
         };
         view.with_version(version)
     }
@@ -542,6 +544,7 @@ impl Inner {
                     false => std::sync::Arc::clone(&current.equality),
                 },
                 canonical: Default::default(),
+                own: Default::default(),
             }
         };
         let wal_bytes = match &shared.durable {
