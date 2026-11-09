@@ -860,10 +860,18 @@ impl CorpusStore {
     /// `request`. `None`: walk. Reads the store only; nothing is claimed, moved, charged to
     /// the store or evicted (contract S3). The caller's derivation probes each touched term
     /// in its own snapshot, so the result is exact whatever the runs hold.
+    ///
+    /// A `private` version (a private transaction's, V3) has an equality cell of its own
+    /// whatever it changes, so it is not asked to share the base's: its classes are the
+    /// base's where its extra runs hold no `sameAs` statement, checked below in both stacks
+    /// (the classes read the default graph's `sameAs` statements of both; equality.rs), and
+    /// otherwise it walks. Every other version keeps the cell check (condition c: a
+    /// restricted or adding view has a fresh cell and a fresh content; DICT2 9 Nov 04:02).
     pub(crate) fn derive_unadmitted(
         &self,
         version: &Arc<Version>,
         kind: KindRef<'_>,
+        private: bool,
         request: &Arc<Budget>,
     ) -> Option<(Arc<Corpus>, ChargedVec<u64>)> {
         let per_probe = self.tuning().documents_per_probe;
@@ -879,7 +887,7 @@ impl CorpusStore {
                 let Some(base) = kept.version.upgrade() else {
                     continue;
                 };
-                if !Arc::ptr_eq(&base.equality, &version.equality) {
+                if !private && !Arc::ptr_eq(&base.equality, &version.equality) {
                     continue;
                 }
                 let Some(prefix) = run_prefix(&base, version) else {

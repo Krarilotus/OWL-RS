@@ -546,3 +546,43 @@ fn view_end(view: &Vocabulary) -> u64 {
 fn literal_key_len(text: &str) -> usize {
     1 + text.len()
 }
+
+/// V3's own entries (DICT2 9 Nov 04:02). Input: a dictionary of two literals, an overlay at
+/// its length that interns a shared literal, an IRI, a simple and a language-tagged literal of
+/// its own, then is frozen; one more own term interned after the freeze. Expected: the view's
+/// own entries are exactly the three own terms, in id order, each id the overlay's (its kind
+/// the term's, its payload from `start`) and each key decoding back to its term; the shared
+/// literal and the term interned after the freeze are not among them.
+#[test]
+fn own_entries_are_the_views_own_terms_with_their_keys() {
+    let budget = unlimited();
+    let (dictionary, overlay) = with_overlay(2, &budget);
+    let start = dictionary.len();
+    overlay.intern(literal("old 1").as_ref()).unwrap();
+    let own: Vec<Term> = vec![
+        iri("x").into(),
+        literal("new words"),
+        Literal::new_language_tagged_literal_unchecked("neu", "de").into(),
+    ];
+    let ids: Vec<TermId> = own
+        .iter()
+        .map(|term| overlay.intern(term.as_ref()).unwrap())
+        .collect();
+    let view = overlay.freeze().unwrap();
+    overlay
+        .intern(literal("after the freeze").as_ref())
+        .unwrap();
+    let entries: Vec<(TermId, Term)> = view
+        .own_entries()
+        .map(|(id, key)| (id, crate::term::dictionary::decode_key(key)))
+        .collect();
+    let want: Vec<(TermId, Term)> = ids.iter().copied().zip(own).collect();
+    assert_eq!(entries, want);
+    let kinds: Vec<TermKind> = entries.iter().map(|(id, _)| id.kind()).collect();
+    assert_eq!(
+        kinds,
+        [TermKind::Iri, TermKind::String, TermKind::LangString]
+    );
+    let payloads: Vec<u64> = entries.iter().map(|(id, _)| id.payload()).collect();
+    assert_eq!(payloads, [start, start + 1, start + 2]);
+}
