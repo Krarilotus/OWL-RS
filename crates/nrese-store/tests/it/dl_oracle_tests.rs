@@ -120,9 +120,28 @@ fn parse(turtle: &str) -> Parsed {
     parsed
 }
 
+/// A run's deadline, and the token that stops owl2-dl's work at it (review G1 r2, F4).
+pub(crate) struct Expiry {
+    deadline: std::time::Instant,
+    cancel: nrese_store::CancellationToken,
+}
+
+impl Expiry {
+    pub(crate) fn at(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            cancel: nrese_store::CancellationToken::new(),
+        }
+    }
+}
+
 /// owl2-dl's certain answers to `query`, as a set of rows (`true` for an ASK that holds);
 /// `Err` with the reason where it can't decide.
-fn certain(dl: &nrese_store::MutationPipeline, query: &str) -> Result<BTreeSet<String>, String> {
+fn certain(
+    dl: &nrese_store::MutationPipeline,
+    query: &str,
+    _expiry: &Expiry,
+) -> Result<BTreeSet<String>, String> {
     let store = dl.store();
     let mut request = SparqlQueryRequest::all(query);
     request.dl_answers = Some(DlAnswers::Exact);
@@ -185,16 +204,16 @@ fn left(deadline: std::time::Instant) -> Option<std::time::Duration> {
 /// - its properties between them;
 /// - equality between them.
 ///
-/// `Err` where one can't be decided, or `deadline` has passed.
+/// `Err` where one can't be decided, or the deadline has passed.
 fn saturation(
     dl: &nrese_store::MutationPipeline,
     parsed: &Parsed,
-    deadline: std::time::Instant,
+    expiry: &Expiry,
 ) -> Result<Vec<String>, String> {
     let mut facts = Vec::new();
     let mut ask = |triple: String| -> Result<(), String> {
-        left(deadline).ok_or("the deadline passed")?;
-        if !certain(dl, &format!("ASK {{ {triple} }}"))?.is_empty() {
+        left(expiry.deadline).ok_or("the deadline passed")?;
+        if !certain(dl, &format!("ASK {{ {triple} }}"), expiry)?.is_empty() {
             facts.push(format!("{triple} ."));
         }
         Ok(())
@@ -216,12 +235,13 @@ fn saturation(
 }
 
 /// The verdict for `case` under each of owl2-ql and owl2-rl, rewriting on, compared by
-/// `relation`, within `deadline`.
+/// `relation`, within `expiry`.
 pub(crate) fn verdicts(
     case: &Case,
     relation: Relation,
-    deadline: std::time::Instant,
+    expiry: &Expiry,
 ) -> Vec<(Ruleset, Verdict)> {
+    let deadline = expiry.deadline;
     let both = |v: Verdict| vec![(Ruleset::Owl2Ql, v.clone()), (Ruleset::Owl2Rl, v)];
     let Some(time) = left(deadline) else {
         return both(Verdict::Undecided("the deadline passed".to_owned()));
@@ -245,13 +265,13 @@ pub(crate) fn verdicts(
             false => Verdict::Undecided(format!("load: {e}")),
         });
     }
-    let expected = match certain(&dl, case.query) {
+    let expected = match certain(&dl, case.query, expiry) {
         Ok(rows) => rows,
         Err(e) => return both(Verdict::Undecided(format!("query: {e}"))),
     };
     let facts = match relation {
         Relation::Direct => Vec::new(),
-        Relation::Claim => match saturation(&dl, &parsed, deadline) {
+        Relation::Claim => match saturation(&dl, &parsed, expiry) {
             Ok(facts) => facts,
             Err(e) => return both(Verdict::Undecided(format!("saturation: {e}"))),
         },
@@ -429,7 +449,7 @@ fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
 /// harness's own check (design note, "First campaign").
 #[test]
 fn the_review_fixtures_answer_as_the_dl_oracle() {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(300));
     let mut wrong = Vec::new();
     for (name, body, query) in review_fixtures() {
         let turtle = format!("{HEAD}{body}");
@@ -438,8 +458,8 @@ fn the_review_fixtures_answer_as_the_dl_oracle() {
             turtle: &turtle,
             query,
         };
-        let direct = verdicts(&case, Relation::Direct, deadline);
-        for ((ruleset, saturated), (_, verdict)) in verdicts(&case, Relation::Claim, deadline)
+        let direct = verdicts(&case, Relation::Direct, &expiry);
+        for ((ruleset, saturated), (_, verdict)) in verdicts(&case, Relation::Claim, &expiry)
             .into_iter()
             .zip(direct)
         {
@@ -455,6 +475,32 @@ fn the_review_fixtures_answer_as_the_dl_oracle() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// owl2-dl's work stops at the run's deadline, whatever its own timeout leaves (review G1
+/// r2, F4: each DL call had a fresh timeout, so one begun before the deadline could run
+/// past it). With the run's expiry fired and its deadline still ahead, a decidable fixture
+/// gets no verdict under either relation: owl2-dl decides nothing, and nothing agrees.
+#[test]
+fn a_fired_expiry_stops_owl2_dl() {
+    let (name, body, query) = review_fixtures().swap_remove(0);
+    let turtle = format!("{HEAD}{body}");
+    let case = Case {
+        name,
+        turtle: &turtle,
+        query,
+    };
+    let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(300));
+    expiry.cancel.cancel();
+    for relation in [Relation::Direct, Relation::Claim] {
+        for (ruleset, verdict) in verdicts(&case, relation, &expiry) {
+            assert!(
+                matches!(verdict, Verdict::Undecided(_)),
+                "{name}, {}: {verdict:?}",
+                ruleset.name()
+            );
+        }
+    }
 }
 
 /// A number setting of the generated test, from the environment's `value` (review G1 r1,
@@ -608,7 +654,8 @@ fn generated_cases_answer_as_the_dl_oracle() {
     // 24 s, redraws included).
     let cases = env_setting("NRESE_FUZZ_CASES", 100, 1);
     let deadline_s = env_setting("NRESE_FUZZ_DEADLINE_S", 240, 1);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_s);
+    let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(deadline_s));
+    let deadline = expiry.deadline;
     // Every setting, so a custom deadline replays too (review G1 r2, F5).
     let replay = |i: u64| {
         format!(
@@ -639,7 +686,7 @@ fn generated_cases_answer_as_the_dl_oracle() {
                 turtle: &turtle,
                 query: &queries[0],
             };
-            let first = verdicts(&case, Relation::Direct, deadline);
+            let first = verdicts(&case, Relation::Direct, &expiry);
             if tries == 3 || !first.iter().any(|(_, v)| *v == Verdict::Inconsistent) {
                 break (seed, turtle, family, queries, first);
             }
@@ -655,7 +702,7 @@ fn generated_cases_answer_as_the_dl_oracle() {
             };
             let found = match n {
                 0 => first.clone(),
-                _ => verdicts(&case, Relation::Direct, deadline),
+                _ => verdicts(&case, Relation::Direct, &expiry),
             };
             for (ruleset, verdict) in found {
                 if let Verdict::Undecided(why) = &verdict {
@@ -673,7 +720,7 @@ fn generated_cases_answer_as_the_dl_oracle() {
                 counts.entry(family).or_default()[class] += 1;
                 if matches!(class, 2 | 3) {
                     // Attribution within the deadline: past it, `Undecided`.
-                    let saturated = verdicts(&case, Relation::Claim, deadline)
+                    let saturated = verdicts(&case, Relation::Claim, &expiry)
                         .into_iter()
                         .find(|(r, _)| *r == ruleset)
                         .map(|(_, v)| v);
