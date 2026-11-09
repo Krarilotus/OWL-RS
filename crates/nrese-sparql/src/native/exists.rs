@@ -42,7 +42,7 @@ use super::{
 pub(super) fn supported_expression(expression: &Expression, outer: &[Variable]) -> bool {
     let mut patterns = Vec::new();
     let plain = split(expression, &mut patterns, &mut |n| {
-        Variable::new_unchecked(format!("exists {n}"))
+        nrese_sparql_syntax::internal::variable("exists", n)
     });
     let _ = outer;
     expr::supported(&plain) && patterns.iter().all(|(_, pattern)| supported(pattern))
@@ -348,11 +348,12 @@ fn split(
 }
 
 impl Context<'_> {
-    /// A variable no query can name, for a column the executor adds for itself.
+    /// A variable no query can name, for a column the executor adds for itself (`what`, one
+    /// word: [`nrese_sparql_syntax::internal::variable`]).
     fn synthetic(&self, what: &str) -> Variable {
         let n = self.synthetic.get();
         self.synthetic.set(n + 1);
-        Variable::new_unchecked(format!("{what} {n}"))
+        nrese_sparql_syntax::internal::variable(what, n)
     }
 
     /// `solutions` with a boolean column for each `EXISTS` in `expression`, and the
@@ -523,7 +524,10 @@ impl Context<'_> {
                 }
                 if let Some(term) = self.term(id) {
                     if let Term::BlankNode(b) = &term {
-                        self.register_alias(super::substitute::alias(b.as_str()).as_str(), id);
+                        self.register_alias(
+                            nrese_sparql_syntax::internal::blank_constant(b.as_str()).as_str(),
+                            id,
+                        );
                     }
                     terms.insert(variable.clone(), term);
                 }
@@ -601,7 +605,7 @@ impl Context<'_> {
             });
             key_of_row.push(id);
         }
-        let key_variable = self.synthetic("exists key");
+        let key_variable = self.synthetic("exists-key");
         let mut vars: Vec<Variable> = keys.iter().map(|&c| solutions.vars[c].clone()).collect();
         vars.push(key_variable.clone());
         let distinct = self.produced(Solutions {
@@ -633,7 +637,7 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let ordered = left.ordered;
         let rows = left.table.len();
-        let row_variable = self.synthetic("left row");
+        let row_variable = self.synthetic("left-row");
         let mut numbered = left;
         let mut columns = std::mem::take(&mut numbered.table).into_columns();
         columns.push((0..rows as u64).collect());

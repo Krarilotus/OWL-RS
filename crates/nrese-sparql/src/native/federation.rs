@@ -280,6 +280,9 @@ impl Context<'_> {
         let mut all: Option<Solutions> = None;
         for pattern in patterns {
             self.check()?;
+            // No made name goes out as it is (`internal`): renamed apart from the pattern's,
+            // and read back from the answer.
+            let (pattern, sent) = nrese_sparql_syntax::internal::printable(pattern);
             // Under the query's BASE: an `IRI()` the endpoint evaluates resolves as here.
             let query = Query::Select {
                 dataset: None,
@@ -310,7 +313,11 @@ impl Context<'_> {
                 }),
             };
             let solutions = self.produced(Solutions {
-                vars: results.variables,
+                vars: results
+                    .variables
+                    .into_iter()
+                    .map(|v| sent.local(v))
+                    .collect(),
                 table,
                 ordered: false,
             })?;

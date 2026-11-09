@@ -110,7 +110,7 @@ pub(super) fn shares(a: &[Variable], b: &[Variable]) -> bool {
 /// The group a row belongs to, as a column next to the row's values. No variable of a
 /// query can have this name.
 fn group_column() -> Variable {
-    Variable::new_unchecked("group of the row")
+    nrese_sparql_syntax::internal::variable("group", "of the row")
 }
 
 impl Context<'_> {
