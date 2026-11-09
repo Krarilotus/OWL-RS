@@ -139,7 +139,7 @@ class GraphdbContract(unittest.TestCase):
         for phase in ('load', 'serve'):
             raw = (self.ctx.logs / f'graphdb-{phase}-config.json').read_text()
             record = json.loads(raw)
-            self.assertEqual(record['image'], 'ontotext/graphdb:11.5.1')
+            self.assertEqual(record['image'], 'ontotext/graphdb:11.5.2')
             self.assertEqual(record['requested_edition'], 'free')
             self.assertEqual(record['env']['GDB_HEAP_SIZE'], '2g')
             self.assertIn('graphdb.license.file=<set>', record['env']['GDB_JAVA_OPTS'])
@@ -159,7 +159,9 @@ class GraphdbContract(unittest.TestCase):
         for key, value in settings.items():
             self.assertEqual(recorded[key], 'set' if key == 'GRAPHDB_LICENSE' else value)
         self.assertNotIn('/private/', manifest.path.read_text())
+        manifest.close()  # one run at a time owns a results directory
         defaults = Manifest(self.ctx.logs, self.ctx.root, [], args, 'docker', {})
+        self.addCleanup(defaults.close)
         self.assertEqual(defaults.entry['settings'], {})
 
 

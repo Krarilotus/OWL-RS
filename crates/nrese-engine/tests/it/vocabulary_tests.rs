@@ -129,12 +129,14 @@ fn compressed_vocabularies_read_as_plain_ones() {
         assert_eq!(by_prefix.len(), 0);
         assert_eq!(anywhere.len(), expected);
         // Full-text search over the decoded strings.
-        let found = snapshot.text_search(&TextQuery {
-            text: "windm\u{fc}hle".to_owned(),
-            all_words: true,
-            prefix: false,
-            stem: None,
-        });
+        let found = snapshot
+            .text_search(&TextQuery {
+                text: "windm\u{fc}hle".to_owned(),
+                all_words: true,
+                prefix: false,
+                stem: None,
+            })
+            .unwrap();
         assert_eq!(
             found.len(),
             first.len() / 7 + usize::from(first.len() % 7 > 2)
@@ -175,7 +177,7 @@ fn compressed_vocabularies_read_as_plain_ones() {
         .unwrap();
     // The flags' bit 1: the keys are compressed.
     let header = std::fs::read(checkpoint).unwrap();
-    assert_eq!(&header[..8], b"NRESECKB");
+    assert_eq!(&header[..8], b"NRESECKC");
     assert_eq!(
         u64::from_le_bytes(header[16..24].try_into().unwrap()) & 2,
         2

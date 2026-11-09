@@ -5,7 +5,7 @@
 //! SPARQL 1.1 §13.2, which keeps them apart (docs/ops/http-api.md, the owner's decision).
 
 use nrese_engine::TermId;
-use nrese_rdf::{GraphName, NamedOrBlankNodeRef, Term};
+use nrese_rdf::{GraphName, GraphNameRef, NamedOrBlankNodeRef, Term};
 use nrese_sparql_syntax::algebra::QueryDataset;
 
 use crate::results::QueryDatasetSpecification;
@@ -118,6 +118,11 @@ impl GraphSet {
 pub(crate) struct ResolvedDataset {
     pub(crate) default: DefaultGraph,
     pub(crate) named: Option<Vec<TermId>>,
+    /// Whether the store's default graph is in reach: what another store's name for it
+    /// (`GRAPH <urn:x-arq:DefaultGraph>`, [`crate::compat`]) reads. Always, but for a reader
+    /// who may not read it ([`Self::restricted`]): then it is absent, as an unreadable named
+    /// graph is.
+    pub(crate) store_default: bool,
 }
 
 impl ResolvedDataset {
@@ -131,6 +136,7 @@ impl ResolvedDataset {
                 DefaultGraph::Store
             },
             named: None,
+            store_default: true,
         }
     }
 
@@ -159,11 +165,11 @@ impl ResolvedDataset {
                 .iter()
                 .filter_map(|name| match name {
                     GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
-                    // Jena's name for the default graph (`compat`).
-                    GraphName::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                        Some(TermId::DEFAULT_GRAPH)
-                    }
-                    GraphName::NamedNode(n) => graph(n.as_ref().into()),
+                    // Another store's name for the default graph names it (`compat`).
+                    GraphName::NamedNode(n) => match crate::compat::graph_named(n) {
+                        GraphNameRef::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                        _ => graph(n.as_ref().into()),
+                    },
                     GraphName::BlankNode(b) => graph(b.as_ref().into()),
                 })
                 .collect();
@@ -184,7 +190,11 @@ impl ResolvedDataset {
                 .filter_map(|name| graph(name.as_ref()))
                 .collect()
         });
-        Self { default, named }
+        Self {
+            default,
+            named,
+            store_default: true,
+        }
     }
 
     /// This dataset restricted to what `access` lets its user read: the default graph
@@ -233,6 +243,10 @@ impl ResolvedDataset {
                 .filter(|&g| access.allows_id(view, g))
                 .collect(),
         });
-        Self { default, named }
+        Self {
+            default,
+            named,
+            store_default: self.store_default && access.default_graph,
+        }
     }
 }

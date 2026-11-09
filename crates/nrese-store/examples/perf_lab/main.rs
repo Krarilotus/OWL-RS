@@ -64,6 +64,10 @@
 //!   `--duration-s`. `--threads N` sizes the thread pool (1: single-threaded). `--export`
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
+//!   `--parse-turtle FILE` parses a Turtle file `--runs` times on one thread, nothing stored
+//!   (the Turtle parser alone); `--split-turtle FILE:PARTS` cuts it into up to PARTS chunks
+//!   as bulk load does, nothing parsed (the skim alone). The file comes first: the native
+//!   bench runtime maps a container path only at the start of a word.
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
 //!   `--replication COMMITS:QUADS` times read replicas' log shipping: COMMITS commits of
@@ -264,6 +268,8 @@ struct Args {
     readers: usize,
     clients: Vec<usize>,
     cache_bytes: usize,
+    /// A durable store's automatic checkpoint threshold, in WAL bytes (unset: the default).
+    checkpoint_after_wal_bytes: Option<u64>,
     duration: Duration,
     threads: Option<usize>,
     export: Option<PathBuf>,
@@ -271,6 +277,8 @@ struct Args {
     count_allocations: bool,
     parse_only: bool,
     kernel: Option<String>,
+    parse_turtle: Option<PathBuf>,
+    split_turtle: Option<(usize, PathBuf)>,
     replication: Option<String>,
     replication_probe: bool,
     upload: Option<PathBuf>,
@@ -314,6 +322,7 @@ fn parse_args() -> Result<Args, String> {
         readers: 0,
         clients: Vec::new(),
         cache_bytes: 0,
+        checkpoint_after_wal_bytes: None,
         duration: Duration::from_secs(10),
         threads: None,
         export: None,
@@ -321,6 +330,8 @@ fn parse_args() -> Result<Args, String> {
         count_allocations: false,
         parse_only: false,
         kernel: None,
+        parse_turtle: None,
+        split_turtle: None,
         replication: None,
         replication_probe: false,
         upload: None,
@@ -384,6 +395,13 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--cache-bytes: {e}"))?
             }
+            "--checkpoint-after-wal-bytes" => {
+                args.checkpoint_after_wal_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--checkpoint-after-wal-bytes: {e}"))?,
+                )
+            }
             "--clients" => {
                 args.clients = value()?
                     .split(',')
@@ -404,6 +422,17 @@ fn parse_args() -> Result<Args, String> {
             "--count-allocations" => args.count_allocations = true,
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
+            "--parse-turtle" => args.parse_turtle = Some(value()?.into()),
+            "--split-turtle" => {
+                let spec = value()?;
+                let (file, parts) = spec
+                    .rsplit_once(':')
+                    .ok_or("--split-turtle takes FILE:PARTS")?;
+                let parts = parts
+                    .parse()
+                    .map_err(|e| format!("--split-turtle parts: {e}"))?;
+                args.split_turtle = Some((parts, file.into()));
+            }
             "--replication" => args.replication = Some(value()?),
             "--replication-probe" => match value()?.as_str() {
                 "swap-one" => args.replication_probe = true,
@@ -1105,6 +1134,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ))
         .unwrap_or_default(),
         support_sets: args.support_sets.unwrap_or(config.support_sets),
+        // What searches rank and select among, as the server takes it (`NRESE_SEARCH_SCOPE`:
+        // global, reader).
+        search_scope: nrese_store::SearchScope::from_name(&setting("NRESE_SEARCH_SCOPE"))
+            .unwrap_or_default(),
+        checkpoint_after_wal_bytes: args
+            .checkpoint_after_wal_bytes
+            .unwrap_or(config.checkpoint_after_wal_bytes),
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
@@ -1121,6 +1157,19 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report.sections.push((
             "upload",
             modes::upload(&config, file, format, args.upload_as, args.runs)?,
+        ));
+        return Ok(());
+    }
+    if let Some(file) = &args.parse_turtle {
+        report
+            .sections
+            .push(("parse_turtle", modes::parse_turtle(file, args.runs)?));
+        return Ok(());
+    }
+    if let Some((parts, file)) = &args.split_turtle {
+        report.sections.push((
+            "split_turtle",
+            modes::split_turtle(file, *parts, args.runs)?,
         ));
         return Ok(());
     }
@@ -1489,7 +1538,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         query.metric = metric;
         query.strategy = nrese_engine::VectorStrategy::Approximate;
         snapshot.prepare_vector_graph(&query);
-        let (_, readiness) = snapshot.vector_search(&query, &|_| true);
+        let (_, readiness) = snapshot
+            .vector_search(&query, &|_| true, &nrese_exec::Budget::unlimited())
+            .unwrap();
         report.sections.push(("vector_prepare", phase.json()));
         let metric = metric.name();
         report.sections.push(("vector_graph", format!(

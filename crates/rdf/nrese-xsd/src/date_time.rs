@@ -307,6 +307,17 @@ impl<'a> Cursor<'a> {
 
     /// `-?([1-9][0-9]{3,}|0[0-9]{3})`
     fn year(&mut self) -> Result<i64, ParseError> {
+        match self.year_or_stand_in()? {
+            (year, false) => Ok(year),
+            (_, true) => self.fail("a year out of range"),
+        }
+    }
+
+    /// [`Self::year`], but a valid year past `MAX_YEAR` reads as a stand-in with its sign and
+    /// its leap years (its remainder mod 400, which its last four digits give), with `true`:
+    /// the rest of the lexical form can still be checked before it is refused as beyond
+    /// what is represented.
+    fn year_or_stand_in(&mut self) -> Result<(i64, bool), ParseError> {
         let negative = self.text.first() == Some(&b'-');
         if negative {
             self.text = &self.text[1..];
@@ -318,13 +329,22 @@ impl<'a> Cursor<'a> {
         if digits > 4 && self.text[0] == b'0' {
             return self.fail("a year of more than four digits with a leading zero");
         }
-        let year: i64 = std::str::from_utf8(&self.text[..digits])
+        let text = &self.text[..digits];
+        let represented = std::str::from_utf8(text)
             .ok()
-            .and_then(|t| t.parse().ok())
-            .filter(|y| *y <= MAX_YEAR)
-            .map_or_else(|| self.fail("a year out of range"), Ok)?;
+            .and_then(|t| t.parse::<i64>().ok())
+            .filter(|y| *y <= MAX_YEAR);
+        let (year, past) = match represented {
+            Some(year) => (year, false),
+            None => {
+                let last4 = text[digits - 4..]
+                    .iter()
+                    .fold(0, |n, d| n * 10 + i64::from(d - b'0'));
+                (2000 + last4 % 400, true)
+            }
+        };
         self.text = &self.text[digits..];
-        Ok(if negative { -year } else { year })
+        Ok((if negative { -year } else { year }, past))
     }
 
     fn month(&mut self) -> Result<u8, ParseError> {
@@ -344,6 +364,7 @@ impl<'a> Cursor<'a> {
         self.expect(b':')?;
         let whole = self.two_digits()?;
         let mut second = Decimal::from(whole);
+        let mut nonzero_fraction = false;
         if self.text.first() == Some(&b'.') {
             let digits = self.text[1..]
                 .iter()
@@ -353,6 +374,8 @@ impl<'a> Cursor<'a> {
                 return self.fail("a '.' without digits after it");
             }
             let fraction = &self.text[1..=digits];
+            // The value keeps 18 digits, but `24:00:00` takes only zeros, however many.
+            nonzero_fraction = hour == 24 && fraction.iter().any(|&b| b != b'0');
             let mut raw = 0_i128;
             let mut unit = SCALE;
             for &b in fraction.iter().take(18) {
@@ -365,7 +388,7 @@ impl<'a> Cursor<'a> {
         if minute > 59 || whole > 59 {
             return self.fail("minutes or seconds out of range");
         }
-        if hour > 24 || (hour == 24 && (minute != 0 || second != Decimal::ZERO)) {
+        if hour > 24 || (hour == 24 && (minute != 0 || whole != 0 || nonzero_fraction)) {
             return self.fail("an hour out of range");
         }
         Ok((hour, minute, second))
@@ -570,7 +593,7 @@ impl DateTime {
     }
 
     fn read(c: &mut Cursor<'_>) -> Result<Self, ParseError> {
-        let year = c.year()?;
+        let (year, past) = c.year_or_stand_in()?;
         c.expect(b'-')?;
         let month = c.month()?;
         c.expect(b'-')?;
@@ -581,6 +604,12 @@ impl DateTime {
         c.expect(b'T')?;
         let (hour, minute, second) = c.time()?;
         let timezone = c.timezone_and_end()?;
+        // A valid lexical form, every part checked: refused only as beyond what is
+        // represented, saying whether it has a timezone (a dateTimeStamp needs one).
+        let unrepresented = || ParseError::unrepresented_year(c.datatype, timezone.is_some());
+        if past {
+            return Err(unrepresented());
+        }
         let props = Props {
             year,
             month,
@@ -595,7 +624,7 @@ impl DateTime {
             return props
                 .plus(0, Decimal::from(86_400))
                 .map(Self::wrap)
-                .ok_or(ParseError::new("dateTime", "a year out of range"));
+                .ok_or_else(unrepresented);
         }
         Ok(Self::wrap(props))
     }
@@ -752,18 +781,31 @@ impl Time {
     }
 
     /// `op:add-dayTimeDuration-to-time`: modulo 24 hours.
+    /// The duration is first reduced to under a day (XPath F&O 3.1 §9.7.15), so every
+    /// duration in range gives a time.
     pub fn checked_add_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
-        let moved = self.props().plus(0, duration.into().as_seconds())?;
+        self.plus_within_day(Self::within_day(duration.into())?)
+    }
+
+    /// `op:subtract-dayTimeDuration-from-time`: modulo 24 hours. The duration is reduced
+    /// before it is negated, which always fits (`Decimal::MIN` itself has no negation).
+    pub fn checked_sub_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
+        self.plus_within_day(Self::within_day(duration.into())?.checked_neg()?)
+    }
+
+    /// The duration's seconds modulo a day, with the duration's sign.
+    fn within_day(duration: DayTimeDuration) -> Option<Decimal> {
+        duration.as_seconds().checked_rem(Decimal::from(DAY as i64))
+    }
+
+    fn plus_within_day(self, seconds: Decimal) -> Option<Self> {
+        let moved = self.props().plus(0, seconds)?;
         Some(Self::wrap(Props {
             year: 1972,
             month: 12,
             day: 31,
             ..moved
         }))
-    }
-
-    pub fn checked_sub_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
-        self.checked_add_duration(duration.into().checked_neg()?)
     }
 
     /// `op:subtract-times`.
@@ -1195,6 +1237,83 @@ mod tests {
             time("17:00:00-06:00").checked_sub(time("08:00:00+09:00")),
             Some(dtd("P1D"))
         );
+    }
+
+    /// XPath F&O 3.1 `op:add-dayTimeDuration-to-time` and
+    /// `op:subtract-dayTimeDuration-from-time`: the duration is taken modulo 86,400
+    /// seconds, so any duration in range has a time result. 10¹⁹ s ≡ 64,000 s (17:46:40);
+    /// `Decimal::MIN` seconds ≡ 09:51:08.312696284115894272 (its negation, 14:08:51.6873…,
+    /// is not a `Decimal`).
+    #[test]
+    fn time_arithmetic_takes_any_duration_modulo_a_day() {
+        let time = |t: &str| t.parse::<Time>().unwrap();
+        let huge = "PT10000000000000000000S"
+            .parse::<DayTimeDuration>()
+            .unwrap();
+        let min = DayTimeDuration::new(Decimal::MIN);
+        let midnight = time("00:00:00");
+        let cases = [
+            ("+ 10¹⁹ s", midnight.checked_add_duration(huge), "17:46:40"),
+            ("- 10¹⁹ s", midnight.checked_sub_duration(huge), "06:13:20"),
+            (
+                "+ MIN s",
+                midnight.checked_add_duration(min),
+                "09:51:08.312696284115894272",
+            ),
+            (
+                "- MIN s",
+                midnight.checked_sub_duration(min),
+                "14:08:51.687303715884105728",
+            ),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(_, got, expected)| *got != Some(time(expected)))
+            .map(|(what, got, expected)| format!("00:00:00 {what} = {got:?}, not {expected}"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// XSD 1.1 Part 2, `endOfDayFrag ::= '24:00:00' ('.' '0'+)?` (in the lexical spaces of
+    /// `xsd:time` §3.3.8 and `xsd:dateTime` §3.3.7): hour
+    /// 24 takes only zero fraction digits, however many; digits past the 18th are still
+    /// digits. Other times keep the precision contract: digits past the 18th are dropped.
+    #[test]
+    fn end_of_day_admits_only_zero_fraction_digits() {
+        let time = |t: &str| t.parse::<Time>().ok();
+        let date_time = |t: &str| t.parse::<DateTime>().ok();
+        let cases = [
+            (
+                "24:00:00.0000000000000000001",
+                time("24:00:00.0000000000000000001").is_none(),
+            ),
+            (
+                "2002-10-10T24:00:00.0000000000000000001",
+                date_time("2002-10-10T24:00:00.0000000000000000001").is_none(),
+            ),
+            // Guards (right on the base too): zeros however many, and ordinary truncation.
+            (
+                "24:00:00.0000000000000000000",
+                time("24:00:00.0000000000000000000") == time("00:00:00"),
+            ),
+            (
+                "2002-10-10T24:00:00.0000000000000000000",
+                date_time("2002-10-10T24:00:00.0000000000000000000")
+                    == date_time("2002-10-11T00:00:00"),
+            ),
+            (
+                "12:00:00.0000000000000000001",
+                time("12:00:00.0000000000000000001") == time("12:00:00"),
+            ),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<&str> = cases
+            .iter()
+            .filter(|(_, holds)| !holds)
+            .map(|(text, _)| *text)
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

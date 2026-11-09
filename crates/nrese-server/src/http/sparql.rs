@@ -39,6 +39,14 @@ pub async fn execute_query_in(
     let deadline = tokio::time::Instant::now() + policy.timeouts.query;
 
     let explain = operation.explain;
+    // An EXPLAIN plans or runs on the committed data alone: inside a transaction it would
+    // describe a dataset other than the one the transaction's reads see.
+    if explain != Explain::No && pending.is_some() {
+        return Err(ApiError::bad_request(
+            "explain isn't available inside a transaction: its plan would be the committed \
+             data's, not the transaction's",
+        ));
+    }
     let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
@@ -96,11 +104,14 @@ pub async fn execute_query_in(
     }
     // The completeness goes with the answers, in a header: the store reports it on the
     // snapshot it reads before writing any answer, and the response starts after that.
-    let status: std::sync::Arc<std::sync::Mutex<Option<nrese_sparql::Completeness>>> =
-        std::sync::Arc::default();
+    // Every reported status is sent, `complete` where no reasoning path can leave answers
+    // out (the store's `None`), so a client never has to read an absent header as one;
+    // a run that reported nothing sends none (SYN-72).
+    type Reported = Option<Option<nrese_sparql::Completeness>>;
+    let status: std::sync::Arc<std::sync::Mutex<Reported>> = std::sync::Arc::default();
     let slot = std::sync::Arc::clone(&status);
     let report = move |r: Option<nrese_sparql::Completeness>| {
-        *slot.lock().unwrap_or_else(|p| p.into_inner()) = r;
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
     };
     let mut response = stream_blocking(
         Pace::Total(deadline),
@@ -118,7 +129,8 @@ pub async fn execute_query_in(
         },
     )
     .await?;
-    if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
+    let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(report) = reported.map(Option::unwrap_or_default) {
         let headers = response.headers_mut();
         headers.insert(
             COMPLETENESS,

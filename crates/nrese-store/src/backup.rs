@@ -9,11 +9,12 @@
 use std::io::Write;
 
 use nrese_engine::{QuadPattern, ReadModel, Snapshot, Transaction};
+use nrese_rdf::QuadRef;
 use nrese_rdf_io::{RdfFormat, RdfParseError};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
-use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad, write_quads};
+use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad, stored_graph_ref, write_quads};
 
 /// The closing comment of an export, before its checksum's 64 hex digits.
 pub const DIGEST_PREFIX: &str = "# nrese-sha256 ";
@@ -156,15 +157,22 @@ pub(crate) fn apply_restore(
 ) -> StoreResult<DatasetRestoreReport> {
     let checksum_verified = verify_checksum(&request.payload)?;
     let replaced_existing = !tx.is_empty();
-    tx.remove_matching(&QuadPattern::all());
+    // The pending changes' growth is charged before it happens (D16-039).
+    tx.remove_matching(&QuadPattern::all())?;
     each_payload_quad(
         request.format.rdf_format(),
         None,
         &request.payload,
         BlankNodes::Fresh,
         Consumer::Interning,
+        // Each in the graph the store keeps it in.
         |quad| {
-            tx.insert(quad);
+            tx.try_insert(QuadRef::new(
+                quad.subject,
+                quad.predicate,
+                quad.object,
+                stored_graph_ref(quad.graph_name),
+            ))?;
             Ok(())
         },
     )?;

@@ -77,20 +77,41 @@ impl MemoryStop {
             .is_some_and(nrese_exec::memory::MemoryWatch::exceeded)
     }
 
+    /// What the operation may still take under this watch now
+    /// ([`nrese_exec::memory::MemoryWatch::room`]): its room for the reasoner
+    /// ([`nrese_reasoner::eval::OperationStop::within`]), which admits by the least of it
+    /// and the process's. Without a watch, no bound of its own.
+    pub(crate) fn room(&self) -> nrese_exec::memory::Reading {
+        self.0
+            .as_ref()
+            .map_or(Ok(u64::MAX), nrese_exec::memory::MemoryWatch::room)
+    }
+
     /// The error of the operation `interrupted` ended, if memory ended it: this watch's
-    /// stop (past its limit, or the memory unread), else the process limit's, by the cause
-    /// the operation itself kept. `None`: its caller stopped it.
+    /// stop (past its limit, or the memory unread), else by the cause the operation itself
+    /// kept: the process limit's stop, or an allocation its room couldn't admit (by the
+    /// least of this watch's and the process's limits, [`Self::room`]), named with the
+    /// least of those limits set. `None`: its caller stopped it.
     pub(crate) fn error(
         &self,
         interrupted: nrese_reasoner::delta::Interrupted,
     ) -> Option<crate::StoreError> {
         use nrese_exec::memory::MemoryStopCause;
-        let process = || nrese_exec::memory::process_limit().unwrap_or(0);
+        let limit = || {
+            [
+                self.0.as_ref().map(nrese_exec::memory::MemoryWatch::limit),
+                nrese_exec::memory::process_limit(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(0)
+        };
         let watch = self
             .0
             .as_ref()
             .and_then(|watch| Some((watch.limit(), watch.cause()?)))
-            .or_else(|| Some((process(), interrupted.memory?)));
+            .or_else(|| Some((limit(), interrupted.memory?)));
         match watch {
             Some((limit, MemoryStopCause::Unread)) => {
                 Some(crate::StoreError::MemoryUnreadable { limit })
@@ -167,6 +188,15 @@ impl StoreService {
         engine.set_canonical_view_budget(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(runtime.query_memory()),
         ));
+        // So do the corpora reader-scoped searches keep, where they are on.
+        if config.search_scope == crate::SearchScope::Reader {
+            start_reader_corpora(
+                &engine,
+                &runtime,
+                config.reader_corpus_bytes,
+                config.reader_corpus_tuning,
+            );
+        }
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
@@ -182,6 +212,10 @@ impl StoreService {
                 std::sync::Arc::new(nrese_sparql::ResultCache::new(config.query_cache_bytes))
             }),
             ql: std::sync::Arc::default(),
+            search_scope: std::sync::Arc::new(std::sync::RwLock::new(config.search_scope)),
+            reader_corpus_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                config.reader_corpus_bytes,
+            )),
         };
         let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
@@ -196,12 +230,19 @@ impl StoreService {
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
+        // So does what client transactions keep between requests.
+        let sessions = crate::sessions::Sessions::within(
+            std::sync::Arc::new(
+                nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+            ),
+            crate::sessions::SESSION_IDLE,
+        );
         let service = Self {
             process_memory,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
-            sessions: std::sync::Arc::default(),
+            sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),
@@ -219,6 +260,11 @@ impl StoreService {
         service
             .engine
             .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
+        // So are the owl2-dl bounds' U1 and read views (SYN-61), the same way.
+        service
+            .dl
+            .bounds
+            .set_kept(std::sync::Arc::new(service.envelope(None).part()));
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
@@ -279,6 +325,65 @@ impl StoreService {
     /// When queries are rewritten for OWL 2 QL.
     pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
         *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What searches rank and select among ([`crate::StoreConfig::search_scope`]).
+    pub fn search_scope(&self) -> crate::SearchScope {
+        self.settings.search_scope()
+    }
+
+    /// Changes what searches rank and select among (a repository's setting): queries and
+    /// updates that start from now on read it; running ones keep theirs. Their cached
+    /// results stay apart ([`nrese_sparql::ResultCache`] keys a reader's scope).
+    pub fn set_search_scope(&self, scope: crate::SearchScope) {
+        let mut current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        // Turned on: the corpora the engine keeps for it draw on the queries' memory.
+        if scope == crate::SearchScope::Reader && *current != scope {
+            self.start_reader_corpora();
+        }
+        *current = scope;
+    }
+
+    /// Changes the bytes a `reader` search scope's corpora may take (a repository's
+    /// setting; [`crate::StoreConfig::reader_corpus_bytes`]): searches from now on keep
+    /// theirs within it, and the corpora kept so far are let go. Under `global` it is read
+    /// when `reader` is turned on.
+    pub fn set_reader_corpus_bytes(&self, bytes: usize) {
+        // Under the scope's lock: a scope turned on meanwhile reads the new bytes.
+        let current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = self
+            .settings
+            .reader_corpus_bytes
+            .swap(bytes, std::sync::atomic::Ordering::Relaxed);
+        if before != bytes && *current == crate::SearchScope::Reader {
+            self.start_reader_corpora();
+        }
+    }
+
+    /// The bytes a `reader` search scope's corpora may take now.
+    pub fn reader_corpus_bytes(&self) -> usize {
+        self.settings
+            .reader_corpus_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gives the engine's corpora their budget (the setting's bytes within the queries'
+    /// memory) and their tuning: reader-scoped searches from now on use them.
+    fn start_reader_corpora(&self) {
+        start_reader_corpora(
+            &self.engine,
+            &self.settings.runtime,
+            self.reader_corpus_bytes(),
+            self.config.reader_corpus_tuning,
+        );
     }
 
     /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
@@ -359,12 +464,14 @@ impl StoreService {
             return Ok(());
         }
         if let Some(path) = self.marker_path() {
-            match std::fs::remove_file(&path) {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            match crate::metadata::remove(&path) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    // The file may still be there: the next invalidation tries again (the
-                    // review of 3 October 2026, A4).
+                    // The file may still be there, or its removal not durable: the next
+                    // invalidation tries again (the review of 3 October 2026, A4).
                     self.marker.store(true, Ordering::Release);
                     return Err(crate::error::StoreError::Io(error));
                 }
@@ -380,11 +487,15 @@ impl StoreService {
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, text).map_err(crate::error::StoreError::Io)?;
-        std::fs::rename(&temporary, &path).map_err(crate::error::StoreError::Io)?;
+        // "A marker may be in place", before anything is written (fix check r1, R2-F2): a
+        // publication that fails after its rename leaves the marker under its name, and the
+        // next invalidation must remove it, or refuse, not skip it.
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
+        // Synced and durably named, the store's path included (DUR-3; fix check DEFER-F1): read
+        // at open, a marker lost or short after a power loss would misstate what the inferred
+        // stack is exact for.
+        crate::metadata::write(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -439,6 +550,12 @@ impl StoreService {
         self.engine.stats()
     }
 
+    /// The corpora a `reader` search scope keeps: their bytes against their budget, and how
+    /// many were walked or derived; `started` false while none was made.
+    pub fn text_corpus_stats(&self) -> nrese_engine::TextCorpusStats {
+        self.engine.snapshot().text_corpus_stats()
+    }
+
     /// Every statement in `format` (a backup); for a scope that reads every graph.
     pub fn export_dataset(
         &self,
@@ -472,6 +589,7 @@ impl StoreService {
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
+            search_scope: self.search_scope(),
             services: self.services(),
             namespaces: self.namespaces.all(),
             supports: std::sync::Arc::clone(&self.supports),
@@ -619,6 +737,11 @@ impl StoreService {
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        } else if let Some(state) = self.reasoning_state() {
+            // Off: the rewriting the closure and the setting call for, whatever came first
+            // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
+            // path, which switches the bounds off, exists).
+            self.note_ql(&state);
         }
     }
 
@@ -906,16 +1029,29 @@ impl StoreService {
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
     }
 
-    /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
-    /// without reasoning, or for asserted statements only): sound, and complete only for
-    /// what the ruleset derives, never certain answers under OWL 2 DL. Known before the
-    /// query runs.
+    /// The status of answers that don't go through the DL bounds; known before the query
+    /// runs. `None` only where no reasoning path can leave answers out: asserted statements
+    /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
+    /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
+    /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
+    /// rules' closure without the bounds ([`Self::dl_mode`]): sound only, never complete
+    /// (SYN-72 slice 2 r1 F1).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        if self.dl.active() || prepared.read_model() == ReadModel::Asserted {
+        if prepared.read_model() == ReadModel::Asserted {
             return None;
+        }
+        if self.dl.active() {
+            let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+            status.incomplete(
+                "dl",
+                "a read of the inferred statements alone: the rules' closure, without the DL \
+                 bounds; certain answers under OWL 2 DL may be missing"
+                    .to_owned(),
+            );
+            return Some(status);
         }
         let ruleset = self
             .materialised
@@ -1187,6 +1323,9 @@ impl StoreService {
         // read as the reader may; what they change is checked at the commit (the view is
         // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
+        // What the operations' transfers reserve of the pending changes is the reading
+        // query's too.
+        tx.charge_pending_to(std::sync::Arc::new(memory.part()))?;
         let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
@@ -1447,13 +1586,24 @@ impl StoreService {
     /// revision reached. Support graph sets start afresh (the records don't say what they
     /// touched in the sets' terms); nothing is reasoned here, the records carry the
     /// inferences.
-    pub fn apply_replication_log(&self, frames: &[u8]) -> StoreResult<u64> {
-        let revision = self
-            .engine
-            .apply_log(frames)
-            .map_err(crate::StoreError::Engine)?;
-        self.supports().forget();
-        Ok(revision)
+    ///
+    /// The answer says what it carries (`expected`): one that doesn't hold exactly that is
+    /// refused with nothing applied. `stop` ends it between records; what was published
+    /// before stays ([`nrese_engine::Applied`]).
+    pub fn apply_replication_log(
+        &self,
+        frames: &[u8],
+        expected: &nrese_engine::LogExpectation,
+        stop: &nrese_exec::stop::StopSource,
+    ) -> StoreResult<nrese_engine::Applied> {
+        let before = self.current_revision();
+        let applied = self.engine.apply_log(frames, expected, stop);
+        // Whatever was published, a whole answer or the records before a stop or a
+        // failure, the support sets start afresh.
+        if self.current_revision() != before {
+            self.supports().forget();
+        }
+        applied.map_err(crate::StoreError::Engine)
     }
 
     /// At most `limit` resources whose labels' or local names' words begin with the words
@@ -1466,12 +1616,18 @@ impl StoreService {
         infer: bool,
     ) -> StoreResult<Vec<crate::autocomplete::Suggestion>> {
         scope.require_all("autocompletion")?;
+        // A reader's corpora draw from the request's envelope, as a query's do.
+        let search_scope = self.search_scope();
+        let budget = (search_scope == crate::SearchScope::Reader)
+            .then(|| std::sync::Arc::new(self.envelope(None).part()));
         Ok(crate::autocomplete::autocomplete(
             &self.engine.snapshot(),
             read_model(infer),
             typed,
             limit,
-        ))
+            search_scope,
+            budget.as_ref(),
+        )?)
     }
 
     /// The named graphs `scope` reads (RDF4J's `/contexts`).
@@ -1762,17 +1918,17 @@ impl StoreService {
     /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
         let memory = self.memory_stop();
-        let stop = || memory.exceeded();
+        let (stop, room) = (|| memory.exceeded(), || memory.room());
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
-        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop).unwrap_or_else(
-            |interrupted| match memory.error(interrupted) {
+        nrese_reasoner::engine::equality_report_with(&program, tx.base(), &operation)
+            .unwrap_or_else(|interrupted| match memory.error(interrupted) {
                 Some(unread @ crate::StoreError::MemoryUnreadable { .. }) => {
                     format!("equality: {unread}")
                 }
                 _ => "equality: stopped by the process memory limit".to_owned(),
-            },
-        )
+            })
     }
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
@@ -1808,15 +1964,17 @@ impl StoreService {
                 .storing_representatives(self.config.equality_compact);
         let memory = self.memory_stop();
         let stop = || stop() || memory.exceeded();
+        let room = || memory.room();
         let stopped = |interrupted| {
             memory
                 .error(interrupted)
                 .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
-        let closure = crate::reasoning::materialise_within(
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+        let closure = crate::reasoning::materialise_with(
             &program,
             rematerialisation.base(),
-            &stop,
+            &operation,
             &self.operation_memory(),
         )
         .map_err(stopped)?;
@@ -1910,6 +2068,20 @@ impl StoreService {
     }
 }
 
+/// Gives `engine`'s corpora of reader-scoped searches ([`crate::SearchScope::Reader`]) a
+/// budget of `bytes` within the memory the queries draw on, and `tuning`.
+fn start_reader_corpora(
+    engine: &Engine,
+    runtime: &crate::Runtime,
+    bytes: usize,
+    tuning: nrese_engine::CorpusTuning,
+) {
+    engine.set_text_corpus_budget(std::sync::Arc::new(
+        nrese_exec::Budget::new(bytes).within(runtime.query_memory()),
+    ));
+    engine.set_corpus_tuning(tuning);
+}
+
 /// The read model of RDF4J's `infer` parameter.
 fn read_model(infer: bool) -> crate::ReadModel {
     match infer {
@@ -1975,6 +2147,75 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::StoreService;
+    use crate::StoreConfig;
+    // The reasoning marker is written as the store's metadata: its directory sync, after the
+    // rename, fails through metadata's fault (`metadata::tests::FAIL_DIR_SYNC`).
+    use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
+
+    /// A reasoning marker whose publication failed after its rename is still cleared by the
+    /// next clear of the inferences (DUR-3 fix check r1, R2-F2). A rematerialisation under RDFS
+    /// of `a a C . C subClassOf D` publishes its inferences, renames its marker into place, and
+    /// the marker's directory sync then fails: `InferencesNotRecorded`. The inferences are
+    /// cleared; the store must no longer claim them current, then or after a reopen, and a later
+    /// RDFS rematerialisation derives `a a D`. Before the fix the marker stayed while the store
+    /// took it for gone, so the clear left it: after it, the store claimed RDFS current with no
+    /// inferences (a wrong `NotEntailed` for `a a D`).
+    #[test]
+    fn a_marker_whose_placement_failed_is_still_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.nt");
+        std::fs::write(
+            &data,
+            "<http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.com/C> .\n<http://example.com/C> \
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> .\n",
+        )
+        .unwrap();
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        // A bulk load invalidates the reasoning: the store takes no marker to be in place.
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![data],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let program = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
+            .materialised_program()
+            .expect("RDFS reasons");
+        FAIL_MARKER_SYNC.set(true);
+        let refused = store.rematerialise(&program);
+        FAIL_MARKER_SYNC.set(false);
+        assert!(
+            matches!(refused, Err(crate::StoreError::InferencesNotRecorded(_))),
+            "{refused:?}"
+        );
+        store.clear_inferred().unwrap();
+        let mut wrong = Vec::new();
+        if store.reasoning_state().is_some() {
+            wrong.push("after the clear, the inferences are claimed current");
+        }
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.reasoning_state().is_some() {
+            wrong.push("after a reopen, the inferences are claimed current");
+        }
+        store.rematerialise(&program).unwrap();
+        let answer = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        if !String::from_utf8_lossy(&answer.payload).contains("true") {
+            wrong.push("a later RDFS rematerialisation doesn't derive a a D");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
 
 #[cfg(test)]

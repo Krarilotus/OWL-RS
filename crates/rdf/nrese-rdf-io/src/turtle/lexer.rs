@@ -114,27 +114,211 @@ pub(crate) enum Lexed {
     Error(usize, &'static str),
 }
 
+/// The tokens that open something a statement must close: `[`, `(`, `<<(`, `<<`, `{|`. A
+/// pattern, the one list for a failing token (`unexpected`), for skipping a failed
+/// statement's rest (`resync`), for the skimmer's cuts (`split`) and for debug builds' count
+/// in `take`; [`pair`] pairs each with its closer.
+macro_rules! opener {
+    () => {
+        Kind::OpenBracket
+            | Kind::OpenParen
+            | Kind::TripleTermOpen
+            | Kind::ReifiedOpen
+            | Kind::AnnotationOpen
+    };
+}
+
+/// Their closers: `]`, `)`, `)>>`, `>>`, `|}`.
+macro_rules! closer {
+    () => {
+        Kind::CloseBracket
+            | Kind::CloseParen
+            | Kind::TripleTermClose
+            | Kind::ReifiedClose
+            | Kind::AnnotationClose
+    };
+}
+
+/// Which pair an [`opener!`] or [`closer!`] token is of: `[ ]`, `( )`, `<<( )>>`, `<< >>`,
+/// `{| |}`.
+pub(crate) fn pair(kind: Kind) -> usize {
+    match kind {
+        Kind::OpenBracket | Kind::CloseBracket => 0,
+        Kind::OpenParen | Kind::CloseParen => 1,
+        Kind::TripleTermOpen | Kind::TripleTermClose => 2,
+        Kind::ReifiedOpen | Kind::ReifiedClose => 3,
+        _ => 4,
+    }
+}
+
+/// What brackets are open where a statement is skipped (a failed statement's rest, or the
+/// skimmer's view of a document), by pair ([`pair`]): the one rule both apply
+/// ([`Brackets::apply`]). The innermost [`Brackets::LANES`] are kept in one word (3 bits
+/// each, a pair plus one, innermost lowest), the ones below them outermost first in `deep`
+/// with a count per pair. An opener, or a closer of the innermost bracket's pair, is a few
+/// register operations; a closer of another pair looks through at most `LANES` lanes and
+/// `deep`'s counts. Each bracket is opened and closed once: linear work.
+#[derive(Default)]
+pub(crate) struct Brackets {
+    lanes: u64,
+    depth: usize,
+    deep: Vec<u8>,
+    deep_counts: [usize; 5],
+}
+
+impl Brackets {
+    const LANES: usize = 21;
+
+    #[inline(always)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.depth == 0
+    }
+
+    /// How many are open (debug builds' check in `resync`, and tests).
+    #[cfg(any(debug_assertions, test))]
+    pub(crate) fn len(&self) -> usize {
+        self.depth
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.lanes = 0;
+        self.depth = 0;
+        self.deep.clear();
+        self.deep_counts = [0; 5];
+    }
+
+    /// Opens a bracket of `pair`.
+    #[inline(always)]
+    pub(crate) fn push(&mut self, pair: usize) {
+        if self.depth >= Self::LANES {
+            self.spill();
+        }
+        self.lanes = (self.lanes << 3) | (pair as u64 + 1);
+        self.depth += 1;
+    }
+
+    /// The outermost lane goes to `deep`, making room for one more.
+    #[cold]
+    fn spill(&mut self) {
+        let shift = 3 * (Self::LANES - 1);
+        let pair = ((self.lanes >> shift) & 7) as usize - 1;
+        self.deep.push(pair as u8);
+        self.deep_counts[pair] += 1;
+        self.lanes &= (1 << shift) - 1;
+    }
+
+    /// Closes the innermost bracket: its pair.
+    #[inline(always)]
+    fn pop(&mut self) -> usize {
+        let pair = (self.lanes & 7) as usize - 1;
+        self.lanes >>= 3;
+        self.depth -= 1;
+        if self.depth >= Self::LANES {
+            self.refill();
+        }
+        pair
+    }
+
+    /// The innermost of `deep` comes back into the outermost lane.
+    #[cold]
+    fn refill(&mut self) {
+        if let Some(pair) = self.deep.pop() {
+            self.deep_counts[pair as usize] -= 1;
+            self.lanes |= (pair as u64 + 1) << (3 * (Self::LANES - 1));
+        }
+    }
+
+    /// An opener or closer met: an opener opens. A closer closes the innermost open bracket
+    /// of its own pair, and the unfinished ones opened inside it go with it; with none of its
+    /// pair open, it closes nothing.
+    #[inline(always)]
+    pub(crate) fn apply(&mut self, kind: Kind) {
+        let pair = pair(kind);
+        if matches!(kind, opener!()) {
+            self.push(pair);
+        } else if self.depth > 0 && (self.lanes & 7) as usize == pair + 1 {
+            self.pop();
+        } else {
+            self.close_other(pair);
+        }
+    }
+
+    /// A closer whose pair is not the innermost one's.
+    #[cold]
+    #[inline(never)]
+    fn close_other(&mut self, pair: usize) {
+        let in_lanes = self.depth.min(Self::LANES);
+        let open = (0..in_lanes).any(|k| ((self.lanes >> (3 * k)) & 7) as usize == pair + 1)
+            || self.deep_counts[pair] > 0;
+        if open {
+            while self.depth > 0 && self.pop() != pair {}
+        }
+    }
+}
+
+/// What a byte that may start a delimiter (`[ ] ( ) { } < > |`) starts, as [`lex`] reads it:
+/// the one reading the lexer and the skimmer (`split`) share.
+pub(crate) enum Delimiter {
+    /// A delimiter of this kind and length.
+    Token(Kind, usize),
+    /// A `>` or `|` that starts none: a byte the lexer can't read, and why.
+    Bad(&'static str),
+    /// The input ends inside it; more may come.
+    NeedMore,
+}
+
+/// The delimiter at `input[start]`: `[`, `]`, `(`, `)`, `{`, `}`, and, outside N3, `<<(`,
+/// `<<`, `)>>`, `>>`, `{|` and `|}`. `None` for anything else (a `<` that starts an IRI
+/// included). `eof`: no more input will come.
+#[inline(always)]
+pub(crate) fn delimiter(input: &[u8], start: usize, eof: bool, n3: bool) -> Option<Delimiter> {
+    let next = |k: usize| input.get(start + k).copied();
+    // A byte after the first, or "need more" if it may still come.
+    macro_rules! need {
+        ($k:expr) => {
+            match next($k) {
+                Some(b) => Some(b),
+                None if eof => None,
+                None => return Some(Delimiter::NeedMore),
+            }
+        };
+    }
+    let token = |kind, len| Some(Delimiter::Token(kind, len));
+    match input[start] {
+        b'<' if !n3 && need!(1) == Some(b'<') => match need!(2) {
+            Some(b'(') => token(Kind::TripleTermOpen, 3),
+            _ => token(Kind::ReifiedOpen, 2),
+        },
+        b'>' => match need!(1) {
+            Some(b'>') => token(Kind::ReifiedClose, 2),
+            _ => Some(Delimiter::Bad("expected '>>'")),
+        },
+        b'|' => match need!(1) {
+            Some(b'}') => token(Kind::AnnotationClose, 2),
+            _ => Some(Delimiter::Bad("expected '|}'")),
+        },
+        b'[' => token(Kind::OpenBracket, 1),
+        b']' => token(Kind::CloseBracket, 1),
+        b'(' => token(Kind::OpenParen, 1),
+        b')' if !n3 && need!(1) == Some(b'>') && need!(2) == Some(b'>') => {
+            token(Kind::TripleTermClose, 3)
+        }
+        b')' => token(Kind::CloseParen, 1),
+        b'{' if !n3 && need!(1) == Some(b'|') => token(Kind::AnnotationOpen, 2),
+        b'{' => token(Kind::OpenBrace, 1),
+        b'}' => token(Kind::CloseBrace, 1),
+        _ => None,
+    }
+}
+
 /// Reads the next token of `input`. `eof`: no more input will come. `after_string`: the
 /// previous token was a string, so `@` starts a language tag (not `@prefix`). `n3`: N3's
 /// tokens too.
 pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexed {
     let len = input.len();
-    let mut i = 0;
-    // Whitespace and comments.
-    loop {
-        while i < len && matches!(input[i], b' ' | b'\t' | b'\n' | b'\r') {
-            i += 1;
-        }
-        if i < len && input[i] == b'#' {
-            match memchr::memchr2(b'\n', b'\r', &input[i..]) {
-                Some(k) => i += k,
-                None if eof => i = len,
-                None => return Lexed::NeedMore,
-            }
-            continue;
-        }
-        break;
-    }
+    let Some(i) = space(input, eof) else {
+        return Lexed::NeedMore;
+    };
     if i == len {
         return if eof {
             token(Kind::Eof, i, i..i, i)
@@ -154,6 +338,19 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
             }
         };
     }
+    // The delimiter at `start`, as `delimiter` reads it.
+    macro_rules! delimited {
+        () => {
+            match delimiter(input, start, eof, n3) {
+                Some(Delimiter::Token(kind, len)) => {
+                    token(kind, start, start..start + len, start + len)
+                }
+                Some(Delimiter::Bad(message)) => Lexed::Error(start, message),
+                Some(Delimiter::NeedMore) => Lexed::NeedMore,
+                None => unreachable!("a delimiter's byte"),
+            }
+        };
+    }
     match input[start] {
         b'<' if n3 => n3_angle(input, start, eof),
         b'=' if n3 => match need!(1) {
@@ -162,19 +359,9 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         },
         b'!' if n3 => token(Kind::Bang, start, start..start + 1, start + 1),
         b'?' if n3 => variable(input, start, eof),
-        b'<' if need!(1) == Some(b'<') => match need!(2) {
-            Some(b'(') => token(Kind::TripleTermOpen, start, start..start + 3, start + 3),
-            _ => token(Kind::ReifiedOpen, start, start..start + 2, start + 2),
-        },
-        b'>' => match need!(1) {
-            Some(b'>') => token(Kind::ReifiedClose, start, start..start + 2, start + 2),
-            _ => Lexed::Error(start, "expected '>>'"),
-        },
-        b'~' => token(Kind::Tilde, start, start..start + 1, start + 1),
-        b'|' => match need!(1) {
-            Some(b'}') => token(Kind::AnnotationClose, start, start..start + 2, start + 2),
-            _ => Lexed::Error(start, "expected '|}'"),
-        },
+        // The delimiters, read by `delimiter` (shared with the skimmer): one arm per byte, so
+        // that its own match on the byte folds away in each.
+        b'<' if need!(1) == Some(b'<') => delimited!(),
         b'<' => match memchr::memchr(b'>', &input[start..]) {
             Some(k) => {
                 let text = start + 1..start + k;
@@ -184,7 +371,16 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
             None if eof => Lexed::Error(start, "an IRI without its closing '>'"),
             None => Lexed::NeedMore,
         },
-        b'"' | b'\'' => string(input, start, eof),
+        b'>' => delimited!(),
+        b'|' => delimited!(),
+        b'[' => delimited!(),
+        b']' => delimited!(),
+        b'(' => delimited!(),
+        b')' => delimited!(),
+        b'{' => delimited!(),
+        b'}' => delimited!(),
+        b'~' => token(Kind::Tilde, start, start..start + 1, start + 1),
+        b'"' | b'\'' => string::<false>(input, start, eof),
         b'_' => match need!(1) {
             Some(b':') => blank_label(input, start, eof),
             _ => Lexed::Error(start, "expected '_:' for a blank node"),
@@ -214,18 +410,6 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         b'+' | b'-' | b'0'..=b'9' => number(input, start, eof),
         b';' => token(Kind::Semicolon, start, start..start + 1, start + 1),
         b',' => token(Kind::Comma, start, start..start + 1, start + 1),
-        b'[' => token(Kind::OpenBracket, start, start..start + 1, start + 1),
-        b']' => token(Kind::CloseBracket, start, start..start + 1, start + 1),
-        b'(' => token(Kind::OpenParen, start, start..start + 1, start + 1),
-        b')' if !n3 && need!(1) == Some(b'>') && need!(2) == Some(b'>') => {
-            token(Kind::TripleTermClose, start, start..start + 3, start + 3)
-        }
-        b')' => token(Kind::CloseParen, start, start..start + 1, start + 1),
-        b'{' if !n3 && need!(1) == Some(b'|') => {
-            token(Kind::AnnotationOpen, start, start..start + 2, start + 2)
-        }
-        b'{' => token(Kind::OpenBrace, start, start..start + 1, start + 1),
-        b'}' => token(Kind::CloseBrace, start, start..start + 1, start + 1),
         b'^' => match need!(1) {
             Some(b'^') => token(Kind::Datatype, start, start..start + 2, start + 2),
             _ if n3 => token(Kind::Caret, start, start..start + 1, start + 1),
@@ -233,6 +417,130 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         },
         b':' => prefixed_name(input, start, start, eof),
         _ => name(input, start, eof, n3),
+    }
+}
+
+/// Whitespace, as Turtle and TriG have it (`WS`: space, tab, CR, LF; no form feed): the
+/// one class the lexer and the skimmer (`split`) read it by.
+#[inline(always)]
+pub(crate) fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// The characters in `bytes`, as a column counts them (`TextPosition`): the bytes that
+/// don't continue a UTF-8 character. Additive, so a line's count can be taken in parts (a
+/// skim's pieces, a reader's refills, a chunk and what came before it).
+pub(crate) fn characters(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| (b as i8) >= -0x40).count() as u64
+}
+
+/// Where the next token starts: past whitespace and comments. `None` if a comment may
+/// still go on (more input may come).
+#[inline(always)]
+fn space(input: &[u8], eof: bool) -> Option<usize> {
+    let len = input.len();
+    let mut i = 0;
+    loop {
+        while i < len && is_space(input[i]) {
+            i += 1;
+        }
+        if i < len && input[i] == b'#' {
+            match memchr::memchr2(b'\n', b'\r', &input[i..]) {
+                Some(k) => i += k,
+                None if eof => i = len,
+                None => return None,
+            }
+            continue;
+        }
+        return Some(i);
+    }
+}
+
+/// A string's opening quote: the quote character, and whether it is long (`"""`, `'''`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Opening {
+    pub(crate) quote: u8,
+    pub(crate) long: bool,
+}
+
+/// How much of the input a token [`lex`] couldn't read spans, for a recovering parser to
+/// skip it whole and go on (see `TurtleParser::resync`).
+pub(crate) enum Malformed {
+    /// Skip this many bytes (whitespace before the token included): a string to its
+    /// closing quote, or anything else's first byte.
+    Skip(usize),
+    /// A string with no closing quote anywhere after it (the input has ended): skip this
+    /// many bytes, up to and including the first byte of its opening only.
+    Missing(usize, Opening),
+    /// The input ends before the token does; more may come.
+    NeedMore,
+}
+
+/// Where the token at the start of `input` starts (after whitespace and comments), and its
+/// opening if it is a string. `None` if more input may change that.
+fn token_start(input: &[u8], eof: bool) -> Option<(usize, Option<Opening>)> {
+    let start = space(input, eof)?;
+    let Some(&quote) = input.get(start) else {
+        return eof.then_some((start, None));
+    };
+    if !matches!(quote, b'"' | b'\'') {
+        return Some((start, None));
+    }
+    if start + 2 >= input.len() && !eof {
+        return None;
+    }
+    let long = input.get(start + 1) == Some(&quote) && input.get(start + 2) == Some(&quote);
+    Some((start, Some(Opening { quote, long })))
+}
+
+/// The extent of the token at the start of `input` (after whitespace and comments) that
+/// [`lex`] failed on. A string ends at its closing quote by [`string`]'s own rules
+/// (escapes, short and long), line breaks allowed, since a line break in a short string is
+/// what fails it; `search` says whether to look for that quote (false where an earlier
+/// search reached the end without one, so that none comes after this one either: see
+/// [`known_missing`]). Anything else (a `%`, a lone `>` or `|`, a bad `@` keyword or
+/// number, invalid UTF-8) spans its first byte. An IRI never fails here before the input's
+/// end: [`lex`] takes `<…>` up to the next `>`.
+pub(crate) fn malformed(input: &[u8], eof: bool, search: impl Fn(Opening) -> bool) -> Malformed {
+    let Some((start, opening)) = token_start(input, eof) else {
+        return Malformed::NeedMore;
+    };
+    match opening {
+        Some(opening) if search(opening) => match string::<true>(input, start, eof) {
+            Lexed::Token(token) => Malformed::Skip(token.consumed),
+            Lexed::NeedMore => Malformed::NeedMore,
+            Lexed::Error(..) => Malformed::Missing(start + 1, opening),
+        },
+        Some(opening) => Malformed::Missing(start + 1, opening),
+        None if start == input.len() => Malformed::Skip(start),
+        None => Malformed::Skip(start + 1),
+    }
+}
+
+/// If the token at the start of `input` is a string whose opening `missing` says has no
+/// closing quote after it: how many bytes to skip, up to and including the first byte of
+/// that opening (as [`Malformed::Missing`]). For a recovering parser to skip it before
+/// lexing it, which would search to the end again.
+///
+/// Why one failed search answers for later ones: a search reads the bytes after the
+/// opening, a `\` and the byte after it as one escape, and a quote outside an escape as
+/// the end (three in a row for a long string).
+/// - A failed short search: every quote after its opening is in an escape, in that
+///   reading. A later opening's first quote is then in one too, so that reading resumes
+///   right after it, where a later search starts, and reads the same escapes from there.
+///   A later string of that quote, short or long, has no closing quote either.
+/// - A failed long search: no three quotes outside escapes are in a row. A later long
+///   opening's first quote was in an escape (else that reading meets its three quotes),
+///   and from there the readings agree, as above. A single quote outside an escape is
+///   allowed, so it says nothing of later short strings.
+pub(crate) fn known_missing(
+    input: &[u8],
+    eof: bool,
+    missing: impl Fn(Opening) -> bool,
+) -> Option<usize> {
+    match token_start(input, eof)? {
+        (start, Some(opening)) if missing(opening) => Some(start + 1),
+        _ => None,
     }
 }
 
@@ -310,8 +618,10 @@ fn char_at(input: &[u8], i: usize, eof: bool) -> Result<Option<char>, Lexed> {
     }
 }
 
-/// Strings, short (`"…"`, `'…'`) and long (`"""…"""`, `'''…'''`).
-fn string(input: &[u8], start: usize, eof: bool) -> Lexed {
+/// Strings, short (`"…"`, `'…'`) and long (`"""…"""`, `'''…'''`). `ANY_LINE`: a short
+/// string may hold line breaks too, to find where a string the grammar refuses ends (for
+/// [`malformed`] only; `lex` has it false, a constant, so its code is as without it).
+fn string<const ANY_LINE: bool>(input: &[u8], start: usize, eof: bool) -> Lexed {
     let quote = input[start];
     let len = input.len();
     // Long if three quotes open it ("" alone is the empty string).
@@ -324,13 +634,13 @@ fn string(input: &[u8], start: usize, eof: bool) -> Lexed {
     let mut escaped = false;
     loop {
         // A short string can't hold a raw line break ('\n' found here, '\r' checked below).
-        let found = if long {
+        let found = if long || ANY_LINE {
             memchr::memchr2(quote, b'\\', &input[i..])
         } else {
             memchr::memchr3(quote, b'\\', b'\n', &input[i..])
         };
         let Some(k) = found else {
-            if !long && input[i..].contains(&b'\r') {
+            if !long && !ANY_LINE && input[i..].contains(&b'\r') {
                 return Lexed::Error(start, "a line break in a short string");
             }
             return if eof {
@@ -341,7 +651,7 @@ fn string(input: &[u8], start: usize, eof: bool) -> Lexed {
         };
         let at = i + k;
         let b = input[at];
-        if !long && (b == b'\n' || input[i..at].contains(&b'\r')) {
+        if !long && !ANY_LINE && (b == b'\n' || input[i..at].contains(&b'\r')) {
             return Lexed::Error(at, "a line break in a short string");
         }
         if b == b'\\' {
@@ -658,6 +968,58 @@ fn prefixed_name(input: &[u8], start: usize, colon: usize, eof: bool) -> Lexed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Brackets` holds what the rule says is open (an opener opens; a closer closes the
+    /// innermost open bracket of its own pair and those inside it, or nothing if none of its
+    /// pair is open), shown by a plain stack of pairs, nested past its lanes too: a sequence
+    /// of pseudo-random openers and closers, mostly openers while it nests deep, then mostly
+    /// closers, many of a pair not innermost or not open at all.
+    #[test]
+    fn brackets_hold_what_the_rule_holds_at_any_depth() {
+        let kinds = [
+            [Kind::OpenBracket, Kind::CloseBracket],
+            [Kind::OpenParen, Kind::CloseParen],
+            [Kind::TripleTermOpen, Kind::TripleTermClose],
+            [Kind::ReifiedOpen, Kind::ReifiedClose],
+            [Kind::AnnotationOpen, Kind::AnnotationClose],
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let mut brackets = Brackets::default();
+        let mut model: Vec<usize> = Vec::new();
+        let mut deepest = 0;
+        for step in 0..20_000 {
+            // Rounds of 400 steps: openers 19 times in 20 (a closer of a random pair closes
+            // about five), then closers four times in five (down to none open, and closers
+            // with nothing open).
+            let opening = (step / 400) % 2 == 0;
+            let open = if opening { next(20) != 0 } else { next(5) == 0 };
+            let pair = next(5) as usize;
+            let kind = kinds[pair][usize::from(!open)];
+            brackets.apply(kind);
+            if open {
+                model.push(pair);
+            } else if let Some(at) = model.iter().rposition(|&p| p == pair) {
+                model.truncate(at);
+            }
+            deepest = deepest.max(model.len());
+            assert_eq!(brackets.len(), model.len(), "step {step}");
+            assert_eq!(brackets.is_empty(), model.is_empty(), "step {step}");
+        }
+        assert!(deepest > 3 * Brackets::LANES, "nested only {deepest} deep");
+        // Each still-open pair, innermost first, closes exactly its own bracket.
+        while let Some(&pair) = model.last() {
+            brackets.apply(kinds[pair][1]);
+            model.pop();
+            assert_eq!(brackets.len(), model.len());
+        }
+        assert!(brackets.is_empty());
+    }
 
     /// The tokens of a complete input, as (kind, text).
     fn tokens(text: &str) -> Vec<(Kind, String)> {

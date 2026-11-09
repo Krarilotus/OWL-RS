@@ -27,10 +27,16 @@
 
 mod bulk;
 pub mod characteristic;
+mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(test)]
+mod own_state_tests;
+mod private;
 mod replication;
+#[cfg(test)]
+mod shared_state_tests;
 mod snapshot;
 pub(crate) mod spill;
 mod statistics;
@@ -53,10 +59,13 @@ use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
-pub use replication::LogBatch;
+pub use private::PrivateTransaction;
+pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+    Admission, Count, HeavyGroups, InferredMask, InferredSubset, OwnState, ProbeCursor,
+    SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -129,7 +138,10 @@ pub struct EngineStats {
     pub inferred: u64,
     /// Runs of both stacks.
     pub runs: usize,
-    /// Index memory of both stacks on the heap.
+    /// Index memory of both stacks on the heap: the latest version's own runs, and every
+    /// quad-layout form of a default-graph run alive (shared by pending versions over a base
+    /// that hasn't the quad layout yet, published or not), each once (DUR-6). Array payload,
+    /// not run boxes; older versions held by snapshots aren't counted.
     pub index_bytes: u64,
     /// Index data of both stacks used in place from a mapped checkpoint.
     pub index_mapped_bytes: u64,
@@ -217,6 +229,12 @@ pub(crate) struct Version {
     pub(crate) asserted: IndexVersion,
     pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
+    /// A time no commit in it was made after, microseconds since 1970: the latest of its
+    /// commits' ([`commit_time`](crate::durability::commit_time),
+    /// [`later`](crate::durability::later)); 0 for revision 0. `None` where that isn't known:
+    /// recovered from a format 11 checkpoint or an untimed log record, and kept until a bulk
+    /// replacement holds nothing from before. Checkpoints keep it (format 12).
+    pub(crate) committed_micros: Option<u64>,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
     /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
@@ -224,8 +242,40 @@ pub(crate) struct Version {
     /// What its statements are: kept where only their layout changes (compaction, a
     /// checkpoint mapped), new for any other version ([`Content`]).
     pub(crate) content: Content,
+    /// What its asserted statements are ([`AssertedIdentity`]): new wherever the asserted
+    /// stack is built or changed (a commit with asserted changes, a bulk publication,
+    /// recovery and open, a transaction's pending state), kept wherever only the inferred
+    /// stack, the layout or the view changes. No default: each construction chooses, and
+    /// `Engine::build`'s `..version` is the only copy by spread (its version is recovery's
+    /// or the empty one).
+    pub(crate) asserted_content: AssertedIdentity,
     /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
     pub(crate) canonical: equality::CanonicalCache,
+    /// What readers of its unpublished snapshots keep ([`OwnState`]): empty at every
+    /// construction, never copied.
+    pub(crate) own: snapshot::OwnSlots,
+}
+
+/// The identity of a snapshot's asserted statements ([`Snapshot::asserted_identity`]
+/// (crate::Snapshot::asserted_identity)): two snapshots with the same one hold the same
+/// asserted statements, by the same ids. It is shared across the views of one asserted
+/// stack (restricted, inferred-masked, equality and canonical views): a cache keyed by it
+/// must not depend on the view's scope or equality mode. A transaction's pending state has
+/// one of its own. Unique within the process, never persisted: an open or a recovery gives
+/// a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssertedIdentity(u64);
+
+impl AssertedIdentity {
+    pub(crate) fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The identity as a number.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 /// The identity of a version's statements: two versions with the same one show the same
@@ -255,10 +305,14 @@ impl Version {
             asserted: IndexVersion::empty(Layout::DefaultGraph),
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
+            // No commit yet: every one is after it.
+            committed_micros: Some(0),
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
+            asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -276,17 +330,37 @@ impl Version {
         }
     }
 
+    /// This version with the time `committed_micros` (a bulk publication, stamped as it
+    /// commits).
+    pub(crate) fn with_time(&self, committed_micros: Option<u64>) -> Self {
+        Self {
+            asserted: self.asserted.clone(),
+            inferred: self.inferred.clone(),
+            revision: self.revision,
+            committed_micros,
+            dictionary_len: self.dictionary_len,
+            equality: Arc::clone(&self.equality),
+            content: self.content,
+            asserted_content: self.asserted_content,
+            canonical: Default::default(),
+            own: Default::default(),
+        }
+    }
+
     fn with_stack(&self, stack: Stack, index: IndexVersion) -> Self {
         let mut next = Self {
             asserted: self.asserted.clone(),
             inferred: self.inferred.clone(),
             revision: self.revision,
+            committed_micros: self.committed_micros,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
             content: self.content,
+            asserted_content: self.asserted_content,
             // A canonical view of the old runs would hold them: made afresh.
             canonical: Default::default(),
+            own: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -327,8 +401,10 @@ impl Versions {
     /// Replaces the current version with a prebuilt one. The caller must hold the writer slot,
     /// so that no statement changed since `version` was built from the latest content (a merge
     /// or a mapped checkpoint published meanwhile changed runs only, and is replaced), and the
-    /// compaction slot, so that none is published while it is replaced.
-    fn install(&self, version: Arc<Version>) {
+    /// compaction slot, so that none is published while it is replaced. A value, never an
+    /// `Arc`: no snapshot can have held it, so its own slots ([`OwnState`]) are empty.
+    fn install(&self, version: Version) {
+        let version = Arc::new(version);
         *self.current.write() = version;
     }
 
@@ -408,15 +484,28 @@ impl Versions {
         Some(Merging(self))
     }
 
+    /// Waits until no merge runs. Off the Rayon pool only (the background worker's thread):
+    /// a pool thread may hold a part of the running merge under its wait.
+    fn wait_for_merge(&self) {
+        let mut merging = self.merging.lock();
+        while *merging {
+            self.merged.wait(&mut merging);
+        }
+    }
+
     /// The asserted stack of the latest version converted to the quad layout (a record's
     /// first quad in a named graph), with the compaction slot, so that nothing replaces the
     /// stack's runs until the caller publishes. Converted without the slot, on the caller's
     /// pool, and kept only where the stack's runs are still the ones converted (a merge or a
     /// mapped checkpoint may have replaced them meanwhile: converted afresh).
-    fn converted_asserted(&self) -> (MutexGuard<'_, ()>, IndexVersion) {
+    fn converted_asserted(
+        &self,
+        forms: &crate::index::Forms,
+    ) -> (MutexGuard<'_, ()>, IndexVersion) {
         loop {
             let base = self.load();
-            let converted = base.asserted.with_quads_layout();
+            // The runs' shared forms: a pending version's, if one holds it still (DUR-6).
+            let converted = base.asserted.with_quads_layout(forms);
             let slot = self.compaction_slot.lock();
             let now = self.load();
             let (was, is) = (base.asserted.runs(), now.asserted.runs());
@@ -458,11 +547,30 @@ struct Shared {
     views: RwLock<Arc<nrese_exec::Budget>>,
     /// The checkpoints' scratch is charged within it ([`EngineConfig::admission`]).
     admission: Option<Arc<nrese_exec::SharedBudget>>,
+    /// The store's commit clock, microseconds since 1970: the latest time a commit of it was
+    /// stamped or logged with, so no commit is stamped before it
+    /// ([`crate::durability::commit_time`]). Apart from a version's time, which is unknown
+    /// while it holds commits of unknown time: the clock stays known through them (review r1,
+    /// R1-F2). Recovered from the checkpoint and the log; changed by writers only.
+    clock: AtomicU64,
+    /// The quad-layout forms of default-graph runs alive, shared by the pending versions (and
+    /// a commit) that read a base in the quad layout: their bytes, counted in the index memory
+    /// ([`Engine::stats`]) while any holder keeps one (DUR-6).
+    forms: crate::index::Forms,
 }
 
 impl Shared {
+    /// A stamp for a new commit: never before the store's clock, which takes it.
+    fn stamp(&self) -> u64 {
+        let stamp = crate::durability::commit_time(Some(self.clock.load(Ordering::Relaxed)));
+        self.clock.fetch_max(stamp, Ordering::Relaxed);
+        stamp
+    }
+
+    /// The installed version, published: the one constructor of a snapshot that grants a
+    /// [`snapshot::SharedState`].
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(
+        Snapshot::published(
             self.versions.load(),
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
@@ -481,9 +589,11 @@ impl Shared {
         };
         let (snapshot, path) = {
             let _slot = admit(&durable.checkpoint_slot, "checkpoint")?;
-            let snapshot = {
+            let (snapshot, clock) = {
                 let mut wal = durable.wal.lock();
+                // Commits publish under the log's lock: the clock is that of the snapshot.
                 let snapshot = self.snapshot();
+                let clock = self.clock.load(Ordering::Relaxed);
                 if checkpoint::exists(durable.root(), snapshot.revision()) {
                     // Nothing was committed since (and the file may be in use, mapped);
                     // searches since may have extended the derived indexes.
@@ -491,10 +601,14 @@ impl Shared {
                     self.dictionary.save_derived();
                     return Ok(snapshot.revision());
                 }
+                // The names a reopen left pending, before anything is written (deferred-sync
+                // design note of 8 Nov): a failure leaves the log as it was.
+                wal.settle_names()?;
                 wal.rotate(snapshot.revision() + 1)?;
-                snapshot
+                (snapshot, clock)
             };
-            let path = checkpoint::write(durable.root(), &snapshot, self.admission.as_ref())?;
+            let path =
+                checkpoint::write(durable.root(), &snapshot, clock, self.admission.as_ref())?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -541,10 +655,14 @@ impl Shared {
                     asserted: index(Stack::Asserted, &asserted),
                     inferred: index(Stack::Inferred, &inferred),
                     revision: current.revision,
+                    committed_micros: current.committed_micros,
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,
+                    // A checkpoint mapped: the same statements.
+                    asserted_content: current.asserted_content,
                     canonical: Default::default(),
+                    own: Default::default(),
                 }
             });
         }
@@ -554,43 +672,194 @@ impl Shared {
         }
     }
 
-    /// Runs whatever maintenance was requested. Called by the background worker.
-    fn maintain(&self) {
-        if self.wants_compaction.swap(false, Ordering::AcqRel) {
-            self.versions.compact(false);
-        }
-        if self.wants_checkpoint.swap(false, Ordering::AcqRel)
-            && let Err(error) = self.checkpoint()
+    /// Runs whatever maintenance was requested: a task of the background worker. Returns what
+    /// is to be done again because it couldn't be done now (on a pool thread nothing waits
+    /// for a running merge or checkpoint); the requests stay set for it.
+    fn maintain(&self) -> Again {
+        let mut again = Again::default();
+        if self.wants_compaction.swap(false, Ordering::AcqRel)
+            && self.versions.compact(false) == CompactionOutcome::Deferred
         {
-            tracing::error!(%error, "background checkpoint failed");
+            self.wants_compaction.store(true, Ordering::Release);
+            again.merge = true;
+        }
+        if self.wants_checkpoint.swap(false, Ordering::AcqRel) {
+            match self.checkpoint() {
+                Ok(_) => {}
+                // Another checkpoint is being written; it may be of an older revision than
+                // the one this request is for: again once it is written.
+                Err(crate::EngineError::SlotBusy(_)) => {
+                    self.wants_checkpoint.store(true, Ordering::Release);
+                    again.checkpoint = true;
+                }
+                Err(error) => tracing::error!(%error, "background checkpoint failed"),
+            }
+        }
+        again
+    }
+
+    /// Waits until no checkpoint is being written. Off the Rayon pool only (the background
+    /// worker's thread).
+    fn wait_for_checkpoint(&self) {
+        if let Some(durable) = &self.durable {
+            drop(durable.checkpoint_slot.lock());
         }
     }
 }
 
-/// Background maintenance thread. Wakeups are coalesced; the thread exits when the engine
-/// is dropped (the sender closes), after finishing the task in progress.
+/// Maintenance a task couldn't do yet ([`Shared::maintain`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct Again {
+    /// A compaction deferred to a merge running.
+    merge: bool,
+    /// A checkpoint refused while another was being written.
+    checkpoint: bool,
+}
+
+/// Where the background worker's current task is (`Worker`).
+enum Task {
+    /// No task.
+    None,
+    /// Spawned on the pool, not started yet.
+    Queued,
+    Running,
+    /// Done: what is to be done again, or the panic the task ended in.
+    Ended(std::thread::Result<Again>),
+    /// Never started: a drop on a pool thread took it back, to leave it undone.
+    Abandoned,
+    /// Never started: a drop off the pool took it back, for the worker's thread to run.
+    Reclaimed,
+}
+
+/// Which thread is dropping the engine, once one is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    /// A Rayon pool thread: no further task is run, and none queued is started.
+    OnPool,
+    /// A thread of no pool: what was requested is still done, on the worker's own thread.
+    OffPool,
+}
+
+/// What the background worker and its drop share.
+struct Lifecycle {
+    /// The current task, and the drop under way, if any.
+    state: Mutex<(Task, Option<Shutdown>)>,
+    changed: Condvar,
+}
+
+/// Background maintenance. Wakeups are coalesced. While the engine lives, each task (a
+/// compaction, a checkpoint) runs as one job of the global Rayon pool, the pool its parallel
+/// parts use, and the worker's own thread waits for it. The worker exits when the engine is
+/// dropped (the sender closes), after the task in progress, and the drop waits for it
+/// without running any pool job and without needing a free one (see `Drop`).
 struct Worker {
     wake: Option<mpsc::SyncSender<()>>,
     thread: Option<JoinHandle<()>>,
+    life: Arc<Lifecycle>,
 }
 
 impl Worker {
     fn spawn(shared: Arc<Shared>) -> std::io::Result<Self> {
         let (wake, wakeups) = mpsc::sync_channel::<()>(1);
-        let thread = std::thread::Builder::new()
-            .name("nrese-maintenance".to_owned())
-            .spawn(move || {
-                while wakeups.recv().is_ok() {
-                    // Set before the requests are taken, so that one is always visible.
-                    shared.maintaining.store(true, Ordering::SeqCst);
-                    shared.maintain();
-                    shared.maintaining.store(false, Ordering::SeqCst);
-                }
-            })?;
+        let life = Arc::new(Lifecycle {
+            state: Mutex::new((Task::None, None)),
+            changed: Condvar::new(),
+        });
+        let thread = {
+            let life = Arc::clone(&life);
+            std::thread::Builder::new()
+                .name("nrese-maintenance".to_owned())
+                .spawn(move || {
+                    while wakeups.recv().is_ok() {
+                        loop {
+                            let again = Self::task(&shared, &life);
+                            // Again once what held it up has ended (this thread may wait).
+                            if again.merge {
+                                shared.versions.wait_for_merge();
+                            }
+                            if again.checkpoint {
+                                shared.wait_for_checkpoint();
+                            }
+                            if !(again.merge || again.checkpoint) {
+                                break;
+                            }
+                        }
+                    }
+                })?
+        };
         Ok(Self {
             wake: Some(wake),
             thread: Some(thread),
+            life,
         })
+    }
+
+    /// Runs one task and waits for it: on the pool while the engine lives, on this thread
+    /// once a drop off the pool is under way, and not at all once one on a pool thread is.
+    fn task(shared: &Arc<Shared>, life: &Arc<Lifecycle>) -> Again {
+        let here = {
+            let mut state = life.state.lock();
+            match state.1 {
+                Some(Shutdown::OnPool) => return Again::default(),
+                Some(Shutdown::OffPool) => true,
+                None => {
+                    state.0 = Task::Queued;
+                    false
+                }
+            }
+        };
+        // Before the requests are taken, so that one is always visible ([`Engine::settle`]).
+        shared.maintaining.store(true, Ordering::SeqCst);
+        if here {
+            let again = shared.maintain();
+            shared.maintaining.store(false, Ordering::SeqCst);
+            return again;
+        }
+        {
+            // Weak: a job taken back by a drop stays queued until the pool runs it, and must
+            // not keep the store (its directory lock, its files) beyond the drop.
+            let (shared, life) = (Arc::downgrade(shared), Arc::clone(life));
+            rayon::spawn(move || {
+                {
+                    let mut state = life.state.lock();
+                    if !matches!(state.0, Task::Queued) {
+                        return;
+                    }
+                    state.0 = Task::Running;
+                }
+                // Caught here: a panic in a Rayon job would abort the process. It is resumed
+                // on the worker's thread, which ends with it.
+                let ended = match shared.upgrade() {
+                    Some(shared) => {
+                        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            shared.maintain()
+                        }));
+                        // Let go of the store before the drop waiting for this task can return.
+                        drop(shared);
+                        ended
+                    }
+                    None => Ok(Again::default()),
+                };
+                life.state.lock().0 = Task::Ended(ended);
+                life.changed.notify_all();
+            });
+        }
+        let task = {
+            let mut state = life.state.lock();
+            while matches!(state.0, Task::Queued | Task::Running) {
+                life.changed.wait(&mut state);
+            }
+            std::mem::replace(&mut state.0, Task::None)
+        };
+        let again = match task {
+            Task::Ended(Ok(again)) => again,
+            Task::Ended(Err(panic)) => std::panic::resume_unwind(panic),
+            // The pool may have no thread free to start it (base ran it on this thread).
+            Task::Reclaimed => shared.maintain(),
+            _ => Again::default(),
+        };
+        shared.maintaining.store(false, Ordering::SeqCst);
+        again
     }
 
     fn wake(&self) {
@@ -602,7 +871,31 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    /// Ends maintenance and waits for it (IB0024): when the drop returns, maintenance has
+    /// ended and released the store. The wait runs no pool job, and needs no pool thread to
+    /// be free: a task that has started runs on a pool thread other than this one and ends
+    /// without it, and one queued but not started is taken back.
+    /// - On a Rayon pool thread (which may be the only one that could start it), it and any
+    ///   further task are left undone. That loses nothing: the next open recovers from the
+    ///   checkpoint and the log.
+    /// - Off the pool, it and what is still requested run on the worker's own thread, as the
+    ///   worker did before it ran tasks on the pool.
     fn drop(&mut self) {
+        let shutdown = match rayon::current_thread_index() {
+            Some(_) => Shutdown::OnPool,
+            None => Shutdown::OffPool,
+        };
+        {
+            let mut state = self.life.state.lock();
+            state.1 = Some(shutdown);
+            if matches!(state.0, Task::Queued) {
+                state.0 = match shutdown {
+                    Shutdown::OnPool => Task::Abandoned,
+                    Shutdown::OffPool => Task::Reclaimed,
+                };
+                self.life.changed.notify_all();
+            }
+        }
         self.wake.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -658,7 +951,7 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An in-memory engine.
     pub fn new(config: EngineConfig) -> EngineResult<Self> {
-        Self::build(config, Arc::default(), None, Version::empty())
+        Self::build(config, Arc::default(), None, Version::empty(), 0)
     }
 
     /// Opens (or creates) a durable engine in `dir`, recovering its last committed revision.
@@ -681,17 +974,25 @@ impl Engine {
             inferred = version.inferred.len(),
             "engine recovered"
         );
-        let engine = Self::build(config, dictionary, Some(recovered.durable), version)?;
+        let engine = Self::build(
+            config,
+            dictionary,
+            Some(recovered.durable),
+            version,
+            recovered.clock,
+        )?;
         engine.inner.shared.statistics.set_dir(derived);
         Ok(engine)
     }
 
-    /// `version.dictionary_len` is replaced by the dictionary's actual length.
+    /// `version.dictionary_len` is replaced by the dictionary's actual length; `clock` is
+    /// the store's commit clock ([`Shared::clock`]).
     fn build(
         config: EngineConfig,
         dictionary: Arc<Dictionary>,
         durable: Option<Durable>,
         version: Version,
+        clock: u64,
     ) -> EngineResult<Self> {
         let version = Version {
             dictionary_len: dictionary.len(),
@@ -699,7 +1000,7 @@ impl Engine {
         };
         let shared = Arc::new(Shared {
             dictionary,
-            statistics: Arc::default(),
+            statistics: Arc::new(statistics::Statistics::for_engine()),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
@@ -716,6 +1017,8 @@ impl Engine {
             equality: RwLock::new(None),
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             admission: config.admission,
+            clock: AtomicU64::new(clock),
+            forms: Default::default(),
         });
         let worker = config
             .background_maintenance
@@ -772,6 +1075,27 @@ impl Engine {
         *self.inner.shared.views.write() = budget;
     }
 
+    /// How reader-scoped searches build their corpora from now on ([`CorpusTuning`]; at
+    /// first its defaults). Makes the engine's store of corpora if no reader-scoped search
+    /// did yet.
+    pub fn set_corpus_tuning(&self, tuning: CorpusTuning) {
+        if let Some(store) = self.inner.shared.statistics.corpora.get_or_init() {
+            store.set_tuning(tuning);
+        }
+    }
+
+    /// What the corpora of reader-scoped searches the engine keeps are charged to from now
+    /// on ([`Snapshot::text_search_in`]; at first [`DEFAULT_READER_CORPUS_BYTES`] of their
+    /// own): a store that uses
+    /// reader-scoped search gives them its share. The kept corpora and their lineage are let
+    /// go (searches holding one keep it, charged to the old budget, until they let go).
+    /// Makes the engine's store of corpora if no reader-scoped search did yet.
+    pub fn set_text_corpus_budget(&self, budget: Arc<nrese_exec::Budget>) {
+        if let Some(store) = self.inner.shared.statistics.corpora.get_or_init() {
+            store.set_budget(budget);
+        }
+    }
+
     /// What runs the vector graph builds searches start from now on in the background
     /// (spaces of [`SYNC_BUILD`](crate::term::vectors::SYNC_BUILD) vectors or more): the
     /// owner's executor, which may also hold or refuse them. Unset, each build gets a
@@ -810,6 +1134,18 @@ impl Engine {
     /// (as an aborted transaction's are). [`Transaction::commit`] fails on it.
     pub fn speculative(&self) -> Transaction<'_> {
         Transaction::new(&self.inner, None)
+    }
+
+    /// A private transaction over `snapshot`: speculative changes that read its statements,
+    /// with terms of their own past its dictionary length, charged to `budget`, which never
+    /// enter the dictionary. It never commits and doesn't take the writer slot. Refused
+    /// ([`EngineError::Configuration`]) for a private snapshot or another engine's.
+    pub fn speculative_over(
+        &self,
+        snapshot: &Snapshot,
+        budget: Arc<nrese_exec::Budget>,
+    ) -> EngineResult<PrivateTransaction<'_>> {
+        PrivateTransaction::over(&self.inner, snapshot, budget)
     }
 
     /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`]; on a Rayon pool
@@ -877,7 +1213,11 @@ impl Engine {
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
         let shared = &self.inner.shared;
         let snapshot = shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot, shared.admission.as_ref())?;
+        // Read after the snapshot: no commit in it is later (one after it may be, which only
+        // keeps the clock higher, as it must stay).
+        let clock = shared.clock.load(Ordering::Relaxed);
+        let path =
+            crate::durability::checkpoint::write(dir, &snapshot, clock, shared.admission.as_ref())?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,
@@ -898,7 +1238,14 @@ impl Engine {
             quads: version.asserted.len(),
             inferred: version.inferred.len(),
             runs: version.runs().count(),
-            index_bytes: version.runs().map(|run| run.memory_bytes()).sum(),
+            // The latest version's own runs, and every shared quad-layout form alive, published
+            // or not, once (DUR-6).
+            index_bytes: version
+                .runs()
+                .filter(|run| !run.is_form())
+                .map(|run| run.memory_bytes())
+                .sum::<u64>()
+                + self.inner.shared.forms.bytes(),
             index_mapped_bytes: version.runs().map(|run| run.mapped_bytes()).sum(),
             dictionary: self.inner.shared.dictionary.stats(),
             wal_bytes_since_checkpoint: self

@@ -7,10 +7,11 @@ use super::env_names as names;
 use super::env_values::parse_bool;
 use super::source::ConfigSource;
 
-pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
+pub(super) fn parse_store_config(
+    source: &dyn ConfigSource,
+    machine: nrese_exec::memory::Reading,
+) -> Result<StoreConfig> {
     let defaults = StoreConfig::default();
-    // The memory the shares (`50%`) are of, read once.
-    let machine = super::units::machine_memory_bytes();
     let equality = parse_equality(source.get(names::REASONING_EQUALITY).as_deref())?;
     Ok(StoreConfig {
         mode: parse_store_mode(source.get(names::STORE_MODE).as_deref())?,
@@ -40,6 +41,33 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         geosparql_stated_only: parse_geosparql_relations(
             source.get(names::GEOSPARQL_RELATIONS).as_deref(),
         )?,
+        search_scope: match choice(source, names::SEARCH_SCOPE, &["global", "reader"])? {
+            Some(1) => nrese_store::SearchScope::Reader,
+            _ => nrese_store::SearchScope::Global,
+        },
+        reader_corpus_bytes: super::env_values::parse_bytes(
+            source,
+            names::READER_CORPUS_BYTES,
+            defaults.reader_corpus_bytes,
+        )?,
+        reader_corpus_tuning: nrese_store::CorpusTuning {
+            walk_slice_words: match super::env_values::parse_usize(
+                source,
+                names::READER_WALK_SLICE,
+                defaults.reader_corpus_tuning.walk_slice_words,
+            )? {
+                0 => bail!("{} must be at least 1", names::READER_WALK_SLICE),
+                words => words,
+            },
+            documents_per_probe: match super::env_values::parse_u64(
+                source,
+                names::READER_DOCUMENTS_PER_PROBE,
+                defaults.reader_corpus_tuning.documents_per_probe,
+            )? {
+                0 => bail!("{} must be at least 1", names::READER_DOCUMENTS_PER_PROBE),
+                documents => documents,
+            },
+        },
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
             machine,
@@ -433,11 +461,56 @@ mod tests {
             if let Some(value) = value {
                 source.insert(names::REASONING_SUPPORT_SETS, value);
             }
-            parse_store_config(&source).unwrap().support_sets
+            parse_store_config(&source, Ok(16 << 30))
+                .unwrap()
+                .support_sets
         };
         assert_eq!(cap(None), 16);
         assert_eq!(cap(Some("4")), 4);
         assert_eq!(cap(Some(usize::MAX.to_string().as_str())), usize::MAX);
+    }
+
+    /// Spec: docs/ops/config-reference.md, `store.reader_corpus_bytes` (default 256 MiB, a
+    /// size), `store.reader_walk_slice` (default 1024, at least 1) and
+    /// `store.reader_documents_per_probe` (default 10, at least 1): each reaches the store; a
+    /// zero where at least 1 is asked is refused, naming its setting. New settings: their
+    /// test was written with them.
+    #[test]
+    fn the_reader_corpus_settings_reach_the_store() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let mut source = KeyValueSource::default();
+            for &(name, value) in pairs {
+                source.insert(name, value);
+            }
+            parse_store_config(&source, Ok(16 << 30))
+        };
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(defaults.reader_corpus_bytes, 256 << 20);
+        assert_eq!(
+            defaults.reader_corpus_tuning,
+            nrese_store::CorpusTuning {
+                walk_slice_words: 1024,
+                documents_per_probe: 10
+            }
+        );
+        let set = parse(&[
+            (names::READER_CORPUS_BYTES, "1GiB"),
+            (names::READER_WALK_SLICE, "256"),
+            (names::READER_DOCUMENTS_PER_PROBE, "4"),
+        ])
+        .unwrap();
+        assert_eq!(set.reader_corpus_bytes, 1 << 30);
+        assert_eq!(
+            set.reader_corpus_tuning,
+            nrese_store::CorpusTuning {
+                walk_slice_words: 256,
+                documents_per_probe: 4
+            }
+        );
+        for name in [names::READER_WALK_SLICE, names::READER_DOCUMENTS_PER_PROBE] {
+            let refused = parse(&[(name, "0")]).map(|_| ()).unwrap_err();
+            assert!(refused.to_string().contains(name), "{name}: {refused}");
+        }
     }
 
     #[test]
@@ -460,6 +533,65 @@ mod tests {
         let mut source = KeyValueSource::default();
         source.insert(names::DL_ANSWERS, "complete");
         assert!(parse_dl(&source).is_err());
+    }
+
+    /// Only `0` and `unlimited` mean no budget: a positive budget below one millisecond or
+    /// one byte is refused, naming its setting, not read as none; so is one past the range.
+    /// Every row is checked; the failures are reported together.
+    #[test]
+    fn a_dl_budget_below_one_unit_or_past_the_range_is_refused() {
+        let mut wrong = Vec::new();
+        for (name, value) in [
+            (names::DL_TIMEOUT_MS, "0.1ms"),
+            (names::DL_TIMEOUT_MS, "0.4"),
+            (names::DL_LOWER_BOUND_TIMEOUT_MS, "0.1ms"),
+            (names::DL_MEMORY, "0.4"),
+            (names::DL_MEMORY, "0.4B"),
+            (names::DL_MEMORY, "17179869184GiB"),
+            (names::DL_TIMEOUT_MS, "5124095576030432h"),
+        ] {
+            let mut source = KeyValueSource::default();
+            source.insert(name, value);
+            match parse_dl(&source) {
+                Ok(dl) => wrong.push(format!(
+                    "{name}={value}: timeout {:?}, lower-bound timeout {:?}, memory {:?}",
+                    dl.timeout, dl.lower_bound_timeout, dl.memory_bytes
+                )),
+                Err(error) if !format!("{error:#}").contains(name) => {
+                    wrong.push(format!("{name}={value}: {error:#} doesn't name it"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Through the DL configuration: a positive budget too small for a float (`0.000…1`) is
+    /// refused naming its setting, never loaded as no budget (review p2-b7-a r1 R1). Every
+    /// row is checked.
+    #[test]
+    fn a_dl_budget_too_small_for_a_float_is_refused() {
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let mut wrong = Vec::new();
+        for (name, value) in [
+            (names::DL_TIMEOUT_MS, format!("{tiny}ms")),
+            (names::DL_LOWER_BOUND_TIMEOUT_MS, format!("{tiny}ms")),
+            (names::DL_MEMORY, format!("{tiny}B")),
+        ] {
+            let mut source = KeyValueSource::default();
+            source.insert(name, &value);
+            match parse_dl(&source) {
+                Ok(dl) => wrong.push(format!(
+                    "{name}: loaded, timeout {:?}, lower-bound timeout {:?}, memory {:?}",
+                    dl.timeout, dl.lower_bound_timeout, dl.memory_bytes
+                )),
+                Err(error) if !format!("{error:#}").contains(name) => {
+                    wrong.push(format!("{name}: {error:#} doesn't name it"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

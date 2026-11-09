@@ -24,10 +24,11 @@ use crate::limits::Limit;
 
 use nrese_owl::{Normalised, Ontology, Term};
 
-use super::consistency::{self, Verdict};
+use super::consistency::{self, Decided};
 use super::known::{self, Lower};
 use super::{Classification, Deadline, Options, Profile, Taxonomy};
 use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
+use crate::verdict::Verdict;
 
 /// A class's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +145,8 @@ impl<'a> Driver<'a> {
                 }
             }
             let known = self.known.clone();
-            return self.finish(&known, &lower_top, started);
+            let consistency = Verdict::Unknown(format!("unsupported: {why}"));
+            return self.finish(&known, &lower_top, consistency, started);
         }
         super::trace("consistency");
         // 1. Consistency: the context core where it can, else the hypertableau.
@@ -161,9 +163,11 @@ impl<'a> Driver<'a> {
         } else {
             None
         };
-        if matches!(by_core, Some(Verdict::Inconsistent)) {
+        if matches!(by_core, Some(Decided::Inconsistent)) {
             return self.inconsistent();
         }
+        // Decided by the context core, else by the hypertableau below.
+        let mut consistency = Verdict::Consistent;
         let full = (by_core.is_none() || !exact).then(|| {
             let program = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
             self.profile.compile += program.compile_time();
@@ -190,11 +194,15 @@ impl<'a> Driver<'a> {
                 match &out.answer {
                     Answer::Inconsistent => return self.inconsistent(),
                     Answer::Consistent => {}
-                    other => self.incomplete.push(format!(
-                        "consistency not decided ({}): {}",
-                        other.class(),
-                        reason(other)
-                    )),
+                    other => {
+                        self.incomplete.push(format!(
+                            "consistency not decided ({}): {}",
+                            other.class(),
+                            reason(other)
+                        ));
+                        consistency =
+                            Verdict::Unknown(format!("{}: {}", other.class(), reason(other)));
+                    }
                 }
                 if let Some(labels) = &out.labels {
                     self.observe(labels, None);
@@ -219,17 +227,19 @@ impl<'a> Driver<'a> {
                 by_core.is_some(),
             )
         };
-        self.finish(&subsumers, &top, started)
+        self.finish(&subsumers, &top, consistency, started)
     }
 
     /// The taxonomy from the subsumers and `owl:Thing`'s equivalents found, with what
     /// stays undecided.
-    fn finish(mut self, subsumers: &[Vec<u32>], top: &[u32], started: Instant) -> Taxonomy {
-        let mut c = Classification {
-            classes: self.classes.to_vec(),
-            consistent: true,
-            ..Classification::default()
-        };
+    fn finish(
+        mut self,
+        subsumers: &[Vec<u32>],
+        top: &[u32],
+        consistency: Verdict,
+        started: Instant,
+    ) -> Taxonomy {
+        let mut c = Classification::new(self.classes.to_vec(), consistency);
         for (i, found) in subsumers.iter().enumerate() {
             if self.status[i] == Status::Unsat {
                 c.unsatisfiable.push(self.classes[i]);
@@ -363,12 +373,8 @@ impl<'a> Driver<'a> {
     }
 
     fn inconsistent(self) -> Taxonomy {
-        let c = Classification {
-            classes: self.classes.to_vec(),
-            unsatisfiable: self.classes.to_vec(),
-            consistent: false,
-            ..Classification::default()
-        };
+        let mut c = Classification::new(self.classes.to_vec(), Verdict::Inconsistent);
+        c.unsatisfiable = self.classes.to_vec();
         Taxonomy {
             classification: c,
             incomplete: self.incomplete,

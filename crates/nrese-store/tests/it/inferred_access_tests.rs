@@ -964,12 +964,15 @@ fn a_planned_read_charges_its_view_to_the_query() {
     })
     .unwrap();
     let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
-    store
-        .execute_update(&SparqlUpdateRequest::new(format!(
-            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-             INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
-        )))
-        .unwrap();
+    // Loaded past the pipeline: a write's pending changes draw on the same 64 KiB (D16-039),
+    // and the data is the read's, not what this tests.
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix ex: <{EX}> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }}"
+        ),
+    );
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
     store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
     let mut request = SparqlQueryRequest::new(
@@ -1005,13 +1008,10 @@ fn a_session_read_follows_a_change_of_the_rules() {
     let store = store();
     let sessions = store.sessions();
     let id = sessions.begin(None).unwrap();
-    assert!(sessions.add(
-        &id,
-        None,
-        vec![StatementOp::Update(SparqlUpdateRequest::new(format!(
-            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:z a ex:Z }} }}"
-        )))]
-    ));
+    let insert = vec![StatementOp::Update(SparqlUpdateRequest::new(format!(
+        "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:z a ex:Z }} }}"
+    )))];
+    assert!(sessions.add(&id, None, insert).unwrap());
     let in_session = StatementsRequest {
         ops: sessions.pending(&id, None).unwrap(),
         session: Some(id.clone()),

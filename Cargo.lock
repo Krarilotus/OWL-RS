@@ -1164,6 +1164,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1263,10 +1264,12 @@ dependencies = [
  "mimalloc",
  "nrese-exec",
  "nrese-rdf",
+ "nrese-rdf-io",
  "nrese-reasoner",
  "nrese-sparql",
  "nrese-sparql-results",
  "nrese-store",
+ "nrese-xsd",
  "parking_lot",
  "reqwest",
  "serde",
@@ -1304,6 +1307,7 @@ name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [
  "geo",
+ "hashbrown 0.16.1",
  "hex",
  "md-5",
  "nrese-engine",
@@ -1396,6 +1400,7 @@ dependencies = [
 name = "nrese-vector"
 version = "0.1.0"
 dependencies = [
+ "nrese-exec",
  "parking_lot",
  "rayon",
 ]
@@ -1404,6 +1409,7 @@ dependencies = [
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
+ "iri-string",
  "regex-syntax",
  "thiserror 2.0.21",
 ]

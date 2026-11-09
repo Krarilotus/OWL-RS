@@ -19,6 +19,9 @@ pub struct Shapes {
     pub(crate) index: HashMap<TermId, ShapeRef>,
     /// The shapes graph's name, if it is a named graph: `$shapesGraph` in SHACL-SPARQL.
     pub(crate) graph: Option<TermId>,
+    /// The `sh:entailment` values of the shapes graph (SHACL §1.5): regimes the data must be
+    /// validated under. None is supported, so each is a failure of every validation.
+    pub(crate) entailments: Vec<TermId>,
 }
 
 impl Shapes {
@@ -29,6 +32,26 @@ impl Shapes {
 
     pub fn is_empty(&self) -> bool {
         self.shapes.is_empty()
+    }
+
+    /// Whether validating against these shapes can report nothing at all: no shape, and no
+    /// `sh:entailment`, which is a failure of every validation even without shapes.
+    pub fn is_vacuous(&self) -> bool {
+        self.shapes.is_empty() && self.entailments.is_empty()
+    }
+
+    /// Whether any shape, nested ones included, has a SHACL-SPARQL constraint (`sh:sparql`
+    /// or a SPARQL-based constraint component): validating it evaluates queries over the
+    /// view's [`nrese_sparql::ReadView::evaluation_snapshot`], not through its quad reads,
+    /// the only read of this crate that does. Deactivated shapes count: it tells what the
+    /// shapes graph declares, so `true` where no query may run is the safe side.
+    pub fn uses_sparql(&self) -> bool {
+        self.shapes.iter().any(|shape| {
+            shape
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, Constraint::Sparql(_)))
+        })
     }
 
     /// The shapes validation starts from: active ones with a target.
@@ -170,10 +193,56 @@ pub(crate) struct SparqlCheck {
     /// An ASK validator: run per value node, with `$value`; a value fails when it answers
     /// false. Otherwise a SELECT: each solution is a result.
     pub(crate) ask: bool,
-    /// The component's parameters: the variable each is pre-bound as, and the value.
-    pub(crate) parameters: Vec<(nrese_rdf::Variable, TermId)>,
+    /// The component's parameters: the variable each is pre-bound as, and the shape's values
+    /// for it. The component constrains the shape once per combination of these values
+    /// (SHACL §6.2), each run in turn ([`SparqlCheck::each_combination`]); they aren't
+    /// multiplied out, which would grow as a power of the shapes graph.
+    pub(crate) parameters: Vec<(nrese_rdf::Variable, Vec<TermId>)>,
     /// The `sh:message`s of the constraint or validator (else the component's).
     pub(crate) messages: Vec<TermId>,
+}
+
+impl SparqlCheck {
+    /// Calls `each` with every combination of the parameters' values, one value per
+    /// parameter, the first parameter's changing slowest, until `each` breaks. Without
+    /// parameters (`sh:sparql`) that is one combination, the empty one; a parameter without
+    /// values leaves none.
+    pub(crate) fn each_combination(
+        &self,
+        mut each: impl FnMut(&[(nrese_rdf::Variable, TermId)]) -> std::ops::ControlFlow<()>,
+    ) {
+        if self.parameters.iter().any(|(_, values)| values.is_empty()) {
+            return;
+        }
+        let mut at = vec![0; self.parameters.len()];
+        let mut chosen: Vec<(nrese_rdf::Variable, TermId)> = self
+            .parameters
+            .iter()
+            .map(|(variable, values)| (variable.clone(), values[0]))
+            .collect();
+        loop {
+            if each(&chosen).is_break() {
+                return;
+            }
+            // The next combination: the last parameter that has a next value takes it, and
+            // every parameter after it starts over.
+            let mut parameter = self.parameters.len();
+            loop {
+                if parameter == 0 {
+                    return;
+                }
+                parameter -= 1;
+                let values = &self.parameters[parameter].1;
+                at[parameter] += 1;
+                if at[parameter] < values.len() {
+                    chosen[parameter].1 = values[at[parameter]];
+                    break;
+                }
+                at[parameter] = 0;
+                chosen[parameter].1 = values[0];
+            }
+        }
+    }
 }
 
 /// A constraint component, as `sh:sourceConstraintComponent` names it.

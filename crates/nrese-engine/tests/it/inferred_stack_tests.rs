@@ -209,7 +209,7 @@ fn remove_matching_retracts_asserted_statements_only() {
     let mut tx = engine.transaction();
     tx.insert_encoded(triple(1, 2, 3).in_default_graph());
     tx.insert_inferred(triple(1, 2, 4));
-    assert_eq!(tx.remove_matching(&QuadPattern::all()), 1);
+    assert_eq!(tx.remove_matching(&QuadPattern::all()).unwrap(), 1);
     tx.commit().expect("commit");
     let snapshot = engine.snapshot();
     assert_eq!(MODELS.map(|model| snapshot.len_in(model)), [1, 0, 1]);
@@ -855,5 +855,188 @@ fn merged_columns_keep_the_scan_order_or_are_refused() {
     assert_eq!(
         snapshot.scan_range_columns_in(model, &by_predicate, Permutation::Posg, o1, o100, &[2]),
         Some(in_order)
+    );
+}
+
+/// What `Snapshot::asserted_identity` says (P2-C1; DUR's and NUM's conditions): a commit of
+/// inferred statements only keeps it, as does a restricted view; a commit of asserted
+/// statements gives a new one, as does a transaction's pending state, even unchanged, and
+/// `CommitSummary::asserted` is the published snapshot's.
+#[test]
+fn the_asserted_identity_follows_the_asserted_statements_only() {
+    let engine = engine();
+    let first = engine.snapshot().asserted_identity();
+    let mut tx = engine.transaction();
+    tx.insert_inferred(triple(1, 2, 3));
+    let summary = tx.commit().expect("commit");
+    assert_eq!(
+        engine.snapshot().asserted_identity(),
+        first,
+        "inferred only"
+    );
+    assert_eq!(summary.asserted, first);
+    let mut tx = engine.transaction();
+    assert_ne!(
+        tx.pending_snapshot().asserted_identity(),
+        first,
+        "pending, unchanged"
+    );
+    assert!(tx.insert_encoded(EncodedQuad::new(id(4), id(5), id(6), TermId::DEFAULT_GRAPH)));
+    let pending = tx.pending_snapshot().asserted_identity();
+    assert_ne!(pending, first, "pending");
+    let summary = tx.commit().expect("commit");
+    let after = engine.snapshot().asserted_identity();
+    assert_ne!(after, first, "an asserted commit");
+    assert_ne!(after, pending, "the committed state isn't the pending view");
+    assert_eq!(
+        summary.asserted, after,
+        "the summary names what was published"
+    );
+    let nothing = engine.transaction().commit().expect("commit");
+    assert_eq!(nothing.asserted, after, "a commit that changes nothing");
+}
+
+/// Spec (`Transaction::pending_over`'s contract; review P2B0-F1, 8 Nov): the pending state as a
+/// reader of a restricted view reads it is the view's asserted statements with the pending
+/// asserted changes, and the view's inferred statements less those the pending changes delete
+/// or assert and those `hidden` names. The pending inferred inserts aren't in it.
+///
+/// - Input: a base asserting `a` and inferring `i1`..`i5`; a view without `i5`; a transaction
+///   that deletes `i1` as inferred and asserts it too (two removal sources of one statement),
+///   asserts `i2`, infers `n`; `hidden` naming `i2` (asserted as well), `i3`, `i5` (not in the
+///   view) and `x` (in nothing).
+/// - Expected: asserted `a`, `i1`, `i2`; inferred `i4` alone; the view itself unchanged.
+#[test]
+fn a_pending_read_over_a_view_drops_every_removed_inference_once() {
+    use nrese_engine::InferredSubset;
+    let engine = engine();
+    let a = triple(1, 2, 3).in_default_graph();
+    let inferred: Vec<EncodedTriple> = (4..9).map(|o| triple(1, 2, o)).collect();
+    let [i1, i2, i3, i4, i5] = [0, 1, 2, 3, 4].map(|n| inferred[n].in_default_graph());
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(a));
+    for &statement in &inferred {
+        assert!(tx.insert_inferred(statement));
+    }
+    tx.commit().expect("commit");
+
+    let view = engine
+        .snapshot()
+        .with_inferred_subset(InferredSubset::Without(vec![i5]));
+    let mut tx = engine.transaction();
+    assert!(tx.remove_inferred(inferred[0]), "i1 deleted as inferred");
+    assert!(tx.insert_encoded(i1), "i1 asserted too");
+    assert!(tx.insert_encoded(i2), "i2 asserted");
+    let n = triple(1, 2, 9);
+    assert!(tx.insert_inferred(n), "n inferred, pending");
+    let x = triple(9, 9, 9).in_default_graph();
+    let pending = tx.pending_over(&view, &[i2, i3, i5, x]);
+
+    assert_eq!(
+        scan(&pending, ReadModel::Asserted),
+        BTreeSet::from([a, i1, i2]),
+        "the view's asserted statements with the pending changes"
+    );
+    assert_eq!(
+        scan(&pending, ReadModel::Inferred),
+        BTreeSet::from([i4]),
+        "the view's inferred statements less those deleted, asserted or hidden"
+    );
+    assert_eq!(
+        MODELS.map(|model| pending.len_in(model)),
+        [4, 3, 1],
+        "materialised, asserted, inferred: the counts kept"
+    );
+    assert!(
+        !pending.contains(&n.in_default_graph()),
+        "no pending inference"
+    );
+    assert!(!pending.contains(&x));
+    assert_eq!(
+        scan(&view, ReadModel::Inferred),
+        BTreeSet::from([i1, i2, i3, i4]),
+        "the view unchanged"
+    );
+    assert_eq!(scan(&view, ReadModel::Asserted), BTreeSet::from([a]));
+}
+
+/// Spec (the transaction's read methods' docs; review P2B0-F2, 8 Nov): a transaction's named
+/// graphs and its pending inferred changes include what it has done so far.
+///
+/// - Input: a base asserting in graphs `g9` and `g10` and the default graph, inferring `i`; a
+///   transaction that empties `g10`, fills `g11`, asserts and retracts in `g12`, asserts one
+///   more statement in `g9` (a graph both the base and the pending inserts name) and one in
+///   `g8` (an id before every base graph's: review P2B1-F2, so the order and the single
+///   listing are the method's work); deletes `i`, infers `n`, infers `m` and then asserts it,
+///   and tries to infer an asserted statement.
+/// - Expected: named graphs `g8`, `g9` and `g11`, in id order, each once, and only those
+///   contain statements (the default graph is not a named graph); inferred pending: inserted
+///   `n` and `m`, deleted `i`, counted before the commit; the commit drops `m` from the
+///   inferred stack.
+#[test]
+fn a_transaction_reads_its_own_graphs_and_pending_inferences() {
+    let engine = engine();
+    let in_graph = |o: u64, g: u64| EncodedQuad::new(id(1), id(2), id(o), id(g));
+    let asserted = triple(1, 2, 5).in_default_graph();
+    let i = triple(1, 2, 6);
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(in_graph(3, 9)));
+    assert!(tx.insert_encoded(in_graph(4, 10)));
+    assert!(tx.insert_encoded(asserted));
+    assert!(tx.insert_inferred(i));
+    tx.commit().expect("commit");
+
+    let mut tx = engine.transaction();
+    assert!(tx.remove_encoded(in_graph(4, 10)), "g10 emptied");
+    assert!(tx.insert_encoded(in_graph(7, 11)), "g11 filled");
+    assert!(tx.insert_encoded(in_graph(8, 12)));
+    assert!(tx.remove_encoded(in_graph(8, 12)), "g12 back to empty");
+    assert!(
+        tx.insert_encoded(in_graph(14, 9)),
+        "g9 named by a pending insert too"
+    );
+    assert!(
+        tx.insert_encoded(in_graph(16, 8)),
+        "g8, before every base graph"
+    );
+    assert!(id(8) < id(9), "the fixture's ids are in order");
+    assert_eq!(
+        tx.named_graphs(),
+        vec![id(8), id(9), id(11)],
+        "the non-empty named graphs, in id order, each once"
+    );
+    assert_eq!(
+        [8, 9, 10, 11, 12].map(|g| tx.contains_named_graph(id(g))),
+        [true, true, false, true, false],
+        "g8, g9, g10, g11, g12"
+    );
+    assert!(
+        !tx.contains_named_graph(TermId::DEFAULT_GRAPH),
+        "the default graph is not a named graph"
+    );
+
+    let (n, m) = (triple(1, 2, 13), triple(1, 2, 15));
+    assert!(tx.remove_inferred(i));
+    assert!(tx.insert_inferred(n));
+    assert!(tx.insert_inferred(m));
+    assert!(tx.insert_encoded(m.in_default_graph()), "m asserted");
+    assert!(
+        !tx.insert_inferred(EncodedTriple::new(id(1), id(2), id(5))),
+        "an asserted statement is never inferred"
+    );
+    assert_eq!(tx.inferred_pending(), (2, 1), "inserted n and m, deleted i");
+    assert_eq!(
+        tx.inferred_inserted().collect::<BTreeSet<_>>(),
+        BTreeSet::from([n, m])
+    );
+    assert_eq!(
+        tx.inferred_deleted().collect::<BTreeSet<_>>(),
+        BTreeSet::from([i])
+    );
+    let summary = tx.commit().expect("commit");
+    assert_eq!(
+        (summary.inferred_inserted, summary.inferred_deleted),
+        (1, 1),
+        "m asserted, so not inferred: {summary:?}"
     );
 }

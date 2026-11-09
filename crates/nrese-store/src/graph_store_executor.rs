@@ -17,7 +17,7 @@ pub(crate) fn graph_exists(
     model: ReadModel,
 ) -> StoreResult<bool> {
     let pattern = target.pattern_in(view)?;
-    Ok(matches!(target, GraphTarget::DefaultGraph)
+    Ok(matches!(target.resolved()?, GraphTarget::DefaultGraph)
         || pattern.is_some_and(|p| view.quads_for_pattern_in(model, &p).next().is_some()))
 }
 
@@ -51,7 +51,7 @@ pub(crate) fn apply_graph_write(
 ) -> StoreResult<GraphWriteReport> {
     let graph = request.target.graph_name()?;
     let existing = request.target.pattern_in(&*tx)?;
-    let created = match (&request.target, existing) {
+    let created = match (request.target.resolved()?, existing) {
         (GraphTarget::DefaultGraph, _) => false,
         (GraphTarget::NamedGraph(_), Some(pattern)) => {
             tx.quads_for_pattern(&pattern).next().is_none()
@@ -59,10 +59,11 @@ pub(crate) fn apply_graph_write(
         (GraphTarget::NamedGraph(_), None) => true,
     };
     let before = tx.pending();
+    // The pending changes' growth is charged before it happens (D16-039).
     if request.replace
         && let Some(pattern) = existing
     {
-        tx.remove_matching(&pattern);
+        tx.remove_matching(&pattern)?;
     }
     let mut any = false;
     each_graph_quad(
@@ -73,7 +74,7 @@ pub(crate) fn apply_graph_write(
         BlankNodes::Fresh,
         Consumer::Interning,
         |quad| {
-            tx.insert(quad);
+            tx.try_insert(quad)?;
             any = true;
             Ok(())
         },
@@ -92,7 +93,7 @@ pub(crate) fn apply_graph_delete(
     target: &GraphTarget,
 ) -> StoreResult<GraphDeleteReport> {
     let removed = match target.pattern_in(&*tx)? {
-        Some(pattern) => tx.remove_matching(&pattern),
+        Some(pattern) => tx.remove_matching(&pattern)?,
         None => 0,
     };
     Ok(GraphDeleteReport {

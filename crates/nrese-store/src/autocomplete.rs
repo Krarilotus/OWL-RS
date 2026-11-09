@@ -33,13 +33,18 @@ pub struct Suggestion {
     pub score: f64,
 }
 
-/// At most `limit` resources for `typed`, best first.
+/// At most `limit` resources for `typed`, best first, scored over `scope`'s documents: the
+/// dictionary's whole indexes, or (reader) the labels and IRIs `snapshot`'s statements in
+/// `model` use, every graph (autocompletion is for readers of every graph). What a reader's
+/// corpora take is charged to `budget` (`None`: unbounded).
 pub(crate) fn autocomplete(
     snapshot: &Snapshot,
     model: ReadModel,
     typed: &str,
     limit: usize,
-) -> Vec<Suggestion> {
+    scope: nrese_sparql::SearchScope,
+    budget: Option<&std::sync::Arc<nrese_exec::Budget>>,
+) -> Result<Vec<Suggestion>, nrese_engine::SearchRefused> {
     let query = TextQuery {
         text: typed.to_owned(),
         all_words: true,
@@ -62,10 +67,23 @@ pub(crate) fn autocomplete(
         }
     };
     // Both indexes at once (each built at its first use, on every core).
-    let (label_hits, name_hits) = rayon::join(
-        || snapshot.text_search(&query),
-        || snapshot.iri_search(&query),
-    );
+    let (label_hits, name_hits) = match scope {
+        nrese_sparql::SearchScope::Global => {
+            let (labels, names) = rayon::join(
+                || snapshot.text_search(&query),
+                || snapshot.iri_search(&query),
+            );
+            (labels?, names?)
+        }
+        nrese_sparql::SearchScope::Reader => {
+            let every = nrese_engine::TextScope::EVERY;
+            let (labels, names) = rayon::join(
+                || snapshot.text_search_in(model, &every, &query, budget),
+                || snapshot.iri_search_in(model, &every, &query, budget),
+            );
+            (labels?, names?)
+        }
+    };
     // Matches come best first: the first `limit` resources of each kind are its best.
     let mut from_labels = 0;
     for hit in label_hits {
@@ -133,5 +151,5 @@ pub(crate) fn autocomplete(
             .then_with(|| a.iri.cmp(&b.iri))
     });
     suggestions.truncate(limit);
-    suggestions
+    Ok(suggestions)
 }

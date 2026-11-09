@@ -77,6 +77,13 @@ impl Context<'_> {
         }
         encoder.number(self.cross_chunk_rows as u64);
         encoder.number(self.stream_rows.map_or(u64::MAX, |rows| rows as u64));
+        // A reader's searches rank and select differently: their results are their own. A
+        // global context's bytes stay as they were; a reader's have one more, a tag no key
+        // continues a global context's with (the active graph's tags, `key_start`), so the
+        // two never share a key.
+        if self.search_scope == crate::SearchScope::Reader {
+            encoder.tag(b'R');
+        }
         Arc::new(CacheScope {
             cache,
             snapshot: self.snapshot.identity(),
@@ -277,7 +284,10 @@ impl Context<'_> {
         let table = match part.computed.is_empty() {
             true => part.table.clone(),
             false => {
-                let ids: Vec<u64> = part.computed.iter().map(|term| self.id(term)).collect();
+                let mut ids = Vec::with_capacity(part.computed.len());
+                for term in &part.computed {
+                    ids.push(self.id(term)?);
+                }
                 IdTable::from_columns(
                     part.table
                         .columns()

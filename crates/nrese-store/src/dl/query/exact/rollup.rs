@@ -60,7 +60,7 @@ pub(super) fn roll_up(
             };
             add_var(x, &mut vars);
             let expr = match v {
-                Slot::Const(lit) if is_literal(*lit) => {
+                Slot::Const(lit) if TermId::from_raw(*lit).kind().is_literal() => {
                     note_literal(o, snapshot, *lit);
                     ClassExpr::DataHasValue(*p, *lit)
                 }

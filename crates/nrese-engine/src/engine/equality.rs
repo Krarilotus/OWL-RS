@@ -316,10 +316,14 @@ fn canonical_version(
         asserted,
         inferred: version.inferred.clone(),
         revision: version.revision,
+        committed_micros: version.committed_micros,
         dictionary_len: version.dictionary_len,
         equality: Arc::new(EqualityCell::holding(same_as, Arc::clone(classes))),
         content: version.content,
+        // Its asserted stack renamed to representatives: not the stored ids.
+        asserted_content: super::AssertedIdentity::fresh(),
         canonical: Default::default(),
+        own: Default::default(),
     });
     Ok(Some(View(Some(Arc::new(ViewData {
         version,
@@ -553,11 +557,7 @@ impl Classes {
 
 /// Whether `id` is a literal: any kind but IRIs, blank nodes and triple terms.
 fn is_literal(id: TermId) -> bool {
-    use crate::term::TermKind;
-    !matches!(
-        id.kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::Triple | TermKind::DefaultGraph
-    )
+    id.kind().is_literal()
 }
 
 enum Values<'a> {

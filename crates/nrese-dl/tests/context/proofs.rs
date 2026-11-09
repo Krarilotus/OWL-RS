@@ -41,7 +41,7 @@ fn every_subsumption_has_a_proof_from_a_justification() {
             continue;
         };
         let c = saturated.classification();
-        if !c.consistent {
+        if c.consistency != nrese_dl::verdict::Verdict::Consistent {
             continue;
         }
         let goals: Vec<(u64, Option<u64>)> = c

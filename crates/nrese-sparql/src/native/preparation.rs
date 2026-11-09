@@ -90,8 +90,8 @@ pub(super) fn semantic_pattern<'q>(
 }
 
 /// The QL rewriting of a query's pattern: the pattern rewritten (`None` if unchanged), and
-/// what it did (`None` where it doesn't apply). A schema with nothing to rewrite leaves the
-/// pattern unread.
+/// what it did (`None` where it doesn't apply). A schema with nothing to rewrite or report
+/// leaves the pattern unread.
 fn ql_stage(
     query: &Query,
     options: &QueryOptions,
@@ -110,7 +110,9 @@ fn ql_stage(
         true => crate::Regime::Owl2Rl,
         false => crate::Regime::Owl2Ql,
     };
-    if tbox.is_empty() {
+    // Nothing to rewrite and nothing to report: the pattern stays unread. Asserted
+    // existentials have anonymous individuals with nothing to rewrite (design §7).
+    if tbox.is_empty() && !tbox.has_concerns() {
         let mut report = crate::ql::QlReport::default();
         report.completeness.regime = Some(regime);
         return (None, Some(report));

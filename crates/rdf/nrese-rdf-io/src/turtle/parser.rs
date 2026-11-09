@@ -25,7 +25,11 @@ use nrese_rdf::{
     QuadRef, TermRef, TripleRef,
 };
 
-use super::lexer::{Kind, Lexed, Token, lex};
+use super::lexer::{
+    Brackets, Kind, Lexed, Malformed, Opening, Token, characters, known_missing, lex, malformed,
+    pair,
+};
+use super::split::Cut;
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
@@ -60,6 +64,26 @@ enum Source<'a, R> {
     },
 }
 
+/// What ends a failed statement besides a `.` with nothing open (and the `}` of the TriG
+/// block it is in), by its form: noted as it fails (`TurtleParser::ends_with`), read by
+/// `resync`. A statement that parses never touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// Only that.
+    Dot,
+    /// It has ended: a SPARQL-style `PREFIX` or `BASE` whose IRI was taken.
+    Ended,
+    /// A SPARQL-style `PREFIX` or `BASE` without its IRI yet: after the next IRI.
+    Iri,
+    /// A SPARQL-style `VERSION` without its string yet: after the next short string.
+    String,
+    /// A TriG graph block's head whose graph name failed: if `{` follows, its block is the
+    /// statement's, which ends at the `}` closing it.
+    Head,
+    /// Inside that block: a `.` ends nothing.
+    Block,
+}
+
 /// Where a statement starts, as `TurtleParser::statement_start` keeps it: the document offsets
 /// of its first token and of the input's position then, and the input's line counters.
 #[derive(Clone, Copy)]
@@ -80,6 +104,14 @@ struct Input<'a, R> {
     base: u64,
     line: u64,
     line_start: u64,
+    /// The start of the line `data()[0]` is in, and that line's characters before it: a
+    /// column counts characters, also where its line began before the buffer (a chunk's
+    /// first line, a long line across refills).
+    first_line_start: u64,
+    first_line_chars: u64,
+    /// A read error met while recovery read ahead: the next `refill` returns it, or the
+    /// parser does once it has stopped, so it is never lost (see `skip_malformed`).
+    held: Option<io::Error>,
 }
 
 impl<R: Read> Input<'_, R> {
@@ -98,6 +130,9 @@ impl<R: Read> Input<'_, R> {
     }
 
     fn refill(&mut self) -> io::Result<()> {
+        if let Some(error) = self.held.take() {
+            return Err(error);
+        }
         let Source::Reader {
             reader,
             buffer,
@@ -108,6 +143,15 @@ impl<R: Read> Input<'_, R> {
             return Ok(());
         };
         if self.position > 0 {
+            // The line the new `data()[0]` is in, and its characters before it.
+            let gone = &buffer[..self.position];
+            match memchr::memrchr(b'\n', gone) {
+                Some(k) => {
+                    self.first_line_start = self.base + k as u64 + 1;
+                    self.first_line_chars = characters(&gone[k + 1..]);
+                }
+                None => self.first_line_chars += characters(gone),
+            }
             buffer.copy_within(self.position..*end, 0);
             *end -= self.position;
             self.base += self.position as u64;
@@ -197,16 +241,17 @@ impl<R: Read> Input<'_, R> {
                 self.line_start
             } else {
                 // The line began before the buffer where no break precedes `at` in it.
-                memchr::memrchr(b'\n', &data[..at]).map_or(self.base, |i| self.base + i as u64 + 1)
+                memchr::memrchr(b'\n', &data[..at])
+                    .map_or(self.first_line_start, |i| self.base + i as u64 + 1)
             };
             (self.line.saturating_sub(breaks), line_start)
         };
-        // Characters when the line is still buffered, bytes otherwise.
-        let column = if line_start >= self.base && line_start <= offset {
-            let from = (line_start - self.base) as usize;
-            String::from_utf8_lossy(&data[from..at]).chars().count() as u64
-        } else {
-            offset.saturating_sub(line_start)
+        // Characters from the line's start: in the buffer, or before it too where the line
+        // began earlier (then it is the line `data()[0]` is in).
+        let column = match line_start.checked_sub(self.base) {
+            Some(from) if line_start <= offset => characters(&data[from as usize..at]),
+            Some(_) => 0,
+            None => self.first_line_chars + characters(&data[..at]),
         };
         TextPosition {
             line,
@@ -278,6 +323,28 @@ pub(crate) struct TurtleParser<'a, R> {
     generated: u64,
     lookahead: Option<Token>,
     after_string: bool,
+    /// Debug builds only, for `resync`'s check: the current statement's `[`, `(`, `<<(`, `<<`
+    /// and `{|` not closed yet, and whether the token taken last was a `.` with none open.
+    /// Release builds keep no count per token: what recovery needs is noted on errors only.
+    #[cfg(debug_assertions)]
+    open: i64,
+    #[cfg(debug_assertions)]
+    ended: bool,
+    /// When a statement fails: the brackets it left open, by pair ([`pair`]), noted as its
+    /// error unwinds out of the routines that took them, innermost first (`within`); and
+    /// its failing token, when that was itself an opener, a closer or a `.` (`unexpected`).
+    /// Written on an error only, read by `resync`, cleared at the error: a statement that
+    /// parses never touches them.
+    unclosed: Vec<usize>,
+    failed: Option<Kind>,
+    /// When a statement fails: what its form says ends it besides a `.` (see [`Ending`]),
+    /// noted as it fails (`ends_with`); read and cleared as `unclosed` is.
+    ending: Ending,
+    /// Per quote (`"`, `'`) and width (short, long), whether no later string has a closing
+    /// quote: a search for one reached the input's end without it ([`known_missing`] says
+    /// why that answers for later ones). Recovery then neither lexes nor searches such a
+    /// string again (see `resync`).
+    no_closing: [[bool; 2]; 2],
     /// The current statement.
     arena: String,
     triples: Vec<Triple>,
@@ -326,24 +393,28 @@ type Step<T> = Result<T, RdfParseError>;
 
 impl<'a, R: Read> TurtleParser<'a, R> {
     /// This parser for a chunk of a larger document ([`super::split`]): where the chunk
-    /// starts there (so errors give the document's lines), and the directives in force at
-    /// its start, read now.
-    pub(crate) fn for_chunk(
-        mut self,
-        offset: u64,
-        line: u64,
-        line_start: u64,
-        directives: &str,
-    ) -> Result<Self, RdfParseError> {
-        self.input.base = offset;
-        self.input.line = line;
-        self.input.line_start = line_start;
+    /// starts there (`cut`: so errors give the document's lines and columns), and the
+    /// directives in force at its start, read now.
+    pub(crate) fn for_chunk(mut self, cut: Cut, directives: &str) -> Result<Self, RdfParseError> {
+        self.input.base = cut.offset;
+        self.input.line = cut.line;
+        self.input.line_start = cut.line_start;
+        self.input.first_line_start = cut.line_start;
+        self.input.first_line_chars = cut.column;
         // A byte order mark can only be at the document's start.
-        self.started = offset > 0;
+        self.started = cut.offset > 0;
         if !directives.is_empty() {
             let mut header = TurtleParser::from_slice(directives.as_bytes(), self.settings.clone());
             while let Some(step) = header.next_ref() {
-                step?;
+                match step {
+                    // Recovering, a directive that fails is the error of the chunk that holds
+                    // it; here it puts in force what it set before failing, as in the
+                    // sequential parse.
+                    Err(RdfParseError::Syntax(_)) if self.settings.recover => {}
+                    step => {
+                        step?;
+                    }
+                }
             }
             self.prefixes = header.prefixes;
             self.base = header.base;
@@ -358,6 +429,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             base: 0,
             line: 0,
             line_start: 0,
+            first_line_start: 0,
+            first_line_chars: 0,
+            held: None,
         };
         Self {
             input,
@@ -368,6 +442,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             generated: 0,
             lookahead: None,
             after_string: false,
+            #[cfg(debug_assertions)]
+            open: 0,
+            #[cfg(debug_assertions)]
+            ended: false,
+            unclosed: Vec::new(),
+            failed: None,
+            ending: Ending::Dot,
+            no_closing: [[false; 2]; 2],
             arena: String::new(),
             triples: Vec::new(),
             handed_out: 0,
@@ -392,12 +474,18 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 return Some(Ok(self.quad(triple)));
             }
             if self.done {
-                return None;
+                // A read error recovery met before it stopped comes after its syntax error.
+                return self.input.held.take().map(|error| Err(error.into()));
             }
             self.arena.clear();
             self.triples.clear();
             self.triple_terms.clear();
             self.handed_out = 0;
+            #[cfg(debug_assertions)]
+            {
+                self.open = 0;
+                self.ended = false;
+            }
             // Where the statement starts (its first token), for an error's statement.
             let start = match self.statement_start() {
                 Ok(start) => start,
@@ -410,8 +498,13 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 self.abort_statement();
                 let start = self.input.resolve(start);
                 let syntax = matches!(error, RdfParseError::Syntax(_));
+                // A statement whose failing token was its own `.` has ended there already:
+                // recovery goes on right after it, skipping nothing more (`resync`).
                 self.done =
                     !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
+                self.unclosed.clear();
+                self.failed = None;
+                self.ending = Ending::Dot;
                 let error = match error {
                     RdfParseError::Syntax(error) => {
                         RdfParseError::Syntax(self.skipped(error, start))
@@ -480,47 +573,217 @@ impl<'a, R: Read> TurtleParser<'a, R> {
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
     /// the `}` closing the TriG block it is in), so that parsing goes on with the next one.
-    /// Bytes the lexer can't read are skipped one by one. `false` at the end of the input,
-    /// or on a read error.
+    /// What is open while skipping, readable tokens or not, is one stack of brackets with
+    /// their kinds (see [`Brackets::apply`]):
+    /// - at its bottom, the brackets the statement had open when it failed (`unclosed`),
+    ///   so a `.` inside them ends nothing; then its failing token if that was an opener, a
+    ///   closer (braces included) or a `.` (`failed`), counted as the first token skipped: a
+    ///   failing `.` with nothing open has ended the statement, and nothing more is skipped;
+    /// - above them, the brackets opened while skipping. A closer closes the innermost open
+    ///   bracket of its own pair, with those opened inside it; with none of its pair open it
+    ///   closes nothing.
+    ///
+    /// A token the lexer can't read is skipped whole where its end is known, and nothing
+    /// open is forgotten (see `skip_malformed`). Where a quote has no closing quote after it
+    /// (a missing closer), only the quote is skipped and the text after it is read as tokens,
+    /// what was open still open: nothing inside the failed statement is ever emitted, and its
+    /// span, to where parsing resumes, is the error's skipped statement. A string already
+    /// known to have no closing quote (`no_closing`) is skipped so before it is lexed, which
+    /// would search to the end again. `false` at the end of the input, or on a read error.
+    /// Cold, and never inlined: recovery stays out of the parsing path.
+    #[cold]
+    #[inline(never)]
     fn resync(&mut self) -> bool {
         self.lookahead = None;
         self.arena.clear();
         self.triples.clear();
         self.triple_terms.clear();
-        let (mut nesting, mut braces) = (0i64, 0i64);
+        // Outermost first: `unclosed` was noted innermost first, as the error unwound.
+        let mut open = Brackets::default();
+        for &pair in self.unclosed.iter().rev() {
+            open.push(pair);
+        }
+        // The allocation is kept for the next failed statement.
+        self.unclosed.clear();
+        let failed = self.failed.take();
+        // Debug builds: every opener `take` counted is still open in a routine that noted it,
+        // or is the failing token; every closer it counted closed its own routine's opener, or
+        // is the failing token; and the statement ended at its failing token exactly when that
+        // is a `.` taken with nothing open. A routine taking an opener without `within`, or a
+        // site rejecting a token without `unexpected`, breaks this.
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                self.open,
+                open.len() as i64
+                    + match failed {
+                        Some(opener!()) => 1,
+                        Some(closer!()) => -1,
+                        _ => 0,
+                    },
+                "the brackets noted open disagree with those taken",
+            );
+            assert_eq!(
+                self.ended,
+                failed == Some(Kind::Dot) && open.is_empty(),
+                "the statement's end noted disagrees with the one taken",
+            );
+        }
+        let mut braces = 0i64;
+        let mut ending = std::mem::replace(&mut self.ending, Ending::Dot);
+        // The failing token counts as the first one skipped: a `}` closing the TriG block
+        // ends the statement right there.
+        let ended = ending == Ending::Ended
+            || failed
+                .is_some_and(|kind| self.skip_token(kind, &mut open, &mut braces, &mut ending));
+        ended || self.skip_rest(&mut open, &mut braces, &mut ending)
+    }
+
+    /// The rest of a failed statement, skipped token by token (`skip_token`) up to its end:
+    /// `true` there, `false` at the end of the input or on a read error (see `resync`). A
+    /// failed `PREFIX` or `BASE` ends after its next IRI, a failed `VERSION` after its next
+    /// short string (`ending`).
+    fn skip_rest(&mut self, open: &mut Brackets, braces: &mut i64, ending: &mut Ending) -> bool {
         loop {
+            if self.no_closing != [[false; 2]; 2] {
+                let no_closing = self.no_closing;
+                let missing =
+                    |opening: Opening| no_closing[quote(opening)][usize::from(opening.long)];
+                let data = &self.input.data()[self.input.position..];
+                if let Some(n) = known_missing(data, self.input.eof(), missing) {
+                    self.input.consume(n);
+                    continue;
+                }
+            }
             match self.fill() {
                 Ok(()) => {}
-                Err(RdfParseError::Io(_)) => return false,
+                Err(RdfParseError::Io(error)) => {
+                    // Recovery stops; the parser returns the read error after the syntax
+                    // error (`next_ref`).
+                    self.input.held = Some(error);
+                    break false;
+                }
                 Err(_) => {
-                    // Unreadable bytes: drop one and lex again.
                     self.lookahead = None;
-                    if self.input.position < self.input.data().len() {
-                        self.input.consume(1);
-                    } else if self.input.eof() || self.input.refill().is_err() {
-                        return false;
+                    // Bytes the lexer can't read after a graph block's head: no block.
+                    if *ending == Ending::Head {
+                        *ending = Ending::Dot;
+                    }
+                    if !self.skip_malformed() {
+                        break false;
                     }
                     continue;
                 }
             }
             let Some(token) = self.lookahead.take() else {
-                return false;
+                break false;
             };
             self.input.consume(token.consumed);
             self.after_string = matches!(token.kind, Kind::String { .. });
-            match token.kind {
-                Kind::Eof => return false,
-                Kind::OpenBracket | Kind::OpenParen => nesting += 1,
-                Kind::CloseBracket | Kind::CloseParen => nesting -= 1,
-                Kind::OpenBrace => braces += 1,
-                Kind::CloseBrace if braces > 0 => braces -= 1,
-                Kind::CloseBrace if self.settings.trig && self.in_block => {
-                    self.in_block = false;
-                    self.graph = None;
+            if token.kind == Kind::Eof {
+                break false;
+            }
+            let directive_end = match *ending {
+                Ending::Iri => matches!(token.kind, Kind::IriRef { .. }),
+                Ending::String => {
+                    matches!(token.kind, Kind::String { .. }) && token.text.start == token.start + 1
+                }
+                _ => false,
+            };
+            if directive_end {
+                // A version label isn't a literal: no language tag follows it (as in
+                // `version`), and the next statement starts as a chunk does.
+                self.after_string = false;
+                break true;
+            }
+            if self.skip_token(token.kind, open, braces, ending) {
+                break true;
+            }
+        }
+    }
+
+    /// One token of a failed statement, its failing token or one of its rest, applied to
+    /// what is open there: brackets (`open`, see [`Brackets::apply`]), the `{` opened in it
+    /// (`braces`) and the block of a failed graph block's head (`ending`). `true` when it
+    /// ends the statement: the `}` closing the TriG block it is in, or the one its own head
+    /// opened (open brackets or not), or a `.` with nothing open outside that block.
+    fn skip_token(
+        &mut self,
+        kind: Kind,
+        open: &mut Brackets,
+        braces: &mut i64,
+        ending: &mut Ending,
+    ) -> bool {
+        // A graph block's head that failed: the `{` right after it opens its block all the
+        // same; anything else, no block.
+        if *ending == Ending::Head {
+            *ending = Ending::Dot;
+            if kind == Kind::OpenBrace {
+                *ending = Ending::Block;
+                return false;
+            }
+        }
+        match kind {
+            Kind::OpenBrace => *braces += 1,
+            Kind::CloseBrace if *braces > 0 => *braces -= 1,
+            Kind::CloseBrace if *ending == Ending::Block => return true,
+            Kind::CloseBrace if self.settings.trig && self.in_block => {
+                self.in_block = false;
+                self.graph = None;
+                return true;
+            }
+            Kind::Dot => return open.is_empty() && *braces == 0 && *ending != Ending::Block,
+            opener!() | closer!() => open.apply(kind),
+            _ => {}
+        }
+        false
+    }
+
+    /// Skips the token the lexer couldn't read, where `fill` stopped: a string up to its
+    /// closing quote, by the lexer's own string rules with line breaks allowed
+    /// ([`malformed`]); a string with no closing quote after it, its quote only (noted in
+    /// `no_closing`: a failed short search answers for later strings of that quote, a
+    /// failed long one for later long ones); anything else, one byte. Before searching
+    /// again for more input, it reads at least as much again as it has, so a long string
+    /// costs linear work even from a reader that gives a byte at a time. A read error while
+    /// reading ahead is held (`Input::held`) and the search goes on with what was read: the
+    /// error comes when the input is next needed, after what it already holds. `false` at
+    /// the end of the input, or when the string's end can't be read (the error then held).
+    fn skip_malformed(&mut self) -> bool {
+        loop {
+            let no_closing = self.no_closing;
+            let search = |opening: Opening| !no_closing[quote(opening)][usize::from(opening.long)];
+            let data = &self.input.data()[self.input.position..];
+            match malformed(data, self.input.eof(), search) {
+                Malformed::Skip(0) => return false,
+                Malformed::Skip(n) => {
+                    self.input.consume(n);
                     return true;
                 }
-                Kind::Dot if nesting <= 0 && braces == 0 => return true,
-                _ => {}
+                Malformed::Missing(n, opening) => {
+                    let quote = quote(opening);
+                    self.no_closing[quote][1] = true;
+                    if !opening.long {
+                        self.no_closing[quote][0] = true;
+                    }
+                    self.input.consume(n);
+                    return true;
+                }
+                Malformed::NeedMore => {
+                    if self.input.held.is_some() {
+                        // The end can't be read: recovery stops, the error comes next.
+                        return false;
+                    }
+                    let wanted = 2 * data.len() + 1;
+                    while self.input.data().len() - self.input.position < wanted
+                        && !self.input.eof()
+                    {
+                        if let Err(error) = self.input.refill() {
+                            self.input.held = Some(error);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -634,15 +897,91 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let token = self.lookahead.take().expect("filled");
         self.input.consume(token.consumed);
         self.after_string = matches!(token.kind, Kind::String { .. });
+        // Debug builds: what of the statement is open, and whether this token is its end (a
+        // `.` with nothing open), for `resync`'s check of what errors note.
+        #[cfg(debug_assertions)]
+        {
+            match token.kind {
+                opener!() => self.open += 1,
+                closer!() => self.open -= 1,
+                _ => {}
+            }
+            self.ended = token.kind == Kind::Dot && self.open == 0;
+        }
         Ok(token)
     }
 
     fn expect(&mut self, kind: Kind, what: &'static str) -> Step<Token> {
         let token = self.take()?;
         if token.kind != kind {
-            return Err(self.error(token.start, what));
+            return Err(self.unexpected(&token, what));
         }
         Ok(token)
+    }
+
+    /// The error for `token`, taken where the grammar has no place for it. An opener or a
+    /// closer, braces included, or a `.` is noted (`failed`): it opens, closes or ends in the
+    /// document though no routine took it as such, and recovery counts it (`resync`).
+    #[cold]
+    fn unexpected(&mut self, token: &Token, what: impl Into<String>) -> RdfParseError {
+        if matches!(
+            token.kind,
+            opener!() | closer!() | Kind::OpenBrace | Kind::CloseBrace | Kind::Dot
+        ) {
+            self.failed = Some(token.kind);
+        }
+        self.error(token.start, what)
+    }
+
+    /// `inside`, the part of a statement right after `opener` was taken, up to and with its
+    /// closer. On an error the opener is still open: it is noted (`unclosed`, as the error
+    /// unwinds, so innermost first) for recovery to keep it open (`resync`). On success
+    /// nothing is added to what `?` does.
+    #[inline(always)]
+    fn within<T>(&mut self, opener: Kind, inside: impl FnOnce(&mut Self) -> Step<T>) -> Step<T> {
+        match inside(self) {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.still_open(opener, error)),
+        }
+    }
+
+    #[cold]
+    fn still_open(&mut self, opener: Kind, error: RdfParseError) -> RdfParseError {
+        self.unclosed.push(pair(opener));
+        error
+    }
+
+    /// `inside`, a statement's part whose form says where the statement ends if it fails
+    /// there (`ending`, see [`Ending`]): noted on an error, unless a closer reading was noted
+    /// inside. On success nothing is added to what `?` does.
+    #[inline(always)]
+    fn ends_with<T>(
+        &mut self,
+        ending: Ending,
+        inside: impl FnOnce(&mut Self) -> Step<T>,
+    ) -> Step<T> {
+        match inside(self) {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.ending_noted(ending, error)),
+        }
+    }
+
+    #[cold]
+    fn ending_noted(&mut self, ending: Ending, error: RdfParseError) -> RdfParseError {
+        if self.ending == Ending::Dot {
+            self.ending = ending;
+        }
+        error
+    }
+
+    /// `error`, in a SPARQL-style directive (not `dot`) whose IRI has been taken: the
+    /// directive has ended there.
+    #[cold]
+    fn ended_with(&mut self, dot: bool, error: RdfParseError) -> RdfParseError {
+        if !dot {
+            self.ending = Ending::Ended;
+        }
+        error
     }
 
     /// The text of a token taken last.
@@ -785,7 +1124,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     return Err(self.error(token.start, "a prefixed name that isn't an IRI"));
                 }
             }
-            _ => return Err(self.error(token.start, "expected an IRI")),
+            _ => return Err(self.unexpected(token, "expected an IRI")),
         }
         Ok(self.span_from(start))
     }
@@ -851,14 +1190,21 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 Err(self.error(token.start, "a directive inside a graph block"))
             }
             Kind::AtPrefix => self.prefix(true),
-            Kind::Prefix => self.prefix(false),
+            // The SPARQL forms end after their IRI or string, not at a `.`.
+            Kind::Prefix => self.ends_with(Ending::Iri, |p| p.prefix(false)),
             Kind::AtBase => self.base(true),
-            Kind::Base => self.base(false),
+            Kind::Base => self.ends_with(Ending::Iri, |p| p.base(false)),
             Kind::AtVersion => self.version(true),
-            Kind::Version => self.version(false),
+            Kind::Version => self.ends_with(Ending::String, |p| p.version(false)),
             Kind::Graph if trig && !self.in_block => {
                 let label = self.take()?;
-                let label = self.graph_label(&label)?;
+                // A graph name that fails still heads its block.
+                let label = match label.kind {
+                    Kind::IriRef { .. } | Kind::PrefixedName { .. } | Kind::BlankLabel => {
+                        self.ends_with(Ending::Head, |p| p.graph_label(&label))?
+                    }
+                    _ => self.graph_label(&label)?,
+                };
                 self.expect(Kind::OpenBrace, "expected '{' after the graph's name")?;
                 self.open_block(Some(label))
             }
@@ -873,9 +1219,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             Kind::IriRef { .. } | Kind::PrefixedName { .. } | Kind::BlankLabel
                 if trig && !self.in_block =>
             {
+                // A graph name that fails still heads its block, if `{` follows (`Ending`).
                 let term = match token.kind {
-                    Kind::BlankLabel => Term::Blank(self.blank_label(&token)?),
-                    _ => Term::Iri(self.iri(&token)?),
+                    Kind::BlankLabel => {
+                        Term::Blank(self.ends_with(Ending::Head, |p| p.blank_label(&token))?)
+                    }
+                    _ => Term::Iri(self.ends_with(Ending::Head, |p| p.iri(&token))?),
                 };
                 if self.peek()? == Kind::OpenBrace {
                     self.take()?;
@@ -893,7 +1242,11 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 self.predicate_object_list(term, 0)?;
                 self.end_of_triples()
             }
-            Kind::OpenBracket if trig && !self.in_block && self.peek()? == Kind::CloseBracket => {
+            Kind::OpenBracket
+                if trig
+                    && !self.in_block
+                    && self.within(Kind::OpenBracket, Self::peek)? == Kind::CloseBracket =>
+            {
                 // `[]`: a graph's name, or the subject of triples.
                 self.take()?;
                 if self.peek()? == Kind::OpenBrace {
@@ -945,7 +1298,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 ))
             }
             Kind::OpenBracket => {
-                self.expect(Kind::CloseBracket, "expected '[]' as a graph's name")?;
+                self.within(Kind::OpenBracket, |p| {
+                    p.expect(Kind::CloseBracket, "expected '[]' as a graph's name")
+                })?;
                 let Term::Blank(span) = self.fresh() else {
                     unreachable!()
                 };
@@ -953,7 +1308,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     self.arena[span.start as usize..span.end as usize].to_owned(),
                 ))
             }
-            _ => Err(self.error(token.start, "expected a graph's name")),
+            _ => Err(self.unexpected(token, "expected a graph's name")),
         }
     }
 
@@ -961,7 +1316,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn prefix(&mut self, dot: bool) -> Step<()> {
         let name = self.take()?;
         let Kind::PrefixedName { colon, .. } = name.kind else {
-            return Err(self.error(name.start, "expected a prefix name ending with ':'"));
+            let error = self.unexpected(&name, "expected a prefix name ending with ':'");
+            // `PREFIX <iri>`: the SPARQL form ends with its IRI.
+            return Err(match name.kind {
+                Kind::IriRef { .. } => self.ended_with(dot, error),
+                _ => error,
+            });
         };
         let text = self.text(&name)?;
         if text.len() != colon + 1 {
@@ -970,9 +1330,11 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let prefix = text[..colon].to_owned();
         let iri = self.take()?;
         if !matches!(iri.kind, Kind::IriRef { .. }) {
-            return Err(self.error(iri.start, "expected the prefix's IRI"));
+            return Err(self.unexpected(&iri, "expected the prefix's IRI"));
         }
-        self.resolve_iri(&iri)?;
+        if let Err(error) = self.resolve_iri(&iri) {
+            return Err(self.ended_with(dot, error));
+        }
         self.prefixes.insert(prefix, self.resolved.clone());
         if dot {
             self.expect(Kind::Dot, "expected '.' after @prefix")?;
@@ -984,13 +1346,18 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn base(&mut self, dot: bool) -> Step<()> {
         let iri = self.take()?;
         if !matches!(iri.kind, Kind::IriRef { .. }) {
-            return Err(self.error(iri.start, "expected the base IRI"));
+            return Err(self.unexpected(&iri, "expected the base IRI"));
         }
-        self.resolve_iri(&iri)?;
-        self.base = Some(
-            Iri::parse(self.resolved.clone())
-                .map_err(|e| self.error(iri.text.start, format!("an invalid base IRI: {e}")))?,
-        );
+        if let Err(error) = self.resolve_iri(&iri) {
+            return Err(self.ended_with(dot, error));
+        }
+        match Iri::parse(self.resolved.clone()) {
+            Ok(base) => self.base = Some(base),
+            Err(e) => {
+                let error = self.error(iri.text.start, format!("an invalid base IRI: {e}"));
+                return Err(self.ended_with(dot, error));
+            }
+        }
         if dot {
             self.expect(Kind::Dot, "expected '.' after @base")?;
         }
@@ -1004,7 +1371,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         self.after_string = false;
         let long = label.text.start - label.start == 3;
         if !matches!(label.kind, Kind::String { .. }) || long {
-            return Err(self.error(label.start, "expected the version label as a short string"));
+            return Err(self.unexpected(&label, "expected the version label as a short string"));
         }
         if dot {
             self.expect(Kind::Dot, "expected '.' after @version")?;
@@ -1017,7 +1384,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn triples_from(&mut self, first: Token) -> Step<()> {
         match first.kind {
             Kind::ReifiedOpen => {
-                let subject = self.reified_triple(0)?;
+                let subject = self.within(Kind::ReifiedOpen, |p| p.reified_triple(0))?;
                 if self.peek_is_verb()? {
                     self.predicate_object_list(subject, 0)?;
                 }
@@ -1033,23 +1400,25 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             }
             Kind::OpenBracket => {
                 let subject = self.fresh();
-                if self.peek()? == Kind::CloseBracket {
+                if self.within(Kind::OpenBracket, Self::peek)? == Kind::CloseBracket {
                     // `[]` as subject: a predicate-object list must follow.
                     self.take()?;
                     return self.predicate_object_list(subject, 0);
                 }
-                self.predicate_object_list(subject, 1)?;
-                self.expect(Kind::CloseBracket, "expected ']'")?;
+                self.within(Kind::OpenBracket, |p| {
+                    p.predicate_object_list(subject, 1)?;
+                    p.expect(Kind::CloseBracket, "expected ']'")
+                })?;
                 if self.peek_is_verb()? {
                     self.predicate_object_list(subject, 0)?;
                 }
                 Ok(())
             }
             Kind::OpenParen => {
-                let subject = self.collection(1)?;
+                let subject = self.within(Kind::OpenParen, |p| p.collection(1))?;
                 self.predicate_object_list(subject, 0)
             }
-            _ => Err(self.error(first.start, "expected a subject")),
+            _ => Err(self.unexpected(&first, "expected a subject")),
         }
     }
 
@@ -1099,7 +1468,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         match verb.kind {
             Kind::A => Ok(Term::Static(rdf::TYPE)),
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => Ok(Term::Iri(self.iri(&verb)?)),
-            _ => Err(self.error(verb.start, "expected a predicate")),
+            _ => Err(self.unexpected(&verb, "expected a predicate")),
         }
     }
 
@@ -1116,30 +1485,34 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             | Kind::True
             | Kind::False => self.literal(&token)?,
             Kind::OpenBracket => {
-                let depth = self.deeper(depth, token.start)?;
-                let node = self.fresh();
-                self.emit(subject, predicate, node);
-                if self.peek()? != Kind::CloseBracket {
-                    self.predicate_object_list(node, depth)?;
-                }
-                self.expect(Kind::CloseBracket, "expected ']'")?;
-                return Ok(node);
+                return self.within(Kind::OpenBracket, |p| {
+                    let depth = p.deeper(depth, token.start)?;
+                    let node = p.fresh();
+                    p.emit(subject, predicate, node);
+                    if p.peek()? != Kind::CloseBracket {
+                        p.predicate_object_list(node, depth)?;
+                    }
+                    p.expect(Kind::CloseBracket, "expected ']'")?;
+                    Ok(node)
+                });
             }
             Kind::OpenParen => {
-                let depth = self.deeper(depth, token.start)?;
-                let head = self.collection(depth)?;
+                let head = self.within(Kind::OpenParen, |p| {
+                    let depth = p.deeper(depth, token.start)?;
+                    p.collection(depth)
+                })?;
                 self.emit(subject, predicate, head);
                 return Ok(head);
             }
-            Kind::TripleTermOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.triple_term(depth)?
-            }
-            Kind::ReifiedOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.reified_triple(depth)?
-            }
-            _ => return Err(self.error(token.start, "expected an object")),
+            Kind::TripleTermOpen => self.within(Kind::TripleTermOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.triple_term(depth)
+            })?,
+            Kind::ReifiedOpen => self.within(Kind::ReifiedOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.reified_triple(depth)
+            })?,
+            _ => return Err(self.unexpected(&token, "expected an object")),
         };
         self.emit(subject, predicate, object);
         Ok(object)
@@ -1163,13 +1536,15 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => Ok(Term::Iri(self.iri(token)?)),
             Kind::BlankLabel => Ok(Term::Blank(self.blank_label(token)?)),
             Kind::OpenBracket => {
-                self.expect(
-                    Kind::CloseBracket,
-                    "expected ']': only '[]' is allowed here",
-                )?;
+                self.within(Kind::OpenBracket, |p| {
+                    p.expect(
+                        Kind::CloseBracket,
+                        "expected ']': only '[]' is allowed here",
+                    )
+                })?;
                 Ok(self.fresh())
             }
-            _ => Err(self.error(token.start, what)),
+            _ => Err(self.unexpected(token, what)),
         }
     }
 
@@ -1193,10 +1568,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let predicate = self.verb()?;
         let token = self.take()?;
         let object = match token.kind {
-            Kind::TripleTermOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.triple_term(depth)?
-            }
+            Kind::TripleTermOpen => self.within(Kind::TripleTermOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.triple_term(depth)
+            })?,
             kind if Self::starts_literal(kind) => self.literal(&token)?,
             _ => self.node(
                 &token,
@@ -1215,10 +1590,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn reified_triple(&mut self, depth: usize) -> Step<Term> {
         let token = self.take()?;
         let subject = match token.kind {
-            Kind::ReifiedOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.reified_triple(depth)?
-            }
+            Kind::ReifiedOpen => self.within(Kind::ReifiedOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.reified_triple(depth)
+            })?,
             _ => self.node(
                 &token,
                 "expected an IRI, a blank node or a reified triple as subject",
@@ -1227,14 +1602,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let predicate = self.verb()?;
         let token = self.take()?;
         let object = match token.kind {
-            Kind::ReifiedOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.reified_triple(depth)?
-            }
-            Kind::TripleTermOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.triple_term(depth)?
-            }
+            Kind::ReifiedOpen => self.within(Kind::ReifiedOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.reified_triple(depth)
+            })?,
+            Kind::TripleTermOpen => self.within(Kind::TripleTermOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.triple_term(depth)
+            })?,
             kind if Self::starts_literal(kind) => self.literal(&token)?,
             _ => self.node(&token, "expected an object of the reified triple")?,
         };
@@ -1289,21 +1664,23 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 }
                 Kind::AnnotationOpen => {
                     let token = self.take()?;
-                    let depth = self.deeper(depth, token.start)?;
-                    let triple = match term {
-                        Some(triple) => triple,
-                        None => *term.insert(self.add_triple_term(subject, predicate, object)),
-                    };
-                    let block_subject = match reifier.take() {
-                        Some(named) => named,
-                        None => {
-                            let fresh = self.fresh();
-                            self.emit(fresh, Term::Static(rdf::REIFIES), triple);
-                            fresh
-                        }
-                    };
-                    self.predicate_object_list(block_subject, depth)?;
-                    self.expect(Kind::AnnotationClose, "expected '|}' after the annotation")?;
+                    self.within(Kind::AnnotationOpen, |p| {
+                        let depth = p.deeper(depth, token.start)?;
+                        let triple = match term {
+                            Some(triple) => triple,
+                            None => *term.insert(p.add_triple_term(subject, predicate, object)),
+                        };
+                        let block_subject = match reifier.take() {
+                            Some(named) => named,
+                            None => {
+                                let fresh = p.fresh();
+                                p.emit(fresh, Term::Static(rdf::REIFIES), triple);
+                                fresh
+                            }
+                        };
+                        p.predicate_object_list(block_subject, depth)?;
+                        p.expect(Kind::AnnotationClose, "expected '|}' after the annotation")
+                    })?;
                 }
                 _ => return Ok(()),
             }
@@ -1386,6 +1763,11 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             _ => Term::Static(rdf::NIL),
         })
     }
+}
+
+/// The index of a string opening's quote in `no_closing`: `"` then `'`.
+fn quote(opening: Opening) -> usize {
+    usize::from(opening.quote == b'\'')
 }
 
 /// A key random per document, for generated blank nodes.

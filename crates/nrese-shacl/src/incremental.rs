@@ -18,16 +18,20 @@
 //! changed statement is an `rdfs:subClassOf` (class membership of every node may move).
 //! So is a shape whose affected nodes pass [`MAX_AFFECTED`].
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use nrese_engine::{EncodedQuad, GraphSelector, TermId};
+use nrese_exec::Reservation;
+use nrese_rdf::Term;
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::graph::{GraphView, Selection};
-use crate::model::{Constraint, Path, ShapeRef, Shapes, Target};
+use crate::model::{Constraint, Path, Shape, ShapeRef, Shapes, Target};
 use crate::path;
 use crate::report::{ValidationReport, decode};
-use crate::validate::{RawResult, Validator};
+use crate::validate::{self, RawResult, Validator};
 
 /// Affected focus nodes per shape beyond which the shape is validated whole: following
 /// that many nodes back costs about what a full validation does.
@@ -61,10 +65,15 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    let validator_before = Validator::new(before, shapes, data, resources);
-    let validator_after = Validator::new(after, shapes, data, resources);
+    // Both states tell a query's terms stored or computed by the state after's dictionary:
+    // one term, one form in both ([`ResultTerm`]).
+    let frontier = |term: &Term| graph_after.lookup(term);
+    // The state before's failures are thrown away: none is made or charged.
+    let validator_before = Validator::discarding_failures(before, shapes, data, resources)
+        .with_frontier(&frontier)
+        .comparing();
+    let validator_after = Validator::new(after, shapes, data, resources).comparing();
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
-    let mut failures = Vec::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
@@ -105,16 +114,182 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let before_results = validator_before.validate_all(&work(focus(
                 validator_before.focus_nodes(&shapes.shapes[shape]),
             )));
+            // Charged per result found, so counted before the set drops repeated ones.
+            let before_bytes: usize = before_results.iter().map(RawResult::retained_bytes).sum();
             let before: BTreeSet<RawResult> = before_results.into_iter().collect();
-            introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
+            // Results kept are charged to their state's validator; those dropped here are
+            // returned to it once freed.
+            let mut dropped = 0;
+            for result in after_results {
+                if before.contains(&result) || introduced.contains(&result) {
+                    dropped += result.retained_bytes();
+                } else {
+                    introduced.insert(result);
+                }
+            }
+            validator_after.release(dropped);
+            drop(before);
+            validator_before.release(before_bytes);
         }
     }
-    // A stop in either state is the outcome; only the state after reports its failures.
-    failures.extend(validator_after.into_failures()?);
-    validator_before.into_failures()?;
+    // A stop in either state is the outcome: what was introduced is freed before the
+    // validators (and their charges) go.
+    if validator_after.has_stopped() || validator_before.has_stopped() {
+        introduced.clear();
+    }
+    // Only the state after reports its failures, which the report takes over with their
+    // charge; the state before's are dropped now, with theirs.
+    let (failures, held_after) = validator_after.into_failures()?;
+    let (earlier_failures, held_before) = validator_before.into_failures()?;
+    drop(earlier_failures);
     let raw: Vec<RawResult> = introduced.into_iter().collect();
-    Ok(decode(after, shapes, &raw, failures))
+    // The raw results are freed as they are decoded, then their charges returned.
+    let report = decode(after, shapes, raw, failures, resources);
+    drop((held_after, held_before));
+    report
 }
+
+/// The results a change of the shapes introduces in `data`: full validation against
+/// `shapes_after` in `after`, less what full validation against `shapes_before` found in
+/// `before` (`None`: the shapes didn't compile before, so nothing was found), with the
+/// failures of the state after. Both views must share one dictionary, and each set of
+/// shapes be compiled from it. Runs on `resources` as [`crate::validate`] does.
+///
+/// The state before is validated only to tell its results apart: not at all when the state
+/// after has none, and without its failures, which are neither made nor charged. So a
+/// commit that removes what failed (an unsupported `sh:entailment`, a broken constraint)
+/// can't be refused by what it removes.
+///
+/// A result is the same finding in either compilation when its focus node, path, value,
+/// shape (by node), component, source constraint, the shape's severity and the messages in
+/// effect (the result's own, else the shape's) are: compared in place, nothing copied
+/// ([`Key`]). The comparison's own storage is charged to `resources` before it is filled,
+/// and it checks `resources` as it goes; only the results introduced are decoded.
+pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    shapes_before: Option<&Shapes>,
+    after: &B,
+    shapes_after: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    // Its results are compared only where there were shapes before.
+    let compares = shapes_before.is_some();
+    let (raw, failures, held_after) =
+        validate::validate_raw(after, shapes_after, data, resources, compares)?;
+    // Declared after their charge, so dropped before it, whatever the outcome.
+    let mut later = raw;
+    if let Some(shapes_before) = shapes_before
+        && !later.is_empty()
+    {
+        // Both states tell a query's terms stored or computed by the state after's
+        // dictionary, which the state after's own ids (its shapes' paths included) are of.
+        let graph_after = GraphView::new(after, data);
+        let frontier = |term: &Term| graph_after.lookup(term);
+        let (earlier, held_before) =
+            validate::validate_raw_results(before, shapes_before, data, resources, &frontier)?;
+        let kept = introduced(&earlier, shapes_before, later, shapes_after, resources);
+        // The earlier results are freed, then their charge returned.
+        drop(earlier);
+        drop(held_before);
+        later = kept?;
+    }
+    // The raw results are freed as they are decoded, then their charge returned.
+    let report = decode(after, shapes_after, later, failures, resources);
+    drop(held_after);
+    report
+}
+
+/// A result as the same finding in any compilation of the shapes ([`validate_shapes_change`]):
+/// borrowed, so comparing copies nothing.
+struct Key<'r> {
+    result: &'r RawResult,
+    shapes: &'r Shapes,
+}
+
+impl<'r> Key<'r> {
+    fn shape(&self) -> &'r Shape {
+        &self.shapes.shapes[self.result.shape]
+    }
+
+    /// The messages in effect: the result's own, else its shape's.
+    fn messages(&self) -> &'r [TermId] {
+        self.result
+            .messages
+            .as_deref()
+            .unwrap_or(&self.shape().messages)
+    }
+
+    fn order(&self, other: &Self) -> Ordering {
+        let (a, b) = (self.result, other.result);
+        a.focus
+            .cmp(&b.focus)
+            .then_with(|| a.component.cmp(&b.component))
+            .then_with(|| self.shape().node.cmp(&other.shape().node))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.value.cmp(&b.value))
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| self.shape().severity.cmp(&other.shape().severity))
+            .then_with(|| self.messages().cmp(other.messages()))
+    }
+}
+
+/// The results of `later` (validated against `shapes_after`) that no result of `earlier`
+/// (against `shapes_before`) is the same finding as ([`Key`]); the others are freed. The
+/// earlier keys' storage is charged before it is filled; `resources` is checked every
+/// [`CHECK_EVERY`] keys. A refusal or a cancellation is the outcome.
+fn introduced(
+    earlier: &[RawResult],
+    shapes_before: &Shapes,
+    mut later: Vec<RawResult>,
+    shapes_after: &Shapes,
+    resources: &Resources,
+) -> Result<Vec<RawResult>, QueryEvaluationError> {
+    let mut held = Reservation::new(Arc::new(resources.memory.part()));
+    held.charge(earlier.len() * std::mem::size_of::<Key<'_>>())?;
+    let mut keys: Vec<Key<'_>> = Vec::with_capacity(earlier.len());
+    for (i, result) in earlier.iter().enumerate() {
+        if i % CHECK_EVERY == 0 {
+            resources.check()?;
+        }
+        keys.push(Key {
+            result,
+            shapes: shapes_before,
+        });
+    }
+    keys.sort_unstable_by(Key::order);
+    // In place: the later results kept stay where they are, the others are freed.
+    let mut checked = 0;
+    let mut stop = None;
+    later.retain(|result| {
+        if stop.is_some() {
+            return false;
+        }
+        if checked % CHECK_EVERY == 0
+            && let Err(error) = resources.check()
+        {
+            stop = Some(error);
+            return false;
+        }
+        checked += 1;
+        let key = Key {
+            result,
+            shapes: shapes_after,
+        };
+        keys.binary_search_by(|earlier| earlier.order(&key))
+            .is_err()
+    });
+    // The keys go before their charge.
+    drop(keys);
+    drop(held);
+    match stop {
+        Some(stop) => Err(stop),
+        None => Ok(later),
+    }
+}
+
+/// How many keys a comparison handles between two checks of its resources.
+const CHECK_EVERY: usize = 4096;
 
 fn in_selection(data: Selection, graph: TermId) -> bool {
     let selected = match data.graphs {

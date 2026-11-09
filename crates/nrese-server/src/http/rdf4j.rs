@@ -34,7 +34,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Term};
+use nrese_rdf::{GraphName, Literal, Term};
 
 use crate::access::AccessView;
 use nrese_store::{
@@ -52,6 +52,7 @@ use crate::http::requests::{
     accept_header_value, query_from_post, query_from_url, update_from_post,
 };
 use crate::http::sparql;
+use crate::policy::PolicyConfig;
 use crate::repositories::DEFAULT_REPOSITORY;
 use crate::state::AppState;
 
@@ -70,77 +71,12 @@ fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// A term written as in N-Triples.
+/// A term written as in N-Triples, the whole parameter (spaces and line ends around it
+/// aside), read by the N-Triples reader ([`nrese_rdf_io::parse_term`]).
 pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
-    let bad = || ApiError::bad_request(format!("'{text}' is not an N-Triples term"));
-    let text = text.trim();
-    if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
-        return NamedNode::new(unescape(iri).ok_or_else(bad)?)
-            .map(Term::from)
-            .map_err(|_| bad());
-    }
-    if let Some(label) = text.strip_prefix("_:") {
-        return BlankNode::new(label).map(Term::from).map_err(|_| bad());
-    }
-    let rest = text.strip_prefix('"').ok_or_else(bad)?;
-    // The closing quote: the last one not escaped.
-    let mut end = None;
-    let mut escaped = false;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '\\' if !escaped => escaped = true,
-            '"' if !escaped => end = Some(i),
-            _ => escaped = false,
-        }
-        if c != '\\' {
-            escaped = false;
-        }
-    }
-    let end = end.ok_or_else(bad)?;
-    let value = unescape(&rest[..end]).ok_or_else(bad)?;
-    let suffix = &rest[end + 1..];
-    if suffix.is_empty() {
-        return Ok(Literal::new_simple_literal(value).into());
-    }
-    if let Some(language) = suffix.strip_prefix('@') {
-        return Literal::new_language_tagged_literal(value, language)
-            .map(Term::from)
-            .map_err(|_| bad());
-    }
-    let datatype = suffix
-        .strip_prefix("^^<")
-        .and_then(|d| d.strip_suffix('>'))
-        .ok_or_else(bad)?;
-    let datatype = NamedNode::new(unescape(datatype).ok_or_else(bad)?).map_err(|_| bad())?;
-    Ok(Literal::new_typed_literal(value, datatype).into())
-}
-
-/// N-Triples string escapes undone; `None` for a malformed one (a `\u` escape takes exactly
-/// four hex digits, `\U` eight, as everywhere else).
-fn unescape(text: &str) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('\\') {
-        out.push_str(&rest[..at]);
-        let escape = &rest[at..];
-        let (c, width) = match escape.as_bytes().get(1)? {
-            b't' => ('\t', 2),
-            b'b' => ('\u{8}', 2),
-            b'n' => ('\n', 2),
-            b'r' => ('\r', 2),
-            b'f' => ('\u{c}', 2),
-            b'"' => ('"', 2),
-            b'\'' => ('\'', 2),
-            b'\\' => ('\\', 2),
-            b'u' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 6),
-            b'U' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 10),
-            _ => return None,
-        };
-        out.push(c);
-        rest = &escape[width..];
-    }
-    out.push_str(rest);
-    Some(out)
+    nrese_rdf_io::parse_term(text.trim()).map_err(|error| {
+        ApiError::bad_request(format!("'{text}' is not an N-Triples term: {error}"))
+    })
 }
 
 /// The graphs of the `context` parameters (`null`: the default graph).
@@ -212,12 +148,16 @@ fn is_update(headers: &HeaderMap) -> bool {
         || media_type_matches(content_type, "application/sparql-update")
 }
 
+/// The SPARQL update of a request, within the policy's update limit (its decoded text, as
+/// `/dataset/update` counts it): every RDF4J path that takes one comes here.
 pub(crate) fn update(
+    policy: &PolicyConfig,
     raw: &RawQuery,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<SparqlUpdateRequest, ApiError> {
     let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
+    policy.enforce_update_bytes(operation.update.len())?;
     Ok(SparqlUpdateRequest {
         update: operation.update,
         using_graphs: operation.using_graphs,
@@ -240,7 +180,7 @@ fn read_error(error: nrese_store::StoreError) -> ApiError {
 
 pub(crate) async fn apply(
     state: &AppState,
-    ops: Vec<StatementOp>,
+    ops: impl Into<nrese_store::StatementOps>,
     access: &AccessView,
 ) -> Result<(), ApiError> {
     mutation::run(
@@ -480,7 +420,7 @@ pub async fn query_post(
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
     if form_update || media_type_matches(content_type, "application/sparql-update") {
         let access = guard::update_access(&state, &authenticated).await?;
-        let request = update(&raw, &headers, &body)?;
+        let request = update(&state.policy(), &raw, &headers, &body)?;
         apply(&state, vec![StatementOp::Update(request)], &access).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -557,7 +497,7 @@ pub async fn statements_post(
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let op = if is_update(&headers) {
-        StatementOp::Update(update(&raw, &headers, &body)?)
+        StatementOp::Update(update(&state.policy(), &raw, &headers, &body)?)
     } else {
         state.policy().enforce_rdf_upload_bytes(body.len())?;
         StatementOp::Add {
@@ -930,7 +870,7 @@ pub async fn transaction_action(
     if !sessions.ping(&txid, owner) {
         return Err(ApiError::not_found(format!("no transaction '{txid}'")));
     }
-    // A body past the upload limit is refused before it is read.
+    // A payload past the upload limit is refused before it is read.
     if matches!(action.as_str(), "ADD" | "DELETE" | "UPDATE") {
         state.policy().enforce_rdf_upload_bytes(body.len())?;
     }
@@ -940,13 +880,19 @@ pub async fn transaction_action(
             contexts: contexts(&pairs)?,
         }]),
         "DELETE" => Some(removals(&pairs, &headers, &body)?),
-        "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
+        "UPDATE" => Some(vec![StatementOp::Update(update(
+            &state.policy(),
+            &raw,
+            &headers,
+            &body,
+        )?)]),
         _ => None,
     };
     if let Some(ops) = ops {
         return match sessions.add(&txid, owner, ops) {
-            true => Ok(StatusCode::OK.into_response()),
-            false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+            Ok(true) => Ok(StatusCode::OK.into_response()),
+            Ok(false) => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+            Err(refused) => Err(sparql::map_query_error(&state.policy(), refused.into())),
         };
     }
     match action.as_str() {
@@ -1009,6 +955,8 @@ pub async fn transaction_rollback(
 
 #[cfg(test)]
 mod tests {
+    use nrese_rdf::NamedNode;
+
     use super::*;
 
     #[test]
@@ -1040,6 +988,34 @@ mod tests {
         assert!(term("\"\\u12\"").is_err());
         assert!(term("\"\\u+041\"").is_err());
         assert!(term("<http://e/\\U0001F98>").is_err());
+    }
+
+    /// A term that isn't one N-Triples term (an unescaped quote inside a literal, a raw line
+    /// break, a second term) is refused, never read as a different value: a DELETE pattern
+    /// with it would remove other statements. Every row is checked; the failures are
+    /// reported together.
+    #[test]
+    fn malformed_terms_are_refused_not_read_as_others() {
+        let mut wrong = Vec::new();
+        for text in [
+            "\"a\"\"",
+            "\"a\"b\"",
+            "\"a\" \"b\"",
+            "\"a\nb\"",
+            "\"a\rb\"@en",
+        ] {
+            if let Ok(read) = term(text) {
+                wrong.push(format!("{text:?} read as {read:?}"));
+            }
+        }
+        // Guards: an escaped quote, surrounding spaces.
+        for (text, value) in [("\"a\\\"b\"", "a\"b"), ("  \"a\"  ", "a")] {
+            let expected = Term::from(Literal::new_simple_literal(value));
+            if term(text).ok().as_ref() != Some(&expected) {
+                wrong.push(format!("{text:?}: {:?}", term(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
