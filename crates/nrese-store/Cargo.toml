@@ -20,6 +20,8 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 hashbrown = { workspace = true }
+# A request's body, shared with the transport rather than copied (D16-039 S12).
+bytes = "1.11.1"
 rayon = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
