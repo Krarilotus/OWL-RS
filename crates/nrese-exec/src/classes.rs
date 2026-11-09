@@ -13,6 +13,28 @@
 
 use hashbrown::HashMap;
 
+/// Test-only: the members unions moved on this thread, counted where they are moved, so a
+/// counted caller's tests see the work itself and not what it was told (REAS-3a fix check r1
+/// F3). Compiled for this crate's tests, or with the `witness` feature in a debug build (other
+/// crates' tests, as a dev-dependency).
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub mod witness {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MOVED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add(n: u64) {
+        MOVED.with(|moved| moved.set(moved.get() + n));
+    }
+
+    /// The members unions have moved on this thread so far.
+    pub fn moved() -> u64 {
+        MOVED.with(Cell::get)
+    }
+}
+
 /// Classes of two or more ids; an id in none is its own class.
 #[derive(Debug, Clone, Default)]
 pub struct Classes {
@@ -136,6 +158,8 @@ impl Classes {
         let (gone_min, moved) = self.roots.remove(&gone).expect("a root");
         self.parent.insert(gone, keep);
         let (keep_min, members) = self.roots.get_mut(&keep).expect("a root");
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        witness::add(moved.len() as u64);
         members.extend(moved);
         let lost = gone_min.max(*keep_min);
         *keep_min = gone_min.min(*keep_min);

@@ -453,7 +453,13 @@ impl Classes {
             if !credit.take_many(meter, identities.len() as u64) {
                 return None;
             }
+            #[cfg(not(any(test, all(feature = "witness", debug_assertions))))]
             identities.sort_unstable();
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            identities.sort_unstable_by(|a, b| {
+                crate::witness::add(crate::witness::Site::SortWork, 1);
+                a.cmp(b)
+            });
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
             classes.literals |= is_literal(TermId::from_raw(representative));
@@ -1307,5 +1313,165 @@ mod tests {
             "{largest} units of work between two asks of the visitor: at most {}",
             2 * interval
         );
+    }
+
+    /// The work a counted class build does, counted where it is done: scan steps and runs,
+    /// copies, finished identities, sort work and the union kernel's member moves (fix check r1
+    /// F3: not what the build told its visitor).
+    fn work() -> u64 {
+        use crate::witness::{self, Site};
+        [
+            Site::ScanSteps,
+            Site::RunProbes,
+            Site::ExpandCopies,
+            Site::ClassFinish,
+            Site::SortWork,
+        ]
+        .into_iter()
+        .map(witness::get)
+        .sum::<u64>()
+            + nrese_exec::classes::witness::moved()
+    }
+
+    /// A snapshot under equality whose default graph holds `same_as` statements between the
+    /// names given (interned in the order given first), and `subject p o`; and its pattern
+    /// `? p ?`.
+    fn under_equality(
+        names: &[String],
+        same_as: &[(usize, usize)],
+        subject: usize,
+    ) -> (crate::Snapshot, QuadPattern) {
+        let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let predicate = tx.intern(node("sameAs").as_ref().into());
+        for name in names {
+            tx.intern(node(name).as_ref().into());
+        }
+        let quad = |s: &str, p: &str, o: &str| {
+            nrese_rdf::Quad::new(
+                node(s),
+                node(p),
+                node(o),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+        };
+        for &(a, b) in same_as {
+            tx.insert(quad(&names[a], "sameAs", &names[b]).as_ref());
+        }
+        tx.insert(quad(&names[subject], "p", "o").as_ref());
+        tx.commit().unwrap();
+        engine.set_equality(Some(predicate));
+        let snapshot = engine.snapshot();
+        let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
+        let pattern = QuadPattern {
+            predicate: Some(p),
+            ..QuadPattern::all()
+        };
+        (snapshot, pattern)
+    }
+
+    /// Counts `pattern` on `snapshot` (materialised, its classes cold) with a visitor that
+    /// answers yes `yeses` times, then no: the answer, and the most work done between a yes
+    /// and the visitor's next call (or the read's end).
+    fn stopped_after(
+        snapshot: &crate::Snapshot,
+        pattern: &QuadPattern,
+        yeses: usize,
+    ) -> (Result<crate::Count, crate::Stopped>, u64) {
+        let calls = std::cell::Cell::new(0);
+        let last = std::cell::Cell::new(work());
+        let largest = std::cell::Cell::new(0);
+        let gap = || {
+            let now = work();
+            largest.set(largest.get().max(now - last.replace(now)));
+        };
+        let answer = snapshot
+            .counted()
+            .count(crate::ReadModel::Materialised, pattern, &|_| {
+                gap();
+                calls.set(calls.get() + 1);
+                calls.get() <= yeses
+            });
+        gap();
+        (answer, largest.get())
+    }
+
+    /// Spec (`crate::visit`: after its visitor's last yes a counted read does at most a run of
+    /// work, then stops at its next call; review r1 R1, fix check r1 F3): a counted read's cold
+    /// class build, stopped after its visitor's k-th yes for every k until it finishes, answers
+    /// `Stopped` and does at most two intervals of work after any yes. Then, not stopped, it
+    /// answers every copy. Work is counted where it is done (`work`). Map initialisation, held
+    /// for the owner (fix check r1 F2), is not counted.
+    fn a_cold_class_build_stops_within_an_interval_of_any_yes(
+        names: &[String],
+        same_as: &[(usize, usize)],
+        subject: usize,
+        copies: u64,
+    ) {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        // A stopped build keeps nothing, so each run builds the classes cold again.
+        let (snapshot, pattern) = under_equality(names, same_as, subject);
+        // (stopped after, units of work after a yes) for each run past the bound.
+        let mut over = Vec::new();
+        for yeses in 0.. {
+            let (answer, largest) = stopped_after(&snapshot, &pattern, yeses);
+            if largest > 2 * interval {
+                over.push((yeses, largest));
+            }
+            match answer {
+                Err(crate::Stopped) => continue,
+                Ok(count) => {
+                    assert_eq!(count, crate::Count::Exact(copies), "every copy");
+                    break;
+                }
+            }
+        }
+        assert!(
+            over.is_empty(),
+            "units of work after a yes, past {} (stopped after, units): {over:?}",
+            2 * interval
+        );
+    }
+
+    /// REAS-3a fix check r1 R1 (the union and the sort) and F3. Two chains of three intervals
+    /// of identities each, then one statement joining them, last in every order of the scan
+    /// (its ends are interned last): that union moves a whole chain, three intervals of members,
+    /// and the joined class's sort sorts six.
+    #[test]
+    fn a_large_union_and_sort_stop_within_an_interval_of_any_yes() {
+        let half = 3 * nrese_exec::POLL_UNITS as usize;
+        let names: Vec<String> = (0..half - 1)
+            .map(|i| format!("a{i}"))
+            .chain((0..half - 1).map(|i| format!("b{i}")))
+            .chain(["a-end".to_owned(), "b-end".to_owned()])
+            .collect();
+        let (a, b) = (|i: usize| i, |i: usize| half - 1 + i);
+        let (a_end, b_end) = (2 * half - 2, 2 * half - 1);
+        let mut same_as: Vec<(usize, usize)> = (1..half - 1)
+            .flat_map(|i| [(a(i - 1), a(i)), (b(i - 1), b(i))])
+            .collect();
+        same_as.extend([(a(half - 2), a_end), (b(half - 2), b_end), (a_end, b_end)]);
+        a_cold_class_build_stops_within_an_interval_of_any_yes(
+            &names,
+            &same_as,
+            a(0),
+            2 * half as u64,
+        );
+    }
+
+    /// REAS-3a fix check r1 F3, the many-small-classes shape: three intervals of classes of two.
+    #[test]
+    fn many_small_classes_stop_within_an_interval_of_any_yes() {
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let names: Vec<String> = (0..n)
+            .flat_map(|i| [format!("c{i}"), format!("d{i}")])
+            .collect();
+        let same_as: Vec<(usize, usize)> = (0..n).map(|i| (2 * i, 2 * i + 1)).collect();
+        a_cold_class_build_stops_within_an_interval_of_any_yes(&names, &same_as, 0, 2);
     }
 }
