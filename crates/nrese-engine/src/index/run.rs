@@ -360,6 +360,12 @@ impl Run {
         self.inserts + self.deletes
     }
 
+    /// Every entry, inserts and tombstones alike, as `[subject, predicate, object, graph]`
+    /// (raw ids), in SPOG order: every layout keeps that permutation.
+    pub(crate) fn statements(&self) -> impl Iterator<Item = Key> + '_ {
+        self.permutation(Permutation::Spog).keys.iter()
+    }
+
     /// This run (of the default-graph layout) in the quad layout: SPOG, POSG and OSPG
     /// shared or copied, the graph-first permutations from the graph-last ones with each
     /// key's graph moved to the front, the same order since every graph is the default

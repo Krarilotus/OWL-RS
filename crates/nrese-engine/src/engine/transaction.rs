@@ -279,22 +279,6 @@ impl<'e> Transaction<'e> {
         } = self.pending.snapshot_changes();
         let base = self.pending.base().version();
         let content = super::Content::fresh();
-        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
-            let changed = [
-                &asserted_inserts,
-                &asserted_deletes,
-                &inferred_inserts,
-                &inferred_deletes,
-            ];
-            corpora.record(
-                base.content,
-                content,
-                changed
-                    .into_iter()
-                    .flatten()
-                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
-            );
-        }
         let version = Version {
             content,
             // Pending: its own, even without asserted changes (staged terms).
@@ -335,16 +319,6 @@ impl<'e> Transaction<'e> {
         let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
         let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
         let content = super::Content::fresh();
-        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
-            corpora.record(
-                seen.content,
-                content,
-                [&asserted_inserts, &asserted_deletes, &gone]
-                    .into_iter()
-                    .flatten()
-                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
-            );
-        }
         let version = Version {
             content,
             // Pending: its own, even without asserted changes (staged terms).
