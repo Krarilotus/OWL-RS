@@ -152,12 +152,18 @@ pub fn reachable_within<'p, B: Deref<Target = Budget>>(
 ) -> Result<Buf<'p, u64, B>, Stop> {
     let ticker = Ticker::new(stop)?;
     let mut order = Charged::in_pool(pool);
+    // One start: the nodes seen are a set, with nothing to stamp.
+    let mut seen: ChargedMap<u64, (), Share<'p, B>> = ChargedMap::in_pool(pool);
+    let mark = |node: u64, _: usize| -> Result<bool, BudgetExceeded> {
+        Ok(seen.get_or_insert_with(node, || ())?.1)
+    };
     search(
         [start],
         include_start,
         successors,
         pool,
         &ticker,
+        mark,
         |_, node| order.push(node),
     )?;
     ticker.finish()?;
@@ -166,24 +172,18 @@ pub fn reachable_within<'p, B: Deref<Target = Budget>>(
 
 /// A breadth-first search from each of `starts` over `successors`, `found(start, node)` for
 /// each node reached from it in one or more steps, or zero or more with `reflexive`, each
-/// once per start. The nodes seen (stamped with the last start they were reached from, so
-/// nothing is cleared between starts) and the frontiers are charged to `pool` before they
-/// grow; `ticker` ticks once per node expanded and once per successor walked.
+/// once per start. `mark(node, i)` marks `node` seen from the `i`-th start, true the first
+/// time; the frontiers are charged to `pool` before they grow; `ticker` ticks once per node
+/// expanded and once per successor walked.
 fn search<'p, B: Deref<Target = Budget>>(
     starts: impl IntoIterator<Item = u64>,
     reflexive: bool,
     mut successors: impl Successors,
     pool: &'p Pool<B>,
     ticker: &Ticker<StopFn<'_>>,
+    mut mark: impl FnMut(u64, usize) -> Result<bool, BudgetExceeded>,
     mut found: impl FnMut(u64, u64) -> Result<(), BudgetExceeded>,
 ) -> Result<(), Stop> {
-    let mut seen: ChargedMap<u64, usize, Share<'p, B>> = ChargedMap::in_pool(pool);
-    let mut mark = |node: u64, start: usize| {
-        let (at, new) = seen.get_or_insert_with(node, || start)?;
-        let first = new || *at != start;
-        *at = start;
-        Ok::<_, BudgetExceeded>(first)
-    };
     let mut frontier: Buf<'p, u64, B> = Charged::in_pool(pool);
     let mut next: Buf<'p, u64, B> = Charged::in_pool(pool);
     for (i, start) in starts.into_iter().enumerate() {
@@ -243,9 +243,24 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
 ) -> Result<Buf<'p, (u64, u64), B>, Stop> {
     let ticker = Ticker::new(stop)?;
     let mut out = Charged::in_pool(pool);
-    search(starts, reflexive, adjacency, pool, &ticker, |start, end| {
-        out.push((start, end))
-    })?;
+    // Per node, the last start it was reached from: a stamp, so nothing is cleared between
+    // starts.
+    let mut seen: ChargedMap<u64, usize, Share<'p, B>> = ChargedMap::in_pool(pool);
+    let mark = |node: u64, start: usize| -> Result<bool, BudgetExceeded> {
+        let (at, new) = seen.get_or_insert_with(node, || start)?;
+        let first = new || *at != start;
+        *at = start;
+        Ok(first)
+    };
+    search(
+        starts,
+        reflexive,
+        adjacency,
+        pool,
+        &ticker,
+        mark,
+        |start, end| out.push((start, end)),
+    )?;
     ticker.finish()?;
     Ok(out)
 }
