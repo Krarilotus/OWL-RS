@@ -46,7 +46,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hashbrown::{HashMap, HashSet};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{
-    EncodedQuad, GraphSelector, InferredMask, QuadPattern, ReadModel, Snapshot, TermId, Transaction,
+    EncodedQuad, EngineError, GraphSelector, InferredMask, PendingView, PrivateTransaction,
+    QuadPattern, ReadModel, Snapshot, TermId, Transaction,
 };
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
@@ -56,7 +57,7 @@ use nrese_reasoner::graph_sets::{
     rederived_candidates, support_sets, update_support_sets,
 };
 use nrese_reasoner::ir::Triple;
-use nrese_sparql::{CancellationToken, GraphAccess, ReadView};
+use nrese_sparql::{CancellationToken, GraphAccess, PendingRead, ReadView};
 
 use crate::reasoning::Program;
 
@@ -1775,13 +1776,19 @@ impl Reading {
     /// and delete (`Transaction::pending_over`) and, of the statements the view adds (asserted
     /// only in graphs the reader can't read, and derived), those they assert where the reader
     /// reads: the view of the base, kept, with the delta applied. O(d log n) for d pending
-    /// changes; nothing of the view is scanned or copied.
-    pub(crate) fn pending(&self, tx: &Transaction<'_>) -> Result<Snapshot, Unavailable> {
+    /// changes; nothing of the view is scanned or copied. Either kind of transaction, its
+    /// pending snapshot made against `budget`; refused (a private transaction's charges), the
+    /// read fails with the engine's refusal.
+    pub(crate) fn pending<T: PendingView>(
+        &self,
+        tx: &T,
+        budget: &Arc<Budget>,
+    ) -> crate::StoreResult<Snapshot> {
         if tx.pending() == (0, 0) && tx.inferred_pending() == (0, 0) {
-            return self.committed(tx.base());
+            return Ok(self.committed(tx.base())?);
         }
         if !self.through_view(tx.base()) {
-            return Ok(tx.pending_snapshot());
+            return Ok(tx.pending_snapshot_within(budget)?);
         }
         let view = self.committed(tx.base())?;
         // A view made before isn't made again: the read's cancellation still stops it here.
@@ -1798,7 +1805,9 @@ impl Reading {
                 quad.object,
                 TermId::DEFAULT_GRAPH,
             );
-            if self.access.allows_id(tx, quad.graph)
+            if self
+                .access
+                .allows_id(&PendingRead::new(tx, budget), quad.graph)
                 && view.contains_in(ReadModel::Inferred, &fact)
                 && !tx.base().contains_in(ReadModel::Inferred, &fact)
             {
@@ -1807,20 +1816,40 @@ impl Reading {
         }
         hidden.sort_unstable();
         dedup(&mut hidden);
-        Ok(tx.pending_over(&view, &hidden))
+        Ok(tx.pending_over_within(&view, &hidden, budget)?)
     }
 }
 
 /// An update's `WHERE` clauses read the transaction's state as its requester's queries
-/// would ([`Reading::pending`]); the failure as the store's error for it says
-/// ([`From<Unavailable>`](crate::StoreError)).
+/// would ([`Reading::pending`]), for either kind of transaction; the failure as the store's
+/// error for it says ([`From<Unavailable>`](crate::StoreError)), a memory refusal as the
+/// evaluation's.
 impl nrese_sparql::ReadSource for Reading {
-    fn state(&self, tx: &Transaction<'_>) -> Result<Snapshot, nrese_sparql::QueryEvaluationError> {
-        self.pending(tx)
-            .map_err(|unavailable| match crate::StoreError::from(unavailable) {
-                crate::StoreError::SparqlEvaluation(error) => error,
-                error => nrese_sparql::QueryEvaluationError::Dataset(Box::new(error)),
-            })
+    fn state(
+        &self,
+        tx: &Transaction<'_>,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, nrese_sparql::QueryEvaluationError> {
+        self.pending(tx, budget).map_err(as_evaluation)
+    }
+
+    fn private_state(
+        &self,
+        tx: &PrivateTransaction<'_>,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, nrese_sparql::QueryEvaluationError> {
+        self.pending(tx, budget).map_err(as_evaluation)
+    }
+}
+
+/// A reader's failure as its `WHERE` clause's evaluation's.
+fn as_evaluation(error: crate::StoreError) -> nrese_sparql::QueryEvaluationError {
+    match error {
+        crate::StoreError::SparqlEvaluation(error) => error,
+        crate::StoreError::Engine(EngineError::MemoryLimit(exceeded)) => {
+            nrese_sparql::QueryEvaluationError::MemoryLimit(exceeded)
+        }
+        error => nrese_sparql::QueryEvaluationError::Dataset(Box::new(error)),
     }
 }
 
