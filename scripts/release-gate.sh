@@ -745,6 +745,8 @@ report)
 
 w3c)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks} NRESE_W3C_REQUIRED=1
+  # An earlier run's result goes first: this run's stands, or none (review r1 R2).
+  rm -f "$OUT/w3c.json"
   mkdir -p "$OUT/w3c"
   bash scripts/fetch-w3c-tests.sh > "$OUT/w3c/fetch.log" 2>&1 || { tail -20 "$OUT/w3c/fetch.log"; exit 1; }
   # The OWL 2 test cases (the DL suites' data), pinned.
@@ -758,23 +760,29 @@ w3c)
   # The kits w3c-expected.toml declares, each launched and its outcome recorded by the checker
   # (release_gate.py w3c --run), with the receipt that binds them to this checkout's tree and build
   # identity (scripts/lib/gate-key.sh). A kit that didn't run whole, or a count short of its
-  # requirement, is the verdict's (w3c.json); this step fails only when the data, the identity or
-  # the result couldn't be had.
+  # requirement, is the verdict's (w3c.json: the checker exits 0 or 1 with it); this step fails when
+  # the data, the identity or the result couldn't be had, or the checker exited otherwise.
   identity=$(gate_identity HEAD) || { log "w3c: the gate can't name its toolchain and flags: no receipt"; exit 1; }
   py benches/fast/release_gate.py w3c "$OUT/w3c" --expected benches/fast/w3c-expected.toml --run \
     --identity "$identity" --json "$OUT/w3c.json" > "$OUT/w3c/counts.txt" 2> >(tee -a "$OUT/gate.log" >&2)
-  [ -f "$OUT/w3c.json" ] || exit 1
+  code=$?
+  { [ "$code" -le 1 ] && [ -f "$OUT/w3c.json" ]; } || { log "w3c: no result (the checker exited $code)"; exit "$(( code > 1 ? code : 1 ))"; }
   log "w3c: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print("passed" if d["passed"] else "NOT passed: " + "; ".join(d["errors"]))' "$OUT/w3c.json")"
   ;;
 
 guards)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks}
+  # An earlier run's result goes first: this run's stands, or none (review r1 R2).
+  rm -f "$OUT/guards.json"
   mkdir -p "$OUT/guards"
   # The guards' test run by the checker (release_gate.py guards --run), its exit code and receipt kept.
+  # A guard failing is the verdict's (guards.json: the checker exits 0 or 1 with it); this step fails
+  # when the identity or the result couldn't be had, or the checker exited otherwise.
   identity=$(gate_identity HEAD) || { log "guards: the gate can't name its toolchain and flags: no receipt"; exit 1; }
   py benches/fast/release_gate.py guards --run --log "$OUT/guards/test.log" --identity "$identity" \
     --json "$OUT/guards.json" | tee -a "$OUT/gate.log"
-  [ -f "$OUT/guards.json" ] || exit 1  # the guards' verdict is guards.json's
+  code=${PIPESTATUS[0]}
+  { [ "$code" -le 1 ] && [ -f "$OUT/guards.json" ]; } || { log "guards: no result (the checker exited $code)"; exit "$(( code > 1 ? code : 1 ))"; }
   ;;
 
 verdict)
