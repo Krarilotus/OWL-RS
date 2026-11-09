@@ -6,6 +6,7 @@ mod functional;
 
 use std::collections::HashMap;
 
+use nrese_owl::mapping::ClassExpressionMarkers;
 use nrese_owl::{
     Axiom, Diagnostic, Make, Ontology, Statement, Term, TermKind, Terms, Vocabulary, read, write,
 };
@@ -128,6 +129,35 @@ impl Make for Table {
     fn literal(&mut self, lexical: &str, datatype: &str) -> Term {
         self.id(Literal::new_typed_literal(lexical, NamedNode::new_unchecked(datatype)).into())
     }
+}
+
+/// The class-expression markers a caller looks up by their own IRIs are the mapping's, those
+/// of the whole vocabulary, whichever of its terms the source has
+/// (`ClassExpressionMarkers::lookup` and `::of`: one definition, I24c-2).
+#[test]
+fn class_expression_markers_looked_up_alone_are_the_vocabularys() {
+    let mut every = Table::default();
+    let vocabulary = every.vocabulary();
+    let markers = ClassExpressionMarkers::lookup(&|iri| every.iri(iri));
+    assert_eq!(markers, ClassExpressionMarkers::of(&vocabulary));
+    assert!(
+        markers
+            .types
+            .iter()
+            .chain(&markers.set_operators)
+            .all(Option::is_some)
+    );
+    // A source with every other term of the vocabulary, under other ids.
+    let mut some = Table::default();
+    some.iri_id("http://example.com/first");
+    for (_, iri) in Vocabulary::iris().into_iter().step_by(2) {
+        some.iri_id(&iri);
+    }
+    let vocabulary = Vocabulary::new(&|iri| some.iri(iri));
+    assert_eq!(
+        ClassExpressionMarkers::lookup(&|iri| some.iri(iri)),
+        ClassExpressionMarkers::of(&vocabulary)
+    );
 }
 
 fn load(table: &mut Table, turtle: &str) -> Vec<Statement> {

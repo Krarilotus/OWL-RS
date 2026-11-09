@@ -39,6 +39,90 @@ fn an_unconsumed_result_keeps_its_shared_capacity_until_drop() {
     assert_eq!(shared.used(), 0);
 }
 
+/// Spec: a live result keeps the charge of what it holds (as the test above), so no table
+/// the evaluation consumes may release a charge it never took. Rows without columns count
+/// one id each, made per row of a substituted EXISTS (as written): one solution without
+/// bindings (an empty group under OPTIONAL; sol-loop r1 S1), and a fast COUNT(*) projected
+/// to no column (r2 T1). The live result of n one-column rows keeps at least their n * 8
+/// bytes charged.
+#[test]
+fn rows_without_columns_never_release_another_holders_charge() {
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+    use nrese_sparql::QueryResults;
+
+    let (subjects, counts) = (2_000, 200);
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let node = |name: &str| NamedNode::new_unchecked(name);
+    let mut tx = engine.transaction();
+    for i in 0..subjects {
+        let quad = Quad::new(
+            node(&format!("urn:s{i}")),
+            node("urn:p"),
+            node("urn:o"),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    // k statements with the object k, for k = 1..=200.
+    let integer = node("http://www.w3.org/2001/XMLSchema#integer");
+    for k in 1..=counts {
+        for j in 0..k {
+            let quad = Quad::new(
+                node(&format!("urn:t{k}-{j}")),
+                node("urn:q"),
+                Literal::new_typed_literal(k.to_string(), integer.clone()),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let values = (1..=counts).map(|k| k.to_string()).collect::<Vec<_>>();
+    let cases = [
+        (
+            "an empty group",
+            "SELECT ?s WHERE { ?s <urn:p> ?o FILTER EXISTS { OPTIONAL { FILTER(?s = ?s) } } }"
+                .to_owned(),
+        ),
+        (
+            "a fast count",
+            format!(
+                "SELECT ?c WHERE {{ VALUES ?c {{ {} }} FILTER EXISTS {{ \
+                 SELECT (COUNT(*) AS ?c) WHERE {{ ?s <urn:q> ?c }} LIMIT 1 }} }}",
+                values.join(" ")
+            ),
+        ),
+    ];
+    for (case, query) in &cases {
+        let query = SparqlParser::new().parse_query(query).unwrap();
+        let shared = SharedBudget::new(1 << 30);
+        let options = QueryOptions {
+            as_written: true,
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let result = evaluate_query(&snapshot, &query, &options).unwrap();
+        let held = shared.used();
+        let QueryResults::Solutions(rows) = result else {
+            panic!("solutions")
+        };
+        let rows = rows.count();
+        assert!(rows > 0, "{case}: no rows, nothing tested");
+        assert!(
+            held >= rows * 8,
+            "{case}: the live result of {rows} rows keeps {held} bytes charged"
+        );
+    }
+}
+
 #[test]
 fn graph_results_keep_shared_capacity_through_conversion_and_early_drop() {
     use nrese_rdf::{GraphName, NamedNode, Quad};

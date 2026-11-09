@@ -49,6 +49,8 @@ mod tests;
 pub mod unnamed;
 mod violations;
 pub mod vocabulary;
+#[cfg(test)]
+mod witness;
 
 pub use capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature, ReasonerRunStatus};
 pub use config::{ConfigError, ReasonerConfig, ReasoningMode};
