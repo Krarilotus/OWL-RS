@@ -53,11 +53,14 @@ impl<'e> PrivateTransaction<'e> {
                 "a private transaction opens over a snapshot of its own engine".to_owned(),
             ));
         }
+        // The pending changes are charged to the same budget as the terms, for their life.
+        let mut pending = Pending::over(base.clone());
+        pending.charge_to(Arc::clone(&budget))?;
         let overlay = Overlay::over(Arc::clone(dictionary), base.dictionary_len(), budget);
         Ok(Self {
             _engine: engine,
             overlay,
-            pending: Pending::over(base.clone()),
+            pending,
         })
     }
 
