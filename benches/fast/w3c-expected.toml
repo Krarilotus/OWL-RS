@@ -1,9 +1,38 @@
-# The W3C suites the release gate requires (release_gate.py w3c; benches/PROTOCOL.md §5):
-# per suite at least `passed`, no failure beyond `failed` (0), at most the known `skipped`
-# and `disputed`. A suite without counts (its data missing, its kit not run) fails. The
-# numbers are the v2 merge gate's (docs/plan/2026-10-05-v2-merge-checklist.md §4: no wrong
-# answers), as measured on office-pc on 14 Oct 2026 (v15-gate-w3c-3, v15-gate-w3c-dl).
-# A suite that grows raises its count here in the same commit.
+# The W3C kits and suites the release gate requires (release_gate.py w3c; benches/PROTOCOL.md §5).
+#
+# Each [kit."CRATE:TEST"] is launched, in this order, by `release-gate.sh w3c` (release_gate.py
+# w3c --run; nothing else lists them): it must exit 0 with passing libtest summaries, and `suites`
+# are the suites whose counts its own log (or its `table`, which it writes as NRESE_W3C_OUT) reports.
+# A kit that didn't run whole fails, whatever its log says. Every suite below is one kit's.
+#
+# Per suite at least `passed`, no failure beyond `failed` (0), at most the known `skipped` and
+# `disputed`. A suite without counts (its data missing, its kit not run) fails. The numbers are the
+# v2 merge gate's (docs/plan/2026-10-05-v2-merge-checklist.md §4: no wrong answers), as measured on
+# office-pc on 14 Oct 2026 (v15-gate-w3c-3, v15-gate-w3c-dl). A suite that grows raises its count
+# here in the same commit.
+
+[kit."nrese-sparql:w3c_sparql11"]
+suites = ["SPARQL 1.1", "SPARQL 1.2"]
+
+[kit."nrese-sparql:geosparql_compliance"]
+suites = ["GeoSPARQL"]
+
+[kit."nrese-shacl:w3c_shacl"]
+suites = ["SHACL Core", "SHACL-SPARQL"]
+
+[kit."nrese-store:w3c_owl2_rl"]
+suites = ["OWL 2 RL"]
+
+[kit."nrese-dl:tableau_w3c"]
+suites = ["OWL 2 DL"]
+table = "tableau-w3c.tsv"
+
+# Their counts aren't parsed: the kit's own assertions are its verdict (exit 0, summaries ok).
+[kit."nrese-owl:w3c_owl2"]
+suites = []
+
+[kit."nrese-reasoner:w3c_n3_reasoner"]
+suites = []
 
 [suite."SPARQL 1.1"]
 passed = 505

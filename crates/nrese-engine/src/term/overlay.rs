@@ -387,50 +387,24 @@ impl OverlayView {
         triple_ids(self.own_key(id)?)
     }
 
+    /// Own entries first, then the dictionary's, through the dictionary's one decode
+    /// ([`super::dictionary::Terms`]), which the charged decode and its bound share.
     pub(crate) fn decode(&self, id: TermId) -> Option<Term> {
-        if !self.is_own(id) {
-            return self.dictionary().decode(id);
-        }
-        let key = self.own_key(id)?;
-        let Some([s, p, o]) = triple_ids(key) else {
-            return Some(decode_key(key));
-        };
-        let Term::NamedNode(predicate) = self.decode(p)? else {
-            return None;
-        };
-        Some(
-            Triple::new(
-                NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
-                predicate,
-                self.decode(o)?,
-            )
-            .into(),
-        )
+        self.dictionary().terms(Some(self)).decode(id)
     }
 
+    /// As [`Dictionary::decode_charged`]: `charge` called with no lock held, each call an
+    /// increment.
     pub(crate) fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        if !self.is_own(id) {
-            return self.dictionary().decode_charged(id, charge);
-        }
-        // As the dictionary's: a triple term's decode is its components' (`None` here).
-        let Some(key) = self.own_key(id).filter(|_| id.kind() != TermKind::Triple) else {
-            return Ok(None);
-        };
-        charge(key.len())?;
-        Ok(Some(decode_key(key)))
+        self.dictionary().decode_charged_in(Some(self), id, charge)
     }
 
     pub(crate) fn decode_bound(&self, id: TermId) -> Option<usize> {
-        if !self.is_own(id) {
-            return self.dictionary().decode_bound(id);
-        }
-        self.own_key(id)
-            .filter(|_| id.kind() != TermKind::Triple)
-            .map(<[u8]>::len)
+        self.dictionary().terms(Some(self)).bound(id)
     }
 
     pub(crate) fn with_view<R>(&self, id: TermId, f: impl FnOnce(TermView<'_>) -> R) -> Option<R> {
@@ -440,19 +414,22 @@ impl OverlayView {
         self.own_key(id).map(|key| f(view_key(key)))
     }
 
-    /// Calls `f` with a lookup of entry views, the dictionary's below `start` under one of its
-    /// read guards, its own from the frozen entries (no lock).
-    pub(crate) fn with_views<R>(
-        &self,
-        f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
-    ) -> R {
-        self.dictionary().with_views(self.start(), |shared| {
-            let both = |id: TermId| match self.is_own(id) {
-                true => self.own_key(id).map(view_key),
-                false => shared(id),
-            };
-            f(&both)
-        })
+    /// Own entry `id`'s view, from the frozen entries (no lock); `None` for an id below
+    /// `start`, which the dictionary answers (`Vocabulary::with_views` asks it under one of
+    /// its read guards).
+    #[inline]
+    pub(crate) fn own_view(&self, id: TermId) -> Option<Option<TermView<'_>>> {
+        self.is_own(id).then(|| self.own_entry_view(id))
+    }
+
+    /// Out of line, so a caller's loop over [`Vocabulary::with_views`] inlines one key decode
+    /// (the dictionary's), not two; with two, the decode itself moved out of the loop on the
+    /// shared path too (package 2b's B17 count).
+    ///
+    /// [`Vocabulary::with_views`]: super::resolve::Vocabulary::with_views
+    #[inline(never)]
+    fn own_entry_view(&self, id: TermId) -> Option<TermView<'_>> {
+        self.own_key(id).map(view_key)
     }
 
     pub(crate) fn decode_quad(&self, quad: crate::EncodedQuad) -> Option<nrese_rdf::Quad> {
@@ -506,6 +483,16 @@ impl OverlayView {
 
     pub(crate) fn matching_strings(&self, test: &super::StringTest<'_>) -> Vec<TermId> {
         self.matching_strings_scan(test).0
+    }
+}
+
+impl super::dictionary::OwnKeys for OverlayView {
+    fn is_own(&self, id: TermId) -> bool {
+        Self::is_own(self, id)
+    }
+
+    fn own_key(&self, id: TermId) -> Option<&[u8]> {
+        Self::own_key(self, id)
     }
 }
 

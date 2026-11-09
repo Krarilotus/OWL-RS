@@ -7,6 +7,11 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Fault points other crates' tests reach (src/fault_points.rs): off by default, turned on only by
+# nrese-store's dev-dependency on this crate; no product build has them (scripts/check-features.sh).
+fault-points = []
+
 [dependencies]
 aho-corasick = "1.1"
 crc32fast = "1.5"
@@ -22,7 +27,6 @@ memmap2 = "0.9"
 # classes (src/engine/equality.rs), the sort.
 nrese-exec = { path = "../nrese-exec" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
-nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 nrese-vector = { path = "../nrese-vector" }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
@@ -30,12 +34,20 @@ rust-stemmers = "1.2"
 thiserror.workspace = true
 tracing.workspace = true
 
+# Durable renames and directory flushes on Windows (src/durability/place.rs); the version
+# nrese-exec already uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs),
 # and the unit tests' counting allocator (src/lib.rs) checks that what the statistics keep is
 # what they charge; measuring without its allocator fails (tests/measure_without_its_allocator.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
+# The N-Triples parser that read triple terms keyed by their text before: the oracle that
+# their reader (src/term/text_triple.rs) matches.
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 
 [lints]
 workspace = true

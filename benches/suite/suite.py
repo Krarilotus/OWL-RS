@@ -11,6 +11,7 @@
     benches/suite/suite.py standings [--write]  NRESE against every contender (benches/STANDINGS.md)
     benches/suite/suite.py ledger DIR...      the run records under benches/runs/ (outcomes, no numbers)
     benches/suite/suite.py status [--write]   what is measured and what isn't (benches/STATUS.md)
+    benches/suite/suite.py coverage [--json]  which cells have a current receipt (suitekit/coverage.py)
     benches/suite/suite.py data [freeze|verify]  the frozen datasets (benches/datasets.toml)
     benches/suite/suite.py images [systems]  the images the systems need (for build-sif.sh)
 
@@ -128,6 +129,9 @@ def main(argv):
     if argv[1:2] == ["status"]:
         from suitekit import status
         return status.main(argv[2:], systems, workloads, HERE.parent.parent)
+    if argv[1:2] == ["coverage"]:
+        from suitekit import coverage
+        return coverage.main(argv[2:], systems, workloads, HERE.parent.parent)
     if argv[1:] == ["--check"]:
         from suitekit import cases
         print(f"{len(systems)} systems, {len(workloads)} workloads, {len(cases.load())} cases: ok")

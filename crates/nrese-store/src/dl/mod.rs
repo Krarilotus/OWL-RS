@@ -30,6 +30,9 @@ pub(crate) mod query;
 pub(crate) mod source;
 pub mod upper;
 
+#[cfg(test)]
+mod literal_kind_tests;
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 

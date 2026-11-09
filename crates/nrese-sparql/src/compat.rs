@@ -21,12 +21,13 @@
 //! `urn:x-rdflib:default` ([`RDFLIB_DEFAULT_GRAPH`]) and asks for it as the query's
 //! `default-graph-uri` while writing its triples into the default graph. Here both are the
 //! default graph: in `GRAPH` patterns of queries and updates, in the data and templates of
-//! updates, in a query's dataset (`FROM`, `default-graph-uri`), and as the Graph Store
-//! Protocol's `?graph=`.
+//! updates, as the graph of `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE` and `COPY`, in a query's
+//! dataset (`FROM`, `default-graph-uri`), and as the Graph Store Protocol's `?graph=`; with the
+//! default graph's access rules. [`graph_named`] is that one resolution.
 
 use std::collections::HashMap;
 
-use nrese_rdf::Variable;
+use nrese_rdf::{GraphNameRef, NamedNode, Variable};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, OrderExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::{Query, SparqlParser, SparqlSyntaxError};
@@ -40,6 +41,15 @@ pub const RDFLIB_DEFAULT_GRAPH: &str = "urn:x-rdflib:default";
 /// Whether `iri` names the default graph by another store's convention.
 pub fn names_default_graph(iri: &str) -> bool {
     iri == JENA_DEFAULT_GRAPH || iri == RDFLIB_DEFAULT_GRAPH
+}
+
+/// The store graph `name` names: the default graph for another store's name for it, else the
+/// named graph. Every graph name of a query or an update resolves here (module docs).
+pub fn graph_named(name: &NamedNode) -> GraphNameRef<'_> {
+    match names_default_graph(name.as_str()) {
+        true => GraphNameRef::DefaultGraph,
+        false => GraphNameRef::NamedNode(name.as_ref()),
+    }
 }
 
 /// Parses a query and applies the compatibility rewrites.

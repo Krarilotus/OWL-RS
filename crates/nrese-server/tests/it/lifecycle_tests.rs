@@ -53,10 +53,12 @@ async fn inconsistent_data_is_quarantined_but_readable_and_repairable()
     let ready = app.clone().oneshot(get("/readyz")).await?;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_text(ready).await?;
-    assert!(
-        body.contains("\"quarantined\"") && body.contains("\"violations\":1"),
-        "{body}"
-    );
+    // D16-310: quarantine is a fixed readiness category; diagnostics require /info.
+    let public: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(public, serde_json::json!({"status": "quarantined"}));
+    let info = app.clone().oneshot(get("/dataset/info")).await?;
+    assert_eq!(info.status(), StatusCode::OK);
+    assert!(body_text(info).await?.contains("\"violations\":1"));
 
     let query = format!("/dataset/query?query=ASK%20%7B%20%3C{EX}x%3E%20%3Fp%20%3Fo%20%7D");
     let answer = app.clone().oneshot(get(&query)).await?;

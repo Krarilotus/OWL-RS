@@ -123,11 +123,13 @@ impl Vocabulary {
         }
     }
 
+    /// As [`Dictionary::decode_charged`]: `charge` called with no lock held, each call an
+    /// increment.
     pub(crate) fn decode_charged<E>(
         &self,
         id: TermId,
         bound: u64,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
         match self {
             Self::Shared(dictionary) => {
@@ -169,15 +171,27 @@ impl Vocabulary {
         }
     }
 
+    /// Calls `f` with a lookup of entry views under one of the dictionary's read guards, a
+    /// private view's own entries from its frozen ones. `f` is called in one place for both
+    /// kinds: called once per kind, a caller's `f` has two call sites, isn't inlined where the
+    /// dictionary's lookup is known, and every lookup becomes an indirect call (package 2b's
+    /// B17 count).
     pub(crate) fn with_views<R>(
         &self,
         bound: u64,
         f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
     ) -> R {
-        match self {
-            Self::Shared(dictionary) => dictionary.with_views(bound, f),
-            Self::Private(view) => view.with_views(f),
-        }
+        let (dictionary, bound, own) = match self {
+            Self::Shared(dictionary) => (dictionary, bound, None),
+            Self::Private(view) => (view.dictionary(), view.start(), Some(view)),
+        };
+        dictionary.with_views(bound, |shared| {
+            let views = |id: TermId| match own.and_then(|view| view.own_view(id)) {
+                Some(view) => view,
+                None => shared(id),
+            };
+            f(&views)
+        })
     }
 
     pub(crate) fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {

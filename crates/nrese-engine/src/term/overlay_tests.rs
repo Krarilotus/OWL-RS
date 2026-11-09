@@ -243,19 +243,15 @@ fn a_frozen_view_answers_what_it_was_taken_with() {
 }
 
 /// B9. The bounded and charged reads at the edge: the last own id, the first past it, an id below
-/// start, a triple term (whose charged decode is its components', `None`, as the dictionary's).
+/// start, a triple term (decoded and charged as a whole, its components with it: package C3,
+/// `notes/2026-11-09-d039-update-sweep.md` row C3; before it, `None`).
 #[test]
 fn bounded_reads_answer_at_the_own_edge() {
     let budget = unlimited();
     let (_dictionary, overlay) = with_overlay(6, &budget);
     let last = overlay.intern(literal("last").as_ref()).unwrap();
-    let triple = overlay
-        .intern(TermRef::Triple(&Triple::new(
-            iri("s"),
-            iri("p"),
-            literal("last"),
-        )))
-        .unwrap();
+    let triple_term: Term = Triple::new(iri("s"), iri("p"), literal("last")).into();
+    let triple = overlay.intern(triple_term.as_ref()).unwrap();
     let view = Vocabulary::Private(overlay.freeze().unwrap());
     let past = TermId::new(TermKind::String, view_end(&view));
     let below = TermId::new(TermKind::String, 2);
@@ -266,10 +262,15 @@ fn bounded_reads_answer_at_the_own_edge() {
         view.decode_charged(below, 0, ok),
         Ok(Some(literal("old 2")))
     );
-    assert_eq!(view.decode_charged(triple, 0, ok), Ok(None));
+    assert_eq!(
+        view.decode_charged(triple, 0, ok),
+        Ok(Some(triple_term.clone()))
+    );
     assert_eq!(view.decode_bound(last, 0), Some(literal_key_len("last")));
     assert_eq!(view.decode_bound(past, 0), None);
-    assert_eq!(view.decode_bound(triple, 0), None);
+    // What the decoded term holds: `triple_term`'s strings, from `format!`, may hold more.
+    let holds = view.decode(triple).map(|term| term.heap_bytes());
+    assert!(holds.is_some() && view.decode_bound(triple, 0) >= holds);
     assert!(view.decode_bound(below, 0).is_some());
     let text = |v: crate::TermView<'_>| v.str().map(str::to_owned);
     assert_eq!(view.with_view(last, 0, text), Some(Some("last".into())));

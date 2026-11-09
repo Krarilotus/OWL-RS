@@ -113,7 +113,7 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 
 - A commit whose closure violates a consistency rule is **rejected**. The response carries an explanation: the rule, its premises (asserted or inferred) and the likely commit-local trigger. A committer who may not read every graph is shown the premises asserted in graphs it may read; the others (asserted elsewhere, or inferred: a rejected commit's state has no support sets to tell what it could have derived) are counted, not shown, and none of their terms reaches the report.
 - Commit-path checking examines what the commit adds, so it relies on a consistent baseline. When a full materialisation finds violations (data imported without reasoning, or a ruleset switched on later), the store is **quarantined**:
-  - `/readyz` answers 503 with status `quarantined` and the violation count;
+  - `/readyz` answers 503 with only status `quarantined`; `/api/v1/repositories/{id}/info` gives the violation count to whole-dataset readers or administrators;
   - reads work;
   - consistent commits are accepted and each one revalidates the whole store, until the data is repaired.
 - `nrese-server load` fails when the loaded data is inconsistent (the data stays loaded).
