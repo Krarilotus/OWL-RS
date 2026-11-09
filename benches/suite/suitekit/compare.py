@@ -993,16 +993,15 @@ def main(argv: list[str]) -> int:
                                args.allow_host_change)
     systems = set(args.systems.split(",")) if args.systems else None
     base_files, new_files = files(args.base), files(args.new)
-    refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
     # The input rule of compare_reports() (input_difference()), over the /data files the runs read:
     # another release of a dataset is no evidence of a code change (the orchestrator, 7 Nov 2026).
     (base_sha, base_bytes), (new_sha, new_bytes) = suite_inputs(base_files), suite_inputs(new_files)
-    other_input = None
     if base_sha != {} or new_sha != {}:
         if why := input_difference(base_sha, new_sha, base_bytes, new_bytes):
-            other_input = why
             print(f"## Inputs\n\n- {why}\n\nREFUSED: the runs didn't read the same input: no time or memory "
                   "verdict would be evidence of a code change")
+            return 2
+    refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
     base = collect(base_files, systems, args.include_restricted)
     new = collect(new_files, systems, args.include_restricted)
     print(f"# {args.new} against {args.base}\n")
@@ -1011,10 +1010,10 @@ def main(argv: list[str]) -> int:
     out = Out()
     totals = compare_pairs(base, new, args.threshold, args.min_ms, out,
                            (memory_kinds(base_files), memory_kinds(new_files)), (verdicts(base_files), verdicts(new_files)),
-                           measures=not (refused or other_input))
+                           measures=not refused)
     out.print()
-    if not (refused or other_input):
+    if not refused:
         print(f"**Queries:** {totals['slower']} slower, {totals['faster']} faster, {totals['=']} within noise, "
               f"{totals['not comparable']} not comparable (incomplete, wrong, disputed or without timings).")
     print(f"**{out.regressions} regression(s)** (lost work, changed answers, worse beyond noise).")
-    return 1 if out.regressions else 2 if refused or other_input else 0
+    return 1 if out.regressions else 2 if refused else 0
