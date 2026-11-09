@@ -31,7 +31,10 @@ mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
+mod private;
 mod replication;
+#[cfg(test)]
+mod shared_state_tests;
 mod snapshot;
 pub(crate) mod spill;
 mod statistics;
@@ -56,10 +59,11 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
+pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot,
-    SnapshotIdentity, TextScope,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
+    SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -132,7 +136,10 @@ pub struct EngineStats {
     pub inferred: u64,
     /// Runs of both stacks.
     pub runs: usize,
-    /// Index memory of both stacks on the heap.
+    /// Index memory of both stacks on the heap: the latest version's own runs, and every
+    /// quad-layout form of a default-graph run alive (shared by pending versions over a base
+    /// that hasn't the quad layout yet, published or not), each once (DUR-6). Array payload,
+    /// not run boxes; older versions held by snapshots aren't counted.
     pub index_bytes: u64,
     /// Index data of both stacks used in place from a mapped checkpoint.
     pub index_mapped_bytes: u64,
@@ -481,10 +488,14 @@ impl Versions {
     /// stack's runs until the caller publishes. Converted without the slot, on the caller's
     /// pool, and kept only where the stack's runs are still the ones converted (a merge or a
     /// mapped checkpoint may have replaced them meanwhile: converted afresh).
-    fn converted_asserted(&self) -> (MutexGuard<'_, ()>, IndexVersion) {
+    fn converted_asserted(
+        &self,
+        forms: &crate::index::Forms,
+    ) -> (MutexGuard<'_, ()>, IndexVersion) {
         loop {
             let base = self.load();
-            let converted = base.asserted.with_quads_layout();
+            // The runs' shared forms: a pending version's, if one holds it still (DUR-6).
+            let converted = base.asserted.with_quads_layout(forms);
             let slot = self.compaction_slot.lock();
             let now = self.load();
             let (was, is) = (base.asserted.runs(), now.asserted.runs());
@@ -532,6 +543,10 @@ struct Shared {
     /// while it holds commits of unknown time: the clock stays known through them (review r1,
     /// R1-F2). Recovered from the checkpoint and the log; changed by writers only.
     clock: AtomicU64,
+    /// The quad-layout forms of default-graph runs alive, shared by the pending versions (and
+    /// a commit) that read a base in the quad layout: their bytes, counted in the index memory
+    /// ([`Engine::stats`]) while any holder keeps one (DUR-6).
+    forms: crate::index::Forms,
 }
 
 impl Shared {
@@ -542,8 +557,10 @@ impl Shared {
         stamp
     }
 
+    /// The installed version, published: the one constructor of a snapshot that grants a
+    /// [`snapshot::SharedState`].
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(
+        Snapshot::published(
             self.versions.load(),
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
@@ -990,6 +1007,7 @@ impl Engine {
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             admission: config.admission,
             clock: AtomicU64::new(clock),
+            forms: Default::default(),
         });
         let worker = config
             .background_maintenance
@@ -1107,6 +1125,18 @@ impl Engine {
         Transaction::new(&self.inner, None)
     }
 
+    /// A private transaction over `snapshot`: speculative changes that read its statements,
+    /// with terms of their own past its dictionary length, charged to `budget`, which never
+    /// enter the dictionary. It never commits and doesn't take the writer slot. Refused
+    /// ([`EngineError::Configuration`]) for a private snapshot or another engine's.
+    pub fn speculative_over(
+        &self,
+        snapshot: &Snapshot,
+        budget: Arc<nrese_exec::Budget>,
+    ) -> EngineResult<PrivateTransaction<'_>> {
+        PrivateTransaction::over(&self.inner, snapshot, budget)
+    }
+
     /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`]; on a Rayon pool
     /// thread, the contract of [`Self::transaction`].
     pub fn bulk_load(&self, mode: BulkMode) -> BulkLoad<'_> {
@@ -1197,7 +1227,14 @@ impl Engine {
             quads: version.asserted.len(),
             inferred: version.inferred.len(),
             runs: version.runs().count(),
-            index_bytes: version.runs().map(|run| run.memory_bytes()).sum(),
+            // The latest version's own runs, and every shared quad-layout form alive, published
+            // or not, once (DUR-6).
+            index_bytes: version
+                .runs()
+                .filter(|run| !run.is_form())
+                .map(|run| run.memory_bytes())
+                .sum::<u64>()
+                + self.inner.shared.forms.bytes(),
             index_mapped_bytes: version.runs().map(|run| run.mapped_bytes()).sum(),
             dictionary: self.inner.shared.dictionary.stats(),
             wal_bytes_since_checkpoint: self

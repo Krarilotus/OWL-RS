@@ -286,8 +286,9 @@ impl Context<'_> {
         }
         let mut wanted = variables.to_vec();
         wanted.extend(aggregates.iter().map(|(target, _)| target.clone()));
-        let projected = self.project(solutions, &wanted);
-        self.produced(projected)
+        // Charged already (each final is `produced`, the merge `reshaped`): the projection
+        // keeps that charge and charges only the columns it makes.
+        self.project(solutions, &wanted)
     }
 
     /// The partial groups of several morsels merged into one partial per group.

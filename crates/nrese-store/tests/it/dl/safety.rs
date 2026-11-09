@@ -172,8 +172,9 @@ fn explanations_are_only_for_readers_of_every_graph() {
 }
 
 /// Consistency on commit (and the islands deciding it): a committer who may read and
-/// write `open` only is rejected for what the secret schema makes inconsistent, and the
-/// rejection shows the axioms of the graphs it may read, never the secret ones.
+/// write `open` only is rejected for what the secret schema makes inconsistent. Its own
+/// graphs have a model by themselves, so the rejection shows no axiom (Q07: even its own
+/// statements, picked from a justification with secret axioms, would tell of them).
 #[test]
 fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
     let dl = pipeline();
@@ -201,24 +202,22 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
     let Err(MutationError::Rejected(reject)) = rejected else {
         panic!("expected a rejection, got {rejected:?}");
     };
-    let evidence = reject.explanation.expect("an explanation").evidence;
-    let shown = |local: &str| {
-        evidence.iter().any(|e| {
-            [&e.subject, &e.predicate, &e.object]
-                .iter()
-                .any(|t| t.contains(local))
-        })
-    };
-    // The committer's own statements, not the secret union or disjointness.
-    assert!(shown("example.com/x"), "{evidence:#?}");
+    // Not the secret union or disjointness, nor which of the committer's statements they
+    // take part in, nor how many axioms or statements it took.
+    assert!(reject.explanation.is_none(), "{reject:?}");
+    for leak in [
+        "unionOf",
+        "disjointWith",
+        "equivalentClass",
+        "example.com/x",
+        "axiom",
+    ] {
+        assert!(!reject.detail.contains(leak), "{leak}: {}", reject.detail);
+    }
     assert!(
-        !evidence.iter().any(|e| e.predicate.contains("unionOf")
-            || e.predicate.contains("disjointWith")
-            || e.predicate.contains("equivalentClass")),
-        "{evidence:#?}"
-    );
-    assert!(
-        reject.detail.contains("graphs you can't read"),
+        reject
+            .detail
+            .contains("Only statements in graphs you can read are shown"),
         "{}",
         reject.detail
     );
