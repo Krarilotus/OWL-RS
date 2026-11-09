@@ -734,7 +734,15 @@ mod tests {
         for i in 600..1000 {
             assert!(pending.insert_asserted(quad(i)));
         }
-        assert_eq!(pending.asserted.inserts.capacity(), capacity, "no growth");
+        // No growth is no new allocation. `capacity()` is not that measure: it counts the free
+        // slots left, and how many a removal frees depends on the hashes (a tombstone or an
+        // empty slot), which a seeded hasher varies from run to run: 1 in 100 runs of this test
+        // on engine-v2 ab99d53e saw 1786 for 1792 with the same table (D16-039 diagnostic).
+        assert_eq!(
+            pending.asserted.inserts.allocation_size(),
+            charged,
+            "no growth"
+        );
         assert_eq!(
             budget.used(),
             charged,
