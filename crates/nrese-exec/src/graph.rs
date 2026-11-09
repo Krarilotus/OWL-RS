@@ -161,7 +161,7 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
     pool: &'p Pool<B>,
     stop: StopFn<'_>,
 ) -> Result<Buf<'p, (u64, u64), B>, Stop> {
-    let mut ticker = Ticker::new(stop)?;
+    let ticker = Ticker::new(stop)?;
     let mut out = Charged::in_pool(pool);
     // Per node, the last start it was reached from: a stamp, so nothing is cleared between
     // starts.
@@ -182,6 +182,7 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
         frontier.push(start)?;
         while !frontier.is_empty() {
             for k in 0..frontier.len() {
+                ticker.tick(1)?;
                 for &target in adjacency.neighbours(frontier[k]) {
                     ticker.tick(1)?;
                     if mark(&mut seen, target, i)? {
@@ -234,7 +235,7 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
     pool: &'p Pool<B>,
     stop: StopFn<'_>,
 ) -> Result<Buf<'p, (u64, u64), B>, Stop> {
-    let mut ticker = Ticker::new(stop)?;
+    let ticker = Ticker::new(stop)?;
     let Condensation {
         nodes,
         offsets,
@@ -246,7 +247,7 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
         reach,
         reach_starts,
         rows,
-    } = Condensation::of(edges, pool, &mut ticker)?;
+    } = Condensation::of(edges, pool, &ticker)?;
     // What only the condensation needed, freed before the output is charged.
     drop((offsets, targets, component, cyclic));
     let (nodes, members, starts): (&[u64], &[u32], &[usize]) = (&nodes, &members, &starts);
@@ -286,11 +287,13 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
     let runs: &[(usize, usize)] = &runs;
     out.fill(0, |room| {
         room.try_par_fill_parts(&lengths, |i, part| {
-            let mut ticker = Ticker::new(stop)?;
+            let ticker = Ticker::new(stop)?;
             let (first, end) = runs[i];
             for c in first..end {
+                ticker.tick(1)?;
                 let reached = &reach[reach_starts[c]..reach_starts[c + 1]];
                 for &x in members_of(c) {
+                    ticker.tick(1)?;
                     for &d in reached {
                         for &y in members_of(d as usize) {
                             ticker.tick(1)?;
@@ -328,8 +331,8 @@ pub fn closure_sizes_within<'p, B: Deref<Target = Budget>>(
     pool: &'p Pool<B>,
     stop: StopFn<'_>,
 ) -> Result<Buf<'p, (u64, u64, bool), B>, Stop> {
-    let mut ticker = Ticker::new(stop)?;
-    let g = Condensation::of(edges, pool, &mut ticker)?;
+    let ticker = Ticker::new(stop)?;
+    let g = Condensation::of(edges, pool, &ticker)?;
     // Dense ids follow the sorted node ids, so the output comes out sorted.
     let mut out = Charged::in_pool(pool);
     let size = &g.rows;
@@ -388,8 +391,8 @@ pub fn components_csr(
 ) -> Option<Components> {
     let budget = Budget::unlimited();
     let pool = Pool::new(&budget);
-    let mut ticker = Ticker::new(stop).ok()?;
-    let found = components_csr_in(offsets, targets, &pool, &mut ticker).ok()?;
+    let ticker = Ticker::new(stop).ok()?;
+    let found = components_csr_in(offsets, targets, &pool, &ticker).ok()?;
     Some(Components {
         component: found.component.into_parts().0,
         members: found.members.into_parts().0,
@@ -403,7 +406,7 @@ fn components_csr_in<'p, B: Deref<Target = Budget>>(
     offsets: &[u32],
     targets: &[u32],
     pool: &'p Pool<B>,
-    ticker: &mut Ticker<StopFn<'_>>,
+    ticker: &Ticker<StopFn<'_>>,
 ) -> Result<ComponentsIn<'p, B>, Stop> {
     const UNSEEN: u32 = u32::MAX;
     let n = offsets.len() - 1;
@@ -471,6 +474,7 @@ fn components_csr_in<'p, B: Deref<Target = Budget>>(
                 }
                 continue;
             }
+            ticker.tick(1)?;
             calls.truncate(calls.len() - 1);
             if let Some(&(u, _)) = calls.last() {
                 low[u as usize] = low[u as usize].min(low[v as usize]);
@@ -513,14 +517,23 @@ pub fn components(n: usize, edges: &[(u32, u32)]) -> Components {
     components_csr(&offsets, &targets, &|| false).expect("never stopped")
 }
 
-/// `values`, sorted, with each value once.
-fn dedup_sorted<T: PartialEq + Copy, B: Deref<Target = Budget>>(values: &mut Buf<'_, T, B>) {
-    let mut previous = None;
-    values.retain(|&value| {
-        let first = previous != Some(value);
-        previous = Some(value);
-        first
-    });
+/// `values`, sorted, with each value once: a tick a value, so a stop is seen within
+/// [`crate::POLL_UNITS`] comparisons (sol-loop r2 of the graph closure package). Stopped, it
+/// leaves `values` part-compacted: the kernels then drop them.
+fn dedup_sorted<T: PartialEq + Copy, B: Deref<Target = Budget>>(
+    values: &mut Buf<'_, T, B>,
+    ticker: &Ticker<StopFn<'_>>,
+) -> Result<(), Stop> {
+    let mut kept = 0;
+    for read in 0..values.len() {
+        ticker.tick(1)?;
+        if kept == 0 || values[read] != values[kept - 1] {
+            values[kept] = values[read];
+            kept += 1;
+        }
+    }
+    values.truncate(kept);
+    Ok(())
 }
 
 /// A relation's strongly connected components and, per component, the components it
@@ -556,7 +569,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
     fn of(
         edges: &[(u64, u64)],
         pool: &'p Pool<B>,
-        ticker: &mut Ticker<StopFn<'_>>,
+        ticker: &Ticker<StopFn<'_>>,
     ) -> Result<Self, Stop> {
         use rayon::prelude::*;
 
@@ -576,20 +589,21 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         ticker.check()?;
         nodes.par_sort_unstable();
         ticker.check()?;
-        dedup_sorted(&mut nodes);
+        dedup_sorted(&mut nodes, ticker)?;
         // Room for both ends of every edge, of which the distinct nodes are often far fewer.
         nodes.shrink_to_fit()?;
         let n = nodes.len();
         let sorted: &[u64] = &nodes;
         let dense = |id: u64| sorted.binary_search(&id).expect("every endpoint is a node") as u32;
         let mut pairs: Buf<'p, (u32, u32), B> = Charged::with_capacity_in(pool, edges.len())?;
+        ticker.check()?;
         pairs.fill(0, |room| {
             room.par_fill(edges.len(), |i| (dense(edges[i].0), dense(edges[i].1)))
         })?;
         ticker.check()?;
         pairs.par_sort_unstable();
         ticker.check()?;
-        dedup_sorted(&mut pairs);
+        dedup_sorted(&mut pairs, ticker)?;
         let mut offsets: Buf<'p, u32, B> = Charged::in_pool(pool);
         offsets.resize(n + 1, 0)?;
         for &(a, _) in pairs.iter() {
@@ -645,7 +659,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
 
     /// Reach per component, successors first, each set's growth charged before it grows,
     /// a tick per successor walked and per entry taken over.
-    fn reach(&mut self, pool: &'p Pool<B>, ticker: &mut Ticker<StopFn<'_>>) -> Result<(), Stop> {
+    fn reach(&mut self, pool: &'p Pool<B>, ticker: &Ticker<StopFn<'_>>) -> Result<(), Stop> {
         let components = self.components();
         let mut stamp: Buf<'p, u32, B> = Charged::in_pool(pool);
         stamp.resize(components, u32::MAX)?;
@@ -655,9 +669,11 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         self.reach_starts.push(0)?;
         let size = |starts: &[usize], d: u32| (starts[d as usize + 1] - starts[d as usize]) as u32;
         for c in 0..components {
+            ticker.tick(1)?;
             let mut cyclic = self.members_of(c).len() > 1;
             let mut row = 0u32;
             for k in self.starts[c]..self.starts[c + 1] {
+                ticker.tick(1)?;
                 let x = self.members[k] as usize;
                 for j in self.offsets[x] as usize..self.offsets[x + 1] as usize {
                     ticker.tick(1)?;
@@ -887,6 +903,39 @@ mod tests {
         drop(refused);
         drop(pool);
         assert_eq!(small.used(), 0);
+    }
+
+    /// Spec (stop.rs, W1; sol-loop r2 of the graph closure package): the kernels' dedup sees a
+    /// stop within `POLL_UNITS` comparisons. Over 100,000 distinct values whose comparisons
+    /// are counted, a stop that fires once 10,000 have been made stops it no more than
+    /// `POLL_UNITS` comparisons later; scanned without a tick, it made all 99,999.
+    #[test]
+    fn a_dedup_stops_within_a_poll_interval() {
+        static COMPARED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        #[derive(Clone, Copy)]
+        struct Counted(u64);
+        impl PartialEq for Counted {
+            fn eq(&self, other: &Self) -> bool {
+                COMPARED.fetch_add(1, Ordering::Relaxed);
+                self.0 == other.0
+            }
+        }
+        const AT: usize = 10_000;
+        let budget = Budget::unlimited();
+        let pool = Pool::new(&budget);
+        let mut values: Buf<'_, Counted, &Budget> =
+            Charged::with_capacity_in(&pool, 100_000).unwrap();
+        for i in 0..100_000 {
+            values.push(Counted(i)).unwrap();
+        }
+        let stop: StopFn<'_> = &|| COMPARED.load(Ordering::Relaxed) >= AT;
+        let ticker = Ticker::new(stop).unwrap();
+        assert_eq!(dedup_sorted(&mut values, &ticker), Err(Stop::Cancelled));
+        let compared = COMPARED.load(Ordering::Relaxed);
+        assert!(
+            compared <= AT + crate::POLL_UNITS as usize,
+            "{compared} comparisons, the stop at {AT}"
+        );
     }
 
     /// The SCC kernel: components, each once, sinks first.
