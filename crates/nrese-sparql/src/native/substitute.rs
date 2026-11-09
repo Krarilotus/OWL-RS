@@ -7,9 +7,10 @@
 //! subquery): [`super::exists::correlation_safe`]. Those patterns come here.
 //!
 //! A value is put in as a constant. SPARQL has no syntax for a particular blank node, so a
-//! blank node is put in as an alias IRI ([`ALIAS`] and its id), which the evaluation
-//! context reads as the node itself: in patterns ([`Context::lookup_const`]) and in
-//! expressions ([`super::expr::Evaluator`]'s aliases).
+//! blank node is put in as a made constant ([`internal::blank_constant`] of its label),
+//! which the evaluation context reads as the node itself: in patterns
+//! ([`Context::lookup_const`]) and in expressions ([`super::expr::Evaluator`]'s aliases).
+//! No IRI is spelt like one.
 
 use std::collections::HashMap;
 
@@ -17,10 +18,8 @@ use nrese_rdf::{NamedNode, Term, Variable};
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, Expression, GraphPattern, OrderExpression,
 };
+use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
-
-/// The namespace of the alias IRIs that stand for blank nodes.
-pub(super) const ALIAS: &str = "urn:nrese:substituted-blank-node:";
 
 /// An outer solution's values, as constants to put in.
 pub(super) struct Values<'a> {
@@ -32,7 +31,7 @@ impl Values<'_> {
         Some(match self.terms.get(variable)? {
             Term::NamedNode(n) => Constant::Iri(n.clone()),
             Term::Literal(l) => Constant::Literal(l.clone()),
-            Term::BlankNode(b) => Constant::Iri(alias(b.as_str())),
+            Term::BlankNode(b) => Constant::Iri(internal::blank_constant(b.as_str())),
             // Triple terms aren't substituted into the pattern: it stays a join.
             Term::Triple(_) => return None,
         })
@@ -54,7 +53,7 @@ impl Values<'_> {
             NamedNodePattern::Variable(v) => match self.constant(v) {
                 Some(Constant::Iri(n)) => NamedNodePattern::NamedNode(n),
                 // A literal where only an IRI may stand: a node no data has.
-                Some(Constant::Literal(_)) => NamedNodePattern::NamedNode(alias("literal")),
+                Some(Constant::Literal(_)) => NamedNodePattern::NamedNode(internal::no_term()),
                 None => name.clone(),
             },
             other => other.clone(),
@@ -347,11 +346,6 @@ impl Constant {
     }
 }
 
-/// The alias IRI of blank node `label`.
-pub(super) fn alias(label: &str) -> NamedNode {
-    NamedNode::new_unchecked(format!("{ALIAS}{label}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,7 +373,10 @@ mod tests {
         ]);
         let text = Values { terms: &terms }.pattern(&pattern).to_string();
         assert!(!text.contains("?o"), "{text}");
-        assert!(text.contains(&format!("<{ALIAS}b7>")), "{text}");
+        assert!(
+            text.contains(&format!("<{}>", internal::blank_constant("b7").as_str())),
+            "{text}"
+        );
         // VALUES keeps the agreeing row and drops the column.
         assert!(!text.contains(" 2 "), "{text}");
     }
