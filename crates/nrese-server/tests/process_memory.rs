@@ -231,13 +231,13 @@ fn server_output_holds_the_same_memory_for_a_graph_four_times_larger() {
 
 fn assert_output_growth(name: &str, peaks: [usize; 2]) {
     let growth = peaks[1].saturating_sub(peaks[0]);
-    // The export's bounded channel may be empty at n and full at 4n. Keep the
+    // A streamed response's bounded channel may be empty at n and full at 4n. Keep the
     // existing fixed-overhead allowance, adding only its size-independent payload.
     let allowance = 256 * 1024
-        + if name == "export" {
-            MAX_BUFFERED_OUTPUT_BYTES
-        } else {
+        + if name == "HEAD" {
             0
+        } else {
+            MAX_BUFFERED_OUTPUT_BYTES
         };
     eprintln!("{name}: peaks={peaks:?}, growth={growth}, allowance={allowance}");
     assert!(
