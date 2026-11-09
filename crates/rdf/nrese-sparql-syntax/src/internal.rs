@@ -71,8 +71,9 @@ const SENT_CONSTANT: &str = "urn:nrese:substituted-blank-node:";
 /// pattern doesn't use, each made constant in its previous spelling ([`SENT_CONSTANT`]);
 /// with the names to read the endpoint's answer by ([`Sent::local`]). A blank node whose
 /// made variable ([`blank_variable`]) the pattern names too is written as that renamed
-/// variable, so the two stay one node. Unchanged, and nothing renamed, when the pattern
-/// holds no made name.
+/// variable, so the two stay one node. A pattern that would match a made constant matches
+/// nothing ([`unmatchable`]). Unchanged, and nothing renamed, when the pattern holds no
+/// made name.
 pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
     // First what the pattern names, then the renames: a new name is clear of every one.
     let mut made: HashSet<Variable> = HashSet::new();
@@ -88,6 +89,9 @@ pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
         SlotMut::Iri(n) => constants |= is_constant(n.as_str()),
         SlotMut::Blank(_) => {}
     });
+    if constants {
+        unmatchable(&mut pattern);
+    }
     let mut names: HashMap<Variable, Variable> = HashMap::new();
     if !made.is_empty() || constants {
         let mut next = 0usize;
@@ -127,6 +131,50 @@ pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
     }
     let local = names.into_iter().map(|(made, sent)| (sent, made)).collect();
     (pattern, Sent(local))
+}
+
+/// Each basic graph pattern, path and GRAPH of `pattern` that would match a made constant
+/// itself, wrapped in `FILTER(false)`: it matches nothing, because no endpoint holds the
+/// local term a made constant stands for (and [`no_term`] stands for none), and its
+/// variables stay in scope, so a join, OPTIONAL or UNION around it reads as here. An
+/// expression's made constant is sent as it is spelt (an IRI no endpoint is meant to hold).
+fn unmatchable(pattern: &mut GraphPattern) {
+    let mut stack = vec![NodeMut::Pattern(pattern)];
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeMut::Pattern(p) => {
+                if matches!(
+                    p,
+                    GraphPattern::Bgp { .. }
+                        | GraphPattern::Path { .. }
+                        | GraphPattern::Graph { .. }
+                ) {
+                    let mut holds = false;
+                    pattern_slots_mut(p, &mut |slot| {
+                        if let SlotMut::Iri(n) = slot {
+                            holds |= is_constant(n.as_str());
+                        }
+                    });
+                    if holds {
+                        let matched = std::mem::replace(
+                            p,
+                            GraphPattern::Bgp {
+                                patterns: Vec::new(),
+                            },
+                        );
+                        *p = GraphPattern::Filter {
+                            expr: Expression::Literal(nrese_rdf::Literal::from(false)),
+                            inner: Box::new(matched),
+                        };
+                        // Nothing in it can match either.
+                        continue;
+                    }
+                }
+                stack.extend(p.children_mut());
+            }
+            NodeMut::Expression(e) => stack.extend(e.children_mut()),
+        }
+    }
 }
 
 /// The made variables a [`printable`] pattern sent under other names.
@@ -323,7 +371,7 @@ mod tests {
                 TriplePattern {
                     subject: variable("triple-term", 0).into(),
                     predicate: NamedNode::new_unchecked("urn:q").into(),
-                    object: blank_constant("b7").into(),
+                    object: NamedNode::new_unchecked("urn:o").into(),
                 },
             ],
         };
@@ -358,10 +406,36 @@ mod tests {
         );
         assert_eq!(back(names[1]), Variable::new_unchecked("_m0"));
         assert_eq!(back(names[2]), variable("triple-term", 0));
-        assert_eq!(
-            patterns[1].object,
-            TermPattern::NamedNode(NamedNode::new_unchecked(format!("{SENT_CONSTANT}blank-b7"))),
-            "{text}"
-        );
+    }
+
+    /// A triple pattern matching a made constant matches nothing at the endpoint: its
+    /// pattern is sent under `FILTER(false)`, its variables in scope, and the constant in
+    /// a spelling the text parses.
+    #[test]
+    fn a_pattern_matching_a_made_constant_is_sent_matching_nothing() {
+        for constant in [blank_constant("b7"), no_term()] {
+            let p = GraphPattern::Bgp {
+                patterns: vec![TriplePattern {
+                    subject: Variable::new_unchecked("s").into(),
+                    predicate: NamedNode::new_unchecked("urn:p").into(),
+                    object: constant.clone().into(),
+                }],
+            };
+            let (printed, _) = printable(p);
+            let text = format!("SELECT * WHERE {{ {printed} }}");
+            let GraphPattern::Project { inner, variables } = pattern(&text) else {
+                panic!("{text}")
+            };
+            assert_eq!(variables, [Variable::new_unchecked("s")], "{text}");
+            let GraphPattern::Filter { expr, inner } = *inner else {
+                panic!("{text}")
+            };
+            assert_eq!(
+                expr,
+                Expression::Literal(nrese_rdf::Literal::from(false)),
+                "{text}"
+            );
+            assert!(matches!(*inner, GraphPattern::Bgp { .. }), "{text}");
+        }
     }
 }
