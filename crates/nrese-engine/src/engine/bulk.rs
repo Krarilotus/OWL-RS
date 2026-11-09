@@ -112,6 +112,11 @@ impl<'e> BulkLoad<'e> {
         }
     }
 
+    /// Proof that this load holds the writer slot.
+    pub fn writer(&self) -> super::WriterHeld<'_> {
+        super::WriterHeld::new()
+    }
+
     /// Adds a batch of quads as the next of this load's own numbering (chunk 0): in the
     /// order the calls come, which is the input's where one thread adds.
     pub fn add(&self, quads: &[Quad]) {
@@ -812,13 +817,26 @@ impl<'e> Rematerialisation<'e> {
         self.engine.shared.dictionary.intern(term)
     }
 
+    /// Proof that this rematerialisation holds the writer slot.
+    pub fn writer(&self) -> super::WriterHeld<'_> {
+        super::WriterHeld::new()
+    }
+
     /// Replaces the inferred stack with `inferred` (in the default graph). Statements that
     /// are asserted in the default graph are dropped: the stacks stay disjoint. Returns the
     /// revision and the inferred statements added and removed.
     pub fn finish(self, inferred: Vec<EncodedTriple>) -> EngineResult<CommitSummary> {
+        self.finish_held(inferred)
+            .map(|finished| finished.summary())
+    }
+
+    /// [`Self::finish`], keeping the writer slot until the returned [`super::Finished`] drops:
+    /// what describes the published inferences (a store's reasoning certificate) is recorded
+    /// before any other write can change the data they were computed over.
+    pub fn finish_held(self, inferred: Vec<EncodedTriple>) -> EngineResult<super::Finished<'e>> {
         let Self {
             engine,
-            _slot,
+            _slot: slot,
             base,
         } = self;
         let shared = &engine.shared;
@@ -855,10 +873,11 @@ impl<'e> Rematerialisation<'e> {
             asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
-            return Ok(CommitSummary {
+            let summary = CommitSummary {
                 revision: base.revision(),
                 ..summary
-            });
+            };
+            return Ok(super::Finished::new(summary, slot));
         }
         let inferred = IndexVersion::from_quads(Layout::DefaultGraph, quads);
         // A merge may have replaced the asserted runs since `base` was taken, with the same
@@ -893,6 +912,6 @@ impl<'e> Rematerialisation<'e> {
             "inferred stack replaced"
         );
         engine.after_commit(0);
-        Ok(summary)
+        Ok(super::Finished::new(summary, slot))
     }
 }

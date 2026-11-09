@@ -23,6 +23,7 @@ pub(crate) mod slot;
 mod strings;
 pub(crate) mod suffix;
 pub mod text;
+mod text_triple;
 pub mod vectors;
 pub(crate) mod vocabulary;
 #[cfg(test)]

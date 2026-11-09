@@ -145,8 +145,10 @@ pub(crate) mod tests {
     /// Expected, judged apart:
     /// - the reopen and its reads work (guard: a reopen changes nothing on disk);
     /// - a namespace change is refused, not published, and leaves the store available;
-    /// - the reasoning marker of a rematerialisation is refused (`InferencesNotRecorded`: the
-    ///   inferences are published in memory, unrecorded);
+    /// - a rematerialisation is refused before it publishes anything: the removal of the
+    ///   certificate of the closure it would replace can't be made durable (Q06 remainder,
+    ///   review r1 F3; before it, the marker was refused after the publication,
+    ///   `InferencesNotRecorded`), and the inferences aren't there;
     /// - reopened, neither the binding nor the reasoning is there;
     /// - once naming works, the same change and rematerialisation are acknowledged (a retry
     ///   after a refusal), and the binding and the reasoning are there after a reopen;
@@ -203,11 +205,17 @@ pub(crate) mod tests {
             ));
         }
         match store.rematerialise(&program) {
-            Err(StoreError::InferencesNotRecorded(_)) => {}
+            Err(StoreError::Io(_)) => {}
             other => wrong.push(format!(
-                "a reasoning marker placed before its store was named: {:?}",
+                "a rematerialisation not refused before it published, its store not named: {:?}",
                 other.map(drop)
             )),
+        }
+        let derived = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        if String::from_utf8_lossy(&derived.payload).contains("true") {
+            wrong.push("a refused rematerialisation published its inferences".to_owned());
         }
         FAIL_NAMING_OF.set(None);
         // Reopened (the refusals' durable outcome, modelled): neither is there.
