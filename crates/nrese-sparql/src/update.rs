@@ -127,11 +127,15 @@ pub fn apply_update(
     update: &Update,
     options: &UpdateOptions,
 ) -> Result<(), UpdateError> {
+    // What a `WHERE` clause's snapshot of the pending state is charged to: one budget for the
+    // request, drawn from its envelope, so an unchanged state's snapshot is the one kept, not
+    // made again (DUR-6's memo is per budget).
+    let reads = Arc::new(options.resources.memory.part());
     for operation in &update.operations {
         if options.resources.check().is_err() {
             return Err(UpdateError::Cancelled);
         }
-        apply_operation(tx, operation, update, options)?;
+        apply_operation(tx, operation, update, options, &reads)?;
     }
     Ok(())
 }
@@ -141,6 +145,7 @@ fn apply_operation(
     operation: &GraphUpdateOperation,
     update: &Update,
     options: &UpdateOptions,
+    reads: &Arc<nrese_exec::Budget>,
 ) -> Result<(), UpdateError> {
     match operation {
         GraphUpdateOperation::InsertData { data } => {
@@ -174,9 +179,14 @@ fn apply_operation(
                 .as_ref()
                 .map(|read| read.state(tx))
                 .transpose()?;
-            let pending = (read.is_none()
-                && (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0)))
-                .then(|| tx.pending_snapshot());
+            // Charged to the request's envelope by its builder (DUR-6) before it is made, and
+            // for as long as it is held (D16-039); refused, the request's memory error.
+            let pending = match read.is_none()
+                && (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0))
+            {
+                true => Some(tx.pending_snapshot_within(reads).map_err(pending_error)?),
+                false => None,
+            };
             let state = read.as_ref().or(pending.as_ref()).unwrap_or(tx.base());
             let query_options = crate::query::QueryOptions {
                 resources: options.resources.clone(),
