@@ -142,8 +142,10 @@ fn cache_state(cache: &ResultCache) -> (ResultCacheStats, Vec<PinnedResult>) {
 }
 
 /// `view`, unpublished, is answered as without the cache, through every entry point, and the
-/// cache is left as `before`: no part, prefix or output entry, no claim, no eviction, no pin.
-fn answered_and_kept_nowhere(
+/// shared cache is left as `before`: no part, prefix or output entry, no claim, no eviction,
+/// no pin. Its answer's bytes go through its own version's cache (package 3.0c), twice, and
+/// are the bytes written without one.
+fn answered_and_kept_off_the_shared_cache(
     name: &str,
     view: &Snapshot,
     cache: &ResultCache,
@@ -164,13 +166,13 @@ fn answered_and_kept_nowhere(
             "{name}"
         );
         explain_query(view, &parse(&text), options).unwrap();
-        assert!(
-            matches!(
-                cached_output(view, &parse(&text), options, TSV, ""),
-                CachedOutput::Off
-            ),
-            "{name}: no slot for an unpublished state's bytes"
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                tsv_through_the_cache(view, &text, options),
+                tsv(view, &text, &plain),
+                "{name}: its bytes, through its own version's cache"
+            );
+        }
     }
     assert_eq!(
         &cache_state(cache),
@@ -199,7 +201,7 @@ fn inferred(snapshot: &Snapshot) -> Vec<EncodedQuad> {
 ///   ids, with no change, and after inserting then deleting one statement; a speculative
 ///   transaction's; a private transaction's (both builders).
 /// - Expected: each answers as without the cache through every entry point and leaves the
-///   cache exactly as it was; the published snapshot is answered from it afterwards.
+///   shared cache exactly as it was; the published snapshot is answered from it afterwards.
 #[test]
 fn unpublished_snapshots_are_answered_and_leave_the_cache_as_it_was() {
     let engine = engine();
@@ -249,7 +251,7 @@ fn unpublished_snapshots_are_answered_and_leave_the_cache_as_it_was() {
         unpublished.push(("private, over a view", tx.pending_over(&view, &[]).unwrap()));
     }
     for (name, snapshot) in &unpublished {
-        answered_and_kept_nowhere(name, snapshot, &cache, &options, &before);
+        answered_and_kept_off_the_shared_cache(name, snapshot, &cache, &options, &before);
     }
 
     let hits = cache.stats().hits;
@@ -305,7 +307,7 @@ fn views_admit_by_their_own_publication_under_their_own_identity() {
         ),
     ];
     for (name, view) in &views {
-        answered_and_kept_nowhere(name, view, &cache, &options, &before);
+        answered_and_kept_off_the_shared_cache(name, view, &cache, &options, &before);
     }
 
     let text = &queries()[2];

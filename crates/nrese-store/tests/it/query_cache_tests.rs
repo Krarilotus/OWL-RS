@@ -253,14 +253,15 @@ fn repeats_are_answered_from_their_written_bytes() {
 }
 
 /// A session's reads over its pending operations (the lifecycle contract's S3; package 3.6's
-/// design note §4 item 1, its real caller): unpublished state is answered for the request and
-/// admitted nowhere, however often the session reads its kept view.
+/// design note §4 item 1, its real caller): unpublished state is never admitted into the
+/// store's cache, however often the session reads its kept view (what it keeps, its own
+/// version keeps: §11).
 ///
 /// - Input: the per-city query answered and cached; a session adding a person who knows `p0`;
 ///   the query three times on the session's pending operations.
 /// - Expected: every pending read is the answer the store gives once the same update is
-///   committed, and the cache is as the published query left it (no entry, claim, miss or
-///   hit) until then.
+///   committed, and the store's cache is as the published query left it (no entry, claim,
+///   miss or hit) until then.
 #[test]
 fn a_sessions_reads_over_its_pending_operations_keep_nothing() {
     use nrese_store::{SparqlUpdateRequest, StatementOp};
