@@ -378,6 +378,79 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:s> <urn:p> } . <urn:after> <urn:p> <urn:o> .",
             vec![None, Some(&after)],
         ),
+        // A TriG graph block whose name fails (an undeclared prefix, an IRI that can't be
+        // one) is skipped through its own `}`: the statement after the block isn't part of
+        // it. Before, the `{` was read as a brace of the failed statement, which went on to
+        // the next `.` and took that statement with it.
+        (
+            false,
+            RdfFormat::TriG,
+            "ex:g { <urn:u> <urn:v> <urn:w> . } <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "GRAPH <a b> { <urn:u> <urn:v> <urn:w> . } <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // A name that fails without a block after it is a failed statement, as before.
+        (
+            true,
+            RdfFormat::TriG,
+            "ex:s <urn:p> <urn:o> . <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // A SPARQL-style directive that fails ends after its IRI (PREFIX, BASE) or its string
+        // (VERSION), as one that parses does: the statement after it isn't part of it.
+        // Before, the failed directive went on to the next `.` and took that statement with
+        // it.
+        (
+            false,
+            RdfFormat::Turtle,
+            "PREFIX ex: <a b>\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "PREFIX ex <x>\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "BASE <a b>\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "VERSION 12 \"1.2\"\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // The string a failed VERSION ends with is its label, not a literal: an `@` after it
+        // starts a directive, as after a VERSION that parses (sol-loop r3 S6).
+        (
+            false,
+            RdfFormat::Turtle,
+            "VERSION 12 \"1.2\"\n@prefix ex: <http://e/> .\nex:a ex:b ex:c . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // With no IRI (or string) to end it, it ends at a `.` with nothing open, as before.
+        (
+            true,
+            RdfFormat::Turtle,
+            "VERSION 12\n<urn:u> <urn:v> <urn:w> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // In its `@` form a directive ends at its `.`, failed or not, as before.
+        (
+            true,
+            RdfFormat::Turtle,
+            "@prefix ex: <a b> <urn:u> .\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
         // A string with a line break in it, closed later: its end is known, so it is
         // skipped whole and the `] .` and statement in it are text, not structure (fix
         // check r2). LF and CR, both quotes, and in a TriG block.
@@ -591,99 +664,33 @@ fn an_opener_refused_by_the_nesting_limit_stays_open() {
 /// here (fix check r3; P, r5). A guard: before, there was no such check.
 #[test]
 fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
-    const DELIMITERS: [&str; 13] = [
-        "[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}", "{", "}", ".",
-    ];
-    let seeds = [
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> [ <urn:q> ( 1 <<( <urn:a> <urn:b> <urn:c> )>> ) ; <urn:r> << <urn:a> <urn:b> <urn:c> ~ <urn:x> >> {| <urn:p> <urn:o> |} ] .",
-        ),
-        (RdfFormat::Turtle, "[ <urn:p> <urn:o> ] <urn:q> <urn:r> ."),
-        (RdfFormat::Turtle, "[ ] <urn:p> <urn:o> ."),
-        (RdfFormat::Turtle, "( 1 2 ) <urn:p> <urn:o> ."),
-        (
-            RdfFormat::Turtle,
-            "<< << <urn:a> <urn:b> <urn:c> >> <urn:p> << <urn:a> <urn:b> <urn:c> >> >> <urn:q> <urn:r> .",
-        ),
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> << [ ] <urn:b> <<( <urn:a> <urn:b> \"x\" )>> ~ [ ] >> .",
-        ),
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> <<( [ ] <urn:b> <<( <urn:a> <urn:b> <urn:c> )>> )>> .",
-        ),
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> <urn:o> ~ [ ] {| <urn:q> [ <urn:r> <urn:o> ] |} .",
-        ),
-        (RdfFormat::Turtle, "<urn:s> <urn:p> \"x\"^^ <urn:dt> ."),
-        (RdfFormat::Turtle, "@prefix ex: <urn:ex#> ."),
-        (RdfFormat::Turtle, "@base <urn:b> ."),
-        (RdfFormat::Turtle, "@version \"1.2\" ."),
-        (RdfFormat::Turtle, "PREFIX ex: <urn:ex#>"),
-        (RdfFormat::TriG, "GRAPH [ ] { <urn:s> <urn:p> <urn:o> . }"),
-        (
-            RdfFormat::TriG,
-            "[ ] { <urn:s> <urn:p> [ <urn:q> <urn:o> ] . }",
-        ),
-        (
-            RdfFormat::TriG,
-            "<urn:g> { [ <urn:p> <urn:o> ] <urn:q> ( 1 ) . }",
-        ),
-        (RdfFormat::TriG, "[ ] <urn:p> <urn:o> ."),
-        (RdfFormat::TriG, "[ <urn:p> <urn:o> ] <urn:q> <urn:r> ."),
-    ];
     let mut table = Table::default();
-    for (format, seed) in seeds {
-        let tokens: Vec<&str> = seed.split(' ').collect();
-        for at in 0..=tokens.len() {
-            for delimiter in DELIMITERS {
-                for replace in [false, true] {
-                    if replace && at == tokens.len() {
-                        continue;
-                    }
-                    let mut mutated = tokens.clone();
-                    if replace {
-                        mutated[at] = delimiter;
-                    } else {
-                        mutated.insert(at, delimiter);
-                    }
-                    let document: &'static str = Box::leak(
-                        format!("{} <urn:after> <urn:p> <urn:o> .", mutated.join(" "))
-                            .into_boxed_str(),
-                    );
-                    let parser = || RdfParser::from_format(format).recovering();
-                    let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
-                    // Every item to the end: the delimiter can come after the seed's own
-                    // quads (fix check r3's sol-loop, S1). A parser that doesn't end fails
-                    // the row.
-                    const BOUND: usize = 1_000;
-                    let outcome = std::panic::catch_unwind(|| {
-                        [
-                            parser().for_slice(document.as_bytes()).take(BOUND).count(),
-                            parser().for_reader(document.as_bytes()).take(BOUND).count(),
-                            parser().for_reader(bytes()).take(BOUND).count(),
-                        ]
-                    })
-                    .map_err(|panic| {
-                        let message = panic
-                            .downcast_ref::<String>()
-                            .cloned()
-                            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()));
-                        format!("panicked: {message:?}")
-                    })
-                    .and_then(|counts| {
-                        match counts.iter().all(|&n| n < BOUND) {
-                            true => Ok(()),
-                            false => Err(format!("no end within {BOUND} items: {counts:?}")),
-                        }
-                    });
-                    table.row(true, (format, document), outcome);
-                }
-            }
-        }
+    for (format, document) in crate::recovery_inputs::sweep() {
+        let document: &'static str = Box::leak(document.into_boxed_str());
+        let parser = || RdfParser::from_format(format).recovering();
+        let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
+        // Every item to the end: the delimiter can come after the seed's own quads (fix
+        // check r3's sol-loop, S1). A parser that doesn't end fails the row.
+        const BOUND: usize = 1_000;
+        let outcome = std::panic::catch_unwind(|| {
+            [
+                parser().for_slice(document.as_bytes()).take(BOUND).count(),
+                parser().for_reader(document.as_bytes()).take(BOUND).count(),
+                parser().for_reader(bytes()).take(BOUND).count(),
+            ]
+        })
+        .map_err(|panic| {
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()));
+            format!("panicked: {message:?}")
+        })
+        .and_then(|counts| match counts.iter().all(|&n| n < BOUND) {
+            true => Ok(()),
+            false => Err(format!("no end within {BOUND} items: {counts:?}")),
+        });
+        table.row(true, (format, document), outcome);
     }
     table.done();
 }

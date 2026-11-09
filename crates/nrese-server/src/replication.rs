@@ -445,7 +445,9 @@ pub async fn bootstrap(config: &ReplicationConfig, data_dir: &Path) -> anyhow::R
     manifest
         .image_name()
         .map_err(|error| anyhow::anyhow!("{primary}: {error}"))?;
-    std::fs::create_dir_all(data_dir)?;
+    // Durably named, every new level (made where else, the placement would take it for one
+    // provisioned beforehand: DUR-3).
+    nrese_store::place::create_dir_all(data_dir)?;
     let incoming = tempfile::tempdir_in(data_dir)?;
     let staged = incoming.path().join(STAGED_IMAGE);
     {

@@ -613,13 +613,19 @@ pub(crate) fn write_stamped(
     admission: Option<&Arc<SharedBudget>>,
     stamp: &mut dyn FnMut() -> Times,
 ) -> EngineResult<PathBuf> {
+    // A private snapshot's own ids mean terms the dictionary doesn't have.
+    let Some(dictionary) = snapshot.shared_dictionary() else {
+        return Err(EngineError::Configuration(
+            "a private snapshot has no published state to checkpoint".to_owned(),
+        ));
+    };
     let version = snapshot.version();
     write_parts(
         dir,
         admission,
         snapshot.revision(),
         stamp,
-        snapshot.dictionary(),
+        dictionary,
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
         &mut |stack, permutation| Ok(snapshot.version().stack(stack).packed(permutation)),
@@ -728,7 +734,7 @@ pub(crate) fn write_parts<'a>(
     file.sync_all()?;
     drop(file);
     let path = checkpoint_path(dir, revision, EXTENSION);
-    fs::rename(&tmp, &path)?;
+    super::place::rename(&tmp, &path)?;
     #[cfg(test)]
     super::fault::check(&super::fault::FAIL_DIR_SYNC, "directory sync")?;
     super::sync_dir(dir)?;
