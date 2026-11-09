@@ -118,18 +118,21 @@ impl<'e> Transaction<'e> {
         let generation = self.pending.generation();
         // Kept only while nothing it shows changed: no write (the generation), no term interned
         // since (its vocabulary ends at the dictionary's length then: sol-loop r1, S2), the
-        // same budget.
-        if let Some(kept) = self.pending.memo().lock().as_ref()
-            && kept.generation == generation
-            && kept.snapshot.version().dictionary_len == self.engine.shared.dictionary.len()
-            && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
-        {
-            return Ok(kept.snapshot.clone());
-        }
-        // Not current: let go before its replacement is charged. Held through the build, a stale
-        // one would count twice against the same budget (sol-loop r2, S4); a caller still holding
-        // it keeps its own share.
-        let stale = self.pending.memo().lock().take();
+        // same budget. Not current: taken out under the same guard (another reader may have
+        // made the current one meanwhile: sol-loop r3, S5) and let go, outside it, before its
+        // replacement is charged. Held through the build, a stale one would count twice against
+        // the same budget (sol-loop r2, S4); a caller still holding it keeps its own share.
+        let stale = {
+            let mut memo = self.pending.memo().lock();
+            if let Some(kept) = memo.as_ref()
+                && kept.generation == generation
+                && kept.snapshot.version().dictionary_len == self.engine.shared.dictionary.len()
+                && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
+            {
+                return Ok(kept.snapshot.clone());
+            }
+            memo.take()
+        };
         drop(stale);
         let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
         scratch.charge(self.pending.snapshot_changes_bound())?;
