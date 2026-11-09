@@ -12,14 +12,6 @@
 //! [`Overlay::freeze`] makes an [`OverlayView`]: the entries there were then, for a snapshot to
 //! hold. Lookups through a view still read the overlay's table, accepting only its own entries.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots and private transactions hold overlays from package 2b"
-    )
-)]
-
 use std::sync::Arc;
 
 use nrese_exec::{Budget, BudgetExceeded, Reservation};
@@ -82,6 +74,8 @@ impl Overlay {
         })
     }
 
+    /// Test support: its `start`, which its views report ([`OverlayView::start`]).
+    #[cfg(test)]
     pub(crate) fn start(&self) -> u64 {
         self.start
     }
@@ -157,6 +151,66 @@ impl Overlay {
     /// The id of `term` if it is known: inline, shared below `start`, or this overlay's own.
     pub(crate) fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
         self.lookup_below(term, u64::MAX)
+    }
+
+    /// [`Self::lookup`] of each of `quad`'s terms (the default graph as itself); `None` if one
+    /// is unknown. Interns nothing.
+    pub(crate) fn lookup_quad(&self, quad: nrese_rdf::QuadRef<'_>) -> Option<crate::EncodedQuad> {
+        let graph = match super::dictionary::graph_term(quad.graph_name) {
+            Some(term) => self.lookup(term)?,
+            None => TermId::DEFAULT_GRAPH,
+        };
+        Some(crate::EncodedQuad::new(
+            self.lookup(quad.subject.into())?,
+            self.lookup(quad.predicate.into())?,
+            self.lookup(quad.object)?,
+            graph,
+        ))
+    }
+
+    /// [`Self::decode`] of each of `quad`'s terms, as a view of this overlay decodes a quad.
+    pub(crate) fn decode_quad(&self, quad: crate::EncodedQuad) -> Option<nrese_rdf::Quad> {
+        let graph_name = if quad.graph.is_default_graph() {
+            nrese_rdf::GraphName::DefaultGraph
+        } else {
+            NamedOrBlankNode::try_from(self.decode(quad.graph)?)
+                .ok()?
+                .into()
+        };
+        let Term::NamedNode(predicate) = self.decode(quad.predicate)? else {
+            return None;
+        };
+        Some(nrese_rdf::Quad::new(
+            NamedOrBlankNode::try_from(self.decode(quad.subject)?).ok()?,
+            predicate,
+            self.decode(quad.object)?,
+            graph_name,
+        ))
+    }
+
+    /// The term of `id`: inline or the dictionary's below `start`, else this overlay's own,
+    /// as a view of it decodes. An own key is copied out of the leaf lock first, so a triple
+    /// term's components are decoded with no lock held under it. Not charged, as
+    /// `Snapshot::decode` isn't.
+    pub(crate) fn decode(&self, id: TermId) -> Option<Term> {
+        if !id.kind().is_dictionary() || id.payload() < self.start {
+            return self.dictionary.decode(id);
+        }
+        let key = self.suffix.lock().key(id.payload())?.to_vec();
+        let Some([s, p, o]) = triple_ids(&key) else {
+            return Some(decode_key(&key));
+        };
+        let Term::NamedNode(predicate) = self.decode(p)? else {
+            return None;
+        };
+        Some(
+            Triple::new(
+                NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
+                predicate,
+                self.decode(o)?,
+            )
+            .into(),
+        )
     }
 
     /// [`Self::lookup`], counting only own entries below `end`.
@@ -244,7 +298,8 @@ impl OverlayView {
         self.overlay.start + self.frozen.len()
     }
 
-    /// Its own entries' count.
+    /// Test support: its own entries' count.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> u64 {
         self.frozen.len()
     }
@@ -361,19 +416,22 @@ impl OverlayView {
         self.own_key(id).map(|key| f(view_key(key)))
     }
 
-    /// Calls `f` with a lookup of entry views, the dictionary's below `start` under one of its
-    /// read guards, its own from the frozen entries (no lock).
-    pub(crate) fn with_views<R>(
-        &self,
-        f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
-    ) -> R {
-        self.dictionary().with_views(self.start(), |shared| {
-            let both = |id: TermId| match self.is_own(id) {
-                true => self.own_key(id).map(view_key),
-                false => shared(id),
-            };
-            f(&both)
-        })
+    /// Own entry `id`'s view, from the frozen entries (no lock); `None` for an id below
+    /// `start`, which the dictionary answers (`Vocabulary::with_views` asks it under one of
+    /// its read guards).
+    #[inline]
+    pub(crate) fn own_view(&self, id: TermId) -> Option<Option<TermView<'_>>> {
+        self.is_own(id).then(|| self.own_entry_view(id))
+    }
+
+    /// Out of line, so a caller's loop over [`Vocabulary::with_views`] inlines one key decode
+    /// (the dictionary's), not two; with two, the decode itself moved out of the loop on the
+    /// shared path too (package 2b's B17 count).
+    ///
+    /// [`Vocabulary::with_views`]: super::resolve::Vocabulary::with_views
+    #[inline(never)]
+    fn own_entry_view(&self, id: TermId) -> Option<TermView<'_>> {
+        self.own_key(id).map(view_key)
     }
 
     pub(crate) fn decode_quad(&self, quad: crate::EncodedQuad) -> Option<nrese_rdf::Quad> {

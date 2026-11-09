@@ -11,7 +11,9 @@
 //! ```
 //!
 //! They are content, not policy: a change keeps its author and time, not an entry in the
-//! access history.
+//! access history. A query belongs to its space's incarnation: one saved in a space with
+//! an id has `nra:spaceId` and a resource `<urn:nrese:query:project~7/…>`, and a space
+//! removed and created again under its name doesn't see it (SYN-64).
 
 use std::collections::BTreeMap;
 
@@ -26,6 +28,7 @@ use crate::{NamespaceMap, SparqlUpdateRequest, StoreService};
 pub const QUERIES_GRAPH: &str = "urn:nrese:system:queries";
 const QUERY: &str = "urn:nrese:query:";
 const XSD_DATE_TIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// A saved query.
@@ -49,6 +52,28 @@ pub struct SavedQuery {
     pub author: String,
     /// When, UTC, as `xsd:dateTime`.
     pub time: String,
+    /// The incarnation of its space it belongs to ([`AccessState::space_id`]): it is found
+    /// only while that is the space's (SYN-64). Kept as `nra:spaceId`, not shown.
+    #[serde(skip)]
+    pub space_id: Option<u64>,
+}
+
+impl SavedQuery {
+    /// Its key: its space's incarnation ([`super::space_key`]) and its name.
+    fn key(&self) -> (String, String) {
+        (
+            super::space_key(&self.space, self.space_id),
+            self.name.clone(),
+        )
+    }
+}
+
+/// The key of query `name` in the current incarnation of `space`.
+fn key_in(state: &AccessState, space: &str, name: &str) -> (String, String) {
+    (
+        super::space_key(space, state.space_id(space)),
+        name.to_owned(),
+    )
 }
 
 /// What a client sends to save a query.
@@ -65,7 +90,7 @@ pub struct QueryDraft {
     pub repository: Option<String>,
 }
 
-/// The saved queries, by space and name.
+/// The saved queries, by space incarnation ([`super::space_key`]) and name.
 pub(super) type Queries = BTreeMap<(String, String), SavedQuery>;
 
 fn valid_name(name: &str) -> bool {
@@ -117,7 +142,8 @@ fn check(text: &str, namespaces: &NamespaceMap) -> Result<(), AccessError> {
     }
 }
 
-fn resource(space: &str, name: &str) -> NamedNode {
+/// The resource of the query `key` names: its space's incarnation and its name.
+fn resource((space, name): &(String, String)) -> NamedNode {
     iri(&format!("{QUERY}{}/{}", segment(space), segment(name)))
 }
 
@@ -140,7 +166,7 @@ fn segment(text: &str) -> String {
 
 fn quads(query: &SavedQuery) -> Vec<Quad> {
     let graph = GraphName::NamedNode(iri(QUERIES_GRAPH));
-    let subject = resource(&query.space, &query.name);
+    let subject = resource(&query.key());
     let text = |value: &str| Term::Literal(Literal::new_simple_literal(value));
     let mut out = vec![
         (
@@ -167,6 +193,15 @@ fn quads(query: &SavedQuery) -> Vec<Quad> {
         if let Some(value) = value {
             out.push((term(local), text(value)));
         }
+    }
+    if let Some(id) = query.space_id {
+        out.push((
+            term("spaceId"),
+            Term::Literal(Literal::new_typed_literal(
+                id.to_string(),
+                NamedNode::new_unchecked(XSD_INTEGER),
+            )),
+        ));
     }
     out.into_iter()
         .map(|(predicate, object)| Quad::new(subject.clone(), predicate, object, graph.clone()))
@@ -205,16 +240,18 @@ pub(super) fn load(store: &StoreService) -> Result<Queries, AccessError> {
             continue;
         };
         let query = SavedQuery {
-            space: space.clone(),
-            name: name.clone(),
+            space,
+            name,
             query: text,
             title: take("title"),
             description: take("description"),
             repository: take("repository"),
             author: take("author").unwrap_or_default(),
             time: take("time").unwrap_or_default(),
+            // A query from before ids belongs to its space's incarnation from before ids.
+            space_id: take("spaceId").and_then(|id| id.parse().ok()),
         };
-        queries.insert((space, name), query);
+        queries.insert(query.key(), query);
     }
     Ok(queries)
 }
@@ -227,7 +264,10 @@ impl super::AccessControl {
             .read()
             .expect("queries")
             .values()
-            .filter(|query| level(&state, principal, &query.space).is_some())
+            .filter(|query| {
+                query.space_id == state.space_id(&query.space)
+                    && level(&state, principal, &query.space).is_some()
+            })
             .cloned()
             .collect()
     }
@@ -241,13 +281,14 @@ impl super::AccessControl {
         name: &str,
     ) -> Result<SavedQuery, AccessError> {
         let missing = || AccessError::NotFound(format!("no saved query '{space}/{name}'"));
-        if level(&self.state(), principal, space).is_none() {
+        let state = self.state();
+        if level(&state, principal, space).is_none() {
             return Err(missing());
         }
         self.queries
             .read()
             .expect("queries")
-            .get(&(space.to_owned(), name.to_owned()))
+            .get(&key_in(&state, space, name))
             .cloned()
             .ok_or_else(missing)
     }
@@ -300,10 +341,13 @@ impl super::AccessControl {
             repository: blank(draft.repository),
             author: principal.display(),
             time: super::control::now(),
+            // The incarnation the requester was checked a member of.
+            space_id: state.space_id(space),
         };
+        let key = saved.key();
         let mut queries = self.queries.write().expect("queries");
-        self.write_query(space, name, Some(&saved))?;
-        queries.insert((space.to_owned(), name.to_owned()), saved.clone());
+        self.write_query(&key, Some(&saved))?;
+        queries.insert(key, saved.clone());
         Ok(saved)
     }
 
@@ -323,22 +367,22 @@ impl super::AccessControl {
                 "only editors and owners of '{space}' remove its queries"
             )));
         }
+        let key = found.key();
         let mut queries = self.queries.write().expect("queries");
-        self.write_query(space, name, None)?;
-        queries.remove(&(space.to_owned(), name.to_owned()));
+        self.write_query(&key, None)?;
+        queries.remove(&key);
         Ok(())
     }
 
-    /// Replaces query `space/name` in the system store by `query` (`None`: removes it).
+    /// Replaces the query `key` names in the system store by `query` (`None`: removes it).
     fn write_query(
         &self,
-        space: &str,
-        name: &str,
+        key: &(String, String),
         query: Option<&SavedQuery>,
     ) -> Result<(), AccessError> {
         let mut update = format!(
             "DELETE WHERE {{ GRAPH <{QUERIES_GRAPH}> {{ {} ?p ?o }} }}",
-            resource(space, name)
+            resource(key)
         );
         if let Some(query) = query {
             update.push_str(&format!(

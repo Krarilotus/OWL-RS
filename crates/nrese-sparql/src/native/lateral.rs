@@ -3,7 +3,7 @@
 //!
 //! As for `EXISTS` by substitution ([`super::substitute`]), `right` is evaluated once per
 //! distinct value of the left variables it mentions, not once per row: each result gets
-//! those values as columns, the results are put together, and one join with `left` gives
+//! a private group key as a column, the results are put together, and one join with `left` gives
 //! every row the results of its values. A `LIMIT`, an aggregate or an `ORDER BY` inside
 //! `right` therefore applies per left solution, which is what `LATERAL` is for. A left
 //! variable that is unbound in a row isn't put in: `right` binds it freely there, and the
@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use nrese_exec::{IdTable, UNDEF};
+use nrese_exec::UNDEF;
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::algebra::GraphPattern;
 
@@ -37,20 +37,33 @@ impl Context<'_> {
             return self.join(left, right);
         }
         // Each distinct key once, in the order the rows first have it.
-        let mut seen: HashMap<Vec<u64>, ()> = HashMap::new();
+        let mut seen: HashMap<Vec<u64>, u64> = HashMap::new();
         let mut keys: Vec<Vec<u64>> = Vec::new();
-        for row in 0..left.table.len() {
-            let mut key: Vec<u64> = columns
-                .iter()
-                .map(|(c, _)| left.table.get(row, *c))
-                .collect();
-            key.push(graph_column.map_or(UNDEF, |c| left.table.get(row, c)));
-            if seen.insert(key.clone(), ()).is_none() {
-                keys.push(key);
+        let group_variable = self.synthetic("lateral-key");
+        let rows = left.table.len();
+        // A bound group identity distinguishes UNDEF from the other substitutions:
+        // ordinary SPARQL join compatibility alone would mix their right-side results.
+        let left = self.reshaped(left, rows.saturating_mul(8), |mut left| {
+            let mut groups = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let mut key: Vec<u64> = columns
+                    .iter()
+                    .map(|(c, _)| left.table.get(row, *c))
+                    .collect();
+                key.push(graph_column.map_or(UNDEF, |c| left.table.get(row, c)));
+                let next = keys.len() as u64;
+                let group = *seen.entry(key.clone()).or_insert_with(|| {
+                    keys.push(key);
+                    next
+                });
+                groups.push(group);
             }
-        }
+            left.table.push_column(groups);
+            left.vars.push(group_variable.clone());
+            left
+        })?;
         let mut results: Option<Solutions> = None;
-        for key in keys {
+        for (group, key) in keys.into_iter().enumerate() {
             self.check()?;
             let mut terms = HashMap::new();
             let mut put_in: Vec<(Variable, u64)> = Vec::new();
@@ -68,36 +81,54 @@ impl Context<'_> {
             }
             let substituted = super::substitute::Values { terms: &terms }.pattern(right);
             let graph = key.last().copied().filter(|&id| id != UNDEF);
-            let mut found = match graph {
+            let found = match graph {
                 Some(id) => self.in_graph(
                     GraphScope::Named(nrese_engine::TermId::from_raw(id)),
                     &substituted,
                 )?,
                 None => self.eval(&substituted)?,
             };
-            // The values put in, as columns: what joins the results to their rows.
+            // The values put in, as columns: what joins the results to their rows. A column
+            // per value the results lack, however many the query puts in, charged before
+            // they are made.
             let rows = found.table.len();
             let mut added: Vec<(Variable, u64)> = put_in;
+            added.push((group_variable.clone(), group as u64));
             if let (Some(id), GraphScope::Variable(g)) = (graph, &*self.graph.borrow()) {
                 added.push((g.clone(), id));
             }
+            let mut lacking: Vec<(Variable, u64)> = Vec::with_capacity(added.len());
             for (variable, id) in added {
-                if found.column(&variable).is_some() {
-                    continue;
+                if found.column(&variable).is_none() && lacking.iter().all(|(v, _)| *v != variable)
+                {
+                    lacking.push((variable, id));
                 }
-                let mut columns = std::mem::take(&mut found.table).into_columns();
-                columns.push(vec![id; rows]);
-                found.table = IdTable::from_columns(columns);
-                found.vars.push(variable);
             }
+            let growth = rows.saturating_mul(8).saturating_mul(lacking.len());
+            let found = self.reshaped(found, growth, |mut found| {
+                for (variable, id) in lacking {
+                    found.table.push_column(vec![id; rows]);
+                    found.vars.push(variable);
+                }
+                found
+            })?;
             results = Some(match results {
                 None => found,
                 Some(results) => self.union(results, found)?,
             });
         }
         match results {
-            Some(results) => self.join(left, results),
-            None => Ok(left),
+            Some(results) => {
+                let joined = self.join(left, results)?;
+                let variables: Vec<_> = joined
+                    .vars
+                    .iter()
+                    .filter(|v| **v != group_variable)
+                    .cloned()
+                    .collect();
+                self.project(joined, &variables)
+            }
+            None => self.drop_added(left, 1),
         }
     }
 }

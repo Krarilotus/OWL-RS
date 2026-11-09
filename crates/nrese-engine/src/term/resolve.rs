@@ -6,11 +6,6 @@
 //! applied. `Private` ignores the bound passed in: its bound is its own (`start + n`), fixed when
 //! the overlay opened over a snapshot. A mismatched bound can't reach it in a release build.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "snapshots resolve through it from package 2b")
-)]
-
 use std::sync::Arc;
 
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
@@ -35,6 +30,10 @@ impl Vocabulary {
     /// The contract's b(V) (§4.1): ids below it are the dictionary's, the same in every
     /// vocabulary of that dictionary bounded at or past it. `bound` for shared, `start` for
     /// private.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "alignment by value reads it in package 5")
+    )]
     pub(crate) fn shared_bound(&self, bound: u64) -> u64 {
         match self {
             Self::Shared(_) => bound,
@@ -58,6 +57,16 @@ impl Vocabulary {
         match self {
             Self::Shared(dictionary) => Some(dictionary),
             Self::Private(_) => None,
+        }
+    }
+
+    /// The dictionary under either kind, for what reads its shared state only (planning
+    /// choices, sizes, search's own indexes). Never a decoder of this vocabulary's ids: a
+    /// private one's own ids aren't in it.
+    pub(crate) fn underlying(&self) -> &Arc<Dictionary> {
+        match self {
+            Self::Shared(dictionary) => dictionary,
+            Self::Private(view) => view.dictionary(),
         }
     }
 
@@ -160,15 +169,27 @@ impl Vocabulary {
         }
     }
 
+    /// Calls `f` with a lookup of entry views under one of the dictionary's read guards, a
+    /// private view's own entries from its frozen ones. `f` is called in one place for both
+    /// kinds: called once per kind, a caller's `f` has two call sites, isn't inlined where the
+    /// dictionary's lookup is known, and every lookup becomes an indirect call (package 2b's
+    /// B17 count).
     pub(crate) fn with_views<R>(
         &self,
         bound: u64,
         f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
     ) -> R {
-        match self {
-            Self::Shared(dictionary) => dictionary.with_views(bound, f),
-            Self::Private(view) => view.with_views(f),
-        }
+        let (dictionary, bound, own) = match self {
+            Self::Shared(dictionary) => (dictionary, bound, None),
+            Self::Private(view) => (view.dictionary(), view.start(), Some(view)),
+        };
+        dictionary.with_views(bound, |shared| {
+            let views = |id: TermId| match own.and_then(|view| view.own_view(id)) {
+                Some(view) => view,
+                None => shared(id),
+            };
+            f(&views)
+        })
     }
 
     pub(crate) fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {

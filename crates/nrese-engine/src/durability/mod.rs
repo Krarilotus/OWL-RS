@@ -585,7 +585,7 @@ fn replay(
         dictionary.restore_key(record.dictionary_start + offset as u64, key)?;
     }
     let asserted = match record.names_a_graph() {
-        true => version.asserted.with_quads_layout(),
+        true => version.asserted.with_quads_layout_alone(),
         false => version.asserted.clone(),
     };
     let runs = record.runs(asserted.layout());

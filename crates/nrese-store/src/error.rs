@@ -130,6 +130,13 @@ impl From<nrese_exec::BudgetExceeded> for StoreError {
     }
 }
 
+/// A search's refusal, as a query's ([`QueryEvaluationError`]'s `From`).
+impl From<nrese_engine::SearchRefused> for StoreError {
+    fn from(refused: nrese_engine::SearchRefused) -> Self {
+        QueryEvaluationError::from(refused).into()
+    }
+}
+
 impl StoreError {
     /// This error with a memory refusal's bytes held and asked for left out (for a reader
     /// of some graphs: a scan of graphs it may not read can size them); any other as it is.
