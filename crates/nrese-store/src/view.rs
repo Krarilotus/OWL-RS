@@ -23,14 +23,26 @@ pub(crate) fn decoded_quads<'a, V: ReadView>(
 }
 
 impl GraphTarget {
-    /// The RDF graph name this target addresses.
+    /// The store graph this target addresses: another store's name for the default graph is the
+    /// default graph (`rdf_io::stored_graph`).
     pub(crate) fn graph_name(&self) -> StoreResult<GraphName> {
         match self {
             Self::DefaultGraph => Ok(GraphName::DefaultGraph),
             Self::NamedGraph(iri) => NamedNode::new(iri.as_str())
-                .map(GraphName::from)
+                .map(|name| crate::rdf_io::stored_graph(name.into()))
                 .map_err(|_| StoreError::InvalidGraphIri(iri.clone())),
         }
+    }
+
+    /// This target as the store graph it addresses ([`Self::graph_name`]): `DefaultGraph` for
+    /// another store's name for it. What a graph result says (whether a graph exists, whether a
+    /// write created it) is decided on this, never on how the target was spelled (review r2 of
+    /// SYN-54 slice 3, S3-F3).
+    pub(crate) fn resolved(&self) -> StoreResult<GraphTarget> {
+        Ok(match self.graph_name()? {
+            GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+            _ => self.clone(),
+        })
     }
 
     /// The pattern selecting this graph's quads in `view`, or `None` for a named graph the

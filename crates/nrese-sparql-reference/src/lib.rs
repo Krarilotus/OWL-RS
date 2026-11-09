@@ -41,7 +41,7 @@ use nrese_sparql_syntax::term::{
     GraphNamePattern, GroundQuadPattern, GroundTermPattern, NamedNodePattern,
     QuadPattern as PatternQuad, TermPattern, TriplePattern,
 };
-use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation, Query, TransferOp, Update};
 
 /// A dataset: quads, the default graph's with [`GraphName::DefaultGraph`].
 #[derive(Debug, Clone, Default)]
@@ -276,6 +276,30 @@ impl Dataset {
                         GraphTarget::NamedGraphs => q.graph_name == GraphName::DefaultGraph,
                         GraphTarget::AllGraphs => false,
                     });
+                }
+                // SPARQL 1.1 Update §3.2.3–3.2.5: the statements stored in `from`, whatever the
+                // options a WHERE clause reads with; a graph to itself changes nothing.
+                GraphUpdateOperation::Transfer { op, from, to, .. } => {
+                    let (from, to) = (graph_of(from), graph_of(to));
+                    if from == to {
+                        continue;
+                    }
+                    let copies: Vec<Quad> = self
+                        .quads
+                        .iter()
+                        .filter(|q| q.graph_name == from)
+                        .map(|q| Quad {
+                            graph_name: to.clone(),
+                            ..q.clone()
+                        })
+                        .collect();
+                    if *op != TransferOp::Add {
+                        self.quads.retain(|q| q.graph_name != to);
+                    }
+                    if *op == TransferOp::Move {
+                        self.quads.retain(|q| q.graph_name != from);
+                    }
+                    self.quads.extend(copies);
                 }
             }
         }
@@ -1267,12 +1291,14 @@ fn merge(dataset: &Dataset, graphs: Option<&[GraphName]>) -> Graph {
 
 /// Blank nodes of a pattern are variables no query can name (§18.2.1): they join where
 /// the parser's translation shares them (a path sequence becomes two paths through one),
-/// and no projection lists them.
+/// and no projection lists them. Each is named as it is written, `_:label`: a colon is in
+/// no SPARQL `VARNAME`, so no variable of the query is spelt like one. (The executor's own
+/// made names are `nrese_sparql_syntax::internal`'s; this evaluator keeps its own.)
 fn blank_variable(b: &nrese_sparql_syntax::term::BlankNode) -> Variable {
     Variable::new_unchecked(format!("{BLANK}{}", b.as_str()))
 }
 
-const BLANK: &str = "__blank_";
+const BLANK: &str = "_:";
 
 fn bind_term(
     pattern: &TermPattern,

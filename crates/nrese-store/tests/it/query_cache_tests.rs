@@ -273,9 +273,9 @@ fn a_sessions_reads_over_its_pending_operations_keep_nothing() {
     let ops = vec![StatementOp::Update(SparqlUpdateRequest::new(
         update.clone(),
     ))];
-    assert!(store.sessions().add(&session, None, ops.clone()));
+    assert!(store.sessions().add(&session, None, ops.clone()).unwrap());
     let pending = nrese_store::StatementsRequest {
-        ops,
+        ops: ops.into(),
         session: Some(session),
     };
     let prepared = store

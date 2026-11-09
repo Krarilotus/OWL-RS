@@ -350,7 +350,7 @@ impl<'e> BulkLoad<'e> {
                 // The first quad in a named graph turns a default-graph stack into a quad
                 // stack.
                 let asserted = match Layout::holding(&inserts) {
-                    Layout::Quads => current.asserted.with_quads_layout(),
+                    Layout::Quads => current.asserted.with_quads_layout_alone(),
                     Layout::DefaultGraph => current.asserted.clone(),
                 };
                 let run = Run::from_quads(asserted.layout(), inserts);
@@ -742,7 +742,13 @@ fn commit_image(
     revision: u64,
     write: impl FnOnce() -> EngineResult<PathBuf>,
 ) -> EngineResult<PathBuf> {
-    durable.wal.lock().rotate(revision)?;
+    {
+        let mut wal = durable.wal.lock();
+        // The names a reopen left pending, before anything is written (deferred-sync design
+        // note of 8 Nov): a failure leaves the log as it was.
+        wal.settle_names()?;
+        wal.rotate(revision)?;
+    }
     let error = match write() {
         Ok(path) => return Ok(path),
         Err(error) => error,
