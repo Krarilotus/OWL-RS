@@ -198,25 +198,61 @@ impl<'e> PrivateTransaction<'e> {
     /// as long as nothing changed: no write that changed the pending changes, no new term, and
     /// the same `budget` (by identity) as the call that made it. The memo holds the snapshot,
     /// and its vocabulary's charge, until the next such call after a change, or the drop.
+    ///
+    /// The memo's lock is held only to look an entry up, take one out or put one in: never
+    /// while a snapshot is built (that runs parallel work on Rayon's pool, from
+    /// `Run::from_delta`'s threshold on, which a reader waiting on the lock from that pool
+    /// would block) or dropped. Two calls that miss at once both build; the first to install
+    /// wins, and the other's snapshot, with its charge, is dropped.
+    ///
+    /// An entry is keyed by the vocabulary end its snapshot froze, not one read before the
+    /// build: [`Self::try_intern`] takes `&self`, so another thread can add a term meanwhile.
     pub fn pending_snapshot_within(&self, budget: &Arc<Budget>) -> EngineResult<Snapshot> {
-        let end = self.overlay.end();
-        let mut memo = self.memo.lock();
-        if let Some(kept) = memo.as_ref().filter(|kept| {
+        let fits = |kept: &Memo, end: u64| {
             kept.changes == self.changes && kept.end == end && Arc::ptr_eq(&kept.budget, budget)
-        }) {
-            return Ok(kept.snapshot.clone());
-        }
-        // Dropped first: a refusal below leaves no stale entry, and its charge is freed
-        // before the new freeze is charged.
-        *memo = None;
+        };
+        let stale = {
+            let mut memo = self.memo.lock();
+            let end = self.overlay.end();
+            if let Some(kept) = memo.as_ref().filter(|kept| fits(kept, end)) {
+                return Ok(kept.snapshot.clone());
+            }
+            // Taken out first: a refusal below leaves no stale entry, and its charge is freed
+            // (below, unlocked) before the new freeze is charged.
+            memo.take()
+        };
+        drop(stale);
         let snapshot = self.pending_snapshot()?;
-        *memo = Some(Memo {
-            changes: self.changes,
-            end,
-            budget: Arc::clone(budget),
-            snapshot: snapshot.clone(),
-        });
-        Ok(snapshot)
+        let frozen = snapshot.dictionary_len();
+        // The answer, and what goes once the lock is let go: our snapshot if another call
+        // installed this state's meanwhile, else the entry ours replaced.
+        let (answer, ours, replaced) = {
+            let mut memo = self.memo.lock();
+            if let Some(kept) = memo.as_ref().filter(|kept| fits(kept, frozen)) {
+                // Its identity is the one every reader gets.
+                (kept.snapshot.clone(), Some(snapshot), None)
+            } else {
+                // Any other entry is another key's; replaced.
+                let replaced = memo.replace(Memo {
+                    changes: self.changes,
+                    end: frozen,
+                    budget: Arc::clone(budget),
+                    snapshot: snapshot.clone(),
+                });
+                (snapshot, None, replaced)
+            }
+        };
+        drop((ours, replaced));
+        Ok(answer)
+    }
+
+    /// Test support: the memo's key end and the vocabulary end its snapshot froze, if it holds
+    /// one.
+    #[cfg(test)]
+    pub(super) fn memo_ends(&self) -> Option<(u64, u64)> {
+        let memo = self.memo.lock();
+        memo.as_ref()
+            .map(|kept| (kept.end, kept.snapshot.dictionary_len()))
     }
 
     /// [`Self::pending_snapshot`] as a reader of `view` reads it, as

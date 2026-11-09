@@ -217,6 +217,232 @@ fn terms(engine: &Engine) -> u64 {
     engine.stats().dictionary.terms
 }
 
+/// Far above any answer's time: reaching it means the readers wait on each other (the lock
+/// tests' deadline).
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pending inserts past `Run::from_delta`'s parallel-build threshold (16,384), so making the
+/// pending snapshot runs Rayon work.
+const PARALLEL_CHANGES: usize = 20_000;
+
+/// A private transaction over `engine` with [`PARALLEL_CHANGES`] asserted statements of its
+/// own, its memo cold, its terms charged to `budget`.
+fn large_private<'e>(engine: &'e Engine, budget: &Arc<Budget>) -> super::PrivateTransaction<'e> {
+    let mut tx = engine.speculative(Arc::clone(budget));
+    for i in 0..PARALLEL_CHANGES {
+        assert!(
+            tx.try_insert(quad(&format!("big{i}"), "x").as_ref())
+                .unwrap()
+        );
+    }
+    tx
+}
+
+/// R1-C1 of V2's review r1 (`notes/review-dict-v2-r1/review.md`): the memo's lock and the
+/// pool. Red on the parent, whose memo held its lock while the snapshot was built.
+///
+/// - Input: 8 rounds, each on a thread of its own: a fresh private transaction with 20,000
+///   pending statements (past the parallel-build threshold), so its memo starts cold, and 64
+///   readers of `pending_snapshot_within`, one budget, run as parallel work on a pool of four
+///   (as SHACL's validation reads one view from its checks on Rayon). All bounded by one
+///   [`DEADLINE`].
+/// - Expected: every round answers, each with one snapshot (one identity) for all its readers.
+#[test]
+fn parallel_readers_of_a_cold_memo_finish_while_it_is_built_on_the_pool() {
+    const ROUNDS: usize = 8;
+    let engine = engine();
+    let (answer, answered) = std::sync::mpsc::channel();
+    for round in 0..ROUNDS {
+        let (engine, answer) = (engine.clone(), answer.clone());
+        std::thread::spawn(move || {
+            let budget = Arc::new(Budget::unlimited());
+            let tx = large_private(&engine, &budget);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .expect("a pool of four");
+            let identities: Vec<_> = pool.install(|| {
+                use rayon::prelude::*;
+                (0..64)
+                    .into_par_iter()
+                    .map(|_| tx.pending_snapshot_within(&budget).unwrap().identity())
+                    .collect()
+            });
+            let _ = answer.send((round, identities));
+        });
+    }
+    let until = std::time::Instant::now() + DEADLINE;
+    let mut answered_rounds = Vec::new();
+    while answered_rounds.len() < ROUNDS {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        match answered.recv_timeout(left) {
+            Ok(round) => answered_rounds.push(round),
+            Err(_) => break,
+        }
+    }
+    let timed_out = ROUNDS - answered_rounds.len();
+    assert_eq!(
+        timed_out, 0,
+        "{timed_out} of {ROUNDS} rounds of readers of a cold memo still wait after {DEADLINE:?}: \
+         the memo's lock held across the build"
+    );
+    for (round, identities) in answered_rounds {
+        assert_eq!(identities.len(), 64);
+        assert!(
+            identities.iter().all(|id| *id == identities[0]),
+            "round {round}: one snapshot for the state"
+        );
+    }
+}
+
+/// R1-C1 again, in the schedule that deadlocked the parent's memo (V2's lead, 06:44: readers
+/// that only park on the lock steal nothing, so a plain `par_iter` of readers rarely meets it).
+///
+/// - Input: 12 trials, each a fresh private transaction with 20,000 pending statements, on a
+///   pool of three, each trial on a thread of its own with its own [`TRIAL_DEADLINE`]. The
+///   first read starts the cold build on one worker (past the parallel-build threshold, so
+///   its build forks onto the pool). A second worker waits [`READER_DELAY`], then forks two
+///   reads: the first waits for the build, the second stays queued in that worker's deque.
+///   The third worker is idle, so it steals the build's work, and the builder, waiting for it,
+///   can steal the queued read.
+/// - Expected: every trial finishes, its three reads with one snapshot. (On the parent the
+///   builder held the memo's lock and met it again in the stolen read: a deadlock.)
+#[test]
+fn a_builder_waiting_on_the_pool_never_meets_its_own_lock() {
+    const TRIALS: usize = 12;
+    let engine = engine();
+    let mut timed_out = 0;
+    for trial in 0..TRIALS {
+        let (answer, answered) = std::sync::mpsc::channel();
+        let engine = engine.clone();
+        std::thread::spawn(move || {
+            let budget = Arc::new(Budget::unlimited());
+            let tx = large_private(&engine, &budget);
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .expect("a pool of three");
+            let read = || tx.pending_snapshot_within(&budget).unwrap().identity();
+            let (built, (first, second)) = pool.install(|| {
+                rayon::join(read, || {
+                    std::thread::sleep(READER_DELAY);
+                    rayon::join(read, read)
+                })
+            });
+            let _ = answer.send(built == first && first == second);
+        });
+        match answered.recv_timeout(TRIAL_DEADLINE) {
+            Ok(one) => assert!(one, "trial {trial}: one snapshot for the state"),
+            Err(_) => timed_out += 1,
+        }
+    }
+    assert_eq!(
+        timed_out, 0,
+        "{timed_out} of {TRIALS} trials still wait after {TRIAL_DEADLINE:?}: the builder met \
+         the memo's lock in a read it stole"
+    );
+}
+
+/// Far above one trial's time (a debug build of 20,000 pending changes takes well under a
+/// second): reaching it means the trial's reads wait on each other.
+const TRIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the second worker waits before its reads, so the build has started and taken the
+/// lock first: short against the build, long against a fork.
+const READER_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// DICT2's correction (06:38): a memo entry is keyed by the vocabulary end its snapshot froze.
+/// `try_intern` takes `&self`, so a term can be added while a snapshot is built.
+///
+/// - Input: a private transaction with 20,000 pending statements; one thread interning 2,000
+///   new terms of its own while another asks for the pending snapshot 50 times. Bounded by
+///   [`DEADLINE`].
+/// - Expected: after every ask, the memo's key end is the end its snapshot froze; once the
+///   interning stops, the next ask is answered again with the same snapshot.
+#[test]
+fn a_memo_is_keyed_by_the_end_its_snapshot_froze() {
+    let engine = engine();
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let budget = Arc::new(Budget::unlimited());
+        let tx = large_private(&engine, &budget);
+        let mismatches = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..2_000 {
+                    let iri = format!("http://example.com/raced/{i}");
+                    tx.try_intern(NamedNodeRef::new_unchecked(&iri).into())
+                        .unwrap();
+                }
+            });
+            let mut mismatches = Vec::new();
+            for ask in 0..50 {
+                drop(tx.pending_snapshot_within(&budget).unwrap());
+                if let Some((key, frozen)) = tx.memo_ends()
+                    && key != frozen
+                {
+                    mismatches.push((ask, key, frozen));
+                }
+            }
+            mismatches
+        });
+        let settled = tx.pending_snapshot_within(&budget).unwrap().identity();
+        let again = tx.pending_snapshot_within(&budget).unwrap().identity();
+        let _ = answer.send((mismatches, settled == again));
+    });
+    let (mismatches, kept) = answered
+        .recv_timeout(DEADLINE)
+        .unwrap_or_else(|_| panic!("the asks still wait after {DEADLINE:?}"));
+    assert!(
+        mismatches.is_empty(),
+        "(ask, key end, frozen end): {mismatches:?}"
+    );
+    assert!(kept, "a settled state's snapshot is kept");
+}
+
+/// The race the unlocked build allows: misses at once both build; one snapshot is installed
+/// and kept, and every other one is dropped with its charge.
+///
+/// - Input: two private transactions alike (20,000 pending statements, each its own budget);
+///   one read once; the other read by 8 threads released together by a barrier, each its
+///   first read, so they miss at once. Bounded by [`DEADLINE`].
+/// - Expected: the 8 readers get one snapshot (one identity), the one a ninth read gets too;
+///   once their answers are dropped, the second budget holds what the first holds with its
+///   one snapshot: no loser's charge stays.
+#[test]
+fn concurrent_misses_install_one_snapshot_and_release_the_others() {
+    let engine = engine();
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let once = Arc::new(Budget::unlimited());
+        let single = large_private(&engine, &once);
+        drop(single.pending_snapshot_within(&once).unwrap());
+        let raced = Arc::new(Budget::unlimited());
+        let tx = large_private(&engine, &raced);
+        let barrier = std::sync::Barrier::new(8);
+        let identities: Vec<_> = std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        tx.pending_snapshot_within(&raced).unwrap().identity()
+                    })
+                })
+                .collect();
+            readers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        let ninth = tx.pending_snapshot_within(&raced).unwrap().identity();
+        let _ = answer.send((identities, ninth, once.used(), raced.used()));
+    });
+    let (identities, ninth, once, raced) = answered
+        .recv_timeout(DEADLINE)
+        .unwrap_or_else(|_| panic!("concurrent readers still wait after {DEADLINE:?}"));
+    assert!(
+        identities.iter().all(|id| *id == ninth),
+        "one snapshot installed"
+    );
+    assert_eq!(raced, once, "no loser's snapshot charge stays");
+}
+
 /// `PendingView::quads_for_pattern_in`'s scan returned through a signature that captures the
 /// transaction's borrow only, as `ReadView::quads_for_pattern_in` does (V2's generic `ReadView`
 /// delegates to it). Doesn't compile (E0700) if the trait's iterator captures the pattern's
