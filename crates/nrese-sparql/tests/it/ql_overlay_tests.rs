@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use nrese_engine::{Engine, EngineConfig};
+use nrese_engine::{Engine, EngineConfig, Snapshot};
 use nrese_exec::Budget;
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::ql::{Closure, QlRewriting};
@@ -35,21 +35,36 @@ fn engine() -> Engine {
     engine
 }
 
-/// `?x :worksFor ?o` through `ql`, on the pending snapshot of a private transaction that
-/// states `class rdfs:subClassOf [ owl:onProperty :worksFor ; owl:someValuesFrom :Org ]` and
-/// `:y a class`: the class, the restriction's blank node and `:y` its own new terms, in that
-/// order (the same numbers in every such transaction over one snapshot).
-fn workers(engine: &Engine, ql: &Arc<QlRewriting>, class: &str) -> Vec<String> {
-    let mut tx = engine.speculative(Arc::new(Budget::unlimited()));
-    let text = format!(
+/// `class rdfs:subClassOf [ owl:onProperty :worksFor ; owl:someValuesFrom :Org ]` and
+/// `:y a class`: the class, the restriction's blank node and `:y` new terms, in that order
+/// (the same numbers in every vocabulary that adds them to one snapshot's).
+fn schema(class: &str) -> String {
+    format!(
         "{PREFIXES} <{class}> rdfs:subClassOf _:r .
          _:r a owl:Restriction ; owl:onProperty :worksFor ; owl:someValuesFrom :Org .
          :y a <{class}> ."
-    );
+    )
+}
+
+/// `?x :worksFor ?o` through `ql`, on the pending snapshot of a private transaction that
+/// states [`schema`] of `class`.
+fn workers(engine: &Engine, ql: &Arc<QlRewriting>, class: &str) -> Vec<String> {
+    answers(&private(engine, class), ql)
+}
+
+/// The pending snapshot of a private transaction over the latest that states [`schema`] of
+/// `class`.
+fn private(engine: &Engine, class: &str) -> Snapshot {
+    let mut tx = engine.speculative(Arc::new(Budget::unlimited()));
+    let text = schema(class);
     for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
         tx.try_insert(quad.unwrap().as_ref()).unwrap();
     }
-    let pending = tx.pending_snapshot().unwrap();
+    tx.pending_snapshot().unwrap()
+}
+
+/// `?x :worksFor ?o` on `snapshot` through `ql`, sorted.
+fn answers(snapshot: &Snapshot, ql: &Arc<QlRewriting>) -> Vec<String> {
     let options = QueryOptions {
         ql: Some(Arc::clone(ql)),
         ..QueryOptions::default()
@@ -57,7 +72,7 @@ fn workers(engine: &Engine, ql: &Arc<QlRewriting>, class: &str) -> Vec<String> {
     let query = SparqlParser::new()
         .parse_query("SELECT ?x WHERE { ?x <http://example.org/worksFor> ?o }")
         .unwrap();
-    let QueryResults::Solutions(rows) = evaluate_query(&pending, &query, &options).unwrap() else {
+    let QueryResults::Solutions(rows) = evaluate_query(snapshot, &query, &options).unwrap() else {
         panic!("solutions expected");
     };
     let mut got: Vec<String> = rows
@@ -92,6 +107,47 @@ fn private_vocabularies_equal_by_number_keep_their_own_ql_schema() {
                     if class == order[0] { "first" } else { "second" }
                 ));
             }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A publication after a private snapshot opened (review dict-v1c r2, R2): private
+/// transactions take no writer slot, so a writer over the same base gives its new terms the
+/// private snapshot's own numbers, and the store's entry its read compiles can be equal by
+/// number to the private schema and differ in meaning.
+///
+/// - Input: a private transaction states [`schema`] of one class, its pending snapshot kept
+///   and not read; a writer then commits [`schema`] of the other over the same base, and the
+///   publication is read through the rewriting (its TBox in the store's entries); then the
+///   private snapshot is read through it. Each way round: `:New` private and the reserved name
+///   published, and the reverse.
+/// - Expected: the private snapshot answers from its own schema: `:y` for `:New`, none for the
+///   reserved name.
+#[test]
+fn a_private_schema_is_never_read_from_a_later_publication_equal_by_number() {
+    let ordinary = format!("{EX}New");
+    let reserved = format!("{OWL}NotAnOwlTerm");
+    let y = vec![format!("<{EX}y>")];
+    let mut failed = Vec::new();
+    for (own, published) in [(&ordinary, &reserved), (&reserved, &ordinary)] {
+        let engine = engine();
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        let pending = private(&engine, own);
+        let mut writer = engine.transaction();
+        let text = schema(published);
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+            writer.insert(quad.unwrap().as_ref());
+        }
+        writer.commit().unwrap();
+        let publication = answers(&engine.snapshot(), &ql);
+        let got = answers(&pending, &ql);
+        let want: &[String] = if own == &ordinary { &y } else { &[] };
+        if got != want {
+            failed.push(format!(
+                "{own} private, {published} published (answered {publication:?}): {got:?}, \
+                 expected {want:?}"
+            ));
         }
     }
     assert!(failed.is_empty(), "{failed:#?}");
