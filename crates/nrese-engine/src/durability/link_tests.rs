@@ -912,3 +912,114 @@ fn a_store_whose_files_are_links_names_their_targets_chain() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The newest segment left after the open's replay is the one `Wal::open` appends to, and is
+/// named when it is a link, whatever the replay did to the segments (review r1 on DUR-5, N2:
+/// the open finds it without listing the log again). Rows, judged apart:
+/// - under a checkpoint: the only segment left holds commit 1, which the checkpoint holds too,
+///   so none of its records is replayed; it is linked to `data/new-parent/`;
+/// - after a point-in-time cut: commits 1, 2 and 3 in segments of their own, the first linked;
+///   an open up to revision 1 removes the other two, so the first is the newest.
+///
+/// With `data/new-parent`'s sync failing, the open (which changed the store, for the cut) or its
+/// first commit is refused. Once it works, a commit is acknowledged and kept after a reopen, with
+/// commit 1. Guards: right before the change too, which listed the log again.
+#[test]
+fn the_newest_segment_left_is_named_after_a_cut_and_under_a_checkpoint() {
+    let mut wrong = Vec::new();
+    for row in ["under a checkpoint", "after a point-in-time cut"] {
+        let small = || EngineConfig {
+            durability: DurabilityConfig {
+                wal_segment_bytes: 1,
+                ..config().durability
+            },
+            ..config()
+        };
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        let store = base.join("store");
+        let wal = store.join("wal");
+        let opening = match row {
+            "under a checkpoint" => {
+                let segment = {
+                    let engine = Engine::open(&store, config()).unwrap();
+                    commit(&engine, 1).unwrap();
+                    let segment = newest_file(&wal, "", ".wal");
+                    std::fs::copy(&segment, base.join("held.wal")).unwrap();
+                    engine.checkpoint().unwrap();
+                    segment
+                };
+                // The log as a checkpoint's release left it undone: its old segment only.
+                for entry in std::fs::read_dir(&wal).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+                std::fs::copy(base.join("held.wal"), &segment).unwrap();
+                config()
+            }
+            _ => {
+                {
+                    let engine = Engine::open(&store, small()).unwrap();
+                    for n in 1..=3 {
+                        commit(&engine, n).unwrap();
+                    }
+                }
+                EngineConfig {
+                    durability: DurabilityConfig {
+                        recover_until: Some(1),
+                        ..small().durability
+                    },
+                    ..small()
+                }
+            }
+        };
+        let file = match row {
+            "under a checkpoint" => newest_file(&wal, "", ".wal"),
+            _ => super::wal::list_segments(&wal).unwrap()[0].1.clone(),
+        };
+        let target = base
+            .join("data")
+            .join("new-parent")
+            .join(file.file_name().unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::rename(&file, &target).unwrap();
+        if !link_file(&target, &file) {
+            eprintln!("{row}: not run (no privilege to make a file symlink on this host)");
+            continue;
+        }
+        fault::FAIL_DIR_SYNC_OF.set(Some((
+            base.join("data").join("new-parent"),
+            std::io::ErrorKind::Other,
+        )));
+        let refused = match Engine::open(&store, opening.clone()) {
+            Err(_) => true,
+            Ok(engine) => commit(&engine, 7).is_err(),
+        };
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if !refused {
+            wrong.push(format!(
+                "{row}: acknowledged though a target ancestor's sync failed"
+            ));
+        }
+        match Engine::open(&store, opening.clone()) {
+            Ok(engine) => {
+                if let Err(error) = commit(&engine, 4) {
+                    wrong.push(format!("{row}: the commit once the fault cleared: {error}"));
+                }
+            }
+            Err(error) => wrong.push(format!("{row}: the reopen once the fault cleared: {error}")),
+        }
+        match Engine::open(&store, config()) {
+            Ok(engine) => {
+                for n in [1, 4] {
+                    if !holds(&engine, n) {
+                        wrong.push(format!(
+                            "{row}: acknowledged commit {n} gone after a reopen"
+                        ));
+                    }
+                }
+            }
+            Err(error) => wrong.push(format!("{row}: the last reopen: {error}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
