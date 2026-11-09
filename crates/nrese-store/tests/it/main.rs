@@ -33,6 +33,7 @@ mod scope_tests;
 mod search_scope_tests;
 mod shacl_gate_tests;
 mod shacl_request_shapes_tests;
+mod speculative_tests;
 mod store_service_tests;
 mod support_cap_tests;
 mod support_round_tests;
