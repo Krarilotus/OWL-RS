@@ -63,6 +63,21 @@ rows = 1
 body = [{ contains = '"three"' }, { not_contains = '"one"' }]
 
 [[step]]
+name = "reopen the named graph's store"
+restart = true
+
+[[step]]
+name = "export after reopen contains only the committed replacement"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 200
+rows = 1
+body = [{ contains = '<http://example.com/verify/s> <http://example.com/verify/p> "three" .' },
+        { not_contains = '"one"' }, { not_contains = '"two"' }]
+
+[[step]]
 name = "DELETE removes it"
 method = "DELETE"
 path = "/dataset/data"
