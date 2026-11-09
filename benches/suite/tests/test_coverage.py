@@ -152,11 +152,11 @@ class Fields(Base):
             (lambda x: x["protocol"].update(runs=1), "unqualified", "protocol short"),
             (lambda x: x["protocol"].update(cache=["off"]), "unqualified", "result cache"),
             (lambda x: x["protocol"].update(order="fixed"), "unqualified", "order fixed"),
-            (lambda x: x["protocol"].pop("runtime"), "unqualified", "no runtime"),
-            (lambda x: x["protocol"].update(runtime="kubernetes"), "unqualified", "unrecognised: runtime"),
+            (lambda x: x["protocol"].pop("runtime"), "unqualified", "runtime None"),
+            (lambda x: x["protocol"].update(runtime="kubernetes"), "unqualified", "runtime 'kubernetes'"),
             (lambda x: x["protocol"].update(runtime="process"), "unqualified", "images: expected"),
             # G4: the invocation
-            (lambda x: x.update(complete=False), "unqualified", "incomplete"),
+            (lambda x: x.update(complete=False), "unqualified", "not complete"),
             (lambda x: x.update(commit=unknown("checkout moved during the run: a -> b")), "unqualified",
              "checkout moved"),
             (lambda x: x.update(commit=unknown("checkout changed during the run: clean at its start")),
@@ -192,9 +192,16 @@ class Fields(Base):
                 toolchain={"rustc": "1.97.0", "cargo": "1.97.0", "host": "h"}), "unqualified", "rustc 1.97.0 selected"),
             (lambda x: x["build"]["harness"].update(controlled=unknown("cargo also reads /home/u/.cargo/config.toml")),
              "unqualified", "cargo also reads"),
-            (lambda x: x["build"]["harness"].update(controlled=False), "unqualified", "unrecognised: harness build controlled"),
+            (lambda x: x["build"]["harness"].update(controlled=False), "unqualified", "harness build not controlled: False"),
             (lambda x: x["build"]["harness"].update(toolchain={"rustc": "1.98.1"}), "unqualified",
-             "unrecognised: harness build toolchain"),
+             "harness build toolchain: unrecognised"),
+            (lambda x: x["build"]["harness"].update(toolchain=unknown("unreadable")), "unqualified",  # sol-loop S1
+             "harness build toolchain: unreadable"),
+            (lambda x: x.update(attempt=7), "unqualified", "attempt 7"),  # sol-loop S2
+            (lambda x: x["build"]["nrese"].update(rust_image=unknown("unreadable")), "unqualified",  # S4: no crash
+             "rust_image"),
+            (lambda x: x["data"].update({"/data/retired.nt": unknown("not hashed")}), "unqualified",  # S7
+             "not hashed"),
             (lambda x: [x["build"]["harness"].pop(k) for k in ("toolchain", "controlled")], "unqualified",
              "unrecognised: harness build fields"),  # an export that failed: built_from's record only
             (lambda x: x["build"]["harness"].update(rust_image="rust:1.98.1-bookworm"), "unqualified",
@@ -369,6 +376,11 @@ class Cells(Base):
             code, out, err = self.run_command()
         self.assertEqual((code, out), (2, ""))
         self.assertIn("images.toml", err)
+        records = self.records()  # made before git is taken away: the fixture reads git too
+        with patch.object(receipts, "code_paths", side_effect=OSError("no git")):  # sol-loop S6: a cell's git
+            code, out, err = self.run_command(records=records)
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("no git", err)
         late = self.records() + [{"id": "r2", "pairs": [{"workload": "lubm", "tier": "1", "system": "jena",
                                                          "outcome": "ok", "receipt": self.repo.receipt("jena")}]}]
         real = coverage.judge

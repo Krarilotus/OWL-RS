@@ -189,24 +189,19 @@ def evidence(pairs: list[tuple[str, dict]]):
 def identity(name: str, got, want: dict, shape: re.Pattern, bad: list, stale: list):
     """An identity map (path or input -> id) against the owner's: an unknown on either side is
     unqualified, a readable difference (key set or value) stale."""
-    if is_unknown(got):
-        bad.append(f"{name}: {got['unknown']}")
-        return
-    if not isinstance(got, dict):
-        bad.append(f"unrecognised: {name}")
+    if is_unknown(got) or not isinstance(got, dict):
+        bad.append(f"{name}: {got['unknown'] if is_unknown(got) else 'unrecognised'}")
         return
     if set(got) != set(want):
         added, removed = sorted(set(got) - set(want)), sorted(set(want) - set(got))
         stale.append(f"{name}: definition changed: +{added} -{removed}")
-    for path in sorted(set(got) & set(want)):
-        g, w = got[path], want[path]
-        if is_unknown(w):
-            bad.append(f"{name} {path}: nothing to compare with: {w['unknown']}")
-        elif is_unknown(g):
-            bad.append(f"{name} {path}: {g['unknown']}")
-        elif not (isinstance(g, str) and shape.fullmatch(g)):
+    for path in sorted(set(got) | set(want)):  # every identity read, so an unknown is never just stale
+        g, w = got.get(path), want.get(path)
+        if is_unknown(w) or is_unknown(g):
+            bad.append(f"{name} {path}: {(w if is_unknown(w) else g)['unknown']}")
+        elif path in got and not (isinstance(g, str) and shape.fullmatch(g)):
             bad.append(f"unrecognised: {name} {path}")
-        elif g != w:
+        elif path in got and path in want and g != w:
             stale.append(f"{name}: {path} changed")
 
 
@@ -231,11 +226,10 @@ def fields(owners, workload, tier, key, receipt, bad, failing, stale):
         bad.append(f"receipt unknown: {receipt['unknown']}")
         return
     if not isinstance(receipt, dict) or receipt.get("complete") is not True:
-        bad.append("attempt incomplete" if isinstance(receipt, dict) and receipt.get("complete") is False
-                   else "unrecognised: complete")
+        bad.append(f"attempt not complete ({receipt.get('complete') if isinstance(receipt, dict) else receipt!r})")
         return
-    if set(receipt) != RECEIPT:
-        bad.append(f"unrecognised: receipt fields {sorted(set(receipt) ^ RECEIPT)}")
+    if set(receipt) != RECEIPT or not isinstance(receipt["attempt"], str):
+        bad.append(f"unrecognised: receipt fields {sorted(set(receipt) ^ RECEIPT)} or attempt {receipt.get('attempt')!r}")
         return
     system = owned("adapters.adapter", adapter, key)
     if system is None:
@@ -250,15 +244,9 @@ def fields(owners, workload, tier, key, receipt, bad, failing, stale):
         bad.append(f"plan unavailable here: {plan.unavailable}")
         return
     protocol = receipt["protocol"]
-    if not isinstance(protocol, dict):
-        bad.append("unrecognised: protocol")
-        return
-    if "runtime" not in protocol:
-        bad.append("no runtime")
-        return
-    kind = protocol["runtime"]
+    kind = protocol.get("runtime") if isinstance(protocol, dict) else None
     if kind not in KINDS:
-        bad.append(f"unrecognised: runtime {kind!r}")
+        bad.append(f"runtime {kind!r}: not one of {', '.join(KINDS)}")
         return
     check_protocol(protocol, system, bad)
     ctx = declared_context(owners.root, kind)
@@ -270,15 +258,13 @@ def fields(owners, workload, tier, key, receipt, bad, failing, stale):
         bad.append("unrecognised: commit")
     if type(receipt["dirty"]) is not int or receipt["dirty"]:
         bad.append(f"run from a dirty checkout ({receipt['dirty']})")
-    paths = owned("driver.receipt_code_paths", driver.receipt_code_paths, owners.root, owners.head, system, plan)
+    paths = driver.receipt_code_paths(owners.root, owners.head, system, plan)  # git: a failure is global
     identity("code", receipt["code"], {p: owners.object_id(owners.head, p) for p in paths}, HEX40, bad, stale)
     images = check_images(owners, system, ctx, receipt["images"], bad, stale)
     check_build(owners, system, kind, ctx, receipt["build"], images, bad, stale)
     settings = receipt["settings"]
-    if is_unknown(settings):
-        bad.append(f"settings: {settings['unknown']}")
-    elif not isinstance(settings, dict):
-        bad.append("unrecognised: settings")
+    if is_unknown(settings) or not isinstance(settings, dict):
+        bad.append(f"settings: {settings['unknown'] if is_unknown(settings) else 'unrecognised'}")
     elif settings:
         bad.append(f"settings set: {', '.join(sorted(settings))} (only the defaults are the standard cell)")
     inputs = owned("Plan.inputs_of", plan.inputs_of, key) + (["external"] if plan.external else [])
@@ -325,11 +311,8 @@ def check_images(owners, system, ctx, got, bad, stale) -> dict:
     scripted = {tag: (context, arg) for tag, context, arg in owned(f"{system.key}.script_builds",
                                                                     system.script_builds, ctx)}
     expected = set(owned(f"{system.key}.images", system.images, ctx)) | set(built)
-    if is_unknown(got):
-        bad.append(f"images: {got['unknown']}")
-        return {}
-    if not isinstance(got, dict):
-        bad.append("unrecognised: images")
+    if is_unknown(got) or not isinstance(got, dict):
+        bad.append(f"images: {got['unknown'] if is_unknown(got) else 'unrecognised'}")
         return {}
     if set(got) != expected:
         bad.append(f"images: expected {sorted(expected)}, has {sorted(got)}")
@@ -378,11 +361,8 @@ def check_build(owners, system, kind, ctx, got, images, bad, stale):
     proofs: its source trees and non-git inputs by content, its controlled build (environment,
     config, declared toolchain), its default settings and, in a container, its pinned Rust image."""
     programs = driver.expected_programs(system)
-    if is_unknown(got):
-        bad.append(f"build: {got['unknown']}")
-        return
-    if not isinstance(got, dict):
-        bad.append("unrecognised: build")
+    if is_unknown(got) or not isinstance(got, dict):
+        bad.append(f"build: {got['unknown'] if is_unknown(got) else 'unrecognised'}")
         return
     if set(got) != set(programs):
         bad.append(f"build: expected {sorted(programs)}, has {sorted(got)}")
@@ -417,19 +397,18 @@ def check_build(owners, system, kind, ctx, got, images, bad, stale):
         toolchain = record["toolchain"]
         readable = isinstance(toolchain, dict) and set(toolchain) == TOOLCHAIN \
             and all(isinstance(v, str) for v in toolchain.values())
-        if not (readable or is_unknown(toolchain)):
-            bad.append(f"unrecognised: {name} toolchain")
-        if is_unknown(record["controlled"]):
+        if not readable:
+            bad.append(f"{name} toolchain: {toolchain['unknown'] if is_unknown(toolchain) else 'unrecognised'}")
+        controlled = record["controlled"]
+        if controlled is not True:
             ran = f" (ran rustc {toolchain['rustc']}, cargo {toolchain['cargo']})" if readable else ""
-            bad.append(f"{name} not controlled: {record['controlled']['unknown']}{ran}")
-        elif record["controlled"] is not True:
-            bad.append(f"unrecognised: {name} controlled")
+            bad.append(f"{name} not controlled: {controlled['unknown'] if is_unknown(controlled) else controlled!r}{ran}")
         for setting, default in owners.settings.items():
             if record[setting] != default:
                 bad.append(f"{name}: {setting} {record[setting]!r}, the default is {default!r}")
         if container:
             image = owned(f"{system.key}.rust_image", system.rust_image, ctx)
-            ran = images.get(record["rust_image"]) if isinstance(images, dict) else None
+            ran = images.get(image) if isinstance(images, dict) else None
             if record["rust_image"] != image:
                 bad.append(f"{name}: rust_image {record['rust_image']!r}, the owner's is {image!r}")
             elif not isinstance(ran, dict) or ran.get("id") != record["rust_image_id"]:
