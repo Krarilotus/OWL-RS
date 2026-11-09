@@ -24,7 +24,7 @@ params = { action = "ADD" }
 headers = { Content-Type = "text/turtle" }
 body = '<http://example.com/private> <http://example.com/value> "staged" .'
 [step.expect]
-status = 204
+status = 200
 
 [[step]]
 name = "the first transaction reads its own load"

@@ -169,15 +169,15 @@ status = 200
 json = { "$.boolean" = true }
 
 [[step]]
-name = "export the reopened asserted graph"
+name = "export the reopened graph with its inference"
 path = "/api/v1/repositories/${repo}/data?default"
-params = { infer = "false" }
 headers = { Accept = "application/n-triples" }
 [step.expect]
 status = 200
-rows = 2
+rows = 3
 body = [{ contains = '<${ex}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <${ex}Animal> .' },
-        { contains = '<${ex}tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <${ex}Cat> .' }]
+        { contains = '<${ex}tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <${ex}Cat> .' },
+        { contains = '<${ex}tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <${ex}Animal> .' }]
 
 [[step]]
 name = "remove it"
