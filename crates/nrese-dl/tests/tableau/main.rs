@@ -197,6 +197,127 @@ fn backjumping_skips_unrelated_choices() {
     );
 }
 
+/// Every order of `0..n`.
+fn orders(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in orders(n - 1) {
+        for at in 0..=rest.len() {
+            let mut o = rest.clone();
+            o.insert(at, n - 1);
+            out.push(o);
+        }
+    }
+    out
+}
+
+/// Review D16-058 r1, R1-F1: under dynamic backtracking, a disjunction reopened and passed
+/// over as satisfied by a newer choice is reopened again when that choice is retracted.
+///
+/// Everything is q = A ⊔ B ⊔ C (or `a` is) and everything is p = Y ⊔ X ⊔ B; `a` exists;
+/// A ⊓ Y, C ⊓ Y, C ⊓ X and C ⊓ B are empty; A ⊑ J ⊔ K with A ⊓ J and A ⊓ K empty;
+/// B ⊑ D ⊔ E and B ⊑ M ⊔ N, one of the two pairs empty with B. A and B are empty, so q
+/// needs C, and under C nothing of p is possible: inconsistent.
+///
+/// p holds everywhere (a clause without body), as the reviewer wrote it: such a clause
+/// fires only for a new node, so a retraction's re-joining of the live facts doesn't queue
+/// it again. (Asserted on `a`, p came back through its assertion's fact, and the search
+/// was right by luck.)
+///
+/// The reviewer's schedule:
+/// 1. q:A, then p:Y fails and p:X is taken.
+/// 2. A is refuted, which retracts p's frame (its failures name A) and reopens p.
+/// 3. q:B is decided again on top, and the reopened p is popped and passed over, satisfied
+///    by B.
+/// 4. B's free pair is chosen, its other pair refutes B, and the retraction of B's level
+///    (the free pair's frame above it) reopened only the disjunctions inside B's saved
+///    window, above p. The search returned a model without p.
+///
+/// The compiled order of disjuncts and clauses isn't specified: `or` orders disjuncts by
+/// expression, and the axioms' order isn't the order they were added in. So every creation
+/// order of the five classes the root disjunctions name runs, with q everywhere or asserted
+/// on `a`, and either of B's pairs empty with B (one of them is then decided first, as step
+/// 4 needs). Each must be inconsistent: with the retraction check off first (the bug's wrong
+/// answer), then on (its assertion).
+#[test]
+fn a_reopened_disjunction_passed_as_satisfied_is_reopened_when_its_satisfier_is_retracted() {
+    let mut wrong = Vec::new();
+    let mut retractions = 0;
+    for check in [false, true] {
+        for order in orders(5) {
+            for (q_everywhere, mn_empty) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let mut b = Build::default();
+                let mut root = [ExprId(0); 5];
+                for &i in &order {
+                    root[i] = b.class(1 + i as u64);
+                }
+                let [y, x, a, bb, c] = root;
+                let [j, k, d, e, m, n] = [6, 7, 8, 9, 10, 11].map(|t| b.class(t));
+                let thing = b.e(ClassExpr::Thing);
+                let q = b.or(&[a, bb, c]);
+                let p = b.or(&[y, x, bb]);
+                b.sub(thing, p);
+                if q_everywhere {
+                    b.sub(thing, q);
+                    b.assert(thing, 100);
+                } else {
+                    b.assert(q, 100);
+                }
+                b.disjoint(a, y);
+                b.disjoint(c, y);
+                b.disjoint(c, x);
+                b.disjoint(c, bb);
+                let jk = b.or(&[j, k]);
+                b.sub(a, jk);
+                b.disjoint(a, j);
+                b.disjoint(a, k);
+                let de = b.or(&[d, e]);
+                let mn = b.or(&[m, n]);
+                b.sub(bb, de);
+                b.sub(bb, mn);
+                let (empty1, empty2) = if mn_empty { (m, n) } else { (d, e) };
+                b.disjoint(bb, empty1);
+                b.disjoint(bb, empty2);
+                for dynamic in [true, false] {
+                    let config = Config {
+                        dynamic_backtracking: dynamic,
+                        check_retraction: check,
+                        disjunct_learning: false,
+                        counting: false,
+                        lazy_definitions: false,
+                        complements: false,
+                        portfolio: false,
+                        ..Config::default()
+                    };
+                    let out = consistency(&b.o, &config);
+                    if dynamic {
+                        retractions += out.telemetry.retractions;
+                    }
+                    if out.answer != Answer::Inconsistent {
+                        wrong.push(format!(
+                            "check {check}, dynamic {dynamic}, order {order:?}, q everywhere \
+                             {q_everywhere}, M and N empty with B {mn_empty}: {:?} ({})",
+                            out.answer, out.telemetry
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} runs:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+    // The schedule the case is about: choices retracted alone.
+    assert!(retractions > 0, "no run retracted a choice");
+}
+
 #[test]
 fn existentials_and_blocking() {
     // A ⊑ ∃R.A: an infinite chain, cut by blocking.

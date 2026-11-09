@@ -1,0 +1,7 @@
+# Methods only named callers may use: each allowed call site carries `#[allow(clippy::disallowed_methods)]`.
+disallowed-methods = [
+    # Dictionary 3.0b (IB2250-153c): its views keep their source's publication, which is sound only for
+    # statements the source's own DL bounds derive from it alone. Its callers are `nrese-store/src/dl/bounds.rs`
+    # (the bounds' lower and upper views) and the engine's own test of it.
+    { path = "nrese_engine::Snapshot::with_inferred_derived_within", reason = "only the store's DL bounds derive views that keep publication (dictionary 3.0b)" },
+]

@@ -6,35 +6,38 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::load;
 use crate::batch::{self, Schema};
-use crate::delta::{Base, Interrupted, MemoryBase, Rules, update_until};
-use crate::eval::OperationStop;
+use crate::delta::{Interrupted, MemoryBase, Rules, VisitsBase, update_until};
+use crate::eval::{OperationStop, Poller, Probe, Stopped as ReadStopped, Visit};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
-/// A base that counts the facts its scans hand out.
+/// A base that counts the facts its scans hand out; reads count on the inner base's.
 struct Counting {
     base: MemoryBase,
     scanned: AtomicUsize,
 }
 
-impl Base for Counting {
-    fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        self.base.scan(pattern, &mut |fact| {
-            self.scanned.fetch_add(1, Ordering::Relaxed);
-            f(fact);
-        });
+impl VisitsBase for Counting {
+    fn visit(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
+        visit.filtered(
+            &|_| {
+                self.scanned.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            },
+            |inner| self.base.visit(pattern, inner),
+        );
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
-        self.base.estimate(pattern)
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, ReadStopped> {
+        self.base.size(pattern, probe)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.base.contains(fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+        self.base.holds(fact, probe)
     }
 
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.base.is_asserted(fact)
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+        self.base.asserts(fact, probe)
     }
 }
 
@@ -219,13 +222,69 @@ fn a_stopped_materialisation_is_never_reported_complete() {
     }
 }
 
+/// An equality materialisation's expanded listing (every identity of a class) counts each
+/// fact's copies as it makes them: one class of 1000 identities lists about a million
+/// copies of its `sameAs` facts, a product far above `POLL_UNITS`. REAS-2's invariant: once
+/// a stop fires, a task does at most `POLL_UNITS` more units plus the work in progress, here
+/// the run of copies counted at once, at most `POLL_UNITS` long (`batch::RUN`, which
+/// `batch::list` cuts its copies by: `mo.chunks(RUN)`). So the listing asks its stop at least once
+/// every `POLL_UNITS` plus one run's worth of copies, a stop that fires while a product is
+/// made is seen within that, and the materialisation ends `Interrupted` (a whole product
+/// counted at once was one ask for all its copies).
+#[test]
+fn an_expanded_listing_stops_within_its_poll_interval() {
+    use crate::rulesets::Ruleset;
+    let n = 1000;
+    let mut vocabulary = LocalVocabulary::default();
+    let text: Vec<String> = (1..n)
+        .map(|i| format!("ex:a{i} owl:sameAs ex:a0"))
+        .collect();
+    let input = load(&mut vocabulary, &text.join("\n"));
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let materialise = |stop: crate::eval::Stop<'_>| {
+        batch::materialise_representatives_until(
+            batch::Input::Facts(input.clone()),
+            &rules,
+            None,
+            &schema,
+            batch::Listing::Expanded,
+            stop,
+        )
+    };
+    let asks = AtomicUsize::new(0);
+    let whole = materialise(&|| {
+        asks.fetch_add(1, Ordering::Relaxed);
+        false
+    })
+    .expect("runs");
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let copies = whole.derived.len();
+    assert!(
+        copies >= 100 * interval,
+        "{copies} copies: the class's product must be far above POLL_UNITS"
+    );
+    // The longest run of copies the listing counts at once (`batch::list`).
+    let run = interval;
+    let polls = asks.load(Ordering::Relaxed);
+    assert!(
+        polls >= copies / (interval + run),
+        "{polls} asks of the stop for {copies} copies: more than {interval} copies plus one \
+         run of {run} made between two of them"
+    );
+    // A stop that fires at the middle ask, most of which the listing makes, and stays fired.
+    let seen = AtomicUsize::new(0);
+    let stopped = materialise(&|| seen.fetch_add(1, Ordering::Relaxed) >= polls / 2);
+    assert_eq!(stopped.err(), Some(Interrupted::default()));
+}
+
 /// A support-set update (graph access) whose change's forward cone is one driver joined
 /// with two atoms of 300 facts each: once its caller's stop fires, the round under way
 /// ends within `POLL_UNITS` scanned facts plus the two scans open on its stack, and the
 /// update ends `Cancelled`, with no sets (RSH-18, the support facet).
 #[test]
 fn a_cancelled_support_update_stops_within_its_poll_interval() {
-    use crate::eval::{Seg, Source};
+    use crate::eval::{Seg, Visits};
     use crate::graph_sets::{
         Change, Limits, Previous, Sets, Stopped, UNWATCHED, update_support_sets,
     };
@@ -235,18 +294,26 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         facts: batch::Store,
         scanned: AtomicUsize,
     }
-    impl Source for Closure {
-        fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
-            self.facts.scan(pattern, seg, &mut |fact| {
-                self.scanned.fetch_add(1, Ordering::Relaxed);
-                f(fact);
-            });
+    impl Visits for Closure {
+        fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
+            visit.filtered(
+                &|_| {
+                    self.scanned.fetch_add(1, Ordering::Relaxed);
+                    Ok(true)
+                },
+                |inner| self.facts.visit(pattern, seg, inner),
+            );
         }
-        fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
-            self.facts.estimate(pattern, seg)
+        fn size(
+            &self,
+            pattern: [Option<u64>; 3],
+            seg: Seg,
+            probe: Probe<'_, '_>,
+        ) -> Result<usize, ReadStopped> {
+            self.facts.size(pattern, seg, probe)
         }
-        fn contains(&self, fact: Triple) -> bool {
-            self.facts.contains(fact)
+        fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+            self.facts.holds(fact, probe)
         }
     }
 
@@ -279,10 +346,10 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         facts: batch::Store::new(closure.clone()),
         scanned: AtomicUsize::new(0),
     };
-    let previous = |_: Triple| Previous::Sets(Sets::NONE);
+    let previous = |_: Triple, _: &Poller<'_>| Ok(Previous::Sets(Sets::NONE));
     let change = Change {
         source: &source,
-        in_closure: &|f| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| Ok(closure.binary_search(&f).is_ok()),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,
