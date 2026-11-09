@@ -54,8 +54,8 @@ fn a_stopped_merge_step_stays_stopped() {
     stops_after_any_portion(&runs, Permutation::Spog.to_key(&k), 1 + 3);
     let later = (0..LINEAR_UP_TO as u64).map(|i| quad(1_000 + i));
     runs.extend(later.map(|q| Run::from_delta(Layout::DefaultGraph, &[q], &[])));
-    // An advance and the heap's repair for each of K's occurrences.
-    stops_after_any_portion(&runs, Permutation::Spog.to_key(&k), 2 * 3);
+    // An advance with the heap's repair, one portion for each of K's occurrences.
+    stops_after_any_portion(&runs, Permutation::Spog.to_key(&k), 3);
 }
 
 fn stops_after_any_portion(runs: &[Run], key: crate::quad::Key, portions: usize) {

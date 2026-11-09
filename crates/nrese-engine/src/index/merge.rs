@@ -267,11 +267,13 @@ impl<'a> SignedMerge<'a> {
     }
 
     /// The next distinct key and the sum of its signs, or `None` at the end. Its work is
-    /// counted on `account` a portion at a time, each before it is done: for each occurrence
-    /// it takes, the cursor's advance with what it reads ([`Cursor::advance_cost`]), then
-    /// the heap's repair together with the test of whether the next head holds the same key.
-    /// The end is counted too. [`Stopped`] once the account has stopped, and the partial
-    /// sum is dropped. After that every step answers [`Stopped`] and does nothing.
+    /// counted on `account` a portion at a time, each before it is done, and each done before
+    /// the next is taken, so no work counted before a yes is done after it (fix check r3 H1).
+    /// For each occurrence a heap step takes, a portion is the cursor's advance with what it
+    /// reads ([`Cursor::advance_cost`]) together with the heap's repair and the test of whether
+    /// the next head holds the same key. The end is counted too. [`Stopped`] once the account
+    /// has stopped, and the partial sum is dropped. After that every step answers [`Stopped`]
+    /// and does nothing.
     #[inline]
     pub(crate) fn step(
         &mut self,
@@ -289,17 +291,12 @@ impl<'a> SignedMerge<'a> {
             self.single = self.heads.pop().map(|head| head.cursor);
         }
         if let Some(i) = self.single {
-            let cursor = &mut self.cursors[i];
-            if !account.take_cost(|| cursor.advance_cost()) {
-                return self.stop();
-            }
-            let item = (cursor.key, cursor.sign());
-            self.left -= 1;
-            if !cursor.advance() {
-                cursor.buffer = Vec::new();
+            let key = self.cursors[i].key;
+            let (sign, live) = self.take_from(i, 0, account)?;
+            if !live {
                 self.single = None;
             }
-            return Ok(Some(item));
+            return Ok(Some((key, sign)));
         }
         let Some(key) = self.heads.peek().map(|head| head.key) else {
             // Counted too, so a stopped account's read answers Stopped, not the end.
@@ -309,24 +306,16 @@ impl<'a> SignedMerge<'a> {
             };
         };
         let mut sign = 0;
-        loop {
+        while let Some(i) = self.heads.peek().map(|head| head.cursor) {
             let repair = 2 * levels(self.heads.len()) + 1;
-            let Some(mut top) = self.heads.peek_mut() else {
-                break;
-            };
-            let cursor = &mut self.cursors[top.cursor];
-            if !account.take_cost(|| cursor.advance_cost()) || !account.take_cost(|| repair) {
-                drop(top);
-                return self.stop();
-            }
-            sign += cursor.sign();
-            self.left -= 1;
-            if cursor.advance() {
-                top.key = cursor.key;
-                drop(top);
+            let (taken, live) = self.take_from(i, repair, account)?;
+            sign += taken;
+            // The top's change, or its pop, repairs the heap as it ends.
+            if live {
+                let next = self.cursors[i].key;
+                self.heads.peek_mut().expect("peeked").key = next;
             } else {
-                cursor.buffer = Vec::new();
-                let _ = PeekMut::pop(top);
+                let _ = PeekMut::pop(self.heads.peek_mut().expect("peeked"));
             }
             worked(1);
             if self.heads.peek().is_none_or(|head| head.key != key) {
@@ -338,46 +327,63 @@ impl<'a> SignedMerge<'a> {
 
     /// [`Self::step`] without a heap, over at most [`LINEAR_UP_TO`] live inputs: the least of
     /// their keys, then each input at it taken, an exhausted one removed. Comparing and testing
-    /// each input is counted first, then each advance.
+    /// each input is one portion, done before each advance is counted.
     #[inline]
     fn select(&mut self, account: &mut impl Account) -> Result<Option<(Key, i64)>, Stopped> {
-        if let [cursor] = self.cursors.as_mut_slice() {
-            if !account.take_cost(|| cursor.advance_cost()) {
-                return self.stop();
-            }
-            let item = (cursor.key, cursor.sign());
-            self.left -= 1;
-            if !cursor.advance() {
+        let n = self.cursors.len();
+        if n == 1 {
+            let key = self.cursors[0].key;
+            let (sign, live) = self.take_from(0, 0, account)?;
+            if !live {
                 self.cursors.clear();
             }
-            return Ok(Some(item));
+            return Ok(Some((key, sign)));
         }
         // The end is counted too.
-        if !account.take((2 * self.cursors.len()).max(1) as u64) {
+        if !account.take((2 * n).max(1) as u64) {
             return self.stop();
         }
-        worked(self.cursors.len());
+        worked(2 * n);
         let Some(&key) = self.cursors.iter().map(|cursor| &cursor.key).min() else {
             return Ok(None);
         };
-        let (mut sign, mut i) = (0, 0);
-        while i < self.cursors.len() {
-            worked(1);
-            let cursor = &mut self.cursors[i];
-            if cursor.key == key {
-                if !account.take_cost(|| cursor.advance_cost()) {
-                    return self.stop();
-                }
-                sign += cursor.sign();
-                self.left -= 1;
-                if !cursor.advance() {
-                    self.cursors.swap_remove(i);
-                    continue;
-                }
+        let mut at = [false; LINEAR_UP_TO];
+        for (i, cursor) in self.cursors.iter().enumerate() {
+            at[i] = cursor.key == key;
+        }
+        let mut sign = 0;
+        // From the last, so a removed cursor's place is taken by one already handled.
+        for i in (0..n).rev().filter(|&i| at[i]) {
+            let (taken, live) = self.take_from(i, 0, account)?;
+            sign += taken;
+            if !live {
+                self.cursors.swap_remove(i);
             }
-            i += 1;
         }
         Ok(Some((key, sign)))
+    }
+
+    /// Cursor `i`'s sign, its advance counted first as one portion with `more` units done
+    /// with it (a heap's repair), then whether it has another key. An exhausted cursor's
+    /// buffer is freed. [`Stopped`] where the account refuses.
+    #[inline]
+    fn take_from(
+        &mut self,
+        i: usize,
+        more: u64,
+        account: &mut impl Account,
+    ) -> Result<(i64, bool), Stopped> {
+        let cursor = &mut self.cursors[i];
+        if !account.take_cost(|| cursor.advance_cost() + more) {
+            return self.stop();
+        }
+        let sign = cursor.sign();
+        self.left -= 1;
+        let live = cursor.advance();
+        if !live {
+            cursor.buffer = Vec::new();
+        }
+        Ok((sign, live))
     }
 
     fn stop<T>(&mut self) -> Result<T, Stopped> {

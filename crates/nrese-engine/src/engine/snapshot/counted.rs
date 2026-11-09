@@ -413,7 +413,8 @@ impl Snapshot {
 }
 
 /// A scan of `index` for `plan` on a read's one account: nothing where the read stopped while it
-/// was being made (the stop is the visitor's to tell).
+/// was being made. The account's refusal is final, so the read's next step answers [`Stopped`]
+/// too, whatever the account had left (fix check r3 H2).
 fn scan_on<'a>(
     index: &'a IndexVersion,
     plan: &AccessPlan,
