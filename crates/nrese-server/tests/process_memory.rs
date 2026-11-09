@@ -130,12 +130,10 @@ fn app_with(n: usize, runtime: &tokio::runtime::Runtime) -> axum::Router {
     app
 }
 
-/// Sends a request and takes its body frame by frame, keeping none: its status, bytes and
-/// lines.
-async fn send(
+async fn response(
     app: axum::Router,
     (method, uri, accept): (Method, &str, &str),
-) -> (StatusCode, usize, usize) {
+) -> axum::response::Response {
     let request = Request::builder()
         .method(method)
         .uri(uri)
@@ -143,7 +141,13 @@ async fn send(
         .header("accept", accept)
         .body(Body::empty())
         .unwrap();
-    let response = app.oneshot(request).await.unwrap();
+    app.oneshot(request).await.unwrap()
+}
+
+/// Sends a request and takes its body frame by frame, keeping none: its status, bytes and
+/// lines.
+async fn send(app: axum::Router, request: (Method, &str, &str)) -> (StatusCode, usize, usize) {
+    let response = response(app, request).await;
     let status = response.status();
     let (mut bytes, mut lines) = (0, 0);
     let mut body = response.into_body();
@@ -249,4 +253,63 @@ fn export_growth_accepts_the_bounded_channel_occupancy() {
     // Spec: IB0622-25e2 / SS-15: scheduling may fill the bounded export channel.
     // gate-push-a9435e267b-1794200086 measured these peaks without retaining the graph.
     assert_output_growth("export", [292_588, 598_064]);
+}
+
+#[test]
+fn get_growth_accepts_a_channel_filled_by_an_unread_body() {
+    // Spec: SS-15 / master's controlled witness: scheduling alone may fill GET's channel.
+    if !measure::alone() {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let app = app_with(80_000, &runtime);
+    let request = (
+        Method::GET,
+        "/dataset/data?graph=urn%3An8%3Ag",
+        "application/n-triples",
+    );
+    runtime.block_on(send(app.clone(), request.clone()));
+    let ((status, _, lines), drained) =
+        measure::measure(|| runtime.block_on(send(app.clone(), request.clone())));
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(lines, 80_000);
+    let ((status, buffered, chunk, failed), unread) = measure::measure(|| {
+        runtime.block_on(async {
+            let response = response(app, request).await;
+            let status = response.status();
+            // The only blocking worker is the producer's. This marker waits until the
+            // unread channel's stall deadline stops it; no sleep guesses when it fills.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            let mut body = response.into_body();
+            let (mut buffered, mut chunk, mut failed) = (0, 0, false);
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            chunk = data.len();
+                            buffered += chunk;
+                        }
+                    }
+                    Err(_) => failed = true,
+                }
+            }
+            (status, buffered, chunk, failed)
+        })
+    });
+    assert_eq!(status, StatusCode::OK);
+    assert!(failed, "the producer must stop on backpressure");
+    // The queue and first frame remain; the pending send and replacement buffer went
+    // with the stopped producer. All queued frames are full, before its final flush.
+    assert_eq!(buffered + 2 * chunk, MAX_BUFFERED_OUTPUT_BYTES);
+    assert!(unread >= MAX_BUFFERED_OUTPUT_BYTES);
+    eprintln!(
+        "unread GET: buffered={buffered}, chunk={chunk}, queue_payload={}, peak={unread}",
+        MAX_BUFFERED_OUTPUT_BYTES - 3 * chunk
+    );
+    assert_output_growth("GET N-Triples", [drained, unread]);
 }
