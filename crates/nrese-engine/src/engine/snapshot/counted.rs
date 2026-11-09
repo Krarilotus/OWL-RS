@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
-use super::{CopyVisibility, Either, Snapshot, SortedMerge};
-use crate::engine::equality::{Classes as EqualityClasses, Expand};
+use super::{CopyVisibility, Either, Snapshot};
+use crate::engine::equality::{Classes as EqualityClasses, Expand, Merged, OnMeter, Read, Step};
 use crate::engine::{ReadModel, Stack};
-use crate::index::CountedScan;
+use crate::index::{IndexVersion, QuadScan};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
-use crate::visit::{Stopped, Visitor};
+use crate::visit::{Account, Ledger, Stopped, Visitor};
 use crate::{Count, SnapshotIdentity, TermId};
 
 /// A snapshot whose data is read only counted: each read takes its reader's visitor and
@@ -219,26 +219,22 @@ impl Snapshot {
         if !supported {
             return None;
         }
-        let scan = |stack: Stack| {
+        // One account for both stacks' scans, which the merge interleaves (fix check r2 G1's
+        // sibling: a ledger each allowed a run each after the same yes).
+        let mut account = Ledger::new(visit);
+        let mut scan = |stack: Stack| {
             model
                 .includes(stack)
-                .then(|| {
-                    self.data(model)
-                        .stack(stack)
-                        .scan_plan_iter_counted(&plan, visit)
-                })
-                .into_iter()
-                .flatten()
+                .then(|| scan_on(self.data(model).stack(stack), &plan, &mut account))
         };
-        Some(Either::Right(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
-            permutation,
-        }))
+        let step = Merged::new(scan(Stack::Asserted), scan(Stack::Inferred), permutation);
+        Some(Either::Right(Read { step, account }))
     }
 
-    /// `Snapshot::expanded_sorted`'s work, counted: its stored scans counted, its copies and
-    /// visibility probes on the expansion's meter (REAS-3, sweeps SW013–SW015).
+    /// `Snapshot::expanded_sorted`'s work, counted: its stored scans, their merge, its copies,
+    /// its visibility probes and its named graphs' scan on the read's one account (REAS-3,
+    /// sweeps SW013–SW015; fix check r2 G1's sibling: the scans' ledgers and the expansion's
+    /// credit allowed a run each after the same yes).
     fn expanded_sorted_visited<'a>(
         &'a self,
         classes: Arc<EqualityClasses>,
@@ -262,18 +258,13 @@ impl Snapshot {
             true => Some(AccessPlan::in_permutation(pattern, permutation)?),
             false => None,
         };
-        let stored: SortedMerge<CountedScan<'a, 'a>, CountedScan<'a, 'a>> = SortedMerge {
-            left: data
-                .asserted
-                .scan_plan_iter_counted(&plan, visit)
-                .peekable(),
-            right: data
-                .inferred
-                .scan_plan_iter_counted(&plan, visit)
-                .peekable(),
+        let mut account = OnMeter::new(visit);
+        let stored = Merged::new(
+            scan_on(&data.asserted, &plan, &mut account),
+            scan_on(&data.inferred, &plan, &mut account),
             permutation,
-        };
-        let expanded = Expand::metered(
+        );
+        let expanded = Expand::of(
             stored,
             classes,
             *pattern,
@@ -281,18 +272,12 @@ impl Snapshot {
             named && !renamed,
             model,
             data,
-            visit,
         )
         .charging(self.reads.clone());
-        let named = named_plan
-            .into_iter()
-            .flat_map(move |plan| data.asserted.scan_plan_iter_counted(&plan, visit))
-            .filter(|quad| !quad.graph.is_default_graph());
-        Some(SortedMerge {
-            left: expanded.peekable(),
-            right: named.peekable(),
-            permutation,
-        })
+        let named =
+            NamedGraphs(named_plan.map(|plan| scan_on(&data.asserted, &plan, &mut account)));
+        let step = Merged::new(expanded, named, permutation);
+        Some(Read { step, account })
     }
 
     /// [`Snapshot::contains_in`]'s work, counted: its run probes, and under equality its
@@ -345,12 +330,8 @@ impl Snapshot {
                 && CopyVisibility::new(self.data(model), model).shows_with(
                     quad,
                     classes.touches(&canonical),
-                    visit,
-                );
-            // A visibility probe that saw the stop answered for nothing.
-            if crate::visit::stopped(visit) {
-                return Err(Stopped);
-            }
+                    &mut OnMeter::new(visit),
+                )?;
             return Ok(shown);
         }
         for stack in Stack::ALL {
@@ -428,5 +409,32 @@ impl Snapshot {
                 .at_least();
         }
         Ok(estimate)
+    }
+}
+
+/// A scan of `index` for `plan` on a read's one account: nothing where the read stopped while it
+/// was being made (the stop is the visitor's to tell).
+fn scan_on<'a>(
+    index: &'a IndexVersion,
+    plan: &AccessPlan,
+    account: &mut impl Account,
+) -> QuadScan<'a> {
+    index
+        .scan_plan_with(plan, account)
+        .unwrap_or_else(|Stopped| QuadScan::empty(plan.permutation))
+}
+
+/// An expanded read's named graphs where its classes rename the pattern's constants: read as
+/// stored, with the pattern's own constants, their default graph left out.
+struct NamedGraphs<'a>(Option<QuadScan<'a>>);
+
+impl Step for NamedGraphs<'_> {
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        loop {
+            match self.0.step(account)? {
+                Some(quad) if quad.graph.is_default_graph() => continue,
+                other => return Ok(other),
+            }
+        }
     }
 }

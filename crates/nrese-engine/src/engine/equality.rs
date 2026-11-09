@@ -29,8 +29,9 @@ use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use parking_lot::Mutex;
 
 use super::{ReadModel, Stack, Version};
-use crate::quad::{EncodedQuad, GraphSelector, Key, Permutation, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Key, Permutation, QuadPattern};
 use crate::term::TermId;
+use crate::visit::{Account, Free, Stopped};
 
 /// The classes of one version, computed at the first read that needs them and passed on
 /// to the next version while no commit changes a `sameAs` statement.
@@ -384,9 +385,15 @@ impl Classes {
         };
         // The reasoner's union kernel (G7 of the investigation of 6 October 2026).
         let mut union = nrese_exec::classes::Classes::default();
-        let mut credit = Credit::default();
+        // One account for all of the build's work: its scans' searches and steps, its unions'
+        // moves and its finish, so at most `POLL_UNITS` units of it follow any yes (fix check
+        // r2 G1: a scan's ledger and the unions' credit apart allowed both).
+        let mut account = OnMeter::new(meter);
+        let plan = AccessPlan::for_pattern(&pattern);
         for stack in Stack::ALL {
-            for quad in meter.scan(version.stack(stack), &pattern) {
+            let index = version.stack(stack);
+            let mut scan = index.scan_plan_with(&plan, &mut account).ok()?;
+            while let Some(quad) = scan.step_with(&mut account).ok()? {
                 let (a, b) = (quad.subject.raw(), quad.object.raw());
                 if a == b {
                     continue;
@@ -395,33 +402,33 @@ impl Classes {
                 // chunk at a time (REAS-3a sol-loop r1 S1, fix check r1 R1); a pair already in
                 // one class moves none (sol-loop r2 S6). A stopped union leaves the kernel half
                 // made: dropped with this build.
-                if M::COUNTED {
-                    union.union_asking(a, b, |n| credit.take_many(meter, n))?;
-                } else {
-                    union.union(a, b);
-                }
+                union.union_asking(a, b, |n| account.take(n))?;
             }
         }
-        if meter.stopped() {
-            return None;
-        }
-        // Finishing the classes (REAS-3a review r1 R1, fix check r1 R1): each identity copied
-        // out of the union kernel, sorted, checked for a literal and indexed is counted before
-        // it is handled, a chunk of at most `POLL_UNITS` units at a time, so a stop is seen
-        // within a run of work however large a class is (a counted sort: `sort_counted`). The
-        // maps are made at their final size before the first insert, counted as the identities
-        // they will hold, so no insert grows them (their initialisation is held for the owner:
-        // fix check r1 F2).
+        // Finishing the classes (REAS-3a review r1 R1, fix check r1 R1): each class the kernel
+        // lists, and each identity copied out of it, sorted, checked for a literal and indexed,
+        // is counted before it is handled, a chunk of at most `POLL_UNITS` units at a time, so
+        // a stop is seen within a run of work however large a class is (a counted sort:
+        // `sort_counted`). The maps are made at their final size before the first insert,
+        // counted as the identities they will hold, so no insert grows them (their
+        // initialisation is held for the owner: fix check r1 F2).
         let chunk = nrese_exec::POLL_UNITS as usize;
-        let mut copies: Vec<Vec<u64>> = Vec::with_capacity(union.classes().size_hint().0);
+        let mut listed = union.classes();
+        let mut copies: Vec<Vec<u64>> = Vec::with_capacity(listed.len());
         let mut identities_in_all = 0;
-        for (_, members) in union.classes() {
+        loop {
+            if !account.take(1) {
+                return None;
+            }
+            let Some((_, members)) = listed.next() else {
+                break;
+            };
             if members.len() < 2 {
                 continue;
             }
             let mut identities = Vec::with_capacity(members.len());
             for part in members.chunks(chunk) {
-                if !credit.take_many(meter, part.len() as u64) {
+                if !account.take(part.len() as u64) {
                     return None;
                 }
                 #[cfg(any(test, all(feature = "witness", debug_assertions)))]
@@ -431,7 +438,7 @@ impl Classes {
             identities_in_all += identities.len();
             copies.push(identities);
         }
-        if !credit.take_many(meter, identities_in_all as u64) {
+        if !account.take(identities_in_all as u64) {
             return None;
         }
         let mut classes = Self {
@@ -442,14 +449,14 @@ impl Classes {
         for mut identities in copies {
             if !M::COUNTED {
                 identities.sort_unstable();
-            } else if !sort_counted(&mut identities, |n| credit.take_many(meter, n)) {
+            } else if !sort_counted(&mut identities, |n| account.take(n)) {
                 return None;
             }
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
             classes.literals |= is_literal(TermId::from_raw(representative));
             for part in identities[1..].chunks(chunk) {
-                if !credit.take_many(meter, part.len() as u64) {
+                if !account.take(part.len() as u64) {
                     return None;
                 }
                 #[cfg(any(test, all(feature = "witness", debug_assertions)))]
@@ -663,24 +670,10 @@ impl Values<'_> {
 pub(crate) trait Metering: Copy {
     /// Whether it counts anything (resolved when compiled).
     const COUNTED: bool;
-    /// Its scans of an index.
-    type Scan<'a>: Iterator<Item = EncodedQuad>
-    where
-        Self: 'a;
     /// Counts `n` units before they are done: false once stopped.
     fn units(self, n: u64) -> bool;
     /// Whether it has stopped, counting nothing.
     fn stopped(self) -> bool;
-    /// A scan of `index` for `pattern`.
-    fn scan<'a>(
-        self,
-        index: &'a crate::index::IndexVersion,
-        pattern: &QuadPattern,
-    ) -> Self::Scan<'a>
-    where
-        Self: 'a;
-    /// Whether `index` holds `quad`; false once stopped.
-    fn contains(self, index: &crate::index::IndexVersion, quad: &EncodedQuad) -> bool;
     /// `index`'s held count for `plan`; `None` once stopped.
     fn count_plan(
         self,
@@ -751,33 +744,14 @@ fn sort_counted(ids: &mut Vec<u64>, mut take: impl FnMut(u64) -> bool) -> bool {
 /// `SORT_RUN · log2 SORT_RUN` comparisons, a fraction of `POLL_UNITS`.
 const SORT_RUN: usize = 256;
 
-/// A meter's count taken a unit at a time and asked for a run at a time: one call of the
-/// visitor per run of at most `POLL_UNITS` units, a decrement per unit (REAS-2's r8 form:
+/// A meter's count taken a portion at a time and asked for a run at a time: one call of the
+/// visitor per run of at most `POLL_UNITS` units, a decrement per portion (REAS-2's r8 form:
 /// a call per unit cost +0.6 % on replicate, the run form noise). Nothing for an unmetered
 /// read.
 #[derive(Default)]
-pub(crate) struct Credit(u64);
+struct Credit(u64);
 
 impl Credit {
-    /// Takes one unit, asking `meter` for the next run when none is left: `left` units at
-    /// most (the ones still to come, this one included), and at most `POLL_UNITS`; false
-    /// once the meter has stopped.
-    #[inline]
-    pub(crate) fn take<M: Metering>(&mut self, meter: M, left: u64) -> bool {
-        if !M::COUNTED {
-            return true;
-        }
-        if self.0 == 0 {
-            let run = left.clamp(1, u64::from(nrese_exec::POLL_UNITS));
-            if !meter.units(run) {
-                return false;
-            }
-            self.0 = run;
-        }
-        self.0 -= 1;
-        true
-    }
-
     /// Takes `n` units at once (a chunk of units, or a step that can't be split), asking
     /// `meter` for a run when fewer are left: `POLL_UNITS`, or `n` where that is more (counted
     /// in runs of at most `POLL_UNITS`, the step done whole once counted); what was left of the
@@ -800,13 +774,41 @@ impl Credit {
     }
 }
 
+/// A [`Credit`] on its meter as an [`Account`]: the one account of an equality read for all
+/// its work, its scans' steps, its probes and its own (fix check r2 G1 and its siblings: a
+/// class build, an expanded count, an expansion; [`Read`]). Its portions may be up to
+/// `POLL_UNITS` (a union's chunk, a sort's run), each taken whole, after a yes at most
+/// `POLL_UNITS` of them ([`Credit::take_many`]). Nothing for an unmetered read.
+pub(crate) struct OnMeter<M: Metering> {
+    credit: Credit,
+    meter: M,
+}
+
+impl<M: Metering> OnMeter<M> {
+    /// An account on `meter` with nothing asked for yet.
+    pub(crate) fn new(meter: M) -> Self {
+        Self {
+            credit: Credit::default(),
+            meter,
+        }
+    }
+}
+
+impl<M: Metering> Account for OnMeter<M> {
+    const COUNTED: bool = M::COUNTED;
+
+    #[inline(always)]
+    fn take(&mut self, n: u64) -> bool {
+        self.credit.take_many(self.meter, n)
+    }
+}
+
 /// Counting nothing: the plain reads.
 #[derive(Clone, Copy)]
 pub(crate) struct Unmetered;
 
 impl Metering for Unmetered {
     const COUNTED: bool = false;
-    type Scan<'a> = crate::index::QuadScan<'a>;
 
     #[inline(always)]
     fn units(self, _: u64) -> bool {
@@ -819,23 +821,6 @@ impl Metering for Unmetered {
     }
 
     #[inline(always)]
-    fn scan<'a>(
-        self,
-        index: &'a crate::index::IndexVersion,
-        pattern: &QuadPattern,
-    ) -> Self::Scan<'a>
-    where
-        Self: 'a,
-    {
-        index.scan(pattern)
-    }
-
-    #[inline(always)]
-    fn contains(self, index: &crate::index::IndexVersion, quad: &EncodedQuad) -> bool {
-        index.contains(quad)
-    }
-
-    #[inline(always)]
     fn count_plan(
         self,
         index: &crate::index::IndexVersion,
@@ -845,12 +830,8 @@ impl Metering for Unmetered {
     }
 }
 
-impl<'v> Metering for crate::visit::Visitor<'v> {
+impl Metering for crate::visit::Visitor<'_> {
     const COUNTED: bool = true;
-    type Scan<'a>
-        = crate::index::CountedScan<'a, 'v>
-    where
-        Self: 'a;
 
     #[inline]
     fn units(self, n: u64) -> bool {
@@ -859,21 +840,6 @@ impl<'v> Metering for crate::visit::Visitor<'v> {
 
     fn stopped(self) -> bool {
         crate::visit::stopped(self)
-    }
-
-    fn scan<'a>(
-        self,
-        index: &'a crate::index::IndexVersion,
-        pattern: &QuadPattern,
-    ) -> Self::Scan<'a>
-    where
-        Self: 'a,
-    {
-        index.scan_counted(pattern, self)
-    }
-
-    fn contains(self, index: &crate::index::IndexVersion, quad: &EncodedQuad) -> bool {
-        index.contains_counted(quad, self).unwrap_or(false)
     }
 
     fn count_plan(
@@ -905,9 +871,25 @@ impl<'a> Visibility<'a> {
         }
     }
 
-    fn asserted_anywhere<M: Metering>(&self, copy: &EncodedQuad, meter: M) -> bool {
+    /// Whether the asserted stack holds `copy`, counted on `account` where it counts.
+    fn asserted_holds<A: Account>(
+        &self,
+        copy: &EncodedQuad,
+        account: &mut A,
+    ) -> Result<bool, Stopped> {
+        match A::COUNTED {
+            true => self.version.asserted.contains_with(copy, account),
+            false => Ok(self.version.asserted.contains(copy)),
+        }
+    }
+
+    fn asserted_anywhere<A: Account>(
+        &self,
+        copy: &EncodedQuad,
+        account: &mut A,
+    ) -> Result<bool, Stopped> {
         if !self.named_graphs {
-            return meter.contains(&self.version.asserted, copy);
+            return self.asserted_holds(copy, account);
         }
         let pattern = QuadPattern {
             subject: Some(copy.subject),
@@ -915,40 +897,156 @@ impl<'a> Visibility<'a> {
             object: Some(copy.object),
             graph: GraphSelector::Any,
         };
-        meter
-            .scan(&self.version.asserted, &pattern)
-            .next()
-            .is_some()
+        let plan = AccessPlan::for_pattern(&pattern);
+        let mut scan = self.version.asserted.scan_plan_with(&plan, account)?;
+        Ok(scan.step_with(account)?.is_some())
     }
 
     /// Whether `copy` (in the default graph), a copy of a stored quad that `touching`
     /// classes or not, is shown.
     pub(crate) fn shows(&self, copy: &EncodedQuad, touching: bool) -> bool {
-        self.shows_with(copy, touching, Unmetered)
+        self.shows_with(copy, touching, &mut Free) == Ok(true)
     }
 
-    /// [`Self::shows`], its probes counted on `meter` (REAS-3, sweep SW015): once stopped,
-    /// an answer the stopped read discards.
-    pub(crate) fn shows_with<M: Metering>(
+    /// [`Self::shows`], its probes counted on `account`, the read's one account (REAS-3,
+    /// sweep SW015; fix check r2 G1's siblings): `Err` once it has stopped.
+    pub(crate) fn shows_with<A: Account>(
         &self,
         copy: &EncodedQuad,
         touching: bool,
-        meter: M,
-    ) -> bool {
+        account: &mut A,
+    ) -> Result<bool, Stopped> {
         if self.inferred_only {
-            return !self.asserted_anywhere(copy, meter);
+            return Ok(!self.asserted_anywhere(copy, account)?);
         }
         // Without classes the stored quad is the only copy: asserted in the default graph,
         // or inferred (never asserted anywhere).
         if !touching || !self.named_graphs {
-            return true;
+            return Ok(true);
         }
-        meter.contains(&self.version.asserted, copy) || !self.asserted_anywhere(copy, meter)
+        Ok(self.asserted_holds(copy, account)? || !self.asserted_anywhere(copy, account)?)
     }
 
     /// Whether every copy of a stored quad is shown without asking each.
     pub(crate) fn shows_all(&self, touching: bool) -> bool {
         !self.inferred_only && (!touching || !self.named_graphs)
+    }
+}
+
+/// A read's quads one at a time, each step's work counted on the account it is given before it
+/// is done: `Err` once that account has stopped. The parts of a counted equality read (its
+/// stored scans, their merge, the expansion and its named scan) are steps, so the read's one
+/// account ([`Read`]) counts all of their work (fix check r2 G1's siblings: an account of each
+/// part's own let each allow a run after the same yes).
+pub(crate) trait Step {
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped>;
+}
+
+impl Step for crate::index::QuadScan<'_> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        self.step_with(account)
+    }
+}
+
+/// A part a read may not have (a stack the model leaves out).
+impl<S: Step> Step for Option<S> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        match self {
+            Some(part) => part.step(account),
+            None => Ok(None),
+        }
+    }
+}
+
+/// A plain read's input: its quads, counting nothing.
+pub(crate) struct Plain<I>(pub(crate) I);
+
+impl<I: Iterator<Item = EncodedQuad>> Step for Plain<I> {
+    #[inline]
+    fn step(&mut self, _: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        Ok(self.0.next())
+    }
+}
+
+/// A [`Step`] read one quad ahead.
+pub(crate) struct Ahead<S> {
+    step: S,
+    head: Option<Option<EncodedQuad>>,
+}
+
+impl<S: Step> Ahead<S> {
+    fn new(step: S) -> Self {
+        Self { step, head: None }
+    }
+
+    /// The next quad, not taken.
+    fn peek(&mut self, account: &mut impl Account) -> Result<Option<&EncodedQuad>, Stopped> {
+        if self.head.is_none() {
+            self.head = Some(self.step.step(account)?);
+        }
+        Ok(self.head.as_ref().and_then(Option::as_ref))
+    }
+
+    fn next(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        match self.head.take() {
+            Some(head) => Ok(head),
+            None => self.step.step(account),
+        }
+    }
+}
+
+/// Two steps, each sorted by `permutation`, merged in that order: the snapshot's `SortedMerge`
+/// for a read whose parts share its one account.
+pub(crate) struct Merged<L, R> {
+    left: Ahead<L>,
+    right: Ahead<R>,
+    permutation: Permutation,
+}
+
+impl<L: Step, R: Step> Merged<L, R> {
+    pub(crate) fn new(left: L, right: R, permutation: Permutation) -> Self {
+        Self {
+            left: Ahead::new(left),
+            right: Ahead::new(right),
+            permutation,
+        }
+    }
+}
+
+impl<L: Step, R: Step> Step for Merged<L, R> {
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        let permutation = self.permutation;
+        let left = self
+            .left
+            .peek(account)?
+            .map(|quad| permutation.to_key(quad));
+        let right = self
+            .right
+            .peek(account)?
+            .map(|quad| permutation.to_key(quad));
+        match (left, right) {
+            (Some(left), Some(right)) if right < left => self.right.next(account),
+            (Some(_), _) => self.left.next(account),
+            (None, _) => self.right.next(account),
+        }
+    }
+}
+
+/// A counted read's quads: its parts' ([`Step`]), all of their work on its one account,
+/// ending where they end or stop (the stop is the visitor's to tell).
+pub(crate) struct Read<S, A> {
+    pub(crate) step: S,
+    pub(crate) account: A,
+}
+
+impl<S: Step, A: Account> Iterator for Read<S, A> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step.step(&mut self.account).ok().flatten()
     }
 }
 
@@ -964,11 +1062,12 @@ impl<'a> Visibility<'a> {
 /// beside the new while the copies move, and released once freed ([`Reads`]); a growth
 /// the budget refuses ends the scan, the refusal kept for the reader.
 ///
-/// A counted read's expansion ([`Metering`]) counts each copy it makes before it makes it
-/// and each copy it hands on, and its visibility probes; its input is a counted scan. Once
-/// the meter has stopped it hands on nothing more (REAS-3, sweeps SW013, SW014).
-pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>, M: Metering = Unmetered> {
-    input: std::iter::Peekable<I>,
+/// A [`Step`]: a counted read's expansion counts each copy it makes before it makes it, each
+/// copy it hands on, its input's steps and its visibility probes on the read's one account
+/// (REAS-3, sweeps SW013, SW014; fix check r2 G1's siblings). The plain reads' is an iterator
+/// over a plain input, counting nothing.
+pub(crate) struct Expand<'a, S: Step> {
+    input: Ahead<S>,
     classes: Arc<Classes>,
     pattern: QuadPattern,
     permutation: Permutation,
@@ -979,12 +1078,9 @@ pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>, M: Metering = Unme
     reads: Option<super::snapshot::ReadBudget>,
     held: usize,
     refused: bool,
-    meter: M,
-    /// The units the meter has counted ahead and not yet used ([`Credit`]).
-    credit: Credit,
 }
 
-impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
+impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, Plain<I>> {
     pub(crate) fn new(
         input: I,
         classes: Arc<Classes>,
@@ -994,36 +1090,31 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
         model: ReadModel,
         version: &'a Version,
     ) -> Self {
-        Expand::metered(
-            input,
+        Expand::of(
+            Plain(input),
             classes,
             pattern,
             permutation,
             named,
             model,
             version,
-            Unmetered,
         )
     }
 }
 
-impl<'a, I: Iterator<Item = EncodedQuad>, M: Metering> Expand<'a, I, M> {
-    /// [`Expand::new`], its work counted on `meter`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn metered(
-        input: I,
+impl<'a, S: Step> Expand<'a, S> {
+    /// [`Expand::new`] over any input: a counted read's, stepped with its account.
+    pub(crate) fn of(
+        input: S,
         classes: Arc<Classes>,
         pattern: QuadPattern,
         permutation: Permutation,
         named: bool,
         model: ReadModel,
         version: &'a Version,
-        meter: M,
     ) -> Self {
         Self {
-            meter,
-            credit: Credit::default(),
-            input: input.peekable(),
+            input: Ahead::new(input),
             classes,
             pattern,
             permutation,
@@ -1085,51 +1176,59 @@ impl<'a, I: Iterator<Item = EncodedQuad>, M: Metering> Expand<'a, I, M> {
     }
 
     /// Moves the next input quad's copies into the heap; `false` at the end of the input.
-    fn pull(&mut self) -> bool {
-        let Some(raw) = self.input.next() else {
-            return false;
+    fn pull(&mut self, account: &mut impl Account) -> Result<bool, Stopped> {
+        let Some(raw) = self.input.next(account)? else {
+            return Ok(false);
         };
         if !raw.graph.is_default_graph() {
             if self.named {
                 if !self.room(1) {
-                    return self.refuse();
+                    return Ok(self.refuse());
                 }
                 self.pending.push(Reverse(self.permutation.to_key(&raw)));
             }
-            return true;
+            return Ok(true);
         }
         if !self.classes.is_canonical(&raw) {
-            return true;
+            return Ok(true);
         }
         let copies = self.classes.copies(&raw, &self.pattern);
         if !self.room(copies) {
-            return self.refuse();
+            return Ok(self.refuse());
         }
-        let (permutation, visibility, meter) = (self.permutation, self.visibility, self.meter);
+        let (permutation, visibility) = (self.permutation, self.visibility);
         let touching = self.classes.touches(&raw);
         let all = visibility.shows_all(touching);
-        let (pending, credit) = (&mut self.pending, &mut self.credit);
+        let pending = &mut self.pending;
         let mut stopped = false;
-        let mut left = copies as u64;
         self.classes.expand(&raw, &self.pattern, &mut |quad| {
-            // Each copy a unit, counted a run at a time before it is made (SW013).
-            if !credit.take(meter, left) {
+            // Each copy a unit, counted before it is made (SW013), its probe after it.
+            if !account.take(1) {
                 stopped = true;
                 return std::ops::ControlFlow::Break(());
             }
-            left = left.saturating_sub(1);
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::ExpandCopies, 1);
-            if all || visibility.shows_with(&quad, touching, meter) {
-                pending.push(Reverse(permutation.to_key(&quad)));
+            let shown = match all {
+                true => Ok(true),
+                false => visibility.shows_with(&quad, touching, account),
+            };
+            match shown {
+                Ok(true) => pending.push(Reverse(permutation.to_key(&quad))),
+                Ok(false) => {}
+                Err(Stopped) => {
+                    stopped = true;
+                    return std::ops::ControlFlow::Break(());
+                }
             }
             std::ops::ControlFlow::Continue(())
         });
-        !(M::COUNTED && stopped)
+        match stopped {
+            true => Err(Stopped),
+            false => Ok(true),
+        }
     }
-}
 
-impl<I: Iterator<Item = EncodedQuad>, M: Metering> Expand<'_, I, M> {
     /// Ends the scan after a refused growth: nothing more is given (the refusal is the
     /// reader's to see), the heap freed before its charge is released.
     fn refuse(&mut self) -> bool {
@@ -1142,7 +1241,7 @@ impl<I: Iterator<Item = EncodedQuad>, M: Metering> Expand<'_, I, M> {
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>, M: Metering> Drop for Expand<'_, I, M> {
+impl<S: Step> Drop for Expand<'_, S> {
     /// The heap freed, then its charge released.
     fn drop(&mut self) {
         self.pending = BinaryHeap::new();
@@ -1152,36 +1251,41 @@ impl<I: Iterator<Item = EncodedQuad>, M: Metering> Drop for Expand<'_, I, M> {
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>, M: Metering> Iterator for Expand<'_, I, M> {
-    type Item = EncodedQuad;
-
-    fn next(&mut self) -> Option<EncodedQuad> {
+impl<S: Step> Step for Expand<'_, S> {
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         if self.refused {
-            return None;
+            return Ok(None);
         }
         loop {
-            // A counted read's step, a copy handed on or an input quad pulled: a unit, and
-            // the end once its meter has stopped (the heap's rest is never walked).
-            let left = self.pending.len() as u64 + 1;
-            if !self.credit.take(self.meter, left) {
-                return None;
+            // A step, a copy handed on or an input quad pulled: a unit.
+            if !account.take(1) {
+                return Err(Stopped);
             }
             // What the heap holds may go out once no later input can sort before it.
             if let Some(Reverse(first)) = self.pending.peek() {
                 let (pattern, permutation) = (&self.pattern, self.permutation);
-                let safe = match self.input.peek() {
+                let safe = match self.input.peek(account)? {
                     None => true,
                     Some(next) => *first <= Self::least_key(pattern, permutation, next),
                 };
                 if safe {
                     let Reverse(key) = self.pending.pop().expect("peeked");
-                    return Some(self.permutation.key_to_quad(&key));
+                    return Ok(Some(self.permutation.key_to_quad(&key)));
                 }
             }
-            if !self.pull() && (self.refused || self.pending.is_empty()) {
-                return None;
+            if !self.pull(account)? && (self.refused || self.pending.is_empty()) {
+                return Ok(None);
             }
         }
+    }
+}
+
+impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, Plain<I>> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step(&mut Free).unwrap_or(None)
     }
 }
 

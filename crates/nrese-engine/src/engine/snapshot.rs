@@ -5,13 +5,14 @@ use std::sync::Arc;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
 use super::equality::{
-    Classes as EqualityClasses, Credit, Expand, Metering, Unmetered, Visibility as CopyVisibility,
+    Classes as EqualityClasses, Expand, Metering, OnMeter, Unmetered, Visibility as CopyVisibility,
 };
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::resolve::Vocabulary;
 use crate::term::{Dictionary, TermId};
+use crate::visit::Account;
 
 /// A pattern's heavy groups as the engine keeps them ([`Snapshot::heavy_groups_in`]): values
 /// with their match counts, in id order, charged for as long as any holder keeps them.
@@ -1035,15 +1036,20 @@ impl Snapshot {
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
         let mut count: u64 = 0;
-        let mut credit = Credit::default();
+        // One account for the count's scans, copies and visibility probes, so at most
+        // `POLL_UNITS` units of them follow any yes (fix check r2 G1's sibling: a scan's
+        // ledger, the copies' credit and each probe's own allowed one each).
+        let mut account = OnMeter::new(meter);
         for stack in Stack::ALL {
-            let mut scan = meter.scan(data.stack(stack), &normalised);
+            let mut scan = data
+                .stack(stack)
+                .scan_plan_with(&AccessPlan::for_pattern(&normalised), &mut account)
+                .ok()?;
             loop {
                 if count >= limit {
                     return Some(Count::AtLeast(count));
                 }
-                // A scan its meter stopped ends: told below.
-                let Some(quad) = scan.next() else {
+                let Some(quad) = scan.step_with(&mut account).ok()? else {
                     break;
                 };
                 if !quad.graph.is_default_graph() {
@@ -1061,27 +1067,24 @@ impl Snapshot {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
                         let (mut copies, wanted) = (0, limit - count);
-                        // The copies to come, a counted count's hint for its runs.
-                        let all = match M::COUNTED {
-                            true => classes.copies(&quad, pattern) as u64,
-                            false => 0,
-                        };
-                        let mut made = 0;
                         let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
-                            if !credit.take(meter, all.saturating_sub(made)) {
+                            // Each copy a unit, counted before it is made, its probe after it.
+                            let shown = match account.take(1) {
+                                true => visibility.shows_with(&copy, touching, &mut account),
+                                false => Err(crate::visit::Stopped),
+                            };
+                            let Ok(shown) = shown else {
                                 stopped = true;
                                 return std::ops::ControlFlow::Break(());
-                            }
-                            made += 1;
-                            copies += u64::from(visibility.shows_with(&copy, touching, meter));
+                            };
+                            copies += u64::from(shown);
                             match copies >= wanted {
                                 true => std::ops::ControlFlow::Break(()),
                                 false => std::ops::ControlFlow::Continue(()),
                             }
                         });
-                        // A visibility probe that saw the stop answered for nothing.
-                        if stopped || meter.stopped() {
+                        if stopped {
                             return None;
                         }
                         Some(copies)
@@ -1093,24 +1096,21 @@ impl Snapshot {
                 }
             }
         }
-        if meter.stopped() {
-            return None;
-        }
         if count < limit
             && model == ReadModel::Materialised
             && pattern.graph == GraphSelector::Any
             && normalised != *pattern
             && !self.canonical
         {
-            let mut scan = meter.scan(&self.data(model).asserted, pattern);
+            let mut scan = data
+                .asserted
+                .scan_plan_with(&AccessPlan::for_pattern(pattern), &mut account)
+                .ok()?;
             while count < limit {
-                let Some(quad) = scan.next() else {
+                let Some(quad) = scan.step_with(&mut account).ok()? else {
                     break;
                 };
                 count += u64::from(!quad.graph.is_default_graph());
-            }
-            if meter.stopped() {
-                return None;
             }
         }
         Some(match count >= limit {
