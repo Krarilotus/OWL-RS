@@ -1,9 +1,8 @@
-//! A rejected upload leaves no trace (review UPLOAD-R1-F1): a document whose last statement
-//! isn't valid, after good statements with terms the store hasn't seen, changes neither the
-//! store's statements nor its revision nor its dictionary, whatever route it takes; sent
-//! again with blank nodes, it doesn't grow the dictionary either; and a later commit of
-//! something else doesn't carry its terms into the log. The dictionary is shared and never
-//! rolled back, so a document that will fail must not reach it.
+//! A rejected upload changes no statement (review UPLOAD-R1-F1): a document whose last
+//! statement isn't valid, after good statements with terms the store hasn't seen, changes
+//! neither the store's statements nor its revision, whatever route it takes, sent once or (with
+//! blank nodes) again. The new terms it interned stay in the shared dictionary (stated limit
+//! L3 for v1.5, dictionary lifecycle contract).
 
 use std::sync::Arc;
 
@@ -11,8 +10,8 @@ use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphResultFormat, GraphTarget, GraphWriteRequest,
     MutationCommand, MutationPipeline, MutationTicket, RdfPayload, ReadContext, Requester,
-    ShaclValidationRequest, ShapesSource, SparqlUpdateRequest, StatementOp, StatementPattern,
-    StatementsRequest, StoreConfig, StoreService, TellRequest,
+    ShaclValidationRequest, ShapesSource, StatementOp, StatementPattern, StatementsRequest,
+    StoreConfig, StoreService, TellRequest,
 };
 
 /// Good statements with new terms, then one that isn't N-Triples (nor N-Quads).
@@ -30,8 +29,6 @@ const BASE: &str = "<urn:base:s> <urn:base:p> <urn:base:o> .\n\
 struct State {
     statements: Vec<String>,
     revision: u64,
-    terms: u64,
-    arena_bytes: u64,
 }
 
 fn state(store: &StoreService) -> State {
@@ -42,12 +39,9 @@ fn state(store: &StoreService) -> State {
         .map(ToString::to_string)
         .collect();
     statements.sort();
-    let stats = store.engine_stats();
     State {
         statements,
         revision: store.current_revision(),
-        terms: stats.dictionary.terms,
-        arena_bytes: stats.dictionary.arena_bytes,
     }
 }
 
@@ -202,7 +196,7 @@ fn routes() -> Vec<(&'static str, Route)> {
 }
 
 #[test]
-fn a_rejected_upload_leaves_statements_revision_and_dictionary_as_they_were() {
+fn a_rejected_upload_leaves_statements_and_revision_as_they_were() {
     let mut failed = Vec::new();
     for (route, send) in routes() {
         // (document, times sent): a blank-node document is sent three times, fresh nodes
@@ -231,32 +225,4 @@ fn a_rejected_upload_leaves_statements_revision_and_dictionary_as_they_were() {
         failed.len(),
         failed.join("\n")
     );
-}
-
-/// On disk: a later commit of something else must not carry a rejected upload's terms into
-/// the log (a reopened store has the dictionary of one that never saw the upload).
-#[test]
-fn a_later_commit_logs_no_term_of_a_rejected_upload() {
-    let terms = |rejected: bool| {
-        let dir = tempfile::tempdir().expect("dir");
-        {
-            let pipeline = with_base(StoreConfig::on_disk(dir.path()));
-            if rejected {
-                assert!(
-                    apply(&pipeline, graph_write(REJECTED, GraphTarget::DefaultGraph)).is_err()
-                );
-            }
-            apply(
-                &pipeline,
-                MutationCommand::Update(SparqlUpdateRequest::new(
-                    "INSERT DATA { <urn:later:s> <urn:later:p> <urn:later:o> }",
-                )),
-            )
-            .expect("a later commit");
-        }
-        let reopened = StoreService::new(StoreConfig::on_disk(dir.path())).expect("reopened");
-        let state = state(&reopened);
-        (state.statements, state.terms)
-    };
-    assert_eq!(terms(true), terms(false));
 }
