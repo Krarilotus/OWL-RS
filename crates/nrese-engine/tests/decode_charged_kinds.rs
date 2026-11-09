@@ -77,7 +77,8 @@ fn committed(engine: &Engine, objects: &[Term]) -> Vec<TermId> {
 }
 
 /// The charged decode of `id` in `snapshot` gives the plain decode, `expected`, after one or more
-/// charges that together cover what the term holds, and holds no byte beyond what it charged.
+/// charges that together cover what the decoded term holds (its own strings' capacities, not
+/// those of `expected`, which `format!` may leave larger), and holds no byte beyond its charge.
 fn decodes_charged(snapshot: &Snapshot, id: TermId, expected: &Term) {
     assert_eq!(snapshot.decode(id).as_ref(), Some(expected), "plain decode");
     let budget = Budget::unlimited();
@@ -95,11 +96,13 @@ fn decodes_charged(snapshot: &Snapshot, id: TermId, expected: &Term) {
         "charged decode of {expected}"
     );
     assert!(charges.get() >= 1, "{expected}: no charge");
+    let holds = decoded
+        .as_ref()
+        .map_or(0, |term| term.as_ref().map_or(0, Term::heap_bytes));
     assert!(
-        charged.get() >= expected.heap_bytes(),
-        "{expected}: {} bytes charged, the term holds {}",
+        charged.get() >= holds,
+        "{expected}: {} bytes charged, the decoded term holds {holds}",
         charged.get(),
-        expected.heap_bytes()
     );
     assert_eq!(
         excess, 0,

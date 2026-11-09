@@ -268,7 +268,9 @@ fn bounded_reads_answer_at_the_own_edge() {
     );
     assert_eq!(view.decode_bound(last, 0), Some(literal_key_len("last")));
     assert_eq!(view.decode_bound(past, 0), None);
-    assert!(view.decode_bound(triple, 0) >= Some(triple_term.heap_bytes()));
+    // What the decoded term holds: `triple_term`'s strings, from `format!`, may hold more.
+    let holds = view.decode(triple).map(|term| term.heap_bytes());
+    assert!(holds.is_some() && view.decode_bound(triple, 0) >= holds);
     assert!(view.decode_bound(below, 0).is_some());
     let text = |v: crate::TermView<'_>| v.str().map(str::to_owned);
     assert_eq!(view.with_view(last, 0, text), Some(Some("last".into())));

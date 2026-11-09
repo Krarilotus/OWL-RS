@@ -64,17 +64,15 @@ pub(crate) fn try_inline_literal(literal: LiteralRef<'_>, derived: bool) -> Opti
 
 /// Materialises an inline id back into its literal; `None` for non-inline kinds.
 pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
+    let datatype = inline_datatype(id)?;
     let payload = id.payload();
-    let (lexical, datatype) = match id.kind() {
-        TermKind::Integer => (decode_integer(payload).to_string(), xsd::INTEGER),
-        TermKind::Boolean => ((payload != 0).to_string(), xsd::BOOLEAN),
-        TermKind::Decimal => (decode_decimal(payload), xsd::DECIMAL),
-        TermKind::Date => (decode_date(payload), xsd::DATE),
-        TermKind::DateTime => (decode_date_time(payload), xsd::DATE_TIME),
-        TermKind::DerivedInteger => {
-            let (value, code) = decode_derived(payload);
-            (value.to_string(), DERIVED.get(code)?.0)
-        }
+    let lexical = match id.kind() {
+        TermKind::Integer => decode_integer(payload).to_string(),
+        TermKind::Boolean => (payload != 0).to_string(),
+        TermKind::Decimal => decode_decimal(payload),
+        TermKind::Date => decode_date(payload),
+        TermKind::DateTime => decode_date_time(payload),
+        TermKind::DerivedInteger => decode_derived(payload).0.to_string(),
         TermKind::DefaultGraph
         | TermKind::Iri
         | TermKind::BlankNode
@@ -86,6 +84,38 @@ pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
         }
     };
     Some(Literal::new_typed_literal(lexical, datatype))
+}
+
+/// The most bytes [`inline_to_literal`] holds at once for `id`, `None` where it gives no
+/// literal: its datatype's IRI and [`INLINE_TEXT_BOUND`].
+pub(crate) fn inline_bound(id: TermId) -> Option<usize> {
+    inline_datatype(id).map(|datatype| datatype.as_str().len() + INLINE_TEXT_BOUND)
+}
+
+/// What an inline literal's text holds while it is made, at most: the text (29 bytes at most,
+/// a dateTime with milliseconds and an offset) and the strings it is formatted through, each a
+/// `String` grown to at most twice its text (8 bytes at least), with a growth's old buffer.
+/// A dateTime's, the largest, holds about 100 bytes.
+const INLINE_TEXT_BOUND: usize = 256;
+
+/// The datatype of the inline literal `id`; `None` for non-inline kinds and an unknown
+/// derived datatype's code.
+fn inline_datatype(id: TermId) -> Option<nrese_rdf::NamedNodeRef<'static>> {
+    Some(match id.kind() {
+        TermKind::Integer => xsd::INTEGER,
+        TermKind::Boolean => xsd::BOOLEAN,
+        TermKind::Decimal => xsd::DECIMAL,
+        TermKind::Date => xsd::DATE,
+        TermKind::DateTime => xsd::DATE_TIME,
+        TermKind::DerivedInteger => DERIVED.get(decode_derived(id.payload()).1)?.0,
+        TermKind::DefaultGraph
+        | TermKind::Iri
+        | TermKind::BlankNode
+        | TermKind::String
+        | TermKind::LangString
+        | TermKind::TypedLiteral
+        | TermKind::Triple => return None,
+    })
 }
 
 // --- xsd:integer ------------------------------------------------------------------------
