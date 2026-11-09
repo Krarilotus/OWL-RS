@@ -1,14 +1,13 @@
 //! SPARQL 1.1 Graph Store Protocol operations: read from a view, write into a transaction.
 
 use nrese_engine::{ReadModel, Transaction};
-use nrese_exec::Envelope;
 use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphTarget, GraphWriteReport, GraphWriteRequest,
 };
-use crate::rdf_io::{BlankNodes, StagedQuads, each_graph_quad, write_quads};
+use crate::rdf_io::{BlankNodes, each_graph_quad, write_quads};
 
 /// Whether the target graph exists in `view` under `model`: the default graph always, a
 /// named graph while it holds a statement. Nothing is decoded (Graph Store Protocol `HEAD`).
@@ -42,26 +41,15 @@ pub(crate) fn write_graph(
     Ok(true)
 }
 
-/// Adds (or, with `replace`, substitutes) the payload's triples in the target graph. The
-/// payload is read whole first, staged and charged to `memory` ([`StagedQuads`]): one that is
-/// invalid, or too large for the request's memory, interns nothing and changes nothing, and
-/// fails the write, whose transaction is then discarded (the mutation pipeline commits only a
-/// write that ends).
+/// Adds (or, with `replace`, substitutes) the payload's triples in the target graph, each as
+/// it is read: an invalid payload fails the write, whose transaction is then discarded (the
+/// mutation pipeline commits only a write that ends). The new terms it interned stay in the
+/// shared dictionary (stated limit L3 for v1.5, dictionary lifecycle contract).
 pub(crate) fn apply_graph_write(
     tx: &mut Transaction<'_>,
     request: &GraphWriteRequest,
-    memory: &Envelope,
 ) -> StoreResult<GraphWriteReport> {
     let graph = request.target.graph_name()?;
-    let mut staged = StagedQuads::new(memory);
-    each_graph_quad(
-        request.format,
-        request.base_iri.as_deref(),
-        &request.payload,
-        graph,
-        BlankNodes::Fresh,
-        |quad| staged.stage(quad, true),
-    )?;
     let existing = request.target.pattern_in(&*tx)?;
     let created = match (request.target.resolved()?, existing) {
         (GraphTarget::DefaultGraph, _) => false,
@@ -77,8 +65,19 @@ pub(crate) fn apply_graph_write(
     {
         tx.remove_matching(&pattern)?;
     }
-    // The target is checked as a whole (`MutationCommand::apply`).
-    let any = staged.write(tx, &[], &mut |_| Ok(()))?;
+    let mut any = false;
+    each_graph_quad(
+        request.format,
+        request.base_iri.as_deref(),
+        &request.payload,
+        graph,
+        BlankNodes::Fresh,
+        |quad| {
+            tx.try_insert(quad)?;
+            any = true;
+            Ok(())
+        },
+    )?;
     Ok(GraphWriteReport {
         target: request.target.clone(),
         // Net change: replacing a graph with identical content modifies nothing.

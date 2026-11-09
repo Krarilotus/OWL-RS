@@ -20,9 +20,6 @@ use url::Url;
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
 
-mod staged;
-pub(crate) use staged::StagedQuads;
-
 impl GraphResultFormat {
     pub(crate) fn rdf_format(self) -> RdfFormat {
         match self {
@@ -62,13 +59,12 @@ fn parser(
 }
 
 // Uploads are read once, as they go: each statement goes to its consumer borrowed from the
-// parser's buffers and is gone before the next. A consumer that only looks terms up (a
-// removal, a check) uses it there. A write stages it ([`StagedQuads`]): the dictionary is
-// shared and never rolls back, so nothing is interned before the whole document has been read
-// without an error, and what is kept until then is charged to the request first. A
-// document's statements are never kept as owned copies uncharged: with one long namespace and
-// many short statements, those copies cost thousands of times the document (the upload
-// sizing). A caller that must keep them as quads gets [`ChargedQuads`].
+// parser's buffers (a write's transaction, a validation's speculative one, a check) and is
+// gone before the next. A write that fails part-way is discarded with its transaction; the
+// new terms it interned stay in the shared dictionary (stated limit L3 for v1.5, dictionary
+// lifecycle contract). A document's statements are never kept as owned copies uncharged:
+// with one long namespace and many short statements, those copies cost thousands of times
+// the document (the upload sizing). A caller that must keep them gets [`ChargedQuads`].
 
 /// Gives `each` every quad of `quads` in order, borrowed until the next; the first error,
 /// the parser's or `each`'s, ends it.

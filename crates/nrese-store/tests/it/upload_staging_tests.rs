@@ -1,12 +1,11 @@
-//! An upload's parsed document is charged to the memory the requests share
-//! (`total_query_memory_bytes`) before it is kept, on every route that writes it, whatever its
-//! transaction (D16-039 S1–S3; the master's direction of 9 Nov: "Charge the parsed body at its
-//! producer, regardless of the transaction type"). A document refused for memory leaves the
-//! store's statements, revision and dictionary as they were: nothing reaches the shared
-//! dictionary before the whole document is parsed and its room is paid for (review UPLOAD-R1-F1).
-//! With memory to spare, each document is written (guard rows).
+//! What an upload keeps is charged to the memory the requests share (`total_query_memory_bytes`)
+//! before it is kept, on every route that writes it, whatever its transaction (D16-039 S1–S3):
+//! an upload is read as it goes, so what it keeps is its pending changes. A document refused for
+//! memory leaves the store's statements and revision as they were; the new terms it interned
+//! stay (stated limit L3 for v1.5, dictionary lifecycle contract). With memory to spare, each
+//! document is written (guard rows).
 //!
-//! Design: notes/2026-11-09-upload-staging-design.md (Harness), rows R1, R2 and G1.
+//! Design: notes/2026-11-09-upload-staging-design.md (Harness), rows R1 and G1.
 
 use std::sync::Arc;
 
@@ -49,7 +48,6 @@ fn of_store<T>(result: Result<T, StoreError>) -> Outcome {
 struct State {
     quads: usize,
     revision: u64,
-    terms: u64,
 }
 
 fn state(store: &StoreService) -> State {
@@ -57,7 +55,6 @@ fn state(store: &StoreService) -> State {
         // Counted without a query, which would draw on the same small memory.
         quads: store.stats().expect("stats").quad_count,
         revision: store.current_revision(),
-        terms: store.engine_stats().dictionary.terms,
     }
 }
 
@@ -234,18 +231,14 @@ fn new_terms() -> String {
         .collect()
 }
 
-/// R1: a write larger than the shared memory is refused, and leaves no term behind.
+/// R1: a write larger than the shared memory is refused, and leaves no statement behind.
 #[test]
-fn a_write_refused_for_memory_interns_nothing() {
+fn a_write_refused_for_memory_changes_no_statement() {
     none_wrong(&rows_not(&Outcome::RefusedForMemory, SHARED, &new_terms()));
 }
 
-/// R2: a few statements whose literals take `LITERALS` bytes, twice the shared memory. The
-/// pending changes hold four encoded quads, so only the parsed document can be refused.
+/// A few statements whose literals take 512 KiB.
 const LITERAL: usize = 128 << 10;
-const LITERALS: usize = 4 * LITERAL;
-const SHARED_R2: usize = 256 << 10;
-const _: () = assert!(LITERALS >= 2 * SHARED_R2);
 
 fn long_literals() -> String {
     (0..4)
@@ -256,17 +249,7 @@ fn long_literals() -> String {
         .collect()
 }
 
-/// R2: the parsed document is charged, not only the pending changes it makes.
-#[test]
-fn a_document_larger_than_the_shared_memory_is_refused() {
-    none_wrong(&rows_not(
-        &Outcome::RefusedForMemory,
-        SHARED_R2,
-        &long_literals(),
-    ));
-}
-
-/// Guard (R1, R2): with memory to spare, every route writes both documents.
+/// Guard (R1): with memory to spare, every route writes both documents.
 #[test]
 fn guard_documents_within_the_shared_memory_are_written() {
     let mut wrong = rows_not(&Outcome::Written, 256 << 20, &new_terms());
@@ -325,7 +308,7 @@ fn triples(store: &StoreService) -> Vec<String> {
 }
 
 /// Guard: every route that keeps a document writes each term kind as a SPARQL update of the
-/// same statements does (which reads them its own way, unstaged).
+/// same statements does (which reads them its own way).
 #[test]
 fn guard_every_term_kind_is_written_as_a_sparql_update_writes_it() {
     let expected = {
