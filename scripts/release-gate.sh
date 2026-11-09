@@ -745,8 +745,10 @@ report)
 
 w3c)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks} NRESE_W3C_REQUIRED=1
-  # An earlier run's result goes first: this run's stands, or none (review r1 R2).
-  rm -f "$OUT/w3c.json"
+  # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
+  # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
+  { rm -f "$OUT/w3c.json" && [ ! -e "$OUT/w3c.json" ]; } \
+    || { log "w3c: the earlier result $OUT/w3c.json can't be removed: no run"; exit 1; }
   mkdir -p "$OUT/w3c"
   bash scripts/fetch-w3c-tests.sh > "$OUT/w3c/fetch.log" 2>&1 || { tail -20 "$OUT/w3c/fetch.log"; exit 1; }
   # The OWL 2 test cases (the DL suites' data), pinned.
@@ -772,8 +774,10 @@ w3c)
 
 guards)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks}
-  # An earlier run's result goes first: this run's stands, or none (review r1 R2).
-  rm -f "$OUT/guards.json"
+  # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
+  # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
+  { rm -f "$OUT/guards.json" && [ ! -e "$OUT/guards.json" ]; } \
+    || { log "guards: the earlier result $OUT/guards.json can't be removed: no run"; exit 1; }
   mkdir -p "$OUT/guards"
   # The guards' test run by the checker (release_gate.py guards --run), its exit code and receipt kept.
   # A guard failing is the verdict's (guards.json: the checker exits 0 or 1 with it); this step fails
