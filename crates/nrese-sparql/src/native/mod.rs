@@ -3782,8 +3782,9 @@ impl<'a> Context<'a> {
         let mut described = ChargedMap::new(&*self.budget);
         let mut todo = ChargedVec::new(&*self.budget);
         // The decoded payloads stay charged with the output, just as CONSTRUCT's do.
+        // One thread, with no sibling payload grant: the whole spare.
         // Declared before `out` so the triples are freed before their payload charge.
-        let mut kept = Grant::new(&*self.budget);
+        let mut kept = Grant::with_workers(&*self.budget, 1);
         let mut out = ChargedVec::new(&*self.budget);
         for row in 0..table.len() {
             self.check()?;
