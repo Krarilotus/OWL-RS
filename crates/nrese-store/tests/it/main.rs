@@ -36,5 +36,6 @@ mod store_service_tests;
 mod support_cap_tests;
 mod support_round_tests;
 mod transfer_memory_tests;
+mod update_memory_tests;
 mod user_rules_tests;
 mod write_path_tests;
