@@ -201,13 +201,15 @@ static STARTING: AtomicBool = AtomicBool::new(false);
 /// Panics unless [`Measured`] is the process's global allocator: without it a measurement
 /// counts nothing, and passes whatever the work holds. Asked anew each time: one byte from
 /// the global allocator, uncounted, which only a [`Measured`] that is the global allocator
-/// sees (a `Measured` of the test's own, called directly, never does).
+/// sees (a `Measured` of the test's own, called directly, never does). The block passes through
+/// `black_box`: the compiler may remove an allocation nothing uses, and in release builds it did,
+/// so the probe saw no byte and refused every measured binary.
 fn require_measured() {
     let before = UNCOUNTED.replace(Some(0));
     let layout = Layout::new::<u8>();
     // SAFETY: a layout of non-zero size; the block, if one was made, is freed with it.
     unsafe {
-        let block = std::alloc::alloc(layout);
+        let block = std::hint::black_box(std::alloc::alloc(layout));
         if !block.is_null() {
             std::alloc::dealloc(block, layout);
         }

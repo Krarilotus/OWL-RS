@@ -386,22 +386,42 @@ impl IndexVersion {
     /// − 2 × tombstones in range): O(r log n) for tombstone-free runs, plus a popcount over
     /// the range otherwise. Plans with a default-graph post-filter count by scanning.
     pub(crate) fn count_plan(&self, plan: &AccessPlan) -> u64 {
+        self.count_plan_visiting(plan, &mut |_| true)
+            .expect("never stopped")
+    }
+
+    /// [`Self::count_plan`], calling `visit(n)` (`n` at most `POLL_UNITS`) before the work it
+    /// counts: each run's range search (one), its tombstone words as they are read
+    /// (`PermutationRun::tombstones_in_visiting`), each merge step a default-graph
+    /// post-filter scan takes ([`QuadScan::next_visiting`]). `None` as soon as `visit` returns
+    /// false, nothing more read (REAS-2 fix check r1, R2-F1: the count lives in the reader).
+    pub(crate) fn count_plan_visiting(
+        &self,
+        plan: &AccessPlan,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return 0;
+            return Some(0);
         };
         if adapted.exclude_default_graph {
-            return self.scan_plan(plan).count() as u64;
+            let mut count = 0u64;
+            let mut scan = self.scan_plan(plan);
+            while scan.next_visiting(visit).ok()?.is_some() {
+                count += 1;
+            }
+            return Some(count);
         }
-        let signed: i64 = self
-            .runs
-            .iter()
-            .map(|run| {
-                let perm = run.permutation(adapted.permutation);
-                let (start, end) = perm.range(&adapted.low, &adapted.high);
-                (end - start) as i64 - 2 * perm.tombstones_in(start, end) as i64
-            })
-            .sum();
-        u64::try_from(signed).expect("exact deltas never make a range count negative")
+        let mut signed: i64 = 0;
+        for run in self.runs.iter() {
+            if !visit(1) {
+                return None;
+            }
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let tombstones = perm.tombstones_in_visiting(start, end, visit)?;
+            signed += (end - start) as i64 - 2 * tombstones as i64;
+        }
+        Some(u64::try_from(signed).expect("exact deltas never make a range count negative"))
     }
 
     /// True if some visible quad matches `plan`: one bound search per run, where no run has
@@ -758,6 +778,8 @@ impl Iterator for QuadScan<'_> {
     fn next(&mut self) -> Option<EncodedQuad> {
         loop {
             let (key, sign) = self.merge.next()?;
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
             }
@@ -774,5 +796,43 @@ impl Iterator for QuadScan<'_> {
     }
 }
 
+/// A read its visitor stopped ([`QuadScan::next_visiting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stopped;
+
+impl QuadScan<'_> {
+    /// [`Iterator::next`], calling `visit(1)` before each merge step, a key passed over
+    /// (deleted, or in the default graph where it is left out) as much as one handed on
+    /// (REAS-2 fix check r1, R2-F1: a count's work is every position its scan passes, so
+    /// a long deleted run can't be drained unseen). `Err` once `visit` returns false,
+    /// nothing more read. Readers that count nothing use `next`, which this leaves as it was.
+    #[inline]
+    pub(crate) fn next_visiting(
+        &mut self,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<Option<EncodedQuad>, Stopped> {
+        loop {
+            if !visit(1) {
+                return Err(Stopped);
+            }
+            let Some((key, sign)) = self.merge.next() else {
+                return Ok(None);
+            };
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
+            if sign <= 0 {
+                continue;
+            }
+            let quad = self.permutation.key_to_quad(&key);
+            if self.exclude_default_graph && quad.graph.is_default_graph() {
+                continue;
+            }
+            return Ok(Some(quad));
+        }
+    }
+}
+
+#[cfg(test)]
+mod count_tests;
 #[cfg(test)]
 mod model_tests;
