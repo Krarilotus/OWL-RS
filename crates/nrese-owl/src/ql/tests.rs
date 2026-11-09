@@ -981,3 +981,49 @@ fn what_binds_an_atom_on_every_individual_is_read_once_and_paid() {
         "{short} steps for 10 atoms, {long} for 40"
     );
 }
+
+/// Outside the profile, under owl2-ql (I24c-1 rework, found by I24c-2's green2): an
+/// equality of individuals, which the QL closure has no rule for, reaches every term. Its
+/// hazard is global, named by an individual (no property or class names it). Under
+/// owl2-rl the closure's equality rules apply it, so it is no hazard.
+#[test]
+fn outside_ql_an_equality_of_individuals_is_global() {
+    let (same, _) = tbox("SameIndividual(:c :e)", false);
+    assert!(
+        matches!(same.global_hazard(), Some(Hazard::OutsideProfile(_))),
+        "{:?}",
+        same.global_hazard()
+    );
+    let (same, _) = tbox("SameIndividual(:c :e)", true);
+    assert_eq!(same.global_hazard(), None);
+}
+
+/// Outside the profile, under owl2-ql (I24c-1 rework, found by I24c-2's green2): an
+/// irreflexive and asymmetric property only rules pairs out, so it concludes nothing.
+/// Irreflexivity is outside the QL grammar (`w3c2012owl2profiles.txt:599`), though the QL
+/// feature list of the same document includes it (`:457`).
+#[test]
+fn outside_ql_irreflexivity_and_asymmetry_conclude_nothing() {
+    let (irreflexive, table) = tbox(
+        "IrreflexiveObjectProperty(:p) AsymmetricObjectProperty(:p) \
+         ObjectPropertyAssertion(:p :c :d)",
+        false,
+    );
+    let p = table.iri("http://e/p").expect(":p");
+    assert!(!irreflexive.has_concerns(), "{:?}", irreflexive.concern(p));
+}
+
+/// An uncovered axiom that equates individuals makes the hazard global even where no term
+/// names it (master, 8 Nov 13:15): a global hazard reaches every term, so it needs none of
+/// its own. The reader gives every equating form a property, class or individual; an empty
+/// `SameIndividual`, built here directly, is one `label` can't name.
+#[test]
+fn outside_ql_an_unnamed_equating_axiom_is_global() {
+    let mut ontology = crate::mapping::Ontology::default();
+    ontology
+        .axioms
+        .push(crate::model::Axiom::SameIndividual(Vec::new()));
+    ontology.sources = vec![Vec::new()];
+    let tbox = Tbox::compile(&ontology, Closure { lists: false }, None);
+    assert!(tbox.global_hazard().is_some(), "no global hazard");
+}
