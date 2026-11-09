@@ -7,6 +7,11 @@
 //! - It keeps a term only where, kept, it would hold no more than the room it leaves free
 //!   (sol-loop r1 S2), so what the query must hold later finds at least as much room as the
 //!   cache takes. A term that doesn't fit so is decoded again as it is needed.
+//! - At each term it is offered, where it holds more than the room left (what the query holds
+//!   grew since), it lets go of everything it keeps and starts afresh (sol-loop r2 S2).
+//!   Residual: a required charge made while only cached terms are read, with no term decoded
+//!   in between, still meets the cache as it was; it holds at most what it left free when it
+//!   last kept a term.
 //! - Where the budget refuses an entry anyway, the cache lets go of everything it keeps, with
 //!   its charge, and keeps nothing more for the rest of its life.
 //!
@@ -32,6 +37,19 @@ struct Kept {
     text: Grant,
     /// What both draw from, for the room it leaves free.
     budget: Arc<Budget>,
+    /// How many caches fill theirs at once ([`DecodeCache::new`]).
+    workers: usize,
+}
+
+impl Kept {
+    fn new(budget: &Arc<Budget>, workers: usize) -> Self {
+        Self {
+            terms: ChargedMap::new(Arc::clone(budget)),
+            text: Grant::with_workers(Arc::clone(budget), workers),
+            budget: Arc::clone(budget),
+            workers,
+        }
+    }
 }
 
 impl DecodeCache {
@@ -40,11 +58,7 @@ impl DecodeCache {
     /// grant holds, [`Grant::with_workers`]).
     pub(super) fn new(budget: &Arc<Budget>, entries: usize, workers: usize) -> Self {
         Self {
-            kept: Some(Kept {
-                terms: ChargedMap::new(Arc::clone(budget)),
-                text: Grant::with_workers(Arc::clone(budget), workers),
-                budget: Arc::clone(budget),
-            }),
+            kept: Some(Kept::new(budget, workers)),
             entries,
         }
     }
@@ -65,11 +79,22 @@ impl DecodeCache {
             return;
         }
         let text = term.as_ref().map_or(0, Term::heap_bytes);
-        // Kept, the cache would hold `held + text` and leave `remaining - text` free.
         let held = kept.terms.charged() + kept.text.bytes();
+        let remaining = kept.budget.remaining();
+        // What the query must hold grew since the cache last kept a term: where the cache now
+        // holds more than the room left, it lets everything go, so that room is the query's
+        // again (sol-loop r2 S2), and starts afresh.
+        if held > remaining {
+            let (budget, workers) = (Arc::clone(&kept.budget), kept.workers);
+            // The old terms and their charge go before anything new is charged.
+            self.kept = None;
+            self.kept = Some(Kept::new(&budget, workers));
+            return;
+        }
+        // Kept, the cache would hold `held + text` and leave `remaining - text` free.
         let fits = held
             .checked_add(text.saturating_mul(2))
-            .is_some_and(|needed| needed <= kept.budget.remaining());
+            .is_some_and(|needed| needed <= remaining);
         if !fits {
             return;
         }
@@ -138,6 +163,28 @@ mod tests {
         assert!(held <= limit / 2, "it holds {held} bytes of {limit}");
         drop(cache);
         assert_eq!(budget.used(), 0, "dropped, nothing stays charged");
+    }
+
+    /// What the query holds grows after a term is kept, until the cache holds more than the
+    /// room left: at the next term it is offered, it lets go of everything and starts afresh.
+    #[test]
+    fn a_cache_lets_go_once_the_query_needs_its_room() {
+        let limit = 64 << 10;
+        let budget = Arc::new(Budget::new(limit));
+        let mut cache = DecodeCache::new(&budget, 1 << 10, 1);
+        cache.keep(0, &literal(0, 4096));
+        assert!(cache.get(0).is_some(), "kept while there is room");
+        // The query's own charge leaves 1 KiB, less than the cache holds.
+        let mut answer = nrese_exec::Reservation::new(Arc::clone(&budget));
+        answer.charge(budget.remaining() - 1024).unwrap();
+        cache.keep(1, &literal(1, 16));
+        assert_eq!(cache.get(0), None, "the kept term is let go");
+        assert!(cache.keeps(), "and the cache starts afresh, not refused");
+        assert_eq!(
+            budget.used(),
+            answer.bytes(),
+            "only the query's own charge is left"
+        );
     }
 
     /// Where the budget refuses what the cache would grow (its table, here: nothing decoded
