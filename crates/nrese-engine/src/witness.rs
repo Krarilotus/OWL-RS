@@ -30,16 +30,20 @@ pub enum Site {
     RunProbes,
     /// Identities an equality class build's finish handles: each member it copies out of the
     /// union kernel, each it checks for a literal and indexes as an alias (`Classes::of_with`;
-    /// its sorts are not counted here).
+    /// its sorts are [`Site::SortWork`], a union's moves the kernel's own counter,
+    /// `nrese_exec::classes::witness`).
     ClassFinish,
     /// Merge cursors read outside a merge step. The remaining-entries hint
     /// (`SignedMerge::remaining`) read every cursor until REAS-3a review r1 R2; it now keeps
     /// its count as the cursors advance and reads none, so nothing counts here.
     CursorReads,
+    /// A class build's sort work: each comparison of a run's sort and each identity a merge
+    /// of sorted runs moves (`Classes::of_with`; REAS-3a fix check r1 F3).
+    SortWork,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 6] = const { [const { Cell::new(0) }; 6] };
+    static COUNTS: [Cell<u64>; 7] = const { [const { Cell::new(0) }; 7] };
 }
 
 /// Counts `n` units at `site` on this thread.
