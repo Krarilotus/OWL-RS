@@ -760,6 +760,8 @@ pub(crate) fn stack_index(
 
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
+    /// The file it was read from, under its name in the root (it may be a link: DUR-5).
+    pub path: PathBuf,
     pub revision: u64,
     /// When its last commit was made (format 12); `None` where that isn't known.
     pub committed_micros: Option<u64>,
@@ -896,6 +898,7 @@ pub(crate) fn load_latest(
             .map_err(|error| corrupt(&error))?;
         lap("packed permutations");
         return Ok(Some(Loaded {
+            path: path.clone(),
             revision,
             committed_micros,
             clock_micros,
@@ -920,6 +923,7 @@ pub(crate) fn load_latest(
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| corrupt("truncated inferred"))?;
     Ok(Some(Loaded {
+        path: path.clone(),
         revision,
         committed_micros: None,
         clock_micros: 0,
