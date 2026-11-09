@@ -1075,9 +1075,18 @@ impl Snapshot {
                 .asserted
                 .with_change_within(asserted[0], asserted[1], forms, budget)?;
         let (inferred, inferred_held) =
-            version
+            match version
                 .inferred
-                .with_change_within(inferred[0], inferred[1], forms, budget)?;
+                .with_change_within(inferred[0], inferred[1], forms, budget)
+            {
+                Ok(built) => built,
+                Err(refused) => {
+                    // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
+                    drop(asserted);
+                    drop(asserted_held);
+                    return Err(refused);
+                }
+            };
         let held = nrese_exec::Reservation::adopt(
             Arc::clone(budget),
             held.transfer() + asserted_held.transfer() + inferred_held.transfer(),

@@ -148,7 +148,10 @@ impl Pending {
         use std::mem::size_of;
         let quad = size_of::<EncodedQuad>();
         let list = |n: usize| 2 * n.max(4) * quad;
-        let shadowed = self.asserted.inserts.len();
+        // Shadowed: asserted inserts that are inferred, and inferred inserts that are asserted
+        // (a statement retracted, inferred, then asserted again), as `shadowed_inferred` takes
+        // them (sol-loop r1 on DUR-6, S1).
+        let shadowed = self.asserted.inserts.len() + self.inferred.inserts.len();
         let set = 2 * ((shadowed * 8 / 7 + 1).next_power_of_two().max(4) * (quad + 1) + 16);
         set + list(self.asserted.inserts.len())
             + list(self.asserted.deletes.len())
