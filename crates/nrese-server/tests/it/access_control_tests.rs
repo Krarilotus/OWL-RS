@@ -169,6 +169,76 @@ async fn seeded() -> Result<axum::Router, Box<dyn std::error::Error>> {
 
 const GRAPHS: &str = "SELECT DISTINCT ?x WHERE { GRAPH ?x { ?s ?p ?o } }";
 
+// Spec: D16-310's task makes public readiness status-only, including for a reader.
+#[tokio::test]
+async fn readiness_disclosure_public_status_only() -> Result<(), Box<dyn std::error::Error>> {
+    let app = seeded().await?;
+    for roles in [None, Some(&["analyst"][..]), Some(&["nrese.admin"][..])] {
+        let mut request = Request::builder().uri("/readyz");
+        if let Some(roles) = roles {
+            request = request.header("authorization", format!("Bearer {}", token(roles)));
+        }
+        let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+        assert_eq!(json, serde_json::json!({"status": "ready"}));
+    }
+    Ok(())
+}
+
+// Spec: D16-310 denies global figures to restricted readers on either info alias.
+#[tokio::test]
+async fn readiness_disclosure_restricted_info() -> Result<(), Box<dyn std::error::Error>> {
+    let app = seeded().await?;
+    for uri in ["/dataset/info", "/api/v1/repositories/nrese/info"] {
+        let (status, body) = send(&app, &["analyst"], Method::GET, uri, None, "").await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        for field in [
+            "quad_count",
+            "named_graph_count",
+            "violations",
+            "engine",
+            "revision",
+        ] {
+            assert!(!body.contains(field), "{body}");
+        }
+    }
+    Ok(())
+}
+
+// Spec: D16-310 preserves detailed monitoring for full readers/admins, and defaults.
+#[tokio::test]
+async fn readiness_disclosure_authorized_details() -> Result<(), Box<dyn std::error::Error>> {
+    // With fallback allow, the normal read grant has an unrestricted view; the analyst
+    // still has its explicit restricted rule. DL is active so its fields are exercised.
+    let policy = POLICY.replacen("default = \"deny\"", "default = \"allow\"", 1);
+    let app = app_in(&policy, ReasoningMode::Owl2Dl)?;
+    for roles in [&["nrese.read"][..], &["nrese.admin"][..]] {
+        for uri in ["/dataset/info", "/api/v1/repositories/nrese/info"] {
+            let (status, body) = send(&app, roles, Method::GET, uri, None, "").await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body)?;
+            assert!(json["quad_count"].is_number(), "{json}");
+            assert!(json["named_graph_count"].is_number(), "{json}");
+            assert!(json.get("violations").is_some(), "{json}");
+            assert!(json["dl"]["engine"].is_string(), "{json}");
+            assert!(json["dl"].get("reason").is_some(), "{json}");
+        }
+    }
+    let app = crate::support::test_app()?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/info")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(json["quad_count"], 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn each_role_queries_its_own_dataset() -> Result<(), Box<dyn std::error::Error>> {
     let app = seeded().await?;

@@ -226,6 +226,12 @@ impl QuerySolution {
         &self.values
     }
 
+    /// The values, taken out of the solution: one per variable, in the order of
+    /// [`QuerySolution::variables`] (`None`: unbound).
+    pub fn into_values(self) -> Vec<Option<Term>> {
+        self.values
+    }
+
     /// How many variables the solution binds.
     pub fn len(&self) -> usize {
         self.values.iter().filter(|v| v.is_some()).count()
@@ -367,6 +373,17 @@ mod tests {
         assert_eq!(solution.get("c"), None);
         assert_eq!(solution.iter().count(), 1);
         assert_eq!(solution.len(), 1);
+    }
+
+    /// A solution gives up its values in the order of its variables, unbound ones as `None`.
+    #[test]
+    fn a_solution_gives_up_its_values_in_variable_order() {
+        let variables: Arc<[Variable]> =
+            vec![Variable::new_unchecked("a"), Variable::new_unchecked("b")].into();
+        let b: Term = NamedNode::new_unchecked("http://e/b").into();
+        let solution = QuerySolution::new(variables, vec![None, Some(b.clone())]);
+        assert_eq!(solution.variables()[1].as_str(), "b");
+        assert_eq!(solution.into_values(), vec![None, Some(b)]);
     }
 
     #[test]

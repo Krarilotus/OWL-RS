@@ -88,8 +88,9 @@ fn token(snapshot: &Snapshot) -> bool {
 /// Review §5 item 1, 3.0's share: pending state of both kinds grants no token, with no private
 /// id involved.
 ///
-/// - Input: a published snapshot; writer pending snapshots (`pending_snapshot` and `pending_over`)
-///   after inserting and deleting statements made only of existing ids, with no change, and after
+/// - Input: a published snapshot; writer pending snapshots (`pending_snapshot` and `pending_over`,
+///   and DUR-6a's charged `_within` forms of both, once changed) after inserting and deleting
+///   statements made only of existing ids, with no change, and after
 ///   inserting then deleting the same statement; `Engine::speculative()`'s; a private
 ///   transaction's, from both builders.
 /// - Expected: the published one grants a token whose snapshot is itself; none of the others
@@ -115,6 +116,14 @@ fn pending_states_of_both_kinds_grant_no_token() {
     assert!(
         !token(&changed.pending_over(&view, &[])),
         "writer, over a view"
+    );
+    assert!(
+        !token(&changed.pending_snapshot_within(&budget()).unwrap()),
+        "writer, charged"
+    );
+    assert!(
+        !token(&changed.pending_over_within(&view, &[], &budget()).unwrap()),
+        "writer, charged, over a view"
     );
     drop(changed);
 

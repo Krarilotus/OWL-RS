@@ -197,6 +197,29 @@ pub(crate) fn read_pending<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     ))
 }
 
+/// The ontology of a transaction's statements asserted in the graphs `readable` admits,
+/// after its changes: what a reader of only those graphs sees (a statement asserted there
+/// and elsewhere too is one of them). Its scratch charged to `budget` as [`read_pending`]'s.
+pub(crate) fn read_pending_where<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+    tx: &Transaction<'_>,
+    budget: B,
+    readable: impl Fn(nrese_engine::TermId) -> bool,
+) -> Result<Ontology, nrese_exec::BudgetExceeded> {
+    let quads = tx
+        .quads_for_pattern_in(ReadModel::Asserted, &ANY)
+        .filter(|quad| readable(quad.graph));
+    let statements = statements(quads, budget)?;
+    let decode = |id| tx.decode(id);
+    let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+    Ok(nrese_owl::read(
+        &statements,
+        &StoreTerms {
+            decode: &decode,
+            lookup: &lookup,
+        },
+    ))
+}
+
 /// The ontology of a snapshot's asserted statements, its scratch charged to `budget`
 /// (refused: `Err`, nothing kept). O(asserted).
 pub(crate) fn read_snapshot<B: std::ops::Deref<Target = nrese_exec::Budget>>(

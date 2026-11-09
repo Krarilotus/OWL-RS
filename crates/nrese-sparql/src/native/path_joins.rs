@@ -129,9 +129,7 @@ impl<'q> PathJoin<'q> {
 fn end_variable(term: &TermPattern) -> Option<Variable> {
     match term {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(nrese_sparql_syntax::internal::blank_variable(b)),
         _ => None,
     }
 }

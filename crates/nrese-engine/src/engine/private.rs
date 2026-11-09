@@ -94,11 +94,17 @@ impl<'e> PrivateTransaction<'e> {
     /// from `start`, at least `base`'s length.
     fn opened(engine: &'e Inner, base: Snapshot, start: u64, budget: Arc<Budget>) -> Self {
         let dictionary = Arc::clone(&engine.shared.dictionary);
+        // The pending changes are charged to the same budget as the terms, for their life. A
+        // new `Pending` has no budget yet, so attaching this one is never refused.
+        let mut pending = Pending::over(base);
+        if let Err(error) = pending.charge_to(Arc::clone(&budget)) {
+            unreachable!("a new Pending has no budget yet: {error}");
+        }
         let overlay = Overlay::over(dictionary, start, budget);
         Self {
             _engine: engine,
             overlay,
-            pending: Pending::over(base),
+            pending,
             changes: 0,
             memo: Mutex::new(None),
         }
@@ -175,9 +181,12 @@ impl<'e> PrivateTransaction<'e> {
         let version = Version {
             content: super::Content::fresh(),
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: base
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            // The base's runs read in the quad layout are their shared forms (DUR-6).
+            asserted: base.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self._engine.shared.forms,
+            ),
             inferred: base
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
@@ -266,9 +275,11 @@ impl<'e> PrivateTransaction<'e> {
         let version = Version {
             content: super::Content::fresh(),
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: seen
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            asserted: seen.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self._engine.shared.forms,
+            ),
             inferred: seen.inferred.with_delta(&[], &gone),
             revision: seen.revision,
             committed_micros: seen.committed_micros,
