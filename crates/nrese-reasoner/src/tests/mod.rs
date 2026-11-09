@@ -2339,8 +2339,9 @@ fn check_supports(
                     .is_some_and(|kept| kept.truncated && !fits(kept))
             });
             let within = undecided.then(|| {
-                let read =
-                    |fact: Triple, _: &crate::eval::Poller<'_>| data.binary_search(&fact).is_ok();
+                let read = |fact: Triple, _: &crate::eval::Poller<'_>| {
+                    Ok(data.binary_search(&fact).is_ok())
+                };
                 closure_within(&full, &ground, &[], &read, Limits::unlimited(&scratch())).unwrap()
             });
             let visible: Vec<Triple> = full
@@ -2642,19 +2643,21 @@ pub(super) fn support_set_updates_against_recomputation() {
             // and the update makes them (`Previous::Own`). Both updates are the same.
             let mut updates = Vec::with_capacity(2);
             for own_made in [false, true] {
-                let previous = |f: Triple, _: &crate::eval::Poller<'_>| match sets_before.get(&f) {
-                    Some(sets)
-                        if own_made
-                            && *sets == initial_sets(graphs_in(&old_placed, f), false, cap) =>
-                    {
-                        Previous::Own
-                    }
-                    Some(sets) => Previous::Sets(Sets::of(sets)),
-                    None => Previous::Sets(Sets::NONE),
+                let previous = |f: Triple, _: &crate::eval::Poller<'_>| {
+                    Ok(match sets_before.get(&f) {
+                        Some(sets)
+                            if own_made
+                                && *sets == initial_sets(graphs_in(&old_placed, f), false, cap) =>
+                        {
+                            Previous::Own
+                        }
+                        Some(sets) => Previous::Sets(Sets::of(sets)),
+                        None => Previous::Sets(Sets::NONE),
+                    })
                 };
                 let change = Change {
                     source: &source,
-                    in_closure: &|f, _| after.binary_search(&f).is_ok(),
+                    in_closure: &|f, _| Ok(after.binary_search(&f).is_ok()),
                     touched: &touched,
                     previous: &previous,
                     limit: usize::MAX,
@@ -2714,8 +2717,9 @@ pub(super) fn support_set_updates_against_recomputation() {
                 data.sort_unstable();
                 data.dedup();
                 let fresh = closure(&data);
-                let read =
-                    |fact: Triple, _: &crate::eval::Poller<'_>| data.binary_search(&fact).is_ok();
+                let read = |fact: Triple, _: &crate::eval::Poller<'_>| {
+                    Ok(data.binary_search(&fact).is_ok())
+                };
                 let within = closure_within(
                     &after,
                     &ground_after,
@@ -2967,16 +2971,21 @@ fn in_place_drivers_visit_what_a_scan_visits() {
             for seg in [Seg::Delta, Seg::Old, Seg::All] {
                 let poll = crate::eval::Poller::never();
                 let mut scanned = Vec::new();
-                store.scan(pattern, seg, &poll, &mut |t| scanned.push(t));
+                store
+                    .scan(pattern, seg, &poll, &mut |t| scanned.push(t))
+                    .expect("never stopped");
                 let len = store
                     .matches_len(pattern, seg, &poll)
+                    .expect("never stopped")
                     .expect("the store indexes its matches");
                 assert!(len >= scanned.len());
                 let morsel = 1 + next(7);
                 let mut ranged = Vec::new();
                 for start in (0..len).step_by(morsel) {
                     let range = start..(start + morsel).min(len);
-                    store.scan_range(pattern, seg, range, &poll, &mut |t| ranged.push(t));
+                    store
+                        .scan_range(pattern, seg, range, &poll, &mut |t| ranged.push(t))
+                        .expect("never stopped");
                 }
                 assert_eq!(ranged, scanned, "{pattern:?} {seg:?} morsel {morsel}");
             }

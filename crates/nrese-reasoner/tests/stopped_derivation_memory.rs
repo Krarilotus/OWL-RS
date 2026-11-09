@@ -7,7 +7,7 @@
 use nrese_exec::measure;
 use nrese_reasoner::batch::{self, Schema};
 use nrese_reasoner::delta::{MemoryBase, Rules, program};
-use nrese_reasoner::eval::{OperationStop, Probe, Seg, Visit, Visits};
+use nrese_reasoner::eval::{OperationStop, Probe, Seg, Stopped, Visit, Visits};
 use nrese_reasoner::ir::{RDFS, Vocabulary, parse_rules};
 use nrese_reasoner::vocabulary::LocalVocabulary;
 
@@ -69,12 +69,17 @@ fn a_stopped_derivation_check_allocates_nothing() {
         "the operation has stopped before the checks are asked"
     );
     let fired = || stopped.fired();
+    // Stopped, the checks answer that (REAS-2 fix check r1, rule 2: once a "false").
     let (by, held) = measure::measure(|| ground.derivable_by(&source, fact, &all, true, &fired));
-    assert_eq!((by, held), (false, 0), "derivable_by over {n} producers");
+    assert_eq!(
+        (by, held),
+        (Err(Stopped), 0),
+        "derivable_by over {n} producers"
+    );
     let (with, held) = measure::measure(|| ground.derivable_with(&source, fact, true, &fired));
     assert_eq!(
         (with, held),
-        (false, 0),
+        (Err(Stopped), 0),
         "derivable_with over {n} producers"
     );
 }
@@ -97,15 +102,23 @@ impl Visits for Facts {
         }
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], _: Seg, probe: Probe<'_, '_>) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        _: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         let matches = |t: &[u64; 3]| (0..3).all(|i| pattern[i].is_none_or(|v| v == t[i]));
         match probe.units(self.0.len()) {
-            true => self.0.iter().filter(|t| matches(t)).count(),
-            false => 0,
+            true => Ok(self.0.iter().filter(|t| matches(t)).count()),
+            false => Err(Stopped),
         }
     }
 
-    fn holds(&self, fact: [u64; 3], probe: Probe<'_, '_>) -> bool {
-        probe.units(self.0.len()) && self.0.contains(&fact)
+    fn holds(&self, fact: [u64; 3], probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        match probe.units(self.0.len()) {
+            true => Ok(self.0.contains(&fact)),
+            false => Err(Stopped),
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::load;
 use crate::batch::{self, Schema};
 use crate::delta::{Interrupted, MemoryBase, Rules, VisitsBase, update_until};
-use crate::eval::{OperationStop, Poller, Probe, Visit};
+use crate::eval::{OperationStop, Poller, Probe, Stopped as ReadStopped, Visit};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
@@ -22,21 +22,21 @@ impl VisitsBase for Counting {
         visit.filtered(
             &|_| {
                 self.scanned.fetch_add(1, Ordering::Relaxed);
-                true
+                Ok(true)
             },
             |inner| self.base.visit(pattern, inner),
         );
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, ReadStopped> {
         self.base.size(pattern, probe)
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
         self.base.holds(fact, probe)
     }
 
-    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
         self.base.asserts(fact, probe)
     }
 }
@@ -299,15 +299,20 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
             visit.filtered(
                 &|_| {
                     self.scanned.fetch_add(1, Ordering::Relaxed);
-                    true
+                    Ok(true)
                 },
                 |inner| self.facts.visit(pattern, seg, inner),
             );
         }
-        fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+        fn size(
+            &self,
+            pattern: [Option<u64>; 3],
+            seg: Seg,
+            probe: Probe<'_, '_>,
+        ) -> Result<usize, ReadStopped> {
             self.facts.size(pattern, seg, probe)
         }
-        fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
             self.facts.holds(fact, probe)
         }
     }
@@ -341,10 +346,10 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         facts: batch::Store::new(closure.clone()),
         scanned: AtomicUsize::new(0),
     };
-    let previous = |_: Triple, _: &Poller<'_>| Previous::Sets(Sets::NONE);
+    let previous = |_: Triple, _: &Poller<'_>| Ok(Previous::Sets(Sets::NONE));
     let change = Change {
         source: &source,
-        in_closure: &|f, _| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| Ok(closure.binary_search(&f).is_ok()),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,

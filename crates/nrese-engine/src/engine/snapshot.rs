@@ -858,9 +858,10 @@ impl Snapshot {
     /// the stored matches over representatives weighted by how many quads each stands for,
     /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
     /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
-    /// holds (its maximum then; PR #70 fix check 2 F3). `visit(1)` is called for each stored
-    /// quad it scans and each copy it expands; `None` as soon as it returns false
-    /// ([`Self::count_in_visiting`]).
+    /// holds (its maximum then; PR #70 fix check 2 F3). `visit(1)` is called before each
+    /// stored position its scans pass, deleted ones included (`QuadScan::next_visiting`;
+    /// REAS-2 fix check r1, R2-F1), and before each copy it expands; `None` as soon as it
+    /// returns false, nothing more read ([`Self::count_in_visiting`]).
     fn expanded_count(
         &self,
         classes: &EqualityClasses,
@@ -874,13 +875,14 @@ impl Snapshot {
         let visibility = CopyVisibility::new(data, model);
         let mut count: u64 = 0;
         for stack in Stack::ALL {
-            for quad in data.stack(stack).scan(&normalised) {
+            let mut scan = data.stack(stack).scan(&normalised);
+            loop {
                 if count >= limit {
                     return Some(Count::AtLeast(count));
                 }
-                if !visit(1) {
-                    return None;
-                }
+                let Some(quad) = scan.next_visiting(visit).ok()? else {
+                    break;
+                };
                 if !quad.graph.is_default_graph() {
                     count += u64::from(
                         model == ReadModel::Materialised
@@ -926,13 +928,11 @@ impl Snapshot {
             && normalised != *pattern
             && !self.canonical
         {
-            for quad in self.data(model).asserted.scan(pattern) {
-                if count >= limit {
+            let mut scan = self.data(model).asserted.scan(pattern);
+            while count < limit {
+                let Some(quad) = scan.next_visiting(visit).ok()? else {
                     break;
-                }
-                if !visit(1) {
-                    return None;
-                }
+                };
                 count += u64::from(!quad.graph.is_default_graph());
             }
         }
@@ -1160,12 +1160,13 @@ impl Snapshot {
             .expect("never stopped")
     }
 
-    /// [`Self::count_in`], calling `visit(n)` for the work as it goes: each stored quad
-    /// `expanded_count` scans and each copy it expands (1 each), each run a held count reads
-    /// (that run's tombstone words + 1), each quad a default-graph post-filter scans (1
-    /// each). `None` as soon as `visit` returns false: the count is abandoned, nothing is
-    /// cached. A reader whose stop must see a long count counts with it (REAS-2 review r1 F2:
-    /// maintenance's estimates under compact equality scan the stored matches).
+    /// [`Self::count_in`], calling `visit(n)` before the work it counts, `n` at most
+    /// `nrese_exec::POLL_UNITS`: each stored position a scan passes, deleted ones included,
+    /// and each copy it expands (1 each); each run's range search a held count makes (1),
+    /// and its tombstone words, a run of at most `POLL_UNITS` at a time as they are read.
+    /// `None` as soon as `visit` returns false, nothing more read: the count is abandoned,
+    /// nothing is cached. A reader whose stop must see a long count counts with it (REAS-2
+    /// review r1 F2; fix check r1 R2-F1: the count lives in the reader).
     pub fn count_in_visiting(
         &self,
         model: ReadModel,

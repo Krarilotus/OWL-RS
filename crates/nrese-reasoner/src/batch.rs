@@ -32,7 +32,7 @@ use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
     AllFacts, GroundProgram, Job, MORSEL, NEVER, OperationStop, Poller, Probe, Probes, Seg, Source,
-    Visit, Visits, guards_hold, run_jobs_by_morsel,
+    Stopped, Visit, Visits, guards_hold, run_jobs_by_morsel,
 };
 use super::ir::Triple;
 use super::ir::{Guard, Head, Rule, SharedClasses, Term};
@@ -838,80 +838,57 @@ impl Run {
     }
 
     /// The pairs matching the bound positions, as slices of one order (a slice per chunk
-    /// they are in), with whether that order is `(object, subject)` and `old`; `false` if
-    /// they aren't one slice per chunk (an object without its order).
-    fn matching<'a>(
-        &'a self,
-        s: Option<u64>,
-        o: Option<u64>,
-        old: bool,
-        out: &mut Slices<'a>,
-    ) -> bool {
-        match (s, o) {
+    /// they are in), with whether that order is `(object, subject)` and `old`, made as they
+    /// are asked for (REAS-2 fix check r1, rule 1: no list built and counted afterwards);
+    /// `None` if they aren't one slice per chunk (an object without its order).
+    fn matching(&self, s: Option<u64>, o: Option<u64>, old: bool) -> Option<RunSlices<'_>> {
+        Some(match (s, o) {
             (Some(s), Some(o)) => {
-                if let Some(chunk) = self.so.chunk_of((s, o))
-                    && let Ok(at) = chunk.binary_search(&(s, o))
-                {
-                    out.push(Slice::of(&chunk[at..=at], false, old));
-                }
+                let one = self.so.chunk_of((s, o)).and_then(|chunk| {
+                    let at = chunk.binary_search(&(s, o)).ok()?;
+                    Some(Slice::of(&chunk[at..=at], false, old))
+                });
+                RunSlices::one(one)
             }
-            (Some(s), None) => out.extend(self.so.range(s).map(|p| Slice::of(p, false, old))),
+            (Some(s), None) => RunSlices::of_key(&self.so, s, false, old, None),
             (None, Some(o)) => match &self.os {
-                Some(os) => out.extend(os.range(o).map(|p| Slice::of(p, true, old))),
-                None => return self.len() == 0,
+                Some(os) => RunSlices::of_key(os, o, true, old, None),
+                None if self.len() == 0 => RunSlices::one(None),
+                None => return None,
             },
-            (None, None) => out.extend(self.so.chunks.iter().map(|p| Slice::of(p, false, old))),
-        }
-        true
+            (None, None) => RunSlices::whole(&self.so, old, None),
+        })
     }
 
     /// [`Run::matching`] without the pairs `marks` marks, as slices that carry their
-    /// chunk's marks ([`Slice::skip`]); `false` where [`Run::matching`] is.
+    /// chunk's marks ([`Slice::skip`]), made as they are asked for; `None` where
+    /// [`Run::matching`] is.
     fn matching_unmarked<'a>(
         &'a self,
         s: Option<u64>,
         o: Option<u64>,
         marks: &'a Marks,
-        out: &mut Slices<'a>,
-    ) -> bool {
+    ) -> Option<RunSlices<'a>> {
         if marks.all {
-            return true;
+            return Some(RunSlices::one(None));
         }
-        let slice = |pairs, swapped, words: &'a [u64], start| Slice {
-            pairs,
-            swapped,
-            old: false,
-            skip: Some((words, start)),
-        };
-        match (s, o) {
+        Some(match (s, o) {
             (Some(s), Some(o)) => {
-                if let Some((c, i)) = self.so.position((s, o))
-                    && !marked(&marks.so[c], i)
-                {
-                    out.push(Slice::of(&self.so.chunks[c][i..=i], false, false));
-                }
+                let one = self
+                    .so
+                    .position((s, o))
+                    .filter(|&(c, i)| !marked(&marks.so[c], i))
+                    .map(|(c, i)| Slice::of(&self.so.chunks[c][i..=i], false, false));
+                RunSlices::one(one)
             }
-            (Some(s), None) => out.extend(
-                self.so
-                    .range_at(s)
-                    .map(|(c, start, p)| slice(p, false, &marks.so[c][..], start)),
-            ),
+            (Some(s), None) => RunSlices::of_key(&self.so, s, false, false, Some(&marks.so)),
             (None, Some(o)) => match (&self.os, &marks.os) {
-                (Some(os), Some(os_marks)) => out.extend(
-                    os.range_at(o)
-                        .map(|(c, start, p)| slice(p, true, &os_marks[c][..], start)),
-                ),
-                _ => return self.len() == 0,
+                (Some(os), Some(os_marks)) => RunSlices::of_key(os, o, true, false, Some(os_marks)),
+                _ if self.len() == 0 => RunSlices::one(None),
+                _ => return None,
             },
-            (None, None) => out.extend(
-                self.so
-                    .chunks
-                    .iter()
-                    .zip(&marks.so)
-                    .map(|(p, words)| slice(p, false, &words[..], 0)),
-            ),
-        }
-        true
+            (None, None) => RunSlices::whole(&self.so, false, Some(&marks.so)),
+        })
     }
 
     /// [`Run::scan`] without the pairs `marks` marks: each slice's positions handed on
@@ -927,9 +904,10 @@ impl Run {
         if marks.all {
             return;
         }
-        let mut slices = Slices::new();
-        if self.matching_unmarked(s, o, marks, &mut slices) {
-            for slice in &slices {
+        // Each slice made as it is reached; its positions counted ahead below (a key's
+        // chunks without a pair of it end the slices: at most one empty slice is made).
+        if let Some(slices) = self.matching_unmarked(s, o, marks) {
+            for slice in slices {
                 // A slice is handed on in pieces of at most POLL_UNITS positions, each
                 // counted ahead: a chunk (up to CHUNK_PAIRS, 1 << 20) counted at once was
                 // one poll for all of it.
@@ -1060,8 +1038,135 @@ impl<'a> Slice<'a> {
     }
 }
 
-/// Slices of runs matching a pattern, in the order their runs are read.
-type Slices<'a> = smallvec::SmallVec<[Slice<'a>; 4]>;
+/// Keeps the facts of `facts` that `store` doesn't hold, in order; [`Stopped`] at the first
+/// probe its poller stopped, `facts` then emptied (fix check r1, rule 2: a stopped probe
+/// read as "not held" walked every fact after it).
+fn keep_unheld<S: Source + ?Sized>(
+    store: &S,
+    facts: &mut Vec<Triple>,
+    poll: &Poller<'_>,
+) -> Result<(), Stopped> {
+    let mut kept = 0;
+    for i in 0..facts.len() {
+        match store.contains(facts[i], poll) {
+            Ok(true) => {}
+            Ok(false) => {
+                facts[kept] = facts[i];
+                kept += 1;
+            }
+            Err(Stopped) => {
+                facts.clear();
+                return Err(Stopped);
+            }
+        }
+    }
+    facts.truncate(kept);
+    Ok(())
+}
+
+/// One run's slices matching a pattern ([`Run::matching`]), each made as it is asked for:
+/// a chunk's slice of a key costs a search in that chunk, and nothing is collected (REAS-2
+/// fix check r1, R2-F2: one key can span any number of chunks).
+#[derive(Clone)]
+struct RunSlices<'a> {
+    /// A pair's own slice (both positions bound), handed on first.
+    one: Option<Slice<'a>>,
+    /// The chunks read from `at` on, `None` once read or where there are none.
+    chunks: Option<&'a Pairs>,
+    at: usize,
+    /// The key the slices hold (`None`: whole chunks).
+    key: Option<u64>,
+    swapped: bool,
+    old: bool,
+    /// Each chunk's marks, where the slices skip marked pairs.
+    marks: Option<&'a [Vec<u64>]>,
+}
+
+impl<'a> RunSlices<'a> {
+    /// At most one slice.
+    fn one(one: Option<Slice<'a>>) -> Self {
+        Self {
+            one,
+            chunks: None,
+            at: 0,
+            key: None,
+            swapped: false,
+            old: false,
+            marks: None,
+        }
+    }
+
+    /// The pairs whose first component is `key`: a slice of each chunk they are in, from
+    /// the first whose last pair isn't before them.
+    fn of_key(
+        pairs: &'a Pairs,
+        key: u64,
+        swapped: bool,
+        old: bool,
+        marks: Option<&'a [Vec<u64>]>,
+    ) -> Self {
+        Self {
+            chunks: Some(pairs),
+            at: pairs.lasts.partition_point(|last| last.0 < key),
+            key: Some(key),
+            swapped,
+            old,
+            marks,
+            ..Self::one(None)
+        }
+    }
+
+    /// Every chunk whole.
+    fn whole(pairs: &'a Pairs, old: bool, marks: Option<&'a [Vec<u64>]>) -> Self {
+        Self {
+            chunks: Some(pairs),
+            old,
+            marks,
+            ..Self::one(None)
+        }
+    }
+}
+
+impl<'a> Iterator for RunSlices<'a> {
+    type Item = Slice<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Slice<'a>> {
+        if let Some(one) = self.one.take() {
+            return Some(one);
+        }
+        let chunks = self.chunks?;
+        let Some(chunk) = chunks.chunks.get(self.at) else {
+            self.chunks = None;
+            return None;
+        };
+        let c = self.at;
+        self.at += 1;
+        let (start, pairs) = match self.key {
+            None => (0, &chunk[..]),
+            Some(key) if chunk[0].0 > key => {
+                self.chunks = None;
+                return None;
+            }
+            Some(key) => {
+                let start = chunk.partition_point(|p| p.0 < key);
+                let len = chunk[start..].partition_point(|p| p.0 == key);
+                (start, &chunk[start..start + len])
+            }
+        };
+        Some(Slice {
+            pairs,
+            swapped: self.swapped,
+            old: self.old,
+            skip: self.marks.map(|marks| (&marks[c][..], start)),
+        })
+    }
+}
+
+/// Slices of a relation's runs matching a pattern, in the order its runs are read
+/// ([`Relation::matching`]): each run's made as it is asked for.
+type Slices<'a> =
+    std::iter::Flatten<std::iter::Flatten<std::array::IntoIter<Option<RunSlices<'a>>, 3>>>;
 
 /// The pairs of one predicate, in sorted runs: the store's input, apart, and what was
 /// added since, in a large base and a small recent run that takes each round's delta.
@@ -1357,23 +1462,29 @@ impl Relation {
     }
 
     /// The matches of the bound positions in `seg`, as the slices of the runs that
-    /// hold them, in [`Relation::scan`]'s order (see [`Slices`]); `None` if a run can't
-    /// give them as slices (an object without its order).
+    /// hold them, in [`Relation::scan`]'s order (see [`Slices`]), each made as it is asked
+    /// for; `None` if a run can't give them as slices (an object without its order),
+    /// decided before any is made.
     fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> Option<Slices<'_>> {
-        let mut out = Slices::new();
-        let whole = match seg {
-            Seg::Delta | Seg::DeltaNotBy(_) => match self.skips(seg) {
-                Some(marks) => self.delta.matching_unmarked(s, o, marks, &mut out),
-                None => self.delta.matching(s, o, false, &mut out),
-            },
-            Seg::All | Seg::Old => {
-                self.input.matching(s, o, false, &mut out)
-                    && self.base.matching(s, o, false, &mut out)
-                    && (seg == Seg::Old && self.recent_is_delta()
-                        || self.recent.matching(s, o, seg == Seg::Old, &mut out))
-            }
+        let runs = match seg {
+            Seg::Delta | Seg::DeltaNotBy(_) => [
+                Some(match self.skips(seg) {
+                    Some(marks) => self.delta.matching_unmarked(s, o, marks)?,
+                    None => self.delta.matching(s, o, false)?,
+                }),
+                None,
+                None,
+            ],
+            Seg::All | Seg::Old => [
+                Some(self.input.matching(s, o, false)?),
+                Some(self.base.matching(s, o, false)?),
+                match seg == Seg::Old && self.recent_is_delta() {
+                    true => None,
+                    false => Some(self.recent.matching(s, o, seg == Seg::Old)?),
+                },
+            ],
         };
-        whole.then_some(out)
+        Some(runs.into_iter().flatten().flatten())
     }
 
     /// An upper bound on the matches of the bound positions in `seg`.
@@ -1512,33 +1623,37 @@ impl Store {
     /// misses at their targets, which a finger keeps: the reasoning took 6 % less.
     /// Returns how often it started the runs from the beginning: once per relation.
     /// Each fact's probe counted on `poll`, a run of at most [`RUN`] at a time (review r1 F1:
-    /// a morsel bounds its drivers, not its output); stopped, the rest is dropped, and the
-    /// morsel, which asks its poller next, keeps nothing.
-    fn retain_new(&self, facts: &mut Vec<Triple>, poll: &Poller<'_>) -> u64 {
+    /// a morsel bounds its drivers, not its output). The first run that finds `poll` stopped
+    /// ends the keep: `facts` is emptied and [`Stopped`] returned, no candidate after it
+    /// looked at (fix check r1, R2-F3: a stopped keep answering "not new" for the rest still
+    /// walked them all).
+    fn retain_new(&self, facts: &mut Vec<Triple>, poll: &Poller<'_>) -> Result<u64, Stopped> {
         let mut at: Option<(u64, Option<&Relation>)> = None;
         let mut fingers = [PairsFinger::default(); 3];
         let mut starts = 0;
-        let (len, mut seen) = (facts.len(), 0usize);
-        let mut stopped = false;
-        facts.retain(|&[s, p, o]| {
+        let len = facts.len();
+        let mut kept = 0;
+        for i in 0..len {
             #[cfg(test)]
             crate::witness::add(crate::witness::Site::RetainStep, 1);
-            if seen % RUN == 0 && !stopped {
-                stopped = poll.attempt(RUN.min(len - seen));
+            if i % RUN == 0 && poll.attempt(RUN.min(len - i)) {
+                facts.clear();
+                return Err(Stopped);
             }
-            seen += 1;
-            if stopped {
-                return false;
-            }
+            let [s, p, o] = facts[i];
             if at.is_none_or(|(q, _)| q != p) {
                 at = Some((p, self.relation(p)));
                 fingers = [PairsFinger::default(); 3];
                 starts += 1;
             }
             let relation = at.and_then(|(_, relation)| relation);
-            relation.is_none_or(|r| !r.contains_from(s, o, &mut fingers))
-        });
-        starts
+            if relation.is_none_or(|r| !r.contains_from(s, o, &mut fingers)) {
+                facts[kept] = facts[i];
+                kept += 1;
+            }
+        }
+        facts.truncate(kept);
+        Ok(starts)
     }
 
     /// The relation of `p`, or every relation where `p` is open, with their predicates.
@@ -1875,19 +1990,27 @@ impl Visits for Store {
     }
 
     /// Each relation asked about counted as it is asked, and each chunk range it reads
-    /// (review r1 F1, F2).
-    fn size(&self, [s, p, o]: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
-        match p {
+    /// (review r1 F1, F2); a sum its stop cut short is `Err` (fix check r1, B9).
+    fn size(
+        &self,
+        [s, p, o]: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
+        let size = match p {
             Some(p) => self.relation(p).map_or(0, |r| r.estimate(s, o, seg, probe)),
             None => probe
                 .counted(&self.relations)
                 .map(|r| r.estimate(s, o, seg, probe))
                 .sum(),
-        }
+        };
+        probe.ended()?;
+        Ok(size)
     }
 
-    fn holds(&self, [s, p, o]: Triple, _: Probe<'_, '_>) -> bool {
-        self.relation(p).is_some_and(|r| r.contains(s, o))
+    /// One search in the relation's runs: the call's count is its work.
+    fn holds(&self, [s, p, o]: Triple, _: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.relation(p).is_some_and(|r| r.contains(s, o)))
     }
 
     fn positions(
@@ -1895,21 +2018,24 @@ impl Visits for Store {
         [s, p, o]: [Option<u64>; 3],
         seg: Seg,
         probe: Probe<'_, '_>,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, Stopped> {
         // Each relation asked about, and each slice it holds of the matches, counted as it is
-        // read (review r1 F1, F2).
-        probe
+        // made (review r1 F1, F2; fix check r1 R2-F2: the slices are made one at a time); a
+        // length its stop cut short is `Err` (B9).
+        let positions = probe
             .counted(self.relations_of(p))
             .map(|(_, relation)| {
                 let slices = relation.matching(s, o, seg)?;
                 Some(
                     probe
-                        .counted(slices.iter())
+                        .counted(slices)
                         .map(|slice| slice.pairs.len())
                         .sum::<usize>(),
                 )
             })
-            .sum()
+            .sum();
+        probe.ended()?;
+        Ok(positions)
     }
 
     fn visit_range(
@@ -1920,13 +2046,16 @@ impl Visits for Store {
         visit: &mut Visit<'_, '_>,
     ) {
         // The range's positions were counted ahead, filtered ones included (REAS sol-loop
-        // r7): each is delivered or skipped within that count.
+        // r7): each is delivered or skipped within that count. The relations and slices
+        // passed on the way to it are counted as they are made (fix check r1, R2-F2: a
+        // range far into one key's chunks passes every slice before it).
+        let poll = visit.poller();
         let mut at = 0;
-        'relations: for (p, relation) in self.relations_of(p) {
+        'relations: for (p, relation) in poll.counted(self.relations_of(p)) {
             let slices = relation
                 .matching(s, o, seg)
                 .expect("matches_len gave slices");
-            for slice in &slices {
+            for slice in poll.counted(slices) {
                 let (start, end) = (at, at + slice.pairs.len());
                 at = end;
                 if end <= range.start {
@@ -1957,6 +2086,9 @@ impl Visits for Store {
                     return;
                 }
             }
+        }
+        if poll.stopped() {
+            return;
         }
         // Marked pairs a slice passes over were counted ahead too.
         visit.settle();
@@ -2007,8 +2139,14 @@ impl Equality {
         }
     }
 
-    /// The class of `x`: itself and its `sameAs` partners, sorted.
-    fn members<S: Source + ?Sized>(&self, store: &S, x: u64, poll: &Poller<'_>) -> Vec<u64> {
+    /// The class of `x`: itself and its `sameAs` partners, sorted; [`Stopped`] where its
+    /// poller stopped the read, never a part of the class (fix check r1, B9).
+    fn members<S: Source + ?Sized>(
+        &self,
+        store: &S,
+        x: u64,
+        poll: &Poller<'_>,
+    ) -> Result<Vec<u64>, Stopped> {
         let mut members = vec![x];
         store.scan(
             [Some(x), Some(self.same_as), None],
@@ -2017,10 +2155,10 @@ impl Equality {
             &mut |t| {
                 members.push(t[2]);
             },
-        );
+        )?;
         members.sort_unstable();
         members.dedup();
-        members
+        Ok(members)
     }
 
     /// The expansions of the delta of `store` (see the type's docs), not yet in it.
@@ -2038,10 +2176,11 @@ impl Equality {
     ) -> Result<Vec<Triple>, Interrupted> {
         let stop: super::eval::Stop<'_> = &|| operation.fired();
         let poll = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
-        let equalities = store.estimate([None, Some(self.same_as), None], Seg::All, &poll);
-        if poll.stopped() {
-            return Err(operation.interrupted());
-        }
+        // A read its poller stopped ends the module (fix check r1, rule 2).
+        let stopped = |Stopped| operation.interrupted();
+        let equalities = store
+            .estimate([None, Some(self.same_as), None], Seg::All, &poll)
+            .map_err(stopped)?;
         if equalities == 0 {
             self.produced.clear();
             return Ok(Vec::new());
@@ -2053,55 +2192,81 @@ impl Equality {
         // a large one (the batch executor's rounds) they are collected once from all
         // `sameAs` facts and then kept current from each round's.
         if self.partners.is_none()
-            && store.estimate([None, None, None], Seg::Delta, &poll) * 8 >= equalities
+            && store
+                .estimate([None, None, None], Seg::Delta, &poll)
+                .map_err(stopped)?
+                * 8
+                >= equalities
         {
             let mut all = TermSet::default();
-            store.scan(
-                [None, Some(same_as), None],
-                Seg::All,
-                &poll,
-                &mut |[s, _, o]| {
-                    if s != o {
-                        all.insert(s);
-                        all.insert(o);
-                    }
-                },
-            );
+            store
+                .scan(
+                    [None, Some(same_as), None],
+                    Seg::All,
+                    &poll,
+                    &mut |[s, _, o]| {
+                        if s != o {
+                            all.insert(s);
+                            all.insert(o);
+                        }
+                    },
+                )
+                .map_err(stopped)?;
             self.partners = Some(all);
         } else if let Some(partners) = &mut self.partners {
-            store.scan(
-                [None, Some(same_as), None],
-                Seg::Delta,
-                &poll,
-                &mut |[s, _, o]| {
-                    if s != o {
-                        partners.insert(s);
-                        partners.insert(o);
-                    }
-                },
-            );
+            store
+                .scan(
+                    [None, Some(same_as), None],
+                    Seg::Delta,
+                    &poll,
+                    &mut |[s, _, o]| {
+                        if s != o {
+                            partners.insert(s);
+                            partners.insert(o);
+                        }
+                    },
+                )
+                .map_err(stopped)?;
         }
         let mut looked_up: HashMap<u64, bool> = HashMap::new();
-        let mut has_partner = |term: u64| match &self.partners {
-            Some(partners) => partners.contains(term),
-            None => *looked_up.entry(term).or_insert_with(|| {
-                // An upper bound: zero means no equality mentions the term.
-                store.estimate([Some(term), Some(same_as), None], Seg::All, &poll) > 0
-                    || store.estimate([None, Some(same_as), Some(term)], Seg::All, &poll) > 0
-            }),
+        let mut has_partner = |term: u64| -> Result<bool, Stopped> {
+            match &self.partners {
+                Some(partners) => Ok(partners.contains(term)),
+                None => {
+                    if let Some(&known) = looked_up.get(&term) {
+                        return Ok(known);
+                    }
+                    // An upper bound: zero means no equality mentions the term.
+                    let found =
+                        store.estimate([Some(term), Some(same_as), None], Seg::All, &poll)? > 0
+                            || store.estimate(
+                                [None, Some(same_as), Some(term)],
+                                Seg::All,
+                                &poll,
+                            )? > 0;
+                    looked_up.insert(term, found);
+                    Ok(found)
+                }
+            }
         };
         let mut seeds: Vec<Triple> = Vec::new();
         let mut merged: Vec<u64> = Vec::new();
         let produced = &self.produced;
-        store.scan([None, None, None], Seg::Delta, &poll, &mut |t| {
-            if t[1] == same_as {
-                if t[0] != t[2] {
-                    merged.push(t[0]);
+        // A lookup its poller stopped seeds nothing: the scan ends at its next position and
+        // answers `Stopped`.
+        store
+            .scan([None, None, None], Seg::Delta, &poll, &mut |t| {
+                if t[1] == same_as {
+                    if t[0] != t[2] {
+                        merged.push(t[0]);
+                    }
+                } else if t.iter().any(|&term| has_partner(term) == Ok(true))
+                    && !produced.contains(&t)
+                {
+                    seeds.push(t);
                 }
-            } else if t.iter().any(|&term| has_partner(term)) && !produced.contains(&t) {
-                seeds.push(t);
-            }
-        });
+            })
+            .map_err(stopped)?;
         // Facts mentioning a term whose class grew.
         merged.sort_unstable();
         merged.dedup();
@@ -2111,9 +2276,15 @@ impl Equality {
                     seeds.push(t);
                 }
             };
-            store.scan([Some(a), None, None], Seg::All, &poll, &mut push);
-            store.scan([None, None, Some(a)], Seg::All, &poll, &mut push);
-            store.scan([None, Some(a), None], Seg::All, &poll, &mut push);
+            for pattern in [
+                [Some(a), None, None],
+                [None, None, Some(a)],
+                [None, Some(a), None],
+            ] {
+                store
+                    .scan(pattern, Seg::All, &poll, &mut push)
+                    .map_err(stopped)?;
+            }
         }
         if poll.stopped() {
             return Err(operation.interrupted());
@@ -2135,13 +2306,16 @@ impl Equality {
                         Poller::new(stop),
                     )
                 },
-                |(mut copies, mut scratch, poll), &[s, p, o]| {
-                    // Stopped, the thread's later seeds do nothing.
+                // The fold's error: `Some` a refusal, `None` a stop. Either ends the thread's
+                // fold (fix check r1, rule 2: a stopped thread passed over each later seed).
+                |(mut copies, mut scratch, poll),
+                 &[s, p, o]|
+                 -> Result<_, Option<BudgetExceeded>> {
                     if let Some(poll) = poll.as_ref().filter(|poll| !poll.stopped()) {
                         let (ms, mp, mo) = (
-                            self.members(store, s, poll),
-                            self.members(store, p, poll),
-                            self.members(store, o, poll),
+                            self.members(store, s, poll).map_err(|Stopped| None)?,
+                            self.members(store, p, poll).map_err(|Stopped| None)?,
+                            self.members(store, o, poll).map_err(|Stopped| None)?,
                         );
                         let bound = copies_at_most([&ms, &mp, &mo]);
                         // The product of its classes, a probe each, counted ahead a run of at
@@ -2159,21 +2333,32 @@ impl Equality {
                                         }
                                         for &o in objects {
                                             let fact = [s, p, o];
-                                            if !store.holds(fact, probe) {
-                                                out.push(fact);
+                                            match store.holds(fact, probe) {
+                                                Ok(false) => out.push(fact),
+                                                Ok(true) => {}
+                                                Err(Stopped) => return,
                                             }
                                         }
                                     }
                                 }
                             }
-                        })?;
+                        })
+                        .map_err(Some)?;
+                        if poll.stopped() {
+                            return Err(None);
+                        }
+                    } else {
+                        return Err(None);
                     }
                     Ok((copies, scratch, poll))
                 },
             )
             .map(|folded| folded.map(|(copies, _scratch, _poll)| copies))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(refused)?;
+            .map_err(|ended| match ended {
+                Some(exceeded) => refused(exceeded),
+                None => operation.interrupted(),
+            })?;
         // A thread that stopped left facts out; the stop is latched, so asking it tells.
         if stop() {
             return Err(operation.interrupted());
@@ -2325,17 +2510,22 @@ impl Visits for Current<'_> {
         if self.stale.is_empty() {
             return self.store.visit(pattern, seg, visit);
         }
-        visit.filtered(&|fact| !self.stale.mentioned(fact), |inner| {
+        visit.filtered(&|fact| Ok(!self.stale.mentioned(fact)), |inner| {
             self.store.visit(pattern, seg, inner)
         });
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         self.store.size(pattern, seg, probe)
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        !self.stale.mentioned(fact) && self.store.holds(fact, probe)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(!self.stale.mentioned(fact) && self.store.holds(fact, probe)?)
     }
 
     fn positions(
@@ -2343,7 +2533,7 @@ impl Visits for Current<'_> {
         pattern: [Option<u64>; 3],
         seg: Seg,
         probe: Probe<'_, '_>,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, Stopped> {
         self.store.positions(pattern, seg, probe)
     }
 
@@ -2357,7 +2547,7 @@ impl Visits for Current<'_> {
         if self.stale.is_empty() {
             return self.store.visit_range(pattern, seg, range, visit);
         }
-        visit.filtered(&|fact| !self.stale.mentioned(fact), |inner| {
+        visit.filtered(&|fact| Ok(!self.stale.mentioned(fact)), |inner| {
             self.store.visit_range(pattern, seg, range, inner)
         });
     }
@@ -2844,16 +3034,18 @@ fn run_body(
         // of the operation's stop, its result checked before use.
         let poll = Poller::new(stop).ok_or_else(Interrupted::default)?;
         let mut pairs = Vec::new();
-        store.scan(
-            [None, Some(reps.same_as), None],
-            Seg::All,
-            &poll,
-            &mut |[s, _, o]| {
-                if s != o {
-                    pairs.push((s, o));
-                }
-            },
-        );
+        store
+            .scan(
+                [None, Some(reps.same_as), None],
+                Seg::All,
+                &poll,
+                &mut |[s, _, o]| {
+                    if s != o {
+                        pairs.push((s, o));
+                    }
+                },
+            )
+            .map_err(|Stopped| Interrupted::default())?;
         check_stop()?;
         let lost = reps.merge(&pairs);
         if !lost.is_empty() {
@@ -2920,9 +3112,15 @@ fn run_body(
         }
         // The object orders the rules can use, built where they became needed and
         // dropped where nothing reads them (P1-F11).
-        let equal = equality
-            .as_ref()
-            .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All, &stage) > 0);
+        let equal = match &equality {
+            Some(e) => {
+                store
+                    .estimate([None, Some(e.same_as), None], Seg::All, &stage)
+                    .map_err(|Stopped| Interrupted::default())?
+                    > 0
+            }
+            None => false,
+        };
         // The orders are the store's state: built only from an answer that means something.
         check_stop()?;
         let reads = Reads::of(program.rules.iter());
@@ -2949,9 +3147,9 @@ fn run_body(
         if let Some(rewrite) = rewrite {
             facts.iter_mut().for_each(|fact| *fact = rewrite(*fact));
         }
-        facts.retain(|&f| !store.contains(f, &stage));
+        keep_unheld(&store, &mut facts, &stage).map_err(|Stopped| Interrupted::default())?;
         let mut candidates: Vec<Candidates> = vec![(None, segments(facts))];
-        pending.retain(|&fact| !store.contains(fact, &stage));
+        keep_unheld(&store, &mut pending, &stage).map_err(|Stopped| Interrupted::default())?;
         candidates.push((None, segments(std::mem::take(&mut pending))));
         // Each job with the closed family its rule belongs to, if any: a variant of such
         // a rule reads the delta without what the family produced, and what a job of the
@@ -2990,10 +3188,12 @@ fn run_body(
         }
         let probes = Probes::for_jobs(jobs.len());
         let starts = std::sync::atomic::AtomicU64::new(0);
-        // One probe per fact, counted as they are made ([`Store::retain_new`]).
+        // One probe per fact, counted as they are made ([`Store::retain_new`]). A stopped keep
+        // leaves nothing, and the morsel's latched check after it ends the stage.
         let keep = |facts: &mut Vec<Triple>, poll: &Poller<'_>| {
-            let n = store.retain_new(facts, poll);
-            starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(n) = store.retain_new(facts, poll) {
+                starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
         };
         candidates.extend(run_jobs_by_morsel(
             &current,
@@ -3083,7 +3283,8 @@ fn run_body(
                 moved
                     .par_iter_mut()
                     .for_each(|fact| *fact = reps.classes.rewrite(*fact));
-                moved.retain(|&fact| !store.contains(fact, &stage));
+                keep_unheld(&store, &mut moved, &stage)
+                    .map_err(|Stopped| Interrupted::default())?;
                 // Rewritten: no longer what a family produced.
                 candidates.push((None, segments(moved)));
                 merged = true;
@@ -3146,9 +3347,15 @@ fn run_body(
         ),
     );
     let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
-    let equal = equality
-        .as_ref()
-        .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All, &stage) > 0);
+    let equal = match &equality {
+        Some(e) => {
+            store
+                .estimate([None, Some(e.same_as), None], Seg::All, &stage)
+                .map_err(|Stopped| Interrupted::default())?
+                > 0
+        }
+        None => false,
+    };
     check_stop()?;
     store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
     let mut found = Violations::new(Arc::clone(memory));
@@ -3502,9 +3709,7 @@ pub(crate) fn check<S: Source + ?Sized>(
                 };
                 !found.record(group, words(program, c, bindings))
             });
-            if poll.stopped() {
-                return Err(Interrupted::default());
-            }
+            let stopped = stopped.map_err(|Stopped| Interrupted::default())?;
             if stopped {
                 break 'jobs;
             }
@@ -3542,9 +3747,10 @@ mod counted_tests {
         store.objects(&|_| false);
         fired_after(&AtomicBool::new(false), |poll| {
             let mut delivered = 0;
-            store.scan([None, Some(5), Some(7)], Seg::All, poll, &mut |_| {
+            let scanned = store.scan([None, Some(5), Some(7)], Seg::All, poll, &mut |_| {
                 delivered += 1
             });
+            assert!(scanned.is_err(), "a scan its poller stopped says so");
             assert_eq!(delivered, 0, "no pair has the object");
             assert!(
                 poll.stopped(),
