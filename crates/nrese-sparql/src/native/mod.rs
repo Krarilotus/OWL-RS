@@ -83,8 +83,8 @@ use nrese_exec::join::{
     left_join, outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, ChargedVec, Grant, IdTable, Reservation, UNDEF, computed_id,
-    computed_index,
+    Budget, BudgetExceeded, ChargedMap, ChargedVec, Grant, IdTable, Reservation, UNDEF,
+    computed_id, computed_index,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
@@ -3781,18 +3781,29 @@ impl<'a> Context<'a> {
             return Ok(Vec::new());
         };
         let table = &solutions.table;
-        let mut described: HashSet<u64> = HashSet::new();
-        let mut todo = Vec::new();
-        let mut out = Vec::new();
+        let mut described = ChargedMap::new(&*self.budget);
+        let mut todo = ChargedVec::new(&*self.budget);
+        // The decoded payloads stay charged with the output, just as CONSTRUCT's do.
+        // One thread, with no sibling payload grant: the whole spare.
+        // Declared before `out` so the triples are freed before their payload charge.
+        let mut kept = Grant::with_workers(&*self.budget, 1);
+        let mut out = ChargedVec::new(&*self.budget);
         for row in 0..table.len() {
             self.check()?;
             for column in 0..table.width() {
                 let id = table.get(row, column);
-                if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
-                    todo.push(id);
+                if id != UNDEF
+                    && computed_index(id).is_none()
+                    && described
+                        .get_or_insert_with(id, || ())
+                        .map_err(QueryEvaluationError::MemoryLimit)?
+                        .1
+                {
+                    todo.push(id).map_err(QueryEvaluationError::MemoryLimit)?;
                 }
             }
-            while let Some(node) = todo.pop() {
+            while let Some(node) = todo.last().copied() {
+                todo.truncate(todo.len() - 1);
                 self.check()?;
                 let Some(subject) = self
                     .term(node)
@@ -3824,15 +3835,27 @@ impl<'a> Context<'a> {
                     ) else {
                         continue;
                     };
-                    if o.is_blank_node() && described.insert(o_id) {
-                        todo.push(o_id);
+                    if o.is_blank_node()
+                        && described
+                            .get_or_insert_with(o_id, || ())
+                            .map_err(QueryEvaluationError::MemoryLimit)?
+                            .1
+                    {
+                        todo.push(o_id).map_err(QueryEvaluationError::MemoryLimit)?;
                     }
-                    out.push(nrese_rdf::Triple::new(subject.clone(), p, o));
+                    let triple = nrese_rdf::Triple::new(subject.clone(), p, o);
+                    kept.take(triple_heap(&triple))
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
+                    out.push(triple)
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
                 }
                 self.consumed(statements);
             }
         }
         self.check()?;
+        let (out, capacity) = out.into_parts();
+        capacity.transfer();
+        kept.transfer();
         Ok(out)
     }
 
