@@ -1566,6 +1566,56 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// An ordinary resolution's torn append leaves nothing a later one joins (review r1, F2): a
+    /// discard's append writes half its record and fails (the fault then gone). A readmission
+    /// with fresh blank nodes after it is acknowledged; after a restart it must still be
+    /// resolved, its statement in the data once, and a second readmission refused. Before the
+    /// fix the readmission's record was appended after the torn bytes, the two read as one
+    /// unreadable record at the start, the statement was open again, and readmitting it made a
+    /// second copy.
+    #[test]
+    fn a_torn_discard_leaves_nothing_a_readmission_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let [readmitted, discarded] = quarantined(&store_dir, dir.path());
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        TORN_RESOLUTION_APPEND.set(true);
+        let discard = store
+            .quarantine()
+            .discard(std::slice::from_ref(&discarded), None);
+        TORN_RESOLUTION_APPEND.set(false);
+        let readmission = readmit_fresh(&store, &readmitted);
+        eprintln!(
+            "discard {discard:?}, readmission ok {}",
+            readmission.is_ok()
+        );
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let mut wrong = Vec::new();
+        if discard.is_ok() {
+            wrong.push("the torn discard was acknowledged".to_owned());
+        }
+        let resolved = store
+            .quarantine()
+            .get(&readmitted)
+            .unwrap()
+            .unwrap()
+            .resolution
+            .is_some();
+        if readmission.is_ok() && !resolved {
+            wrong.push("the acknowledged readmission is open after the restart".to_owned());
+        }
+        if readmission.is_ok() && readmit_fresh(&store, &readmitted).is_ok() {
+            wrong.push("readmitted a second time".to_owned());
+        }
+        let copies = copies(&store);
+        eprintln!("after the restart: resolved {resolved}, {copies} copies");
+        if copies != u64::from(readmission.is_ok()) {
+            wrong.push(format!("{copies} copies of the statement"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// A complete last resolution followed only by zero bytes is kept (D16-322, Q06 r1 F2): a
     /// crash after the newline repair's write but before its sync can leave `{record}\0` where a
     /// filesystem extended the file before writing it. The record is an acknowledged

@@ -74,6 +74,8 @@ impl StoreService {
                 program.name()
             )));
         }
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
         if matches!(
             self.consistency(),
             crate::ConsistencyStatus::Inconsistent { .. }
