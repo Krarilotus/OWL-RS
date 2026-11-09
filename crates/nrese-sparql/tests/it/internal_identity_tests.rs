@@ -23,6 +23,36 @@ use nrese_sparql_syntax::SparqlParser;
 const REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 const SENTINEL: &str = "urn:nrese:substituted-blank-node:";
 
+/// Spec (SPARQL 1.1 §16.2): an unbound template variable emits no triple.
+#[test]
+fn e1_followup_construct_plain_blank_scope() {
+    let engine = engine(&[
+        (iri("urn:s").into(), "urn:p", iri("urn:o").into()),
+        (iri("urn:x").into(), "urn:q", iri("urn:o").into()),
+    ]);
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("CONSTRUCT { ?s <urn:r> ?_m0 } WHERE { ?s <urn:p> ?o . _:b <urn:q> ?o }")
+        .unwrap();
+    for form in [
+        nrese_sparql::ql::PrintForm::Values,
+        nrese_sparql::ql::PrintForm::Paths,
+    ] {
+        let printed = nrese_sparql::ql::print(&snapshot, &query, form).unwrap();
+        let nrese_sparql::ql::Printed::Query { text, .. } = printed else {
+            panic!("expressible")
+        };
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let QueryResults::Graph(rows) =
+            nrese_sparql_reference::evaluate_query(&snapshot, &query, &QueryOptions::default())
+                .unwrap()
+        else {
+            panic!("CONSTRUCT")
+        };
+        assert_eq!(rows.map(Result::unwrap).count(), 0, "{text}");
+    }
+}
+
 /// Spec: a ground triple pre-binding denotes the same RDF1.2 value at a SERVICE (IB0313).
 #[test]
 fn e1_followup_service_sends_a_ground_triple_value() {
