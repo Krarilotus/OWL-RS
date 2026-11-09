@@ -44,7 +44,7 @@ pub(crate) fn autocomplete(
     limit: usize,
     scope: nrese_sparql::SearchScope,
     budget: Option<&std::sync::Arc<nrese_exec::Budget>>,
-) -> Result<Vec<Suggestion>, nrese_exec::BudgetExceeded> {
+) -> Result<Vec<Suggestion>, nrese_engine::SearchRefused> {
     let query = TextQuery {
         text: typed.to_owned(),
         all_words: true,
@@ -68,10 +68,13 @@ pub(crate) fn autocomplete(
     };
     // Both indexes at once (each built at its first use, on every core).
     let (label_hits, name_hits) = match scope {
-        nrese_sparql::SearchScope::Global => rayon::join(
-            || snapshot.text_search(&query),
-            || snapshot.iri_search(&query),
-        ),
+        nrese_sparql::SearchScope::Global => {
+            let (labels, names) = rayon::join(
+                || snapshot.text_search(&query),
+                || snapshot.iri_search(&query),
+            );
+            (labels?, names?)
+        }
         nrese_sparql::SearchScope::Reader => {
             let every = nrese_engine::TextScope::EVERY;
             let (labels, names) = rayon::join(

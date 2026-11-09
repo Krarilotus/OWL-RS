@@ -1166,9 +1166,9 @@ async fn query_results_are_pinned_listed_and_unpinned() {
 
 /// A change of the default repository's reasoning that fails after publishing its
 /// inferences, and can't restore the old ones either (neither reasoning's state file can be
-/// written: `reasoning.tmp` taken), leaves the default repository unavailable until a
-/// restart: its requests get 503, while the repository list (which says why to operators),
-/// `/readyz` (ready, degraded) and the other repositories go on.
+/// written: its staging name `reasoning.state.tmp` taken), leaves the default repository
+/// unavailable until a restart: its requests get 503, while the repository list (which says why
+/// to operators), `/readyz` (ready, degraded) and the other repositories go on.
 #[tokio::test]
 async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -1190,7 +1190,7 @@ async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    std::fs::create_dir(dir.path().join("reasoning.tmp")).unwrap();
+    std::fs::create_dir(dir.path().join("reasoning.state.tmp")).unwrap();
     let (status, text) = send(
         &app,
         Method::PATCH,
@@ -1253,5 +1253,66 @@ async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
             .as_str()
             .is_some_and(|why| why.contains("restart")),
         "{text}"
+    );
+}
+
+/// Rounds of [`repository_patches_at_once_keep_each_other`]: without its fix, whether a
+/// round loses a change depends on how its two requests interleave.
+const PATCH_ROUNDS: usize = 20;
+
+/// Two `PATCH`es of different settings of one repository at once (C-1001, SYN-63): neither
+/// undoes the other. Specified: absent fields stay (the endpoint's contract), also against
+/// a change made meanwhile. On disk, so each change writes its settings file, as in
+/// production. Each round resets both, sends the two concurrently, and reads them back; the
+/// rounds that lost a change are reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repository_patches_at_once_keep_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/r2";
+    let json = Some("application/json");
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        base,
+        json,
+        r#"{"reasoning": "disabled"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let patch = |body: String| {
+        let app = app.clone();
+        tokio::spawn(async move { send(&app, Method::PATCH, base, json, &body).await })
+    };
+    let mut lost = Vec::new();
+    for round in 0..PATCH_ROUNDS {
+        let reset = r#"{"title": null, "query_timeout_ms": null}"#.to_owned();
+        let (status, text) = patch(reset).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let titled = patch(format!(r#"{{"title": "round {round}"}}"#));
+        let timed = patch(r#"{"query_timeout_ms": 5000}"#.to_owned());
+        let (titled, timed) = (titled.await.unwrap(), timed.await.unwrap());
+        assert_eq!(
+            (titled.0, timed.0),
+            (StatusCode::OK, StatusCode::OK),
+            "{titled:?} {timed:?}"
+        );
+        let (status, text) = send(&app, Method::GET, base, None, "").await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let settings = &view["settings"];
+        if settings["title"] != format!("round {round}") || settings["query_timeout_ms"] != 5000 {
+            lost.push(format!("round {round}: {settings}"));
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {PATCH_ROUNDS} rounds lost a change: {lost:#?}",
+        lost.len()
     );
 }
