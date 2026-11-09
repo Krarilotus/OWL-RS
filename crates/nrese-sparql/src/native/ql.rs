@@ -627,7 +627,6 @@ impl Rewriter<'_> {
             return false;
         };
         let other = TermPattern::Variable(Variable::new_unchecked("_qlr_other"));
-        let identity = self.snapshot.identity();
         // What a question reads, counted before it runs: each triple pattern's statements
         // with its constant predicate (and class).
         let model = data.options.read_model;
@@ -706,7 +705,8 @@ impl Rewriter<'_> {
             let snapshot = self.snapshot;
             let asked = &mut self.report.checks;
             let budget = self.limits.checks;
-            let has = data.ql.realised(identity, &key, || {
+            let mode = crate::ql::ProbeMode::of(&data.options);
+            let has = data.ql.realised(snapshot, mode, &key, || {
                 if *asked >= budget || data.options.resources.check().is_err() {
                     return None;
                 }

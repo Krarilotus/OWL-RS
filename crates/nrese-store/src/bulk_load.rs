@@ -130,6 +130,9 @@ pub(crate) fn bulk_load(
     progress: &LoadProgress,
     invalid: InvalidStatements,
     quarantine: &Quarantine,
+    // Clears the reasoning certificate once the load holds the writer slot: a load doesn't
+    // maintain the inferences.
+    invalidate: &dyn Fn(nrese_engine::WriterHeld<'_>) -> StoreResult<()>,
 ) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
     let sources = request
@@ -143,6 +146,9 @@ pub(crate) fn bulk_load(
         false => BulkMode::Append,
     };
     let load = engine.bulk_load(mode);
+    invalidate(load.writer())?;
+    #[cfg(test)]
+    crate::service::hooks::run(&crate::service::hooks::AFTER_INVALIDATION);
     let blank_nodes = BlankNodeScope::new(engine.snapshot().revision());
     let collector = match invalid {
         InvalidStatements::Strict => None,

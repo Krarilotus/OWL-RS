@@ -415,13 +415,19 @@ fn an_updates_read_source_reads_a_private_transaction() {
     ));
 }
 
-/// Search over a private view is refused as an error until V3, never an empty match (A7).
+/// Search over a private view finds what the view holds, never an empty match (A7). Until V3
+/// such a search was refused with an error; V3 (dictionary lifecycle) searches a private
+/// snapshot through its own charged path, so the property A7 protects (no empty answer, no
+/// read of another state) is now the transaction's own term as the one match.
 ///
-/// - Input: a text search for a word only the transaction's own term has.
-/// - Expected: an error, not `Ok` with no rows.
+/// - Input: a text search for a word only the transaction's own term has; the published base
+///   holds only `"published"`.
+/// - Expected: exactly that term, so neither the base nor the shared transaction answered;
+///   the dictionary unchanged.
 #[test]
-fn a_search_over_a_private_transaction_is_refused_not_empty() {
+fn a_search_over_a_private_transaction_finds_its_own_term() {
     let engine = engine();
+    let terms = engine.stats().dictionary.terms;
     let budget = unlimited();
     let mut tx = private(&engine, &budget);
     tx.try_insert(own_quad().as_ref()).unwrap();
@@ -432,14 +438,23 @@ fn a_search_over_a_private_transaction_is_refused_not_empty() {
              SELECT ?o WHERE { ?o bds:search \"transaction\" }",
         )
         .unwrap();
-    let answer: Result<Vec<()>, QueryEvaluationError> = evaluate_query(
+    let rows = evaluate_query(
         &PendingRead::new(&tx, &reads),
         &query,
         &QueryOptions::default(),
     )
     .and_then(|results| match results {
-        QueryResults::Solutions(rows) => rows.map(|row| row.map(drop)).collect(),
+        QueryResults::Solutions(rows) => rows
+            .map(|row| row.map(|solution| solution.get("o").cloned()))
+            .collect::<Result<Vec<_>, _>>(),
         _ => panic!("a SELECT"),
-    });
-    assert!(answer.is_err(), "{answer:?}");
+    })
+    .expect("a private view's search is answered");
+    assert_eq!(
+        rows,
+        [Some(own())],
+        "the transaction's own term, and only it"
+    );
+    drop(tx);
+    unpublished(&engine, terms);
 }
