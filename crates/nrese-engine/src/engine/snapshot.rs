@@ -23,8 +23,8 @@ pub(crate) use own_state::OwnSlots;
 pub use own_state::{Admission, OwnState};
 
 mod reader_search;
-pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
+pub(crate) use reader_search::{CorpusAdmission, Documents};
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
