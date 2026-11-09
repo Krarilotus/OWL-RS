@@ -268,17 +268,21 @@ impl StoreService {
             .dl
             .bounds
             .set_kept(std::sync::Arc::new(service.envelope(None).part()));
+        // Under the writer slot, as every change of the certificate (Q06 remainder, invariant C).
+        let tx = service.engine.transaction();
+        let writer = tx.writer().expect("a transaction holds the writer slot");
         if service.engine.snapshot().revision() != before {
-            service.invalidate_reasoning()?;
+            service.invalidate_held(writer)?;
         }
         if let Some(state) = service.reasoning_state() {
-            service.note_equality(&state);
+            service.note_equality(writer, &state);
             // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
             *service
                 .materialised
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
+        drop(tx);
         service.pin_configured_queries()?;
         Ok(service)
     }
@@ -288,8 +292,8 @@ impl StoreService {
     ///
     /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
     /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
-    fn note_equality(&self, state: &crate::ReasoningState) {
-        self.note_ql(state);
+    fn note_equality(&self, writer: nrese_engine::WriterHeld<'_>, state: &crate::ReasoningState) {
+        self.note_ql(writer, state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
@@ -309,7 +313,7 @@ impl StoreService {
     /// ql-rewriting.md §4): `owl2-ql` and `owl2-rl` make the data H-complete, `owl2-rl`
     /// with its list rules; the others don't close inverses or the domains of restrictions.
     /// Under `owl2-dl` the bounds give those answers ([`crate::dl`]): no rewriting.
-    fn note_ql(&self, state: &crate::ReasoningState) {
+    fn note_ql(&self, _writer: nrese_engine::WriterHeld<'_>, state: &crate::ReasoningState) {
         use nrese_sparql::ql::{Closure, QlRewriting};
         let closure = match state.ruleset.as_str() {
             "owl2-rl" => Some(Closure { lists: true }),
@@ -390,10 +394,17 @@ impl StoreService {
     }
 
     /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
+    /// Under the writer slot: the certificate it reads can't be cleared meanwhile.
     pub fn set_ql_rewriting(&self, mode: crate::QlRewritingMode) {
+        let tx = self.engine.transaction();
         *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
         if let Some(state) = self.reasoning_state() {
-            self.note_ql(&state);
+            #[cfg(test)]
+            hooks::run(&hooks::AFTER_QL_READ);
+            self.note_ql(
+                tx.writer().expect("a transaction holds the writer slot"),
+                &state,
+            );
         }
     }
 
@@ -498,10 +509,10 @@ impl StoreService {
     /// of its publication ([`nrese_engine::Finished`]): no other write comes between them.
     fn record_reasoning(
         &self,
-        _writer: nrese_engine::WriterHeld<'_>,
+        writer: nrese_engine::WriterHeld<'_>,
         state: crate::ReasoningState,
     ) -> StoreResult<()> {
-        self.note_equality(&state);
+        self.note_equality(writer, &state);
         let text = state.to_text();
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         let Some(path) = self.marker_path() else {
@@ -753,6 +764,8 @@ impl StoreService {
     /// pipeline running the reasoner's `owl2-dl` mode registers it, and whether user rules
     /// run with it.
     pub fn use_dl(&self, active: bool, user_rules: bool) {
+        // Under the writer slot, as every change of the certificate's QL schema.
+        let tx = self.engine.transaction();
         self.dl.set_active(active, user_rules);
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
@@ -761,7 +774,10 @@ impl StoreService {
             // Off: the rewriting the closure and the setting call for, whatever came first
             // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
             // path, which switches the bounds off, exists).
-            self.note_ql(&state);
+            self.note_ql(
+                tx.writer().expect("a transaction holds the writer slot"),
+                &state,
+            );
         }
     }
 
@@ -2186,6 +2202,9 @@ pub(crate) mod hooks {
         pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
+        /// A change of the QL rewriting setting has read the certificate and is about to
+        /// install the rewriting it calls for.
+        pub(crate) static AFTER_QL_READ: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
@@ -2305,6 +2324,34 @@ mod certificate_tests {
         let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
         stale(&store, "after a reopen", &mut wrong);
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The QL schema is part of the certificate (sol-loop r1, S3): a bulk load between a QL
+    /// setting's read of the certificate and its installing the rewriting. The rewriting
+    /// relies on the `owl2-rl` closure; once the load leaves no certificate, none may be
+    /// installed. Before the fix the setter read the certificate without the writer slot,
+    /// the load cleared it and committed, and the setter installed the rewriting after.
+    #[test]
+    fn a_ql_setting_raced_by_a_bulk_load_installs_no_rewriting_without_a_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &a);
+        let rl = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+            .materialised_program()
+            .expect("OWL 2 RL reasons");
+        store.rematerialise(rl).unwrap();
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_QL_READ, move || load(&racer, &b));
+        store.set_ql_rewriting(crate::QlRewritingMode::On);
+        join(&joined);
+        let rewriting = store.query_settings().ql().is_some();
+        let certified = store.reasoning_state().is_some();
+        eprintln!("QL rewriting {rewriting}, certificate {certified}");
+        assert!(
+            !rewriting || certified,
+            "QL rewriting installed over data no certificate covers"
+        );
     }
 
     /// C2: a bulk load between a rematerialisation's publication and its certificate. Before

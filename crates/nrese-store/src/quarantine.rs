@@ -232,6 +232,9 @@ pub struct Quarantine {
     state: Mutex<State>,
     /// Held by a resolution from its check to its record: one per statement.
     resolving: Mutex<()>,
+    /// The log may end in bytes an append wrote and couldn't take back: nothing more is
+    /// appended (it would join them, and both be lost at open) until the next open repairs it.
+    unknown: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -335,12 +338,17 @@ impl Quarantine {
                 if beyond {
                     drop_beyond(&resolutions, recovered, &mut state.resolutions)?;
                 }
+                // Its name settled, whatever an earlier open's rewrite left unsynced (the
+                // rename done, the directory's sync failed or never reached): the log read
+                // here is the one a power loss keeps, before anything can commit.
+                nrese_engine::place::sync_dir(dir)?;
             }
         }
         Ok(Self {
             dir,
             state: Mutex::new(state),
             resolving: Mutex::new(()),
+            unknown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -528,12 +536,24 @@ impl Quarantine {
     /// Records `resolution`: appended to the log, then in effect.
     fn record(&self, resolution: Resolution) -> StoreResult<()> {
         if let Some(dir) = &self.dir {
+            self.appendable()?;
             append(dir, &resolution)?;
         }
         self.state()
             .resolutions
             .insert(resolution.id.clone(), resolution);
         Ok(())
+    }
+
+    /// An error once the log may end in bytes an append couldn't take back ([`Self::unknown`]).
+    fn appendable(&self) -> io::Result<()> {
+        match self.unknown.load(Ordering::Acquire) {
+            true => Err(io::Error::other(
+                "the quarantine's resolutions log may end in a failed append's bytes: no \
+                 resolution is recorded until the store opens again",
+            )),
+            false => Ok(()),
+        }
     }
 
     /// The write that admits the open statement `id` as `request` asks, and the text it
@@ -656,6 +676,11 @@ fn append(dir: &Path, resolution: &Resolution) -> io::Result<()> {
         .append(true)
         .open(dir.join(RESOLUTIONS))?;
     let line = serde_json::to_string(resolution).expect("a resolution serialises");
+    #[cfg(test)]
+    if tests::TORN_RESOLUTION_APPEND.get() {
+        log.write_all(&line.as_bytes()[..line.len() / 2])?;
+        return Err(io::Error::other("the resolution's append tore (a test's)"));
+    }
     log.write_all(format!("{line}\n").as_bytes())?;
     log.sync_data()?;
     #[cfg(test)]
@@ -716,6 +741,12 @@ fn log_len(dir: &Path) -> io::Result<u64> {
 /// Takes the resolutions log in `dir` back to its first `len` bytes, durably: what an append
 /// that failed may have written is gone.
 fn take_back(dir: &Path, len: u64) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_TAKE_BACK.get() {
+        return Err(io::Error::other(
+            "taking back the resolution failed (a test's)",
+        ));
+    }
     let log = match fs::OpenOptions::new()
         .write(true)
         .open(dir.join(RESOLUTIONS))
@@ -818,6 +849,9 @@ pub fn readmit(
         let noted = std::sync::Arc::clone(&noted);
         let note: nrese_engine::CommitNote<'_> = Box::new(move |revision| {
             resolution.outcome = Outcome::Readmitted { revision };
+            quarantine
+                .appendable()
+                .map_err(nrese_engine::NoteError::Refused)?;
             let before = log_len(&dir).map_err(nrese_engine::NoteError::Refused)?;
             match append(&dir, &resolution) {
                 Ok(()) => {
@@ -830,7 +864,11 @@ pub fn readmit(
                 // revision, and the engine lets no other commit take it.
                 Err(error) => match take_back(&dir, before) {
                     Ok(()) => Err(nrese_engine::NoteError::Refused(error)),
-                    Err(_) => Err(nrese_engine::NoteError::Unknown(error)),
+                    Err(_) => {
+                        // Nothing more joins what it left (sol-loop r1, S2).
+                        quarantine.unknown.store(true, Ordering::Release);
+                        Err(nrese_engine::NoteError::Unknown(error))
+                    }
                 },
             }
         });
@@ -1112,6 +1150,12 @@ mod tests {
             const { std::cell::Cell::new(false) };
         /// A resolution's append fails before it writes anything.
         pub(super) static FAIL_RESOLUTION_APPEND: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// A resolution's append writes half its record, then fails.
+        pub(super) static TORN_RESOLUTION_APPEND: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Taking back what a failed append wrote fails.
+        pub(super) static FAIL_TAKE_BACK: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
         /// The process stops (exits with [`STOPPED`], nothing unwound) at this point of a
         /// readmission.
@@ -1418,6 +1462,107 @@ mod tests {
         drop(store);
         let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
         check(&store, "after commits past it and a restart", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The log a start reads is the one a power loss keeps (sol-loop r1, S1): a start that
+    /// rewrote the log without a readmission past the store's revision renamed it into place,
+    /// and the quarantine directory's sync then failed (`fault_points`). The next start, that
+    /// sync still failing, must refuse too: its log is in place but not known durable, and a
+    /// power loss could bring back the readmission once a later commit takes its revision.
+    /// Once the sync works the store opens, the readmission open. Before the fix the next
+    /// start found nothing to rewrite and opened without settling the rename.
+    #[test]
+    fn a_start_settles_the_log_an_earlier_start_rewrote() {
+        use nrese_engine::fault_points::fail_dir_sync_of;
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let [readmitted, _] = quarantined(&store_dir, dir.path());
+        let revision = {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            store.engine().snapshot().revision()
+        };
+        let quarantine = store_dir.join(DIR);
+        fs::write(
+            quarantine.join(RESOLUTIONS),
+            line(&Resolution {
+                id: readmitted.clone(),
+                outcome: Outcome::Readmitted {
+                    revision: revision + 3,
+                },
+                at: 0,
+                repairs: Vec::new(),
+                text: None,
+                note: None,
+            }),
+        )
+        .unwrap();
+        let open = || crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir));
+        let mut wrong = Vec::new();
+        fail_dir_sync_of(Some((&quarantine, io::ErrorKind::Other)));
+        let rows = ["the start that rewrites", "the next start"].map(|row| (row, open().is_ok()));
+        fail_dir_sync_of(None);
+        for (row, opened) in rows {
+            eprintln!("row {row}: opened {opened}");
+            if opened {
+                wrong.push(format!("{row}: opened with its log's name not durable"));
+            }
+        }
+        match open() {
+            Ok(store)
+                if store
+                    .quarantine()
+                    .get(&readmitted)
+                    .unwrap()
+                    .unwrap()
+                    .resolution
+                    .is_none() => {}
+            Ok(_) => wrong.push("once the sync works: the readmission is resolved".to_owned()),
+            Err(error) => wrong.push(format!("once the sync works: {error}")),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// No resolution joins bytes a failed append left (sol-loop r1, S2): a readmission's
+    /// append writes half its record and fails, and taking it back fails too. A discard after
+    /// it is either refused or, if acknowledged, kept after a restart; the readmission is
+    /// open with no copy. Before the fix the discard was appended after the torn bytes,
+    /// acknowledged, and skipped with them as one unreadable record at the next start.
+    #[test]
+    fn no_resolution_joins_an_append_that_couldnt_be_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let [readmitted, discarded] = quarantined(&store_dir, dir.path());
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        TORN_RESOLUTION_APPEND.set(true);
+        FAIL_TAKE_BACK.set(true);
+        let readmission = readmit_fresh(&store, &readmitted);
+        TORN_RESOLUTION_APPEND.set(false);
+        FAIL_TAKE_BACK.set(false);
+        let discard = store
+            .quarantine()
+            .discard(std::slice::from_ref(&discarded), None);
+        eprintln!(
+            "readmission ok {}, discard {discard:?}",
+            readmission.is_ok()
+        );
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let mut wrong = Vec::new();
+        if readmission.is_ok() {
+            wrong.push("the readmission was acknowledged".to_owned());
+        }
+        let resolution = |id: &str| store.quarantine().get(id).unwrap().unwrap().resolution;
+        if discard.is_ok() && resolution(&discarded).is_none() {
+            wrong.push("the acknowledged discard was lost at the restart".to_owned());
+        }
+        if resolution(&readmitted).is_some() || copies(&store) != 0 {
+            wrong.push(format!(
+                "the readmission: resolved {}, {} copies",
+                resolution(&readmitted).is_some(),
+                copies(&store)
+            ));
+        }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
