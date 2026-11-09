@@ -224,10 +224,16 @@ fn a_pending_read_is_the_gathered_one() {
         )
     };
     let [mut base_inferred, mut view_added, mut deleted] = [0_usize; 3];
+    let [mut adding_views, mut restricting_views] = [0_usize; 2];
     for seed in 0..48_u64 {
         let mut rng = Seeded(seed);
         let subjects = 10 + 10 * (seed % 9);
-        // Graphs 1 to 5; the reader reads 1, 2 and the default graph.
+        // Graphs 1 to 5; the reader reads 1, 2 and the default graph, and for two seeds in
+        // eight every graph, so that nothing is out of its reach and its view only restricts.
+        let reach = match seed % 8 >= 6 {
+            true => 5,
+            false => 2,
+        };
         let mut data: Vec<Quad> = Vec::new();
         for s in 0..subjects {
             for _ in 0..1 + rng.below(3) {
@@ -269,7 +275,7 @@ fn a_pending_read_is_the_gathered_one() {
             .unwrap();
         store.use_reasoning_rules(Some(nrese_reasoner::rulesets::Ruleset::Owl2Rl.into()));
         let access = Arc::new(GraphAccess {
-            graphs: vec!["urn:t:g1".to_owned(), "urn:t:g2".to_owned()],
+            graphs: (1..=reach).map(|g| format!("urn:t:g{g}")).collect(),
             default_graph: true,
             inferred: true,
             inferred_by_support: seed % 2 == 0,
@@ -286,6 +292,19 @@ fn a_pending_read_is_the_gathered_one() {
         .unwrap();
         let mut tx = store.engine().speculative();
         let view = reading.committed(tx.base()).unwrap();
+        // Dictionary 3.0, sol-loop r1 S1: a view showing facts its published base doesn't
+        // infer (asserted out of the reader's reach) is an addition and unpublished; one
+        // that only hides its base's inferences keeps the base's publication.
+        let adds = view
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .any(|quad| !tx.base().contains_in(ReadModel::Inferred, &quad));
+        assert_eq!(
+            view.shared_state().is_some(),
+            !adds,
+            "seed {seed}: a view adding facts {adds} has a token"
+        );
+        adding_views += usize::from(adds);
+        restricting_views += usize::from(!adds);
         for round in 0..3 {
             for _ in 0..1 + rng.below(2 + 4 * (seed % 5)) {
                 if rng.below(4) == 0 && !data.is_empty() {
@@ -324,6 +343,10 @@ fn a_pending_read_is_the_gathered_one() {
         base_inferred > 0 && view_added > 0 && deleted > 0,
         "the kinds of change covered: base-inferred asserted {base_inferred}, view-added \
          asserted in reach {view_added}, deletions {deleted}"
+    );
+    assert!(
+        adding_views > 0 && restricting_views > 0,
+        "both kinds of view covered: adding {adding_views}, restricting {restricting_views}"
     );
 }
 
