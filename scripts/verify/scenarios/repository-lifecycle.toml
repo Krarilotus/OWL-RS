@@ -60,16 +60,48 @@ status = 200
 json = { "$.title" = "Verify lifecycle, configured", "$.reasoning" = "rdfs" }
 
 [[step]]
-name = "write a class hierarchy and an instance into it"
+name = "open a private load session"
 method = "POST"
-path = "/api/v1/repositories/${repo}/update"
-headers = { Content-Type = "application/sparql-update" }
+path = "/api/v1/repositories/${repo}/sessions"
+[step.expect]
+status = 201
+[step.capture]
+session = { json = "$.path" }
+
+[[step]]
+name = "load a class hierarchy and an instance into the session"
+method = "POST"
+path = "${session}/data"
+headers = { Content-Type = "text/turtle" }
 body = """
-INSERT DATA {
   <${ex}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <${ex}Animal> .
   <${ex}tom> a <${ex}Cat> .
-}
 """
+[step.expect]
+status = 204
+
+[[step]]
+name = "query and reason over the uncommitted load"
+path = "${session}/query"
+params = { query = "ASK { <http://example.com/verify/tom> a <http://example.com/verify/Animal> }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = true }
+
+[[step]]
+name = "the repository cannot see the private load"
+path = "/api/v1/repositories/${repo}/query"
+params = { query = "ASK { <http://example.com/verify/tom> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = false }
+
+[[step]]
+name = "commit the load and its reasoning"
+method = "POST"
+path = "${session}/commit"
 [step.expect]
 status = 204
 
@@ -110,6 +142,17 @@ headers = { Accept = "application/sparql-results+json" }
 [step.expect]
 status = 200
 json = { "$.boolean" = true }
+
+[[step]]
+name = "export the reopened asserted graph"
+path = "/api/v1/repositories/${repo}/data?default"
+params = { infer = "false" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 200
+rows = 2
+body = [{ contains = '<${ex}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <${ex}Animal> .' },
+        { contains = '<${ex}tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <${ex}Cat> .' }]
 
 [[step]]
 name = "remove it"

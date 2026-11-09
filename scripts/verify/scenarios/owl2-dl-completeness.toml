@@ -44,3 +44,28 @@ headers = { Accept = "application/sparql-results+json" }
 status = 200
 headers = { nrese-completeness = "complete" }
 rows = 0
+
+[[step]]
+name = "reopen the committed ontology"
+restart = true
+
+[[step]]
+name = "the exact answer and its completeness survive reopen"
+path = "/dataset/query"
+params = { query = "SELECT ?x { ?x a <http://example.com/D> }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = "complete; regime=owl2-dl; lower=2; upper=3; unresolved=0" }
+rows = 3
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.com/x" } }
+
+[[step]]
+name = "export the reopened ontology's asserted instances"
+path = "/dataset/data?default"
+params = { infer = "false" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 200
+body = [{ contains = '<http://example.com/x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/A> .' },
+        { contains = '<http://example.com/y> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/B> .' }]
