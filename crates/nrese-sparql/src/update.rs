@@ -283,7 +283,7 @@ fn add(
     let Some(source) = source.filter(|&id| options.sees(tx, id)) else {
         return Ok(());
     };
-    let mut ticker = nrese_exec::Ticker::new(options.resources.stop()).map_err(cancelled)?;
+    let ticker = nrese_exec::Ticker::new(options.resources.stop()).map_err(cancelled)?;
     // The state before this operation, the request's earlier operations included.
     let mut quads = nrese_exec::ChargedVec::new(Arc::new(options.resources.memory.part()));
     for quad in tx.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::in_graph(source)) {
