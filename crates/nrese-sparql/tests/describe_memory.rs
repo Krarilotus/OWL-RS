@@ -122,6 +122,27 @@ fn describe_charges_the_terms_it_keeps_decoded() {
     assert_eq!(envelope.used(), 0, "dropped, nothing stays charged");
 }
 
+// Spec (D16-039, sol-loop r1 S2): a decode cache gives way to what the answer must hold.
+// DESCRIBE of one statement with a 1 MiB literal under a 1.5 MiB envelope holds the literal
+// once in its output, which fits; a second copy kept for reuse would not, so it isn't kept.
+#[test]
+fn a_cached_term_never_crowds_out_the_answer() {
+    let engine = distinct(1, 1 << 20);
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new().parse_query("DESCRIBE <urn:a>").unwrap();
+    let options = QueryOptions {
+        resources: Resources {
+            memory: Envelope::new(Some(3 << 19), None),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let QueryResults::Graph(rows) = evaluate_query(&snapshot, &query, &options).unwrap() else {
+        panic!("DESCRIBE returns a graph")
+    };
+    assert_eq!(rows.map(Result::unwrap).count(), 1);
+}
+
 // Guard (D16-039): a decode cache is never needed for an answer. A filter over 16,384
 // distinct 1 KiB literals (16 MiB of text, decoded to be tested) under a 4 MiB envelope, far
 // more than its rows of ids need, still answers, every row.

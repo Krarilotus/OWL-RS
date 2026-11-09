@@ -316,12 +316,13 @@ fn a_failed_reconfiguration_keeps_the_old_reasoning() {
         ..StoreConfig::in_memory()
     })
     .expect("store");
-    store
-        .execute_update_str(
-            "INSERT DATA { <http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
-                           <http://e/a> a <http://e/C> }",
-        )
-        .expect("written");
+    // Loaded past the pipeline: a write's pending changes draw on the process's memory, 1 byte
+    // here (D16-039), and the data is the reconfiguration's, not what this tests.
+    crate::support::load_past_the_pipeline(
+        &store,
+        "<http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
+         <http://e/a> a <http://e/C> .",
+    );
     let catalog =
         Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue");
     let pipeline = || Arc::clone(&*catalog.default_repository().pipeline.read());
