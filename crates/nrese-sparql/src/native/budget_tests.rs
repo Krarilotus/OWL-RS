@@ -9,6 +9,33 @@ use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql_syntax::SparqlParser;
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
+/// Spec: retaining an alias reserves at least its copied literal payload, once (F1).
+#[test]
+fn e1_followup_alias_retention_is_charged_once() {
+    let engine = store([]);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let payload = "x".repeat(65_536);
+    let term: Term = nrese_rdf::Triple::new(
+        node("s"),
+        node("p"),
+        nrese_rdf::Literal::from(payload.as_str()),
+    )
+    .into();
+    let id = ctx.id(&term).ok().unwrap();
+    let alias = internal::class_constant(id);
+    let before = ctx.budget.used();
+    ctx.register_alias(alias.as_str(), id);
+    let after = ctx.budget.used();
+    assert!(
+        after - before >= payload.len(),
+        "retained triple copy must draw from the budget"
+    );
+    ctx.register_alias(alias.as_str(), id);
+    assert_eq!(ctx.budget.used(), after, "same alias retains no new value");
+}
+
 fn node(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{local}"))
 }
