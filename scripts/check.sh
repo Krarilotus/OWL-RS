@@ -462,13 +462,9 @@ case "$mode" in
     step locks bash scripts/check-locks.sh
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
     step names bash scripts/check-names.sh
-    if cargo deny --version > /dev/null 2>&1; then
-      step deny cargo deny --all-features check
-      step "deny (bench harness)" cargo deny --manifest-path benches/nrese-bench-harness/Cargo.toml \
-        --config deny.toml --all-features check
-    else
-      echo "=== cargo-deny isn't installed (cargo install --locked cargo-deny): skipped"
-    fi
+    step deny cargo deny --all-features check
+    step "deny (bench harness)" cargo deny --manifest-path benches/nrese-bench-harness/Cargo.toml \
+      --config deny.toml --all-features check
     console
     ;;
   *)
