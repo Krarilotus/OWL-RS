@@ -261,18 +261,49 @@ impl Quarantine {
             }
             let resolutions = dir.join(RESOLUTIONS);
             if resolutions.exists() {
-                for line in BufReader::new(File::open(&resolutions)?).lines() {
-                    let line = line?;
-                    match serde_json::from_str::<Resolution>(&line) {
+                let mut log = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&resolutions)?;
+                let mut reader = BufReader::new(&log);
+                let mut framed = 0;
+                let mut line = Vec::new();
+                while reader.read_until(b'\n', &mut line)? != 0 {
+                    let terminated = line.last() == Some(&b'\n');
+                    match serde_json::from_slice::<Resolution>(&line) {
                         Ok(resolution) => {
                             state.resolutions.insert(resolution.id.clone(), resolution);
+                            if !terminated {
+                                // A complete record needs its delimiter before the next append.
+                                drop(reader);
+                                log.seek(SeekFrom::End(0))?;
+                                log.write_all(b"\n")?;
+                                log.sync_data()?;
+                                break;
+                            }
                         }
-                        // A record torn by a crash: its resolution didn't happen.
-                        Err(_) if !line.is_empty() => {
-                            tracing::warn!(record = %line, "skipped an unreadable quarantine resolution");
+                        Err(_) if !terminated => {
+                            // Recovery must remove the torn tail, or the next record would
+                            // join it and an acknowledged resolution would disappear on reopen.
+                            tracing::warn!(bytes = line.len(), record = %String::from_utf8_lossy(&line), "truncating a torn quarantine resolution");
+                            drop(reader);
+                            log.set_len(framed)?;
+                            log.sync_data()?;
+                            break;
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            // Keep the existing error policy for framed records, including
+                            // invalid UTF-8; only the unfinished tail is repaired above.
+                            let text = std::str::from_utf8(&line).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?;
+                            if !text.trim_end_matches(['\r', '\n']).is_empty() {
+                                tracing::warn!(record = %text, "skipped an unreadable quarantine resolution");
+                            }
+                        }
                     }
+                    framed += line.len() as u64;
+                    line.clear();
                 }
             }
         }

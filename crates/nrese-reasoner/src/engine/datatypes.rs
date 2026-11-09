@@ -21,18 +21,11 @@
 //! beyond what the owner represents (`LiteralError::Unsupported`).
 
 use crate::ir::{Triple, Violations};
-use nrese_engine::{TermId, TermKind};
+use nrese_engine::TermId;
 use nrese_exec::Budget;
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::owl::{Datatype, LiteralError, Value, ValueSet};
 use std::sync::Arc;
-
-fn is_literal(id: u64) -> bool {
-    !matches!(
-        TermId::from_raw(id).kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
-}
 
 /// What a literal is under OWL 2's datatype map.
 #[derive(Debug, PartialEq)]
@@ -87,7 +80,7 @@ pub(crate) fn violations(
         if !out.complete() {
             break;
         }
-        if !is_literal(s) {
+        if !TermId::from_raw(s).kind().is_literal() {
             continue;
         }
         if p == rdf_type {
@@ -99,7 +92,7 @@ pub(crate) fn violations(
             {
                 out.record(group, [s, o]);
             }
-        } else if Some(p) == same_as && is_literal(o) && s < o {
+        } else if Some(p) == same_as && TermId::from_raw(o).kind().is_literal() && s < o {
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
                 continue;
             };
@@ -208,6 +201,19 @@ mod tests {
         );
         // Guard (holds on the base too).
         assert_eq!(rules("ex:a ex:code \"a b\" ."), none, "a token");
+        // rdf:PlainLiteral's strings hold XML's Char only (rdf:PlainLiteral §§2-3): a language
+        // string holding U+0001 is outside it; an ordinary one is inside (SHACL datatype-map
+        // review r2, R2-F1).
+        assert_eq!(
+            rules("ex:plain rdfs:range rdf:PlainLiteral . ex:a ex:plain \"a\\u0001b\"@en ."),
+            ["dt-not-type"],
+            "U+0001 is no PlainLiteral text"
+        );
+        assert_eq!(
+            rules("ex:plain rdfs:range rdf:PlainLiteral . ex:a ex:plain \"a\"@en ."),
+            none,
+            "an ordinary language string is a PlainLiteral"
+        );
         // Every literal of OWL 2's datatype map is judged by its data value (OWL 2 Structural
         // Specification §4, OWL 2 Profiles table 8). An ill-typed literal has no value, so it is
         // in no value space (RDF 1.2 Concepts §3.4: "a semantic inconsistency"). Every row is

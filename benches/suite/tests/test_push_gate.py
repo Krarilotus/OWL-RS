@@ -39,19 +39,29 @@ ZERO = "0" * 40
 COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
+          "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", *isolation.NS_SH, "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
+answer() {
+  tier=$(cat "$FAKE/tier" 2> /dev/null)
+  if [ -d "$FAKE/$tier" ]; then echo "$FAKE/$tier"; else echo "$FAKE"; fi
+}
 case "$1" in
-  submit) n=$(ls "$FAKE"/job-*.toml 2> /dev/null | wc -l); cp "$2" "$FAKE/job-$n.toml"; echo gate-1 ;;
-  status) cat "$FAKE/status" ;;
+  submit) n=$(ls "$FAKE"/job-*.toml 2> /dev/null | wc -l)
+    cp "$2" "$FAKE/job-$n.toml" || exit $?
+    tier=push; grep -q windows-job.ps1 "$2" && tier=windows
+    printf '%s\\n' "$tier" > "$FAKE/tier" || exit $?
+    echo gate-1 ;;
+  status) cat "$(answer)/status" ;;
   cancel) echo "$2" >> "$FAKE/cancelled" ;;
-  results) echo "$FAKE/results" ;;
+  results) echo "$(answer)/results" ;;
 esac
 """
 # A stand-in for rustc: the toolchain a gate's identity names.
 RUSTC = """#!/bin/sh
+[ "${1#+}" != "$1" ] && shift
 [ "$1" = -vV ] && printf 'rustc 1.98.1\\nbinary: rustc\\ncommit-hash: abcdef1234567890\\nrelease: 1.98.1\\n'
 exit 0
 """
@@ -127,12 +137,14 @@ class Repo(unittest.TestCase):
         *runtime, name = done.stdout.rstrip("\n").split("\n")
         return "\n".join(runtime), name
 
-    def fleet(self, state, tree=None, files=(), tier="push", runtime="declared"):
+    def fleet(self, state, tree=None, files=(), tier="push", runtime="declared", separate=False):
         """The fleet's answer: the job's state and, with TREE, a whole, consistent passing result
         of its gate (TIER) for TREE and FILES; a Windows one, as its job records it, under the
         Python runtime HEAD declares, if it declares one, or under RUNTIME (None: it states none)."""
-        (self.fake / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
-        out = self.fake / "results" / "out"
+        where = self.fake / tier if separate else self.fake
+        out = where / "results" / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        (where / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
         for name in ("gate.json", "attempt", "gate.log"):
             if (out / name).exists():
                 (out / name).unlink()
@@ -141,7 +153,7 @@ class Repo(unittest.TestCase):
         listed = "".join(f"{f}\n" for f in files).encode()  # bytes: the list check.sh hashes has bare LFs
         list_hash = subprocess.run(["git", "hash-object", "--stdin"], input=listed, capture_output=True, cwd=self.repo,
                                    env=self.env, check=True).stdout.decode().strip()
-        identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity"], cwd=self.repo,
+        identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
                                   capture_output=True, text=True, env=self.env).stdout.strip()
         record = {
             "tier": tier, "part": "rest", "tree": tree, "list_hash": list_hash, "identity": identity,
@@ -172,6 +184,45 @@ class Repo(unittest.TestCase):
 
 class PushGate(Repo):
     """The hook and check.sh's push tier, end to end with the stand-in fleet."""
+
+    def test_identity_uses_the_requested_commits_inputs(self):
+        # Spec: IB0622-25e2: the identity of a pushed commit equals its own checkout's,
+        # even when the pusher has different tools, requirements, compiler and flag code.
+        compiler = self.fake / "bin/rustc"
+        compiler.write_text('#!/bin/sh\ncase "$1" in\n+1.98.1) v=1.98.1;;\n'
+                            '+1.99.0) v=1.99.0;;\n*) v=WRONG;;\nesac\n'
+                            'printf "release: %s\\ncommit-hash: abcdef1234567890\\n" "$v"\n', newline="\n")
+        compiler.chmod(0o755)
+
+        def identity(rev):
+            done = subprocess.run([BASH, "-c", '. scripts/lib/gate-key.sh && gate_identity "$1"', "-", rev],
+                                  cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.strip()
+
+        previous = identity("HEAD")
+        for path, text in (("scripts/lib/gate-tools.txt", "# changed tools\n"),
+                           ("benches/suite/requirements.txt", "# changed requirements\n"),
+                           ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n'),
+                           ("scripts/lib/target-cpu.sh", 'export_target_cpu_rustflags() { export RUSTFLAGS="-C opt-level=1"; }\n')):
+            with self.subTest(path=path):
+                original = (self.repo / path).read_text()
+                tip = self.commit(path, text if path.endswith((".toml", ".sh")) else original + text)
+                own = identity("HEAD")
+                self.git(self.repo, "checkout", "-q", "--detach", f"{tip}^")
+                self.assertEqual(identity(tip), own, f"SPEC identity reads {path} from the pushed commit")
+                self.assertNotEqual(own, previous, f"SPEC identity distinguishes changed {path}")
+                if path.endswith(".toml"):
+                    self.assertIn("rustc-1.99.0-", own)
+                self.git(self.repo, "checkout", "-q", "--detach", tip)
+                previous = own
+
+    def test_fake_submit_refuses_a_job_it_cannot_copy(self):
+        # Spec: D16-150: the fleet fake cannot acknowledge a submission it lost.
+        done = subprocess.run([BASH, str(self.fake / "fleet"), "submit", "missing.toml"],
+                              cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(done.returncode, 0, f"SPEC faithful fake: {done.stdout}{done.stderr}")
+        self.assertEqual(done.stdout, "", "SPEC faithful fake: no success id for a lost job")
 
     def test_deletions_alone_need_no_gate(self):
         """A push that only deletes refs has no tree to gate: the hook lets it through and asks
@@ -209,21 +260,26 @@ class PushGate(Repo):
         Windows check is a merge gate with nothing in the environment too."""
         gate = 'priority_class = "merge-gate"'
         tip = self.commit("a.txt", "a changed\n")
-        self.fleet("done", self.tree(tip), ["a.txt"])  # the push tier passes, so the Windows check follows
+        self.fleet("done", self.tree(tip), ["a.txt"], separate=True)
+        self.fleet("done", self.tree(tip), tier="windows", separate=True)
         self.env["NRESE_PUSH_REF"] = "refs/heads/refactor/engine-v2"  # left in the pusher's environment
-        self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO),
-                  ("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        first = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO),
+                          ("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
         del self.env["NRESE_PUSH_REF"]
         tip = self.commit("b.txt", "b changed\n")
-        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
-        self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"], separate=True)
+        self.fleet("done", self.tree(tip), tier="windows", separate=True)
+        second = self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        diagnostics = "\n".join(f"hook {i}: rc={d.returncode}\nstdout:\n{d.stdout}\nstderr:\n{d.stderr}"
+                                for i, d in enumerate((first, second), 1))
+        self.assertEqual([first.returncode, second.returncode], [0, 0], diagnostics)
         jobs = [("windows" if "windows-job.ps1" in path.read_text() else "push",
                  re.findall(r"^priority_class = .*$", path.read_text(), re.M))
                 for path in sorted(self.fake.glob("job-*.toml"))]
         # The package's push tier; engine-v2's passed before for this tree, then its Windows check;
         # the next push's two.
         self.assertEqual(jobs, [("push", []), ("windows", [gate]), ("push", [gate]), ("windows", [gate])],
-                         "SPEC merge-gate: by the hook, each check told its own ref")
+                         "SPEC merge-gate: by the hook, each check told its own ref\n" + diagnostics)
 
     def test_a_build_host_variable_in_the_pushers_environment_changes_nothing(self):
         """NRESE_ON_BUILD_HOST, the gate's own mark for a run on a build host, in the pusher's
@@ -462,7 +518,7 @@ esac
     def test_no_gate_under_flags_its_identity_doesnt_name(self):
         """Sol, review-remote-gates-r1-20261020 (ENCODED_RUSTFLAGS): two encoded cfgs gave one identity."""
         for flags in ("--cfg\x1fvariant_a", ""):
-            done = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity"], cwd=self.repo,
+            done = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
                                   capture_output=True, text=True, env={**self.env, "CARGO_ENCODED_RUSTFLAGS": flags})
             self.assertNotEqual(done.returncode, 0, f"SPEC encoded-flags: {done.stdout}")
             self.assertIn("CARGO_ENCODED_RUSTFLAGS", done.stderr)
@@ -644,7 +700,7 @@ class GateJob(Repo):
         stubs.mkdir()
         for name, body in {
             "rustup": "exit 0",
-            "rustc": 'case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
+            "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
             "cargo": 'echo "cargo-nextest 0.9.146"',  # the pinned one (Miri's too): nothing to install
             "cc-links": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
@@ -845,7 +901,7 @@ class WindowsCheck(Repo):
         whichever Python its host had: the commit is checked again."""
         tip = self.commit("a.txt", "a changed\n")
         old = subprocess.run([BASH, "-c", '. scripts/lib/gate-key.sh && gate_key windows "inputs-$(windows_inputs "$1")"'
-                              ' "$(git hash-object --stdin < /dev/null)" "$(gate_identity)"', "-", tip],
+                              ' "$(git hash-object --stdin < /dev/null)" "$(gate_identity HEAD)"', "-", tip],
                              cwd=self.repo, capture_output=True, text=True, env=self.env, check=True).stdout.strip()
         common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
         (common / "nrese-gate-passed").write_text(f"{old} | {tip} fleet:gate-0@office-pc cpu=znver3\n", newline="\n")

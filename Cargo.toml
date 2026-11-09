@@ -40,6 +40,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)", "cfg(alloc
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 dbg_macro = "deny"
+# The methods `clippy.toml` names, outside their allowed callers.
+disallowed_methods = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.100"

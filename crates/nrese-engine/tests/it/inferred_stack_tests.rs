@@ -964,11 +964,15 @@ fn a_pending_read_over_a_view_drops_every_removed_inference_once() {
 /// graphs and its pending inferred changes include what it has done so far.
 ///
 /// - Input: a base asserting in graphs `g9` and `g10` and the default graph, inferring `i`; a
-///   transaction that empties `g10`, fills `g11`, asserts and retracts in `g12`; deletes `i`,
-///   infers `n`, infers `m` and then asserts it, and tries to infer an asserted statement.
-/// - Expected: named graphs `g9` and `g11`, in id order, and only those contain statements
-///   (the default graph is not a named graph); inferred pending: inserted `n` and `m`, deleted
-///   `i`, counted before the commit; the commit drops `m` from the inferred stack.
+///   transaction that empties `g10`, fills `g11`, asserts and retracts in `g12`, asserts one
+///   more statement in `g9` (a graph both the base and the pending inserts name) and one in
+///   `g8` (an id before every base graph's: review P2B1-F2, so the order and the single
+///   listing are the method's work); deletes `i`, infers `n`, infers `m` and then asserts it,
+///   and tries to infer an asserted statement.
+/// - Expected: named graphs `g8`, `g9` and `g11`, in id order, each once, and only those
+///   contain statements (the default graph is not a named graph); inferred pending: inserted
+///   `n` and `m`, deleted `i`, counted before the commit; the commit drops `m` from the
+///   inferred stack.
 #[test]
 fn a_transaction_reads_its_own_graphs_and_pending_inferences() {
     let engine = engine();
@@ -987,17 +991,24 @@ fn a_transaction_reads_its_own_graphs_and_pending_inferences() {
     assert!(tx.insert_encoded(in_graph(7, 11)), "g11 filled");
     assert!(tx.insert_encoded(in_graph(8, 12)));
     assert!(tx.remove_encoded(in_graph(8, 12)), "g12 back to empty");
-    let mut expected = vec![id(9), id(11)];
-    expected.sort_unstable();
+    assert!(
+        tx.insert_encoded(in_graph(14, 9)),
+        "g9 named by a pending insert too"
+    );
+    assert!(
+        tx.insert_encoded(in_graph(16, 8)),
+        "g8, before every base graph"
+    );
+    assert!(id(8) < id(9), "the fixture's ids are in order");
     assert_eq!(
         tx.named_graphs(),
-        expected,
-        "the non-empty named graphs, in id order"
+        vec![id(8), id(9), id(11)],
+        "the non-empty named graphs, in id order, each once"
     );
     assert_eq!(
-        [9, 10, 11, 12].map(|g| tx.contains_named_graph(id(g))),
-        [true, false, true, false],
-        "g9, g10, g11, g12"
+        [8, 9, 10, 11, 12].map(|g| tx.contains_named_graph(id(g))),
+        [true, true, false, true, false],
+        "g8, g9, g10, g11, g12"
     );
     assert!(
         !tx.contains_named_graph(TermId::DEFAULT_GRAPH),

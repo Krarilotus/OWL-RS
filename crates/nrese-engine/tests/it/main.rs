@@ -5,6 +5,7 @@ mod bulk_load_tests;
 mod corpus_bounds_tests;
 mod corpus_isolation_tests;
 mod corpus_settings_tests;
+mod count_visiting_tests;
 mod cursor_tests;
 mod derived_index_tests;
 mod durability_tests;

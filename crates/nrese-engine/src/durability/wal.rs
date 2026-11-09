@@ -188,17 +188,25 @@ pub(crate) struct PendingNames {
 impl PendingNames {
     /// `holders` (found levels' holders, outermost first), then `own` (the store's
     /// directories), each once.
-    pub(crate) fn new(holders: Vec<PathBuf>, own: impl IntoIterator<Item = PathBuf>) -> Self {
+    /// Each directory once by its key: one spelled through a link (the store's root as opened)
+    /// and physically (the holder of its WAL directory's entry, DUR-4 review r1) is the same
+    /// directory. Both come with their keys, made alike (`place::Named::key`).
+    pub(crate) fn new(holders: Vec<(PathBuf, PathBuf)>, own: Vec<(PathBuf, PathBuf)>) -> Self {
         let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+        let mut keys: Vec<PathBuf> = Vec::new();
         let named = holders
             .into_iter()
-            .map(|dir| (dir, true))
-            .chain(own.into_iter().map(|dir| (dir, false)));
-        for (dir, found) in named {
-            match dirs.iter_mut().find(|(seen, _)| *seen == dir) {
-                // Both a holder and the store's own (a relative root): the stricter.
-                Some((_, tolerant)) => *tolerant &= found,
-                None => dirs.push((dir, found)),
+            .map(|(dir, key)| (dir, key, true))
+            .chain(own.into_iter().map(|(dir, key)| (dir, key, false)));
+        for (dir, key, found) in named {
+            match keys.iter().position(|seen| *seen == key) {
+                // Both a holder and the store's own (a relative root, a linked root): the
+                // stricter.
+                Some(at) => dirs[at].1 &= found,
+                None => {
+                    keys.push(key);
+                    dirs.push((dir, found));
+                }
             }
         }
         Self { dirs }
