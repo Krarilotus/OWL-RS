@@ -35,6 +35,8 @@ fn triple_this_is_visible_to_inner_bind() {
                 "VALUES $this { <urn:other> } BIND($this AS ?value)".to_owned(),
                 false,
             ),
+            ("?s ?p $this".to_owned(), false),
+            ("GRAPH $this {}".to_owned(), false),
             (
                 format!("VALUES ?outer {{ {term} }} LATERAL {{ BIND(?outer AS ?value) }}"),
                 true,
