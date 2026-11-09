@@ -466,6 +466,95 @@ pub fn name_existing(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Makes the names the existing file `path` is reached through durable beyond its own
+/// directory's ([`file_holders`]), each holder synced (one this process may not open for the
+/// sync, `PermissionDenied`, left as [`name_existing`] leaves it). For a file a store appends
+/// to through its name (the quarantine's log): after each append and its sync, which make a
+/// target not there yet, before the append is acknowledged. A failure leaves the append
+/// written but not known durable: its outcome is unknown, so the caller reports no success.
+/// Its own directory is the caller's to name.
+pub fn name_existing_file(path: &Path) -> std::io::Result<()> {
+    for (holder, _) in file_holders(path)? {
+        match sync_dir(&holder) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// The directories, each with its key (its canonical path: a link was followed), holding the
+/// entries the existing file `path` is reached through beyond its own directory's (DUR-5, fix
+/// check r2 on DUR-4, R2-F1): none for a regular file. For a file that is a link, its target
+/// resolved as a directory link's is (relative to the link's directory as reached; on Windows
+/// normalised then, [`as_walked`]): the holders of every level of the target's directory,
+/// links in its chain included ([`resolve`]), and that directory, which holds the target's
+/// entry; for a chain of file links, each one's alike. Refused: a dangling link (`NotFound`),
+/// more than [`MAX_LINKS`] file links (a loop), a target that isn't a file.
+pub(crate) fn file_holders(path: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
+    use std::io::{Error, ErrorKind};
+    let mut holders = Vec::new();
+    let mut keys = Vec::new();
+    let mut current = path.to_path_buf();
+    let mut links = 0;
+    loop {
+        let meta = fs::symlink_metadata(&current).map_err(|error| match current == path {
+            true => error,
+            false => Error::new(
+                error.kind(),
+                format!(
+                    "{}: a link's target isn't there ({error})",
+                    current.display()
+                ),
+            ),
+        })?;
+        if meta.is_file() {
+            break;
+        }
+        if !meta.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("{} is not a file", current.display()),
+            ));
+        }
+        links += 1;
+        if links > MAX_LINKS {
+            return Err(Error::other(format!(
+                "{}: more than {MAX_LINKS} links",
+                path.display()
+            )));
+        }
+        let target = fs::read_link(&current)?;
+        // A relative target is taken from the link's directory as reached, not as spelled:
+        // Windows joins it to the path reparsed so far and only then takes `..` lexically
+        // (sol-loop r1 on DUR-5, S1); Unix walks it from there physically.
+        let from = resolve(current.parent().unwrap_or(Path::new("")))?;
+        let joined = from.reached.join(&target);
+        #[cfg(windows)]
+        let joined = as_walked(&joined);
+        let Some(name) = joined.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("{}: a link's target names no file", current.display()),
+            ));
+        };
+        let dir = resolve(joined.parent().unwrap_or(Path::new("")))?;
+        if !dir.missing.is_empty() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("{}: a link's target isn't there", current.display()),
+            ));
+        }
+        let held = spelled(&dir.reached);
+        for holder in dir.holders.into_iter().chain([held]) {
+            hold(&mut holders, &mut keys, true, holder);
+        }
+        current = dir.reached.join(name);
+    }
+    Ok(holders.into_iter().zip(keys).collect())
+}
+
 /// Names `dir`, a directory in the store's root, and returns whether it made it, so that a
 /// reopen of a store at an absolute path syncs each directory once (timing of 8 Nov; a
 /// relative or `.` root still syncs `.` twice: fix check ONCE-N1):

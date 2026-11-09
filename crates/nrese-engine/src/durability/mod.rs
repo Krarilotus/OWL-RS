@@ -203,6 +203,7 @@ impl Durable {
         crate::engine::spill::remove_leftovers(root)?;
         let clock = std::time::Instant::now();
         let loaded = checkpoint::load_latest(root, dictionary, config.verify_on_open)?;
+        let checkpoint_path = loaded.as_ref().map(|loaded| loaded.path.clone());
         tracing::debug!(
             seconds = clock.elapsed().as_secs_f64(),
             "recovery: checkpoint read"
@@ -326,11 +327,16 @@ impl Durable {
         // What the checkpoint holds, and the segments records were replayed from.
         let covered_through = version.revision;
         let mut replayed = Vec::new();
+        // The newest segment left in place, which `Wal::open` appends to (DUR-5; review r1, N2:
+        // known here, not by listing the log again): one covered by the checkpoint included,
+        // one the replay removed (a point-in-time cut, a tail without even a header) not.
+        let mut newest = None;
         for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
                 fs::remove_file(path)?;
                 continue;
             }
+            let mut kept = true;
             // Wholly covered by the checkpoint (F7): its records all come before the next
             // segment's first, which the checkpoint holds, so none is replayed. A release that
             // failed or crashed left it, and damage in it can't cost a record: it never
@@ -360,6 +366,7 @@ impl Durable {
                 if damaged {
                     tracing::warn!(segment = %path.display(), "damage in a WAL segment the checkpoint covers: its records are all in the checkpoint, nothing is lost");
                 }
+                newest = Some(path);
                 continue;
             }
             let contents = wal::read_segment(path)?;
@@ -391,10 +398,13 @@ impl Durable {
                         .is_some_and(|(until, committed)| committed > until);
                 if after {
                     // Point-in-time restore: the log ends before this record.
-                    match index {
-                        0 => fs::remove_file(path)?,
+                    kept = match index {
+                        0 => {
+                            fs::remove_file(path)?;
+                            false
+                        }
                         _ => wal::truncate_segment(path, contents.ends[index - 1])?,
-                    }
+                    };
                     cut = true;
                     break;
                 }
@@ -458,8 +468,11 @@ impl Durable {
                         );
                     }
                 }
-                wal::truncate_segment(path, at)?;
+                kept = wal::truncate_segment(path, at)?;
                 changed = true;
+            }
+            if kept {
+                newest = Some(path);
             }
         }
         // A point-in-time cut removed or truncated segments.
@@ -488,7 +501,7 @@ impl Durable {
         }
         // The store's own directories keyed as the holders are (one directory, one key); a
         // made root has no holders to meet.
-        let (holders, own) = match named {
+        let (mut holders, own) = match named {
             Some(named) => {
                 let own = vec![
                     (wal_dir.clone(), named.key(wal_dir.file_name())),
@@ -504,6 +517,16 @@ impl Durable {
                 ],
             ),
         };
+        // The authoritative files reached through links (DUR-5, fix check r2 on DUR-4, R2-F1):
+        // the checkpoint loaded, each segment replayed, and the newest segment, which
+        // `Wal::open` appends to (a covered one included), once: it is often the last replayed.
+        // A file that is a link has its target's chain named with the found levels; a regular
+        // file adds nothing.
+        let newest = newest.filter(|path| replayed.last() != Some(path));
+        let replayed_files = replayed.iter().map(|path| &**path);
+        for file in checkpoint_path.iter().chain(replayed_files).chain(newest) {
+            holders.extend(place::file_holders(file)?);
+        }
         let mut pending = wal::PendingNames::new(holders, own);
         if changed {
             pending.settle()?;
