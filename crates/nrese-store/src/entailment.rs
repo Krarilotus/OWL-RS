@@ -68,6 +68,24 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
+        // One certified closure (review r1, F1): an answer stands only if the certificate didn't
+        // change while its reads took their snapshots; else it is asked again, and a change
+        // that left no certificate refuses then.
+        loop {
+            let epoch = self.certificate_epoch();
+            let answer = self.entails_once(&program, conclusion)?;
+            if self.certificate_epoch() == epoch {
+                return Ok(answer);
+            }
+        }
+    }
+
+    /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
+    fn entails_once(
+        &self,
+        program: &RuleProgram,
+        conclusion: &[Triple],
+    ) -> StoreResult<Entailment> {
         if !self.reasoning_is_current(program.clone()) {
             return Err(StoreError::Configuration(format!(
                 "the inferred statements aren't {}'s closure: rematerialise first",
@@ -87,7 +105,7 @@ impl StoreService {
             return Ok(Entailment::NotEntailed);
         }
         for opposite in &split.refutations {
-            if !self.refutes(&program, opposite)? {
+            if !self.refutes(program, opposite)? {
                 return Ok(Entailment::NotEntailed);
             }
         }
