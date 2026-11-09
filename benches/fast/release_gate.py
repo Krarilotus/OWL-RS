@@ -1259,53 +1259,83 @@ def checkout_receipt(kind: str, identity: str, attempt: str, outcomes: list[Outc
 
 
 # A check's step writes its attempt record first (release-gate.sh w3c, guards; `release_gate.py
-# attempt`), before it touches an earlier result: a file of its own beside the result,
-# KIND.attempt.SEQUENCE-ID.json (SEQUENCE one above the highest there, ID fresh and random), created
-# new, never replaced or removed: no reader holding an older record or result can stop it. Its
-# result and receipt carry the id; `verdict` takes a result only of the newest record's id, so an
-# earlier result the step couldn't remove is refused (the orchestrator's design, fix check r2, 9 Nov
-# 2026, 13:01 and 13:17). The run directory is per job: old records stay.
-ATTEMPT_NAME = re.compile(r"(w3c|guards)\.attempt\.(\d{9})-([0-9a-f]{32})\.json")
+# attempt`), before it touches an earlier result: KIND.attempt.SEQUENCE.json beside the result, the
+# sequence its name, created exclusively (O_EXCL: two attempts never hold one sequence, however they
+# overlap; a taken name sends an attempt to the next), never replaced or removed: no reader holding an
+# older record or result can stop it. The record holds a fresh random id, which the result and its
+# receipt carry; `verdict` takes a result only of the newest record's id, and nothing at all from a
+# history it can't order (a sequence held twice, a name of another form, at any position). The
+# orchestrator's design, fix checks r2 and r3, 9 Nov 2026. The run directory is per job: old records stay.
+ATTEMPT_SEQUENCE = re.compile(r"(\d+)")
+# Sequences an attempt tries past the highest it found before it refuses: as many steps of one kind
+# overlapping in one job's directory as this is no gate's (one step a kind runs at a time).
+ATTEMPT_TRIES = 64
 
 
-def attempt_records(where: Path, kind: str) -> list[tuple[int, str, Path]]:
-    """KIND's attempt records in WHERE: (sequence, id, path), oldest first."""
-    found = []
-    for path in where.glob(f"{kind}.attempt.*.json"):
-        if (m := ATTEMPT_NAME.fullmatch(path.name)) and m[1] == kind:
-            found.append((int(m[2]), m[3], path))
-    return sorted(found)
+class AttemptHistory(NamedTuple):
+    """KIND's attempt records in a directory: (sequence, path) of each record's name, oldest first;
+    every sequence a name there holds, of any form (an attempt allocates above them all); and what
+    makes the history unordered (a name of another form, a sequence held twice)."""
+    records: list[tuple[int, Path]]
+    sequences: list[int]
+    ambiguous: list[str]
+
+
+def attempt_records(where: Path, kind: str) -> AttemptHistory:
+    """KIND's attempt history in WHERE (AttemptHistory)."""
+    records, sequences, ambiguous = [], [], []
+    for path in sorted(where.glob(f"{kind}.attempt.*")):
+        rest = path.name[len(f"{kind}.attempt."):]
+        number = ATTEMPT_SEQUENCE.match(rest)
+        if number:
+            sequences.append(int(number[1]))
+        if number and rest == f"{int(number[1]):09d}.json":
+            records.append((int(number[1]), path))
+        else:
+            ambiguous.append(f"{path.name}: not an attempt record's name ({kind}.attempt.SEQUENCE.json)")
+    ambiguous += [f"sequence {s} held by {n} names" for s, n in sorted(Counter(sequences).items()) if n > 1]
+    return AttemptHistory(sorted(records), sequences, ambiguous)
 
 
 def attempt_record(kind: str, where: Path) -> str:
-    """A new attempt of KIND's step in this directory's checkout, recorded in WHERE under a name of
-    its own (created new: an existing name is never written over); its id."""
+    """A new attempt of KIND's step in this directory's checkout, recorded in WHERE as the next
+    sequence no name there holds (created exclusively: a name taken meanwhile sends it to the next,
+    ATTEMPT_TRIES at most); its id."""
     tree = git_line(".", "rev-parse", "HEAD^{tree}")
     if not tree:
         raise SystemExit(f"attempt: no checkout here to name the tree of: no attempt of {kind}")
     attempt = secrets.token_hex(16)
-    sequence = 1 + max((s for s, _, _ in attempt_records(where, kind)), default=0)
-    with open(where / f"{kind}.attempt.{sequence:09d}-{attempt}.json", "x", encoding="utf-8") as out:
-        out.write(json.dumps({"kind": kind, "attempt": attempt, "tree": tree}))
-        out.flush()
-        os.fsync(out.fileno())
-    return attempt
+    first = 1 + max(attempt_records(where, kind).sequences, default=0)
+    for sequence in range(first, first + ATTEMPT_TRIES):
+        try:
+            fd = os.open(where / f"{kind}.attempt.{sequence:09d}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue  # another attempt holds it: the next
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"kind": kind, "attempt": attempt, "tree": tree, "sequence": sequence}))
+            out.flush()
+            os.fsync(out.fileno())
+        return attempt
+    raise SystemExit(f"attempt: sequences {first} to {first + ATTEMPT_TRIES - 1} of {kind} in {where} are all "
+                     "taken: no attempt recorded")
 
 
 def newest_attempt(where: Path, kind: str) -> tuple[dict | None, str | None]:
     """KIND's newest attempt record in WHERE, by sequence, and what's wrong with it: (None, None) when
-    there is none; a record whose content isn't its name's, or two of the newest sequence, is no record."""
-    records = attempt_records(where, kind)
-    if not records:
+    there is none; an unordered history (attempt_records()), or a newest record that isn't one (its
+    content not its name's sequence and kind, no random id or tree), is no record."""
+    history = attempt_records(where, kind)
+    if history.ambiguous:
+        return None, f"its attempt history is ambiguous ({'; '.join(history.ambiguous)})"
+    if not history.records:
         return None, None
-    sequence, attempt, path = records[-1]
-    if sum(1 for s, _, _ in records if s == sequence) > 1:
-        return None, f"two attempt records of sequence {sequence}"
+    sequence, path = history.records[-1]
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         return None, f"its newest attempt record {path.name} can't be read ({error})"
-    if not (isinstance(record, dict) and record.get("kind") == kind and record.get("attempt") == attempt
+    if not (isinstance(record, dict) and record.get("kind") == kind and record.get("sequence") == sequence
+            and isinstance(record.get("attempt"), str) and re.fullmatch(r"[0-9a-f]{32}", record["attempt"])
             and isinstance(record.get("tree"), str) and record["tree"]):
         return None, f"its newest attempt record {path.name} isn't one"
     return record, None
@@ -3005,7 +3035,7 @@ def main() -> int:
     s.add_argument("--json", type=Path)
     s = sub.add_parser("attempt", help="a new attempt of a check's step, recorded beside its result; prints its id")
     s.add_argument("kind", choices=("w3c", "guards"))
-    s.add_argument("where", type=Path, help="the step's results directory (KIND.attempt.SEQUENCE-ID.json)")
+    s.add_argument("where", type=Path, help="the step's results directory (KIND.attempt.SEQUENCE.json)")
     s = sub.add_parser("jobs", help="the fleet jobs of a whole gate, as TOML files")
     s.add_argument("candidate", help="the head to gate (a revision of --checkout)")
     s.add_argument("--harness", help="the revision whose fast suite, generator and gate run (default: the candidate)")

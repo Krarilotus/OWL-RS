@@ -436,11 +436,13 @@ exit code and log's SHA-256. `verdict CAND ...` passes only when every timed par
 tree and every check's receipt names it (a merge commit of the same tree is the same candidate);
 a result without a receipt, a timed directory without its report, or two results of one kind in
 the checks' directory are refused. Each check's step first writes its attempt record, a new file
-beside its result (`KIND.attempt.SEQUENCE-ID.json`: one above the highest sequence there, a fresh
-random id, the tree; created new, never replaced or removed), and its result and receipt carry
-that id: the verdict takes a result only of the newest record's id, so an earlier result the step
-couldn't remove (a Windows reader holding it, or its record) is refused as stale, and a newest
-record without its result is refused too.
+beside its result (`KIND.attempt.SEQUENCE.json`: the sequence its name, created exclusively, so
+two overlapping attempts never hold one sequence and a taken name sends an attempt to the next;
+never replaced or removed; inside, a fresh random id and the tree), and its result and receipt
+carry that id: the verdict takes a result only of the newest record's id, so an earlier result the
+step couldn't remove (a Windows reader holding it, or its record) is refused as stale, and a newest
+record without its result is refused too. A history it can't order (a sequence held twice, a name
+of another form, anywhere in it) passes nothing.
 
 ```sh
 bash scripts/release-gate.sh jobs HEAD --out jobs/   # build, timed (phuoc-yu), big (khaleesi-wsl), checks (office-pc)
