@@ -37,9 +37,9 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
-    /// Counts the certificate's changes (each under the writer slot): a reader that finds it
-    /// the same before and after its reads saw no change of the certificate between them, so
-    /// every commit in between maintained the closure ([`Self::certificate_epoch`]).
+    /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
+    /// odd while one is in progress (under the writer slot, [`CertificateTransition`]), even
+    /// once it is settled in memory and on disk.
     certificate_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
     /// repository's own, [`Self::set_ql_rewriting`]).
@@ -70,6 +70,17 @@ pub struct StoreService {
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
 const REASONING_MARKER: &str = "reasoning.state";
+
+/// A change of the reasoning certificate in progress
+/// ([`StoreService::certificate_epoch`]): made odd by its start, the epoch is even again when
+/// this drops, the change settled or failed, on every way out (`?` and unwinding included).
+struct CertificateTransition<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for CertificateTransition<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// The memory stop of one operation ([`StoreService::memory_stop`]).
 pub(crate) struct MemoryStop(Option<nrese_exec::memory::MemoryWatch>);
@@ -483,12 +494,28 @@ impl StoreService {
         self.reasoning_is_current(program)
     }
 
-    /// The certificate's epoch: changed by every change of the certificate, each before the
-    /// commit it precedes. Equal before and after a reader's reads, the certificate it checked
-    /// covers every snapshot those reads took.
+    /// The certificate's epoch, a sequence lock over its changes. Odd: a change is in progress,
+    /// and what a reader sees of the certificate (in memory or on disk) may be the old one; it
+    /// takes nothing then. Even and the same before and after a reader's reads: no change
+    /// began meanwhile, so the certificate it checked covers every snapshot those reads took
+    /// (every commit in between maintained the closure). Each change runs its whole course,
+    /// marker included, inside one [`CertificateTransition`], before the commit it precedes.
     pub(crate) fn certificate_epoch(&self) -> u64 {
         self.certificate_epoch
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Starts a change of the certificate, under the writer slot: the epoch is odd until the
+    /// returned transition drops, on every way out of the change.
+    fn certificate_transition(
+        &self,
+        _writer: nrese_engine::WriterHeld<'_>,
+    ) -> CertificateTransition<'_> {
+        let before = self
+            .certificate_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(before % 2 == 0, "one change of the certificate at a time");
+        CertificateTransition(&self.certificate_epoch)
     }
 
     /// Forgets what the inferred stack is exact for, taking the writer slot to do so: no
@@ -502,10 +529,11 @@ impl StoreService {
     /// [`Self::invalidate_reasoning`] by a holder of the writer slot, before a commit that
     /// doesn't maintain the inferences: the certificate changes only between commits (the Q06
     /// remainder's invariant C), so no rematerialisation can certify data this write changes.
-    pub(crate) fn invalidate_held(&self, _writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
+    pub(crate) fn invalidate_held(&self, writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
-        // Before the commit it precedes: a reader that saw the old epoch sees the change.
-        self.certificate_epoch.fetch_add(1, Ordering::SeqCst);
+        // Before the commit it precedes, until the marker is settled: no reader takes the old
+        // certificate for the data this write changes (fix check r1 on review r1, F1).
+        let _transition = self.certificate_transition(writer);
         #[cfg(test)]
         hooks::run(&hooks::INSIDE_INVALIDATION);
         self.settings
@@ -540,8 +568,7 @@ impl StoreService {
         writer: nrese_engine::WriterHeld<'_>,
         state: crate::ReasoningState,
     ) -> StoreResult<()> {
-        self.certificate_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _transition = self.certificate_transition(writer);
         self.note_equality(writer, &state);
         let text = state.to_text();
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);

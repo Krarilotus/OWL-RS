@@ -68,11 +68,16 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
-        // One certified closure (review r1, F1): an answer stands only if the certificate didn't
-        // change while its reads took their snapshots; else it is asked again, and a change
-        // that left no certificate refuses then.
+        // One certified closure (review r1, F1): reads start only on a settled certificate (an
+        // even epoch; odd, a change is in progress and the old certificate may still be
+        // visible), and an answer stands only if no change began while they took their
+        // snapshots; else it is asked again, and a change that left no certificate refuses then.
         loop {
             let epoch = self.certificate_epoch();
+            if epoch % 2 == 1 {
+                std::thread::yield_now();
+                continue;
+            }
             let answer = self.entails_once(&program, conclusion)?;
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
