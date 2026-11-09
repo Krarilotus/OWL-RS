@@ -49,7 +49,8 @@ impl Engine<'_> {
         let exhausted = frame.next + 1 >= frame.alternatives.len();
         let (mark, pending, pending_open) = (frame.mark, frame.pending, frame.pending_open);
         for &i in dependent.iter().rev() {
-            self.frames.remove(i);
+            let gone = self.frames.remove(i);
+            self.abandon_frame(&gone);
         }
         let mut frame = self.frames.remove(at);
         self.retract(&levels, mark, pending, pending_open);
@@ -77,6 +78,7 @@ impl Engine<'_> {
         }
         if exhausted {
             // Every alternative failed: the disjunction's own clash, without `k`.
+            self.abandon_frame(&frame);
             let failed = self.deps.union(frame.premise, frame.failed);
             return Some(Err(super::engine::Stop::Clash(failed)));
         }
@@ -242,6 +244,35 @@ impl Engine<'_> {
             assert!(
                 self.g.full_from <= low || self.g.touched.contains(&low),
                 "a touched node escapes the blocking pass"
+            );
+        }
+    }
+
+    /// The invariant a model rests on (`Config::check_retraction`): no live pending
+    /// disjunction is left without a disjunct that holds. The scan and `reopen` must
+    /// between them reach every one; a retraction that loses one shows here, not as a
+    /// wrong answer (fuzz seed 700160, case 144).
+    pub(super) fn check_decided(&mut self) {
+        for at in 0..self.pending.len() {
+            if self.pending_dead[at] {
+                continue;
+            }
+            let pend = self.pending[at];
+            let clause = &self.p.clauses[pend.clause as usize];
+            let (annotation, heads) = (clause.annotation, clause.head.clone());
+            let bind =
+                &self.bindings[pend.bind as usize..pend.bind as usize + clause.vars as usize];
+            if bind.iter().any(|&n| !self.g.live(n)) {
+                continue;
+            }
+            let bind = bind.to_vec();
+            let decided = heads
+                .iter()
+                .any(|&h| matches!(self.holds(self.lit(h, &bind, annotation)), Ok(true)));
+            assert!(
+                decided,
+                "pending disjunction {at} (clause {}) is left undecided in a model",
+                pend.clause
             );
         }
     }

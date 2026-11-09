@@ -90,6 +90,11 @@ pub struct Frame {
     /// head atom, to count its failures.
     pub clause: u32,
     pub heads: Vec<u8>,
+    /// The pending disjunction it decides (else `NONE`: the ≤-rule's and the NI rule's
+    /// choices, whose rules look at the graph again each step). A frame that leaves the
+    /// stack undecided puts it back on `Engine::reopen` ([`Engine::abandon_frame`]): a
+    /// re-decided frame's disjunction lies behind its own saved scan position.
+    pub disjunction: u32,
     pub next: usize,
     /// What the disjunction itself depends on.
     pub premise: DepSetId,

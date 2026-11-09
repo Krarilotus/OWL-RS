@@ -174,6 +174,15 @@ Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
   for the rest of the run (`restarts` in the telemetry). Checkpoints also keep the
   retraction queues, which a backtrack restores as they were. Without the fallback (the
   rollback backend, step 3) no restart would be needed.
+- **A frame that leaves the stack undecided reopens its disjunction.** That covers an
+  exhausted frame popped by a backtrack, a dependent frame retracted with its culprit, and
+  an exhausted culprit. A re-decided frame keeps its disjunction's old place in the pending
+  list, behind the scan position it saved, so neither the scan nor the retraction's window
+  (which binds touched nodes) is sure to find it again. On fuzz seed 700160, case 144, a
+  re-decided frame was popped exhausted, the retraction below it reopened other
+  disjunctions, and the search found a model without that one (D16-058). Each frame records
+  the pending disjunction it decides, and `check_retraction` checks at a model's end that
+  no live pending disjunction is left undecided.
 
 **Measured** (662 to 664, lab profile):
 - Truncating backjumps fall to 0 and rebuilt levels to 0. Branch points fall from millions
