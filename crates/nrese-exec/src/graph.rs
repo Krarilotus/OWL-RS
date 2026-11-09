@@ -517,7 +517,26 @@ pub fn components(n: usize, edges: &[(u32, u32)]) -> Components {
     components_csr(&offsets, &targets, &|| false).expect("never stopped")
 }
 
-/// `values`, sorted, with each value once: a tick a value, so a stop is seen within
+/// `work` over the indices `0..len` in runs of at most [`crate::POLL_UNITS`], each run ticked
+/// once before it: a stop is seen within that many units of a linear pass, at one tick a run
+/// (a tick an element cost the count-only closure +5.5 % instructions: the graph closure
+/// package's counts).
+fn in_runs(
+    ticker: &Ticker<StopFn<'_>>,
+    len: usize,
+    mut work: impl FnMut(std::ops::Range<usize>),
+) -> Result<(), Stop> {
+    let mut at = 0;
+    while at < len {
+        let end = at.saturating_add(crate::POLL_UNITS as usize).min(len);
+        ticker.tick((end - at) as u32)?;
+        work(at..end);
+        at = end;
+    }
+    Ok(())
+}
+
+/// `values`, sorted, with each value once, polled in runs ([`in_runs`]): a stop is seen within
 /// [`crate::POLL_UNITS`] comparisons (sol-loop r2 of the graph closure package). Stopped, it
 /// leaves `values` part-compacted: the kernels then drop them.
 fn dedup_sorted<T: PartialEq + Copy, B: Deref<Target = Budget>>(
@@ -525,13 +544,14 @@ fn dedup_sorted<T: PartialEq + Copy, B: Deref<Target = Budget>>(
     ticker: &Ticker<StopFn<'_>>,
 ) -> Result<(), Stop> {
     let mut kept = 0;
-    for read in 0..values.len() {
-        ticker.tick(1)?;
-        if kept == 0 || values[read] != values[kept - 1] {
-            values[kept] = values[read];
-            kept += 1;
+    in_runs(ticker, values.len(), |run| {
+        for read in run {
+            if kept == 0 || values[read] != values[kept - 1] {
+                values[kept] = values[read];
+                kept += 1;
+            }
         }
-    }
+    })?;
     values.truncate(kept);
     Ok(())
 }
@@ -579,12 +599,12 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         // Sequential passes tick a unit an edge; the parallel sorts and the parallel
         // numbering are opaque calls, checked before and after (`Ticker::check`).
         nodes.fill(0, |room| {
-            for &(a, b) in edges {
-                ticker.tick(1)?;
-                room.push(a);
-                room.push(b);
-            }
-            Ok::<_, Stop>(())
+            in_runs(ticker, edges.len(), |run| {
+                for &(a, b) in &edges[run] {
+                    room.push(a);
+                    room.push(b);
+                }
+            })
         })??;
         ticker.check()?;
         nodes.par_sort_unstable();
@@ -606,21 +626,21 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         dedup_sorted(&mut pairs, ticker)?;
         let mut offsets: Buf<'p, u32, B> = Charged::in_pool(pool);
         offsets.resize(n + 1, 0)?;
-        for &(a, _) in pairs.iter() {
-            ticker.tick(1)?;
-            offsets[a as usize + 1] += 1;
-        }
-        for i in 0..n {
-            ticker.tick(1)?;
-            offsets[i + 1] += offsets[i];
-        }
+        in_runs(ticker, pairs.len(), |run| {
+            for &(a, _) in &pairs[run] {
+                offsets[a as usize + 1] += 1;
+            }
+        })?;
+        in_runs(ticker, n, |run| {
+            for i in run {
+                offsets[i + 1] += offsets[i];
+            }
+        })?;
         let mut targets: Buf<'p, u32, B> = Charged::with_capacity_in(pool, pairs.len())?;
         targets.fill(0, |room| {
-            for &(_, b) in pairs.iter() {
-                ticker.tick(1)?;
-                room.push(b);
-            }
-            Ok::<_, Stop>(())
+            in_runs(ticker, pairs.len(), |run| {
+                room.extend(pairs[run].iter().map(|&(_, b)| b))
+            })
         })??;
         drop(pairs);
         let ComponentsIn {
