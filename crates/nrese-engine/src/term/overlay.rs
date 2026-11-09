@@ -298,6 +298,13 @@ impl OverlayView {
         self.overlay.start + self.frozen.len()
     }
 
+    /// The private transaction's budget, which its own terms are charged to: what a private
+    /// snapshot's search is charged to where its caller brings no budget and attached no
+    /// reader's (V3 review r1 B1). The view holds it as long as it lives.
+    pub(crate) fn budget(&self) -> &Arc<Budget> {
+        &self.overlay.budget
+    }
+
     /// Its own entries (ids `start..end`, none of the dictionary's), in id order, each with
     /// its key: what a private search indexes its own documents from (V3; DICT2 9 Nov
     /// 04:02).
