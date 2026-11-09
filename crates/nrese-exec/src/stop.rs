@@ -11,7 +11,6 @@
 //! poll itself (one relaxed load, and the clock only with a deadline) is out of line.
 
 use std::cell::Cell;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -122,16 +121,20 @@ impl<F: Fn() -> bool + Sync + ?Sized> StopCheck for &F {
 }
 
 /// The countdown of one sequential loop or parallel task: it polls its [`StopCheck`] every
-/// [`POLL_UNITS`] units ticked. `Send`, not `Sync`: each task has its own.
+/// [`POLL_UNITS`] units ticked. `Send`, not `Sync`: each task has its own. The countdown is a
+/// [`Cell`], so it ticks through `&self`: a read can count while the callback it calls reads
+/// on the same ticker (the reasoner's sources), at the cost of a plain load and store, no flag
+/// and no atomic.
 pub struct Ticker<C: StopCheck = StopSource> {
     source: C,
-    left: u32,
-    not_sync: PhantomData<Cell<()>>,
+    left: Cell<u32>,
 }
 
 impl<C: StopCheck> std::fmt::Debug for Ticker<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Ticker").field("left", &self.left).finish()
+        f.debug_struct("Ticker")
+            .field("left", &self.left.get())
+            .finish()
     }
 }
 
@@ -141,41 +144,41 @@ impl<C: StopCheck> Ticker<C> {
         check.check()?;
         Ok(Self {
             source: check,
-            left: POLL_UNITS,
-            not_sync: PhantomData,
+            left: Cell::new(POLL_UNITS),
         })
     }
 
     /// Counts `units` of work done; polls when the allowance runs out, then starts a new
     /// one. A tick past several intervals polls once.
     #[inline]
-    pub fn tick(&mut self, units: u32) -> Result<(), Stop> {
-        self.left = self.left.saturating_sub(units);
-        if self.left == 0 {
+    pub fn tick(&self, units: u32) -> Result<(), Stop> {
+        let left = self.left.get().saturating_sub(units);
+        self.left.set(left);
+        if left == 0 {
             return self.poll();
         }
         Ok(())
     }
 
     /// Checks now, whatever is left: before and after an opaque call.
-    pub fn check(&mut self) -> Result<(), Stop> {
+    pub fn check(&self) -> Result<(), Stop> {
         self.poll()
     }
 
     /// The units left before the next poll, for loops that work in chunks of at most that.
     pub fn left(&self) -> u32 {
-        self.left
+        self.left.get()
     }
 
     /// The closing check of a short task.
-    pub fn finish(&mut self) -> Result<(), Stop> {
+    pub fn finish(&self) -> Result<(), Stop> {
         self.poll()
     }
 
     #[cold]
     #[inline(never)]
-    fn poll(&mut self) -> Result<(), Stop> {
-        self.left = POLL_UNITS;
+    fn poll(&self) -> Result<(), Stop> {
+        self.left.set(POLL_UNITS);
         StopCheck::check(&self.source)
     }
 }
@@ -195,7 +198,7 @@ mod tests {
     fn a_ticker_polls_within_its_interval_and_once_per_tick() {
         for stop_at in [1, 1000, 4095, 4096, 4097, 10_000] {
             let (flag, source) = flagged();
-            let mut ticker = source.ticker().unwrap();
+            let ticker = source.ticker().unwrap();
             let mut units = 0u32;
             let after = loop {
                 if units == stop_at {
@@ -212,7 +215,7 @@ mod tests {
             );
         }
         let (flag, source) = flagged();
-        let mut ticker = source.ticker().unwrap();
+        let ticker = source.ticker().unwrap();
         assert_eq!(ticker.tick(3 * POLL_UNITS), Ok(()));
         assert_eq!(
             ticker.left(),
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn checks_are_immediate_and_a_past_deadline_stops() {
         let (flag, source) = flagged();
-        let mut ticker = source.ticker().unwrap();
+        let ticker = source.ticker().unwrap();
         flag.store(true, Ordering::Relaxed);
         assert_eq!(ticker.check(), Err(Stop::Cancelled));
         assert_eq!(ticker.finish(), Err(Stop::Cancelled));
@@ -263,7 +266,7 @@ mod tests {
         let check = || stopped.load(Ordering::Relaxed);
         let closure: &(dyn Fn() -> bool + Sync) = &check;
         assert_eq!(StopCheck::check(&closure), Ok(()));
-        let mut ticker = Ticker::new(closure).unwrap();
+        let ticker = Ticker::new(closure).unwrap();
         for _ in 0..1000 {
             ticker.tick(1).unwrap();
         }
