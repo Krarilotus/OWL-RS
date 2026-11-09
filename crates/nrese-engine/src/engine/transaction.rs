@@ -104,26 +104,145 @@ impl<'e> Transaction<'e> {
         self.pending.base()
     }
 
-    /// [`Self::pending_snapshot`], what it makes charged to `budget` and held by the snapshot
-    /// (DUR-6). Not yet charged: the tests come first.
+    /// [`Self::pending_snapshot`], what it makes charged to `budget` before it is made and held
+    /// by the snapshot (DUR-6): its scratch, its runs of the pending changes, their lists and
+    /// its version. The base's runs read in the quad layout are their shared forms, the
+    /// store's index memory, not charged here. A refusal ([`crate::EngineError::MemoryLimit`])
+    /// makes nothing and records nothing. An unchanged transaction asking under the same
+    /// budget gets the same snapshot: the last one is kept, with its charge, until the next
+    /// write or the transaction's drop.
     pub fn pending_snapshot_within(
         &self,
         budget: &std::sync::Arc<nrese_exec::Budget>,
     ) -> EngineResult<Snapshot> {
-        let _ = budget;
-        Ok(self.pending_snapshot())
+        let generation = self.pending.generation();
+        if let Some(kept) = self.pending.memo().lock().as_ref()
+            && kept.generation == generation
+            && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
+        {
+            return Ok(kept.snapshot.clone());
+        }
+        let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+        scratch.charge(self.pending.snapshot_changes_bound())?;
+        // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
+        let SnapshotChanges {
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        } = self.pending.snapshot_changes();
+        let base = self.pending.base();
+        let seen = base.version();
+        let content = super::Content::fresh();
+        let equality = match self.changes_equality() {
+            true => Default::default(),
+            false => std::sync::Arc::clone(&seen.equality),
+        };
+        let snapshot = base.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&inferred_inserts[..], &inferred_deletes[..]],
+            &self.engine.shared.forms,
+            budget,
+            |asserted, inferred| Version {
+                content,
+                // Pending: its own, even without asserted changes (staged terms).
+                asserted_content: super::AssertedIdentity::fresh(),
+                asserted,
+                inferred,
+                revision: seen.revision,
+                committed_micros: seen.committed_micros,
+                dictionary_len: self.engine.shared.dictionary.len(),
+                equality,
+                canonical: Default::default(),
+            },
+        )?;
+        // Recorded once nothing can be refused any more (a refusal records nothing).
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            let changed = [
+                &asserted_inserts,
+                &asserted_deletes,
+                &inferred_inserts,
+                &inferred_deletes,
+            ];
+            corpora.record(
+                seen.content,
+                content,
+                changed
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
+        drop((
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        ));
+        drop(scratch);
+        *self.pending.memo().lock() = Some(pending::Memo {
+            generation,
+            budget: std::sync::Arc::downgrade(budget),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
 
-    /// [`Self::pending_over`], what it makes charged to `budget` and held by the snapshot
-    /// (DUR-6). Not yet charged: the tests come first.
+    /// [`Self::pending_over`], what it makes charged to `budget` before it is made and held by
+    /// the snapshot (DUR-6), as [`Self::pending_snapshot_within`] charges (not kept: it reads
+    /// `view` and `hidden`, a new snapshot each call).
     pub fn pending_over_within(
         &self,
         view: &Snapshot,
         hidden: &[EncodedQuad],
         budget: &std::sync::Arc<nrese_exec::Budget>,
     ) -> EngineResult<Snapshot> {
-        let _ = budget;
-        Ok(self.pending_over(view, hidden))
+        let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+        let asserted = self.pending.asserted();
+        let lists = 2
+            * (asserted.inserts.len().max(4) + asserted.deletes.len().max(4))
+            * std::mem::size_of::<EncodedQuad>();
+        scratch.charge(self.pending.over_gone_bound(hidden) + lists)?;
+        let seen = view.version();
+        let gone = self.pending.over_gone(&seen.inferred, hidden);
+        let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
+        let content = super::Content::fresh();
+        let equality = match self.changes_equality() {
+            true => Default::default(),
+            false => std::sync::Arc::clone(&seen.equality),
+        };
+        let snapshot = view.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&[][..], &gone[..]],
+            &self.engine.shared.forms,
+            budget,
+            |asserted, inferred| Version {
+                content,
+                // Pending: its own, even without asserted changes (staged terms).
+                asserted_content: super::AssertedIdentity::fresh(),
+                asserted,
+                inferred,
+                revision: seen.revision,
+                committed_micros: seen.committed_micros,
+                dictionary_len: self.engine.shared.dictionary.len(),
+                equality,
+                canonical: Default::default(),
+            },
+        )?;
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            corpora.record(
+                seen.content,
+                content,
+                [&asserted_inserts, &asserted_deletes, &gone]
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
+        drop((gone, asserted_inserts, asserted_deletes));
+        drop(scratch);
+        Ok(snapshot)
     }
 
     /// The state the transaction would commit, as a snapshot: the base with the pending
@@ -160,9 +279,11 @@ impl<'e> Transaction<'e> {
             content,
             // Pending: its own, even without asserted changes (staged terms).
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: base
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            asserted: base.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self.engine.shared.forms,
+            ),
             inferred: base
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
@@ -207,9 +328,11 @@ impl<'e> Transaction<'e> {
             content,
             // Pending: its own, even without asserted changes (staged terms).
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: seen
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            asserted: seen.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self.engine.shared.forms,
+            ),
             inferred: seen.inferred.with_delta(&[], &gone),
             revision: seen.revision,
             committed_micros: seen.committed_micros,
@@ -529,7 +652,7 @@ impl Inner {
         let [asserted_run, inferred_run] = record.runs(asserted_layout);
         let (_compaction, converted) = match converting {
             true => {
-                let (slot, converted) = shared.versions.converted_asserted();
+                let (slot, converted) = shared.versions.converted_asserted(&shared.forms);
                 (Some(slot), Some(converted))
             }
             false => (None, None),

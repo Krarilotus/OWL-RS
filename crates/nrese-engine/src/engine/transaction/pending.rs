@@ -84,6 +84,20 @@ pub(in crate::engine) struct Pending {
     base: Snapshot,
     asserted: Delta,
     inferred: Delta,
+    /// Bumped by every write (whether it changed anything or not): a pending snapshot made at
+    /// one generation is the pending snapshot until the next (the transaction's memo, DUR-6).
+    generation: u64,
+    /// The last pending snapshot made, with the budget it is charged to (DUR-6): kept, with its
+    /// charge, until the next write (which drops it) or the transaction's drop.
+    memo: parking_lot::Mutex<Option<Memo>>,
+}
+
+/// A pending snapshot kept ([`Pending::memo`]): made at `generation`, charged to `budget`
+/// (weak: it keeps the budget's allocation, so its address isn't taken by another while kept).
+pub(in crate::engine) struct Memo {
+    pub(in crate::engine) generation: u64,
+    pub(in crate::engine) budget: std::sync::Weak<nrese_exec::Budget>,
+    pub(in crate::engine) snapshot: Snapshot,
 }
 
 /// [`Pending::snapshot_changes`]: the changes a pending snapshot of the whole base applies, each
@@ -102,11 +116,50 @@ impl Pending {
             base,
             asserted: Delta::default(),
             inferred: Delta::default(),
+            generation: 0,
+            memo: parking_lot::Mutex::new(None),
         }
     }
 
     pub(in crate::engine) fn base(&self) -> &Snapshot {
         &self.base
+    }
+
+    /// The last pending snapshot kept, if no write came since ([`Memo`]).
+    pub(in crate::engine) fn memo(&self) -> &parking_lot::Mutex<Option<Memo>> {
+        &self.memo
+    }
+
+    /// A write: a new generation, and the snapshot kept (with its charge) dropped.
+    fn changed(&mut self) {
+        self.generation += 1;
+        *self.memo.get_mut() = None;
+    }
+
+    /// The writes so far ([`Self::generation`]'s field).
+    pub(in crate::engine) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// At most what [`Self::snapshot_changes`] allocates at once: its shadowed set and its
+    /// four lists, each list's capacity at most twice its length (grown by doubling) and the
+    /// set's table at most twice its load-factor size, with their control bytes.
+    pub(in crate::engine) fn snapshot_changes_bound(&self) -> usize {
+        use std::mem::size_of;
+        let quad = size_of::<EncodedQuad>();
+        let list = |n: usize| 2 * n.max(4) * quad;
+        let shadowed = self.asserted.inserts.len();
+        let set = 2 * ((shadowed * 8 / 7 + 1).next_power_of_two().max(4) * (quad + 1) + 16);
+        set + list(self.asserted.inserts.len())
+            + list(self.asserted.deletes.len())
+            + list(self.inferred.inserts.len())
+            + list(self.inferred.deletes.len() + shadowed)
+    }
+
+    /// At most what [`Self::over_gone`] allocates for `hidden`: its list, grown by doubling.
+    pub(in crate::engine) fn over_gone_bound(&self, hidden: &[EncodedQuad]) -> usize {
+        let n = self.inferred.deletes.len() + self.asserted.inserts.len() + hidden.len();
+        2 * n.max(4) * std::mem::size_of::<EncodedQuad>()
     }
 
     pub(in crate::engine) fn asserted(&self) -> &Delta {
@@ -299,6 +352,7 @@ impl Pending {
     /// Asserts `quad` (its ids from the base's dictionary or its transaction's vocabulary).
     /// Returns whether it changed anything: `false` if it was already asserted.
     pub(in crate::engine) fn insert_asserted(&mut self, quad: EncodedQuad) -> bool {
+        self.changed();
         let base = &self.base;
         self.asserted
             .insert(quad, || base.stack_contains(Stack::Asserted, &quad))
@@ -307,6 +361,7 @@ impl Pending {
     /// Retracts an asserted quad; returns whether it changed anything. Inferred quads are
     /// unaffected.
     pub(in crate::engine) fn remove_asserted(&mut self, quad: EncodedQuad) -> bool {
+        self.changed();
         let base = &self.base;
         self.asserted
             .remove(quad, || base.stack_contains(Stack::Asserted, &quad))
@@ -314,6 +369,7 @@ impl Pending {
 
     /// Adds an inferred quad: `false` if it is already inferred, or asserted.
     pub(in crate::engine) fn insert_inferred(&mut self, quad: EncodedQuad) -> bool {
+        self.changed();
         if self.stack_contains(Stack::Asserted, &quad) {
             return false;
         }
@@ -324,6 +380,7 @@ impl Pending {
 
     /// Removes an inferred quad: `false` if it was not visible as inferred.
     pub(in crate::engine) fn remove_inferred(&mut self, quad: EncodedQuad) -> bool {
+        self.changed();
         if !self.stack_contains(Stack::Inferred, &quad) {
             return false;
         }
@@ -334,6 +391,7 @@ impl Pending {
 
     /// Enforces disjointness: inferred quads that end up asserted leave the inferred stack.
     pub(super) fn take_over_inferred(&mut self) {
+        self.changed();
         let shadowed: Vec<_> = self.shadowed_inferred().collect();
         let base = &self.base;
         for quad in shadowed {
