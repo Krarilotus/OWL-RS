@@ -10,6 +10,7 @@ mod bulk_load_tests;
 mod catalog_ontology_store_tests;
 mod convert_tests;
 mod dl;
+mod dl_oracle_tests;
 mod entailment_tests;
 mod equality_compact_tests;
 mod explanation_tests;
