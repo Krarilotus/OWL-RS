@@ -170,40 +170,44 @@ impl<'e> PrivateTransaction<'e> {
     }
 
     /// The base with the pending changes, as [`super::Transaction::pending_snapshot`] makes it,
-    /// reading this transaction's terms: private ([`Snapshot::is_private`]). Freezing the
-    /// vocabulary is charged to its budget, so this can be refused.
+    /// reading this transaction's terms: private ([`Snapshot::is_private`]). Charged to the
+    /// transaction's budget, as [`Self::build`] charges, so this can be refused.
     pub fn pending_snapshot(&self) -> EngineResult<Snapshot> {
+        self.build(self.overlay.budget())
+    }
+
+    /// The pending snapshot, what it makes charged to `budget` before it is made and held by
+    /// the snapshot, as [`super::Transaction::pending_snapshot_within`] charges (DUR-6);
+    /// freezing the vocabulary is charged to the transaction's budget.
+    fn build(&self, budget: &Arc<Budget>) -> EngineResult<Snapshot> {
         let view = self.overlay.freeze()?;
+        let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+        scratch.charge(self.pending.snapshot_changes_bound())?;
         let SnapshotChanges {
             asserted_inserts,
             asserted_deletes,
             inferred_inserts,
             inferred_deletes,
         } = self.pending.snapshot_changes();
-        let base = self.pending.base().version();
-        let version = Version {
-            content: super::Content::fresh(),
-            asserted_content: super::AssertedIdentity::fresh(),
-            // The base's runs read in the quad layout are their shared forms (DUR-6).
-            asserted: base.asserted.with_delta_in(
-                &asserted_inserts,
-                &asserted_deletes,
-                &self._engine.shared.forms,
-            ),
-            inferred: base
-                .inferred
-                .with_delta(&inferred_inserts, &inferred_deletes),
-            revision: base.revision,
-            committed_micros: base.committed_micros,
-            // Every id it knows is below its vocabulary's end.
-            dictionary_len: view.end(),
-            // Its own: classes built from its statements name its own ids, and the base's
-            // cell is the published version's.
-            equality: Default::default(),
-            canonical: Default::default(),
-            own: Default::default(),
-        };
-        Ok(self.pending.base().with_version(version).private(view))
+        let base = self.pending.base();
+        let seen = base.version();
+        let end = view.end();
+        let snapshot = base.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&inferred_inserts[..], &inferred_deletes[..]],
+            &self._engine.shared.forms,
+            budget,
+            |asserted, inferred| own_version(seen, asserted, inferred, end),
+        )?;
+        // The lists go before their charge.
+        drop((
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+            scratch,
+        ));
+        Ok(snapshot.private(view))
     }
 
     /// [`Self::pending_snapshot`], the same snapshot (one identity, so one own-state slot) for
@@ -234,7 +238,7 @@ impl<'e> PrivateTransaction<'e> {
             memo.take()
         };
         drop(stale);
-        let snapshot = self.pending_snapshot()?;
+        let snapshot = self.build(budget)?;
         let frozen = snapshot.dictionary_len();
         // The answer, and what goes once the lock is let go: our snapshot if another call
         // installed this state's meanwhile, else the entry ours replaced.
@@ -269,30 +273,37 @@ impl<'e> PrivateTransaction<'e> {
 
     /// [`Self::pending_snapshot`] as a reader of `view` reads it, as
     /// [`super::Transaction::pending_over`] makes it: `view` a restricted snapshot of the base.
+    /// Charged to the transaction's budget, as [`Self::pending_over_within`] charges.
     pub fn pending_over(&self, view: &Snapshot, hidden: &[EncodedQuad]) -> EngineResult<Snapshot> {
+        self.pending_over_within(view, hidden, self.overlay.budget())
+    }
+
+    /// [`Self::pending_over`], what it makes charged to `budget` before it is made and held by
+    /// the snapshot, as [`super::Transaction::pending_over_within`] charges (DUR-6); freezing
+    /// the vocabulary is charged to the transaction's budget.
+    pub fn pending_over_within(
+        &self,
+        view: &Snapshot,
+        hidden: &[EncodedQuad],
+        budget: &Arc<Budget>,
+    ) -> EngineResult<Snapshot> {
         let vocabulary = self.overlay.freeze()?;
+        let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+        scratch.charge(self.pending.over_bound(hidden))?;
         let seen = view.version();
         let gone = self.pending.over_gone(&seen.inferred, hidden);
         let asserted_inserts: Vec<EncodedQuad> = self.pending.asserted().inserted().collect();
         let asserted_deletes: Vec<EncodedQuad> = self.pending.asserted().deleted().collect();
-        let version = Version {
-            content: super::Content::fresh(),
-            asserted_content: super::AssertedIdentity::fresh(),
-            asserted: seen.asserted.with_delta_in(
-                &asserted_inserts,
-                &asserted_deletes,
-                &self._engine.shared.forms,
-            ),
-            inferred: seen.inferred.with_delta(&[], &gone),
-            revision: seen.revision,
-            committed_micros: seen.committed_micros,
-            dictionary_len: vocabulary.end(),
-            // Its own, as `pending_snapshot`'s.
-            equality: Default::default(),
-            canonical: Default::default(),
-            own: Default::default(),
-        };
-        Ok(view.with_version(version).private(vocabulary))
+        let end = vocabulary.end();
+        let snapshot = view.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&[][..], &gone[..]],
+            &self._engine.shared.forms,
+            budget,
+            |asserted, inferred| own_version(seen, asserted, inferred, end),
+        )?;
+        drop((gone, asserted_inserts, asserted_deletes, scratch));
+        Ok(snapshot.private(vocabulary))
     }
 
     /// Number of asserted and inferred quads, including pending changes.
@@ -376,9 +387,11 @@ impl<'e> PrivateTransaction<'e> {
 
     /// Retracts every asserted quad matching `pattern`; the number removed. What the
     /// retractions grow is charged as [`Self::try_insert_encoded`]'s; refused part way, the
-    /// retractions made before the refusal stay.
+    /// retractions made before the refusal stay, so the refusal counts as a change.
     pub fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
-        let removed = self.pending.try_remove_matching(pattern)?;
+        let removed = self.pending.try_remove_matching(pattern).inspect_err(|_| {
+            self.note(true);
+        })?;
         self.note(removed > 0);
         Ok(removed)
     }
@@ -407,6 +420,29 @@ impl<'e> PrivateTransaction<'e> {
 
     pub fn inferred_deleted(&self) -> impl Iterator<Item = EncodedTriple> + '_ {
         self.pending.inferred().deleted().map(Into::into)
+    }
+}
+
+/// A private pending version of `seen` with these stacks, every id it knows below `end`. Its
+/// derived state is its own: classes built from its statements name its own ids, and the
+/// base's cell is the published version's.
+fn own_version(
+    seen: &Version,
+    asserted: crate::index::IndexVersion,
+    inferred: crate::index::IndexVersion,
+    end: u64,
+) -> Version {
+    Version {
+        content: super::Content::fresh(),
+        asserted_content: super::AssertedIdentity::fresh(),
+        asserted,
+        inferred,
+        revision: seen.revision,
+        committed_micros: seen.committed_micros,
+        dictionary_len: end,
+        equality: Default::default(),
+        canonical: Default::default(),
+        own: Default::default(),
     }
 }
 

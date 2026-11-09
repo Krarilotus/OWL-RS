@@ -109,6 +109,11 @@ impl Overlay {
         self.start
     }
 
+    /// What its own entries are charged to.
+    pub(crate) fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
     /// The end of its ids now: `start` plus its own entries so far.
     pub(crate) fn end(&self) -> u64 {
         self.start + self.suffix.lock().len()
