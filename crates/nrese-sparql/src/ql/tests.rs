@@ -130,11 +130,9 @@ fn kept_entries(ql: &QlRewriting) -> Vec<(SnapshotIdentity, AssertedIdentity, *c
 
 /// The probes the rewriting keeps for other operations (contract S3): the view they were
 /// asked of, and each probe with its truth value.
-fn kept_probes(ql: &QlRewriting) -> (Option<SnapshotIdentity>, Vec<(String, bool)>) {
+fn kept_probes(ql: &QlRewriting) -> (Option<SnapshotIdentity>, ProbeAnswers) {
     let realised = ql.realised.lock().unwrap();
-    let mut probes: Vec<(String, bool)> = realised.1.iter().map(|(k, &v)| (k.clone(), v)).collect();
-    probes.sort();
-    (realised.0, probes)
+    (realised.0, realised.1.all())
 }
 
 /// Rewriting options with `ql`, sharing its state.

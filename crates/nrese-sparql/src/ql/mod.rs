@@ -218,7 +218,7 @@ pub struct QlRewriting {
     cached: Mutex<Vec<Cached>>,
     /// Whether the data has a witness's tree wherever it folds, per probe, for one
     /// snapshot view (design §3).
-    realised: Mutex<(Option<SnapshotIdentity>, HashMap<String, bool>)>,
+    realised: Mutex<(Option<SnapshotIdentity>, Probes)>,
     /// The latest commits' changes to memberships of class expressions
     /// ([`Self::note_commit`]), oldest first, at most [`NOTES`].
     notes: Mutex<std::collections::VecDeque<Note>>,
@@ -310,7 +310,7 @@ impl QlRewriting {
             closure,
             limits: Limits::default(),
             cached: Mutex::new(Vec::new()),
-            realised: Mutex::new((None, HashMap::new())),
+            realised: Mutex::new((None, Probes::default())),
             notes: Mutex::new(std::collections::VecDeque::new()),
         }
     }
@@ -374,14 +374,16 @@ impl QlRewriting {
         Some(out)
     }
 
-    /// Whether the data `snapshot` reads has the tree of probe `key` wherever it folds,
-    /// memoised per view and probe (`None`: not asked, the query's questions spent;
-    /// `false` then, and nothing kept). Only a published snapshot's answer is kept by the
-    /// store (contract S3); any other's by its own version alone (dictionary 3.0c).
-    /// Concurrent misses may compute independently; the query itself runs outside the lock.
+    /// Whether the data `snapshot` reads, its default graph the union of its graphs or not
+    /// (`union`), has the tree of probe `key` wherever it folds, memoised per view, mode and
+    /// probe (`None`: not asked, the query's questions spent; `false` then, and nothing
+    /// kept). Only a published snapshot's answer is kept by the store (contract S3); any
+    /// other's by its own version alone (dictionary 3.0c). Concurrent misses may compute
+    /// independently; the query itself runs outside the lock.
     pub(crate) fn realised(
         &self,
         snapshot: &Snapshot,
+        union: bool,
         key: &str,
         compute: impl FnOnce() -> Option<bool>,
     ) -> bool {
@@ -391,7 +393,7 @@ impl QlRewriting {
                 {
                     let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
                     if cache.0 == Some(identity)
-                        && let Some(&known) = cache.1.get(key)
+                        && let Some(known) = cache.1.get(union, key)
                     {
                         return known;
                     }
@@ -400,14 +402,14 @@ impl QlRewriting {
                 let Some(known) = compute() else {
                     return false;
                 };
-                self.remember(&state, key, known);
+                self.remember(&state, union, key, known);
                 known
             }
             Admission::Own(own) => {
                 let mine = own.get_or_insert_with(QlOwn::default);
                 {
                     let probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(&known) = probes.get(&identity).and_then(|p| p.get(key)) {
+                    if let Some(known) = probes.get(&identity).and_then(|p| p.get(union, key)) {
                         return known;
                     }
                 }
@@ -418,21 +420,21 @@ impl QlRewriting {
                 probes
                     .entry(identity)
                     .or_default()
-                    .insert(key.to_owned(), known);
+                    .insert(union, key, known);
                 known
             }
         }
     }
 
-    /// Keeps probe `key`'s answer for the published snapshot `state` gives, replacing
-    /// another view's probes.
-    fn remember(&self, state: &SharedState<'_>, key: &str, known: bool) {
+    /// Keeps probe `key`'s answer in mode `union` for the published snapshot `state`
+    /// gives, replacing another view's probes.
+    fn remember(&self, state: &SharedState<'_>, union: bool, key: &str, known: bool) {
         let identity = state.snapshot().identity();
         let mut cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
         if cache.0 != Some(identity) {
-            *cache = (Some(identity), HashMap::new());
+            *cache = (Some(identity), Probes::default());
         }
-        cache.1.insert(key.to_owned(), known);
+        cache.1.insert(union, key, known);
     }
 
     /// The same with other bounds (tests make them small).
@@ -660,7 +662,42 @@ impl QlRewriting {
 #[derive(Debug, Default)]
 struct QlOwn {
     entries: Mutex<Vec<(Closure, Cached)>>,
-    probes: Mutex<HashMap<SnapshotIdentity, HashMap<String, bool>>>,
+    probes: Mutex<HashMap<SnapshotIdentity, Probes>>,
+}
+
+/// One view's probe answers, by default-graph mode, then by probe. A probe asks the
+/// default graph its query reads, the union of the graphs or not, and neither the view's
+/// identity nor the probe's text says which (sol-loop r1 S1).
+#[derive(Debug, Default)]
+pub(crate) struct Probes([HashMap<String, bool>; 2]);
+
+/// [`Probes::all`]: each probe's answer, with its mode and its query, sorted.
+#[cfg(test)]
+pub(crate) type ProbeAnswers = Vec<((bool, String), bool)>;
+
+impl Probes {
+    fn get(&self, union: bool, key: &str) -> Option<bool> {
+        self.0[usize::from(union)].get(key).copied()
+    }
+
+    fn insert(&mut self, union: bool, key: &str, known: bool) {
+        self.0[usize::from(union)].insert(key.to_owned(), known);
+    }
+
+    /// Every answer, with its mode.
+    #[cfg(test)]
+    pub(crate) fn all(&self) -> ProbeAnswers {
+        let mut out: Vec<_> = [false, true]
+            .into_iter()
+            .flat_map(|union| {
+                self.0[usize::from(union)]
+                    .iter()
+                    .map(move |(k, &v)| ((union, k.clone()), v))
+            })
+            .collect();
+        out.sort();
+        out
+    }
 }
 
 /// What decides a snapshot's compiled TBox besides its memberships ([`Cached`]'s checks).
