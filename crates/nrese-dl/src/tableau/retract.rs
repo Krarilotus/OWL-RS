@@ -178,9 +178,13 @@ impl Engine<'_> {
         }
         touched.sort_unstable();
         touched.dedup();
-        // A disjunction a retracted fact satisfied may be open again: only one queued since
-        // `k`'s frame was opened, already passed by the scan, and binding a touched node.
-        for i in pending_open..self.pending_open.min(self.pending.len() as u32) {
+        // A disjunction a retracted fact satisfied may be open again. It binds a touched node
+        // (the fact's), lies behind the scan, and was looked at since `k`'s frame was opened:
+        // by the scan, at or after the cursor `k` saved, or taken from `reopen`, at or after
+        // `reopened_low` (review D16-058 r1: a reopened disjunction a newer choice satisfied,
+        // below that choice's saved cursor).
+        let low = pending_open.min(self.reopened_low);
+        for i in low..self.pending_open.min(self.pending.len() as u32) {
             let p = self.pending[i as usize];
             if self.pending_dead[i as usize] {
                 continue;
