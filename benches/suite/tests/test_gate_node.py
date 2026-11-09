@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 LEAKS = ("NRESE_", "FLEET_")
 VERSION = "9.9.9"
+SUPPORT = b"// npm's own code, which its launchers load\n"
 
 
 def node_script(reports: str) -> bytes:
@@ -37,8 +38,9 @@ def archive(platform: str, reports: str) -> bytes:
     name for node.exe here), npm and npx beside it on Windows."""
     top = f"node-v{VERSION}-{platform}"
     where = top if platform == "win-x64" else f"{top}/bin"
+    support = f"{top}/node_modules/npm/bin" if platform == "win-x64" else f"{top}/lib/node_modules/npm/bin"
     files = {f"{where}/node": node_script(reports), f"{where}/npm": b"#!/bin/sh\necho 10.9.9\n",
-             f"{where}/npx": b"#!/bin/sh\necho 10.9.9\n"}
+             f"{where}/npx": b"#!/bin/sh\necho 10.9.9\n", f"{support}/npx-cli.js": SUPPORT}
     out = io.BytesIO()
     if platform == "win-x64":
         with zipfile.ZipFile(out, "w") as z:
@@ -223,6 +225,47 @@ class GateNode(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertFalse(marker.exists(), f"SPEC gate-node: the host's npx ran\n{done.stdout}{done.stderr}")
         self.assertEqual(done.stdout.strip(), "10.9.9", "SPEC gate-node: the pinned build's npx ran")
+
+    def test_a_damaged_install_is_never_reused_under_its_record(self):
+        # Review r2 F1/F2: a genuine install, then damaged with its records left as they are: a zero-byte npx
+        # (Git Bash runs it as an empty script, exit 0; a bare npx then skips it and finds the host's), an npx
+        # replaced by another that runs, and npm's support code changed. Each is made again from the archive;
+        # the host's npx never runs. Without the archive to make it again: no Node at all, never the host's.
+        good = self.publish(VERSION)
+        tools = self.pin(good)
+        entry = self.cache / f"node-{VERSION}-{good[:12]}"
+        bin_dir = entry / "bin" if self.platform == "linux-x64" else entry
+        support = entry / ("node_modules" if self.platform == "win-x64" else "lib/node_modules") / "npm/bin/npx-cli.js"
+        host = self.root / "host-bin"
+        host.mkdir()
+        marker = self.root / "host-npx-ran"
+        (host / "npx").write_text(f'#!/bin/sh\n: > "{marker.as_posix()}"\necho HOST-NPX\n', newline="\n")
+        (host / "npx").chmod(0o755)
+        console = ('c=$(cygpath -u "$1" 2> /dev/null || printf "%s" "$1"); '
+                   'bin=$(gate_node "$c" "$2") && PATH="$bin:$PATH" && npx --version')
+        damages = {"zero-byte npx": lambda: (bin_dir / "npx").write_bytes(b""),
+                   "another npx": lambda: (bin_dir / "npx").write_bytes(b"#!/bin/sh\necho STALE-NPX\n"),
+                   "npm's support code": lambda: support.write_bytes(b"// another\n")}
+        for name, damage in damages.items():
+            with self.subTest(name):
+                shutil.rmtree(self.cache, ignore_errors=True)
+                self.seen.unlink(missing_ok=True)
+                self.assertEqual(self.gate_node(tools).returncode, 0, "a genuine install first")
+                records = {p: (entry / p).read_bytes() for p in (".provenance", ".manifest")}
+                damage()
+                done = self.gate_node(tools, console, path=host.as_posix())
+                self.assertFalse(marker.exists(), f"SPEC gate-node: the host's npx ran ({name})\n{done.stdout}{done.stderr}")
+                self.assertEqual((done.returncode, done.stdout.strip(), self.fetches()), (0, "10.9.9", 2),
+                                 f"SPEC gate-node: made again from the archive ({name})\n{done.stderr}")
+                self.assertEqual(support.read_bytes(), SUPPORT, f"SPEC gate-node: the archive's payload ({name})")
+                self.assertEqual({p: (entry / p).read_bytes() for p in records}, records,
+                                 f"SPEC gate-node: records of the same archive and payload ({name})")
+        # Damaged, and the archive can't be had: no Node, and nothing of the host's runs.
+        (bin_dir / "npx").write_bytes(b"")
+        (self.dist / f"v{VERSION}" / self.name).unlink()
+        done = self.gate_node(tools, console, path=host.as_posix())
+        self.assertNotEqual(done.returncode, 0, "SPEC gate-node: a damaged entry that can't be made again is no Node")
+        self.assertFalse(marker.exists(), f"SPEC gate-node: the host's npx ran\n{done.stdout}{done.stderr}")
 
     def test_a_build_reporting_another_version_is_refused(self):
         sha = self.publish("1.0.0")  # the archive's sha256 is pinned, yet its node isn't VERSION
