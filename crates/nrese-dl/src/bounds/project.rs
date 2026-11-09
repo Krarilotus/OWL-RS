@@ -16,7 +16,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::program::{Atom, Provenance, Slot};
-use super::upper::{Compiler, U1};
+use super::upper::Compiler;
+use crate::internal::u1;
 
 /// The body's components, keyed by their atoms, and the projection atom of each.
 pub(super) type Projections = HashMap<Vec<Atom>, Atom>;
@@ -141,7 +142,7 @@ impl Compiler<'_> {
         provenance: &Provenance,
     ) -> Atom {
         let n = self.program.names.projections.len();
-        let term = (self.iri)(&format!("{U1}proj{n}"));
+        let term = (self.iri)(&u1(format_args!("proj{n}")));
         self.program.add_projection(term);
         let atom = match at {
             Some(x) => self.type_atom(x, term),

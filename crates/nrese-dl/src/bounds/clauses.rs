@@ -8,7 +8,8 @@ use nrese_owl::{
 
 use super::program::{Approximations, Atom, Origin, Provenance, Slot};
 use super::project::Projections;
-use super::upper::{Compiler, U1};
+use super::upper::Compiler;
+use crate::internal::u1;
 
 /// A clause's variables as rule variables.
 pub(super) struct Bindings {
@@ -276,7 +277,7 @@ impl Compiler<'_> {
     ) -> bool {
         let collapsed = n > self.max_skolems;
         let constants: Vec<Term> = (0..n.clamp(1, self.max_skolems))
-            .map(|i| self.skolem(&format!("{U1}sk{index}-{k}-{i}")))
+            .map(|i| self.skolem(&u1(format_args!("sk{index}-{k}-{i}"))))
             .collect();
         let provenance = Provenance {
             origin: Origin::Skolem,
@@ -298,7 +299,7 @@ impl Compiler<'_> {
         if let Filler::Not(concept) = filler {
             // The constants are outside the concept: a class of their own, and a clash
             // where an element of it is in the concept.
-            let family = self.skolem(&format!("{U1}sk{index}-{k}-not"));
+            let family = self.skolem(&u1(format_args!("sk{index}-{k}-not")));
             for &c in &constants {
                 head.push(self.type_atom(Slot::Const(c), family));
             }
@@ -318,9 +319,9 @@ impl Compiler<'_> {
             // Pairwise different: each constant carries a tag of its own, and an element
             // with two tags is two of them made equal. Linear in `n`, and right under
             // equality by copying and by representatives alike (tags are never merged).
-            let tag = self.skolem(&format!("{U1}sk{index}-{k}-tag"));
+            let tag = self.skolem(&u1(format_args!("sk{index}-{k}-tag")));
             for (i, &c) in constants.iter().enumerate() {
-                let value = self.skolem(&format!("{U1}sk{index}-{k}-tag{i}"));
+                let value = self.skolem(&u1(format_args!("sk{index}-{k}-tag{i}")));
                 head.push(Atom([Slot::Const(c), Slot::Const(tag), Slot::Const(value)]));
             }
             let body = vec![
@@ -358,6 +359,9 @@ impl Compiler<'_> {
         {
             return (values.clone(), false);
         }
-        (vec![self.skolem(&format!("{U1}sk{index}-{k}-v"))], true)
+        (
+            vec![self.skolem(&u1(format_args!("sk{index}-{k}-v")))],
+            true,
+        )
     }
 }

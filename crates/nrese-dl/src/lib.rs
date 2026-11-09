@@ -27,6 +27,7 @@ pub mod certificate;
 pub mod classify;
 pub mod context;
 pub mod datatypes;
+pub mod internal;
 pub mod islands;
 pub mod limits;
 pub mod memory;
