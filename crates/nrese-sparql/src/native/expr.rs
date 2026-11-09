@@ -214,7 +214,9 @@ impl Evaluator {
             ))
         };
         match expr {
-            Expression::NamedNode(node) if node.as_str().starts_with(super::substitute::ALIAS) => {
+            Expression::NamedNode(node)
+                if nrese_sparql_syntax::internal::is_constant(node.as_str()) =>
+            {
                 self.aliases
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

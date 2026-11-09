@@ -1,8 +1,11 @@
 //! Test-only fault points: each makes one durable step fail, on this thread only, so that
 //! tests running in parallel don't see each other's faults.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::thread::LocalKey;
+
+/// A reader of a snapshot ([`IMAGE_READER`]).
+pub(crate) type Reader = Box<dyn FnMut(&crate::Snapshot)>;
 
 thread_local! {
     /// [`Wal::rotate`](super::wal::Wal::rotate) fails before it changes anything.
@@ -38,6 +41,9 @@ thread_local! {
     /// sees at that moment.
     pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<DirSyncHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Reads a durable bulk load's checkpoint image before the checkpoint is written, as a
+    /// reader of it would (the own-state slots' 3.0c item 5).
+    pub(crate) static IMAGE_READER: RefCell<Option<Reader>> = const { RefCell::new(None) };
 }
 
 /// What [`ON_DIR_SYNC`] calls.

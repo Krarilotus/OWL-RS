@@ -1093,16 +1093,29 @@ impl StoreService {
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
     }
 
-    /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
-    /// without reasoning, or for asserted statements only): sound, and complete only for
-    /// what the ruleset derives, never certain answers under OWL 2 DL. Known before the
-    /// query runs.
+    /// The status of answers that don't go through the DL bounds; known before the query
+    /// runs. `None` only where no reasoning path can leave answers out: asserted statements
+    /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
+    /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
+    /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
+    /// rules' closure without the bounds ([`Self::dl_mode`]): sound only, never complete
+    /// (SYN-72 slice 2 r1 F1).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        if self.dl.active() || prepared.read_model() == ReadModel::Asserted {
+        if prepared.read_model() == ReadModel::Asserted {
             return None;
+        }
+        if self.dl.active() {
+            let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+            status.incomplete(
+                "dl",
+                "a read of the inferred statements alone: the rules' closure, without the DL \
+                 bounds; certain answers under OWL 2 DL may be missing"
+                    .to_owned(),
+            );
+            return Some(status);
         }
         let ruleset = self
             .materialised
