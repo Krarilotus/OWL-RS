@@ -40,10 +40,16 @@ pub enum Site {
     /// A class build's sort work: each comparison of a run's sort and each identity a merge
     /// of sorted runs moves (`Classes::of_with`; REAS-3a fix check r1 F3).
     SortWork,
+    /// Key comparisons a run's range or bound search makes (`PackedKeys::bound_in` and its
+    /// callers; REAS-3a fix check r1 F1).
+    SearchWork,
+    /// A merge's work: each key comparison its selection makes, each cursor it advances and
+    /// each key a cursor decodes (`index::merge`; REAS-3a fix check r1 F1).
+    MergeWork,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 7] = const { [const { Cell::new(0) }; 7] };
+    static COUNTS: [Cell<u64>; 9] = const { [const { Cell::new(0) }; 9] };
 }
 
 /// Counts `n` units at `site` on this thread.

@@ -2,13 +2,162 @@
 //! tombstone words as it reads them, so a caller's stop ends the read within a run of words.
 
 use super::run::Run;
-use super::{IndexVersion, Layout};
+use super::{IndexVersion, Layout, Visitor};
 use crate::quad::{AccessPlan, EncodedQuad, QuadPattern};
 use crate::term::{TermId, TermKind};
 use crate::witness::{self, Site};
+use std::cell::Cell;
+use std::sync::Arc;
 
 fn term(n: u64) -> TermId {
     TermId::new(TermKind::Iri, n + 1)
+}
+
+/// The work a read's producers count: the runs it searches or probes, the comparisons its
+/// searches make, the keys its scan passes and its merge's work.
+fn read_work() -> u64 {
+    [
+        Site::RunProbes,
+        Site::SearchWork,
+        Site::ScanSteps,
+        Site::MergeWork,
+    ]
+    .into_iter()
+    .map(witness::get)
+    .sum()
+}
+
+/// `read` run again for each `k` from 0, its visitor answering yes `k` times and then no,
+/// until it finishes without a no: the most work done between two asks of the visitor, or
+/// after its last ask until `read` returned, over all the runs.
+fn largest_gap(read: impl Fn(Visitor<'_>)) -> u64 {
+    let mut largest = 0;
+    for yeses in 0.. {
+        let (asked, last, most) = (Cell::new(0), Cell::new(read_work()), Cell::new(0));
+        let gap = || {
+            let now = read_work();
+            most.set(most.get().max(now - last.replace(now)));
+        };
+        read(&|_| {
+            gap();
+            asked.set(asked.get() + 1);
+            asked.get() <= yeses
+        });
+        gap();
+        largest = largest.max(most.get());
+        if asked.get() <= yeses {
+            return largest;
+        }
+    }
+    unreachable!("a read asks its visitor finitely often")
+}
+
+/// REAS-3a fix check r1 F1 (design attack r2, E2). Spec (`crate::visit`: a unit is a key
+/// comparison a read's search makes, counted before it is made): a counted read's range
+/// searches stay within its visitor's interval, also where they find nothing. An interval of
+/// runs, 32 statements each, and a subject above every stored one, so that each run's range is
+/// empty (no cursor, no merge step): stopped after each of its visitor's yeses, a counted
+/// scan, count, existence probe and membership probe each do at most two intervals of work
+/// between two asks (and after the last). Counting one unit per run's search, a chunk of runs
+/// counted at once, an interval of searches of about six comparisons each ran unseen.
+#[test]
+fn counted_reads_search_empty_ranges_within_their_visitor_s_interval() {
+    let interval = u64::from(nrese_exec::POLL_UNITS);
+    let (p, o) = (term(1), term(2));
+    let runs: Vec<_> = (0..interval)
+        .map(|r| {
+            let quads: Vec<_> = (0..32)
+                .map(|i| EncodedQuad::new(term(10 + 32 * r + i), p, o, TermId::DEFAULT_GRAPH))
+                .collect();
+            Arc::new(Run::from_delta(Layout::DefaultGraph, &quads, &[]))
+        })
+        .collect();
+    let version = IndexVersion {
+        layout: Layout::DefaultGraph,
+        runs: runs.into(),
+        len: 32 * interval,
+    };
+    let above = term(10 + 32 * interval);
+    let plan = AccessPlan::for_pattern(&QuadPattern {
+        subject: Some(above),
+        predicate: Some(p),
+        ..QuadPattern::all()
+    });
+    let quad = EncodedQuad::new(above, p, o, TermId::DEFAULT_GRAPH);
+    let gaps = [
+        (
+            "scan",
+            largest_gap(|visit| version.scan_plan_iter_counted(&plan, visit).for_each(drop)),
+        ),
+        (
+            "count",
+            largest_gap(|visit| {
+                let _ = version.count_plan_visiting(&plan, visit);
+            }),
+        ),
+        (
+            "existence",
+            largest_gap(|visit| {
+                let _ = version.any_plan_counted(&plan, visit);
+            }),
+        ),
+        (
+            "membership",
+            largest_gap(|visit| {
+                let _ = version.contains_counted(&quad, visit);
+            }),
+        ),
+    ];
+    let over: Vec<_> = gaps.iter().filter(|(_, gap)| *gap > 2 * interval).collect();
+    assert!(
+        over.is_empty(),
+        "work between two asks of the visitor past {}: {over:?}",
+        2 * interval
+    );
+}
+
+/// REAS-3a fix check r1 F1 (design attacks D1, E4). Spec (`crate::visit`: a unit is a key
+/// comparison a merge makes, a cursor it advances or a key it decodes, counted before it is
+/// done): a counted scan steps through many deltas of one statement within its visitor's
+/// interval. Three intervals of runs that insert and delete one statement in turn (inserted
+/// last, so it is there), then a run with a second statement: stopped after each of its
+/// visitor's yeses, the scan does at most two intervals of work between two asks (and after
+/// the last), and unstopped it reads both statements. Counting a step's cursors before it and
+/// then taking it whole, the first step's three intervals of cursors ran unseen.
+#[test]
+fn a_counted_scan_steps_through_many_deltas_within_its_visitor_s_interval() {
+    let interval = u64::from(nrese_exec::POLL_UNITS);
+    let (p, o) = (term(1), term(2));
+    let k = EncodedQuad::new(term(10), p, o, TermId::DEFAULT_GRAPH);
+    let l = EncodedQuad::new(term(11), p, o, TermId::DEFAULT_GRAPH);
+    let mut runs: Vec<_> = (0..=3 * interval)
+        .map(|i| match i % 2 {
+            0 => Arc::new(Run::from_delta(Layout::DefaultGraph, &[k], &[])),
+            _ => Arc::new(Run::from_delta(Layout::DefaultGraph, &[], &[k])),
+        })
+        .collect();
+    runs.push(Arc::new(Run::from_delta(Layout::DefaultGraph, &[l], &[])));
+    let version = IndexVersion {
+        layout: Layout::DefaultGraph,
+        runs: runs.into(),
+        len: 2,
+    };
+    let plan = AccessPlan::for_pattern(&QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    });
+    let largest = largest_gap(|visit| version.scan_plan_iter_counted(&plan, visit).for_each(drop));
+    let read: Vec<_> = version.scan_plan_iter_counted(&plan, &|_| true).collect();
+    assert_eq!(
+        read,
+        [k, l],
+        "the statement inserted last and the second one"
+    );
+    assert!(
+        largest <= 2 * interval,
+        "{largest} units of work between two asks of the visitor: at most {}",
+        2 * interval
+    );
 }
 
 /// Spec (`IndexVersion::count_plan_visiting`, `Snapshot::count_in_visiting`'s contract):
@@ -105,7 +254,8 @@ fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
 /// scan over many runs reads its cursors within its visitor's interval. Five intervals of runs,
 /// one statement each, all matching (a range in every run, a cursor each): from the scan's
 /// first ask to its third quad, between two asks of the visitor (and after the last), it
-/// searches, reads and steps through no more than two intervals of runs, cursors and keys. Its
+/// does no more than two intervals of work: runs searched, their comparisons, cursors read and
+/// the merge's work (fix check r1 F1: a step compared every cursor after one count). Its
 /// credit's hint summed every cursor before each ask, five intervals unseen.
 #[test]
 fn a_counted_scan_reads_its_cursors_within_its_visitor_s_interval() {
@@ -127,12 +277,7 @@ fn a_counted_scan_reads_its_cursors_within_its_visitor_s_interval() {
         predicate: Some(p),
         ..QuadPattern::all()
     });
-    let work = || {
-        [Site::RunProbes, Site::CursorReads, Site::ScanSteps]
-            .into_iter()
-            .map(witness::get)
-            .sum::<u64>()
-    };
+    let work = || read_work() + witness::get(Site::CursorReads);
     let last = std::cell::Cell::new(work());
     let largest = std::cell::Cell::new(0);
     let gap = || {
