@@ -154,6 +154,18 @@ impl MutationPipeline {
         requester: &crate::Requester,
         ticket: &MutationTicket,
     ) -> Result<MutationCommitReport, MutationError> {
+        self.apply_noted(command, requester, ticket, None)
+    }
+
+    /// [`Self::apply`], its commit noted in a journal beside the store's log by `note`
+    /// ([`nrese_engine::Transaction::note_commit`]): a quarantine readmission's resolution.
+    pub(crate) fn apply_noted<'p>(
+        &'p self,
+        command: MutationCommand,
+        requester: &crate::Requester,
+        ticket: &MutationTicket,
+        note: Option<nrese_engine::CommitNote<'p>>,
+    ) -> Result<MutationCommitReport, MutationError> {
         let kind = command.kind();
         let store_error = |source| {
             if ticket.is_cancelled() {
@@ -175,20 +187,40 @@ impl MutationPipeline {
         // belongs to the pipeline that took over. Retirement is part of the stop condition,
         // which the rematerialisation checks a last time under the writer slot before it
         // commits, so retiring during this preflight changes nothing either.
-        if let Some(rules) = self.reasoner.config().materialised_program()
-            && !self.store.reasoning_is_current(&rules)
-        {
-            let stop = || ticket.is_cancelled() || self.is_retired();
-            match self.store.rematerialise_until(&rules, &stop) {
-                Ok(_) => {}
-                Err(StoreError::MaterialisationCancelled) if self.is_retired() => {
-                    return Err(MutationError::Retired);
+        //
+        // The check that decides is the one under the transaction's writer slot (review r1, F1):
+        // a write that doesn't maintain the closure (a bulk load, `clear_inferred`) may clear
+        // the certificate between the preflight and the slot. Then the slot goes back, the
+        // closure is rematerialised, and the transaction is taken again.
+        let rules = self.reasoner.config().materialised_program();
+        let mut tx = loop {
+            if let Some(rules) = &rules
+                && !self.store.reasoning_is_current(rules)
+            {
+                let stop = || ticket.is_cancelled() || self.is_retired();
+                match self.store.rematerialise_until(rules, &stop) {
+                    Ok(_) => {}
+                    Err(StoreError::MaterialisationCancelled) if self.is_retired() => {
+                        return Err(MutationError::Retired);
+                    }
+                    Err(StoreError::MaterialisationCancelled) => {
+                        return Err(MutationError::Cancelled);
+                    }
+                    Err(error) => return Err(store_error(error)),
                 }
-                Err(StoreError::MaterialisationCancelled) => return Err(MutationError::Cancelled),
-                Err(error) => return Err(store_error(error)),
             }
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_PREFLIGHT);
+            let tx = self.store.engine().transaction();
+            let writer = tx.writer().expect("a transaction holds the writer slot");
+            match &rules {
+                Some(rules) if !self.store.reasoning_is_current_held(writer, rules) => drop(tx),
+                _ => break tx,
+            }
+        };
+        if let Some(note) = note {
+            tx.note_commit(note);
         }
-        let mut tx = self.store.engine().transaction();
         // Checked with the writer slot held: a pipeline that took over the store
         // rematerialises after retiring this one, so a write that got the slot before
         // commits first and is recomputed, and one after is refused here.
@@ -406,7 +438,9 @@ impl MutationPipeline {
         }
 
         // Without reasoning, commits don't maintain the inferred stack.
-        self.store.invalidate_reasoning().map_err(store_error)?;
+        self.store
+            .invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
+            .map_err(store_error)?;
         crate::shacl::check_shapes(
             &tx,
             &self.store.config().shapes_graph,
