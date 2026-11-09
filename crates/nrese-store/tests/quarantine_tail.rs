@@ -8,12 +8,16 @@ use nrese_store::*;
 // on reopen (SYN-67). Tail repair does not make RDF commit + journal append atomic.
 #[test]
 fn q06_quarantine_repairs_torn_tail_before_append() {
-    for tail in [b"{\"id\":".as_slice(), b"{\"id\":\"\xf0\x9f".as_slice()] {
+    for tail in [
+        Some(b"{\"id\":".as_slice()),
+        Some(b"{\"id\":\"\xf0\x9f".as_slice()),
+        None,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("bad.ttl");
         std::fs::write(
             &input,
-            "@prefix : <http://example.com/> . _:b :p :o :extra .\n",
+            "@prefix : <http://example.com/> . _:a :p :o :extra .\n_:b :p :o :extra .\n",
         )
         .unwrap();
         let config = StoreConfig {
@@ -30,16 +34,24 @@ fn q06_quarantine_repairs_torn_tail_before_append() {
                 invalid: None,
             })
             .unwrap();
-        let id = store
+        let ids: Vec<_> = store
             .quarantine()
             .list(&QuarantineFilter::default())
-            .unwrap()[0]
-            .statement
-            .id
-            .clone();
+            .unwrap()
+            .into_iter()
+            .map(|item| item.statement.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        store.quarantine().discard(&ids[..1], None).unwrap();
         drop(store);
         let log = config.data_dir.join("quarantine/resolutions.jsonl");
-        std::fs::write(&log, tail).unwrap();
+        let mut prior = std::fs::read(&log).unwrap();
+        if let Some(tail) = tail {
+            prior.extend_from_slice(tail);
+        } else {
+            assert_eq!(prior.pop(), Some(b'\n'));
+        }
+        std::fs::write(&log, prior).unwrap();
         let pipeline = MutationPipeline::new(
             Arc::new(StoreService::new(config.clone()).unwrap()),
             Arc::new(ReasonerService::new(ReasonerConfig::default())),
@@ -53,16 +65,18 @@ fn q06_quarantine_repairs_torn_tail_before_append() {
             &pipeline,
             &Requester::all(),
             &MutationTicket::new(),
-            &id,
+            &ids[1],
             &request,
         )
         .unwrap();
         drop(pipeline);
         let reopened = StoreService::new(config).unwrap();
-        let item = reopened.quarantine().get(&id).unwrap().unwrap();
-        assert!(
-            item.resolution.is_some(),
-            "acknowledged resolution swallowed after torn tail: {item:?}"
-        );
+        for id in &ids {
+            let item = reopened.quarantine().get(id).unwrap().unwrap();
+            assert!(
+                item.resolution.is_some(),
+                "acknowledged resolution swallowed after torn tail: {item:?}"
+            );
+        }
     }
 }
