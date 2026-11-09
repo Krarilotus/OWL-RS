@@ -958,6 +958,28 @@ mod tests {
         );
     }
 
+    /// Spec (stop.rs, W1; sol-loop r4 S5 of the graph closure package): linear passes in runs
+    /// see a stop within `POLL_UNITS` units of work, counted across passes. A pass of 4,096
+    /// units then one of 4,095, with a stop that turns true once 4,096 are done: stopped, and
+    /// no more than `POLL_UNITS` units after it turned. Ticked before its work, the first run
+    /// reset the allowance and the second ran unpolled: 8,191 units, never stopped.
+    #[test]
+    fn linear_passes_see_a_stop_across_passes() {
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || done.load(Ordering::Relaxed) >= crate::POLL_UNITS as usize;
+        let stop: StopFn<'_> = &stop;
+        let ticker = Ticker::new(stop).unwrap();
+        let work = |run: std::ops::Range<usize>| {
+            done.fetch_add(run.len(), Ordering::Relaxed);
+        };
+        let first = in_runs(&ticker, crate::POLL_UNITS as usize, work);
+        let stopped =
+            first.is_err() || in_runs(&ticker, crate::POLL_UNITS as usize - 1, work).is_err();
+        let done = done.load(Ordering::Relaxed);
+        assert!(stopped, "never stopped, {done} units done");
+        assert!(done <= 2 * crate::POLL_UNITS as usize, "{done} units");
+    }
+
     /// The SCC kernel: components, each once, sinks first.
     #[test]
     fn components_come_sinks_first() {
