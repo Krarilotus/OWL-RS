@@ -279,6 +279,12 @@ impl Pending {
             .reserve(Table::Inserts, more, &mut charge.held)
     }
 
+    /// Whether an asserted insert may grow a charged table: a budget is attached and the
+    /// inserts' table is full ([`Self::try_room_for_insert`]).
+    pub(in crate::engine) fn insert_may_grow(&self) -> bool {
+        self.charge.is_some() && self.asserted.inserts.len() >= self.asserted.inserts.capacity()
+    }
+
     /// Room for one more asserted insert where a budget is attached and the table is full:
     /// what [`Self::try_insert_asserted`] would charge, reserved before the quad's terms are
     /// interned, so a refused insert interns nothing. Without a budget, nothing to do.
