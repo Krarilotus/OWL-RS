@@ -82,18 +82,25 @@ impl Engine<'_> {
             let failed = self.deps.union(frame.premise, frame.failed);
             return Some(Err(super::engine::Stop::Clash(failed)));
         }
-        frame.next += 1;
         // On top, as the most recent decision: a fresh level, and the state as it is now
-        // for a later truncation to it.
-        let point = self.checkpoint();
-        frame.id = self.next_level;
+        // for a later truncation to it. Everything but the decision comes from the
+        // checkpoint, the retraction queues included: a truncation to this frame restores
+        // them, and an older copy lost the disjunctions this retraction reopened (fuzz seed
+        // 710126, case 7).
+        let id = self.next_level;
         self.next_level += 1;
-        frame.mark = point.mark;
-        frame.pending = point.pending;
-        frame.bindings = point.bindings;
-        frame.pending_open = point.pending_open;
-        frame.ni_pending = point.ni_pending;
-        frame.ni_open = point.ni_open;
+        let frame = super::engine::Frame {
+            id,
+            semantic: frame.semantic,
+            alternatives: frame.alternatives,
+            clause: frame.clause,
+            heads: frame.heads,
+            disjunction: frame.disjunction,
+            next: frame.next + 1,
+            premise: frame.premise,
+            failed: frame.failed,
+            ..self.checkpoint()
+        };
         self.frames.push(frame);
         Some(self.take_alternative())
     }

@@ -183,6 +183,11 @@ Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
   disjunctions, and the search found a model without that one (D16-058). Each frame records
   the pending disjunction it decides, and `check_retraction` checks at a model's end that
   no live pending disjunction is left undecided.
+- **A re-decided frame takes its whole state from the checkpoint,** the retraction queues
+  included, by struct update: only the decision (alternatives, premise, failures, the next
+  alternative) comes from its first opening. With the queues of its first opening, a
+  truncation to it lost the disjunctions its own retraction had reopened (fuzz seed
+  710126, case 7, found by the model-end check).
 
 **Measured** (662 to 664, lab profile):
 - Truncating backjumps fall to 0 and rebuilt levels to 0. Branch points fall from millions
