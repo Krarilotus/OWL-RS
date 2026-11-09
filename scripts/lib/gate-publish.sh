@@ -53,21 +53,22 @@ lld_of() {
 # The flags the revision's own build hands rustc: its cargo-guarded.sh --print-rustflags where it
 # has one, else its scripts/lib/target-cpu.sh applied here, as its cargo-guarded.sh does (every
 # revision the gate builds has it), else RUSTFLAGS as they are.
-effective_rustflags() {
+effective_rustflags() (
   local tmp out
-  tmp=$(mktemp -d)
-  git archive "$1" scripts 2>/dev/null | tar -x -C "$tmp" 2>/dev/null
+  set -o pipefail
+  tmp=$(mktemp -d) || return 1
+  trap 'rm -rf -- "$tmp"' EXIT
+  git archive "$1" scripts 2>/dev/null | tar -x -C "$tmp" 2>/dev/null || return 1
   if grep -q -- '--print-rustflags' "$tmp/scripts/cargo-guarded.sh" 2>/dev/null; then
-    out=$(bash "$tmp/scripts/cargo-guarded.sh" --print-rustflags)
+    out=$(bash "$tmp/scripts/cargo-guarded.sh" --print-rustflags) || return 1
   elif [ -f "$tmp/scripts/lib/target-cpu.sh" ]; then
     # shellcheck disable=SC1091
-    out=$( . "$tmp/scripts/lib/target-cpu.sh"; export_target_cpu_rustflags; printf '%s' "${RUSTFLAGS:-}")
+    out=$( . "$tmp/scripts/lib/target-cpu.sh" && export_target_cpu_rustflags && printf '%s' "${RUSTFLAGS:-}") || return 1
   else
     out=${RUSTFLAGS:-}
   fi
-  rm -rf "$tmp"
   printf '%s' "$out"
-}
+)
 
 build_identity() {
   local channel flags

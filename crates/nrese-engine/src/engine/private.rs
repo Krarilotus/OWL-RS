@@ -119,9 +119,12 @@ impl<'e> PrivateTransaction<'e> {
         let version = Version {
             content: super::Content::fresh(),
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: base
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            // The base's runs read in the quad layout are their shared forms (DUR-6).
+            asserted: base.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self._engine.shared.forms,
+            ),
             inferred: base
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
@@ -149,9 +152,11 @@ impl<'e> PrivateTransaction<'e> {
         let version = Version {
             content: super::Content::fresh(),
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: seen
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            asserted: seen.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self._engine.shared.forms,
+            ),
             inferred: seen.inferred.with_delta(&[], &gone),
             revision: seen.revision,
             committed_micros: seen.committed_micros,

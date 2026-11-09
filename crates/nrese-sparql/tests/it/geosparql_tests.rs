@@ -10,6 +10,24 @@ const PREFIXES: &str = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
     PREFIX uom: <http://www.opengis.net/def/uom/OGC/1.0/> \
     PREFIX ex: <http://example.com/> ";
 
+// Spec: a constructed GML geometry uses GML 3.2, including its namespace.
+#[test]
+fn d066_gml_uses_gml32_namespace() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let rows = select(
+        &engine,
+        r#"SELECT (geof:centroid('<gml:Point xmlns:gml="http://www.opengis.net/gml/3.2"><gml:pos>1 2</gml:pos></gml:Point>'^^geo:gmlLiteral) AS ?g) WHERE {}"#,
+    );
+    let Some(Term::Literal(gml)) = &rows[0][0] else {
+        panic!("GML literal expected: {rows:?}")
+    };
+    assert!(
+        gml.value()
+            .contains("xmlns:gml=\"http://www.opengis.net/gml/3.2\""),
+        "{gml}"
+    );
+}
+
 fn engine() -> Engine {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
