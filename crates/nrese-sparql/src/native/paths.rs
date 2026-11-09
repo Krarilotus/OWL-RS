@@ -597,17 +597,19 @@ impl PathEvaluator<'_> {
     }
 
     /// One step of a search over `path` from `node`, forwards (`forward`) or backwards: its
-    /// ends, in a buffer of the evaluation. Stopped before or while they were found (a refusal
-    /// cuts them short), the stop, which ends the search. The search takes each end once,
-    /// however many ways lead there.
+    /// ends, in a buffer of the evaluation. Refused while they were found (a refusal cuts them
+    /// short), the refusal, which ends the search; the query's cancellation the search polls
+    /// itself, once per batch of work. The search takes each end once, however many ways lead
+    /// there.
     fn ends_of(&self, path: &Path, node: u64, forward: bool) -> Result<Buf<'_, u64>, Stop> {
-        self.halted()?;
         let ends = match forward {
             true => self.support_from(path, node),
             false => self.support_to(path, node),
         };
-        self.halted()?;
-        Ok(ends)
+        match self.refused.get() {
+            Some(refused) => Err(Stop::Memory(refused)),
+            None => Ok(ends),
+        }
     }
 
     /// The closure of `step` from `node` (`forward`) or into it: the nodes it reaches in one
