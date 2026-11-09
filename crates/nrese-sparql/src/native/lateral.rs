@@ -73,7 +73,10 @@ impl Context<'_> {
                 }
                 if let Some(term) = self.term(id) {
                     if let Term::BlankNode(b) = &term {
-                        self.register_alias(super::substitute::alias(b.as_str()).as_str(), id);
+                        self.register_alias(
+                            nrese_sparql_syntax::internal::blank_constant(b.as_str()).as_str(),
+                            id,
+                        );
                     }
                     terms.insert(variable.clone(), term);
                     put_in.push((variable.clone(), id));
