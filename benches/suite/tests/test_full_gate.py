@@ -1,6 +1,7 @@
 """D16-109: a full tier requires cargo-deny in both Cargo workspaces."""
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -26,20 +27,23 @@ exit 0
 
 
 def full_gate_root(root: Path, source: Path = ROOT) -> Path:
-    """A checkout at ROOT in which `scripts/check.sh all` runs SOURCE's check.sh with its tools stubbed:
-    cargo by CARGO, the steps' scripts exiting 0."""
-    (root / "scripts").mkdir()
-    shutil.copy(source / "scripts/check.sh", root / "scripts/check.sh")
-    (root / "scripts/lib").mkdir()
-    shutil.copy(source / "scripts/lib/gate-tools.txt", root / "scripts/lib/gate-tools.txt")
-    for name in ("cargo-guarded.sh", "check-locks.sh", "check-names.sh", "fetch-w3c-tests.sh"):
-        (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n", newline="\n")
+    """A checkout at ROOT in which `scripts/check.sh all` runs SOURCE's check.sh with its tools stubbed,
+    in one place: SOURCE's scripts/ whole, every script check.sh names exiting 0, cargo by CARGO, and
+    every Python script check.sh names under benches/ exiting 0 (D16-371: a step of a new name needs
+    no edit here)."""
+    shutil.copytree(source / "scripts", root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    check = (source / "scripts/check.sh").read_text(encoding="utf-8")
+    for name in sorted(set(re.findall(r"scripts/([\w./-]+\.(?:sh|py))", check)) - {"check.sh"}):
+        (root / "scripts" / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n" if name.endswith(".sh") else "raise SystemExit(0)\n",
+                                             newline="\n")
         (root / "scripts" / name).chmod(0o755)
     binaries = root / "bin"
     binaries.mkdir()
+    benches = sorted(set(re.findall(r"benches/[\w./-]+\.py", check)))
     scripts = {
         "cargo": CARGO,
-        "python": 'case "$1" in benches/suite/tests/isolation.py) exit 0 ;; esac\n'
+        "python": f'case "$1" in {"|".join(benches)}) exit 0 ;; esac\n'
                   'exec "$REAL_PYTHON" "$@"\n',
     }
     for name, body in scripts.items():
