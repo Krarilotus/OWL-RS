@@ -1050,6 +1050,52 @@ impl Dictionary {
         matches
     }
 
+    /// A private snapshot's search ([`super::text::Private`]; the lifecycle contract's §7):
+    /// literals (`iris` false) or IRI names matching `query` among `corpus`'s documents, the
+    /// shared ones below `start` through this dictionary's index (first taking in the terms
+    /// interned since the last search, as [`Self::text_search_in`] does), the overlay's own
+    /// through `local`. Matches are ids, by each document's kind.
+    pub(crate) fn private_search(
+        &self,
+        iris: bool,
+        query: &super::TextQuery,
+        corpus: &super::text::Corpus,
+        start: u64,
+        local: &super::text::Local,
+    ) -> Vec<super::TextMatch> {
+        self.prepare_text(iris, query.stem.as_deref());
+        // The index's lock before `inner`'s (the lock order).
+        let text = match iris {
+            true => self.iri_text.read(),
+            false => self.text.read(),
+        };
+        let inner = self.inner.read();
+        let text_of = |document: u64| match document < start {
+            false => local.text(document).map(str::to_owned),
+            true => match (iris, view_key(&inner.key(document))) {
+                (true, TermView::Iri(iri)) => super::text::local_name_text(iri),
+                (false, TermView::String(value) | TermView::LangString { value, .. }) => {
+                    Some(value.to_owned())
+                }
+                _ => None,
+            },
+        };
+        let source = super::text::Private::new(&text, corpus, start, local, query.stem.as_deref());
+        let mut matches = super::text::search_with(query, &text_of, &source);
+        for found in &mut matches {
+            let kind = match (found.id < start, iris) {
+                (false, _) => local.kind(found.id).unwrap_or(TermKind::String),
+                (true, true) => TermKind::Iri,
+                (true, false) => match view_key(&inner.key(found.id)) {
+                    TermView::LangString { .. } => TermKind::LangString,
+                    _ => TermKind::String,
+                },
+            };
+            found.id = TermId::new(kind, found.id).raw();
+        }
+        matches
+    }
+
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
     /// substring search over the arenas ([`super::strings`]).
     pub fn matching_strings(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
@@ -2055,7 +2101,7 @@ impl<'a> TermView<'a> {
     }
 }
 
-pub(super) fn view_key(key: &[u8]) -> TermView<'_> {
+pub(crate) fn view_key(key: &[u8]) -> TermView<'_> {
     decode_view(key)
 }
 

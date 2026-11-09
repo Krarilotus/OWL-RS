@@ -9,7 +9,7 @@ use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 
 use super::super::{Engine, EngineConfig, InferredSubset, ReadModel, Snapshot, TextScope};
 use crate::error::EngineError;
-use crate::{EncodedTriple, QuadPattern, SearchRefused, TermId, TextQuery, VectorQuery};
+use crate::{EncodedTriple, QuadPattern, TermId, TextQuery, VectorQuery};
 
 fn iri(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("http://example.com/{local}"))
@@ -265,74 +265,122 @@ fn files(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// B15 (§3; the search owner's one test): searches on a private snapshot.
+/// B15 (§3; the search owner's one test), re-specified by V3 (decision of 10:23 item 1, ADR
+/// V3; DICT2 9 Nov 04:02): searches on a private snapshot answer over what it can see, and
+/// leave the shared indexes as they were.
 ///
-/// - Input: an engine with a label and a vector literal, its text and vector indexes not yet
-///   built; a private transaction's pending snapshot.
-/// - Expected: the six searches and the two corpus helpers return `SearchRefused::Private`;
-///   preparing a vector graph does nothing. Afterwards the dictionary's text coverage and
-///   vector bytes are as before. The published snapshot still searches.
+/// - Input: an engine with a label and a vector literal, searched once published (its text,
+///   IRI and vector indexes built); a private transaction that adds a label and a vector of
+///   its own (overlay terms) and removes the base's label.
+/// - Expected: the six searches and the two corpus helpers answer. The text searches find
+///   the private label alone; the vector searches find the private vector first (nearest),
+///   then the base's; preparing a vector graph does nothing. Afterwards the dictionary's text
+///   coverage, vector bytes and index bytes are as before. The published snapshot still finds
+///   its own label. Red before V3: every search refused (`SearchRefused::Private`).
 #[test]
-fn a_private_snapshot_refuses_every_search_and_leaves_the_shared_indexes() {
+fn a_private_snapshot_searches_what_it_sees_and_leaves_the_shared_indexes() {
     let engine = engine();
-    let vector: Term = Literal::new_typed_literal(
-        nrese_vector::lexical(&[1.0, 0.0]),
-        NamedNode::new_unchecked(nrese_vector::DATATYPE),
-    )
-    .into();
+    let vector = |v: &[f32]| -> Term {
+        Literal::new_typed_literal(
+            nrese_vector::lexical(v),
+            NamedNode::new_unchecked(nrese_vector::DATATYPE),
+        )
+        .into()
+    };
     let mut tx = engine.transaction();
     tx.insert(quad("a", "label", literal("alpha beta")).as_ref());
-    tx.insert(quad("a", "vector", vector).as_ref());
+    tx.insert(quad("a", "vector", vector(&[1.0, 0.0])).as_ref());
     tx.commit().unwrap();
     let base = engine.snapshot();
-    let private = engine.speculative_over(&base, budget()).unwrap();
-    let pending = private.pending_snapshot().unwrap();
-    let stats = || engine.inner.shared.dictionary.stats();
-    let before = stats();
-
     let text = TextQuery {
         text: "alpha".to_owned(),
         all_words: false,
         prefix: false,
         stem: None,
     };
-    let near = VectorQuery::new(vec![1.0, 0.0], 1);
+    let near = VectorQuery::new(vec![0.0, 1.0], 2);
     let unlimited = budget();
     let every = TextScope::EVERY;
     let model = ReadModel::Materialised;
-    let refused = |result: Result<(), SearchRefused>| matches!(result, Err(SearchRefused::Private));
-    assert!(refused(pending.text_search(&text).map(drop)), "text_search");
-    assert!(refused(pending.iri_search(&text).map(drop)), "iri_search");
-    assert!(
-        refused(
-            pending
-                .vector_search(&near, &|_| true, &unlimited)
-                .map(drop)
-        ),
-        "vector_search"
+    // Published searches first: the shared indexes built, covering the base.
+    assert_eq!(base.text_search(&text).unwrap().len(), 1);
+    base.iri_search(&text).unwrap();
+    base.vector_search(&near, &|_| true, &unlimited).unwrap();
+    base.text_search_in(model, &every, &text, None).unwrap();
+    base.iri_search_in(model, &every, &text, None).unwrap();
+    base.vector_search_in(model, &every, &near, &|_| true, &unlimited)
+        .unwrap();
+    let stats = || engine.inner.shared.dictionary.stats();
+    let before = stats();
+
+    let mut private = engine.speculative_over(&base, budget()).unwrap();
+    private
+        .try_insert(quad("b", "label", literal("alpha private")).as_ref())
+        .unwrap();
+    private
+        .try_insert(quad("b", "vector", vector(&[0.0, 1.0])).as_ref())
+        .unwrap();
+    assert!(private.remove(quad("a", "label", literal("alpha beta")).as_ref()));
+    let pending = private.pending_snapshot().unwrap();
+    let own = pending.lookup(literal("alpha private").as_ref()).unwrap();
+    let own_vector = pending.lookup(vector(&[0.0, 1.0]).as_ref()).unwrap();
+    let base_vector = pending.lookup(vector(&[1.0, 0.0]).as_ref()).unwrap();
+    let ids = |found: Vec<crate::TextMatch>| -> Vec<TermId> {
+        found.iter().map(|m| TermId::from_raw(m.id)).collect()
+    };
+    assert_eq!(
+        ids(pending.text_search(&text).unwrap()),
+        [own],
+        "text_search"
     );
-    assert!(
-        refused(pending.text_search_in(model, &every, &text, None).map(drop)),
+    assert_eq!(
+        ids(pending.text_search_in(model, &every, &text, None).unwrap()),
+        [own],
         "text_search_in"
     );
     assert!(
-        refused(pending.iri_search_in(model, &every, &text, None).map(drop)),
-        "iri_search_in"
+        pending.iri_search(&text).unwrap().is_empty(),
+        "iri_search: no IRI is named alpha"
     );
     assert!(
-        refused(
+        pending
+            .iri_search_in(model, &every, &text, None)
+            .unwrap()
+            .is_empty(),
+        "iri_search_in"
+    );
+    let nearest = |hits: super::super::snapshot::VectorHits<'_>| -> Vec<TermId> {
+        hits.0.iter().map(|&(id, _)| id).collect()
+    };
+    assert_eq!(
+        nearest(pending.vector_search(&near, &|_| true, &unlimited).unwrap()),
+        [own_vector, base_vector],
+        "vector_search"
+    );
+    assert_eq!(
+        nearest(
             pending
                 .vector_search_in(model, &every, &near, &|_| true, &unlimited)
-                .map(drop)
+                .unwrap()
         ),
+        [own_vector, base_vector],
         "vector_search_in"
     );
-    assert!(refused(
-        pending.text_corpus_members(model, &every, false).map(drop)
-    ));
-    assert!(refused(
-        pending.vector_corpus_members(model, &every).map(drop)
-    ));
+    assert!(
+        pending
+            .text_corpus_members(model, &every, false)
+            .unwrap()
+            .0
+            .contains(&own.payload()),
+        "text corpus members"
+    );
+    assert!(
+        pending
+            .vector_corpus_members(model, &every)
+            .unwrap()
+            .contains(&own_vector.payload()),
+        "vector corpus members"
+    );
     pending.prepare_vector_graph(&near);
     let after = stats();
     assert_eq!(after.text_covered, before.text_covered, "text index cover");
@@ -345,7 +393,7 @@ fn a_private_snapshot_refuses_every_search_and_leaves_the_shared_indexes() {
     assert_eq!(
         base.text_search(&text).unwrap().len(),
         1,
-        "the published snapshot searches"
+        "the published snapshot finds its own label"
     );
 }
 
