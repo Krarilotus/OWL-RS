@@ -442,7 +442,11 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
     #[inline(never)]
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let (outer, header) = with_header(layout).expect("the layout it was allocated with");
-        let Some(grown) = size.checked_add(header) else {
+        // The grown block with its header must be a layout too (`A`'s contract), as in `alloc`.
+        let Some((grown, _)) = Layout::from_size_align(size, layout.align())
+            .ok()
+            .and_then(with_header)
+        else {
             return std::ptr::null_mut();
         };
         // SAFETY: a block of this allocator, allocated with `layout`; its header moves with
@@ -451,7 +455,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
             let was = tag_of(pointer);
             let (tag, counted) = block_tag(size);
             let moved = handed_out(
-                self.0.realloc(pointer.sub(header), outer, grown),
+                self.0.realloc(pointer.sub(header), outer, grown.size()),
                 header,
                 tag,
             );
