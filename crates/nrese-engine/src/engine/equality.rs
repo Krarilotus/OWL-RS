@@ -88,15 +88,23 @@ impl EqualityCell {
     }
 
     /// The classes of `version` read canonically: the same aliases, no members to expand
-    /// to ([`Classes::canonical_view`]); made once per version.
+    /// to ([`Classes::canonical_view`]); made once per version. Made outside the cell's lock,
+    /// as the classes are (REAS-3a sol-loop r1 S5: a counted reader that only checks the cell
+    /// mustn't wait out a copy of every alias), the first view finished kept.
     pub(crate) fn canonical(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
         let full = self.classes(version, same_as);
+        if let Some((_, classes, Some(canonical))) = self.0.lock().as_ref()
+            && Arc::ptr_eq(classes, &full)
+        {
+            return Arc::clone(canonical);
+        }
+        let view = Arc::new(full.canonical_view());
         let mut cell = self.0.lock();
         match cell.as_mut() {
             Some((_, classes, canonical)) if Arc::ptr_eq(classes, &full) => {
-                Arc::clone(canonical.get_or_insert_with(|| Arc::new(full.canonical_view())))
+                Arc::clone(canonical.get_or_insert(view))
             }
-            _ => Arc::new(full.canonical_view()),
+            _ => view,
         }
     }
 }
@@ -378,9 +386,27 @@ impl Classes {
         for stack in Stack::ALL {
             for quad in meter.scan(version.stack(stack), &pattern) {
                 let (a, b) = (quad.subject.raw(), quad.object.raw());
-                if a != b {
-                    union.union(a, b);
+                if a == b {
+                    continue;
                 }
+                // A union moves the smaller side's members: counted before it is made
+                // (REAS-3a sol-loop r1 S1). One union is one step, done whole once counted. A
+                // pair already in one class (one member list) moves nothing and counts one
+                // unit (sol-loop r2 S6: an inferred star over an asserted chain).
+                if M::COUNTED {
+                    let (class_a, class_b) = (union.class_of(a), union.class_of(b));
+                    let moved = match (class_a, class_b) {
+                        (Some(x), Some(y)) if std::ptr::eq(x, y) => 1,
+                        _ => {
+                            let size = |class: Option<&[u64]>| class.map_or(1, <[u64]>::len);
+                            size(class_a).min(size(class_b)) as u64
+                        }
+                    };
+                    if !meter.units(moved) {
+                        return None;
+                    }
+                }
+                union.union(a, b);
             }
         }
         if meter.stopped() {

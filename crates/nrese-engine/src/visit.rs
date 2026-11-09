@@ -13,7 +13,12 @@
 //!
 //! So after a reader's stop fires, a counted read does at most the units its visitor last
 //! allowed, then stops at its next call: `POLL_UNITS` plus the run in progress per task
-//! (REAS-2's invariant, one level down).
+//! (REAS-2's invariant, one level down). A step that can't be split, and costs more than
+//! `POLL_UNITS` units, is counted whole (in runs of at most `POLL_UNITS`) before it is done:
+//! a merge step over more cursors, a union of two equality classes (the smaller side's
+//! members move), one class's copy and sort. The run in progress is then that step, bounded
+//! by the largest class or the run count, not by the data a read passes over (REAS-3a,
+//! sol-loop r1 S1; splitting a union is the union kernel's, `nrese_exec::classes`).
 
 /// A read its visitor stopped: an error its caller has to handle, never an answer (REAS-2
 /// fix check r1, rule 2; one type for the engine and the reasoner).

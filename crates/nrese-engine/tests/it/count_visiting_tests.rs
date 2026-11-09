@@ -257,3 +257,69 @@ fn counted_reads_answer_as_the_uncounted_ones() {
         }
     }
 }
+
+/// REAS-3a, sol-loop r2 S6. Spec (`nrese_engine::visit`: a union is counted by the members
+/// it moves): a counted read's cold equality class build counts in proportion to its input.
+/// An asserted chain of `n` identities (`s_i sameAs s_i+1`, one class) and materialisation's
+/// inferred star over it (`s_i sameAs s_0`, each pair already in that class, which a union
+/// leaves as it is): a count's visitor is told of at most a small multiple of `n` units.
+/// Charging a union by the smaller side's size whatever it does, each star statement counted
+/// the whole class: about `n` squared.
+#[test]
+fn a_counted_class_build_counts_in_proportion_to_its_statements() {
+    let n = 2 * nrese_exec::POLL_UNITS as usize;
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    let ids: Vec<_> = (0..n)
+        .map(|i| tx.intern(node(&format!("s{i}")).as_ref().into()))
+        .collect();
+    for i in 1..n {
+        tx.insert(
+            Quad::new(
+                node(&format!("s{}", i - 1)),
+                node("sameAs"),
+                node(&format!("s{i}")),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    for &identity in &ids[1..] {
+        tx.insert_inferred(EncodedTriple {
+            subject: identity,
+            predicate: same_as,
+            object: ids[0],
+        });
+    }
+    tx.insert(Quad::new(node("s0"), node("p"), node("o"), GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let snapshot = engine.snapshot();
+    let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
+    let pattern = QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    };
+    let units = std::cell::Cell::new(0u64);
+    let counted = snapshot
+        .counted()
+        .count(ReadModel::Materialised, &pattern, &|k| {
+            units.set(units.get() + k);
+            true
+        });
+    assert_eq!(
+        counted,
+        Ok(Count::Exact(n as u64)),
+        "the statement's copy for each identity"
+    );
+    let (units, bound) = (units.get(), 16 * n as u64);
+    assert!(
+        units <= bound,
+        "{units} units counted for {n} identities: at most {bound}"
+    );
+}
