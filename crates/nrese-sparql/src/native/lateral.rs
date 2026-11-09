@@ -69,7 +69,7 @@ impl Context<'_> {
                     put_in.push((variable.clone(), id));
                 }
             }
-            let substituted = super::substitute::Values { terms: &terms }.pattern(right);
+            let substituted = super::substitute::Values::new(self, &terms)?.pattern(right);
             let graph = key.last().copied().filter(|&id| id != UNDEF);
             let found = match graph {
                 Some(id) => self.in_graph(
