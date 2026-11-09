@@ -165,7 +165,7 @@ async fn write_graph(
         target,
         format,
         base_iri: parse_rdf_base_iri(&headers),
-        payload: body.to_vec(),
+        payload: body,
         replace,
     };
     let report = match mutation::run(

@@ -26,7 +26,9 @@ fn export_snapshot_serializes_default_and_named_graphs() -> Result<(), Box<dyn s
         target: GraphTarget::NamedGraph("http://example.com/graph/backup".to_owned()),
         format: GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:named-s ex:p ex:named-o .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:named-s ex:p ex:named-o ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
 
@@ -54,7 +56,9 @@ fn restore_replaces_existing_dataset_and_resets_contents_to_backup()
         target: GraphTarget::NamedGraph("http://example.com/graph/source".to_owned()),
         format: GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:source-named ex:p ex:value .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:source-named ex:p ex:value ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     let artifact =

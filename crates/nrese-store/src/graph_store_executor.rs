@@ -57,7 +57,7 @@ pub(crate) fn apply_graph_write(
     each_graph_quad(
         request.format,
         request.base_iri.as_deref(),
-        request.payload.as_slice(),
+        &request.payload,
         graph,
         BlankNodes::Fresh,
         |quad| staged.stage(quad, true),

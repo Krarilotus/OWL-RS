@@ -84,7 +84,7 @@ fn a_graph_store_write_holds_no_copy_of_its_document() {
             target: GraphTarget::NamedGraph("http://example.com/g".to_owned()),
             format: GraphResultFormat::Turtle,
             base_iri: None,
-            payload,
+            payload: payload.into(),
             replace: true,
         }),
     );
@@ -104,7 +104,7 @@ fn statements_added_into_contexts_hold_no_copy_of_their_document() {
         &pipeline,
         MutationCommand::Statements(StatementsRequest::new(vec![StatementOp::Add {
             data: RdfPayload {
-                payload: long_prefix_turtle(),
+                payload: long_prefix_turtle().into(),
                 format: GraphResultFormat::Turtle,
                 base_iri: None,
             },

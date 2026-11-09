@@ -239,7 +239,7 @@ fn store_with(graphs: &[Option<&str>], limits: &DraftLimits) -> Result<StoreServ
                 target: GraphTarget::DefaultGraph,
                 format: GraphResultFormat::NTriples,
                 base_iri: None,
-                payload: text.as_bytes().to_vec(),
+                payload: text.as_bytes().to_vec().into(),
                 replace: false,
             })
             .map_err(|error| failed(format!("an input is not valid N-Triples: {error}")))?;
