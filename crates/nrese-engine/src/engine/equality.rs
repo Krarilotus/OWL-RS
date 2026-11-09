@@ -1823,4 +1823,70 @@ mod tests {
             "{largest} units of work between two asks of the visitor: at most {interval}"
         );
     }
+
+    /// REAS-3a fix check r3 H2. Spec (`crate::visit`: once `visit` answers false the read
+    /// does no more work and answers `Stopped`, never a value): a counted sorted read stopped
+    /// while its scans are being made hands on no quad after the stop. Two asserted commits of
+    /// 129 and 8,065 statements and one inferred statement, read by SPOG and stopped at each of
+    /// its asks in turn. The asserted scan's stop left its account the rest of a run, which
+    /// made the inferred scan and handed its statement on.
+    #[test]
+    fn a_sorted_read_stopped_while_its_scans_are_made_hands_on_nothing_after() {
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            // No window ever merges, so each commit keeps its own run.
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        for (prefix, n) in [("a", 129), ("b", 8_065)] {
+            let mut tx = engine.transaction();
+            for i in 0..n {
+                tx.insert(statement("s", "p", &format!("{prefix}{i}")).as_ref());
+            }
+            if prefix == "b" {
+                let [s, p, o] = ["s", "p", "c"].map(|name| tx.intern(node(name).as_ref().into()));
+                tx.insert_inferred(crate::EncodedTriple {
+                    subject: s,
+                    predicate: p,
+                    object: o,
+                });
+            }
+            tx.commit().unwrap();
+        }
+        let snapshot = engine.snapshot();
+        let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
+        for yeses in 0.. {
+            let asked = std::cell::Cell::new(0);
+            let visit = |_: u64| {
+                asked.set(asked.get() + 1);
+                asked.get() <= yeses
+            };
+            let (mut after, mut stopped) = (0, false);
+            let counted = snapshot.counted();
+            let read = counted
+                .scan_sorted(model, &pattern, Permutation::Spog, &visit)
+                .expect("SPOG answers it");
+            for quad in read {
+                match quad {
+                    Ok(_) if asked.get() > yeses => after += 1,
+                    Ok(_) => {}
+                    Err(Stopped) => stopped = true,
+                }
+            }
+            if asked.get() <= yeses {
+                break;
+            }
+            assert_eq!(
+                after,
+                0,
+                "stopped at ask {}: quads after the stop",
+                yeses + 1
+            );
+            assert!(stopped, "stopped at ask {}: answers Stopped", yeses + 1);
+        }
+    }
 }
