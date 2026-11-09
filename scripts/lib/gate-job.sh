@@ -129,7 +129,7 @@ export PATH="$pybin:$PATH"
 
 # shellcheck source=gate-key.sh
 . "$tool/scripts/lib/gate-key.sh"
-identity=$(gate_identity) || infra "no rustc"
+identity=$(gate_identity HEAD) || infra "no rustc"
 
 # The host's one cache (Harness/notes/2026-10-20-host-cache-contract.md, shared with /verify): a
 # target directory per toolchain release, each entry's last use recorded, one sweep for all, run

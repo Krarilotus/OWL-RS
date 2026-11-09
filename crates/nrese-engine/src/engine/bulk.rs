@@ -350,7 +350,7 @@ impl<'e> BulkLoad<'e> {
                 // The first quad in a named graph turns a default-graph stack into a quad
                 // stack.
                 let asserted = match Layout::holding(&inserts) {
-                    Layout::Quads => current.asserted.with_quads_layout(),
+                    Layout::Quads => current.asserted.with_quads_layout_alone(),
                     Layout::DefaultGraph => current.asserted.clone(),
                 };
                 let run = Run::from_quads(asserted.layout(), inserts);
