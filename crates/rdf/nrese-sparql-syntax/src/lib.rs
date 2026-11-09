@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod algebra;
+pub mod internal;
 mod parser;
 mod query;
 pub mod term;

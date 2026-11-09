@@ -27,7 +27,7 @@
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
 #                                  built whole, clippy on it all, all its tests and doc tests,
-#                                  the suite contracts, by its own tier here, which its own
+#                                  the suite contracts, the console, by its own tier here, which its own
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
 #                                  passed before, under the Python runtime it declares
@@ -216,6 +216,8 @@ side_steps() {
   local files=("$@")
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
     step locks bash scripts/check-locks.sh
+    # No test-only feature in a product build (scripts/check-features.sh, DUR-4).
+    step features bash scripts/check-features.sh
   fi
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
@@ -238,13 +240,15 @@ harness() {
     --all-targets
   step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
 }
+# The console's typecheck and tests, wherever the tier runs. The dependencies come from the
+# console's lockfile first, every time (`npm ci` replaces node_modules: the Linux gate's worktree
+# keeps an earlier tree's, sol-loop r1 S1), and a host that can't install them fails that step by
+# name; the console is never passed unchecked (benches/suite/tests/test_console_step.py).
 console() {
-  if [ -d apps/nrese-console/node_modules ]; then
-    step "console typecheck" npm --prefix apps/nrese-console run typecheck
-    step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
-  else
-    echo "=== the console's dependencies aren't installed (npm ci in apps/nrese-console): skipped"
-  fi
+  step "console dependencies" npm --prefix apps/nrese-console ci --no-audit --no-fund
+  [ "${results[-1]%% *}" = 0 ] || return 0
+  step "console typecheck" npm --prefix apps/nrese-console run typecheck
+  step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
 }
 
 # A full tier uses the declared cargo-deny release; installing it belongs to prerequisites.
@@ -411,6 +415,7 @@ case "$mode" in
     step fmt cargo fmt --all --check
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
       step locks bash scripts/check-locks.sh
+      step features bash scripts/check-features.sh
     fi
     # Docker names only from the job namespace (scripts/check-names.sh).
     if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
@@ -442,6 +447,7 @@ case "$mode" in
       step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
       step seeds run_seeds "${changed[@]}"
       step locks bash scripts/check-locks.sh
+      step features bash scripts/check-features.sh
     fi
     # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
     # compile-fail rows that keep their misuse unwritable (a settled region grows).
@@ -464,6 +470,8 @@ case "$mode" in
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    # The console's typecheck and tests, with the gate's own Node (scripts/lib/windows-job.sh).
+    console
     ;;
   all)
     step fmt cargo fmt --all --check
@@ -475,6 +483,7 @@ case "$mode" in
     step "doc tests" "$guarded" test --locked --workspace --doc
     harness
     step locks bash scripts/check-locks.sh
+    step features bash scripts/check-features.sh
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
     step names bash scripts/check-names.sh
     step "cargo-deny version" deny_version
