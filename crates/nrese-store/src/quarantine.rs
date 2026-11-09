@@ -536,13 +536,33 @@ impl Quarantine {
     /// Records `resolution`: appended to the log, then in effect.
     fn record(&self, resolution: Resolution) -> StoreResult<()> {
         if let Some(dir) = &self.dir {
-            self.appendable()?;
-            append(dir, &resolution)?;
+            self.append_resolution(dir, &resolution)
+                .map_err(AppendError::into_io)?;
         }
         self.state()
             .resolutions
             .insert(resolution.id.clone(), resolution);
         Ok(())
+    }
+
+    /// Appends `resolution` to the resolutions log in `dir`: the one way any resolution is
+    /// written (a discard, a readmission's commit note, its record after a commit that
+    /// published nothing). An append that fails takes back what it may have written, so that
+    /// no later record joins it; where that fails too, the log is latched [`Self::unknown`]
+    /// and refuses every append until the next open repairs it (review r1, F2).
+    fn append_resolution(&self, dir: &Path, resolution: &Resolution) -> Result<(), AppendError> {
+        self.appendable().map_err(AppendError::Clean)?;
+        let before = log_len(dir).map_err(AppendError::Clean)?;
+        let Err(error) = append(dir, resolution) else {
+            return Ok(());
+        };
+        match take_back(dir, before) {
+            Ok(()) => Err(AppendError::Clean(error)),
+            Err(_) => {
+                self.unknown.store(true, Ordering::Release);
+                Err(AppendError::Unknown(error))
+            }
+        }
     }
 
     /// An error once the log may end in bytes an append couldn't take back ([`Self::unknown`]).
@@ -658,7 +678,25 @@ impl Quarantine {
     }
 }
 
-/// Appends `resolution` to the resolutions log in `dir`, the quarantine's one append path.
+/// Why a resolution's append failed, as the log is afterwards
+/// ([`Quarantine::append_resolution`]).
+enum AppendError {
+    /// The log is as it was before the append.
+    Clean(io::Error),
+    /// The log may end in the append's bytes; the quarantine refuses appends until it opens again.
+    Unknown(io::Error),
+}
+
+impl AppendError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Clean(error) | Self::Unknown(error) => error,
+        }
+    }
+}
+
+/// Writes `resolution` to the resolutions log in `dir`. Only through
+/// [`Quarantine::append_resolution`], which takes back a failed write.
 fn append(dir: &Path, resolution: &Resolution) -> io::Result<()> {
     #[cfg(test)]
     if tests::FAIL_RESOLUTION_APPEND.get() {
@@ -849,27 +887,16 @@ pub fn readmit(
         let noted = std::sync::Arc::clone(&noted);
         let note: nrese_engine::CommitNote<'_> = Box::new(move |revision| {
             resolution.outcome = Outcome::Readmitted { revision };
-            quarantine
-                .appendable()
-                .map_err(nrese_engine::NoteError::Refused)?;
-            let before = log_len(&dir).map_err(nrese_engine::NoteError::Refused)?;
-            match append(&dir, &resolution) {
+            match quarantine.append_resolution(&dir, &resolution) {
                 Ok(()) => {
                     let _ = noted.set(revision);
                     #[cfg(test)]
                     tests::stop_at(tests::Stop::InNote);
                     Ok(())
                 }
-                // What it may have written goes; if that fails too, the log may name the
-                // revision, and the engine lets no other commit take it.
-                Err(error) => match take_back(&dir, before) {
-                    Ok(()) => Err(nrese_engine::NoteError::Refused(error)),
-                    Err(_) => {
-                        // Nothing more joins what it left (sol-loop r1, S2).
-                        quarantine.unknown.store(true, Ordering::Release);
-                        Err(nrese_engine::NoteError::Unknown(error))
-                    }
-                },
+                Err(AppendError::Clean(error)) => Err(nrese_engine::NoteError::Refused(error)),
+                // The log may name the revision: the engine lets no other commit take it.
+                Err(AppendError::Unknown(error)) => Err(nrese_engine::NoteError::Unknown(error)),
             }
         });
         note

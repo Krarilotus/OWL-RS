@@ -37,6 +37,10 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// Counts the certificate's changes (each under the writer slot): a reader that finds it
+    /// the same before and after its reads saw no change of the certificate between them, so
+    /// every commit in between maintained the closure ([`Self::certificate_epoch`]).
+    certificate_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
     /// repository's own, [`Self::set_ql_rewriting`]).
     ql_mode: std::sync::Arc<std::sync::RwLock<crate::QlRewritingMode>>,
@@ -255,6 +259,7 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
@@ -467,6 +472,25 @@ impl StoreService {
             })
     }
 
+    /// Whether the certificate covers `program` for a holder of the writer slot: no write can
+    /// change it, or the data it covers, until the holder lets the slot go. A writer that maintains
+    /// the closure checks it here, under its own transaction (review r1, F1).
+    pub(crate) fn reasoning_is_current_held(
+        &self,
+        _writer: nrese_engine::WriterHeld<'_>,
+        program: &nrese_reasoner::RuleProgram,
+    ) -> bool {
+        self.reasoning_is_current(program)
+    }
+
+    /// The certificate's epoch: changed by every change of the certificate, each before the
+    /// commit it precedes. Equal before and after a reader's reads, the certificate it checked
+    /// covers every snapshot those reads took.
+    pub(crate) fn certificate_epoch(&self) -> u64 {
+        self.certificate_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Forgets what the inferred stack is exact for, taking the writer slot to do so: no
     /// rematerialisation certifies it meanwhile. Never call it under the slot (it isn't
     /// reentrant): a holder calls [`Self::invalidate_held`].
@@ -480,6 +504,8 @@ impl StoreService {
     /// remainder's invariant C), so no rematerialisation can certify data this write changes.
     pub(crate) fn invalidate_held(&self, _writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
+        // Before the commit it precedes: a reader that saw the old epoch sees the change.
+        self.certificate_epoch.fetch_add(1, Ordering::SeqCst);
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
@@ -512,6 +538,8 @@ impl StoreService {
         writer: nrese_engine::WriterHeld<'_>,
         state: crate::ReasoningState,
     ) -> StoreResult<()> {
+        self.certificate_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.note_equality(writer, &state);
         let text = state.to_text();
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
@@ -2028,6 +2056,10 @@ impl StoreService {
         if stop() {
             return Err(stopped(nrese_reasoner::delta::Interrupted::default()));
         }
+        // The certificate of the closure about to be replaced goes first, durably: a stop or
+        // a failed certificate between the publication and the new certificate must not leave
+        // the old one describing the new closure after a start (review r1, F3).
+        self.invalidate_held(rematerialisation.writer())?;
         // Where asked, what the reasoner freed goes back before the inferred stack, the
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
