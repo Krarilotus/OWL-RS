@@ -383,12 +383,19 @@ pub(crate) fn output_key(
     let scope = ctx.cache.as_ref()?;
     let mut encoder = ctx.key_start(scope);
     encoder.tag(b'S');
-    // The answer is the context's reading of `snapshot` (canonical answers read a view of
-    // it, an identity of its own), but the cache keys it by `snapshot`'s: its equality and
-    // canonical modes are part of these bytes (sol-loop r1 S1).
+    // The answer is the context's reading of `snapshot`, which the cache keys it by: where
+    // the context reads another view of it (canonical answers read a view with an identity
+    // of its own), that view's equality and canonical modes are part of these bytes too
+    // (sol-loop r1 S1). One presence byte first, in the same place in every key, so a key
+    // with them and one without never meet.
     let read = ctx.snapshot.identity();
-    encoder.number(read.equality.map_or(u64::MAX, nrese_engine::TermId::raw));
-    encoder.tag(u8::from(read.canonical));
+    if read == snapshot.identity() {
+        encoder.tag(b'-');
+    } else {
+        encoder.tag(b'r');
+        encoder.number(read.equality.map_or(u64::MAX, nrese_engine::TermId::raw));
+        encoder.tag(u8::from(read.canonical));
+    }
     encoder.text(format);
     encoder.text(context);
     // The QL rewriting changes the answer of the query as parsed (parts see it in the
@@ -657,6 +664,51 @@ mod tests {
     use nrese_sparql_syntax::SparqlParser;
 
     use crate::{QueryOptions, QueryResults, ResultCache, evaluate_query};
+
+    /// Sol-loop r1 S1's key bytes (the lead's condition on writing the reading only where it
+    /// differs): an answer read canonically, which reads a view of the snapshot with an
+    /// identity of its own, and the same answer read as given never share a key, though the
+    /// cache keys both by the same snapshot.
+    ///
+    /// - Input: `Alias owl:sameAs Rep` inferred and `Rep p o`, the store reading equality
+    ///   classes; `?x p o` with early expansion, its output key read canonically and as given.
+    /// - Expected: both keys exist; the canonical one carries the reading (it is longer) and
+    ///   the two differ.
+    #[test]
+    fn a_canonical_answers_key_is_never_the_published_readings() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let iri = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut tx = engine.transaction();
+        let rep = tx.intern(iri("Rep").as_ref().into());
+        let alias = tx.intern(iri("Alias").as_ref().into());
+        let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+        let same_as = tx.intern(same_as.as_ref().into());
+        let quad = Quad::new(iri("Rep"), iri("p"), iri("o"), GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+        tx.insert_inferred(nrese_engine::EncodedTriple::new(alias, same_as, rep));
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let query = SparqlParser::new()
+            .parse_query("SELECT ?x WHERE { ?x <http://e/p> <http://e/o> }")
+            .unwrap();
+        let options = |canonical: bool| QueryOptions {
+            equality_early_expansion: true,
+            equality_canonical: canonical,
+            result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+            ..QueryOptions::default()
+        };
+        let key = |canonical: bool| {
+            super::output_key(&snapshot, &query, &options(canonical), "text/csv", "")
+                .expect("an answer that is cached")
+        };
+        let (canonical, given) = (key(true), key(false));
+        assert!(
+            canonical.len() > given.len(),
+            "the canonical reading is written"
+        );
+        assert_ne!(canonical, given);
+    }
 
     /// A path of n steps is a basic graph pattern of n triples, and each prefix of its join
     /// order a part: their keys are linear in n (each spelled out its whole prefix, O(n²)
