@@ -43,9 +43,11 @@ impl fmt::Debug for Completeness {
     }
 }
 
-/// The semantics a status is relative to. `complete` under one is no claim under another:
-/// complete under `owl2-ql` or `owl2-rl` means every answer the closure's rules (and the
-/// QL rewriting's existentials) entail, not every certain answer under OWL 2 DL.
+/// The semantics a status is relative to. `complete` under one is no claim under another.
+/// Under `owl2-ql` or `owl2-rl` the closure's rules and the QL rewriting answer, and an
+/// axiom outside the profile that the answers can meet is reported: answered or reported,
+/// a `complete` answer misses no certain answer under the OWL 2 Direct Semantics (I24c;
+/// master's ruling of 8 Nov 10:31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Regime {
     /// The OWL 2 QL closure, with the QL rewriting's existentials.
