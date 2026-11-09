@@ -333,7 +333,7 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   fi
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
-  identity=$(gate_identity) || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
+  identity=$(gate_identity "$push_commit") || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
   # The Windows part's pass belongs to the commit's inputs, not its tree: a later commit with the
   # same inputs carries it (scripts/lib/gate-key.sh windows_inputs), and its record names the commit.
   keyed=$tree on=""
