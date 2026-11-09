@@ -120,34 +120,48 @@ fn parse(turtle: &str) -> Parsed {
     parsed
 }
 
-/// A run's deadline, and the token that stops owl2-dl's work at it (review G1 r2, F4).
+/// A run's deadline, and the token that stops owl2-dl's work at it (review G1 r2, F4): a
+/// watcher fires it at the deadline, so a DL call begun before it stops there, whatever
+/// its own timeout left. The watcher ends with the run.
 pub(crate) struct Expiry {
     deadline: std::time::Instant,
     cancel: nrese_store::CancellationToken,
+    /// Dropped with the run, which wakes the watcher before the deadline.
+    _ended: std::sync::mpsc::Sender<()>,
 }
 
 impl Expiry {
     pub(crate) fn at(deadline: std::time::Instant) -> Self {
+        let cancel = nrese_store::CancellationToken::new();
+        let (ended, run) = std::sync::mpsc::channel::<()>();
+        let fire = cancel.clone();
+        std::thread::spawn(move || {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = run.recv_timeout(wait) {
+                fire.cancel();
+            }
+        });
         Self {
             deadline,
-            cancel: nrese_store::CancellationToken::new(),
+            cancel,
+            _ended: ended,
         }
     }
 }
 
 /// owl2-dl's certain answers to `query`, as a set of rows (`true` for an ASK that holds);
-/// `Err` with the reason where it can't decide.
+/// `Err` with the reason where it can't decide, `expiry` has fired among them.
 fn certain(
     dl: &nrese_store::MutationPipeline,
     query: &str,
-    _expiry: &Expiry,
+    expiry: &Expiry,
 ) -> Result<BTreeSet<String>, String> {
     let store = dl.store();
     let mut request = SparqlQueryRequest::all(query);
     request.dl_answers = Some(DlAnswers::Exact);
     let prepared = store.prepare_query(&request).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    match crate::dl::run_dl(store, &prepared, &mut out) {
+    match store.run_query_dl(&prepared, &expiry.cancel, &mut out) {
         Ok(_) => Ok(rows(&out)),
         Err(e) => Err(e.to_string()),
     }
