@@ -1708,6 +1708,8 @@ impl StoreService {
         progress: &crate::LoadProgress,
     ) -> StoreResult<BulkLoadReport> {
         self.invalidate_reasoning()?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_INVALIDATION);
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
         bulk_load(&self.engine, request, progress, invalid, &self.quarantine)
     }
@@ -1991,6 +1993,8 @@ impl StoreService {
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_PUBLICATION);
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(crate::ReasoningState::of_with(
             rules,
@@ -2134,6 +2138,164 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+/// Test seams in the reasoning certificate's lifecycle: each runs a test's closure once, on the
+/// thread that reaches it.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+    thread_local! {
+        /// A bulk load has cleared the reasoning certificate and is about to load.
+        pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
+        /// A rematerialisation has published its inferences and is about to certify them.
+        pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn run(hook: &'static LocalKey<Hook>) {
+        if let Some(hook) = hook.with_borrow_mut(Option::take) {
+            hook();
+        }
+    }
+}
+
+/// The reasoning certificate says what the inferred stack is exact for (`reasoning_state`,
+/// `reasoning_is_current`, `consistency`). It must never claim a ruleset current for data that
+/// ruleset's closure wasn't computed over: queries and the pipeline rely on it (the pipeline
+/// then skips its rematerialisation, `MutationPipeline::apply`). Each witness races a bulk load
+/// that adds `C subClassOf D` against an RDFS rematerialisation over `a a C`, at one point of
+/// the race, and then asks: if RDFS is certified current, `a a D` must hold. Where the writer
+/// slot is free at that point the other operation completes there; where it is held, it waits
+/// for the slot (the test waits for it up to `WAIT`, then lets the first one go on), and every
+/// order then reaches the same answer.
+#[cfg(test)]
+mod certificate_tests {
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+
+    use super::{StoreService, hooks};
+    use crate::StoreConfig;
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    const A_C: &str = "<http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                       <http://example.com/C> .\n";
+    const C_D: &str = "<http://example.com/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+                       <http://example.com/D> .\n";
+
+    fn rdfs() -> nrese_reasoner::RuleProgram {
+        nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
+            .materialised_program()
+            .expect("RDFS reasons")
+    }
+
+    fn load(store: &StoreService, file: &std::path::Path) {
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file.to_path_buf()],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+    }
+
+    /// Makes `hook` run `other` on a thread of its own, waiting for it up to `WAIT`; the
+    /// returned slot holds that thread, to be joined once the operation that reached the hook
+    /// is done.
+    fn interleave(
+        hook: &'static std::thread::LocalKey<hooks::Hook>,
+        other: impl FnOnce() + Send + 'static,
+    ) -> Arc<Mutex<Option<JoinHandle<()>>>> {
+        let joined = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&joined);
+        hook.set(Some(Box::new(move || {
+            let (done, finished) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                other();
+                let _ = done.send(());
+            });
+            let _ = finished.recv_timeout(WAIT);
+            *slot.lock().unwrap() = Some(thread);
+        })));
+        joined
+    }
+
+    fn join(joined: &Mutex<Option<JoinHandle<()>>>) {
+        let thread = joined.lock().unwrap().take().expect("the hook ran");
+        thread.join().expect("the interleaved operation succeeds");
+    }
+
+    /// What is wrong with the certificate: RDFS claimed current without `a a D`.
+    fn stale(store: &StoreService, when: &str, wrong: &mut Vec<String>) {
+        let answer = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        let derived = String::from_utf8_lossy(&answer.payload).contains("true");
+        let current = store.reasoning_is_current(rdfs());
+        eprintln!("{when}: RDFS certified current {current}, a a D {derived}");
+        if current && !derived {
+            wrong.push(format!(
+                "{when}: RDFS certified current over data it wasn't computed for"
+            ));
+        }
+    }
+
+    fn files(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (a, b) = (dir.join("a.nt"), dir.join("b.nt"));
+        std::fs::write(&a, A_C).unwrap();
+        std::fs::write(&b, C_D).unwrap();
+        (a, b)
+    }
+
+    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its load.
+    /// Before the fix the load cleared the certificate before it took the writer slot: the
+    /// rematerialisation then certified RDFS, and the load committed `C subClassOf D` under it.
+    #[test]
+    fn a_bulk_load_raced_by_a_rematerialisation_leaves_no_stale_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        load(&store, &a);
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_INVALIDATION, move || {
+            racer.rematerialise(rdfs()).unwrap();
+        });
+        load(&store, &b);
+        join(&joined);
+        let mut wrong = Vec::new();
+        stale(&store, "in process", &mut wrong);
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        stale(&store, "after a reopen", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C2: a bulk load between a rematerialisation's publication and its certificate. Before
+    /// the fix the rematerialisation released the writer slot when it published: the load then
+    /// committed `C subClassOf D`, and the certificate came after it.
+    #[test]
+    fn a_rematerialisation_raced_by_a_bulk_load_leaves_no_stale_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        load(&store, &a);
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_PUBLICATION, move || load(&racer, &b));
+        store.rematerialise(rdfs()).unwrap();
+        join(&joined);
+        let mut wrong = Vec::new();
+        stale(&store, "in process", &mut wrong);
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        stale(&store, "after a reopen", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
 
 #[cfg(test)]
