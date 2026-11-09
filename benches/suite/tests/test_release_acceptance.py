@@ -11,6 +11,8 @@ final join pass a candidate it must refuse, each reproduced on engine-v2 3a4e0a2
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -463,6 +465,92 @@ class GuardRun(Scratch):
                               env=isolation.inherit("NRESE_", "FLEET_"))
         self.assertNotEqual(done.returncode, 0, f"SPEC the step fails\n{done.stdout}{done.stderr}")
         self.assertFalse((out / "guards.json").exists(), "SPEC no earlier result stands")
+
+
+@contextlib.contextmanager
+def undeletable(path: Path):
+    """PATH held open as a Windows reader may hold it: read and write sharing, no delete sharing
+    (CreateFileW), so neither rm nor os.remove can take it away while held."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                   ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    generic_read, share_read_write, open_existing = 0x80000000, 0x00000003, 3
+    handle = kernel.CreateFileW(str(path), generic_read, share_read_write, None, open_existing, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        kernel.CloseHandle(handle)
+
+
+@unittest.skipUnless(os.name == "nt", "a reader that blocks deletion is Windows' (no delete sharing)")
+class ResultInvalidation(Scratch):
+    """Fix check r1, R2 (IB1223-a565): an earlier result that can't be removed is no run's result. The
+    step fails before anything runs; the checker's failed removal is a crash (exit 3), never the judged
+    result's 0 or 1."""
+
+    def setUp(self):
+        super().setUp()
+        self.out = self.tmp / "out"
+        (self.out / "guards").mkdir(parents=True)
+        (self.out / "w3c").mkdir()
+
+    def step(self, name: str, py: str) -> subprocess.CompletedProcess:
+        """release-gate.sh's NAME step as checked in, its checker PY (`-c` the step's summary line)."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        body = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8").split(f"\n{name})\n", 1)[1].split("\n  ;;", 1)[0]
+        cwd = self.tmp / "cwd"
+        (cwd / "scripts").mkdir(parents=True, exist_ok=True)
+        (cwd / "scripts/fetch-w3c-tests.sh").write_text("exit 0\n", encoding="utf-8", newline="\n")
+        script = self.tmp / f"{name}-step.sh"
+        script.write_text('set -uo pipefail\nOUT="$1"\nGATE="$1"\nlog() { echo "$*"; }\n'
+                          'gate_identity() { echo identity; }\nsha256sum() { cat > /dev/null; }\n'
+                          f'py() {{ [ "$1" != -c ] || return 0; "$REALPY" "$REALGATE" {py}; }}\n' + body + "\n",
+                          encoding="utf-8", newline="\n")
+        return subprocess.run([bash, script.as_posix(), self.out.as_posix()], cwd=cwd, capture_output=True, text=True,
+                              timeout=120, env=isolation.inherit("NRESE_", "FLEET_", "CARGO_",
+                                                                 REALPY=Path(sys.executable).as_posix(),
+                                                                 REALGATE=GATE.as_posix(), PYTHONIOENCODING="utf-8"))
+
+    def test_a_step_whose_earlier_result_can_t_be_removed_fails_and_runs_nothing(self):
+        # Spec: fix check r1, witness check_boundaries.py: a passed guards.json (w3c.json) of an earlier run,
+        # held by a reader without delete sharing; the step's checker can't publish (its names / expectations
+        # can't be read). Today the step's rm fails silently, the checker exits 1 and the step accepts the
+        # earlier file: exit 0, and the verdict passes on it. The step must fail, saying why.
+        for name, result, py in (
+                ("guards", "guards.json", 'guards --run --identity identity --names "$OUT/no-names" '
+                                          '--log "$OUT/guards/test.log" --json "$OUT/guards.json"'),
+                ("w3c", "w3c.json", 'w3c "$OUT/w3c" --expected "$OUT/no-expected" --run --identity identity '
+                                    '--json "$OUT/w3c.json"')):
+            with self.subTest(name):
+                earlier = self.out / result
+                earlier.write_text(json.dumps(checks("c", "t")[0 if name == "w3c" else 1]), encoding="utf-8")
+                with undeletable(earlier):
+                    done = self.step(name, py)
+                self.assertNotEqual(done.returncode, 0, f"SPEC {name}: an earlier result held\n{done.stdout}{done.stderr}")
+                self.assertIn(f"{name}: the earlier result", done.stdout + done.stderr)
+
+    def test_the_checker_s_failed_removal_is_a_crash_not_a_judged_result(self):
+        # Spec: fix check r1: the checker exits 0 (passed) or 1 (not passed) only with its own published
+        # result; an earlier result it can't remove exits 3.
+        for name, args in (("guards", ["guards", "--run", "--identity", IDENTITY, "--names", "no-names",
+                                       "--log", "test.log", "--json", "guards.json"]),
+                           ("w3c", ["w3c", "logs", "--expected", "no-expected", "--run", "--identity", IDENTITY,
+                                    "--json", "w3c.json"])):
+            with self.subTest(name):
+                earlier = self.tmp / f"{name}.json"
+                earlier.write_text("{}", encoding="utf-8")
+                with undeletable(earlier):
+                    done = subprocess.run([sys.executable, str(GATE), *args], cwd=self.tmp, capture_output=True,
+                                          text=True, timeout=120,
+                                          env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
+                self.assertEqual(done.returncode, 3, f"SPEC {name}: a crash\n{done.stdout}{done.stderr}")
+                self.assertIn("can't be removed", done.stderr)
 
 
 def wrong_everywhere(side, n):
