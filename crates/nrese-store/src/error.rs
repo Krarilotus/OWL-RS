@@ -36,8 +36,10 @@ pub enum StoreError {
     Configuration(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// An engine error other than a refusal for memory, which is the request's memory error
+    /// (`From<EngineError>`).
     #[error("storage engine error: {0}")]
-    Engine(#[from] EngineError),
+    Engine(#[source] EngineError),
     #[error("SPARQL syntax error: {0}")]
     SparqlSyntax(#[from] SparqlSyntaxError),
     #[error("SPARQL evaluation error: {0}")]
@@ -127,6 +129,19 @@ pub enum Refusal {
 impl From<nrese_exec::BudgetExceeded> for StoreError {
     fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
         QueryEvaluationError::MemoryLimit(exceeded).into()
+    }
+}
+
+/// The engine refusing a change for memory (the pending changes' growth past the request's
+/// envelope, D16-039) is the request's memory error, as a query's or an update's is, so every
+/// transport answers it alike ([`StoreError::is_memory_limit`]). Any other engine error is the
+/// store's.
+impl From<EngineError> for StoreError {
+    fn from(error: EngineError) -> Self {
+        match error {
+            EngineError::MemoryLimit(exceeded) => exceeded.into(),
+            error => Self::Engine(error),
+        }
     }
 }
 

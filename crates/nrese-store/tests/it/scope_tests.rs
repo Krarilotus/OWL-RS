@@ -659,12 +659,12 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         let secret: String = (0..hidden)
             .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
             .collect();
-        pipeline
-            .execute_update_str(&format!(
-                "INSERT DATA {{ GRAPH <urn:g:public> {{ {public} }}
-                   GRAPH <urn:g:secret> {{ {secret} }} }}"
-            ))
-            .unwrap();
+        // Loaded past the pipeline: a write's pending changes draw on the same 64 KiB
+        // (D16-039), and the data is the refusals', not what this tests.
+        crate::support::load_past_the_pipeline(
+            pipeline.store(),
+            &format!("<urn:g:public> {{ {public} }} <urn:g:secret> {{ {secret} }}"),
+        );
         pipeline
     };
     // Scanned: a query of `?s <urn:p> ?o` in every graph reads the secret graph's.

@@ -63,13 +63,14 @@ pub(crate) fn apply_graph_write(
         (GraphTarget::NamedGraph(_), None) => true,
     };
     let before = tx.pending();
+    // The pending changes' growth is charged before it happens (D16-039).
     if request.replace
         && let Some(pattern) = existing
     {
-        tx.remove_matching(&pattern);
+        tx.remove_matching(&pattern)?;
     }
     for quad in &quads {
-        tx.insert(quad.as_ref());
+        tx.try_insert(quad.as_ref())?;
     }
     Ok(GraphWriteReport {
         target: request.target.clone(),
@@ -85,7 +86,7 @@ pub(crate) fn apply_graph_delete(
     target: &GraphTarget,
 ) -> StoreResult<GraphDeleteReport> {
     let removed = match target.pattern_in(&*tx)? {
-        Some(pattern) => tx.remove_matching(&pattern),
+        Some(pattern) => tx.remove_matching(&pattern)?,
         None => 0,
     };
     Ok(GraphDeleteReport {
