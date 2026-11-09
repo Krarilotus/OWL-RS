@@ -121,6 +121,41 @@ fn remove_matching_clears_one_graph() {
     assert_eq!(snapshot.named_graphs().count(), 0);
 }
 
+/// A charged insert that grows nothing needs no room (D16-039, sol-loop r1 S1): one that
+/// undoes the transaction's removal of a statement, or of a statement asserted already,
+/// succeeds within a budget that the removal alone fills at its peak.
+#[test]
+fn a_charged_insert_that_grows_nothing_needs_no_room() {
+    use std::sync::Arc;
+    let engine = inline_engine();
+    let statement = quad(1, 2, 3);
+    let mut tx = engine.transaction();
+    tx.insert(statement.as_ref());
+    tx.commit().expect("commit");
+    // What the removal alone holds at its peak.
+    let alone = Arc::new(nrese_exec::Budget::unlimited());
+    let mut tx = engine.transaction();
+    tx.charge_pending_to(Arc::clone(&alone)).unwrap();
+    assert!(tx.try_remove(statement.as_ref()).unwrap());
+    drop(tx);
+    let budget = Arc::new(nrese_exec::Budget::new(alone.peak()));
+    let mut tx = engine.transaction();
+    tx.charge_pending_to(Arc::clone(&budget)).unwrap();
+    assert!(
+        tx.try_remove(statement.as_ref()).unwrap(),
+        "the removal fits"
+    );
+    assert!(
+        tx.try_insert(statement.as_ref()).unwrap(),
+        "undoing it needs no room"
+    );
+    assert!(
+        !tx.try_insert(statement.as_ref()).unwrap(),
+        "nor does a statement asserted already"
+    );
+    assert_eq!(tx.pending(), (0, 0));
+}
+
 #[test]
 fn named_graphs_lists_non_empty_graphs() {
     let engine = inline_engine();
