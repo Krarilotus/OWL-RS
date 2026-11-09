@@ -130,13 +130,58 @@ fn own_length(
 /// own-document indexes by their corpus and stemming language. Views of one version share
 /// the slot (equality modes, stored, canonical, reading budgets), so the key holds the full
 /// identity: two of them never share an entry they shouldn't. Each value keeps the charge of
-/// the request that built it until the version's last holder drops it; each entry's key is
-/// charged there too, before it is made. The locks are leaves, held only to look up or to
-/// insert, never while a corpus is built. The first value kept for a key wins.
+/// the request that built it until the version's last holder drops it; each entry (its node,
+/// its value's shared allocation, its key's copies) is charged there too, before it is made
+/// ([`entry_bytes`]; sol-loop r3 B5). The locks are leaves, held only to look up or to link
+/// an entry in, never while a corpus is built; a losing entry drops after the lock. The
+/// first value kept for a key wins.
 #[derive(Default)]
 pub(crate) struct OwnCorpora {
-    corpora: parking_lot::Mutex<Vec<OwnCorpus>>,
-    locals: parking_lot::Mutex<Vec<OwnLocal>>,
+    corpora: parking_lot::Mutex<Links<OwnCorpus>>,
+    locals: parking_lot::Mutex<Links<OwnLocal>>,
+}
+
+/// Entries, newest first, each in an allocation of exactly its node: no backing vector whose
+/// growth would hold more than was charged.
+struct Links<T>(Option<Box<Link<T>>>);
+
+struct Link<T> {
+    entry: T,
+    next: Option<Box<Link<T>>>,
+}
+
+impl<T> Default for Links<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> Links<T> {
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        std::iter::successors(self.0.as_deref(), |link| link.next.as_deref())
+            .map(|link| &link.entry)
+    }
+
+    fn push(&mut self, mut link: Box<Link<T>>) {
+        link.next = self.0.take();
+        self.0 = Some(link);
+    }
+}
+
+impl<T> Drop for Links<T> {
+    /// One node at a time: no recursion as deep as the list.
+    fn drop(&mut self) {
+        let mut next = self.0.take();
+        while let Some(mut link) = next {
+            next = link.next.take();
+        }
+    }
+}
+
+/// The bytes an entry of `T` holding a value `V` allocates: its node, and its value's shared
+/// allocation (an `Arc`'s two counts and the value).
+const fn entry_bytes<T, V>() -> usize {
+    size_of::<Link<T>>() + 2 * size_of::<usize>() + size_of::<V>()
 }
 
 struct OwnCorpus {
@@ -163,32 +208,39 @@ impl OwnCorpora {
             .map(|own| Arc::clone(&own.corpus))
     }
 
-    /// Keeps `corpus` for `kind` read as `identity`, its key charged to `request` first
-    /// (an entry and the vector's doubling, the scope's graphs); the one kept first for
-    /// that key where another search kept one meanwhile.
+    /// Keeps `corpus` for `kind` read as `identity`, its entry charged to `request` first
+    /// (its node and shared allocation, the scope's graphs); the one kept first for that key
+    /// where another search kept one meanwhile, this one dropped after the lock.
     fn keep(
         &self,
         kind: KindRef<'_>,
         identity: super::SnapshotIdentity,
-        corpus: Arc<Corpus>,
+        corpus: Corpus,
         request: &Arc<nrese_exec::Budget>,
     ) -> Result<Arc<Corpus>, nrese_exec::BudgetExceeded> {
         let mut key = nrese_exec::Reservation::new(Arc::clone(request));
-        key.charge(2 * size_of::<OwnCorpus>() + scope_bytes(kind.scope))?;
-        let owned = kind.to_owned();
+        key.charge(entry_bytes::<OwnCorpus, Corpus>() + scope_bytes(kind.scope))?;
+        let corpus = Arc::new(corpus);
+        let link = Box::new(Link {
+            entry: OwnCorpus {
+                kind: kind.to_owned(),
+                identity,
+                corpus: Arc::clone(&corpus),
+                _key: key,
+            },
+            next: None,
+        });
         let mut corpora = self.corpora.lock();
-        if let Some(own) = corpora
+        let kept = corpora
             .iter()
             .find(|own| own.identity == identity && kind.matches(&own.kind))
-        {
-            return Ok(Arc::clone(&own.corpus));
+            .map(|own| Arc::clone(&own.corpus));
+        if let Some(kept) = kept {
+            drop(corpora);
+            drop(link);
+            return Ok(kept);
         }
-        corpora.push(OwnCorpus {
-            kind: owned,
-            identity,
-            corpus: Arc::clone(&corpus),
-            _key: key,
-        });
+        corpora.push(link);
         Ok(corpus)
     }
 
@@ -206,30 +258,41 @@ impl OwnCorpora {
             .map(|own| Arc::clone(&own.local))
     }
 
-    /// Keeps `local` for `corpus` stemmed for `language`, its key charged to `request`
-    /// first; the one kept first where another search kept one meanwhile.
+    /// Keeps `local` for `corpus` stemmed for `language`, its entry charged to `request`
+    /// first (its node and shared allocation, the language's copy); the one kept first
+    /// where another search kept one meanwhile, this one dropped after the lock.
     fn keep_local(
         &self,
         corpus: &Arc<Corpus>,
         language: Option<&str>,
-        local: Arc<crate::term::text::Local>,
+        local: crate::term::text::Local,
         request: &Arc<nrese_exec::Budget>,
     ) -> Result<Arc<crate::term::text::Local>, nrese_exec::BudgetExceeded> {
         let mut key = nrese_exec::Reservation::new(Arc::clone(request));
-        key.charge(2 * size_of::<OwnLocal>() + language.map_or(0, str::len))?;
+        key.charge(
+            entry_bytes::<OwnLocal, crate::term::text::Local>() + language.map_or(0, str::len),
+        )?;
+        let local = Arc::new(local);
+        let link = Box::new(Link {
+            entry: OwnLocal {
+                corpus: Arc::clone(corpus),
+                language: language.map(str::to_owned),
+                local: Arc::clone(&local),
+                _key: key,
+            },
+            next: None,
+        });
         let mut locals = self.locals.lock();
-        if let Some(own) = locals
+        let kept = locals
             .iter()
             .find(|own| Arc::ptr_eq(&own.corpus, corpus) && own.language.as_deref() == language)
-        {
-            return Ok(Arc::clone(&own.local));
+            .map(|own| Arc::clone(&own.local));
+        if let Some(kept) = kept {
+            drop(locals);
+            drop(link);
+            return Ok(kept);
         }
-        locals.push(OwnLocal {
-            corpus: Arc::clone(corpus),
-            language: language.map(str::to_owned),
-            local: Arc::clone(&local),
-            _key: key,
-        });
+        locals.push(link);
         Ok(local)
     }
 }
@@ -389,19 +452,27 @@ impl Snapshot {
         let language = query.stem.as_deref();
         // A corpus kept in the version's own slot keeps its own-document index beside it
         // (R32-N2); one built for this search alone builds its index for it alone.
-        let own = match (corpus, self.own_corpora()) {
-            (CorpusRef::Kept(kept), Some(slot)) => match slot.local(kept, language) {
-                Some(local) => local,
-                None => {
-                    let local = self.own_documents(view, documents, corpus, language, request)?;
-                    slot.keep_local(kept, language, Arc::new(local), request)?
-                }
-            },
-            _ => Arc::new(self.own_documents(view, documents, corpus, language, request)?),
+        let (kept_local, fresh);
+        let own: &crate::term::text::Local = match (corpus, self.own_corpora()) {
+            (CorpusRef::Kept(kept), Some(slot)) => {
+                kept_local = match slot.local(kept, language) {
+                    Some(local) => local,
+                    None => {
+                        let local =
+                            self.own_documents(view, documents, corpus, language, request)?;
+                        slot.keep_local(kept, language, local, request)?
+                    }
+                };
+                &kept_local
+            }
+            _ => {
+                fresh = self.own_documents(view, documents, corpus, language, request)?;
+                &fresh
+            }
         };
         Ok(self
             .underlying()
-            .private_search(iris, query, corpus, view.start(), &own))
+            .private_search(iris, query, corpus, view.start(), own))
     }
 
     /// The IRIs that are subjects of statements this snapshot shows in `scope`'s graphs
@@ -768,7 +839,7 @@ impl Snapshot {
             // Kept in the version's own slot, still on the search's budget: charged to the
             // request that built it until the version's last holder drops it.
             (None, Some(own)) => {
-                let corpus = Arc::new(Corpus::finish(&built, span, request)?);
+                let corpus = Corpus::finish(&built, span, request)?;
                 CorpusRef::Kept(own.keep(kind, identity, corpus, request)?)
             }
             (None, None) => CorpusRef::Own(Corpus::finish(&built, span, request)?),
