@@ -19,7 +19,9 @@ use crate::http::requests::{
     SparqlOperation, accept_header_value, operation_from_post, query_from_post, query_from_url,
     update_from_post,
 };
-use crate::http::responses::{StatusResponse, build_ready_response, build_version_response};
+use crate::http::responses::{
+    StatusResponse, build_readiness_response, build_ready_response, build_version_response,
+};
 use crate::http::service_description::build_service_description;
 use crate::http::shacl;
 use crate::http::sparql;
@@ -84,7 +86,7 @@ pub async fn operator_dataset_summary(
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
     guard::enforce_operator_read(&state, &authenticated).await?;
-    operator_api::dataset_summary(state)
+    operator_api::dataset_summary(state, &authenticated).await
 }
 
 pub async fn operator_extended_health(
@@ -92,7 +94,7 @@ pub async fn operator_extended_health(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     guard::enforce_operator_read(&state, &authenticated).await?;
-    operator_api::extended_health(state)
+    operator_api::extended_health(state, &authenticated).await
 }
 
 pub async fn operator_runtime_diagnostics(
@@ -160,16 +162,17 @@ pub async fn admin_restore_dataset(
 }
 
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    match build_ready_response(&state) {
-        Ok(response) if state.is_ready() => (StatusCode::OK, Json(response)).into_response(),
+    let response = build_readiness_response(&state);
+    if response.status == "ready" {
+        (StatusCode::OK, Json(response)).into_response()
+    } else {
         // Not ready is a status document, not an error: probes read it as written.
-        Ok(response) => (
+        (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Extension(crate::error::Verbatim),
             Json(response),
         )
-            .into_response(),
-        Err(error) => error.into_response(),
+            .into_response()
     }
 }
 
@@ -177,8 +180,11 @@ pub async fn dataset_info(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
-    guard::enforce_service_description_read(&state, &authenticated).await?;
-    Ok((StatusCode::OK, Json(build_ready_response(&state)?)).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(build_ready_response(&state, &authenticated).await?),
+    )
+        .into_response())
 }
 
 pub async fn version(State(state): State<AppState>) -> Response {

@@ -1168,7 +1168,7 @@ async fn query_results_are_pinned_listed_and_unpinned() {
 /// inferences, and can't restore the old ones either (neither reasoning's state file can be
 /// written: its staging name `reasoning.state.tmp` taken), leaves the default repository
 /// unavailable until a restart: its requests get 503, while the repository list (which says why
-/// to operators), `/readyz` (ready, degraded) and the other repositories go on.
+/// to operators), `/readyz` (ready) and the other repositories go on.
 #[tokio::test]
 async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -1238,6 +1238,10 @@ async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
         "the other repository serves: {text}"
     );
     let (status, text) = send(&app, Method::GET, "/readyz", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let ready: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ready, serde_json::json!({"status": "ready"}));
+    let (status, text) = send(&app, Method::GET, "/api/v1/repositories/r2/info", None, "").await;
     assert_eq!(status, StatusCode::OK, "{text}");
     let ready: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
