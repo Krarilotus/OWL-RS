@@ -64,6 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all = asserted.clone();
     all.extend(&inferred);
     all.sort_unstable();
+    // An in-memory lookup: one unit a call on the reading task's poller (`Graphs` for a
+    // function).
     let graph_of = |fact: Triple| -> Option<u32> {
         asserted
             .binary_search(&fact)

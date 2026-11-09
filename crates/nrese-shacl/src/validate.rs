@@ -439,13 +439,6 @@ fn holds_blank_node(term: &Term) -> bool {
     }
 }
 
-fn is_literal(id: TermId) -> bool {
-    !matches!(
-        id.kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
-}
-
 impl<'a, V: ReadView> Validator<'a, V> {
     pub(crate) fn new(
         view: &'a V,
@@ -790,7 +783,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             return false;
         };
         let subclasses = &self.classes[&class];
-        !is_literal(node)
+        !node.kind().is_literal()
             && self
                 .graph
                 .objects(node, rdf_type)
@@ -861,7 +854,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     fn has_datatype(&self, node: TermId, datatype: &str) -> bool {
-        if !is_literal(node) {
+        if !node.kind().is_literal() {
             return false;
         }
         match self.graph.decode(node) {
@@ -871,7 +864,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 } else {
                     literal.datatype().as_str()
                 };
-                actual == datatype && well_formed(datatype, literal.value())
+                actual == datatype && well_formed(datatype, literal.value(), literal.language())
             }
             _ => false,
         }
@@ -914,7 +907,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             }
             Constraint::NodeKind(kind) => each(Component::NodeKind, &mut |v| {
                 let (iri, blank) = (v.kind() == TermKind::Iri, v.kind() == TermKind::BlankNode);
-                let literal = is_literal(v);
+                let literal = v.kind().is_literal();
                 match kind {
                     NodeKind::Iri => iri,
                     NodeKind::BlankNode => blank,

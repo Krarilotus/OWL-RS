@@ -230,12 +230,19 @@ impl StoreService {
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
+        // So does what client transactions keep between requests.
+        let sessions = crate::sessions::Sessions::within(
+            std::sync::Arc::new(
+                nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+            ),
+            crate::sessions::SESSION_IDLE,
+        );
         let service = Self {
             process_memory,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
-            sessions: std::sync::Arc::default(),
+            sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),
@@ -730,6 +737,11 @@ impl StoreService {
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        } else if let Some(state) = self.reasoning_state() {
+            // Off: the rewriting the closure and the setting call for, whatever came first
+            // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
+            // path, which switches the bounds off, exists).
+            self.note_ql(&state);
         }
     }
 
@@ -1298,6 +1310,9 @@ impl StoreService {
         // read as the reader may; what they change is checked at the commit (the view is
         // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
+        // What the operations' transfers reserve of the pending changes is the reading
+        // query's too.
+        tx.charge_pending_to(std::sync::Arc::new(memory.part()))?;
         let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {

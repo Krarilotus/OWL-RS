@@ -13,7 +13,10 @@
 //!   `-01`, `-.5`, `-1.5e3`, `-9223372036854775808`) is unresolved, since spargebra reads the
 //!   token and the expression (`+(1)`) alike though they are two terms;
 //! - the shape of a nest of `&&` or `||` (both associative): nrese balances it, spargebra
-//!   folds it left.
+//!   folds it left;
+//! - `ADD`, `MOVE` and `COPY`: nrese keeps each as one operation (it reads the stored graph and
+//!   resolves both names first, SYN-54), spargebra lowers it to the `DROP` and `DELETE`/`INSERT`
+//!   steps §3.2.3–3.2.5 define it as, none for two equal names.
 //!
 //! Every other difference is listed. Those explained (spargebra's right-associative
 //! `-` and `/`, and what each accepts or rejects) are checked to be exactly the expected
@@ -36,7 +39,7 @@ use nrese_sparql_syntax::term::{
     TriplePattern,
 };
 use nrese_sparql_syntax::visit::{Node, NodeMut};
-use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, TransferOp, Update};
 use oxigraph_comparison::w3c;
 use spargebra::algebra as sa;
 use spargebra::term as st;
@@ -327,9 +330,7 @@ impl Names {
                 expr: self.expr(expr),
                 inner: b(self, inner),
             },
-            S::Union { left, right } => {
-                P::union_all(vec![self.pattern(left), self.pattern(right)])
-            }
+            S::Union { left, right } => P::union_all(vec![self.pattern(left), self.pattern(right)]),
             S::Graph { name, inner } => P::Graph {
                 name: self.nnp(name),
                 inner: b(self, inner),
@@ -938,9 +939,78 @@ fn canonical(mut query: Query) -> Canonical {
     }
 }
 
+/// spargebra's form of nrese's `ADD`: the `DeleteInsert` SPARQL 1.1 Update §3.2.3 defines it
+/// as, `?s ?p ?o` of `from` into `to`.
+fn lowered(from: &GraphName, to: &GraphName) -> U {
+    let [s, p, o] = ["s", "p", "o"].map(Variable::new_unchecked);
+    let bgp = P::Bgp {
+        patterns: vec![TriplePattern::new(s.clone(), p.clone(), o.clone())],
+    };
+    U::DeleteInsert {
+        delete: Vec::new(),
+        insert: vec![QuadPattern::new(
+            s,
+            p,
+            o,
+            GraphNamePattern::from(to.clone()),
+        )],
+        using: None,
+        pattern: Box::new(match from {
+            GraphName::NamedNode(from) => P::Graph {
+                name: from.clone().into(),
+                inner: Box::new(bgp),
+            },
+            GraphName::DefaultGraph => bgp,
+        }),
+    }
+}
+
+/// spargebra's form of nrese's transfer: nothing for two equal names, else the `DROP` and
+/// `DELETE`/`INSERT` steps SPARQL 1.1 Update §3.2.3–3.2.5 define it as.
+fn spargebra_form(operation: U) -> Vec<U> {
+    let U::Transfer {
+        op,
+        silent,
+        from,
+        to,
+    } = operation
+    else {
+        return vec![operation];
+    };
+    if from == to {
+        return Vec::new();
+    }
+    let target = |g: &GraphName| match g {
+        GraphName::NamedNode(n) => GraphTarget::NamedNode(n.clone()),
+        GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+    };
+    let drop_to = U::Drop {
+        silent: true,
+        graph: target(&to),
+    };
+    let copy = lowered(&from, &to);
+    match op {
+        TransferOp::Add => vec![copy],
+        TransferOp::Copy => vec![drop_to, copy],
+        TransferOp::Move => vec![
+            drop_to,
+            copy,
+            U::Drop {
+                silent,
+                graph: target(&from),
+            },
+        ],
+    }
+}
+
 /// An update as the test compares it, as [`canonical`] a query.
 fn canonical_update(mut update: Update) -> Canonical {
     let mut names = Generated::default();
+    update.operations = update
+        .operations
+        .into_iter()
+        .flat_map(spargebra_form)
+        .collect();
     for operation in &mut update.operations {
         match operation {
             U::InsertData { data } => {
@@ -974,7 +1044,8 @@ fn canonical_update(mut update: Update) -> Canonical {
             | U::Load { .. }
             | U::Clear { .. }
             | U::Create { .. }
-            | U::Drop { .. } => {}
+            | U::Drop { .. }
+            | U::Transfer { .. } => {}
         }
     }
     Canonical {
@@ -1159,6 +1230,24 @@ fn every_query_parses_to_the_same_algebra() {
 /// specification.
 const EXPLAINED: &[(&str, &str, &str)] = &[
     (
+        "sparql10/syntax-sparql2/syntax-general-04.rq",
+        "different algebra",
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
+         consumes `+11`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
+    ),
+    (
+        "sparql10/syntax-sparql2/syntax-general-07.rq",
+        "different algebra",
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
+         consumes `+1.0`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
+    ),
+    (
+        "sparql10/syntax-sparql2/syntax-general-10.rq",
+        "different algebra",
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
+         consumes `+1.0e+1`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
+    ),
+    (
         "sparql10/expr-ops/query-add-literals.rq",
         "different algebra",
         "spargebra reads `a + b + c` as `a + (b + c)`; the grammar's rule 116 associates to the left",
@@ -1212,9 +1301,15 @@ fn subtraction_associates_to_the_left_in_nrese_only() {
     let ours = format!("{ours:?}");
     // spargebra: the outer subtraction's left operand is the literal 10, its right `5 - 2`.
     assert!(!theirs.contains("Subtract(Subtract("), "{theirs}");
-    assert!(theirs.contains("Subtract(Literal(Literal { value: \"10\""), "{theirs}");
+    assert!(
+        theirs.contains("Subtract(Literal(Literal { value: \"10\""),
+        "{theirs}"
+    );
     // nrese: the left operand of the outer subtraction is `10 - 5`.
-    assert!(ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""), "{ours}");
+    assert!(
+        ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""),
+        "{ours}"
+    );
 }
 
 /// SYNTAX5-F1 (Sol, PR #61 fix check 2): `&&` and `||` were reassociated in the algebra's
