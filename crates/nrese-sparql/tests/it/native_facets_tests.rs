@@ -5,6 +5,64 @@ use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query};
 use nrese_sparql_syntax::SparqlParser;
 
+// Spec: legal result variable names have no 64 KiB limit. A header larger than the
+// writer's chunk with 4097 rows must preserve the header and every row (D16-066).
+// This regression is a checked-arithmetic witness, not a demonstrated release crash.
+#[test]
+fn d066_large_header_streams_all_rows() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let name = "x".repeat(65_540);
+    let values = (0..4097)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = SparqlParser::new()
+        .parse_query(&format!(
+            "SELECT ?{name} ?i WHERE {{ VALUES ?i {{ {values} }} }}"
+        ))
+        .unwrap();
+    for format in [
+        nrese_sparql::ResultsFormat::Tsv,
+        nrese_sparql::ResultsFormat::Csv,
+        nrese_sparql::ResultsFormat::Json,
+    ] {
+        let mut out = Vec::new();
+        nrese_sparql::write_results(
+            &snapshot,
+            &query,
+            &QueryOptions::default(),
+            format,
+            None,
+            &mut out,
+        )
+        .unwrap()
+        .unwrap();
+        let mut actual: Vec<usize> = if format == nrese_sparql::ResultsFormat::Json {
+            let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(doc["head"]["vars"], serde_json::json!([name, "i"]));
+            doc["results"]["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["i"]["value"].as_str().unwrap().parse().unwrap())
+                .collect()
+        } else {
+            let text = std::str::from_utf8(&out).unwrap();
+            let mut lines = text.lines();
+            let header = if format == nrese_sparql::ResultsFormat::Tsv {
+                format!("?{name}\t?i")
+            } else {
+                format!("{name},i")
+            };
+            assert_eq!(lines.next(), Some(header.as_str()));
+            lines.map(|row| row[1..].parse().unwrap()).collect()
+        };
+        actual.sort_unstable();
+        assert_eq!(actual, (0..4097).collect::<Vec<_>>(), "{format:?}");
+    }
+}
+
 // Spec: RDF 1.2 triple terms are not literals; SPARQL LANG accepts only literals.
 // The optimized FILTER must agree for both classification and language predicates.
 #[test]
