@@ -13,7 +13,10 @@
 //! absent), and a write fails as a whole if it would add or remove a statement in a graph
 //! its requester may not write, whether the statement is there or not.
 
+use std::sync::Arc;
+
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{GraphName, NamedNode, Quad, Term, TermRef};
 use nrese_sparql::ReadView;
 
@@ -138,19 +141,141 @@ pub enum StatementOp {
     Update(SparqlUpdateRequest),
 }
 
+impl StatementOp {
+    /// The heap bytes it holds beside its own slot, by capacity: what a holder that keeps it
+    /// charges ([`crate::sessions`]).
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Add { data, contexts } | Self::RemoveData { data, contexts } => {
+                data.payload.capacity()
+                    + data.base_iri.as_ref().map_or(0, String::capacity)
+                    + graphs_bytes(contexts)
+            }
+            Self::RemoveMatching(pattern) => {
+                pattern.subject.as_ref().map_or(0, Term::heap_bytes)
+                    + pattern.predicate.as_ref().map_or(0, NamedNode::heap_bytes)
+                    + pattern.object.as_ref().map_or(0, Term::heap_bytes)
+                    + graphs_bytes(&pattern.contexts)
+            }
+            Self::Update(update) => update.heap_bytes(),
+        }
+    }
+}
+
+/// The heap bytes of a list of graphs: its slots and their names.
+fn graphs_bytes(graphs: &Vec<GraphName>) -> usize {
+    graphs.capacity() * std::mem::size_of::<GraphName>()
+        + graphs.iter().map(GraphName::heap_bytes).sum::<usize>()
+}
+
+/// A request's operations, shared without copying: a client transaction's reads and its
+/// commit hold the one history its session keeps ([`crate::sessions`]), and with it the
+/// charge of what the history holds, returned when its last holder lets it go.
+#[derive(Debug, Clone, Default)]
+pub struct StatementOps(Arc<Held>);
+
+#[derive(Debug)]
+enum Held {
+    /// One request's own operations, uncharged (they live as long as the request).
+    Plain(Vec<StatementOp>),
+    /// Kept between requests: their slots charged by the vector, the bytes they hold by
+    /// `nested`, both on the keeper's budget.
+    Kept {
+        ops: ChargedVec<StatementOp>,
+        nested: Reservation,
+    },
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self::Plain(Vec::new())
+    }
+}
+
+impl std::ops::Deref for StatementOps {
+    type Target = [StatementOp];
+
+    fn deref(&self) -> &[StatementOp] {
+        match &*self.0 {
+            Held::Plain(ops) => ops,
+            Held::Kept { ops, .. } => ops,
+        }
+    }
+}
+
+impl From<Vec<StatementOp>> for StatementOps {
+    fn from(ops: Vec<StatementOp>) -> Self {
+        Self(Arc::new(Held::Plain(ops)))
+    }
+}
+
+/// An append the budget had no room for, and the operations it would have appended.
+pub(crate) type Refused = (BudgetExceeded, Vec<StatementOp>);
+
+impl StatementOps {
+    /// `more` appended, everything kept charged to `budget` first (the one budget these were
+    /// kept on, if they were): in place where nobody else holds these, else as a copy
+    /// charged anew, so that a reader holding these keeps them with their own charge. A
+    /// refusal changes nothing and hands `more` back.
+    pub(crate) fn append_within(
+        &mut self,
+        more: Vec<StatementOp>,
+        budget: &Arc<Budget>,
+    ) -> Result<(), Refused> {
+        let bytes: usize = more.iter().map(StatementOp::heap_bytes).sum();
+        if let Some(Held::Kept { ops, nested }) = Arc::get_mut(&mut self.0) {
+            if let Err(refused) = nested.charge(bytes) {
+                return Err((refused, more));
+            }
+            if let Err(refused) = ops.reserve(more.len()) {
+                nested.release(bytes);
+                return Err((refused, more));
+            }
+            push_reserved(ops, more);
+            return Ok(());
+        }
+        let old: &[StatementOp] = self;
+        let mut nested = Reservation::new(Arc::clone(budget));
+        if let Err(refused) =
+            nested.charge(old.iter().map(StatementOp::heap_bytes).sum::<usize>() + bytes)
+        {
+            return Err((refused, more));
+        }
+        let mut ops = match ChargedVec::with_capacity(Arc::clone(budget), old.len() + more.len()) {
+            Ok(ops) => ops,
+            Err(refused) => return Err((refused, more)),
+        };
+        push_reserved(&mut ops, old.iter().cloned());
+        push_reserved(&mut ops, more);
+        self.0 = Arc::new(Held::Kept { ops, nested });
+        Ok(())
+    }
+}
+
+/// `items` pushed onto `ops`, which has the room for them reserved.
+fn push_reserved(ops: &mut ChargedVec<StatementOp>, items: impl IntoIterator<Item = StatementOp>) {
+    // No room to reserve beyond the length, so nothing to refuse; a push past the room
+    // panics before it allocates.
+    let filled = ops.fill(0, |room| items.into_iter().for_each(|op| room.push(op)));
+    debug_assert!(filled.is_ok());
+}
+
 /// Writes applied in order in one transaction: an RDF4J transaction's operations, or one
 /// request to `/statements`.
 #[derive(Debug, Clone, Default)]
 pub struct StatementsRequest {
-    pub ops: Vec<StatementOp>,
+    pub ops: StatementOps,
     /// The session ([`crate::sessions`]) the operations were collected in, if any: reads on
     /// them keep the data they see there until the session or the store changes.
     pub session: Option<String>,
 }
 
 impl StatementsRequest {
-    pub fn new(ops: Vec<StatementOp>) -> Self {
-        Self { ops, session: None }
+    pub fn new(ops: impl Into<StatementOps>) -> Self {
+        Self {
+            ops: ops.into(),
+            session: None,
+        }
     }
 }
 
@@ -162,7 +287,7 @@ pub(crate) fn apply_statements(
     requester: &crate::Requester,
     update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
-    for op in &request.ops {
+    for op in request.ops.iter() {
         match op {
             StatementOp::Add { data, contexts } => {
                 for quad in data.quads(contexts)? {
