@@ -140,25 +140,38 @@ pub(crate) fn local_name_text(iri: &str) -> Option<String> {
     if local.is_empty() {
         return None;
     }
-    let mut spaced = String::with_capacity(local.len() * 2);
-    let mut previous: Option<char> = None;
+    // Measured first, so the text is made in one allocation of exactly its length
+    // ([`local_name_text_bytes`] bounds it; sol-loop r2 B4).
+    let split = |previous: Option<char>, c: char| {
+        previous.is_some_and(|p| p.is_lowercase() && c.is_uppercase())
+    };
+    let mut previous = None;
+    let mut spaces = 0;
     for c in local.chars() {
-        if previous.is_some_and(|p| p.is_lowercase() && c.is_uppercase()) {
-            spaced.push(' ');
-        }
-        spaced.push(c);
+        spaces += usize::from(split(previous, c));
         previous = Some(c);
     }
-    let whole: String = local.chars().filter(|c| c.is_alphanumeric()).collect();
-    Some(format!("{spaced} {whole}"))
+    let alphanumeric = |c: &char| c.is_alphanumeric();
+    let whole: usize = local.chars().filter(alphanumeric).map(char::len_utf8).sum();
+    let mut text = String::with_capacity(local.len() + spaces + 1 + whole);
+    let mut previous = None;
+    for c in local.chars() {
+        if split(previous, c) {
+            text.push(' ');
+        }
+        text.push(c);
+        previous = Some(c);
+    }
+    text.push(' ');
+    text.extend(local.chars().filter(alphanumeric));
+    Some(text)
 }
 
-/// The most bytes [`local_name_text`] holds at once for an IRI of `iri_len` bytes: its
-/// spaced copy (at most twice the local name, as allocated), the whole name, and the result
-/// (at most three times and one more), with a byte of slack (for a caller that charges it
-/// first).
+/// The most bytes [`local_name_text`] allocates for an IRI of `iri_len` bytes: its one
+/// allocation, of the local name (at most the IRI), a space at most a byte before each of
+/// its bytes, one more, and its letters and digits (at most the local name again).
 pub(crate) const fn local_name_text_bytes(iri_len: usize) -> usize {
-    6 * iri_len + 2
+    3 * iri_len + 1
 }
 
 /// The words of `text`: maximal runs of letters and digits, lower-cased.
@@ -1009,6 +1022,30 @@ mod tests {
         );
         assert_eq!(local_name_text("urn:isbn:123").as_deref(), Some("123 123"));
         assert_eq!(local_name_text("http://example.com/"), None);
+    }
+
+    /// V3's sol-loop r2 B4: `local_name_text` makes its text in one allocation of its
+    /// length, within `local_name_text_bytes` of the IRI. The IRIs: sol's witness (`urn:`
+    /// and 1,025 `a`s), camel case at every letter, non-ASCII letters, a local name of
+    /// separators only.
+    #[test]
+    fn local_name_text_is_one_allocation_within_its_bound() {
+        let iris = [
+            format!("urn:{}", "a".repeat(1025)),
+            "http://example.com/aBaBaBaBaB".to_owned(),
+            "http://example.com/überÄpfel_Ölß".to_owned(),
+            "http://example.com/x#-_-".to_owned(),
+            "http://dbpedia.org/resource/Albert_Einstein".to_owned(),
+        ];
+        for iri in &iris {
+            let text = local_name_text(iri).unwrap();
+            assert_eq!(text.capacity(), text.len(), "{iri}");
+            assert!(text.capacity() <= local_name_text_bytes(iri.len()), "{iri}");
+        }
+        assert_eq!(
+            local_name_text("http://example.com/aBaB").as_deref(),
+            Some("a Ba B aBaB")
+        );
     }
 
     /// `-word` excludes the literals that have it; `word~` matches words within two edits,

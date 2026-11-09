@@ -2036,7 +2036,9 @@ impl Snapshot {
             }
             // Otherwise an `Arc`'d budget of what `budget` has left, that room held on
             // `budget` until the search is done, then the hits charged there. The snapshot's
-            // reads, where it has any, charge their own budget, not this one.
+            // reads, where it has any, charge their own budget, not this one. (A reader's
+            // budget beside `budget` under one parent would find the parent's room held:
+            // no caller passes one; SPARQL passes the reader's, the others unbounded ones.)
             let (inner, held) = match budget.is_bounded() {
                 true => {
                     let room = budget.remaining();
@@ -2054,11 +2056,15 @@ impl Snapshot {
                 accept,
                 &inner,
             )?;
-            // The held room first, then the hits charged on `budget` before they are copied
-            // (the inner ones are the inner budget's until they drop).
-            drop(held);
+            // Of the held room, what the copy takes is let go for it, the rest held until the
+            // inner hits are freed (sol-loop r2 B3: no gap where neither is counted).
+            let held = held.map(|mut held| {
+                held.release(hits.len() * std::mem::size_of::<(TermId, f32)>());
+                held
+            });
             let found = nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
             drop(hits);
+            drop(held);
             return Ok((found?, report));
         }
         let (hits, report) =

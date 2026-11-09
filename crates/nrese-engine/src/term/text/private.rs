@@ -45,14 +45,15 @@ pub(crate) struct Local {
 ///   an IRI's local-name text ([`local_name_text_bytes`]);
 /// - then, before it is indexed, each byte of the text ([`PER_BYTE`]: its lower-cased words,
 ///   up to three bytes a byte, once while tokenised and once as keys, and their stem table
-///   copies), and each word ([`PER_WORD`]: a tokenising map slot with its `String` (88), a
-///   B-tree entry with its node's share at the minimum fill of five (170), a posting buffer
-///   at its doubling (34), a stem table slot with its `String` and vector (128); 420, rounded
-///   up).
+///   copies), and each word ([`PER_WORD`]): a tokenising map slot with its `String` (88); a
+///   whole B-tree node, since a map of n words holds at most n nodes and a word alone in its
+///   shard is its own root (sol-loop r2 B1: an internal node of eleven 16-byte keys, eleven
+///   40-byte postings, twelve edges and its header, 728); a posting buffer at its doubling
+///   (34); a stem table slot with its `String` and vector (128). 978, rounded up.
 const UPFRONT: usize = 8 << 10;
 const PER_DOCUMENT: usize = 128;
 const PER_BYTE: usize = 12;
-const PER_WORD: usize = 512;
+const PER_WORD: usize = 1 << 10;
 
 impl Local {
     /// The index of the overlay's own entries `own` (id and key, ascending) that `member`

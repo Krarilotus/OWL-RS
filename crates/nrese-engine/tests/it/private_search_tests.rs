@@ -584,6 +584,43 @@ fn a_private_search_charges_its_own_index_before_it_builds_it() {
     );
 }
 
+/// Sol-loop r2 B1: a word alone in its shard costs its index a whole B-tree root. One own
+/// literal of 36 one-character words (`0` to `9`, `a` to `z`: 36 shards) needs about 29 KB
+/// for its shard maps and roots alone; within 32 KiB it is refused (the r1 charge, about
+/// 27.7 KB, admitted it), within 64 MiB found.
+#[test]
+fn a_private_search_charges_a_root_for_each_sparse_shard() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    base(&engine);
+    let published = engine.snapshot();
+    let mut private = engine
+        .speculative_over(&published, Arc::new(nrese_exec::Budget::unlimited()))
+        .unwrap();
+    let words: Vec<String> = ('0'..='9').chain('a'..='z').map(String::from).collect();
+    let text = words.join(" ");
+    private
+        .try_insert(label("sparse", &text, None).as_ref())
+        .unwrap();
+    let pending = private.pending_snapshot().unwrap();
+    let z = query("z", false, false);
+    let search = |limit: usize| {
+        let budget = Arc::new(nrese_exec::Budget::new(limit));
+        pending.text_search_in(
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            &z,
+            Some(&budget),
+        )
+    };
+    let small = search(32 << 10);
+    assert!(small.is_err(), "within 32 KiB: {small:?}");
+    let found = search(64 << 20).unwrap();
+    assert!(
+        decoded(&pending, &found).iter().any(|(t, _)| *t == text),
+        "within 64 MiB"
+    );
+}
+
 /// Sol-loop r1 B3: a private snapshot that reads within a request's budget (as a SPARQL
 /// query's does), with equality expansion and a cold vector corpus, searched by the global
 /// vector entry point within that same budget, answers: the search charges the budget
