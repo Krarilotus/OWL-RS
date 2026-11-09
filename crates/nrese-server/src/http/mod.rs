@@ -33,4 +33,5 @@ mod shacl;
 mod sparql;
 mod tell;
 
+pub use result_stream::MAX_BUFFERED_OUTPUT_BYTES;
 pub use routes::router;

@@ -1410,7 +1410,9 @@ impl Dictionary {
         let decoded = Decoded::default();
         let view = |id: TermId| {
             (id.kind().is_dictionary() && id.payload() < len).then(|| {
-                view_key(match inner.key(id.payload()) {
+                // Inlined here alone: a caller's loop over many views keeps the decode in
+                // line (package 2b's B17 count); every other caller gets `view_key`'s.
+                decode_view(match inner.key(id.payload()) {
                     Key::Borrowed(key) => key,
                     Key::Owned(key) => decoded.keep(key),
                 })
@@ -2082,6 +2084,13 @@ impl<'a> TermView<'a> {
 }
 
 pub(super) fn view_key(key: &[u8]) -> TermView<'_> {
+    decode_view(key)
+}
+
+/// [`view_key`]'s body, always inlined: for [`Dictionary::with_views`]'s lookup, whose callers
+/// loop over many views.
+#[inline(always)]
+fn decode_view(key: &[u8]) -> TermView<'_> {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default();
     match key[0] {

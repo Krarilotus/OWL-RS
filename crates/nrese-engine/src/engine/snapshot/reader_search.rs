@@ -114,13 +114,14 @@ fn request_budget(budget: Option<&Arc<nrese_exec::Budget>>) -> Arc<nrese_exec::B
 }
 
 /// What the corpus store admits by (contract S3): the version of a snapshot with the
-/// shared-state capability, made only from its token ([`Admission::of`]), so that an
-/// admission works on the token's own snapshot and never on one passed beside it.
-pub(crate) struct Admission<'s> {
+/// shared-state capability, made only from its token ([`CorpusAdmission::of`]), so that an
+/// admission works on the token's own snapshot and never on one passed beside it. (Named
+/// apart from 3.0c's [`super::Admission`], the capability it is made from.)
+pub(crate) struct CorpusAdmission<'s> {
     version: &'s Arc<crate::engine::Version>,
 }
 
-impl<'s> Admission<'s> {
+impl<'s> CorpusAdmission<'s> {
     /// The admission of the snapshot `token` was taken from.
     fn of(token: &super::SharedState<'s>) -> Self {
         Self {
@@ -392,7 +393,7 @@ impl Snapshot {
         // Only a published snapshot, or a restriction of one, admits into the store; any
         // other derives what it can from a kept corpus, reading it, and keeps nothing.
         let token = self.shared_state();
-        let admitted = token.as_ref().map(Admission::of);
+        let admitted = token.as_ref().map(CorpusAdmission::of);
         let store = self.corpora(admitted.is_some());
         let kind = KindRef {
             documents,

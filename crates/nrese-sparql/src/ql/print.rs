@@ -154,6 +154,9 @@ pub fn print<V: ReadView>(
     if !reasons.is_empty() {
         return Ok(Printed::NotExpressible(reasons));
     }
+    // The rewriting's own variables are made names no text holds: written as names the
+    // printed query doesn't use (`internal::printable`).
+    let (printed, _) = nrese_sparql_syntax::internal::printable(printed);
     let query = match query.clone() {
         Query::Select {
             dataset, base_iri, ..

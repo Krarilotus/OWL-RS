@@ -37,7 +37,7 @@
 //! many corpora and steps are kept.
 //!
 //! Only a published snapshot, or a restriction of one, changes the store (the dictionary
-//! lifecycle's S3: its [`super::snapshot::Admission`], from its `SharedState`): it makes it,
+//! lifecycle's S3: its [`super::snapshot::CorpusAdmission`], from its `SharedState`): it makes it,
 //! claims, evicts, keeps, abandons; only a successful publication records a step. Any other
 //! snapshot (a writer's pending state, a view that adds facts) builds for its search alone,
 //! derived from a kept corpus where that corpus's runs are its own runs' prefix
@@ -50,7 +50,7 @@ use std::sync::{Arc, Weak};
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use parking_lot::Mutex;
 
-use super::snapshot::{Admission, Documents, TextScope};
+use super::snapshot::{CorpusAdmission, Documents, TextScope};
 use super::{Content, ReadModel, Stack, Version};
 use crate::term::text::Corpus;
 use crate::term::{TermId, TermKind};
@@ -664,7 +664,7 @@ impl CorpusStore {
     /// restriction of one) is admitted (contract S3): it may claim an entry and evict.
     pub(crate) fn find(
         &self,
-        admitted: &Admission<'_>,
+        admitted: &CorpusAdmission<'_>,
         kind: KindRef<'_>,
         request: &Arc<Budget>,
     ) -> Result<Found, BudgetExceeded> {
@@ -775,7 +775,7 @@ impl CorpusStore {
     /// builds it on its own budget). The build runs without the store's lock.
     pub(crate) fn keep_built(
         &self,
-        admitted: &Admission<'_>,
+        admitted: &CorpusAdmission<'_>,
         kind: KindRef<'_>,
         bytes: usize,
         build: impl FnOnce(&Arc<Budget>) -> Result<Corpus, BudgetExceeded>,
@@ -838,7 +838,7 @@ impl CorpusStore {
     /// Lets go of the entry [`Self::find`] made for the corpus `kind` of `version` while it
     /// has no corpus yet: its build failed (a budget refused it, a read stopped early), so no
     /// corpus will fill it, and a later search builds and keeps its own.
-    pub(crate) fn abandon(&self, admitted: &Admission<'_>, kind: KindRef<'_>) {
+    pub(crate) fn abandon(&self, admitted: &CorpusAdmission<'_>, kind: KindRef<'_>) {
         let content = admitted.version().content;
         let mut state = self.state.lock();
         if let Some(at) = state
@@ -984,7 +984,7 @@ mod tests {
         let scope = TextScope::EVERY;
         let request = Arc::new(Budget::unlimited());
         let fresh = Arc::new(Budget::new(1 << 20));
-        let admitted = Admission::for_tests(&version);
+        let admitted = CorpusAdmission::for_tests(&version);
         let made = store.find(&admitted, kind(&scope), &request);
         assert!(matches!(made, Ok(Found::Build { keep: true, .. })));
         let served = store.keep_built(&admitted, kind(&scope), 64, |old| {
@@ -1013,7 +1013,7 @@ mod tests {
         let scope = TextScope::EVERY;
         let request = Arc::new(Budget::unlimited());
         let first = Arc::new(Version::empty());
-        let admitted = Admission::for_tests(&first);
+        let admitted = CorpusAdmission::for_tests(&first);
         store.find(&admitted, kind(&scope), &request).unwrap();
         store
             .keep_built(&admitted, kind(&scope), 64, corpus)
@@ -1030,7 +1030,7 @@ mod tests {
             content: parent,
             ..Version::empty()
         });
-        let admitted = Admission::for_tests(&last);
+        let admitted = CorpusAdmission::for_tests(&last);
         store.find(&admitted, kind(&scope), &request).unwrap();
         store
             .keep_built(&admitted, kind(&scope), 64, corpus)
