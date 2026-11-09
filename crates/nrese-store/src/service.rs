@@ -514,7 +514,10 @@ impl StoreService {
         let before = self
             .certificate_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        debug_assert!(before % 2 == 0, "one change of the certificate at a time");
+        debug_assert!(
+            before.is_multiple_of(2),
+            "one change of the certificate at a time"
+        );
         CertificateTransition(&self.certificate_epoch)
     }
 

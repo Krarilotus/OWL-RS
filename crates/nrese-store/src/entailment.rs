@@ -74,7 +74,7 @@ impl StoreService {
         // snapshots; else it is asked again, and a change that left no certificate refuses then.
         loop {
             let epoch = self.certificate_epoch();
-            if epoch % 2 == 1 {
+            if !epoch.is_multiple_of(2) {
                 std::thread::yield_now();
                 continue;
             }
