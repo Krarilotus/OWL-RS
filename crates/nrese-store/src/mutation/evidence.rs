@@ -160,21 +160,6 @@ pub(crate) fn shown(
     }
 }
 
-/// `text` (N-Triples terms) with each blank node label cut to `_:`: what orders a view's
-/// evidence. Labels are a store's own names, fresh per store and in no statement's content;
-/// the rest is what the view's statements say. Evidence that differs only in which blank
-/// node it names stays in the order it came in.
-pub(crate) fn without_blank_labels(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("_:") {
-        out.push_str(&rest[..at + 2]);
-        rest = rest[at + 2..].trim_start_matches(|c: char| c.is_ascii_alphanumeric());
-    }
-    out.push_str(rest);
-    out
-}
-
 /// The likely commit-local trigger sentence of `attribution`, or nothing.
 pub(crate) fn trigger(attribution: Option<&RejectAttribution>) -> String {
     attribution

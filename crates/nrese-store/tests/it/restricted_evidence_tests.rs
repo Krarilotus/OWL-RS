@@ -271,49 +271,50 @@ fn shacl_result_of_the_readable_graphs_is_explained() {
 // graphs are the same, both rejected, give it the same rejection, whichever gate rejected
 // and whatever the other graphs hold.
 
-/// The two rejections are equal up to a renaming of blank nodes: each fixture is its own
-/// store, whose `[ ... ]` get fresh labels however equal the data. Which blank nodes are
-/// the same one stays compared ([`relabelled`]).
+/// The two rejections are equal, field by field (no text of them is compared or rewritten:
+/// that could hide a difference). A fixture whose rejection shows blank nodes gives them
+/// fixed labels ([`Trig`]): SPARQL `INSERT DATA` labels each fresh, so two stores would
+/// differ by construction.
 fn same_for_both(a: MutationReject, b: MutationReject) {
-    assert_eq!(relabelled(&format!("{a:?}")), relabelled(&format!("{b:?}")));
+    assert_eq!(a.detail, b.detail);
+    assert_eq!(a.explanation, b.explanation);
+    assert_eq!(a.attribution, b.attribution);
 }
 
-/// `text` with its blank node labels (`_:` and hex digits) renamed in order of first
-/// occurrence (`_:b1`, `_:b2`, ...): the same label stays the same name, different labels
-/// different names.
-fn relabelled(text: &str) -> String {
-    let mut names: Vec<&str> = Vec::new();
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("_:") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let end = after
-            .find(|c: char| !c.is_ascii_hexdigit())
-            .unwrap_or(after.len());
-        let label = &after[..end];
-        let n = match names.iter().position(|&known| known == label) {
-            Some(i) => i + 1,
-            None => {
-                names.push(label);
-                names.len()
-            }
-        };
-        out.push_str(&format!("_:b{n}"));
-        rest = &after[end..];
+/// A write of TriG statements as they are written, blank node labels kept: the library
+/// write path ([`MutationCommand::Delta`]), gated as every write is.
+#[derive(Debug)]
+struct Trig(String);
+
+impl nrese_store::DeltaPlanner for Trig {
+    fn name(&self) -> &str {
+        "trig"
     }
-    out.push_str(rest);
-    out
+
+    fn plan(
+        &self,
+        tx: &mut nrese_engine::Transaction<'_>,
+        _: &Requester,
+        _: &nrese_store::UpdateContext<'_>,
+    ) -> Result<(), nrese_store::StoreError> {
+        let text = format!(
+            "@prefix : <http://example.com/> . \
+             @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+             @prefix sh: <http://www.w3.org/ns/shacl#> . {}",
+            self.0
+        );
+        let parser = nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::TriG);
+        for quad in parser.for_slice(text.as_bytes()) {
+            tx.insert(quad.expect("TriG").as_ref());
+        }
+        Ok(())
+    }
 }
 
-/// [`relabelled`] keeps which blank nodes are shared: a renaming compares equal, a change
-/// of sharing doesn't.
-#[test]
-fn relabelling_keeps_blank_node_sharing() {
-    let same = |a: &str, b: &str| relabelled(a) == relabelled(b);
-    assert!(same("_:a1 p _:f2 . _:f2 q x", "_:c3 p _:d4 . _:d4 q x"));
-    assert!(!same("_:a1 p _:a1", "_:a1 p _:f2"), "sharing differs");
-    assert!(!same("_:a1 p _:f2 . _:a1 q x", "_:a1 p _:f2 . _:f2 q x"));
+fn trig(text: &str) -> MutationCommand {
+    MutationCommand::Delta(Arc::new(Trig(text.to_owned())))
 }
 
 /// OWL 2 RL: a disjointness, or a subclass into a disjointness, in `:secret`.
@@ -366,6 +367,29 @@ fn shacl_rejection_depends_only_on_the_readable_graphs() {
 }
 
 // Sol-loop r1 (S1–S3): the view's reasons don't depend on the gates' own state.
+
+/// The rejection `requester` gets for `commit` on a fresh store after the `setup` writes
+/// (by a reader of every graph), in order.
+fn rejected_after(
+    config: StoreConfig,
+    mode: ReasoningMode,
+    setup: &[MutationCommand],
+    commit: MutationCommand,
+    requester: &Requester,
+) -> MutationReject {
+    let p = MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
+    );
+    for command in setup {
+        p.apply(command.clone(), &Requester::all(), &MutationTicket::new())
+            .expect("setup commits");
+    }
+    match p.apply(commit, requester, &MutationTicket::new()) {
+        Err(MutationError::Rejected(reject)) => *reject,
+        other => panic!("must reject: {other:?}"),
+    }
+}
 
 fn reject_on(p: &MutationPipeline, commit: &str, requester: &Requester) -> MutationReject {
     match p.apply(update(commit), requester, &MutationTicket::new()) {
@@ -495,19 +519,16 @@ fn dl_reason_of_the_view_doesnt_depend_on_the_dl_verdict() {
         ..StoreConfig::in_memory()
     };
     let run = |secret: &str| {
+        // Fixed blank node labels: the union and its list are shown.
         let data = format!(
-            "GRAPH <{}> {{ :S a sh:NodeShape ; sh:targetClass :T ; \
-             sh:property [ sh:path :needed ; sh:minCount 1 ] }} \
-             GRAPH :open {{ :U owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
-             :B owl:disjointWith :D . :C owl:disjointWith :D . :y a :D . :p rdfs:range :U }} \
-             {secret}",
+            "GRAPH <{}> {{ :S a sh:NodeShape ; sh:targetClass :T ; sh:property _:ps .              _:ps sh:path :needed ; sh:minCount 1 }}              GRAPH :open {{ :U owl:equivalentClass _:u . _:u owl:unionOf _:l1 .              _:l1 rdf:first :B ; rdf:rest _:l2 . _:l2 rdf:first :C ; rdf:rest rdf:nil .              :B owl:disjointWith :D . :C owl:disjointWith :D . :y a :D . :p rdfs:range :U }}              {secret}",
             config().shapes_graph
         );
-        let commit = "GRAPH :open { :x :p :y . :z a :T }";
-        rejection(
+        let commit = update("GRAPH :open { :x :p :y . :z a :T }");
+        rejected_after(
             config(),
             ReasoningMode::Owl2Dl,
-            &data,
+            &[trig(&data)],
             commit,
             &shapes_reader(),
         )
@@ -517,6 +538,7 @@ fn dl_reason_of_the_view_doesnt_depend_on_the_dl_verdict() {
         run("GRAPH :secret { :p a owl:AnnotationProperty }"),
     );
     assert!(dl.detail.contains("OWL 2 DL"), "{}", dl.detail);
+    assert!(format!("{dl:?}").contains("_:u"), "{dl:?}");
     same_for_both(dl, shacl);
 }
 
@@ -646,4 +668,97 @@ fn shapes_refusal_doesnt_describe_an_unreadable_shapes_graph() {
 fn shapes_refusal_full_reader_names_the_shape() {
     let refusal = shapes_refusal("SECRET_A", &Requester::all());
     assert!(refusal.contains("SECRET_A"), "{refusal}");
+}
+
+// Fix check r1 (R1-D1 still open): every term is compared whole, a blank node by its
+// label (the store's name for it, in the committer's own view), so the shown focus or
+// individual is the least of the view's, whatever was interned first.
+
+/// A readable shape requiring `:p` of every `:T`, then `first` (a statement deciding only
+/// which term is interned first), then `data`; `commit` by a reader of `:open` and the
+/// shapes graph. The SHACL gate enforces, without reasoning.
+fn shacl_after(first: &str, data: &str, commit: MutationCommand) -> MutationReject {
+    let config = StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        ..StoreConfig::in_memory()
+    };
+    let shapes = format!(
+        "GRAPH <{}> {{ :S a sh:NodeShape ; sh:targetClass :T ; sh:property _:ps . \
+         _:ps sh:path :p ; sh:minCount 1 }}",
+        config.shapes_graph
+    );
+    let mut setup = vec![trig(first), trig(&shapes)];
+    if !data.is_empty() {
+        setup.push(trig(data));
+    }
+    rejected_after(
+        config,
+        ReasoningMode::Disabled,
+        &setup,
+        commit,
+        &shapes_reader(),
+    )
+}
+
+/// Two named focus nodes whose IRIs differ only after a `_:`: the least is shown, whichever
+/// a secret statement made the dictionary know first.
+#[test]
+fn shacl_named_focus_differing_after_blank_marker_is_the_least() {
+    let (a, b) = ("<http://example.com/_:A>", "<http://example.com/_:B>");
+    let commit = update(&format!("GRAPH :open {{ {a} a :T . {b} a :T }}"));
+    for first in [a, b] {
+        let reject = shacl_after(
+            &format!("GRAPH :secret {{ {first} :marker :v }}"),
+            "",
+            commit.clone(),
+        );
+        let focus = reject.explanation.expect("explained").focus_resource;
+        assert_eq!(focus, a, "interned first: {first}");
+    }
+}
+
+/// Two blank focus nodes, each anchored by a readable label: the least label is shown,
+/// whichever a secret statement made the dictionary know first.
+#[test]
+fn shacl_anchored_blank_focus_is_the_least() {
+    let anchors = "GRAPH :open { _:q07a rdfs:label \"A\" . _:q07b rdfs:label \"B\" }";
+    let commit = trig("GRAPH :open { _:q07a a :T . _:q07b a :T }");
+    for first in ["_:q07a", "_:q07b"] {
+        let reject = shacl_after(
+            &format!("GRAPH :secret {{ {first} :marker :v }}"),
+            anchors,
+            commit.clone(),
+        );
+        let focus = reject.explanation.expect("explained").focus_resource;
+        assert_eq!(focus, "_:q07a", "interned first: {first}");
+    }
+}
+
+/// Two anonymous individuals, each anchored by a readable label and each in both of two
+/// disjoint classes: the justification shown names one of them, the same one whichever a
+/// secret statement made the dictionary know first.
+#[test]
+fn dl_anchored_blank_individual_doesnt_follow_term_ids() {
+    let data = "GRAPH :open { :C1 owl:disjointWith :C2 . \
+         _:q07a rdfs:label \"A\" . _:q07b rdfs:label \"B\" }";
+    let commit = trig("GRAPH :open { _:q07a a :C1, :C2 . _:q07b a :C1, :C2 }");
+    let run = |first: &str| {
+        rejected_after(
+            StoreConfig::in_memory(),
+            ReasoningMode::Owl2Dl,
+            &[
+                trig(&format!("GRAPH :secret {{ {first} :marker :v }}")),
+                trig(data),
+            ],
+            commit.clone(),
+            &open_reader(),
+        )
+        .explanation
+        .expect("explained")
+        .evidence
+    };
+    let (a, b) = (run("_:q07a"), run("_:q07b"));
+    let named = |label: &str| a.iter().any(|e| e.subject == label);
+    assert!(named("_:q07a") != named("_:q07b"), "one individual: {a:#?}");
+    assert_eq!(a, b);
 }

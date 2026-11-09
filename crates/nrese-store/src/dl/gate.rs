@@ -31,7 +31,7 @@ use nrese_engine::Transaction;
 use super::consistency::{self, Budget, Checked, Verdict};
 use super::{DlConsistency, DlStatus, source};
 use crate::StoreService;
-use crate::mutation::evidence::{Draft, EvidenceView, without_blank_labels};
+use crate::mutation::evidence::{Draft, EvidenceView};
 
 /// What the gate decided: the commit's status, and why it is rejected if it is, for the
 /// committer ([`rejection`]).
@@ -361,7 +361,8 @@ fn axiom_evidence(
 }
 
 /// The axioms of `ontology` but its declarations, in the order of what they say: each by
-/// its functional-syntax form and its source triples, decoded. Never the ontology's own
+/// its source triples' decoded terms, then (between axioms of the same statements) by its
+/// functional-syntax form. Never the ontology's own
 /// order, which follows term ids, so what was interned first in any graph (package review
 /// r1-D1): the justification [`super::explain::justify_among`] finds in this order depends
 /// on the view's statements alone. The keys are charged to `memory`; `None` past it or the
@@ -372,12 +373,8 @@ fn canonical_candidates(
     memory: nrese_exec::Envelope,
     deadline: Deadline,
 ) -> Option<Vec<usize>> {
-    let decode = |t: u64| {
-        tx.decode(nrese_engine::TermId::from_raw(t))
-            .map_or_else(|| format!("#{t}"), |term| term.to_string())
-    };
     let mut grant = nrese_exec::Grant::new(memory);
-    let mut keyed: Vec<(String, usize)> = Vec::new();
+    let mut keyed: Vec<(Vec<DecodedTriple>, String, usize)> = Vec::new();
     for (i, axiom) in ontology.axioms.iter().enumerate() {
         if matches!(axiom, nrese_owl::Axiom::Declaration(..)) {
             continue;
@@ -385,25 +382,56 @@ fn canonical_candidates(
         if deadline.passed() {
             return None;
         }
-        let mut triples: Vec<String> = ontology.sources[i]
-            .iter()
-            .flat_map(|source| source.triples.iter())
-            .map(|t| without_blank_labels(&t.map(&decode).join(" ")))
-            .collect();
+        let mut triples = Vec::new();
+        for source in &ontology.sources[i] {
+            for &triple in &source.triples {
+                let decoded = decoded_triple(tx, triple)?;
+                grant.take(decoded_bytes(&decoded)).ok()?;
+                triples.push(decoded);
+            }
+        }
         triples.sort_unstable();
-        let key = format!(
-            "{}\n{}",
-            without_blank_labels(&ontology.functional(axiom, &decode)),
-            triples.join("\n")
-        );
+        // Axioms of the same statements only: nrese-owl's functional form of the axiom,
+        // printed from its decoded terms (never edited), tells them apart.
+        let rendering = ontology.functional(axiom, &|t| {
+            tx.decode(nrese_engine::TermId::from_raw(t))
+                .map_or_else(|| format!("#{t}"), |term| term.to_string())
+        });
         grant
-            .take(key.capacity() + std::mem::size_of::<(String, usize)>())
+            .take(rendering.capacity() + std::mem::size_of::<(Vec<DecodedTriple>, String, usize)>())
             .ok()?;
-        keyed.push((key, i));
+        keyed.push((triples, rendering, i));
     }
-    // Stable: axioms that differ only in which blank node they name keep their order.
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    Some(keyed.into_iter().map(|(_, i)| i).collect())
+    // Ordered by decoded terms (`nrese_rdf::Term`'s order: the kind, then the value; a
+    // blank node by its label, the store's name for it in the committer's view). Equal keys
+    // are the same axiom from the same statements: either shows the same.
+    keyed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    Some(keyed.into_iter().map(|(_, _, i)| i).collect())
+}
+
+/// A source triple's terms, decoded.
+type DecodedTriple = [nrese_rdf::Term; 3];
+
+/// `triple` of `tx`, decoded; `None` for an id the dictionary doesn't know.
+fn decoded_triple(tx: &Transaction<'_>, triple: [u64; 3]) -> Option<DecodedTriple> {
+    let [s, p, o] = triple.map(|t| tx.decode(nrese_engine::TermId::from_raw(t)));
+    Some([s?, p?, o?])
+}
+
+/// About what `triple` holds on the heap: its terms' text.
+fn decoded_bytes(triple: &DecodedTriple) -> usize {
+    std::mem::size_of::<DecodedTriple>()
+        + triple
+            .iter()
+            .map(|term| match term {
+                nrese_rdf::Term::NamedNode(node) => node.as_str().len(),
+                nrese_rdf::Term::BlankNode(node) => node.as_str().len(),
+                nrese_rdf::Term::Literal(literal) => {
+                    literal.value().len() + literal.datatype().as_str().len()
+                }
+                nrese_rdf::Term::Triple(_) => std::mem::size_of::<nrese_rdf::Triple>(),
+            })
+            .sum::<usize>()
 }
 
 /// The OWL 2 DL reason a restricted committer's view shows: the ontology of the statements
@@ -433,11 +461,27 @@ fn view_reason(
         "the data is inconsistent under OWL 2 DL: these {} axiom(s) have no model together",
         justification.axioms.len()
     );
-    let mut evidence = axiom_evidence(view.tx(), &ontology, &justification);
-    evidence.sort_by_cached_key(|e| {
-        [&e.subject, &e.predicate, &e.object].map(|term| without_blank_labels(term))
-    });
-    evidence.dedup();
+    // Its source triples, each once, in the order of their decoded terms.
+    let mut triples: Vec<DecodedTriple> = Vec::new();
+    for &i in &justification.axioms {
+        for source in &ontology.sources[i] {
+            for &triple in &source.triples {
+                triples.push(decoded_triple(view.tx(), triple)?);
+            }
+        }
+    }
+    triples.sort_unstable();
+    triples.dedup();
+    let evidence = triples
+        .into_iter()
+        .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
+            role: "axiom",
+            subject: s.to_string(),
+            predicate: p.to_string(),
+            object: o.to_string(),
+            origin: "asserted".to_owned(),
+        })
+        .collect();
     Some(crate::mutation::evidence::shown(
         reason,
         CONSTRAINT,
