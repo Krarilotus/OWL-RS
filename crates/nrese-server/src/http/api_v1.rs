@@ -98,7 +98,9 @@ pub async fn repository_get(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let repository = state.for_repository(&id)?;
-    let settings = Some(repository.repository_settings())
+    // One observation: its settings and the reasoning in effect from the same change.
+    let (settings, reasoning) = repository.observe_repository();
+    let settings = Some(settings)
         .filter(|settings| *settings != crate::repository_config::RepositorySettings::default());
     Ok(Json(RepositoryView {
         path: format!("/api/v1/repositories/{id}"),
@@ -107,7 +109,7 @@ pub async fn repository_get(
             .and_then(|settings| settings.title.clone())
             .unwrap_or_else(|| format!("NRESE: {id}")),
         default: id == DEFAULT_REPOSITORY,
-        reasoning: repository.pipeline().reasoner().mode_name(),
+        reasoning,
         settings,
         id,
     })
