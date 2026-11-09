@@ -72,7 +72,7 @@ Known bypasses:
 
 DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not exact pre-allocation admission.
 
-A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`, open row, owner engine/transaction); ingest callers that intern validate the whole document first (`crates/nrese-store/src/rdf_io.rs` `Consumer::Interning`).
+A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`, open row, owner engine/transaction). Uploads insert each statement as it is read, their pending growth charged (D16-039); one that fails part-way is discarded with its transaction, and the new terms it interned stay, as stated limit L3 accepts for v1.5 (`crates/nrese-store/src/rdf_io.rs`).
 
 ## Lock order
 
