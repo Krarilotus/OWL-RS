@@ -54,17 +54,13 @@ async function main(): Promise<void> {
       case "tell": {
         const response = await client.runTell(
           await resolveBody(options.command.text),
-          options.command.graphMode,
-          options.command.graphIri,
+          options.command.target,
         );
         printTextResponse(response, options.requireComplete);
         break;
       }
       case "graph-read": {
-        const response = await client.readGraph(
-          options.command.graphMode,
-          options.command.graphIri,
-        );
+        const response = await client.readGraph(options.command.target);
         printTextResponse(response, options.requireComplete);
         break;
       }
@@ -72,17 +68,13 @@ async function main(): Promise<void> {
         const response = await client.writeGraph(
           options.command.method,
           await resolveBody(options.command.text),
-          options.command.graphMode,
-          options.command.graphIri,
+          options.command.target,
         );
         printTextResponse(response, options.requireComplete);
         break;
       }
       case "graph-delete": {
-        const response = await client.deleteGraph(
-          options.command.graphMode,
-          options.command.graphIri,
-        );
+        const response = await client.deleteGraph(options.command.target);
         printTextResponse(response, options.requireComplete);
         break;
       }
