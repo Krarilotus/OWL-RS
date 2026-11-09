@@ -730,6 +730,11 @@ impl StoreService {
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        } else if let Some(state) = self.reasoning_state() {
+            // Off: the rewriting the closure and the setting call for, whatever came first
+            // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
+            // path, which switches the bounds off, exists).
+            self.note_ql(&state);
         }
     }
 

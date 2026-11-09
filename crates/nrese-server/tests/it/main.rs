@@ -29,6 +29,7 @@ mod read_ahead_tests;
 mod replication_apply_tests;
 mod replication_rounds_tests;
 mod replication_tests;
+mod restart_tests;
 mod service_description_tests;
 mod shacl_api_tests;
 mod tell_api_tests;
