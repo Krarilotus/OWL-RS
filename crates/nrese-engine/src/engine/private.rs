@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use nrese_exec::Budget;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
+use parking_lot::Mutex;
 
 use super::transaction::{Pending, SnapshotChanges};
 use super::{Inner, ReadModel, Snapshot, Version};
@@ -26,6 +27,14 @@ use crate::term::overlay::Overlay;
 
 /// Speculative changes over one snapshot, with a vocabulary of their own: no writer slot, no
 /// commit, nothing added to the dictionary.
+///
+/// It has no commit, by type:
+///
+/// ```compile_fail
+/// let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+/// let tx = engine.speculative(std::sync::Arc::new(nrese_exec::Budget::unlimited()));
+/// tx.commit();
+/// ```
 pub struct PrivateTransaction<'e> {
     /// Its engine, which it doesn't outlive, as a write transaction doesn't.
     _engine: &'e Inner,
@@ -33,6 +42,19 @@ pub struct PrivateTransaction<'e> {
     overlay: Arc<Overlay>,
     /// The base snapshot and the pending changes over it.
     pending: Pending,
+    /// Its change generation: one more for every write that changed the pending changes.
+    changes: u64,
+    /// The last [`Self::pending_snapshot_within`], while its key holds.
+    memo: Mutex<Option<Memo>>,
+}
+
+/// A pending snapshot and what it was made of: the change generation, the vocabulary's end
+/// (an intern after it isn't in its frozen view) and the budget it was asked for, by identity.
+struct Memo {
+    changes: u64,
+    end: u64,
+    budget: Arc<Budget>,
+    snapshot: Snapshot,
 }
 
 impl<'e> PrivateTransaction<'e> {
@@ -53,12 +75,49 @@ impl<'e> PrivateTransaction<'e> {
                 "a private transaction opens over a snapshot of its own engine".to_owned(),
             ));
         }
-        let overlay = Overlay::over(Arc::clone(dictionary), base.dictionary_len(), budget);
-        Ok(Self {
+        let start = base.dictionary_len();
+        Ok(Self::opened(engine, base.clone(), start, budget))
+    }
+
+    /// Over `engine`'s latest snapshot, which is its own and published. Its vocabulary starts
+    /// at the dictionary's length now, read after the snapshot: past the snapshot's own
+    /// length (its last commit's) by the names appended since without the writer slot
+    /// ([`super::Engine::intern_system_vocabulary`]). Those keep their shared ids here, as
+    /// state that holds them (the DL bounds) has them, and no own id can equal one.
+    pub(super) fn over_latest(engine: &'e Inner, budget: Arc<Budget>) -> Self {
+        let base = engine.shared.snapshot();
+        let start = engine.shared.dictionary.len().max(base.dictionary_len());
+        Self::opened(engine, base, start, budget)
+    }
+
+    /// Over `base`, a published snapshot of `engine` (checked by the callers), its own ids
+    /// from `start`, at least `base`'s length.
+    fn opened(engine: &'e Inner, base: Snapshot, start: u64, budget: Arc<Budget>) -> Self {
+        let dictionary = Arc::clone(&engine.shared.dictionary);
+        let overlay = Overlay::over(dictionary, start, budget);
+        Self {
             _engine: engine,
             overlay,
-            pending: Pending::over(base.clone()),
-        })
+            pending: Pending::over(base),
+            changes: 0,
+            memo: Mutex::new(None),
+        }
+    }
+
+    /// Whether every id `published` names keeps its term in this transaction's vocabulary:
+    /// a snapshot of the same engine whose dictionary length is at most this vocabulary's
+    /// start. Then its ids and this transaction's own (from that start on) never collide, and
+    /// the two can be compared by raw id: the precondition of every API that mixes a published
+    /// input with this transaction's ids (dictionary lifecycle V1, the bounded-prefix case).
+    pub fn extends(&self, published: &Snapshot) -> bool {
+        published.shares_dictionary_with(self.base())
+            && published.dictionary_len() <= self.overlay.start()
+    }
+
+    /// `changed`, counted into the change generation when it is true.
+    fn note(&mut self, changed: bool) -> bool {
+        self.changes += u64::from(changed);
+        changed
     }
 
     /// The id of `term` in this transaction's vocabulary, added as its own if the base didn't
@@ -72,13 +131,13 @@ impl<'e> PrivateTransaction<'e> {
     /// already asserted.
     pub fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
         let encoded = self.overlay.intern_quad(quad)?;
-        Ok(self.pending.insert_asserted(encoded))
+        Ok(self.insert_encoded(encoded))
     }
 
     /// Retracts the asserted `quad`; `false` if it was not asserted. Never interns.
     pub fn remove(&mut self, quad: QuadRef<'_>) -> bool {
         match self.overlay.lookup_quad(quad) {
-            Some(encoded) => self.pending.remove_asserted(encoded),
+            Some(encoded) => self.remove_encoded(encoded),
             None => false,
         }
     }
@@ -133,6 +192,31 @@ impl<'e> PrivateTransaction<'e> {
             own: Default::default(),
         };
         Ok(self.pending.base().with_version(version).private(view))
+    }
+
+    /// [`Self::pending_snapshot`], the same snapshot (one identity, so one own-state slot) for
+    /// as long as nothing changed: no write that changed the pending changes, no new term, and
+    /// the same `budget` (by identity) as the call that made it. The memo holds the snapshot,
+    /// and its vocabulary's charge, until the next such call after a change, or the drop.
+    pub fn pending_snapshot_within(&self, budget: &Arc<Budget>) -> EngineResult<Snapshot> {
+        let end = self.overlay.end();
+        let mut memo = self.memo.lock();
+        if let Some(kept) = memo.as_ref().filter(|kept| {
+            kept.changes == self.changes && kept.end == end && Arc::ptr_eq(&kept.budget, budget)
+        }) {
+            return Ok(kept.snapshot.clone());
+        }
+        // Dropped first: a refusal below leaves no stale entry, and its charge is freed
+        // before the new freeze is charged.
+        *memo = None;
+        let snapshot = self.pending_snapshot()?;
+        *memo = Some(Memo {
+            changes: self.changes,
+            end,
+            budget: Arc::clone(budget),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
 
     /// [`Self::pending_snapshot`] as a reader of `view` reads it, as
@@ -226,11 +310,13 @@ impl<'e> PrivateTransaction<'e> {
     /// Asserts an encoded quad, its ids from this transaction's vocabulary ([`Self::try_intern`]
     /// or the base's). `false` if it was already asserted.
     pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
-        self.pending.insert_asserted(quad)
+        let changed = self.pending.insert_asserted(quad);
+        self.note(changed)
     }
 
     pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
-        self.pending.remove_asserted(quad)
+        let changed = self.pending.remove_asserted(quad);
+        self.note(changed)
     }
 
     /// Retracts every asserted quad matching `pattern`; the number removed.
@@ -247,11 +333,13 @@ impl<'e> PrivateTransaction<'e> {
     /// Adds an inferred statement (in the default graph); `false` if it is already inferred,
     /// or asserted.
     pub fn insert_inferred(&mut self, triple: EncodedTriple) -> bool {
-        self.pending.insert_inferred(triple.in_default_graph())
+        let changed = self.pending.insert_inferred(triple.in_default_graph());
+        self.note(changed)
     }
 
     pub fn remove_inferred(&mut self, triple: EncodedTriple) -> bool {
-        self.pending.remove_inferred(triple.in_default_graph())
+        let changed = self.pending.remove_inferred(triple.in_default_graph());
+        self.note(changed)
     }
 
     pub fn inferred_inserted(&self) -> impl Iterator<Item = EncodedTriple> + '_ {

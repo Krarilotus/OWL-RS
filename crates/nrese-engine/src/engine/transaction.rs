@@ -54,8 +54,8 @@ pub struct CommitSummary {
 /// [`ReadModel::Materialised`]. Dropping the transaction aborts it.
 pub struct Transaction<'e> {
     engine: &'e Inner,
-    /// The writer slot; `None` for a speculative transaction ([`crate::Engine::speculative`]),
-    /// which never commits.
+    /// The writer slot; `None` for the old speculative transaction
+    /// ([`crate::Engine::speculative_shared`], until V2), which never commits.
     _slot: Option<MutexGuard<'e, ()>>,
     /// The base snapshot and the pending changes over it.
     pending: Pending,

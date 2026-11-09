@@ -325,7 +325,8 @@ impl StoreService {
                 // they share the repository's dictionary, as stored shapes do, and leave no
                 // trace. It takes no writer slot, so commits go on meanwhile. The graph holds
                 // no stored statement (SYN-58).
-                let mut tx = self.engine().speculative();
+                // V1: private once V2 reads a private transaction through SPARQL.
+                let mut tx = self.engine().speculative_shared();
                 let revision = tx.base().revision();
                 let validated = match &request.graphs {
                     ValidatedGraphs::Named(iri) => Some(graph_iri(iri)?),

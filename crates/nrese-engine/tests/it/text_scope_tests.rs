@@ -903,12 +903,14 @@ fn aborted_and_speculative_terms_change_no_answer_or_score() {
             failed.push(name);
         }
     }
-    let mut speculative = engine.speculative();
+    let mut speculative = engine.speculative(Arc::new(nrese_exec::Budget::unlimited()));
     for i in 0..50 {
         let subject = format!("alphaThing{i}x");
-        speculative.insert(label(&subject, "beta beta eta", None).as_ref());
+        speculative
+            .try_insert(label(&subject, "beta beta eta", None).as_ref())
+            .unwrap();
     }
-    let pending = speculative.pending_snapshot();
+    let pending = speculative.pending_snapshot().unwrap();
     for (name, got) in [
         ("speculative, earlier reader", answers(&reader)),
         ("speculative, new reader", answers(&engine.snapshot())),

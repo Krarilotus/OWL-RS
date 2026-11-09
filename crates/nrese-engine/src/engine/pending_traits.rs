@@ -249,8 +249,8 @@ impl PendingWrite for Transaction<'_> {
 }
 
 /// A private transaction answers its inherent methods, the infallible ones as `Ok`. Its
-/// pending snapshots' freeze is charged to the budget it was opened with; `budget` is not read
-/// yet.
+/// pending snapshots' freeze is charged to the budget it was opened with; `budget` keys its
+/// memo ([`PrivateTransaction::pending_snapshot_within`]).
 impl PendingView for PrivateTransaction<'_> {
     #[inline]
     fn base(&self) -> &Snapshot {
@@ -258,8 +258,8 @@ impl PendingView for PrivateTransaction<'_> {
     }
 
     #[inline]
-    fn pending_snapshot_within(&self, _budget: &Arc<Budget>) -> EngineResult<Snapshot> {
-        PrivateTransaction::pending_snapshot(self)
+    fn pending_snapshot_within(&self, budget: &Arc<Budget>) -> EngineResult<Snapshot> {
+        PrivateTransaction::pending_snapshot_within(self, budget)
     }
 
     #[inline]

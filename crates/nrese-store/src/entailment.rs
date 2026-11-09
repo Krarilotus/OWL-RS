@@ -23,6 +23,7 @@
 //! a negative entailment answer or an assumed-unreachable panic.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use nrese_rdf::vocab::{owl, rdf};
 use nrese_rdf::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
@@ -116,7 +117,8 @@ impl StoreService {
         let (stop, room) = (|| memory.exceeded(), || memory.room());
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let config = self.config();
-        let mut tx = self.engine().speculative();
+        // V1: private once the reasoner's maintenance takes either transaction kind.
+        let mut tx = self.engine().speculative_shared();
         for t in opposite {
             let quad = Quad::new(
                 t.subject.clone(),
@@ -366,34 +368,47 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
-        let tx = self.engine().speculative();
-        source::intern_vocabulary(&tx);
+        // The OWL vocabulary and the fresh names are system vocabulary, shared (dictionary
+        // lifecycle V1); the conclusion's terms are the request's own, in a private
+        // vocabulary charged to its envelope, past the premise's ids.
+        source::intern_system_vocabulary(self.engine())?;
+        let tx = source::private_over(self.engine(), &snapshot, Arc::new(memory.part()));
         let n = CONCLUSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let blank = |b: &BlankNode| BlankNode::new_unchecked(format!("nresec{n}x{}", b.as_str()));
-        let id = |t: Term| -> u64 {
+        let id = |t: Term| -> nrese_engine::EngineResult<u64> {
             let t = match t {
                 Term::BlankNode(b) => Term::BlankNode(blank(&b)),
                 other => other,
             };
-            tx.intern(t.as_ref()).raw()
+            Ok(tx.try_intern(t.as_ref())?.raw())
         };
-        let statements: Vec<nrese_owl::Statement> = conclusion
+        let statements: nrese_engine::EngineResult<Vec<nrese_owl::Statement>> = conclusion
             .iter()
             .map(|t| {
                 let subject: Term = match &t.subject {
                     NamedOrBlankNode::NamedNode(n) => Term::NamedNode(n.clone()),
                     NamedOrBlankNode::BlankNode(b) => Term::BlankNode(b.clone()),
                 };
-                nrese_owl::Statement {
+                Ok(nrese_owl::Statement {
                     triple: [
-                        id(subject),
-                        id(Term::NamedNode(t.predicate.clone())),
-                        id(t.object.clone()),
+                        id(subject)?,
+                        id(Term::NamedNode(t.predicate.clone()))?,
+                        id(t.object.clone())?,
                     ],
                     graph: nrese_engine::TermId::DEFAULT_GRAPH.raw(),
-                }
+                })
             })
             .collect();
+        // Undecided where the envelope can't take the conclusion's terms, as the premise's.
+        let Ok(statements) = statements else {
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(format!(
+                    "the conclusion: {}",
+                    source::refused("the conclusion")
+                )),
+                premise: checked.verdict,
+            });
+        };
         let decode = |term| tx.decode(term);
         let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
         let read = nrese_owl::read(
@@ -413,12 +428,16 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
-        let fresh: Vec<u64> = (0..source::FRESH)
+        // Shared names (above): the private vocabulary finds them below its start.
+        let fresh: nrese_engine::EngineResult<Vec<u64>> = (0..source::FRESH)
             .map(|i| {
-                tx.intern(NamedNodeRef::new_unchecked(&source::fresh_iri(i)).into())
-                    .raw()
+                let iri = source::fresh_iri(i);
+                Ok(tx
+                    .try_intern(NamedNodeRef::new_unchecked(&iri).into())?
+                    .raw())
             })
             .collect();
+        let fresh = fresh?;
         Ok(DlEntailment {
             answer: entails_ontology(&premise, &read, &fresh, &budget),
             premise: checked.verdict,

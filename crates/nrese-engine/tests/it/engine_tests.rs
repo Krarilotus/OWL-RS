@@ -481,9 +481,9 @@ fn a_pending_snapshot_is_what_the_commit_publishes() {
 #[test]
 fn speculative_transactions_leave_the_writer_slot_free() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut speculative = engine.speculative();
-    speculative.insert(quad(1, 2, 3).as_ref());
-    let pending = speculative.pending_snapshot();
+    let mut speculative = engine.speculative(Arc::new(nrese_exec::Budget::unlimited()));
+    speculative.try_insert(quad(1, 2, 3).as_ref()).unwrap();
+    let pending = speculative.pending_snapshot().unwrap();
     let mut writer = engine.transaction();
     writer.insert(quad(4, 5, 6).as_ref());
     writer
@@ -504,8 +504,6 @@ fn speculative_transactions_leave_the_writer_slot_free() {
         !seen.contains(&quad(4, 5, 6)),
         "its base is the snapshot it started from"
     );
-    assert!(matches!(
-        speculative.commit(),
-        Err(nrese_engine::EngineError::Speculative)
-    ));
+    // It can't commit: a private transaction has no commit, by type (its doc test).
+    drop(speculative);
 }
