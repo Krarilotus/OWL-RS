@@ -1635,7 +1635,8 @@ impl<T> Room<'_, T> {
     /// The first error (by part) is returned and nothing is published: the room holds what
     /// it held (items are `Copy`: what was written needs no drop). Panics where the room
     /// has fewer slots than the parts, or a part that returns `Ok` is short, before
-    /// publishing.
+    /// publishing. Its bookkeeping, a slot range and a result a part, is uncharged: the
+    /// caller bounds the parts (the graph's closure: at most four a thread and one more).
     pub fn try_par_fill_parts<E: Send>(
         &mut self,
         lengths: &[usize],

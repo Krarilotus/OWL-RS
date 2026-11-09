@@ -30,11 +30,6 @@ pub type Buf<'p, T, B> = Charged<T, Share<'p, B>>;
 /// A caller's stop condition: true to stop.
 type StopFn<'s> = &'s (dyn Fn() -> bool + Sync);
 
-/// Units of work for a [`Ticker`]: a count past `u32` is one full poll interval.
-fn units(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
-}
-
 /// Outgoing edges per source node, in CSR form.
 #[derive(Debug, Clone, Default)]
 pub struct Adjacency {
@@ -199,6 +194,7 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
             next.clear();
         }
     }
+    ticker.finish()?;
     Ok(out)
 }
 
@@ -249,6 +245,7 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
         cyclic,
         reach,
         reach_starts,
+        rows,
     } = Condensation::of(edges, pool, &mut ticker)?;
     // What only the condensation needed, freed before the output is charged.
     drop((offsets, targets, component, cyclic));
@@ -256,18 +253,12 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
     let (reach, reach_starts): (&[u32], &[usize]) = (&reach, &reach_starts);
     let components = starts.len() - 1;
     let members_of = |c: usize| &members[starts[c]..starts[c + 1]];
-    let reach_of = |c: usize| &reach[reach_starts[c]..reach_starts[c + 1]];
-    // Component `c`'s pairs: its members times the members of the components it reaches.
-    let pairs_of = |c: usize| {
-        let row: usize = reach_of(c)
-            .iter()
-            .map(|&d| members_of(d as usize).len())
-            .sum();
-        members_of(c).len().checked_mul(row)
-    };
+    // Component `c`'s pairs: its members times the nodes it reaches (counted as its reach set
+    // was made: sizing is one step a component, sol-loop r1 S1).
+    let pairs_of = |c: usize| members_of(c).len().checked_mul(rows[c] as usize);
     let mut total = Some(0usize);
     for c in 0..components {
-        ticker.tick(units(reach_of(c).len()))?;
+        ticker.tick(1)?;
         total = total
             .zip(pairs_of(c))
             .and_then(|(total, own)| total.checked_add(own));
@@ -284,6 +275,7 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
     let mut runs: Buf<'p, (usize, usize), B> = Charged::in_pool(pool);
     let (mut first, mut length) = (0, 0);
     for c in 0..components {
+        ticker.tick(1)?;
         length += pairs_of(c).unwrap_or(0);
         if length >= target || c + 1 == components {
             lengths.push(length)?;
@@ -307,9 +299,10 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
                     }
                 }
             }
-            Ok::<_, Stop>(())
+            ticker.finish()
         })
     })??;
+    ticker.finish()?;
     Ok(out)
 }
 
@@ -337,25 +330,17 @@ pub fn closure_sizes_within<'p, B: Deref<Target = Budget>>(
 ) -> Result<Buf<'p, (u64, u64, bool), B>, Stop> {
     let mut ticker = Ticker::new(stop)?;
     let g = Condensation::of(edges, pool, &mut ticker)?;
-    let mut size: Buf<'p, u64, B> = Charged::with_capacity_in(pool, g.components())?;
-    for c in 0..g.components() {
-        let reached = g.reach_of(c);
-        ticker.tick(units(reached.len()))?;
-        size.push(
-            reached
-                .iter()
-                .map(|&d| g.members_of(d as usize).len() as u64)
-                .sum(),
-        )?;
-    }
     // Dense ids follow the sorted node ids, so the output comes out sorted.
     let mut out = Charged::in_pool(pool);
+    let size = &g.rows;
     for x in 0..g.nodes.len() as u32 {
+        ticker.tick(1)?;
         if g.has_successors(x) {
             let c = g.component[x as usize] as usize;
-            out.push((g.nodes[x as usize], size[c], g.cyclic[c]))?;
+            out.push((g.nodes[x as usize], u64::from(size[c]), g.cyclic[c]))?;
         }
     }
+    ticker.finish()?;
     Ok(out)
 }
 
@@ -493,6 +478,7 @@ fn components_csr_in<'p, B: Deref<Target = Budget>>(
             if low[v as usize] == order[v as usize] {
                 let c = out.starts.len() as u32 - 1;
                 loop {
+                    ticker.tick(1)?;
                     let w = *stack.last().expect("v is on the stack");
                     stack.truncate(stack.len() - 1);
                     on_stack[w as usize] = false;
@@ -561,6 +547,9 @@ struct Condensation<'p, B: Deref<Target = Budget>> {
     /// in one or more steps (itself if cyclic): quadratic in the components on a chain.
     reach: Buf<'p, u32, B>,
     reach_starts: Buf<'p, usize, B>,
+    /// Per component, the nodes it reaches: its row of the closure, counted as its reach set
+    /// is made (a dense node count, within `u32`).
+    rows: Buf<'p, u32, B>,
 }
 
 impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
@@ -574,13 +563,19 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         // Dense node numbering and CSR over it.
         let mut nodes: Buf<'p, u64, B> =
             Charged::with_capacity_in(pool, edges.len().saturating_mul(2))?;
+        // Sequential passes tick a unit an edge; the parallel sorts and the parallel
+        // numbering are opaque calls, checked before and after (`Ticker::check`).
         nodes.fill(0, |room| {
             for &(a, b) in edges {
+                ticker.tick(1)?;
                 room.push(a);
                 room.push(b);
             }
-        })?;
+            Ok::<_, Stop>(())
+        })??;
+        ticker.check()?;
         nodes.par_sort_unstable();
+        ticker.check()?;
         dedup_sorted(&mut nodes);
         // Room for both ends of every edge, of which the distinct nodes are often far fewer.
         nodes.shrink_to_fit()?;
@@ -591,18 +586,28 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         pairs.fill(0, |room| {
             room.par_fill(edges.len(), |i| (dense(edges[i].0), dense(edges[i].1)))
         })?;
+        ticker.check()?;
         pairs.par_sort_unstable();
+        ticker.check()?;
         dedup_sorted(&mut pairs);
         let mut offsets: Buf<'p, u32, B> = Charged::in_pool(pool);
         offsets.resize(n + 1, 0)?;
         for &(a, _) in pairs.iter() {
+            ticker.tick(1)?;
             offsets[a as usize + 1] += 1;
         }
         for i in 0..n {
+            ticker.tick(1)?;
             offsets[i + 1] += offsets[i];
         }
         let mut targets: Buf<'p, u32, B> = Charged::with_capacity_in(pool, pairs.len())?;
-        targets.fill(0, |room| room.extend(pairs.iter().map(|&(_, b)| b)))?;
+        targets.fill(0, |room| {
+            for &(_, b) in pairs.iter() {
+                ticker.tick(1)?;
+                room.push(b);
+            }
+            Ok::<_, Stop>(())
+        })??;
         drop(pairs);
         let ComponentsIn {
             component,
@@ -619,6 +624,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
             cyclic: Charged::in_pool(pool),
             reach: Charged::in_pool(pool),
             reach_starts: Charged::in_pool(pool),
+            rows: Charged::in_pool(pool),
         };
         g.reach(pool, ticker)?;
         Ok(g)
@@ -637,11 +643,6 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         &self.members[self.starts[c]..self.starts[c + 1]]
     }
 
-    /// The components component `c` reaches.
-    fn reach_of(&self, c: usize) -> &[u32] {
-        &self.reach[self.reach_starts[c]..self.reach_starts[c + 1]]
-    }
-
     /// Reach per component, successors first, each set's growth charged before it grows,
     /// a tick per successor walked and per entry taken over.
     fn reach(&mut self, pool: &'p Pool<B>, ticker: &mut Ticker<StopFn<'_>>) -> Result<(), Stop> {
@@ -650,9 +651,12 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         stamp.resize(components, u32::MAX)?;
         self.cyclic.reserve_exact(components)?;
         self.reach_starts.reserve_exact(components + 1)?;
+        self.rows.reserve_exact(components)?;
         self.reach_starts.push(0)?;
+        let size = |starts: &[usize], d: u32| (starts[d as usize + 1] - starts[d as usize]) as u32;
         for c in 0..components {
             let mut cyclic = self.members_of(c).len() > 1;
+            let mut row = 0u32;
             for k in self.starts[c]..self.starts[c + 1] {
                 let x = self.members[k] as usize;
                 for j in self.offsets[x] as usize..self.offsets[x + 1] as usize {
@@ -665,6 +669,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
                     if stamp[d as usize] != c as u32 {
                         stamp[d as usize] = c as u32;
                         self.reach.push(d)?;
+                        row += size(&self.starts, d);
                         let (from, to) = (
                             self.reach_starts[d as usize],
                             self.reach_starts[d as usize + 1],
@@ -675,6 +680,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
                             if stamp[e as usize] != c as u32 {
                                 stamp[e as usize] = c as u32;
                                 self.reach.push(e)?;
+                                row += size(&self.starts, e);
                             }
                         }
                     }
@@ -682,8 +688,10 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
             }
             if cyclic {
                 self.reach.push(c as u32)?;
+                row += size(&self.starts, c as u32);
             }
             self.cyclic.push(cyclic)?;
+            self.rows.push(row)?;
             self.reach_starts.push(self.reach.len())?;
         }
         Ok(())
