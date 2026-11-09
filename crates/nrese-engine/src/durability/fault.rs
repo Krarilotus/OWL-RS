@@ -23,7 +23,23 @@ thread_local! {
     /// What `CLOCK` reads once a transaction's record is about to be written to the log,
     /// its preparation (runs, a layout conversion, a rotation) done: the time that took.
     pub(crate) static CLOCK_AT_APPEND: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The files this thread synced through `durability::place`, in order.
+    pub(crate) static SYNCED: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// A file sync through `durability::place` fails.
+    pub(crate) static FAIL_FILE_SYNC: Cell<bool> = const { Cell::new(false) };
+    /// The sync of this directory through `durability::place` fails, with this kind of error.
+    pub(crate) static FAIL_DIR_SYNC_OF: std::cell::RefCell<
+        Option<(std::path::PathBuf, std::io::ErrorKind)>,
+    > = const { std::cell::RefCell::new(None) };
+    /// Called with each directory `durability::place` syncs, before the sync: what a test
+    /// sees at that moment.
+    pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<DirSyncHook>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+/// What [`ON_DIR_SYNC`] calls.
+pub(crate) type DirSyncHook = Box<dyn FnMut(&std::path::Path)>;
 
 /// An error if `point` is set on this thread.
 pub(crate) fn check(point: &'static LocalKey<Cell<bool>>, what: &str) -> std::io::Result<()> {

@@ -325,6 +325,13 @@ class Adapter:
         """(image, build context under benches/) for images this repository builds."""
         return []
 
+    def script_builds(self, ctx: Context) -> list[tuple[str, str, str]]:
+        """(image, build context under benches/, the Dockerfile ARG naming its source commit) for
+        images a script builds from a source chosen apart from their context (benches/sparql/images.sh):
+        their build label names that source commit, and a receipt without it is unknown (review
+        image-source-commit r1 F2)."""
+        return []
+
     def supports(self, ctx: Context, inputs: list[str], regime: str) -> str | None:
         if ctx.runtime.kind not in self.runtimes:
             return f"no {ctx.runtime.kind} path (runs: {', '.join(sorted(self.runtimes))})"
@@ -493,7 +500,7 @@ class Qlever(Adapter):
     result_cache = True
 
     def images(self, ctx):
-        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
+        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:commit-0998359ab0")]
 
     def load(self, ctx, store, inputs, regime):
         fmt = "nt" if all_ntriples(inputs) else "nq" if all(i.endswith(".nq") for i in inputs) else "ttl"
@@ -553,7 +560,7 @@ class Oxigraph(Adapter):
     key = "oxigraph"
 
     def images(self, ctx):
-        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.11")]
+        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.13")]
 
     def load(self, ctx, store, inputs, regime, log_name="load.log"):
         files = [a for i in inputs for a in ("--file", i)]
@@ -764,6 +771,10 @@ class MillenniumDB(Adapter):
     def images(self, ctx):
         return [ctx.setting("MILLENNIUMDB_IMAGE", "nrese-bench/millenniumdb:ecbf6dd")]
 
+    def script_builds(self, ctx):
+        # benches/sparql/images.sh millenniumdb: its source at MDB_COMMIT (the Dockerfile's default).
+        return [(self.images(ctx)[0], "competitors/millenniumdb", "MDB_COMMIT")]
+
     def load(self, ctx, store, inputs, regime):
         buffer = ctx.setting("MDB_IMPORT_BUFFER", "4GB")
         spec = Spec(ctx.name("load"), self.images(ctx)[0],
@@ -876,7 +887,7 @@ class Graphdb(Adapter):
 
     key = "graphdb"
     regimes = GRAPHDB_RULESETS
-    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.1", "GRAPHDB_EDITION": "free",
+    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.2", "GRAPHDB_EDITION": "free",
                 "GRAPHDB_ENTITY_ID_SIZE": "32", "GRAPHDB_ENTITY_INDEX_SIZE": "10000000",
                 "GRAPHDB_CONTEXT_INDEX": "false", "GRAPHDB_CHECK_INCONSISTENCIES": "false"}
 

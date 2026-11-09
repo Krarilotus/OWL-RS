@@ -17,7 +17,7 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 |  | BUILD_PATHS for a compiled NRESE or harness); coarse, exact: any change re-qualifies it |
 | images | image -> `id`, the one its containers ran (the run's pin map, ns.pinned), and `source`, |
 |  | read off that id, never off the tag: "built from benches/CONTEXT@TREE" (its build label), |
-|  | else unknown (unlabelled; pulled: no digest pin yet) |
+|  | "pulled, pinned DIGEST" (the id holds its tag's pin, images.toml), else unknown, with why |
 | build | NRESE's server and the timing harness: built in this run from `commit` (its `dirty`), with |
 |  | `target_cpu`, inherited `rustflags_env`, and in Docker `rust_image` and `rustflags`; or unknown |
 | settings | the suite settings in force that change a measurement (manifest `settings` less |

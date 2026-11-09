@@ -140,7 +140,7 @@ impl Context<'_> {
                 .map_or(written, |(i, _)| i)
         };
         let Some(first) = inputs.get(start) else {
-            return Ok(Solutions::unit());
+            return self.unit();
         };
         let mut rows = self.eval(first)?;
         for (i, input) in inputs.iter().enumerate() {
