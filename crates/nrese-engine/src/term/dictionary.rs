@@ -2273,9 +2273,10 @@ impl Dictionary {
     /// called with no lock of the dictionary held: the bound is read under the read guard,
     /// the guard let go, the bound charged, and the term decoded under a new guard. A rebase
     /// between them (the one change of a key's storage, [`Self::rebase`]) may store the
-    /// term's keys compressed, with a larger bound: the decode then reads the bound again and
-    /// charges only the difference, again with no lock held, until a guard sees the state it
-    /// was charged for. Ids never change meaning, so only the bound can differ.
+    /// term's keys compressed, with a larger bound: the decode then reads the bound again under
+    /// its guard, decodes under that guard if what was charged covers it, and else charges
+    /// only the difference, again with no lock held. Ids never change meaning, so only the
+    /// bound can differ.
     pub(super) fn decode_charged_in<E>(
         &self,
         own: Option<&dyn OwnKeys>,
@@ -2283,24 +2284,28 @@ impl Dictionary {
         mut charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
         let mut charged = 0;
+        // The state the charge was made for, once made: its generation, `None` where its bound
+        // read no shared entry (a decode that read none reads none later: own entries are
+        // frozen).
+        let mut charged_for: Option<Option<u64>> = None;
         loop {
-            let (bound, generation) = {
-                let terms = self.terms(own);
-                let Some(bound) = terms.bound(id) else {
-                    return Ok(None);
-                };
-                (bound, terms.generation())
-            };
-            if bound > charged {
-                charge(bound - charged)?;
-                charged = bound;
-            }
             let terms = self.terms(own);
-            // A decode that read no shared entry for its bound reads none now: own entries
-            // are frozen.
-            if generation.is_none_or(|generation| terms.inner().generation == generation) {
+            if let Some(generation) = charged_for
+                && generation.is_none_or(|generation| terms.inner().generation == generation)
+            {
                 return Ok(terms.decode(id));
             }
+            let Some(bound) = terms.bound(id) else {
+                return Ok(None);
+            };
+            if bound <= charged {
+                return Ok(terms.decode(id));
+            }
+            let generation = terms.generation();
+            drop(terms);
+            charge(bound - charged)?;
+            charged = bound;
+            charged_for = Some(generation);
         }
     }
 }

@@ -3,25 +3,27 @@
 //! `<>`, blank nodes as `_:`, quoted literals with their escapes, `@tag`, `@tag--dir` and
 //! `^^<datatype>`). No path writes one now; a store of that version still holds them.
 //!
-//! Read back here, not by the N-Triples parser, so that what a decode holds has a bound:
-//! [`decode`] allocates the term's strings, each at exactly its length, which is at most its
-//! source text's (escapes only shorten), and one box a triple term, each of which has at least
-//! [`TRIPLE_TEXT`] bytes of text of its own; nothing else. Text it can't read (what the
-//! parser refused too, such as triple terms nested deeper than it took) is the simple literal
-//! of the text, as the parser's fallback gave.
+//! Read back here, not by the N-Triples parser, so that what a decode holds has a bound and the
+//! stored term comes back whatever its depth (that version set no limit; the parser takes 64
+//! levels): [`decode`] allocates the term's strings, each at exactly its length, which is at
+//! most its source text's (escapes only shorten), and one box a triple term, each of which has
+//! at least [`TRIPLE_TEXT`] bytes of text of its own; nothing else, and no stack: only an object
+//! nests, so the chain of triple terms is built from the outside in, through the slot of the
+//! innermost one's object.
+//!
+//! Text that is no term, which that writer never wrote (a damaged key), is the simple literal
+//! of the text, as the parser's fallback was: the decode has no error to give (`decode` answers
+//! a term or none, and the key is one), and the literal keeps it total and bounded, the text.
 
 use nrese_rdf::vocab::rdf;
 use nrese_rdf::{BaseDirection, BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 
-/// How deep triple terms may nest, as the N-Triples parser that read these keys allowed
-/// (`nrese_rdf_io::ntriples::MAX_NESTING`): deeper text decodes as its fallback.
-const MAX_NESTING: usize = 64;
-
-/// The text a triple term has of its own, at least: `<<(`, `)>>`, and the two bytes at least
-/// (`<>`, or `_:` and a byte) of its subject and of its predicate. Its object may be a triple
-/// term's; the spaces the writer puts between them aren't counted, since [`decode`] reads text
-/// without them too.
-const TRIPLE_TEXT: usize = 3 + 3 + 2 + 2;
+/// The text a triple term has read of its own when [`decode`] boxes it, at least: `<<(` and the
+/// two bytes at least (`<>`, or `_:` and a byte) of its subject and of its predicate. Its
+/// closing `)>>` isn't counted, since a damaged text may lack it (sol-loop r4 S3), nor its
+/// object, which may be a triple term's, nor the spaces the writer puts between them, since
+/// [`decode`] reads text without them too.
+const TRIPLE_TEXT: usize = 3 + 2 + 2;
 
 /// The most bytes [`decode`] holds for a text of `len` bytes, from its length alone: its
 /// strings, together at most the text, and a box for each triple term it can hold; or the
@@ -30,20 +32,73 @@ pub(super) fn bound(len: usize) -> usize {
     len.saturating_add((len / TRIPLE_TEXT).saturating_mul(size_of::<Triple>()))
 }
 
-/// The term `text` writes, or the simple literal of `text` where it can't be read.
+/// The term `text` writes, or the simple literal of `text` where it can't be read. What was
+/// read before that is let go first, one level at a time: a damaged key's chain may be deeper
+/// than a recursive drop has stack for.
 pub(super) fn decode(text: &str) -> Term {
     let mut at = 0;
-    read(text, &mut at)
-        .filter(|_| {
-            space(text, &mut at);
-            at == text.len()
-        })
-        .unwrap_or_else(|| Literal::new_simple_literal(text).into())
+    let mut term = placeholder();
+    if read(text, &mut at, &mut term).is_some() && {
+        space(text, &mut at);
+        at == text.len()
+    } {
+        return term;
+    }
+    let_go(term);
+    Literal::new_simple_literal(text).into()
 }
 
-fn read(text: &str, at: &mut usize) -> Option<Term> {
+/// Drops `term` a triple term at a time, its object taken out first.
+fn let_go(mut term: Term) {
+    while let Term::Triple(triple) = term {
+        term = triple.object;
+    }
+}
+
+/// Reads the term at `*at` into `slot`: a run of triple terms, each the object of the one
+/// before, read from the outside in, then the innermost object, then their closings. Each triple
+/// term is boxed with a placeholder object (an empty IRI, which allocates nothing) that the
+/// next one, or the innermost object, replaces. `None` where the text is no term; `slot` then
+/// holds what was read.
+fn read(text: &str, at: &mut usize, slot: &mut Term) -> Option<()> {
     space(text, at);
-    term(text, at, 0)
+    let mut slot = slot;
+    let mut open = 0usize;
+    while text.get(*at..)?.starts_with("<<(") {
+        *at += 3;
+        space(text, at);
+        let subject: NamedOrBlankNode = match text.as_bytes().get(*at)? {
+            b'<' if !text[*at..].starts_with("<<(") => iri(text, at)?.into(),
+            b'_' => blank(text, at)?.into(),
+            _ => return None,
+        };
+        space(text, at);
+        let predicate = iri(text, at)?;
+        space(text, at);
+        *slot = Triple::new(subject, predicate, placeholder()).into();
+        slot = match slot {
+            Term::Triple(triple) => &mut triple.object,
+            _ => unreachable!("a triple term was just put here"),
+        };
+        open += 1;
+    }
+    *slot = match text.as_bytes().get(*at)? {
+        b'<' => iri(text, at)?.into(),
+        b'_' => blank(text, at)?.into(),
+        b'"' => literal(text, at)?.into(),
+        _ => return None,
+    };
+    for _ in 0..open {
+        space(text, at);
+        text.get(*at..)?.starts_with(")>>").then_some(())?;
+        *at += 3;
+    }
+    Some(())
+}
+
+/// What a triple term holds until its object is read: allocates nothing.
+fn placeholder() -> Term {
+    NamedNode::new_unchecked(String::new()).into()
 }
 
 /// Spaces and tabs at `*at`, skipped.
@@ -52,41 +107,6 @@ fn space(text: &str, at: &mut usize) {
     while matches!(bytes.get(*at), Some(b' ' | b'\t')) {
         *at += 1;
     }
-}
-
-/// The term at `*at`, an object's: `depth` triple terms hold it.
-fn term(text: &str, at: &mut usize, depth: usize) -> Option<Term> {
-    let rest = text.get(*at..)?;
-    if rest.starts_with("<<(") {
-        return triple(text, at, depth + 1).map(Term::from);
-    }
-    match rest.as_bytes().first()? {
-        b'<' => iri(text, at).map(Term::from),
-        b'_' => blank(text, at).map(Term::from),
-        b'"' => literal(text, at).map(Term::from),
-        _ => None,
-    }
-}
-
-fn triple(text: &str, at: &mut usize, depth: usize) -> Option<Triple> {
-    if depth > MAX_NESTING {
-        return None;
-    }
-    *at += 3;
-    space(text, at);
-    let subject: NamedOrBlankNode = match text.as_bytes().get(*at)? {
-        b'<' if !text[*at..].starts_with("<<(") => iri(text, at)?.into(),
-        b'_' => blank(text, at)?.into(),
-        _ => return None,
-    };
-    space(text, at);
-    let predicate = iri(text, at)?;
-    space(text, at);
-    let object = term(text, at, depth)?;
-    space(text, at);
-    text.get(*at..)?.starts_with(")>>").then_some(())?;
-    *at += 3;
-    Some(Triple::new(subject, predicate, object))
 }
 
 /// `<iri>`, its `\u` and `\U` escapes read.
@@ -309,6 +329,36 @@ mod tests {
             let decoded = decode(&text);
             assert!(decoded == expected, "depth {depth}: not the term");
             assert!(decoded.heap_bytes() <= bound(text.len()), "depth {depth}");
+        }
+    }
+
+    /// A damaged key: 200,000 triple terms opened and none closed, no object. The decode is the
+    /// text as a literal, the chain it read let go a level at a time (dropped whole, it would
+    /// recurse 200,000 deep).
+    #[test]
+    fn a_damaged_deep_text_is_let_go_without_recursion() {
+        let text = "<<( <urn:s> <urn:p> ".repeat(200_000);
+        assert!(decode(&text) == Literal::new_simple_literal(&text).into());
+    }
+
+    /// Package C3, sol-loop r4 S3: a triple term is boxed once its opening, subject and
+    /// predicate are read, before its closing, so damaged text of only those, `<<(<><>` (7
+    /// bytes) once and repeated, holds a box for each. Measured (`nrese_exec::measure`): the
+    /// decode's peak is within [`bound`] of the text's length.
+    #[test]
+    fn a_text_of_openings_alone_holds_no_more_than_its_bound() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        for repeats in [1, 2, 100, 10_000] {
+            let text = "<<(<><>".repeat(repeats);
+            let (decoded, peak) = nrese_exec::measure::measure(|| decode(&text));
+            assert!(decoded == Literal::new_simple_literal(&text).into());
+            assert!(
+                peak <= bound(text.len()),
+                "{repeats} openings: peak {peak}, bound {}",
+                bound(text.len())
+            );
         }
     }
 
