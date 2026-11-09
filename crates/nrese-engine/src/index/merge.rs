@@ -83,6 +83,10 @@ impl Cursor<'_> {
 
 pub(crate) struct SignedMerge<'a> {
     cursors: Vec<Cursor<'a>>,
+    /// The entries the cursors have left: summed as they are made, less one for each entry a
+    /// step passes, so [`Self::remaining`] reads no cursor (REAS-3a review r1 R2: a counted
+    /// scan asks it before it asks its visitor).
+    left: usize,
 }
 
 impl<'a> SignedMerge<'a> {
@@ -90,6 +94,7 @@ impl<'a> SignedMerge<'a> {
     pub(crate) fn new(parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>) -> Self {
         let mut merge = Self {
             cursors: Vec::new(),
+            left: 0,
         };
         merge.refill(parts);
         merge
@@ -101,27 +106,30 @@ impl<'a> SignedMerge<'a> {
         &mut self,
         parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>,
     ) {
+        let mut left = 0;
         self.cursors.clear();
         self.cursors.extend(
             parts
                 .into_iter()
                 .filter(|&(_, start, end)| start < end)
-                .map(|(run, pos, end)| Cursor {
-                    run,
-                    pos,
-                    end,
-                    key: run.keys.get(pos),
-                    buffer: Vec::new(),
-                    buffered: pos + 1,
+                .map(|(run, pos, end)| {
+                    left += end - pos;
+                    Cursor {
+                        run,
+                        pos,
+                        end,
+                        key: run.keys.get(pos),
+                        buffer: Vec::new(),
+                        buffered: pos + 1,
+                    }
                 }),
         );
+        self.left = left;
     }
 
-    /// Upper bound on the remaining entries.
+    /// The entries left: an upper bound on the keys still to come. O(1).
     pub(crate) fn remaining(&self) -> usize {
-        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-        crate::witness::add(crate::witness::Site::CursorReads, self.cursors.len() as u64);
-        self.cursors.iter().map(|c| c.end - c.pos).sum()
+        self.left
     }
 
     /// The cursors the next step compares: what a step costs ([`crate::visit`]: a unit each).
@@ -139,6 +147,7 @@ impl Iterator for SignedMerge<'_> {
         if let [cursor] = self.cursors.as_mut_slice() {
             // Single input: no comparisons needed.
             let item = (*cursor.key(), cursor.sign());
+            self.left -= 1;
             if !cursor.advance() {
                 self.cursors.clear();
             }
@@ -151,6 +160,7 @@ impl Iterator for SignedMerge<'_> {
             let cursor = &mut self.cursors[i];
             if *cursor.key() == key {
                 sign += cursor.sign();
+                self.left -= 1;
                 if !cursor.advance() {
                     self.cursors.swap_remove(i);
                     continue;

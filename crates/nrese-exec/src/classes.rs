@@ -118,6 +118,11 @@ impl Classes {
 
     /// Merges the classes of `a` and `b`; returns the representative that lost its place
     /// (the larger of the two smallest ids), or `None` if they were one class.
+    ///
+    /// One union is a step that can't be split: it moves the smaller side's members into the
+    /// larger side's list (O(smaller side) work, the larger list grown to hold them, the
+    /// smaller one freed), and asks no stop. A caller that counts its work for a stop counts a
+    /// union whole before it starts (the engine's counted reads, `nrese_engine::visit`).
     pub fn union(&mut self, a: u64, b: u64) -> Option<u64> {
         let (ra, rb) = (self.root_or_new(a), self.root_or_new(b));
         if ra == rb {
