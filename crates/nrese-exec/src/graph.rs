@@ -99,20 +99,22 @@ impl Adjacency {
 /// A node's successors, as a search walks them: an [`Adjacency`]'s, or index probes for a
 /// bound start ([`Probes`]).
 pub trait Successors {
-    /// Calls `visit` with each successor of `node` (a successor may come more than once); the
-    /// first error ends the walk and is returned.
-    fn each(&mut self, node: u64, visit: impl FnMut(u64) -> Result<(), Stop>) -> Result<(), Stop>;
+    /// Calls `visit` once with the successors of `node` (a successor may come more than once),
+    /// and returns what it returns.
+    fn each(
+        &mut self,
+        node: u64,
+        visit: impl FnOnce(&[u64]) -> Result<(), Stop>,
+    ) -> Result<(), Stop>;
 }
 
 impl Successors for &Adjacency {
     fn each(
         &mut self,
         node: u64,
-        mut visit: impl FnMut(u64) -> Result<(), Stop>,
+        visit: impl FnOnce(&[u64]) -> Result<(), Stop>,
     ) -> Result<(), Stop> {
-        self.neighbours(node)
-            .iter()
-            .try_for_each(|&target| visit(target))
+        visit(self.neighbours(node))
     }
 }
 
@@ -128,10 +130,9 @@ where
     fn each(
         &mut self,
         node: u64,
-        mut visit: impl FnMut(u64) -> Result<(), Stop>,
+        visit: impl FnOnce(&[u64]) -> Result<(), Stop>,
     ) -> Result<(), Stop> {
-        let successors = (self.0)(node)?;
-        successors.iter().try_for_each(|&target| visit(target))
+        visit(&(self.0)(node)?)
     }
 }
 
@@ -153,17 +154,14 @@ pub fn reachable_within<'p, B: Deref<Target = Budget>>(
     let ticker = Ticker::new(stop)?;
     let mut order = Charged::in_pool(pool);
     // One start: the nodes seen are a set, with nothing to stamp.
-    let mut seen: ChargedMap<u64, (), Share<'p, B>> = ChargedMap::in_pool(pool);
-    let mark = |node: u64, _: usize| -> Result<bool, BudgetExceeded> {
-        Ok(seen.get_or_insert_with(node, || ())?.1)
-    };
+    let stamp = |_| ();
     search(
         [start],
         include_start,
         successors,
         pool,
         &ticker,
-        mark,
+        stamp,
         |_, node| order.push(node),
     )?;
     ticker.finish()?;
@@ -172,34 +170,42 @@ pub fn reachable_within<'p, B: Deref<Target = Budget>>(
 
 /// A breadth-first search from each of `starts` over `successors`, `found(start, node)` for
 /// each node reached from it in one or more steps, or zero or more with `reflexive`, each
-/// once per start. `mark(node, i)` marks `node` seen from the `i`-th start, true the first
-/// time; the frontiers are charged to `pool` before they grow; `ticker` ticks once per node
-/// expanded and once per successor walked.
-fn search<'p, B: Deref<Target = Budget>>(
+/// once per start. The nodes seen map to the `stamp(i)` of the `i`-th start that last reached
+/// them, so one map serves every start without clearing (a single start's stamp is `()`: a
+/// set). The nodes seen and the frontiers are charged to `pool` before they grow; `ticker`
+/// counts a unit per node expanded and per successor walked, a tick per node and per batch of
+/// at most [`crate::POLL_UNITS`] successors.
+fn search<'p, B: Deref<Target = Budget>, V: Copy + PartialEq>(
     starts: impl IntoIterator<Item = u64>,
     reflexive: bool,
     mut successors: impl Successors,
     pool: &'p Pool<B>,
     ticker: &Ticker<StopFn<'_>>,
-    mut mark: impl FnMut(u64, usize) -> Result<bool, BudgetExceeded>,
+    stamp: impl Fn(usize) -> V,
     mut found: impl FnMut(u64, u64) -> Result<(), BudgetExceeded>,
 ) -> Result<(), Stop> {
+    let mut seen: ChargedMap<u64, V, Share<'p, B>> = ChargedMap::in_pool(pool);
     let mut frontier: Buf<'p, u64, B> = Charged::in_pool(pool);
     let mut next: Buf<'p, u64, B> = Charged::in_pool(pool);
     for (i, start) in starts.into_iter().enumerate() {
+        let own = stamp(i);
         if reflexive {
-            mark(start, i)?;
+            first_seen(&mut seen, start, own)?;
             found(start, start)?;
         }
         frontier.push(start)?;
         while !frontier.is_empty() {
             for k in 0..frontier.len() {
                 ticker.tick(1)?;
-                successors.each(frontier[k], |target| {
-                    ticker.tick(1)?;
-                    if mark(target, i)? {
-                        found(start, target)?;
-                        next.push(target)?;
+                successors.each(frontier[k], |targets| {
+                    for batch in targets.chunks(crate::POLL_UNITS as usize) {
+                        ticker.tick(batch.len() as u32)?;
+                        for &target in batch {
+                            if first_seen(&mut seen, target, own)? {
+                                found(start, target)?;
+                                next.push(target)?;
+                            }
+                        }
                     }
                     Ok(())
                 })?;
@@ -209,6 +215,21 @@ fn search<'p, B: Deref<Target = Budget>>(
         }
     }
     Ok(())
+}
+
+/// Marks `node` seen with `stamp`: true where it was unseen or seen with another stamp.
+/// Inlined into the search's loop, whose hot step it is (a call of its own per successor
+/// walked).
+#[inline(always)]
+fn first_seen<V: Copy + PartialEq, H: crate::budget::Hold>(
+    seen: &mut ChargedMap<u64, V, H>,
+    node: u64,
+    stamp: V,
+) -> Result<bool, BudgetExceeded> {
+    let (at, new) = seen.get_or_insert_with(node, || stamp)?;
+    let first = new || *at != stamp;
+    *at = stamp;
+    Ok(first)
 }
 
 /// Every `(start, end)` pair of the closure from each of `starts` over `adjacency`: `end`
@@ -245,20 +266,14 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
     let mut out = Charged::in_pool(pool);
     // Per node, the last start it was reached from: a stamp, so nothing is cleared between
     // starts.
-    let mut seen: ChargedMap<u64, usize, Share<'p, B>> = ChargedMap::in_pool(pool);
-    let mark = |node: u64, start: usize| -> Result<bool, BudgetExceeded> {
-        let (at, new) = seen.get_or_insert_with(node, || start)?;
-        let first = new || *at != start;
-        *at = start;
-        Ok(first)
-    };
+    let stamp = |i: usize| i;
     search(
         starts,
         reflexive,
         adjacency,
         pool,
         &ticker,
-        mark,
+        stamp,
         |start, end| out.push((start, end)),
     )?;
     ticker.finish()?;
