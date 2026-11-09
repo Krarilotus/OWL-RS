@@ -162,19 +162,19 @@ pub fn reachable_within<'p, B: Deref<Target = Budget>>(
         pool,
         &ticker,
         stamp,
-        |_, node| order.push(node),
+        |_, nodes| order.extend_from_slice(nodes),
     )?;
     ticker.finish()?;
     Ok(order)
 }
 
-/// A breadth-first search from each of `starts` over `successors`, `found(start, node)` for
-/// each node reached from it in one or more steps, or zero or more with `reflexive`, each
-/// once per start. The nodes seen map to the `stamp(i)` of the `i`-th start that last reached
-/// them, so one map serves every start without clearing (a single start's stamp is `()`: a
-/// set). The nodes seen and the frontiers are charged to `pool` before they grow; `ticker`
-/// counts a unit per node expanded and per successor walked, a tick per node and per batch of
-/// at most [`crate::POLL_UNITS`] successors.
+/// A breadth-first search from each of `starts` over `successors`, `found(start, nodes)` with
+/// the nodes reached from it in one or more steps, or zero or more with `reflexive`, each once
+/// per start. The nodes seen map to the `stamp(i)` of the `i`-th start that last reached them,
+/// so one map serves every start without clearing (a single start's stamp is `()`: a set).
+/// Successors are taken in batches of at most [`crate::POLL_UNITS`]: per batch, one tick
+/// counting each, and the nodes new in it appended to the next frontier with one charge, then
+/// passed to `found` at once. The nodes seen are charged before they grow.
 fn search<'p, B: Deref<Target = Budget>, V: Copy + PartialEq>(
     starts: impl IntoIterator<Item = u64>,
     reflexive: bool,
@@ -182,7 +182,7 @@ fn search<'p, B: Deref<Target = Budget>, V: Copy + PartialEq>(
     pool: &'p Pool<B>,
     ticker: &Ticker<StopFn<'_>>,
     stamp: impl Fn(usize) -> V,
-    mut found: impl FnMut(u64, u64) -> Result<(), BudgetExceeded>,
+    mut found: impl FnMut(u64, &[u64]) -> Result<(), BudgetExceeded>,
 ) -> Result<(), Stop> {
     let mut seen: ChargedMap<u64, V, Share<'p, B>> = ChargedMap::in_pool(pool);
     let mut frontier: Buf<'p, u64, B> = Charged::in_pool(pool);
@@ -190,8 +190,8 @@ fn search<'p, B: Deref<Target = Budget>, V: Copy + PartialEq>(
     for (i, start) in starts.into_iter().enumerate() {
         let own = stamp(i);
         if reflexive {
-            first_seen(&mut seen, start, own)?;
-            found(start, start)?;
+            seen.insert(start, own)?;
+            found(start, &[start])?;
         }
         frontier.push(start)?;
         while !frontier.is_empty() {
@@ -200,12 +200,22 @@ fn search<'p, B: Deref<Target = Budget>, V: Copy + PartialEq>(
                 successors.each(frontier[k], |targets| {
                     for batch in targets.chunks(crate::POLL_UNITS as usize) {
                         ticker.tick(batch.len() as u32)?;
-                        for &target in batch {
-                            if first_seen(&mut seen, target, own)? {
-                                found(start, target)?;
-                                next.push(target)?;
-                            }
+                        let (from, mut refused) = (next.len(), None);
+                        let new = batch.iter().copied().filter(|&target| {
+                            refused.is_none()
+                                && match seen.insert(target, own) {
+                                    Ok(old) => old != Some(own),
+                                    Err(e) => {
+                                        refused = Some(e);
+                                        false
+                                    }
+                                }
+                        });
+                        next.extend_bounded(batch.len(), new)?;
+                        if let Some(refused) = refused {
+                            return Err(refused.into());
                         }
+                        found(start, &next[from..])?;
                     }
                     Ok(())
                 })?;
@@ -215,21 +225,6 @@ fn search<'p, B: Deref<Target = Budget>, V: Copy + PartialEq>(
         }
     }
     Ok(())
-}
-
-/// Marks `node` seen with `stamp`: true where it was unseen or seen with another stamp.
-/// Inlined into the search's loop, whose hot step it is (a call of its own per successor
-/// walked).
-#[inline(always)]
-fn first_seen<V: Copy + PartialEq, H: crate::budget::Hold>(
-    seen: &mut ChargedMap<u64, V, H>,
-    node: u64,
-    stamp: V,
-) -> Result<bool, BudgetExceeded> {
-    let (at, new) = seen.get_or_insert_with(node, || stamp)?;
-    let first = new || *at != stamp;
-    *at = stamp;
-    Ok(first)
 }
 
 /// Every `(start, end)` pair of the closure from each of `starts` over `adjacency`: `end`
@@ -274,7 +269,7 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
         pool,
         &ticker,
         stamp,
-        |start, end| out.push((start, end)),
+        |start, ends| out.extend_bounded(ends.len(), ends.iter().map(|&end| (start, end))),
     )?;
     ticker.finish()?;
     Ok(out)
