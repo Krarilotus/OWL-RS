@@ -99,3 +99,60 @@ fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
         2 * interval
     );
 }
+
+/// REAS-3a review r1 R2. Spec (`crate::visit`: a counted read asks its visitor before the work
+/// it counts; a merge step over its cursors is one step, counted before it is taken): a counted
+/// scan over many runs reads its cursors within its visitor's interval. Five intervals of runs,
+/// one statement each, all matching (a range in every run, a cursor each): from the scan's
+/// first ask to its third quad, between two asks of the visitor (and after the last), it
+/// searches, reads and steps through no more than two intervals of runs, cursors and keys. Its
+/// credit's hint summed every cursor before each ask, five intervals unseen.
+#[test]
+fn a_counted_scan_reads_its_cursors_within_its_visitor_s_interval() {
+    let interval = u64::from(nrese_exec::POLL_UNITS);
+    let n = 5 * interval;
+    let (p, o) = (term(1), term(2));
+    let runs: Vec<_> = (0..n)
+        .map(|i| {
+            let quad = EncodedQuad::new(term(10 + i), p, o, TermId::DEFAULT_GRAPH);
+            std::sync::Arc::new(Run::from_delta(Layout::DefaultGraph, &[quad], &[]))
+        })
+        .collect();
+    let version = IndexVersion {
+        layout: Layout::DefaultGraph,
+        runs: runs.into(),
+        len: n,
+    };
+    let plan = AccessPlan::for_pattern(&QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    });
+    let work = || {
+        [Site::RunProbes, Site::CursorReads, Site::ScanSteps]
+            .into_iter()
+            .map(witness::get)
+            .sum::<u64>()
+    };
+    let last = std::cell::Cell::new(work());
+    let largest = std::cell::Cell::new(0);
+    let gap = || {
+        let now = work();
+        largest.set(largest.get().max(now - last.replace(now)));
+    };
+    let visit = |_| {
+        gap();
+        true
+    };
+    let first: Vec<EncodedQuad> = version
+        .scan_plan_iter_counted(&plan, &visit)
+        .take(3)
+        .collect();
+    gap();
+    assert_eq!(first.len(), 3, "every run's statement matches");
+    let largest = largest.get();
+    assert!(
+        largest <= 2 * interval,
+        "{largest} runs, cursors and keys read between two asks of the visitor: at most {}",
+        2 * interval
+    );
+}

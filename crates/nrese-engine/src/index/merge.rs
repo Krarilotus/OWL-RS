@@ -119,6 +119,8 @@ impl<'a> SignedMerge<'a> {
 
     /// Upper bound on the remaining entries.
     pub(crate) fn remaining(&self) -> usize {
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        crate::witness::add(crate::witness::Site::CursorReads, self.cursors.len() as u64);
         self.cursors.iter().map(|c| c.end - c.pos).sum()
     }
 

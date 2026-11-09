@@ -416,6 +416,10 @@ impl Classes {
         let mut copied = true;
         let members = union.classes().map_while(|(representative, members)| {
             copied = !M::COUNTED || meter.units(members.len() as u64);
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            if copied {
+                crate::witness::add(crate::witness::Site::ClassFinish, members.len() as u64);
+            }
             copied.then(|| (representative, members.to_vec()))
         });
         let mut classes = Self::default();
@@ -424,12 +428,16 @@ impl Classes {
                 continue;
             }
             identities.sort_unstable();
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::ClassFinish, identities.len() as u64);
             classes.literals |= identities
                 .iter()
                 .any(|&id| is_literal(TermId::from_raw(id)));
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
             for &identity in &identities[1..] {
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::ClassFinish, 1);
                 classes.aliases.insert(identity, representative);
             }
             classes
@@ -1163,5 +1171,92 @@ mod tests {
             ..all
         };
         assert_eq!(classes.multiplicity(&quad(r, r, r), &bound), Some(1 << 44));
+    }
+
+    /// REAS-3a review r1 R1. Spec (`crate::visit`: after its visitor's last yes a counted read
+    /// does at most the units that yes allowed, `POLL_UNITS`, plus a step that can't be split;
+    /// finishing a class is split): a counted read's cold class build finishes its classes
+    /// within its visitor's interval. One asserted chain of three intervals of identities, one
+    /// class built one identity at a time, and one statement about its representative: between
+    /// two asks of the visitor, and after the last, the read handles at most two intervals of
+    /// scan steps, runs, copies and finished identities. Finishing the class after one count
+    /// of it (its members copied, checked for literals and indexed), it handled three times the
+    /// class unseen.
+    #[test]
+    fn a_counted_class_build_finishes_its_class_within_its_visitor_s_interval() {
+        use crate::witness::{self, Site};
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 3 * interval as usize;
+        let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        for i in 1..n {
+            tx.insert(
+                nrese_rdf::Quad::new(
+                    node(&format!("s{}", i - 1)),
+                    node("sameAs"),
+                    node(&format!("s{i}")),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.insert(
+            nrese_rdf::Quad::new(
+                node("s0"),
+                node("p"),
+                node("o"),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
+        let pattern = QuadPattern {
+            predicate: Some(p),
+            ..QuadPattern::all()
+        };
+        let work = || {
+            [
+                Site::ScanSteps,
+                Site::RunProbes,
+                Site::ExpandCopies,
+                Site::ClassFinish,
+            ]
+            .into_iter()
+            .map(witness::get)
+            .sum::<u64>()
+        };
+        let last = std::cell::Cell::new(work());
+        let largest = std::cell::Cell::new(0);
+        let gap = || {
+            let now = work();
+            largest.set(largest.get().max(now - last.replace(now)));
+        };
+        let counted = snapshot
+            .counted()
+            .count(crate::ReadModel::Materialised, &pattern, &|_| {
+                gap();
+                true
+            });
+        gap();
+        assert_eq!(
+            counted,
+            Ok(crate::Count::Exact(n as u64)),
+            "the statement's copy for each identity"
+        );
+        let largest = largest.get();
+        assert!(
+            largest <= 2 * interval,
+            "{largest} units of work between two asks of the visitor: at most {}",
+            2 * interval
+        );
     }
 }

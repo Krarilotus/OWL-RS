@@ -28,10 +28,17 @@ pub enum Site {
     /// Runs a read searches or probes: a scan's range search per run
     /// (`IndexVersion::scan_plan`), a membership probe per run (`IndexVersion::contains`).
     RunProbes,
+    /// Identities an equality class build's finish handles: each member it copies out of the
+    /// union kernel, each it checks for a literal and indexes as an alias (`Classes::of_with`;
+    /// its sorts are not counted here).
+    ClassFinish,
+    /// Merge cursors read outside a merge step: the remaining-entries hint
+    /// (`SignedMerge::remaining`).
+    CursorReads,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 4] = const { [const { Cell::new(0) }; 4] };
+    static COUNTS: [Cell<u64>; 6] = const { [const { Cell::new(0) }; 6] };
 }
 
 /// Counts `n` units at `site` on this thread.
