@@ -234,14 +234,13 @@ fn unpublished_schema_reads_leave_the_kept_tbox() {
     check(&published, &options, &expected);
     let before = kept_entries(&ql);
     let gains = membership(&published, "ann", restriction(&published));
-    for (name, snapshot) in unpublished(&engine, &[(gains, true)]) {
+    // A version keeps what any rewriting reads of it (dictionary 3.0c), so the fresh
+    // rewriting reads equal snapshots of versions of their own.
+    let alike = unpublished(&engine, &[(gains, true)]);
+    for ((name, snapshot), (_, same)) in unpublished(&engine, &[(gains, true)]).iter().zip(&alike) {
         let fresh = sharing(&Arc::new(QlRewriting::new(Closure { lists: true })));
-        let own = check(&snapshot, &fresh, &expected);
-        assert_eq!(
-            check(&snapshot, &options, &expected),
-            own,
-            "{name} snapshot"
-        );
+        let own = check(same, &fresh, &expected);
+        assert_eq!(check(snapshot, &options, &expected), own, "{name} snapshot");
         assert_eq!(kept_entries(&ql), before, "{name} snapshot");
     }
     MEMBER_SCANS.set(0);
@@ -285,11 +284,12 @@ fn unpublished_membership_reads_leave_the_kept_memberships() {
 }
 
 /// Contract S3, the probes family (G3): a probe asked of a snapshot no commit published is
-/// answered from that snapshot's data each time it is asked, and kept for none; the
+/// answered from that snapshot's data and kept by its own version alone (dictionary 3.0c;
+/// review r1 F1), so asked again of the same snapshot it is answered without a check; the
 /// published view's probes stay and answer it again. A probe the budget leaves unasked
 /// keeps no truth value (review r0 §5 item 4).
 #[test]
-fn unpublished_probes_are_answered_each_time_and_not_kept() {
+fn unpublished_probes_are_kept_by_their_own_version_alone() {
     let engine = engine(":ann :worksFor :acme .");
     let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
     let options = sharing(&ql);
@@ -310,12 +310,23 @@ fn unpublished_probes_are_answered_each_time_and_not_kept() {
         object: id("acme"),
         graph: TermId::DEFAULT_GRAPH,
     };
+    let unasked = || {
+        Arc::new(
+            QlRewriting::new(Closure { lists: true }).with_limits(Limits {
+                checks: 0,
+                ..Limits::default()
+            }),
+        )
+    };
     for (name, snapshot) in unpublished(&engine, &[(witness, false)]) {
-        for ask in 0..2 {
+        // Left unasked first, the version keeps nothing, so the next asks it.
+        let report = check(&snapshot, &sharing(&unasked()), &expected);
+        assert_eq!(report.checks, 0, "{name} snapshot, unasked");
+        for (ask, checks) in [(0, 1), (1, 0)] {
             let report = check(&snapshot, &options, &expected);
             assert_eq!(
                 (report.realised, report.checks),
-                (0, 1),
+                (0, checks),
                 "{name} snapshot, ask {ask}"
             );
         }
@@ -323,14 +334,97 @@ fn unpublished_probes_are_answered_each_time_and_not_kept() {
     }
     let report = check(&published, &options, &expected);
     assert_eq!((report.realised, report.checks), (1, 0));
-    let unasked = Arc::new(
-        QlRewriting::new(Closure { lists: true }).with_limits(Limits {
-            checks: 0,
-            ..Limits::default()
-        }),
-    );
+    let unasked = unasked();
     check(&published, &sharing(&unasked), &expected);
     assert!(kept_probes(&unasked).1.is_empty());
+}
+
+/// Review r1 F1 (dictionary 3.0c): a pending snapshot read again, as a store session's is,
+/// reads its schema once. Its first read compiles, or reuses a published TBox its schema
+/// matches; later reads of it scan no membership and give the same TBox, and the store's
+/// shared entries stay as they were. A new pending snapshot is a new version, read afresh.
+#[test]
+fn a_retained_pending_snapshot_reads_its_schema_once() {
+    for (data, gains, reuses) in [
+        // The memberless restriction gains a member: its own TBox.
+        ("", "ann", false),
+        // The restriction has one, and gets another: the published TBox.
+        (":m0 a _:restriction .", "ann", true),
+    ] {
+        let engine = engine(data);
+        let ql = QlRewriting::new(Closure { lists: true });
+        let published = engine.snapshot();
+        let original = ql.tbox(&published, None);
+        let before = kept_entries(&ql);
+        let member = membership(&published, gains, restriction(&published));
+        let mut tx = engine.transaction();
+        tx.insert_encoded(member);
+        let pending = tx.pending_snapshot();
+        let first = ql.tbox(&pending, None);
+        assert_eq!(Arc::ptr_eq(&original, &first), reuses, "{data:?}");
+        for read in 0..3 {
+            MEMBER_SCANS.set(0);
+            let again = ql.tbox(&pending, None);
+            assert!(Arc::ptr_eq(&first, &again), "{data:?}, read {read}");
+            assert_eq!(MEMBER_SCANS.get(), 0, "{data:?}, read {read}");
+        }
+        assert_eq!(kept_entries(&ql), before, "{data:?}");
+        MEMBER_SCANS.set(0);
+        ql.tbox(&tx.pending_snapshot(), None);
+        assert!(MEMBER_SCANS.get() > 0, "{data:?}: a new pending snapshot");
+    }
+}
+
+/// Dictionary 3.0c's required guard: views of one version with other equality modes (the
+/// canonical view of a pending snapshot) share its slot but never an entry. Each reads its
+/// own schema once, and answers as a fresh rewriting does.
+#[test]
+fn views_of_one_version_in_other_equality_modes_keep_their_own_entries() {
+    let engine = engine("");
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = sharing(&ql);
+    let published = engine.snapshot();
+    let member = membership(&published, "ann", restriction(&published));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(member);
+    let pending = tx.pending_snapshot();
+    let canonical = pending.with_canonical_equality();
+    assert_ne!(canonical.identity(), pending.identity());
+    // The fresh rewriting reads equal views of a version of their own.
+    let alike = tx.pending_snapshot();
+    let alike_canonical = alike.with_canonical_equality();
+    let expected = ["<http://example.org/ann>"];
+    for (view, same) in [(&pending, &alike), (&canonical, &alike_canonical)] {
+        let fresh = sharing(&Arc::new(QlRewriting::new(Closure { lists: true })));
+        let own = check(same, &fresh, &expected);
+        MEMBER_SCANS.set(0);
+        assert_eq!(check(view, &options, &expected), own);
+        assert!(MEMBER_SCANS.get() > 0, "the first read of each view");
+    }
+    for view in [&pending, &canonical, &pending] {
+        MEMBER_SCANS.set(0);
+        check(view, &options, &expected);
+        assert_eq!(MEMBER_SCANS.get(), 0, "a view read again");
+    }
+}
+
+/// What the TBox compiles to depends on the closure, so two rewritings with other closures
+/// reading one pending snapshot never get each other's TBox from its version.
+#[test]
+fn rewritings_with_other_closures_keep_their_own_tboxes_of_a_version() {
+    let engine = engine("");
+    let published = engine.snapshot();
+    let member = membership(&published, "ann", restriction(&published));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(member);
+    let pending = tx.pending_snapshot();
+    let rl = QlRewriting::new(Closure { lists: true });
+    let ql = QlRewriting::new(Closure { lists: false });
+    let on_rl = rl.tbox(&pending, None);
+    let on_ql = ql.tbox(&pending, None);
+    assert!(!Arc::ptr_eq(&on_rl, &on_ql));
+    assert!(Arc::ptr_eq(&on_rl, &rl.tbox(&pending, None)));
+    assert!(Arc::ptr_eq(&on_ql, &ql.tbox(&pending, None)));
 }
 
 /// A mask of a published snapshot is published (dictionary 3.0): changing only its
@@ -384,6 +478,8 @@ fn graph_restricted_readers_keep_no_probes() {
 /// - Their probes ask the materialised data, which differs (here the witness is only in the
 ///   view), so they're kept apart by the view's identity (`realised`'s lookup).
 #[test]
+// The DL bounds' own constructor (dictionary 3.0b): only they and their tests may call it.
+#[allow(clippy::disallowed_methods)]
 fn an_added_view_and_its_base_keep_their_own_probes() {
     let engine = engine(":other :knows :acme .");
     let base = engine.snapshot();
@@ -391,14 +487,16 @@ fn an_added_view_and_its_base_keep_their_own_probes() {
         base.lookup(NamedNodeRef::new_unchecked(&format!("{EX}{s}")).into())
             .unwrap()
     };
-    let witness = EncodedQuad {
+    let witness = nrese_engine::EncodedTriple {
         subject: id("ann"),
         predicate: id("worksFor"),
         object: id("acme"),
-        graph: TermId::DEFAULT_GRAPH,
     };
-    // The DL bounds' constructor replaces this once it exists (DICT2, 8 Nov).
-    let added = base.with_inferred_added(&[witness]);
+    // The view keeps its base's publication, so it may keep what it reads (3.0b).
+    let added = base
+        .with_inferred_derived_within(&[witness], &Arc::new(nrese_exec::Budget::unlimited()))
+        .unwrap();
+    assert!(added.shared_state().is_some());
     assert_ne!(added.identity(), base.identity());
     assert_eq!(added.asserted_identity(), base.asserted_identity());
     let expected = ["<http://example.org/ann>"];
