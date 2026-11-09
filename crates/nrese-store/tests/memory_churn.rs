@@ -109,11 +109,14 @@ impl Soak {
             "INSERT DATA {{ GRAPH <{SOAK}> {{ {} }} }}",
             self.some(5).join(" ")
         );
-        store.sessions().add(
-            &session,
-            None,
-            vec![StatementOp::Update(SparqlUpdateRequest::new(update))],
-        );
+        store
+            .sessions()
+            .add(
+                &session,
+                None,
+                vec![StatementOp::Update(SparqlUpdateRequest::new(update))],
+            )
+            .expect("room for the session's update");
         if self.rng.below(10) < 7 {
             let request = store.sessions().take(&session, None).expect("open");
             self.write(MutationCommand::Statements(StatementsRequest::new(

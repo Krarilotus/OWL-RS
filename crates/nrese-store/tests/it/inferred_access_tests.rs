@@ -1005,13 +1005,10 @@ fn a_session_read_follows_a_change_of_the_rules() {
     let store = store();
     let sessions = store.sessions();
     let id = sessions.begin(None).unwrap();
-    assert!(sessions.add(
-        &id,
-        None,
-        vec![StatementOp::Update(SparqlUpdateRequest::new(format!(
-            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:z a ex:Z }} }}"
-        )))]
-    ));
+    let insert = vec![StatementOp::Update(SparqlUpdateRequest::new(format!(
+        "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:z a ex:Z }} }}"
+    )))];
+    assert!(sessions.add(&id, None, insert).unwrap());
     let in_session = StatementsRequest {
         ops: sessions.pending(&id, None).unwrap(),
         session: Some(id.clone()),
