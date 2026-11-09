@@ -3,10 +3,14 @@
 //! cache keeps is charged to the query's budget while it is kept (D16-039): its table before it
 //! grows ([`ChargedMap`]) and each kept term's text ([`Grant`], [`Term::heap_bytes`]).
 //!
-//! A cache is never needed for an answer. Where the budget has no room for an entry, the cache
-//! lets go of everything it keeps, with its charge, and keeps nothing more for the rest of its
-//! life: the room goes to what the query must hold, and the query decodes each term again as
-//! it is needed, the same terms.
+//! A cache is never needed for an answer, so it gives way to what the query must hold:
+//! - It keeps a term only where, kept, it would hold no more than the room it leaves free
+//!   (sol-loop r1 S2), so what the query must hold later finds at least as much room as the
+//!   cache takes. A term that doesn't fit so is decoded again as it is needed.
+//! - Where the budget refuses an entry anyway, the cache lets go of everything it keeps, with
+//!   its charge, and keeps nothing more for the rest of its life.
+//!
+//! Either way the query decodes the same terms; only how often changes.
 
 use std::sync::Arc;
 
@@ -26,6 +30,8 @@ struct Kept {
     terms: ChargedMap<u64, Option<Term>>,
     /// After the table: fields drop in order, the terms freed before their charge goes.
     text: Grant,
+    /// What both draw from, for the room it leaves free.
+    budget: Arc<Budget>,
 }
 
 impl DecodeCache {
@@ -37,6 +43,7 @@ impl DecodeCache {
             kept: Some(Kept {
                 terms: ChargedMap::new(Arc::clone(budget)),
                 text: Grant::with_workers(Arc::clone(budget), workers),
+                budget: Arc::clone(budget),
             }),
             entries,
         }
@@ -47,8 +54,9 @@ impl DecodeCache {
         self.kept.as_ref()?.terms.get(&id)
     }
 
-    /// Keeps `term` for `id` where there is room: within `entries`, its text and the table's
-    /// growth charged first. Refused, the cache lets go of everything and keeps nothing more.
+    /// Keeps `term` for `id` where there is room: within `entries`, holding no more than it
+    /// leaves free, its text and the table's growth charged first. Refused, the cache lets go
+    /// of everything and keeps nothing more.
     pub(super) fn keep(&mut self, id: u64, term: &Option<Term>) {
         let Some(kept) = &mut self.kept else {
             return;
@@ -57,6 +65,14 @@ impl DecodeCache {
             return;
         }
         let text = term.as_ref().map_or(0, Term::heap_bytes);
+        // Kept, the cache would hold `held + text` and leave `remaining - text` free.
+        let held = kept.terms.charged() + kept.text.bytes();
+        let fits = held
+            .checked_add(text.saturating_mul(2))
+            .is_some_and(|needed| needed <= kept.budget.remaining());
+        if !fits {
+            return;
+        }
         if kept.text.take(text).is_err() {
             self.kept = None;
             return;
@@ -104,20 +120,38 @@ mod tests {
         assert_eq!(budget.used(), 0, "dropped, nothing stays charged");
     }
 
+    /// 100 terms of 4 KiB offered to a 64 KiB budget: the cache keeps those that leave at
+    /// least as much free as it holds, never half the budget or more, and is not refused.
     #[test]
-    fn a_full_budget_empties_the_cache_and_stops_it() {
+    fn a_cache_holds_no_more_than_it_leaves_free() {
         let limit = 64 << 10;
         let budget = Arc::new(Budget::new(limit));
         let mut cache = DecodeCache::new(&budget, 1 << 10, 1);
         for i in 0..100 {
             cache.keep(i as u64, &literal(i, 4096));
         }
+        assert!(cache.keeps(), "it gave way rather than being refused");
+        assert!(cache.get(0).is_some(), "the first terms are kept");
+        assert!(cache.get(99).is_none(), "the last don't fit so");
+        let kept = cache.kept.as_ref().expect("keeps");
+        let held = kept.terms.charged() + kept.text.bytes();
+        assert!(held <= limit / 2, "it holds {held} bytes of {limit}");
+        drop(cache);
+        assert_eq!(budget.used(), 0, "dropped, nothing stays charged");
+    }
+
+    /// Where the budget refuses what the cache would grow (its table, here: nothing decoded
+    /// has text), it lets go of everything and keeps nothing more.
+    #[test]
+    fn a_refused_cache_empties_and_stops() {
+        let budget = Arc::new(Budget::new(64));
+        let mut cache = DecodeCache::new(&budget, 1 << 10, 1);
+        cache.keep(0, &None);
         assert!(!cache.keeps(), "refused, the cache stops");
         assert_eq!(cache.get(0), None, "and keeps nothing");
         assert_eq!(budget.used(), 0, "its charge is gone");
-        assert!(budget.peak() <= limit);
-        cache.keep(1000, &literal(0, 16));
-        assert_eq!(cache.get(1000), None, "nothing more is kept");
+        cache.keep(1, &literal(0, 16));
+        assert_eq!(cache.get(1), None, "nothing more is kept");
     }
 
     #[test]

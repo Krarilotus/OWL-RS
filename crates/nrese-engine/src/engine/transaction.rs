@@ -472,7 +472,17 @@ impl<'e> Transaction<'e> {
     /// refused ([`crate::EngineError::MemoryLimit`]), nothing changes and nothing is interned.
     /// Without a budget attached it is [`Self::insert`].
     pub fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
-        self.pending.try_room_for_insert()?;
+        if self.pending.insert_may_grow() {
+            let dictionary = &self.engine.shared.dictionary;
+            match dictionary.lookup_quad_bounded(quad, u64::MAX) {
+                // Its terms are known: charged only where it is a new entry, not where it
+                // undoes a removal or is asserted already (sol-loop r1 S1).
+                Some(encoded) => return self.try_insert_encoded(encoded),
+                // A term new to the dictionary: the quad is new, and needs the room, charged
+                // before its terms are interned.
+                None => self.pending.try_room_for_insert()?,
+            }
+        }
         let encoded = self.engine.shared.dictionary.intern_quad(quad);
         self.try_insert_encoded(encoded)
     }
