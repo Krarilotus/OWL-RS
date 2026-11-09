@@ -47,7 +47,8 @@ use std::sync::Arc;
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::graph::{
-    Adjacency, closure_sizes_within, closure_within, reachable, transitive_closure_within,
+    Adjacency, Probes, closure_sizes_within, closure_within, reachable_within,
+    transitive_closure_within,
 };
 use nrese_exec::{Budget, BudgetExceeded, Charged, ChargedMap, Pool, Share, Stop};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
@@ -521,18 +522,6 @@ impl PathEvaluator<'_> {
         true
     }
 
-    /// A vector a producer that doesn't charge made ([`nrese_exec::graph`]'s closures),
-    /// charged now it has arrived; refused, freed, and the evaluator stops.
-    fn adopted<T>(&self, values: Vec<T>) -> Buf<'_, T> {
-        match self.buf().adopt_vec(values) {
-            Ok(values) => values,
-            Err(refused) => {
-                self.refuse(refused);
-                self.buf()
-            }
-        }
-    }
-
     /// The values of a bag, without their copies (a value may still come more than once).
     fn values<'e, T: Copy>(&'e self, bag: Bag<'e, T>) -> Buf<'e, T> {
         match bag {
@@ -598,20 +587,47 @@ impl PathEvaluator<'_> {
         ))
     }
 
-    /// One step of a search forwards over `path` from `node`: none once stopped, which
-    /// ends the search.
-    /// The search takes each end once, however many ways lead there.
-    fn step_from(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
-        if !self.stopped() {
-            out.extend_from_slice(&self.support_from(path, node));
+    /// The evaluator's stop as a search's: its refusal, or the query's cancellation.
+    fn halted(&self) -> Result<(), Stop> {
+        match self.refused.get() {
+            Some(refused) => Err(Stop::Memory(refused)),
+            None if self.stopped() => Err(Stop::Cancelled),
+            None => Ok(()),
         }
     }
 
-    /// [`Self::step_from`] backwards.
-    fn step_to(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
-        if !self.stopped() {
-            out.extend_from_slice(&self.support_to(path, node));
-        }
+    /// One step of a search over `path` from `node`, forwards (`forward`) or backwards: its
+    /// ends, in a buffer of the evaluation. Stopped before or while they were found (a refusal
+    /// cuts them short), the stop, which ends the search. The search takes each end once,
+    /// however many ways lead there.
+    fn ends_of(&self, path: &Path, node: u64, forward: bool) -> Result<Buf<'_, u64>, Stop> {
+        self.halted()?;
+        let ends = match forward {
+            true => self.support_from(path, node),
+            false => self.support_to(path, node),
+        };
+        self.halted()?;
+        Ok(ends)
+    }
+
+    /// The closure of `step` from `node` (`forward`) or into it: the nodes it reaches in one
+    /// or more steps, or zero or more with `include`, each once, in breadth-first order. The
+    /// search's buffers are charged to the evaluator's pool while it searches
+    /// ([`reachable_within`]; review r1 of the graph closure package, R1-F1): refused, the
+    /// evaluator's refusal; stopped, empty.
+    fn search(&self, step: &Path, node: u64, include: bool, forward: bool) -> Buf<'_, u64> {
+        self.closed(self.searched(node, include, |node| self.ends_of(step, node, forward)))
+    }
+
+    /// [`Self::search`] with each node's ends found by `ends`, and its stop returned.
+    fn searched<'e, S: std::ops::Deref<Target = [u64]>>(
+        &'e self,
+        node: u64,
+        include: bool,
+        ends: impl FnMut(u64) -> Result<S, Stop>,
+    ) -> Result<Buf<'e, u64>, Stop> {
+        self.halted()?;
+        reachable_within(node, include, Probes(ends), &self.pool, &self.cancelled())
     }
 
     /// The ends of `path` from `node`, for a set-valued path (a search's step, `p?`): each
@@ -832,18 +848,19 @@ impl PathEvaluator<'_> {
             return None;
         };
         let expanded = std::cell::Cell::new(0usize);
-        let reached = reachable(node, matches!(path, Path::ZeroOrMore(_)), |n, out| {
+        let reached = self.searched(node, matches!(path, Path::ZeroOrMore(_)), |n| {
             if expanded.get() < budget {
                 expanded.set(expanded.get() + 1);
-                match forward {
-                    true => self.step_from(step, n, out),
-                    false => self.step_to(step, n, out),
-                }
+                self.ends_of(step, n, forward)
             } else {
+                // Past the budget: no more nodes expanded, and no estimate.
                 expanded.set(budget + 1);
+                Ok(self.buf())
             }
         });
-        (expanded.get() <= budget && self.refused.get().is_none()).then_some(reached.len())
+        // Stopped or refused: no estimate (the planner's own evaluator, nothing the query keeps).
+        let reached = reached.ok()?.len();
+        (expanded.get() <= budget && self.refused.get().is_none()).then_some(reached)
     }
 
     /// Ends reachable from `start` (a bag), or the charge refused while they were found.
@@ -892,14 +909,12 @@ impl PathEvaluator<'_> {
                     |p, values| self.stream(p, values, Some(start), None, |(_, _, o)| o),
                 );
             }
-            Path::OneOrMore(p) => {
-                self.adopted(reachable(start, false, |n, out| self.step_from(p, n, out)))
-            }
+            Path::OneOrMore(p) => self.search(p, start, false, true),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(start) {
                     return Bag::Copies(self.buf());
                 }
-                self.adopted(reachable(start, true, |n, out| self.step_from(p, n, out)))
+                self.search(p, start, true, true)
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(start) {
@@ -1107,14 +1122,12 @@ impl PathEvaluator<'_> {
                     |p, values| self.stream(p, values, None, Some(end), |(s, _, _)| s),
                 );
             }
-            Path::OneOrMore(p) => {
-                self.adopted(reachable(end, false, |n, out| self.step_to(p, n, out)))
-            }
+            Path::OneOrMore(p) => self.search(p, end, false, false),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(end) {
                     return Bag::Copies(self.buf());
                 }
-                self.adopted(reachable(end, true, |n, out| self.step_to(p, n, out)))
+                self.search(p, end, true, false)
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(end) {
@@ -1190,12 +1203,10 @@ impl PathEvaluator<'_> {
                 if start == end {
                     self.is_node(start)
                 } else {
-                    reachable(start, false, |n, out| self.step_from(p, n, out)).contains(&end)
+                    self.search(p, start, false, true).contains(&end)
                 }
             }
-            Path::OneOrMore(p) => {
-                reachable(start, false, |n, out| self.step_from(p, n, out)).contains(&end)
-            }
+            Path::OneOrMore(p) => self.search(p, start, false, true).contains(&end),
             Path::ZeroOrOne(p) => {
                 if start == end {
                     self.is_node(start)

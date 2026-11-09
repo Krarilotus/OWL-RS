@@ -2,13 +2,16 @@
 //! (`p+`, `p*`) and, in the reasoner, for hierarchies and transitive properties.
 //!
 //! [`Adjacency`] is a compressed sparse row index over `(source, target)` edges: sorted
-//! targets per source, found by binary search over the distinct sources. [`reachable`]
-//! walks it breadth-first with a visited set, so each node is expanded once: set semantics,
-//! as SPARQL requires for `*` and `+`, and cycles terminate.
+//! targets per source, found by binary search over the distinct sources.
+//! [`reachable_within`] and [`closure_within`] walk it, or a bound start's index probes
+//! ([`Successors`]), breadth-first with a set of the nodes seen, so each node is expanded once:
+//! set semantics, as SPARQL requires for `*` and `+`, and cycles terminate.
 //!
-//! The closures ([`transitive_closure_within`], [`closure_sizes_within`], [`closure_within`])
-//! draw every buffer from the caller's [`Pool`]: their output, quadratic in the relation's
-//! size where it is one strongly connected component (a 1,024-node cycle: 1,048,576 pairs),
+//! The searches and closures ([`reachable_within`], [`closure_within`],
+//! [`transitive_closure_within`], [`closure_sizes_within`]) draw every buffer from the caller's
+//! [`Pool`]: a search's nodes seen and order, as long as a chain it walks; a closure's
+//! output, quadratic in the relation's size where it is one strongly connected component (a
+//! 1,024-node cycle: 1,048,576 pairs),
 //! and their reach sets, quadratic in the components where they form a chain, are charged
 //! before they are allocated, and freed before they are released (the code-quality triage's
 //! S-03; the executor memory stack's fix check r4, R4-F1). They poll their stop once per
@@ -16,13 +19,9 @@
 
 use std::ops::Deref;
 
-use hashbrown::HashSet;
-
 use crate::stop::{Stop, Ticker};
 use crate::table::IdTable;
 use crate::{Budget, BudgetExceeded, Charged, ChargedMap, Pool, Share};
-
-type Hasher = foldhash::fast::FixedState;
 
 /// A buffer of a closure, charged to the caller's pool.
 pub type Buf<'p, T, B> = Charged<T, Share<'p, B>>;
@@ -97,38 +96,119 @@ impl Adjacency {
     }
 }
 
+/// A node's successors, as a search walks them: an [`Adjacency`]'s, or index probes for a
+/// bound start ([`Probes`]).
+pub trait Successors {
+    /// Calls `visit` with each successor of `node` (a successor may come more than once); the
+    /// first error ends the walk and is returned.
+    fn each(&mut self, node: u64, visit: impl FnMut(u64) -> Result<(), Stop>) -> Result<(), Stop>;
+}
+
+impl Successors for &Adjacency {
+    fn each(
+        &mut self,
+        node: u64,
+        mut visit: impl FnMut(u64) -> Result<(), Stop>,
+    ) -> Result<(), Stop> {
+        self.neighbours(node)
+            .iter()
+            .try_for_each(|&target| visit(target))
+    }
+}
+
+/// Successors found by a function of the node: `Ok` with them (a buffer the caller charged),
+/// or the stop that ends the search.
+pub struct Probes<F>(pub F);
+
+impl<F, S> Successors for Probes<F>
+where
+    F: FnMut(u64) -> Result<S, Stop>,
+    S: Deref<Target = [u64]>,
+{
+    fn each(
+        &mut self,
+        node: u64,
+        mut visit: impl FnMut(u64) -> Result<(), Stop>,
+    ) -> Result<(), Stop> {
+        let successors = (self.0)(node)?;
+        successors.iter().try_for_each(|&target| visit(target))
+    }
+}
+
 /// Nodes reachable from `start` in one or more steps (`include_start == false`) or zero or
-/// more (`include_start == true`), each once, in breadth-first order. `neighbours` gives a
-/// node's successors: an [`Adjacency`], or index probes for a bound start.
-pub fn reachable(
+/// more (`include_start == true`), each once, in breadth-first order. Every buffer that grows
+/// with the nodes reached (the nodes seen, the order, the frontiers) is charged to `pool`
+/// before it grows, and `stop` polled once per [`crate::POLL_UNITS`] nodes expanded and
+/// successors walked: a bound start's closure over a long chain is as long as the chain
+/// (review r1 of the graph closure package, R1-F1). [`Stop::Memory`] where a charge was
+/// refused, [`Stop::Cancelled`] where `stop` fired, or what `successors` returned; then
+/// everything it made is freed.
+pub fn reachable_within<'p, B: Deref<Target = Budget>>(
     start: u64,
     include_start: bool,
-    mut neighbours: impl FnMut(u64, &mut Vec<u64>),
-) -> Vec<u64> {
-    let mut visited: HashSet<u64, Hasher> = HashSet::with_hasher(Hasher::default());
-    let mut order = Vec::new();
-    if include_start {
-        visited.insert(start);
-        order.push(start);
-    }
-    let mut frontier = vec![start];
-    let mut next = Vec::new();
-    let mut buffer = Vec::new();
-    while !frontier.is_empty() {
-        for &node in &frontier {
-            buffer.clear();
-            neighbours(node, &mut buffer);
-            for &target in &buffer {
-                if visited.insert(target) {
-                    order.push(target);
-                    next.push(target);
-                }
-            }
+    successors: impl Successors,
+    pool: &'p Pool<B>,
+    stop: StopFn<'_>,
+) -> Result<Buf<'p, u64, B>, Stop> {
+    let ticker = Ticker::new(stop)?;
+    let mut order = Charged::in_pool(pool);
+    search(
+        [start],
+        include_start,
+        successors,
+        pool,
+        &ticker,
+        |_, node| order.push(node),
+    )?;
+    ticker.finish()?;
+    Ok(order)
+}
+
+/// A breadth-first search from each of `starts` over `successors`, `found(start, node)` for
+/// each node reached from it in one or more steps, or zero or more with `reflexive`, each
+/// once per start. The nodes seen (stamped with the last start they were reached from, so
+/// nothing is cleared between starts) and the frontiers are charged to `pool` before they
+/// grow; `ticker` ticks once per node expanded and once per successor walked.
+fn search<'p, B: Deref<Target = Budget>>(
+    starts: impl IntoIterator<Item = u64>,
+    reflexive: bool,
+    mut successors: impl Successors,
+    pool: &'p Pool<B>,
+    ticker: &Ticker<StopFn<'_>>,
+    mut found: impl FnMut(u64, u64) -> Result<(), BudgetExceeded>,
+) -> Result<(), Stop> {
+    let mut seen: ChargedMap<u64, usize, Share<'p, B>> = ChargedMap::in_pool(pool);
+    let mut mark = |node: u64, start: usize| {
+        let (at, new) = seen.get_or_insert_with(node, || start)?;
+        let first = new || *at != start;
+        *at = start;
+        Ok::<_, BudgetExceeded>(first)
+    };
+    let mut frontier: Buf<'p, u64, B> = Charged::in_pool(pool);
+    let mut next: Buf<'p, u64, B> = Charged::in_pool(pool);
+    for (i, start) in starts.into_iter().enumerate() {
+        if reflexive {
+            mark(start, i)?;
+            found(start, start)?;
         }
-        std::mem::swap(&mut frontier, &mut next);
-        next.clear();
+        frontier.push(start)?;
+        while !frontier.is_empty() {
+            for k in 0..frontier.len() {
+                ticker.tick(1)?;
+                successors.each(frontier[k], |target| {
+                    ticker.tick(1)?;
+                    if mark(target, i)? {
+                        found(start, target)?;
+                        next.push(target)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            std::mem::swap(&mut frontier, &mut next);
+            next.clear();
+        }
     }
-    order
+    Ok(())
 }
 
 /// Every `(start, end)` pair of the closure from each of `starts` over `adjacency`: `end`
@@ -163,38 +243,9 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
 ) -> Result<Buf<'p, (u64, u64), B>, Stop> {
     let ticker = Ticker::new(stop)?;
     let mut out = Charged::in_pool(pool);
-    // Per node, the last start it was reached from: a stamp, so nothing is cleared between
-    // starts.
-    let mut seen: ChargedMap<u64, usize, Share<'p, B>> = ChargedMap::in_pool(pool);
-    let mark = |seen: &mut ChargedMap<u64, usize, Share<'p, B>>, node: u64, start: usize| {
-        let (at, new) = seen.get_or_insert_with(node, || start)?;
-        let first = new || *at != start;
-        *at = start;
-        Ok::<_, BudgetExceeded>(first)
-    };
-    let mut frontier: Buf<'p, u64, B> = Charged::in_pool(pool);
-    let mut next: Buf<'p, u64, B> = Charged::in_pool(pool);
-    for (i, start) in starts.into_iter().enumerate() {
-        if reflexive {
-            mark(&mut seen, start, i)?;
-            out.push((start, start))?;
-        }
-        frontier.push(start)?;
-        while !frontier.is_empty() {
-            for k in 0..frontier.len() {
-                ticker.tick(1)?;
-                for &target in adjacency.neighbours(frontier[k]) {
-                    ticker.tick(1)?;
-                    if mark(&mut seen, target, i)? {
-                        out.push((start, target))?;
-                        next.push(target)?;
-                    }
-                }
-            }
-            std::mem::swap(&mut frontier, &mut next);
-            next.clear();
-        }
-    }
+    search(starts, reflexive, adjacency, pool, &ticker, |start, end| {
+        out.push((start, end))
+    })?;
     ticker.finish()?;
     Ok(out)
 }
@@ -980,6 +1031,93 @@ mod tests {
         let done = done.load(Ordering::Relaxed);
         assert!(stopped, "never stopped, {done} units done");
         assert!(done <= 2 * crate::POLL_UNITS as usize, "{done} units");
+    }
+
+    /// Spec (SPARQL 1.1 §9.3: `p+` and `p*` from a bound start are the nodes reached in one or
+    /// more, or zero or more, steps, each once; review r1 of the graph closure package, R1-F1):
+    /// a search from one start answers the fixpoint's ends of that start, over an
+    /// [`Adjacency`] and over index probes alike, each node once, in the same order.
+    #[test]
+    fn a_search_from_one_start_answers_the_fixpoint() {
+        let mut state = 23u64;
+        let budget = Budget::unlimited();
+        let pool = Pool::new(&budget);
+        for _ in 0..200 {
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % 9
+            };
+            let edges: Vec<(u64, u64)> = (0..next() * 2).map(|_| (next(), next())).collect();
+            let adjacency = Adjacency::new(edges.clone());
+            for (start, reflexive) in (0..9).flat_map(|s| [(s, false), (s, true)]) {
+                let expected: Vec<u64> = naive_closure(&edges, &[start], reflexive)
+                    .into_iter()
+                    .map(|(_, end)| end)
+                    .collect();
+                let walked = reachable_within(start, reflexive, &adjacency, &pool, &|| false)
+                    .unwrap()
+                    .to_vec();
+                let probes = Probes(|node| Ok::<_, Stop>(adjacency.neighbours(node).to_vec()));
+                let probed = reachable_within(start, reflexive, probes, &pool, &|| false)
+                    .unwrap()
+                    .to_vec();
+                assert_eq!(walked, probed, "{edges:?} from {start}");
+                let mut sorted = walked.clone();
+                sorted.sort_unstable();
+                assert_eq!(
+                    sorted, expected,
+                    "{edges:?} from {start} reflexive={reflexive}"
+                );
+            }
+        }
+        drop(pool);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A chain `0 → 1 → … → n` probed one node at a time.
+    fn chain_probes(n: u64) -> Probes<impl FnMut(u64) -> Result<Vec<u64>, Stop>> {
+        Probes(move |node| Ok(if node < n { vec![node + 1] } else { Vec::new() }))
+    }
+
+    /// Spec (stop.rs, W1; R1-F1): a search from one start polls its stop while it walks. Over
+    /// a 1,000,000-node chain, a stop that fires at its second poll ends it within
+    /// 2 × `POLL_UNITS` nodes expanded (a node and its successor are a unit each). Searched
+    /// without a stop, it walked the whole chain.
+    #[test]
+    fn a_search_from_one_start_stops_while_it_walks() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || polls.fetch_add(1, Ordering::Relaxed) >= 1;
+        let expanded = std::cell::Cell::new(0usize);
+        let budget = Budget::unlimited();
+        let pool = Pool::new(&budget);
+        let mut chain = chain_probes(1_000_000);
+        let counted = Probes(|node| {
+            expanded.set(expanded.get() + 1);
+            (chain.0)(node)
+        });
+        let reached = reachable_within(0, false, counted, &pool, &stop);
+        assert!(matches!(reached, Err(Stop::Cancelled)), "{reached:?}");
+        let expanded = expanded.get();
+        assert!(
+            expanded <= 2 * crate::POLL_UNITS as usize,
+            "{expanded} nodes expanded"
+        );
+    }
+
+    /// Spec (R1-F1): a search's buffers (the nodes seen, the order, the frontiers) are charged
+    /// before they grow: over a 100,000-node chain, 800 KB of order alone, under a 64 KiB
+    /// budget, it is refused, and holds nothing once it is dropped.
+    #[test]
+    fn a_search_from_one_start_is_refused_past_its_budget() {
+        let small = Budget::new(64 << 10);
+        let pool = Pool::new(&small);
+        let reached = reachable_within(0, false, chain_probes(100_000), &pool, &|| false);
+        assert!(matches!(reached, Err(Stop::Memory(_))), "{reached:?}");
+        drop(reached);
+        drop(pool);
+        assert_eq!(small.used(), 0);
     }
 
     /// The SCC kernel: components, each once, sinks first.
