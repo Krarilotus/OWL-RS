@@ -217,10 +217,7 @@ impl<'e> Transaction<'e> {
     ) -> EngineResult<Snapshot> {
         let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
         let asserted = self.pending.asserted();
-        let lists = 2
-            * (asserted.inserts.len().max(4) + asserted.deletes.len().max(4))
-            * std::mem::size_of::<EncodedQuad>();
-        scratch.charge(self.pending.over_gone_bound(hidden) + lists)?;
+        scratch.charge(self.pending.over_bound(hidden))?;
         let seen = view.version();
         let gone = self.pending.over_gone(&seen.inferred, hidden);
         let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
