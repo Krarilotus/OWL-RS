@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use nrese_engine::{
-    EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId,
+    CountedSnapshot, EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, TermId,
     Transaction,
 };
 use nrese_exec::Budget;
@@ -21,8 +21,13 @@ use crate::lists::ListDiagnostic;
 /// and inferred, any graph) without the pending deletes, plus the pending inserts, indexed
 /// in memory. Scanning the transaction itself would filter every pending insert on each
 /// lookup.
+///
+/// The committed state is read only counted ([`CountedSnapshot`]): every read's work in
+/// the engine (its runs, merge steps, deleted copies, equality copies and class build)
+/// counts on the reading task's poller, so a stop is seen within its interval whatever the
+/// engine passes over (REAS-3, sweeps SW016–SW019).
 pub struct EngineBase<'a> {
-    snapshot: &'a Snapshot,
+    snapshot: CountedSnapshot,
     inserts: MemoryBase,
     deletes: HashSet<EncodedQuad>,
     /// The ruleset's axioms (sorted): they count as asserted, so no deletion retracts them.
@@ -33,7 +38,7 @@ impl<'a> EngineBase<'a> {
     pub fn new(tx: &'a Transaction<'_>, axioms: &'a [Triple]) -> Self {
         let inserts: Vec<Triple> = tx.inserted().map(triple).collect();
         Self {
-            snapshot: tx.base(),
+            snapshot: tx.base().counted(),
             inserts: MemoryBase::new(&inserts, &[]),
             deletes: tx.deleted().collect(),
             axioms,
@@ -50,14 +55,17 @@ impl<'a> EngineBase<'a> {
             return Err(Stopped);
         }
         let [s, p, o] = fact.map(Some);
-        Ok(self
+        // Its work in the engine counted too (REAS-3, SW016).
+        let first = self
             .snapshot
-            .quads_for_pattern_in(
+            .quads(
                 ReadModel::Materialised,
                 &pattern([s, p, o], GraphSelector::Any),
+                &|n| poll.visit(n),
             )
             .next()
-            .is_some())
+            .transpose()?;
+        Ok(first.is_some())
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
@@ -70,26 +78,40 @@ impl<'a> EngineBase<'a> {
         probe: Probe<'_, '_>,
     ) -> Result<bool, Stopped> {
         let [s, p, o] = fact.map(Some);
-        let found = self
+        // The engine's work below each copy counted too (REAS-3, SW017).
+        let visit = |n| probe.visited(n);
+        for quad in self
             .snapshot
-            .quads_for_pattern_in(model, &pattern([s, p, o], GraphSelector::Any))
-            .take_while(|_| probe.units(1))
-            .any(|quad| !self.deletes.contains(&quad));
-        if !found {
-            probe.ended()?;
+            .quads(model, &pattern([s, p, o], GraphSelector::Any), &visit)
+        {
+            let quad = quad?;
+            if !probe.units(1) {
+                return Err(Stopped);
+            }
+            if !self.deletes.contains(&quad) {
+                return Ok(true);
+            }
         }
-        Ok(found)
+        Ok(false)
     }
 }
 
 /// Reads count as [`Base`] says: each quad a scan visits is a position, the deleted ones it
-/// passes over skipped, and so is each axiom it checks; the inserts' on their store's.
+/// passes over skipped, and so is each axiom it checks; the inserts' on their store's. The
+/// engine's own work below each quad counts on the same poller ([`CountedSnapshot`]); a scan
+/// it stopped ends, which the scan's caller reads as stopped ([`Poller::ended`]).
 impl VisitsBase for EngineBase<'_> {
     fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
-        {
+        let poll = visit.poller();
+        let reads = |n| poll.visit(n);
+        for quad in self.snapshot.quads(
+            ReadModel::Materialised,
+            &pattern(bound, GraphSelector::Any),
+            &reads,
+        ) {
+            let Ok(quad) = quad else {
+                return;
+            };
             let going = match self.deletes.contains(&quad) {
                 true => visit.skip(),
                 false => visit.fact(triple(quad)),
@@ -106,12 +128,11 @@ impl VisitsBase for EngineBase<'_> {
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         let committed = self
             .snapshot
-            .count_in_visiting(
+            .count(
                 ReadModel::Materialised,
                 &pattern(bound, GraphSelector::Any),
-                &mut |n| probe.visited(n),
-            )
-            .ok_or(Stopped)?
+                &|n| probe.visited(n),
+            )?
             .at_least();
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
@@ -132,10 +153,16 @@ impl VisitsBase for EngineBase<'_> {
     }
 
     fn visit_asserted(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Asserted, &pattern(bound, GraphSelector::Any))
-        {
+        let poll = visit.poller();
+        let reads = |n| poll.visit(n);
+        for quad in self.snapshot.quads(
+            ReadModel::Asserted,
+            &pattern(bound, GraphSelector::Any),
+            &reads,
+        ) {
+            let Ok(quad) = quad else {
+                return;
+            };
             let going = match self.deletes.contains(&quad) {
                 true => visit.skip(),
                 false => visit.fact(triple(quad)),
@@ -748,6 +775,7 @@ mod tests {
     /// The most work a read may do in the engine between two asks of its stop: `POLL_UNITS`
     /// counted units plus one run of at most `POLL_UNITS` in progress (REAS-2's invariant;
     /// REAS-3 design note, "Red witnesses first").
+    #[cfg(debug_assertions)]
     const LARGEST_GAP: u64 = 2 * nrese_exec::POLL_UNITS as u64;
 
     /// REAS-3, group E (sweep SW013). Spec (design note's invariant: a unit is each copy an
@@ -757,6 +785,7 @@ mod tests {
     /// (and after the last one) the engine makes at most `LARGEST_GAP` of them. The engine
     /// builds a quad's whole product before it hands on the first copy, unseen by the stop.
     #[test]
+    #[cfg(debug_assertions)]
     fn an_engine_base_scan_makes_equality_copies_within_its_poll_interval() {
         use crate::witness::EngineGaps;
         use nrese_engine::witness::Site;
@@ -811,6 +840,7 @@ mod tests {
     /// A cold build scans every `sameAs` statement before the read's first step, unseen by the
     /// scan's count.
     #[test]
+    #[cfg(debug_assertions)]
     fn an_engine_base_scan_builds_equality_classes_within_its_poll_interval() {
         use crate::witness::EngineGaps;
         use nrese_engine::witness::Site;
@@ -867,6 +897,7 @@ mod tests {
     /// steps. The engine passes the deleted copies inside one `next`, unseen by the probe's
     /// count.
     #[test]
+    #[cfg(debug_assertions)]
     fn an_engine_base_probe_passes_committed_deletions_within_its_poll_interval() {
         use crate::witness::EngineGaps;
         use nrese_engine::witness::Site;
@@ -919,6 +950,7 @@ mod tests {
     /// read searches at most `LARGEST_GAP` runs. A scan's construction searches every run
     /// before its first step, unseen by the probe's count.
     #[test]
+    #[cfg(debug_assertions)]
     fn an_engine_base_probe_searches_the_runs_within_its_poll_interval() {
         use crate::witness::EngineGaps;
         use nrese_engine::witness::Site;

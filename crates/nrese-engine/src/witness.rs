@@ -1,12 +1,19 @@
 //! Test-only counters of the work producers do (REAS-2 fix check r1, attack list B10). A
 //! stopped poller doesn't ask its stop again, so the work a read does after a stop can't be
 //! seen from the stop; each counter counts it at the producer that does it, on the thread
-//! that does it. The module and every use of it are compiled only for this crate's tests or
+//! that does it. The module and every use of it are compiled only for this crate's tests or,
 //! with the `witness` feature, which other crates' tests take as a dev-dependency (REAS-3: an
-//! adapter's read does its work here): a use outside them doesn't compile in the library, and
-//! product builds carry none.
+//! adapter's read does its work here), in a debug build: a use outside them doesn't compile in
+//! the library. A dev-dependency's features reach that crate's examples too, `perf_lab` among
+//! them, which every count and timing job builds; those builds are release builds, so they carry
+//! none ([`MARK`] tells: the count jobs check a release binary doesn't hold it).
 
 use std::cell::Cell;
+
+/// In every build that has the counters, and only there: a count job's check that a release
+/// binary carries none looks for these bytes.
+#[used]
+pub static MARK: [u8; 24] = *b"nrese-engine-witness-on\0";
 
 /// What a counter counts.
 #[derive(Clone, Copy)]

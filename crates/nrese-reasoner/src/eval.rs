@@ -1274,8 +1274,8 @@ pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
 /// fix check r1, rule 2). A leaf that answers a value (whether a fact holds, how many
 /// matches) answers this instead once its poller has stopped, and the loop around it ends
 /// with `?`, its partial temporaries dropped; each stage maps it to its own cancellation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stopped;
+/// The engine's counted reads answer the same type ([`nrese_engine::visit`]; REAS-3).
+pub use nrese_engine::Stopped;
 
 /// What a task polls a [`Stop`] with: nrese-exec's [`Ticker`](nrese_exec::Ticker) over it,
 /// one unit per unit of work attempted, and whether it has fired. One per morsel, check
@@ -1337,6 +1337,15 @@ impl<'a> Poller<'a> {
     #[inline]
     pub fn tick(&self) -> bool {
         self.attempt(1)
+    }
+
+    /// A counted engine read's visitor on this poller ([`nrese_engine::visit`]; REAS-3): the
+    /// engine's `n` units of work counted before it does them (it counts in runs of at most
+    /// `POLL_UNITS`), false once the stop has fired; `visit(0)` counts nothing and tells
+    /// whether it has. Use as `&|n| poll.visit(n)`.
+    #[inline]
+    pub fn visit(&self, units: u64) -> bool {
+        !self.attempt(usize::try_from(units).unwrap_or(usize::MAX))
     }
 
     /// Counts `units` of attempted work, whether it delivers anything or not (a search, a
