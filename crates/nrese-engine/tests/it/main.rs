@@ -12,6 +12,7 @@ mod durability_tests;
 mod engine_tests;
 mod index_encoding_tests;
 mod inferred_stack_tests;
+mod private_search_tests;
 mod replication_tests;
 mod text_scope_tests;
 mod vector_tests;
