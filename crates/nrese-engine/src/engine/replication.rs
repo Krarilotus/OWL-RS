@@ -802,6 +802,7 @@ mod tests {
                 content: current.content,
                 asserted_content: current.asserted_content,
                 canonical: Default::default(),
+                own: Default::default(),
             });
         let mut records = decoded(&batch.frames);
         records.truncate(2);

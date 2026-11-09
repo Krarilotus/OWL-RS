@@ -323,6 +323,7 @@ fn canonical_version(
         // Its asserted stack renamed to representatives: not the stored ids.
         asserted_content: super::AssertedIdentity::fresh(),
         canonical: Default::default(),
+        own: Default::default(),
     });
     Ok(Some(View(Some(Arc::new(ViewData {
         version,

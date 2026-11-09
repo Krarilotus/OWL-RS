@@ -234,6 +234,7 @@ impl Durable {
                     dictionary_len: 0,
                     equality: Default::default(),
                     canonical: Default::default(),
+                    own: Default::default(),
                 }
             }
             None => Version::empty(),
