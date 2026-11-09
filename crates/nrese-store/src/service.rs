@@ -198,6 +198,12 @@ impl StoreService {
             );
         }
         let before = engine.snapshot().revision();
+        // At the revision the engine recovered, before anything commits (the ontology's
+        // preload may): its readmissions are in effect only where the store holds theirs.
+        let quarantine = crate::quarantine::Quarantine::open(
+            (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
+            before,
+        )?;
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
         let settings = crate::query_executor::StoreSettings {
@@ -221,9 +227,6 @@ impl StoreService {
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
             std::sync::Arc::clone(&unavailable),
-        )?;
-        let quarantine = crate::quarantine::Quarantine::open(
-            (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
         )?;
         // The support graph sets and restricted views draw on the memory the queries do,
         // as the canonical views.
@@ -453,7 +456,18 @@ impl StoreService {
             })
     }
 
+    /// Forgets what the inferred stack is exact for, taking the writer slot to do so: no
+    /// rematerialisation certifies it meanwhile. Never call it under the slot (it isn't
+    /// reentrant): a holder calls [`Self::invalidate_held`].
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
+        let tx = self.engine.transaction();
+        self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
+    }
+
+    /// [`Self::invalidate_reasoning`] by a holder of the writer slot, before a commit that
+    /// doesn't maintain the inferences: the certificate changes only between commits (the Q06
+    /// remainder's invariant C), so no rematerialisation can certify data this write changes.
+    pub(crate) fn invalidate_held(&self, _writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
         self.settings
             .equality_closed
@@ -480,7 +494,13 @@ impl StoreService {
         Ok(())
     }
 
-    fn record_reasoning(&self, state: crate::ReasoningState) -> StoreResult<()> {
+    /// Certifies `state` for the inferred stack just published, still under the writer slot
+    /// of its publication ([`nrese_engine::Finished`]): no other write comes between them.
+    fn record_reasoning(
+        &self,
+        _writer: nrese_engine::WriterHeld<'_>,
+        state: crate::ReasoningState,
+    ) -> StoreResult<()> {
         self.note_equality(&state);
         let text = state.to_text();
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
@@ -501,9 +521,9 @@ impl StoreService {
 
     /// Empties the inferred stack (reasoning switched off), forgetting the marker.
     pub fn clear_inferred(&self) -> StoreResult<u64> {
-        self.invalidate_reasoning()?;
-        self.engine.set_equality(None);
         let rematerialisation = self.engine.rematerialisation();
+        self.invalidate_held(rematerialisation.writer())?;
+        self.engine.set_equality(None);
         if rematerialisation.base().len_in(ReadModel::Inferred) == 0 {
             return Ok(0);
         }
@@ -1648,8 +1668,8 @@ impl StoreService {
         command: &MutationCommand,
         requester: &crate::Requester,
     ) -> StoreResult<MutationCommitReport> {
-        self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
+        self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))?;
         let cancellation = CancellationToken::new();
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
@@ -1707,11 +1727,17 @@ impl StoreService {
         request: &BulkLoadRequest,
         progress: &crate::LoadProgress,
     ) -> StoreResult<BulkLoadReport> {
-        self.invalidate_reasoning()?;
-        #[cfg(test)]
-        hooks::run(&hooks::AFTER_INVALIDATION);
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
-        bulk_load(&self.engine, request, progress, invalid, &self.quarantine)
+        // Cleared under the load's writer slot, before it commits (invariant C).
+        let invalidate = |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer);
+        bulk_load(
+            &self.engine,
+            request,
+            progress,
+            invalid,
+            &self.quarantine,
+            &invalidate,
+        )
     }
 
     /// Builds the query planner's statistics of the store as it is now and saves them
@@ -1990,19 +2016,25 @@ impl StoreService {
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
-        let summary = rematerialisation.finish(closure.inferred)?;
+        // Published with the writer slot still held: certified before any other write.
+        let finished = rematerialisation.finish_held(closure.inferred)?;
+        let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
         #[cfg(test)]
         hooks::run(&hooks::AFTER_PUBLICATION);
         // From here the new inferences are published: a failure says so.
-        self.record_reasoning(crate::ReasoningState::of_with(
-            rules,
-            self.config.hide_unnamed_classes,
-            self.config.equality_compact,
-            violations,
-        ))
+        self.record_reasoning(
+            finished.writer(),
+            crate::ReasoningState::of_with(
+                rules,
+                self.config.hide_unnamed_classes,
+                self.config.equality_compact,
+                violations,
+            ),
+        )
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        drop(finished);
         if violations > 0 {
             tracing::error!(
                 ruleset = %rules.name(),

@@ -65,11 +65,13 @@ the fixed text.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
   `readmitted` with the commit's revision, or `discarded`; when; the repairs; the text
   admitted where it isn't the quarantined one; a note). On open, an incomplete final
-  record is logged and truncated; a complete last record missing its newline gets a
-  synced delimiter before any append. Earlier complete records are kept. A re-admission's
-  RDF commit may have landed before its resolution record, leaving the statement listed
-  open although its data is in. Commit/journal atomicity and retry duplication, including
-  fresh blank nodes, are separate durability work.
+  record is logged and truncated; a complete last record missing its newline (or followed
+  only by zero bytes, a crash during that repair) gets a synced delimiter before any
+  append. Earlier complete records are kept. A `readmitted` record is in effect only where
+  the store holds its revision: one past the revision the engine recovered (its commit
+  never durable, lost under `OsBuffered`, or an older image under this directory) is open
+  again, and the log is rewritten without it (aside, synced, renamed) before anything
+  commits, so a later commit at that revision can't bring it back.
 
 Both survive restarts; checkpoints and the WAL don't touch them. Image backups and
 restores carry the engine's files only, as for the namespaces: a restored store starts
@@ -87,8 +89,18 @@ document (its directives, its TriG block, the text kept or the fix given, the re
 asked for applied in order), parses it (still invalid: an error, the statement stays
 open), and applies it as `MutationCommand::Statements` (an `Add` of that payload, into the
 load's graph for a triple format) through `MutationPipeline::apply`: the same gates,
-access control and commit as any write. Committed, the resolution is recorded with the
-revision; refused by a gate, the statement stays open. One resolution per statement.
+access control and commit as any write. Refused by a gate, the statement stays open. One
+resolution per statement.
+
+The resolution and the commit are one outcome, keyed by the revision. The resolution is
+the commit's note (`Transaction::note_commit`): appended and synced under the writer slot
+once the revision is fixed, before any byte of the commit's record is in the log. A note
+that fails takes its bytes back and refuses the commit; a record that fails after it
+poisons the log, so no other commit takes that revision, and the statement is undecided
+until the next open. With the check at open (§3), a re-admission stopped anywhere is in
+the data once or not at all, and resolved exactly when it is in: retrying one, fresh blank
+nodes included, never makes a second copy. A commit that publishes nothing (the statement
+was in the data already) is recorded after it.
 
 Repairs (`Repair`), on request only:
 

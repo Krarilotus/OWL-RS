@@ -26,6 +26,8 @@ thread_local! {
     /// The files this thread synced through `durability::place`, in order.
     pub(crate) static SYNCED: std::cell::RefCell<Vec<std::path::PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// A commit record's write to the log fails, after its note ([`crate::Transaction::note_commit`]).
+    pub(crate) static FAIL_RECORD_WRITE: Cell<bool> = const { Cell::new(false) };
     /// A file sync through `durability::place` fails.
     pub(crate) static FAIL_FILE_SYNC: Cell<bool> = const { Cell::new(false) };
     /// The sync of this directory through `durability::place` fails, with this kind of error.

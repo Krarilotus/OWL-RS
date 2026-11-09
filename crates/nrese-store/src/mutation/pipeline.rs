@@ -154,6 +154,18 @@ impl MutationPipeline {
         requester: &crate::Requester,
         ticket: &MutationTicket,
     ) -> Result<MutationCommitReport, MutationError> {
+        self.apply_noted(command, requester, ticket, None)
+    }
+
+    /// [`Self::apply`], its commit noted in a journal beside the store's log by `note`
+    /// ([`nrese_engine::Transaction::note_commit`]): a quarantine readmission's resolution.
+    pub(crate) fn apply_noted<'p>(
+        &'p self,
+        command: MutationCommand,
+        requester: &crate::Requester,
+        ticket: &MutationTicket,
+        note: Option<nrese_engine::CommitNote<'p>>,
+    ) -> Result<MutationCommitReport, MutationError> {
         let kind = command.kind();
         let store_error = |source| {
             if ticket.is_cancelled() {
@@ -189,6 +201,9 @@ impl MutationPipeline {
             }
         }
         let mut tx = self.store.engine().transaction();
+        if let Some(note) = note {
+            tx.note_commit(note);
+        }
         // Checked with the writer slot held: a pipeline that took over the store
         // rematerialises after retiring this one, so a write that got the slot before
         // commits first and is recomputed, and one after is refused here.
@@ -406,7 +421,9 @@ impl MutationPipeline {
         }
 
         // Without reasoning, commits don't maintain the inferred stack.
-        self.store.invalidate_reasoning().map_err(store_error)?;
+        self.store
+            .invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
+            .map_err(store_error)?;
         crate::shacl::check_shapes(
             &tx,
             &self.store.config().shapes_graph,
