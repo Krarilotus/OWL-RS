@@ -165,6 +165,39 @@ fn a_term_kept_early_gives_way_to_the_answer() {
     assert_eq!(rows.map(Result::unwrap).count(), 3);
 }
 
+// Spec (D16-039, sol-loop r3 S2): a term that can't be kept makes the cache let go. DESCRIBE
+// of a 1 MiB literal and then a distinct 2 MiB one under 3.5 MiB holds both in its output,
+// 3 MiB, which fits; the first, kept for reuse, must not stay kept once the second needs
+// the room.
+#[test]
+fn a_term_that_cant_be_kept_makes_the_cache_let_go() {
+    let engine = Engine::new(Default::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (i, len) in [1usize << 20, 2 << 20].into_iter().enumerate() {
+        let quad = Quad::new(
+            NamedNode::new_unchecked("urn:a"),
+            NamedNode::new_unchecked(format!("urn:p{i}")),
+            Literal::new_simple_literal(format!("{i:08}{}", "x".repeat(len - 8))),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new().parse_query("DESCRIBE <urn:a>").unwrap();
+    let options = QueryOptions {
+        resources: Resources {
+            memory: Envelope::new(Some(7 << 19), None),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let QueryResults::Graph(rows) = evaluate_query(&snapshot, &query, &options).unwrap() else {
+        panic!("DESCRIBE returns a graph")
+    };
+    assert_eq!(rows.map(Result::unwrap).count(), 2);
+}
+
 // Guard (D16-039): a decode cache is never needed for an answer. A filter over 16,384
 // distinct 1 KiB literals (16 MiB of text, decoded to be tested) under a 4 MiB envelope, far
 // more than its rows of ids need, still answers, every row.
