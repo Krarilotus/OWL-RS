@@ -24,16 +24,27 @@ CARGO = '''case "$1" in
 esac
 exit 0
 '''
+# The scripts check.sh names that run as they are: the full tier's features step (DUR-4) runs the
+# real guard, whose `cargo tree` reaches the fake cargo, which lists nothing, so no test-only
+# feature is found.
+REAL = {"check-features.sh"}
+# The tools the full tier runs, in one place: cargo; python, which runs every Python script under
+# benches/ that check.sh names as exiting 0; and the console's npm and npx (check.sh console), as
+# the fake cargo stands in for cargo: the host's would install nothing here.
+TOOLS = {
+    "cargo": CARGO,
+    "npm": 'echo "npm $*" >> "$CONSOLE_SEEN"\n',
+    "npx": 'echo "npx $*" >> "$CONSOLE_SEEN"\n',
+}
 
 
 def full_gate_root(root: Path, source: Path = ROOT) -> Path:
     """A checkout at ROOT in which `scripts/check.sh all` runs SOURCE's check.sh with its tools stubbed,
-    in one place: SOURCE's scripts/ whole, every script check.sh names exiting 0, cargo by CARGO, and
-    every Python script check.sh names under benches/ exiting 0 (D16-371: a step of a new name needs
-    no edit here)."""
+    in one place: SOURCE's scripts/ whole, every script check.sh names exiting 0 (but REAL), TOOLS
+    on PATH (D16-371: a step of a new name needs no edit here). Its bin directory."""
     shutil.copytree(source / "scripts", root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
     check = (source / "scripts/check.sh").read_text(encoding="utf-8")
-    for name in sorted(set(re.findall(r"scripts/([\w./-]+\.(?:sh|py))", check)) - {"check.sh"}):
+    for name in sorted(set(re.findall(r"scripts/([\w./-]+\.(?:sh|py))", check)) - {"check.sh"} - REAL):
         (root / "scripts" / name).parent.mkdir(parents=True, exist_ok=True)
         (root / "scripts" / name).write_text("#!/bin/sh\nexit 0\n" if name.endswith(".sh") else "raise SystemExit(0)\n",
                                              newline="\n")
@@ -42,7 +53,7 @@ def full_gate_root(root: Path, source: Path = ROOT) -> Path:
     binaries.mkdir()
     benches = sorted(set(re.findall(r"benches/[\w./-]+\.py", check)))
     scripts = {
-        "cargo": CARGO,
+        **TOOLS,
         "python": f'case "$1" in {"|".join(benches)}) exit 0 ;; esac\n'
                   'exec "$REAL_PYTHON" "$@"\n',
     }
@@ -53,11 +64,12 @@ def full_gate_root(root: Path, source: Path = ROOT) -> Path:
     return binaries
 
 
-def run_all(root: Path, binaries: Path, state: str, version: str, seen: Path) -> subprocess.CompletedProcess:
+def run_all(root: Path, binaries: Path, state: str, version: str, seen: Path,
+            console_seen: Path) -> subprocess.CompletedProcess:
     env = isolation.inherit("NRESE_", "FLEET_", "CARGO_",
         PATH=binaries.as_posix() + os.pathsep + os.environ["PATH"],
         REAL_PYTHON=Path(sys.executable).as_posix(), NRESE_ON_BUILD_HOST="1",
-        DENY=state, DENY_VERSION=version, SEEN=seen.as_posix())
+        DENY=state, DENY_VERSION=version, SEEN=seen.as_posix(), CONSOLE_SEEN=console_seen.as_posix())
     return subprocess.run([shutil.which("bash"), "scripts/check.sh", "all"],
                           cwd=root, env=env, capture_output=True, text=True, timeout=60)
 
@@ -74,8 +86,9 @@ class FullGate(unittest.TestCase):
             for state in ("missing", "workspace", "harness", "older", "newer", "ok"):
                 with self.subTest(state=state):
                     seen = root / f"seen-{state}"
+                    console_seen = root / f"console-{state}"
                     version = {"older": "0.20.1", "newer": "0.20.3"}.get(state, "0.20.2")
-                    done = run_all(root, binaries, state, version, seen)
+                    done = run_all(root, binaries, state, version, seen, console_seen)
                     self.assertEqual(done.returncode, 0 if state == "ok" else 1,
                                      f"SPEC required deny: {state}\n{done.stdout}{done.stderr}")
                     if state in ("older", "newer"):
@@ -86,6 +99,16 @@ class FullGate(unittest.TestCase):
                             "deny --all-features check",
                             "deny --manifest-path benches/nrese-bench-harness/Cargo.toml "
                             "--config deny.toml --all-features check"], done.stdout + done.stderr)
+                    if state == "ok":
+                        # The full tier checks the console too: installed from its lockfile,
+                        # typechecked and tested, each a step of its own.
+                        self.assertEqual(console_seen.read_text().splitlines(), [
+                            "npm --prefix apps/nrese-console ci --no-audit --no-fund",
+                            "npm --prefix apps/nrese-console run typecheck",
+                            "npx --prefix apps/nrese-console vitest run --root apps/nrese-console"],
+                            done.stdout + done.stderr)
+                        for step in ("console dependencies", "console typecheck", "console tests"):
+                            self.assertRegex(done.stdout, rf"(?m)^  0  {step} \(", done.stdout)
 
     def test_a_new_full_tier_step_needs_no_fixture_edit(self):
         # Spec: D16-371: the fixture is check.sh's, not a hand-picked copy: #186 (`features`) and #207
@@ -105,6 +128,6 @@ class FullGate(unittest.TestCase):
             root = Path(directory) / "root"
             root.mkdir()
             binaries = full_gate_root(root, source)
-            done = run_all(root, binaries, "ok", "0.20.2", root / "seen")
+            done = run_all(root, binaries, "ok", "0.20.2", root / "seen", root / "console")
             self.assertEqual(done.returncode, 0, f"SPEC a new step, no fixture edit\n{done.stdout}{done.stderr}")
             self.assertIn("=== a new step: exit 0", done.stdout)
