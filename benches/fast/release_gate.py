@@ -1254,6 +1254,11 @@ def checkout_receipt(kind: str, identity: str, outcomes: list[Outcome]) -> Check
                         os.environ.get("FLEET_HOST") or platform.node(), os.environ.get("FLEET_JOB", ""), tuple(outcomes))
 
 
+# The checks' exits: 0 passed and 1 not passed, each with its own published result (the steps keep
+# those for the verdict); CANT_INVALIDATE when an earlier result can't be removed, so no run happened.
+CANT_INVALIDATE = 3
+
+
 def publish(path: Path, data: dict) -> None:
     """DATA as PATH's JSON, whole or not at all: written beside it, then renamed over it."""
     part = path.with_name(path.name + ".partial")
@@ -3028,8 +3033,16 @@ def main() -> int:
         # included: a run stopped at any point leaves none, never one that speaks for what it didn't run.
         # Its own is published only once it is whole (publish()).
         for earlier in (args.json, args.logs / "receipt.json" if args.command == "w3c" and args.logs else None):
-            if earlier is not None:
+            if earlier is None:
+                continue
+            try:
                 earlier.unlink(missing_ok=True)
+            except OSError as error:
+                # Not a judged result (0 passed, 1 not passed: the step keeps those): a crash, which no
+                # step reads as one (fix check r1: an exit 1 beside the earlier file passed it).
+                print(f"{args.command}: the earlier result {earlier} can't be removed ({error}): no run",
+                      file=sys.stderr)
+                return CANT_INVALIDATE
     if args.command == "w3c":
         expected, kits, bad = load_w3c_expected(args.expected.read_text(encoding="utf-8"))
         if bad:
