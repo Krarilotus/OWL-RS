@@ -400,12 +400,15 @@ impl Context<'_> {
     /// it.
     fn found(&self, search: &Search) -> NativeResult<Vec<nrese_engine::TextMatch>> {
         Ok(match self.search_in()? {
-            SearchIn::Global => self.snapshot.text_search(&search.query),
+            SearchIn::Global => self
+                .snapshot
+                .text_search(&search.query)
+                .map_err(crate::QueryEvaluationError::from)?,
             SearchIn::Reader(None) => Vec::new(),
             SearchIn::Reader(Some((_charge, scope))) => self
                 .snapshot
                 .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
-                .map_err(crate::QueryEvaluationError::MemoryLimit)?,
+                .map_err(crate::QueryEvaluationError::from)?,
         })
     }
 
@@ -556,10 +559,10 @@ impl Context<'_> {
             }
             let mut row = vec![found.id];
             if search.relevance.is_some() {
-                row.push(self.id(&Term::from(Literal::from(found.relevance))));
+                row.push(self.id(&Term::from(Literal::from(found.relevance)))?);
             }
             if search.rank.is_some() {
-                row.push(self.id(&Term::from(Literal::from(rank as i64))));
+                row.push(self.id(&Term::from(Literal::from(rank as i64)))?);
             }
             table.push_row(&row);
         }
@@ -642,10 +645,10 @@ impl Context<'_> {
                 }
                 let mut row = vec![found.id];
                 if search.relevance.is_some() {
-                    row.push(self.id(&Term::from(Literal::from(found.relevance))));
+                    row.push(self.id(&Term::from(Literal::from(found.relevance)))?);
                 }
                 if search.rank.is_some() {
-                    row.push(self.id(&Term::from(Literal::from(rank as i64))));
+                    row.push(self.id(&Term::from(Literal::from(rank as i64)))?);
                 }
                 super::reserve_rows(&mut table, &mut held, 1, usize::MAX).map_err(memory)?;
                 table.push_row(&row);
