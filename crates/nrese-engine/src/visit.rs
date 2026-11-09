@@ -8,7 +8,7 @@
 //! - a cursor a merge advances, and each key it reads or decodes;
 //! - a run a read looks at, and a stored position it passes (deleted and filtered ones too);
 //! - a copy an equality read makes;
-//! - a `sameAs` statement or identity an equality class build reads.
+//! - a `sameAs` statement or identity an equality class build reads, and a class it lists.
 //!
 //! Work is counted a portion at a time ([`Account`]), each portion at most [`PORTION`] units
 //! (fix check r1 F1). Once `visit` answers false
@@ -21,7 +21,10 @@
 //! allowed, at most `POLL_UNITS`, then stops at its next call (REAS-2's invariant, one level
 //! down). Work too large for that is done in portions, each counted before it: a union's
 //! member moves (`nrese_exec::classes::Classes::union_asking`), a class build's sort (runs
-//! sorted alone, then merged a chunk at a time) and its copies and indexing.
+//! sorted alone, then merged a chunk at a time) and its copies and indexing. A read that
+//! interleaves several kinds of work counts them all on one account: a class build's scans,
+//! unions and finish, an expanded read's scans, copies and probes, a sorted read's two stacks
+//! (fix check r2 G1 and its siblings).
 //!
 //! Held for the owner in REAS-3a (fix check r1 F2): allocating or releasing memory in bulk is
 //! one allocator call, or one pass over what is released, that is not counted. That covers a
@@ -70,8 +73,12 @@ pub(crate) const PORTION: u64 = 256;
 /// count nothing ([`Free`]), the counted ones on their visitor ([`Ledger`]). One body of a
 /// read serves both (REAS-3a fix check r1 F1, design attack D3).
 pub(crate) trait Account {
-    /// Counts `n` units, at most [`PORTION`], before they are done: false once the read's
-    /// visitor has stopped.
+    /// Whether it counts anything (resolved when compiled): where it doesn't, a read runs its
+    /// plain probes and scans.
+    const COUNTED: bool = true;
+    /// Counts `n` units, at most [`PORTION`] in the index's reads, before they are done: false
+    /// once the read's visitor has stopped. (An equality class build's account also takes its
+    /// own chunks, up to `POLL_UNITS`, whole: `engine::equality`'s `OnMeter`.)
     fn take(&mut self, n: u64) -> bool;
 }
 
@@ -79,6 +86,8 @@ pub(crate) trait Account {
 pub(crate) struct Free;
 
 impl Account for Free {
+    const COUNTED: bool = false;
+
     #[inline(always)]
     fn take(&mut self, _: u64) -> bool {
         true

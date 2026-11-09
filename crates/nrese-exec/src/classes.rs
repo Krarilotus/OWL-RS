@@ -39,7 +39,7 @@ pub mod witness {
         MOVED.with(Cell::get)
     }
 
-    /// The slots enumerations of classes have walked on this thread so far (fix check r2 G3).
+    /// The steps listing the classes has taken on this thread so far (fix check r2 G3).
     pub fn examined() -> u64 {
         EXAMINED.with(Cell::get)
     }
@@ -50,8 +50,11 @@ pub mod witness {
 pub struct Classes {
     /// Every id in a class of two or more, with its parent (a root is its own parent).
     parent: HashMap<u64, u64>,
-    /// Per root: the class's smallest id and its members, in no particular order.
-    roots: HashMap<u64, (u64, Vec<u64>)>,
+    /// Per root: its class's place in `live`.
+    roots: HashMap<u64, usize>,
+    /// The classes, densely: root, smallest id and members (in no particular order). Listing
+    /// the classes walks only these, never a table emptied by unions (fix check r2 G3).
+    live: Vec<(u64, u64, Vec<u64>)>,
 }
 
 impl PartialEq for Classes {
@@ -88,12 +91,14 @@ impl Classes {
 
     /// The representative of `id` (the id itself outside every class).
     pub fn representative(&self, id: u64) -> u64 {
-        self.root(id).map_or(id, |root| self.roots[&root].0)
+        self.root(id)
+            .map_or(id, |root| self.live[self.roots[&root]].1)
     }
 
     /// The members of `id`'s class, in no particular order, if it has two or more.
     pub fn class_of(&self, id: u64) -> Option<&[u64]> {
-        self.root(id).map(|root| self.roots[&root].1.as_slice())
+        self.root(id)
+            .map(|root| self.live[self.roots[&root]].2.as_slice())
     }
 
     /// The members of `id`'s class (`[id]` outside every class), sorted.
@@ -109,22 +114,17 @@ impl Classes {
     }
 
     /// The classes of two or more ids: representative and members (in no particular
-    /// order).
-    pub fn classes(&self) -> impl Iterator<Item = (u64, &[u64])> {
-        // A hash map's iterator walks its whole table of slots, however few are full
-        // (hashbrown's `RawIterRange`): its capacity over its classes, slots per class yielded
-        // (fix check r2 G3).
-        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-        let walked = self.roots.capacity().div_ceil(self.roots.len().max(1)) as u64;
-        self.roots.values().map(move |(representative, members)| {
+    /// order), each class one step of a dense list.
+    pub fn classes(&self) -> impl ExactSizeIterator<Item = (u64, &[u64])> {
+        self.live.iter().map(|(_, representative, members)| {
             #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            witness::examine(walked);
+            witness::examine(1);
             (*representative, members.as_slice())
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
+        self.live.is_empty()
     }
 
     /// `fact` with every id replaced by its representative.
@@ -180,13 +180,14 @@ impl Classes {
             self.drop_if_single(ra);
             return Some(None);
         }
-        let (keep, gone) = match self.roots[&ra].1.len() >= self.roots[&rb].1.len() {
+        let size = |root: u64| self.live[self.roots[&root]].2.len();
+        let (keep, gone) = match size(ra) >= size(rb) {
             true => (ra, rb),
             false => (rb, ra),
         };
-        let (gone_min, moved) = self.roots.remove(&gone).expect("a root");
+        let (gone_min, moved) = self.remove_root(gone);
         self.parent.insert(gone, keep);
-        let (keep_min, members) = self.roots.get_mut(&keep).expect("a root");
+        let (_, keep_min, members) = &mut self.live[self.roots[&keep]];
         members.reserve(moved.len());
         for part in moved.chunks(crate::POLL_UNITS as usize) {
             if !ask(part.len() as u64) {
@@ -215,10 +216,22 @@ impl Classes {
             Some(root) => root,
             None => {
                 self.parent.insert(id, id);
-                self.roots.insert(id, (id, vec![id]));
+                self.roots.insert(id, self.live.len());
+                self.live.push((id, id, vec![id]));
                 id
             }
         }
+    }
+
+    /// Takes `root`'s class out of `live` (the last class moved into its place): its smallest
+    /// id and members.
+    fn remove_root(&mut self, root: u64) -> (u64, Vec<u64>) {
+        let at = self.roots.remove(&root).expect("a root");
+        let (_, min, members) = self.live.swap_remove(at);
+        if let Some(&(moved, _, _)) = self.live.get(at) {
+            self.roots.insert(moved, at);
+        }
+        (min, members)
     }
 
     /// Forgets `root` if its class is one id (made for a union of an id with itself).
@@ -226,9 +239,9 @@ impl Classes {
         if self
             .roots
             .get(&root)
-            .is_some_and(|(_, members)| members.len() == 1)
+            .is_some_and(|&at| self.live[at].2.len() == 1)
         {
-            self.roots.remove(&root);
+            self.remove_root(root);
             self.parent.remove(&root);
         }
     }
