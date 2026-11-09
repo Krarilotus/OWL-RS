@@ -25,6 +25,8 @@ pub(crate) mod fault;
 #[cfg(test)]
 mod link_tests;
 mod lock;
+#[cfg(test)]
+mod note_tests;
 pub mod place;
 pub(crate) mod tail;
 #[cfg(test)]

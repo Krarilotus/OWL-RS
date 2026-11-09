@@ -239,13 +239,20 @@ struct State {
     /// The statements, in a store in memory (on disk they are read from the files).
     held: Vec<QuarantinedStatement>,
     resolutions: HashMap<String, Resolution>,
+    /// Statements whose readmission's outcome the next open decides ([`readmit`]).
+    deciding: std::collections::HashSet<String>,
     /// Statements quarantined, resolved or not.
     total: u64,
 }
 
 impl Quarantine {
-    /// The quarantine of a store whose data directory is `dir` (`None`: in memory).
-    pub(crate) fn open(dir: Option<&Path>) -> StoreResult<Self> {
+    /// The quarantine of a store whose data directory is `dir` (`None`: in memory), the store
+    /// recovered at `recovered`, before anything commits to it. A readmission is in effect only
+    /// where the store holds its revision ([`readmit`]): one logged past `recovered` (its
+    /// commit's record never made durable, lost under `OsBuffered`, or an older image under
+    /// this quarantine) is open again, and taken out of the log before this returns, so that no
+    /// later commit at that revision brings it back.
+    pub(crate) fn open(dir: Option<&Path>, recovered: u64) -> StoreResult<Self> {
         let dir = dir.map(|dir| dir.join(DIR));
         let mut state = State::default();
         if let Some(dir) = dir.as_ref().filter(|dir| dir.exists()) {
@@ -261,6 +268,10 @@ impl Quarantine {
             }
             let resolutions = dir.join(RESOLUTIONS);
             if resolutions.exists() {
+                let mut beyond = false;
+                // The bytes the log keeps of an unfinished last record, and whether a newline
+                // ends them: framed before any append.
+                let mut repair: Option<(u64, bool)> = None;
                 let mut log = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -270,26 +281,31 @@ impl Quarantine {
                 let mut line = Vec::new();
                 while reader.read_until(b'\n', &mut line)? != 0 {
                     let terminated = line.last() == Some(&b'\n');
-                    match serde_json::from_slice::<Resolution>(&line) {
+                    // A complete last record may be followed by zero bytes: a crash after the
+                    // newline repair below wrote, before it synced, where the filesystem
+                    // extended the file first (D16-322). It is the record, kept.
+                    let body = match terminated {
+                        true => &line[..],
+                        false => {
+                            let end = line.iter().rposition(|&b| b != 0).map_or(0, |at| at + 1);
+                            &line[..end]
+                        }
+                    };
+                    match serde_json::from_slice::<Resolution>(body) {
                         Ok(resolution) => {
-                            state.resolutions.insert(resolution.id.clone(), resolution);
+                            beyond |= resolution.beyond(recovered);
                             if !terminated {
-                                // A complete record needs its delimiter before the next append.
-                                drop(reader);
-                                log.seek(SeekFrom::End(0))?;
-                                log.write_all(b"\n")?;
-                                log.sync_data()?;
-                                break;
+                                // A complete record needs its delimiter before the next append,
+                                // in place of any zero bytes after it.
+                                repair = Some((framed + body.len() as u64, true));
                             }
+                            state.resolutions.insert(resolution.id.clone(), resolution);
                         }
                         Err(_) if !terminated => {
                             // Recovery must remove the torn tail, or the next record would
                             // join it and an acknowledged resolution would disappear on reopen.
                             tracing::warn!(bytes = line.len(), record = %String::from_utf8_lossy(&line), "truncating a torn quarantine resolution");
-                            drop(reader);
-                            log.set_len(framed)?;
-                            log.sync_data()?;
-                            break;
+                            repair = Some((framed, false));
                         }
                         Err(_) => {
                             // Keep the existing error policy for framed records, including
@@ -304,6 +320,20 @@ impl Quarantine {
                     }
                     framed += line.len() as u64;
                     line.clear();
+                }
+                drop(reader);
+                if let Some((length, newline)) = repair {
+                    log.set_len(length)?;
+                    if newline {
+                        log.seek(SeekFrom::End(0))?;
+                        log.write_all(b"\n")?;
+                    }
+                    log.sync_data()?;
+                }
+                // Closed: it may be replaced next.
+                drop(log);
+                if beyond {
+                    drop_beyond(&resolutions, recovered, &mut state.resolutions)?;
                 }
             }
         }
@@ -475,6 +505,12 @@ impl Quarantine {
 
     /// The open statement `id`.
     fn open_statement(&self, id: &str) -> StoreResult<QuarantinedStatement> {
+        if self.state().deciding.contains(id) {
+            return Err(StoreError::Quarantine(format!(
+                "quarantined statement {id}: its readmission's outcome is decided when the store \
+                 opens again"
+            )));
+        }
         match self.get(id)? {
             Some(QuarantineItem {
                 statement,
@@ -492,32 +528,7 @@ impl Quarantine {
     /// Records `resolution`: appended to the log, then in effect.
     fn record(&self, resolution: Resolution) -> StoreResult<()> {
         if let Some(dir) = &self.dir {
-            #[cfg(test)]
-            if tests::FAIL_RESOLUTION_APPEND.get() {
-                return Err(
-                    std::io::Error::other("the resolution's append failed (a test's)").into(),
-                );
-            }
-            // Durably named, the directory and the log (DUR-3): the quarantine reads them at
-            // open. The directory is synced after every append, not only when the log is made: a
-            // log made by a call whose sync then failed is in place but not known durable, and
-            // the next call must not take it for so (fix check r1, R2-F1).
-            nrese_engine::place::create_dir_all(dir)?;
-            let mut log = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(RESOLUTIONS))?;
-            let line = serde_json::to_string(&resolution).expect("a resolution serialises");
-            log.write_all(format!("{line}\n").as_bytes())?;
-            log.sync_data()?;
-            #[cfg(test)]
-            if tests::FAIL_LOG_DIR_SYNC.get() {
-                return Err(std::io::Error::other(
-                    "the quarantine's directory sync failed (a test's)",
-                )
-                .into());
-            }
-            nrese_engine::place::sync_dir(dir)?;
+            append(dir, &resolution)?;
         }
         self.state()
             .resolutions
@@ -627,6 +638,97 @@ impl Quarantine {
     }
 }
 
+/// Appends `resolution` to the resolutions log in `dir`, the quarantine's one append path.
+fn append(dir: &Path, resolution: &Resolution) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_RESOLUTION_APPEND.get() {
+        return Err(io::Error::other(
+            "the resolution's append failed (a test's)",
+        ));
+    }
+    // Durably named, the directory and the log (DUR-3): the quarantine reads them at open. The
+    // directory is synced after every append, not only when the log is made: a log made by a
+    // call whose sync then failed is in place but not known durable, and the next call must not
+    // take it for so (fix check r1, R2-F1).
+    nrese_engine::place::create_dir_all(dir)?;
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(RESOLUTIONS))?;
+    let line = serde_json::to_string(resolution).expect("a resolution serialises");
+    log.write_all(format!("{line}\n").as_bytes())?;
+    log.sync_data()?;
+    #[cfg(test)]
+    if tests::FAIL_LOG_DIR_SYNC.get() {
+        return Err(io::Error::other(
+            "the quarantine's directory sync failed (a test's)",
+        ));
+    }
+    nrese_engine::place::sync_dir(dir)
+}
+
+impl Resolution {
+    /// A readmission in a revision past `recovered`: not in a store recovered there.
+    fn beyond(&self, recovered: u64) -> bool {
+        matches!(self.outcome, Outcome::Readmitted { revision } if revision > recovered)
+    }
+}
+
+/// Takes every readmission past `recovered` out of the framed resolutions log at `path`,
+/// durably (written aside and renamed), and `resolutions` becomes what the log keeps. Lines
+/// that don't read stay as they are.
+fn drop_beyond(
+    path: &Path,
+    recovered: u64,
+    resolutions: &mut HashMap<String, Resolution>,
+) -> StoreResult<()> {
+    let bytes = fs::read(path)?;
+    let mut kept = Vec::with_capacity(bytes.len());
+    resolutions.clear();
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        if let Ok(resolution) = serde_json::from_slice::<Resolution>(line) {
+            if resolution.beyond(recovered) {
+                tracing::warn!(
+                    id = %resolution.id,
+                    ?resolution.outcome,
+                    recovered,
+                    "a readmission whose revision the store doesn't hold is open again"
+                );
+                continue;
+            }
+            resolutions.insert(resolution.id.clone(), resolution);
+        }
+        kept.extend_from_slice(line);
+    }
+    crate::metadata::write(path, &kept).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// The resolutions log's length in `dir` (0 where there is none).
+fn log_len(dir: &Path) -> io::Result<u64> {
+    match fs::metadata(dir.join(RESOLUTIONS)) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+/// Takes the resolutions log in `dir` back to its first `len` bytes, durably: what an append
+/// that failed may have written is gone.
+fn take_back(dir: &Path, len: u64) -> io::Result<()> {
+    let log = match fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(RESOLUTIONS))
+    {
+        Ok(log) => log,
+        // Never made: nothing to take back.
+        Err(error) if error.kind() == io::ErrorKind::NotFound && len == 0 => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    log.set_len(len)?;
+    log.sync_data()
+}
+
 /// The files `load-*.<extension>` in `dir`, in the order their loads ran.
 fn load_files(dir: &Path, extension: &str) -> StoreResult<Vec<PathBuf>> {
     let mut files: Vec<(u128, u64, PathBuf)> = fs::read_dir(dir)?
@@ -673,8 +775,18 @@ fn payload_format(format: RdfFormat) -> Option<GraphResultFormat> {
 }
 
 /// Admits the open quarantined statement `id` as `request` asks, through `pipeline` for
-/// `requester`: its gates decide as for any write. Recorded as resolved once committed;
-/// a refused or still-invalid statement stays open.
+/// `requester`: its gates decide as for any write. A refused or still-invalid statement stays
+/// open.
+///
+/// The resolution and the commit are one outcome, keyed by the commit's revision (Q06
+/// remainder, invariant D): on disk the resolution is the commit's note
+/// ([`nrese_engine::Transaction::note_commit`]), durable before any of the commit's record is
+/// in the store's log, and [`Quarantine::open`] holds it in effect only where the store holds
+/// its revision. So a readmission stopped anywhere is in the data once or not at all, and its
+/// statement resolved exactly when it is in. A commit that publishes nothing (the statement
+/// was in the data already) is recorded after it, as it changes nothing to admit again. A
+/// commit whose record failed after its note leaves the statement undecided until the store
+/// opens again: its other resolutions are refused meanwhile.
 pub fn readmit(
     pipeline: &MutationPipeline,
     requester: &crate::Requester,
@@ -692,21 +804,62 @@ pub fn readmit(
         source,
     };
     let (command, text) = quarantine.readmission(id, request).map_err(store_error)?;
-    let revision = match pipeline.apply(command, requester, ticket)? {
-        MutationCommitReport::Applied { revision } => revision,
-        other => unreachable!("statements produced {other:?}"),
-    };
-    #[cfg(test)]
-    tests::stop_at(tests::Stop::AfterCommit);
-    let resolution = Resolution {
+    let mut resolution = Resolution {
         id: id.to_owned(),
-        outcome: Outcome::Readmitted { revision },
+        outcome: Outcome::Readmitted { revision: 0 },
         at: now(),
         repairs: request.repairs.clone(),
         text,
         note: request.note.clone(),
     };
-    quarantine.record(resolution.clone()).map_err(store_error)?;
+    let noted = std::sync::Arc::new(std::sync::OnceLock::new());
+    let note = quarantine.dir.clone().map(|dir| {
+        let mut resolution = resolution.clone();
+        let noted = std::sync::Arc::clone(&noted);
+        let note: nrese_engine::CommitNote<'_> = Box::new(move |revision| {
+            resolution.outcome = Outcome::Readmitted { revision };
+            let before = log_len(&dir).map_err(nrese_engine::NoteError::Refused)?;
+            match append(&dir, &resolution) {
+                Ok(()) => {
+                    let _ = noted.set(revision);
+                    #[cfg(test)]
+                    tests::stop_at(tests::Stop::InNote);
+                    Ok(())
+                }
+                // What it may have written goes; if that fails too, the log may name the
+                // revision, and the engine lets no other commit take it.
+                Err(error) => match take_back(&dir, before) {
+                    Ok(()) => Err(nrese_engine::NoteError::Refused(error)),
+                    Err(_) => Err(nrese_engine::NoteError::Unknown(error)),
+                },
+            }
+        });
+        note
+    });
+    let applied = pipeline.apply_noted(command, requester, ticket, note);
+    let revision = match applied {
+        Ok(MutationCommitReport::Applied { revision }) => revision,
+        Ok(other) => unreachable!("statements produced {other:?}"),
+        Err(error) => {
+            if noted.get().is_some() {
+                quarantine.state().deciding.insert(id.to_owned());
+            }
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    tests::stop_at(tests::Stop::AfterCommit);
+    resolution.outcome = Outcome::Readmitted { revision };
+    match noted.get() {
+        Some(&at) => {
+            debug_assert_eq!(at, revision, "the note has the published revision");
+            quarantine
+                .state()
+                .resolutions
+                .insert(resolution.id.clone(), resolution.clone());
+        }
+        None => quarantine.record(resolution.clone()).map_err(store_error)?,
+    }
     Ok(resolution)
 }
 

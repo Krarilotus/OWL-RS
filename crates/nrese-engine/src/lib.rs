@@ -38,11 +38,12 @@ mod witness;
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
 pub use engine::{
-    Applied, AssertedIdentity, BulkLoad, BulkMode, CommitSummary, Content, CorpusTuning, Count,
-    DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats, EqualityClasses, HeavyGroups,
-    ImageInfo, InferredMask, InferredSubset, LogBatch, LogExpectation, PrivateTransaction,
-    ProbeCursor, ReadModel, Rematerialisation, SearchRefused, Seek, SharedState, Snapshot,
-    SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
+    Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitSummary, Content,
+    CorpusTuning, Count, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats,
+    EqualityClasses, Finished, HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch,
+    LogExpectation, NoteError, PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation,
+    SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope,
+    Transaction, WriterHeld,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;
