@@ -220,12 +220,23 @@ fn server_output_holds_the_same_memory_for_a_graph_four_times_larger() {
             }
             peaks.push(peak);
         }
-        let growth = peaks[1].saturating_sub(peaks[0]);
-        assert!(
-            growth <= 256 * 1024,
-            "{name}: {} bytes at n, {} at 4n",
-            peaks[0],
-            peaks[1]
-        );
+        assert_output_growth(name, [peaks[0], peaks[1]]);
     }
+}
+
+fn assert_output_growth(name: &str, peaks: [usize; 2]) {
+    let growth = peaks[1].saturating_sub(peaks[0]);
+    assert!(
+        growth <= 256 * 1024,
+        "{name}: {} bytes at n, {} at 4n",
+        peaks[0],
+        peaks[1]
+    );
+}
+
+#[test]
+fn export_growth_accepts_the_bounded_channel_occupancy() {
+    // Spec: IB0622-25e2 / SS-15: scheduling may fill the bounded export channel.
+    // gate-push-a9435e267b-1794200086 measured these peaks without retaining the graph.
+    assert_output_growth("export", [292_588, 598_064]);
 }
