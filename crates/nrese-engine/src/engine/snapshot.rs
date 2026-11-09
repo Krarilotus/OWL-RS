@@ -23,8 +23,8 @@ pub(crate) use own_state::OwnSlots;
 pub use own_state::{Admission, OwnState};
 
 mod reader_search;
-pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
+pub(crate) use reader_search::{CorpusAdmission, Documents};
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
@@ -1991,9 +1991,10 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
-    /// [`Self::lookup`], what it allocates charged first through `charge`
-    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
-    /// dictionary, which a checkpoint may otherwise change between them).
+    /// [`Self::lookup`], what it allocates charged first through `charge`, which is called
+    /// with no lock of the dictionary held ([`Dictionary::lookup_charged`]: at the larger of
+    /// a plain and a compressed base's bounds, since a checkpoint may change the base before
+    /// the lookup).
     pub fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
@@ -2050,14 +2051,19 @@ impl Snapshot {
         self.vocabulary.decode(id)
     }
 
-    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
-    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
-    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
-    /// snapshot doesn't know.
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, for every
+    /// kind of term: inline, the dictionary's, a private snapshot's own, and a triple term
+    /// with its components. `Ok(None)` for an id that isn't a term this snapshot knows.
+    ///
+    /// `charge` is called with no lock of the dictionary held, once, or again where a
+    /// checkpoint's rebase came between the bound and the decode
+    /// ([`Dictionary::decode_charged`]): each call charges an increment, and what the decode
+    /// holds is covered by their sum. A refusal ends it, nothing decoded; what was charged
+    /// before stays the caller's to release.
     pub fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
         self.vocabulary
             .decode_charged(id, self.version.dictionary_len, charge)
@@ -2065,8 +2071,8 @@ impl Snapshot {
 
     /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
     /// as stored now: a checkpoint may store the term compressed after, so a charge for a
-    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
-    /// ids this snapshot doesn't know.
+    /// decode goes through [`Self::decode_charged`]. `None` for ids this snapshot doesn't
+    /// know.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
         self.vocabulary
             .decode_bound(id, self.version.dictionary_len)
@@ -2123,24 +2129,18 @@ impl Snapshot {
         self.underlying().stats().arena_bytes
     }
 
-    /// Refused, before any search touches the dictionary, for a private snapshot: the
-    /// shared indexes don't cover its own terms, and building or extending them would change
-    /// state every snapshot shares.
-    fn searchable(&self) -> Result<(), SearchRefused> {
-        match self.is_private() {
-            true => Err(SearchRefused::Private),
-            false => Ok(()),
-        }
-    }
-
     /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check). Refused for a private
-    /// snapshot ([`SearchRefused::Private`]).
+    /// (whether statements still use them is the caller's to check). A private snapshot's
+    /// shared indexes don't cover its own terms, and extending them would change state every
+    /// snapshot shares: it searches what it can see instead, as a reader of every graph in the
+    /// materialised model ([`Self::text_search_in`]; V3, DICT2 9 Nov 04:02 Q2).
     pub fn text_search(
         &self,
         query: &crate::TextQuery,
     ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
-        self.searchable()?;
+        if self.is_private() {
+            return self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None);
+        }
         let known = self.version.dictionary_len;
         let mut matches = self.underlying().text_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
@@ -2151,15 +2151,67 @@ impl Snapshot {
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
     /// (whether statements still use them is the caller's to check, in `accept`). What the
     /// search holds, the hits included, is charged to `budget` before it is allocated: a
-    /// search the budget has no room for is refused, with nothing left charged. Refused for
-    /// a private snapshot too.
+    /// search the budget has no room for is refused, with nothing left charged. A private
+    /// snapshot searches what it can see, as [`Self::text_search`] does
+    /// ([`Self::vector_search_in`]): run within what `budget` has left, held on it meanwhile.
     pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b nrese_exec::Budget,
     ) -> Result<VectorHits<'b>, SearchRefused> {
-        self.searchable()?;
+        if self.is_private() {
+            // A snapshot reading within this very budget (a query's envelope): the reader
+            // path charges it through its own `Arc`, as its reads do (sol-loop r1 B3: a
+            // bridge holding the budget's room would refuse those reads).
+            let reading = self.reads.as_ref().and_then(|reads| reads.0.as_ref());
+            if let Some(reads) = reading.filter(|reads| std::ptr::eq(&*reads.budget, budget)) {
+                let (hits, report) = self.vector_search_in(
+                    ReadModel::Materialised,
+                    &TextScope::EVERY,
+                    query,
+                    accept,
+                    &reads.budget,
+                )?;
+                // Handed over on `budget`: charged there before they are copied.
+                let found =
+                    nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+                drop(hits);
+                return Ok((found?, report));
+            }
+            // Otherwise an `Arc`'d budget of what `budget` has left, that room held on
+            // `budget` until the search is done, then the hits charged there. The snapshot's
+            // reads, where it has any, charge their own budget, not this one. (A reader's
+            // budget beside `budget` under one parent would find the parent's room held:
+            // no caller passes one; SPARQL passes the reader's, the others unbounded ones.)
+            let (inner, held) = match budget.is_bounded() {
+                true => {
+                    let room = budget.remaining();
+                    let mut held = nrese_exec::Reservation::new(budget);
+                    held.charge(room)?;
+                    (nrese_exec::Budget::new(room), Some(held))
+                }
+                false => (nrese_exec::Budget::unlimited(), None),
+            };
+            let inner = Arc::new(inner);
+            let (hits, report) = self.vector_search_in(
+                ReadModel::Materialised,
+                &TextScope::EVERY,
+                query,
+                accept,
+                &inner,
+            )?;
+            // Of the held room, what the copy takes is let go for it, the rest held until the
+            // inner hits are freed (sol-loop r2 B3: no gap where neither is counted).
+            let held = held.map(|mut held| {
+                held.release(hits.len() * std::mem::size_of::<(TermId, f32)>());
+                held
+            });
+            let found = nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+            drop(hits);
+            drop(held);
+            return Ok((found?, report));
+        }
         let (hits, report) =
             self.underlying()
                 .vector_search(query, self.version.dictionary_len, accept, budget)?;
@@ -2178,21 +2230,23 @@ impl Snapshot {
     /// Builds the graph searches like `query` use, covering every vector of its
     /// dimension, before returning: a warm-up (searches build it themselves, a large one
     /// on a thread of its own while they scan exactly). Nothing for a private snapshot,
-    /// which doesn't search: a build is shared state.
+    /// whose searches scan exactly: a build is shared state.
     pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        if self.searchable().is_ok() {
+        if !self.is_private() {
             self.underlying().prepare_vector_graph(query);
         }
     }
 
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check). Refused for a
-    /// private snapshot.
+    /// first (whether statements still use them is the caller's to check). A private
+    /// snapshot searches what it can see, as [`Self::text_search`] does.
     pub fn iri_search(
         &self,
         query: &crate::TextQuery,
     ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
-        self.searchable()?;
+        if self.is_private() {
+            return self.iri_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None);
+        }
         let known = self.version.dictionary_len;
         let mut matches = self.underlying().iri_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
@@ -2252,8 +2306,8 @@ enum ViewOf {
 pub enum SearchRefused {
     /// The search's budget had no room ([`nrese_exec::BudgetExceeded`]).
     Memory(nrese_exec::BudgetExceeded),
-    /// The snapshot is private ([`Snapshot::is_private`]): the shared indexes don't cover
-    /// its own terms, and no search changes them for it.
+    /// Not returned since V3: a private snapshot ([`Snapshot::is_private`]) searches what it
+    /// can see. Kept while callers still match it (`nrese-sparql`'s results).
     Private,
 }
 
