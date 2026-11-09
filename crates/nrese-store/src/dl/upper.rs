@@ -36,7 +36,7 @@ use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Normalised, Ontology};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::delta::{self, Base, VisitsBase};
-use nrese_reasoner::eval::{GroundProgram, Poller, Probe, Schema, Stop, Visit};
+use nrese_reasoner::eval::{GroundProgram, Poller, Probe, Schema, Stop, Stopped, Visit};
 use nrese_reasoner::ir::{self, Triple};
 
 /// U1's own facts beyond its input, indexed for every bound pattern. What it holds is charged
@@ -427,13 +427,18 @@ struct UpperBase<'a> {
 }
 
 impl UpperBase<'_> {
-    /// Whether the view has `s p o`, `o` standing for every literal of its value: each
-    /// member's lookup counted on `poll` before it is made (review r1 F3: a value can be
-    /// written in many ways). Stopped, it answers false, which the stage's check discards.
-    fn in_view(&self, [s, p, o]: Triple, poll: &Poller<'_>) -> bool {
+    /// Whether the view has `s p o`, `o` standing for every literal of its value: the call
+    /// counted before its value's members are looked up (one probe), each member's lookup
+    /// counted before it is made (review r1 F3: a value can be written in many ways).
+    /// [`Stopped`] once `poll` has stopped before a member was found, never a "not in the
+    /// view" that would keep the fact (fix check r1, rule 2).
+    fn in_view(&self, [s, p, o]: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::InView, 1);
-        poll.counted(self.values.members(o)).any(|o| {
+        if poll.tick() {
+            return Err(Stopped);
+        }
+        let found = poll.counted(self.values.members(o)).any(|o| {
             self.view
                 .quads_for_pattern_in(
                     ReadModel::Materialised,
@@ -441,7 +446,11 @@ impl UpperBase<'_> {
                 )
                 .next()
                 .is_some()
-        })
+        });
+        match found || !poll.stopped() {
+            true => Ok(found),
+            false => Err(Stopped),
+        }
     }
 }
 
@@ -491,33 +500,33 @@ impl VisitsBase for UpperBase<'_> {
         });
     }
 
-    /// The view's count's work counted on `probe` as it goes (review r1 F2); stopped, 0, an
-    /// answer the stage's check discards.
-    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
-        let Some(view) =
-            self.view
-                .count_in_visiting(ReadModel::Materialised, &pattern(bound), &mut |n| {
-                    probe.visited(n)
-                })
-        else {
-            return 0;
-        };
-        let view = view.at_least();
+    /// The view's count's work counted on `probe` as it goes (review r1 F2); [`Stopped`]
+    /// where that, or the stack's estimate, stopped.
+    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
+        let view = self
+            .view
+            .count_in_visiting(ReadModel::Materialised, &pattern(bound), &mut |n| {
+                probe.visited(n)
+            })
+            .ok_or(Stopped)?
+            .at_least();
+        let stack = self.stack.estimate_counted(bound, &|| probe.units(1));
+        probe.ended()?;
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
-        usize::try_from(view)
+        Ok(usize::try_from(view)
             .unwrap_or(usize::MAX)
-            .saturating_add(self.stack.estimate_counted(bound, &|| probe.units(1)))
-            .saturating_add(self.facts.len())
+            .saturating_add(stack)
+            .saturating_add(self.facts.len()))
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.stack.contains(&fact) || self.asserts(fact, probe)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.stack.contains(&fact) || self.asserts(fact, probe)?)
     }
 
     /// Each literal member the view is asked about is a unit, counted as it is asked.
-    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.facts.contains(&fact) || self.in_view(fact, probe.poller())
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.facts.contains(&fact) || self.in_view(fact, probe.poller())?)
     }
 }
 
@@ -908,13 +917,19 @@ impl Upper {
             values: &values,
         };
         // Each deleted fact's lookups in the view, counted on the commit's stop (review r1 F3);
-        // stopped, the list means nothing and the change ends here.
+        // the first that finds it stopped ends the change (fix check r1, R2-F3: read as "not
+        // in the view", a stopped lookup kept every fact after it, each looked up).
         let stopped = || GaveUp::new("the upper bound's maintenance was stopped");
         let prep = Poller::new(stop).ok_or_else(stopped)?;
-        deleted.retain(|t| !base.in_view(*t, &prep));
-        if prep.stopped() {
-            return Err(stopped());
+        let mut kept = 0;
+        for i in 0..deleted.len() {
+            let fact = deleted[i];
+            if !base.in_view(fact, &prep).map_err(|Stopped| stopped())? {
+                deleted[kept] = fact;
+                kept += 1;
+            }
         }
+        deleted.truncate(kept);
         let mut change = Change {
             moved,
             ..Change::default()
@@ -944,15 +959,13 @@ impl Upper {
         let equates = |t: &Triple| t[1] == same_as && t[0] != t[2];
         change.merges = inserted.iter().any(equates) || update.insert.iter().any(equates);
         change.remove = update.remove;
-        // A probe per inserted fact, on the commit's stop as the update's reads are.
+        // A probe per inserted fact, on the commit's stop as the update's reads are; the first
+        // that finds it stopped ends the change (fix check r1, rule 2).
         let poll = Poller::new(stop).ok_or_else(stopped)?;
-        change.insert = update
-            .insert
-            .into_iter()
-            .filter(|t| !base.is_asserted(*t, &poll))
-            .collect();
-        if poll.stopped() {
-            return Err(stopped());
+        for t in update.insert {
+            if !base.is_asserted(t, &poll).map_err(|Stopped| stopped())? {
+                change.insert.push(t);
+            }
         }
         change.noted = values.added;
         change.elapsed = started.elapsed();
@@ -1079,7 +1092,8 @@ mod tests {
         let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
         fired.store(true, Ordering::Relaxed);
         let mut delivered = 0;
-        base.scan([None, Some(6), None], &poll, &mut |_| delivered += 1);
+        let scanned = base.scan([None, Some(6), None], &poll, &mut |_| delivered += 1);
+        assert!(scanned.is_err(), "a scan its poller stopped says so");
         assert_eq!(delivered, 0, "no fact matches");
         assert!(
             poll.stopped(),
@@ -1122,7 +1136,8 @@ mod tests {
         let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
         fired.store(true, Ordering::Relaxed);
         let mut delivered = 0;
-        base.scan([Some(1), Some(2), Some(7)], &poll, &mut |_| delivered += 1);
+        let scanned = base.scan([Some(1), Some(2), Some(7)], &poll, &mut |_| delivered += 1);
+        assert!(scanned.is_err(), "a scan its poller stopped says so");
         assert_eq!(delivered, 0, "no stack fact has the object");
         assert!(
             poll.stopped(),
@@ -1176,7 +1191,8 @@ mod tests {
         fired.store(true, Ordering::Relaxed);
         let (delivered, held) = nrese_exec::measure::measure(|| {
             let mut delivered = 0;
-            base.scan([None, Some(5), Some(rep)], &poll, &mut |_| delivered += 1);
+            let scanned = base.scan([None, Some(5), Some(rep)], &poll, &mut |_| delivered += 1);
+            assert!(scanned.is_err(), "a scan its poller stopped says so");
             delivered
         });
         assert_eq!(delivered, 0, "the view holds nothing");
@@ -1221,7 +1237,7 @@ mod tests {
         };
         let poll = nrese_reasoner::eval::Poller::new(&stop).expect("never stopped");
         assert!(
-            !base.contains([1, 5, rep], &poll),
+            !base.contains([1, 5, rep], &poll).expect("never stopped"),
             "the view asserts no member"
         );
         let run = interval;

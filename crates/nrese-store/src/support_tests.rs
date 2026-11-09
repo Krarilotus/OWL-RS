@@ -367,9 +367,14 @@ fn the_closure_after_a_change_counts_the_removed_facts_it_passes_over() {
     let poll = Poller::new(&stop).expect("not stopped yet");
     fired.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut delivered = 0;
-    nrese_reasoner::eval::Source::scan(&after, [None, Some(6), None], Seg::All, &poll, &mut |_| {
-        delivered += 1
-    });
+    let scanned = nrese_reasoner::eval::Source::scan(
+        &after,
+        [None, Some(6), None],
+        Seg::All,
+        &poll,
+        &mut |_| delivered += 1,
+    );
+    assert!(scanned.is_err(), "a scan its poller stopped says so");
     assert_eq!(delivered, 0, "no removed fact matches");
     assert!(
         poll.stopped(),
@@ -399,7 +404,8 @@ fn the_closure_after_a_change_estimates_within_a_run_of_the_stop() {
     };
     let poll = Poller::new(&stop).expect("never stopped");
     let estimate =
-        nrese_reasoner::eval::Source::estimate(&after, [None, Some(6), None], Seg::All, &poll);
+        nrese_reasoner::eval::Source::estimate(&after, [None, Some(6), None], Seg::All, &poll)
+            .expect("never stopped");
     assert_eq!(
         estimate, 0,
         "no removed fact matches, the snapshot holds none"

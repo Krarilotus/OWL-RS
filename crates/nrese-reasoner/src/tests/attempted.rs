@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::load;
 use crate::batch::{self, Schema};
 use crate::delta::{MemoryBase, Rules};
-use crate::eval::{GroundProgram, NEVER, OperationStop, Poller, Probe, Seg, Visit, Visits};
+use crate::eval::{
+    GroundProgram, NEVER, OperationStop, Poller, Probe, Seg, Stopped as ReadStopped, Visit, Visits,
+};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
@@ -48,12 +50,17 @@ impl Visits for Asked {
         self.facts.visit(pattern, seg, visit);
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, ReadStopped> {
         self.estimates.fetch_add(1, Ordering::Relaxed);
         self.facts.size(pattern, seg, probe)
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
         self.contains.fetch_add(1, Ordering::Relaxed);
         self.facts.holds(fact, probe)
     }
@@ -113,7 +120,7 @@ fn empty_support_searches_count_towards_the_stop() {
         "a producer per subproperty"
     );
     let source = Asked::new(closure.clone());
-    let asserted = |f: Triple, _: &Poller<'_>| closure.binary_search(&f).is_ok();
+    let asserted = |f: Triple, _: &Poller<'_>| Ok(closure.binary_search(&f).is_ok());
     let stop = || source.cancel.load(Ordering::Relaxed);
     let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let limits = Limits {
@@ -141,7 +148,8 @@ fn empty_support_searches_count_towards_the_stop() {
 }
 
 /// F2: DRed's one-step derivation checks, asked after their operation stopped, read nothing
-/// and answer false: not the bodiless shortcut (its schema facts), not a producer's search.
+/// and answer that they were stopped (REAS-2 fix check r1, rule 2: once a "false"): not the
+/// bodiless shortcut (its schema facts), not a producer's search.
 #[test]
 fn a_derivation_check_after_its_stop_reads_nothing() {
     let mut vocabulary = LocalVocabulary::default();
@@ -155,7 +163,10 @@ fn a_derivation_check_after_its_stop_reads_nothing() {
     assert!(ground.bodiless.contains(&bodiless), "a bodiless fact");
     let all = vec![true; ground.rules.len()];
     // Guard: unstopped, the bodiless shortcut decides it.
-    assert!(ground.derivable_by(&Asked::new(closure.clone()), bodiless, &all, true, NEVER));
+    assert_eq!(
+        ground.derivable_by(&Asked::new(closure.clone()), bodiless, &all, true, NEVER),
+        Ok(true)
+    );
     let (cancelled, unlimited) = (|| true, || None::<nrese_exec::memory::MemoryStopCause>);
     let stopped = OperationStop::with_poll(&cancelled, &unlimited);
     assert!(
@@ -168,14 +179,14 @@ fn a_derivation_check_after_its_stop_reads_nothing() {
         let by = ground.derivable_by(&source, fact, &all, true, &fired);
         assert_eq!(
             (by, source.reads()),
-            (false, [0; 3]),
+            (Err(ReadStopped), [0; 3]),
             "derivable_by, {what}"
         );
         let source = Asked::new(closure.clone());
         let with = ground.derivable_with(&source, fact, true, &fired);
         assert_eq!(
             (with, source.reads()),
-            (false, [0; 3]),
+            (Err(ReadStopped), [0; 3]),
             "derivable_with, {what}"
         );
     }
@@ -195,20 +206,30 @@ struct Stale {
 impl Visits for Stale {
     fn visit(&self, _: [Option<u64>; 3], _: Seg, _: &mut Visit<'_, '_>) {}
 
-    fn size(&self, pattern: [Option<u64>; 3], _: Seg, _: Probe<'_, '_>) -> usize {
-        if pattern[1] == Some(self.p) {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        _: Seg,
+        _: Probe<'_, '_>,
+    ) -> Result<usize, ReadStopped> {
+        Ok(if pattern[1] == Some(self.p) {
             self.n
         } else {
             0
-        }
+        })
     }
 
-    fn holds(&self, _: Triple, _: Probe<'_, '_>) -> bool {
-        false
+    fn holds(&self, _: Triple, _: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+        Ok(false)
     }
 
-    fn positions(&self, pattern: [Option<u64>; 3], _: Seg, _: Probe<'_, '_>) -> Option<usize> {
-        (pattern[1] == Some(self.p)).then_some(self.n)
+    fn positions(
+        &self,
+        pattern: [Option<u64>; 3],
+        _: Seg,
+        _: Probe<'_, '_>,
+    ) -> Result<Option<usize>, ReadStopped> {
+        Ok((pattern[1] == Some(self.p)).then_some(self.n))
     }
 
     /// Every position of the range stale: each passed over, within the range counted ahead.
@@ -314,12 +335,12 @@ fn each_premise_alternative_counts_towards_the_stop() {
     let asked = AtomicUsize::new(0);
     let previous = |_: Triple, _: &Poller<'_>| {
         asked.fetch_add(1, Ordering::Relaxed);
-        Previous::Sets(Sets::NONE)
+        Ok(Previous::Sets(Sets::NONE))
     };
     let touched = [fact];
     let change = Change {
         source: &source,
-        in_closure: &|f, _| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| Ok(closure.binary_search(&f).is_ok()),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,
@@ -383,11 +404,11 @@ fn a_support_update_s_first_pass_counts_each_fact() {
     let asked = AtomicUsize::new(0);
     let previous = |_: Triple, _: &Poller<'_>| {
         asked.fetch_add(1, Ordering::Relaxed);
-        Previous::Sets(Sets::NONE)
+        Ok(Previous::Sets(Sets::NONE))
     };
     let change = Change {
         source: &source,
-        in_closure: &|f, _| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| Ok(closure.binary_search(&f).is_ok()),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,

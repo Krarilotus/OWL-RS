@@ -305,9 +305,11 @@ impl IndexVersion {
             .expect("never stopped")
     }
 
-    /// [`Self::count_plan`], calling `visit(n)` for its work as it goes: each run's range (its
-    /// tombstone words, plus one), each quad a default-graph post-filter scans. `None` as soon
-    /// as `visit` returns false (REAS-2: a caller's stop sees a long count).
+    /// [`Self::count_plan`], calling `visit(n)` (`n` at most `POLL_UNITS`) before the work it
+    /// counts: each run's range search (one), its tombstone words as they are read
+    /// (`PermutationRun::tombstones_in_visiting`), each merge step a default-graph
+    /// post-filter scan takes ([`QuadScan::next_visiting`]). `None` as soon as `visit` returns
+    /// false, nothing more read (REAS-2 fix check r1, R2-F1: the count lives in the reader).
     pub(crate) fn count_plan_visiting(
         &self,
         plan: &AccessPlan,
@@ -318,22 +320,21 @@ impl IndexVersion {
         };
         if adapted.exclude_default_graph {
             let mut count = 0u64;
-            for _ in self.scan_plan(plan) {
-                if !visit(1) {
-                    return None;
-                }
+            let mut scan = self.scan_plan(plan);
+            while scan.next_visiting(visit).ok()?.is_some() {
                 count += 1;
             }
             return Some(count);
         }
         let mut signed: i64 = 0;
         for run in self.runs.iter() {
-            let perm = run.permutation(adapted.permutation);
-            let (start, end) = perm.range(&adapted.low, &adapted.high);
-            if !visit((end - start) as u64 / 64 + 1) {
+            if !visit(1) {
                 return None;
             }
-            signed += (end - start) as i64 - 2 * perm.tombstones_in(start, end) as i64;
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let tombstones = perm.tombstones_in_visiting(start, end, visit)?;
+            signed += (end - start) as i64 - 2 * tombstones as i64;
         }
         Some(u64::try_from(signed).expect("exact deltas never make a range count negative"))
     }
@@ -707,6 +708,42 @@ impl Iterator for QuadScan<'_> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, Some(self.merge.remaining()))
+    }
+}
+
+/// A read its visitor stopped ([`QuadScan::next_visiting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stopped;
+
+impl QuadScan<'_> {
+    /// [`Iterator::next`], calling `visit(1)` before each merge step, a key passed over
+    /// (deleted, or in the default graph where it is left out) as much as one handed on
+    /// (REAS-2 fix check r1, R2-F1: a count's work is every position its scan passes, so
+    /// a long deleted run can't be drained unseen). `Err` once `visit` returns false,
+    /// nothing more read. Readers that count nothing use `next`, which this leaves as it was.
+    #[inline]
+    pub(crate) fn next_visiting(
+        &mut self,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<Option<EncodedQuad>, Stopped> {
+        loop {
+            if !visit(1) {
+                return Err(Stopped);
+            }
+            let Some((key, sign)) = self.merge.next() else {
+                return Ok(None);
+            };
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
+            if sign <= 0 {
+                continue;
+            }
+            let quad = self.permutation.key_to_quad(&key);
+            if self.exclude_default_graph && quad.graph.is_default_graph() {
+                continue;
+            }
+            return Ok(Some(quad));
+        }
     }
 }
 

@@ -190,7 +190,8 @@ pub fn same_as_partners<S: Source + ?Sized>(
     same_as: Option<u64>,
     term: u64,
     poll: &super::eval::Poller<'_>,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, super::eval::Stopped> {
+    // `Err` where its poller stopped the read, never a part of the class (fix check r1, B9).
     let mut out = Vec::new();
     if let Some(same_as) = same_as {
         source.scan(
@@ -202,9 +203,9 @@ pub fn same_as_partners<S: Source + ?Sized>(
                     out.push(t[2]);
                 }
             },
-        );
+        )?;
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase, VisitsBase};
-use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Visit};
+use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Stopped, Visit};
 use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
@@ -41,33 +41,44 @@ impl<'a> EngineBase<'a> {
     }
 
     /// Whether `fact` was in the state before the transaction (any graph, either stack): one
-    /// lookup, counted on `poll` before it is made (review r1 F5). Stopped, it reads as not
-    /// known, an answer the caller discards.
-    fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> bool {
+    /// lookup, counted on `poll` before it is made (review r1 F5); [`Stopped`] once `poll`
+    /// has stopped, never a "not known" that would keep the fact (fix check r1, rule 2).
+    fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::KnownBefore, 1);
         if poll.tick() {
-            return false;
+            return Err(Stopped);
         }
         let [s, p, o] = fact.map(Some);
-        self.snapshot
+        Ok(self
+            .snapshot
             .quads_for_pattern_in(
                 ReadModel::Materialised,
                 &pattern([s, p, o], GraphSelector::Any),
             )
             .next()
-            .is_some()
+            .is_some())
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
     /// copy it visits counted on `probe`, the deleted ones included (REAS-2, sol-loop r1
-    /// S2); false once that has stopped.
-    fn committed(&self, model: ReadModel, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    /// S2); [`Stopped`] once that has stopped before a copy was found.
+    fn committed(
+        &self,
+        model: ReadModel,
+        fact: Triple,
+        probe: Probe<'_, '_>,
+    ) -> Result<bool, Stopped> {
         let [s, p, o] = fact.map(Some);
-        self.snapshot
+        let found = self
+            .snapshot
             .quads_for_pattern_in(model, &pattern([s, p, o], GraphSelector::Any))
             .take_while(|_| probe.units(1))
-            .any(|quad| !self.deletes.contains(&quad))
+            .any(|quad| !self.deletes.contains(&quad));
+        if !found {
+            probe.ended()?;
+        }
+        Ok(found)
     }
 }
 
@@ -91,32 +102,33 @@ impl VisitsBase for EngineBase<'_> {
     }
 
     /// The engine's count's work counted on `probe` as it goes (review r1 F2: under compact
-    /// equality it scans the stored matches); stopped, 0, an answer the stage's check
-    /// discards.
-    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
-        let Some(committed) = self.snapshot.count_in_visiting(
-            ReadModel::Materialised,
-            &pattern(bound, GraphSelector::Any),
-            &mut |n| probe.visited(n),
-        ) else {
-            return 0;
-        };
-        let committed = committed.at_least();
+    /// equality it scans the stored matches); [`Stopped`] where the count stopped.
+    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
+        let committed = self
+            .snapshot
+            .count_in_visiting(
+                ReadModel::Materialised,
+                &pattern(bound, GraphSelector::Any),
+                &mut |n| probe.visited(n),
+            )
+            .ok_or(Stopped)?
+            .at_least();
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
-        usize::try_from(committed)
+        Ok(usize::try_from(committed)
             .unwrap_or(usize::MAX)
-            .saturating_add(self.inserts.size(bound, probe))
+            .saturating_add(self.inserts.size(bound, probe)?))
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.inserts.holds(fact, probe) || self.committed(ReadModel::Materialised, fact, probe)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.inserts.holds(fact, probe)?
+            || self.committed(ReadModel::Materialised, fact, probe)?)
     }
 
-    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.inserts.holds(fact, probe)
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.inserts.holds(fact, probe)?
             || self.axioms.binary_search(&fact).is_ok()
-            || self.committed(ReadModel::Asserted, fact, probe)
+            || self.committed(ReadModel::Asserted, fact, probe)?)
     }
 
     fn visit_asserted(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
@@ -274,55 +286,51 @@ pub fn maintain_with(
         let stop: crate::eval::Stop<'_> = &|| operation.fired();
         let prep = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
         // Facts new to the state: in no graph and not inferred before the transaction. Each
-        // lookup in the state before counts on `prep` (review r1 F5); stopped, a filter's
-        // output means nothing and the maintenance ends there.
-        let mut inserted: Vec<Triple> = tx
-            .inserted()
-            .map(triple)
-            .filter(|&t| !base.known_before(t, &prep))
-            .collect();
-        if prep.stopped() {
-            return Err(operation.interrupted());
+        // lookup in the state before counts on `prep` (review r1 F5); the first that finds
+        // `prep` stopped ends the maintenance there, its partial lists dropped (fix check
+        // r1, R2-F3: a stopped lookup read as "not known" kept every fact after it).
+        let interrupted = |_: Stopped| operation.interrupted();
+        let mut inserted: Vec<Triple> = Vec::new();
+        for fact in tx.inserted().map(triple) {
+            if !base.known_before(fact, &prep).map_err(interrupted)? {
+                inserted.push(fact);
+            }
         }
         if !(inserted.is_empty() && tx.deleted().next().is_none()) {
-            missing_axioms = program
-                .axioms
-                .iter()
-                .copied()
-                .filter(|&axiom| {
-                    !base.known_before(axiom, &prep) && !base.inserts.contains(axiom, &prep)
-                })
-                .collect();
-            if prep.stopped() {
-                return Err(operation.interrupted());
+            for &axiom in &program.axioms {
+                if base.known_before(axiom, &prep).map_err(interrupted)? {
+                    continue;
+                }
+                if !base.inserts.contains(axiom, &prep).map_err(interrupted)? {
+                    missing_axioms.push(axiom);
+                }
             }
             inserted.extend(missing_axioms.iter().copied());
         }
         if let Some(closure) = rebuilt.as_ref().filter(|_| !first_load) {
-            inserted.extend(
-                closure
-                    .inferred
-                    .iter()
-                    .map(|t| triple(t.in_default_graph()))
-                    .filter(|&fact| !base.known_before(fact, &prep)),
-            );
-            if prep.stopped() {
-                return Err(operation.interrupted());
+            for fact in closure
+                .inferred
+                .iter()
+                .map(|t| triple(t.in_default_graph()))
+            {
+                if !base.known_before(fact, &prep).map_err(interrupted)? {
+                    inserted.push(fact);
+                }
             }
         }
         inserted.sort_unstable();
         inserted.dedup();
-        // A triple deleted from one graph but still asserted in another stays a fact.
-        let mut deleted: Vec<Triple> = tx
-            .deleted()
-            .map(triple)
-            .filter(|&t| !base.is_asserted(t, &prep))
-            .collect();
+        // A triple deleted from one graph but still asserted in another stays a fact. The
+        // first probe that finds `prep` stopped ends the maintenance (fix check r1, rule 2).
+        let mut deleted: Vec<Triple> = Vec::new();
+        for fact in tx.deleted().map(triple) {
+            let asserted = base.is_asserted(fact, &prep);
+            if !asserted.map_err(|Stopped| delta::Interrupted::default())? {
+                deleted.push(fact);
+            }
+        }
         deleted.sort_unstable();
         deleted.dedup();
-        if prep.stopped() {
-            return Err(delta::Interrupted::default());
-        }
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
@@ -343,19 +351,21 @@ pub fn maintain_with(
             // The new inferred facts, as the delta executor reports them (its `insert`): the
             // state tells which storable ones it held before, and none it can't hold (above).
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
-            let derived: Vec<Triple> = closure
+            let stopped = |Stopped| delta::Interrupted::default();
+            let mut derived: Vec<Triple> = Vec::new();
+            for f in closure
                 .inferred
                 .iter()
                 .map(|t| triple(t.in_default_graph()))
-                .filter(|&f| {
-                    !base.is_asserted(f, &prep)
-                        && !(base.contains(f, &prep) && !inserted_set.contains(&f))
-                })
-                .chain(unstorable.drain(..))
-                .collect();
-            if prep.stopped() {
-                return Err(delta::Interrupted::default());
+            {
+                if base.is_asserted(f, &prep).map_err(stopped)? {
+                    continue;
+                }
+                if !(base.contains(f, &prep).map_err(stopped)? && !inserted_set.contains(&f)) {
+                    derived.push(f);
+                }
             }
+            derived.append(&mut unstorable);
             delta::Update {
                 violations: delta::introduced_violations(
                     &base, &inserted, &derived, rules, ground, operation, memory,
@@ -682,7 +692,8 @@ mod tests {
         let poll = Poller::new(&stop).expect("not stopped yet");
         fired.store(true, Ordering::Relaxed);
         let mut delivered = 0;
-        base.scan([None, Some(p), None], &poll, &mut |_| delivered += 1);
+        let scanned = base.scan([None, Some(p), None], &poll, &mut |_| delivered += 1);
+        assert!(scanned.is_err(), "a scan its poller stopped says so");
         assert_eq!(delivered, 0, "every quad the scan meets is deleted");
         assert!(
             poll.stopped(),
@@ -725,7 +736,9 @@ mod tests {
         let poll = Poller::new(&stop).expect("not stopped yet");
         fired.store(true, Ordering::Relaxed);
         let asserted = base.is_asserted([s.raw(), p.raw(), o.raw()], &poll);
-        assert!(!asserted, "every copy is deleted");
+        // Stopped while it reads the deleted copies, the probe says so (fix check r1, rule 2:
+        // once "not asserted").
+        assert_eq!(asserted, Err(Stopped), "every copy is deleted");
         assert!(
             poll.stopped(),
             "{n} deleted copies read without the poller polling"
@@ -1052,7 +1065,9 @@ mod tests {
             false
         };
         let poll = Poller::new(&stop).expect("never stopped");
-        let estimate = base.estimate([None, Some(p.raw()), None], &poll);
+        let estimate = base
+            .estimate([None, Some(p.raw()), None], &poll)
+            .expect("never stopped");
         assert!(
             estimate >= n,
             "{estimate}: an upper bound on the {n} statements and their copies"

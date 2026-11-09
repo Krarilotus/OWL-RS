@@ -46,8 +46,9 @@ use nrese_exec::Budget;
 
 use super::batch::{Equality, Store, check, is_replacement_rule};
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, Poller, Probe, RuleKey, Schema, Seg, Source, Stop, Visit,
-    Visits, instantiate_head, rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
+    AllFacts, GroundProgram, Job, NEVER, Poller, Probe, RuleKey, Schema, Seg, Source, Stop,
+    Stopped, Visit, Visits, instantiate_head, rule_key, run_jobs, run_jobs_acyclic,
+    transitive_predicate,
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
@@ -58,19 +59,24 @@ use super::violations::{Violations, unlimited};
 ///
 /// Every read takes the reading task's poller and counts on it as a [`Source`] read does
 /// (the call, then each position it visits, the ones it filters out included); on a
-/// stopped poller it does no more work and its answer means nothing. As for [`Source`], the
-/// counting is the trait's: an implementation provides [`VisitsBase`], and `Base` is
-/// implemented for every one of those and nothing else.
+/// stopped poller it does no more work and answers [`Stopped`], never a value (REAS-2 fix
+/// check r1, rule 2). As for [`Source`], the counting is the trait's: an implementation
+/// provides [`VisitsBase`], and `Base` is implemented for every one of those and nothing
+/// else.
 pub trait Base: Sync + sealed::Read {
     /// Calls `f` with every fact matching `pattern` (`None` = any term). A fact may be
-    /// reported more than once (asserted in several graphs).
-    fn scan(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>, f: &mut dyn FnMut(Triple));
-    /// An upper bound on the matches of `pattern`; zero only if nothing matches (or, on a
-    /// stopped poller, nothing).
-    fn estimate(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>) -> usize;
-    fn contains(&self, fact: Triple, poll: &Poller<'_>) -> bool;
+    /// reported more than once (asserted in several graphs). `Err` if its poller stopped it.
+    fn scan(
+        &self,
+        pattern: [Option<u64>; 3],
+        poll: &Poller<'_>,
+        f: &mut dyn FnMut(Triple),
+    ) -> Result<(), Stopped>;
+    /// An upper bound on the matches of `pattern`; zero only if nothing matches.
+    fn estimate(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>) -> Result<usize, Stopped>;
+    fn contains(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped>;
     /// Whether `fact` is asserted (after the change).
-    fn is_asserted(&self, fact: Triple, poll: &Poller<'_>) -> bool;
+    fn is_asserted(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped>;
     /// Calls `f` with every asserted fact matching `pattern` (after the change), as
     /// [`Base::scan`] does: a base whose asserted facts are apart reads them alone.
     fn scan_asserted(
@@ -78,22 +84,23 @@ pub trait Base: Sync + sealed::Read {
         pattern: [Option<u64>; 3],
         poll: &Poller<'_>,
         f: &mut dyn FnMut(Triple),
-    );
+    ) -> Result<(), Stopped>;
 }
 
 /// What a [`Base`] implementation provides: its reads, each counted by the caller's side
-/// before it runs, its scans delivering through a [`Visit`] ([`Visits`] for sources).
+/// before it runs, its scans delivering through a [`Visit`] ([`Visits`] for sources). Its
+/// answers are `Err` once their probe's poller has stopped.
 pub trait VisitsBase: Sync {
     /// Hands every position matching `pattern` to `visit` ([`Visits::visit`]).
     fn visit(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>);
     /// [`Base::estimate`], the call already counted.
-    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize;
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped>;
     /// [`Base::contains`], the call already counted.
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool;
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped>;
     /// [`Base::is_asserted`], the call already counted.
-    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool;
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped>;
     /// [`Base::scan_asserted`]: by default the scan, each fact it delivers asked whether it
-    /// is asserted (on the scan's poller).
+    /// is asserted (on the scan's poller); a stopped ask ends the scan.
     fn visit_asserted(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         let probe = Probe::of(visit.poller());
         visit.filtered(&|fact| self.asserts(fact, probe), |inner| {
@@ -110,28 +117,41 @@ mod sealed {
 
 impl<T: VisitsBase + ?Sized> Base for T {
     #[inline]
-    fn scan(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>, f: &mut dyn FnMut(Triple)) {
-        if !poll.tick() {
-            self.visit(pattern, &mut Visit::new(poll, f));
+    fn scan(
+        &self,
+        pattern: [Option<u64>; 3],
+        poll: &Poller<'_>,
+        f: &mut dyn FnMut(Triple),
+    ) -> Result<(), Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
         }
+        self.visit(pattern, &mut Visit::new(poll, f));
+        poll.ended()
     }
 
     #[inline]
-    fn estimate(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>) -> usize {
-        match poll.tick() {
-            true => 0,
-            false => self.size(pattern, Probe::of(poll)),
+    fn estimate(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>) -> Result<usize, Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
         }
+        self.size(pattern, Probe::of(poll))
     }
 
     #[inline]
-    fn contains(&self, fact: Triple, poll: &Poller<'_>) -> bool {
-        !poll.tick() && self.holds(fact, Probe::of(poll))
+    fn contains(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
+        }
+        self.holds(fact, Probe::of(poll))
     }
 
     #[inline]
-    fn is_asserted(&self, fact: Triple, poll: &Poller<'_>) -> bool {
-        !poll.tick() && self.asserts(fact, Probe::of(poll))
+    fn is_asserted(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
+        }
+        self.asserts(fact, Probe::of(poll))
     }
 
     fn scan_asserted(
@@ -139,10 +159,12 @@ impl<T: VisitsBase + ?Sized> Base for T {
         pattern: [Option<u64>; 3],
         poll: &Poller<'_>,
         f: &mut dyn FnMut(Triple),
-    ) {
-        if !poll.tick() {
-            self.visit_asserted(pattern, &mut Visit::new(poll, f));
+    ) -> Result<(), Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
         }
+        self.visit_asserted(pattern, &mut Visit::new(poll, f));
+        poll.ended()
     }
 }
 
@@ -242,8 +264,8 @@ struct Overlay<'a, B: Base + ?Sized> {
 }
 
 impl<B: Base + ?Sized> Overlay<'_, B> {
-    fn in_base(&self, fact: Triple, poll: &Poller<'_>) -> bool {
-        !self.hidden.contains(&fact) && !self.extra.contains(fact, poll)
+    fn in_base(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+        Ok(!self.hidden.contains(&fact) && !self.extra.contains(fact, poll)?)
     }
 }
 
@@ -255,30 +277,38 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
         self.extra.visit(pattern, seg, visit);
         if seg != Seg::Delta && !visit.stopped() {
             let poll = visit.poller();
-            // The base's scan counts each position it visits on this visit's poller.
-            self.base.scan(pattern, poll, &mut |fact| {
-                if self.in_base(fact, poll) {
+            // The base's scan counts each position it visits on this visit's poller; a check
+            // its poller stopped delivers nothing, and the scan ends at its next position.
+            // Stopped, the read around this visit answers `Stopped` (the poller is latched).
+            let scanned = self.base.scan(pattern, poll, &mut |fact| {
+                if self.in_base(fact, poll) == Ok(true) {
                     visit.counted(fact);
                 }
             });
+            debug_assert!(scanned.is_ok() || poll.stopped());
         }
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         let seg = seg.plain();
-        let extra = self.extra.size(pattern, seg, probe);
-        match seg {
+        let extra = self.extra.size(pattern, seg, probe)?;
+        Ok(match seg {
             // The base's estimate saturates (`Snapshot::count_in`), so the sum does too.
             Seg::Old | Seg::All => {
-                extra.saturating_add(self.base.estimate(pattern, probe.poller()))
+                extra.saturating_add(self.base.estimate(pattern, probe.poller())?)
             }
             _ => extra,
-        }
+        })
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.extra.holds(fact, probe)
-            || (!self.hidden.contains(&fact) && self.base.contains(fact, probe.poller()))
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.extra.holds(fact, probe)?
+            || (!self.hidden.contains(&fact) && self.base.contains(fact, probe.poller())?))
     }
 }
 
@@ -424,6 +454,9 @@ fn update_body<B: Base + ?Sized>(
             Ok(())
         }
     };
+    // A read its poller stopped ends the update here (fix check r1, rule 2), as the stage's
+    // own check does.
+    let stopped = |Stopped| Interrupted::default();
     let mut result = Update::default();
     if policy.rebuilds_at_once() {
         result.policy.plan = policy::Plan::Rebuild;
@@ -449,7 +482,8 @@ fn update_body<B: Base + ?Sized>(
             policy,
             &mut result.policy,
             &stage,
-        );
+        )
+        .map_err(stopped)?;
         check_stop()?;
         match decision {
             policy::Decision::Keep => {}
@@ -491,8 +525,10 @@ fn update_body<B: Base + ?Sized>(
             hidden: &inserted_set,
             extra: &Store::new(deleted.to_vec()),
         };
+        // A term of the program's rules a stop cut short counts as without partners: the loop
+        // asking is the program's (bounded), and the next stage's reads answer `Stopped`.
         super::recursion::non_recursive(&old_program.rules, schema.rdf_type(), &|term| {
-            super::recursion::same_as_partners(&before, same_as, term, &stage)
+            super::recursion::same_as_partners(&before, same_as, term, &stage).unwrap_or_default()
         })
     };
 
@@ -512,8 +548,8 @@ fn update_body<B: Base + ?Sized>(
         recloses.clear();
         // The region's facts, overdeleted at once: every inferred fact that mentions one
         // of its terms (the asserted ones are what phase 2 settles it from).
-        region_asserted = asserted_mentioning(base, &region, &stage);
-        region_facts = facts_mentioning(base, &region, &stage);
+        region_asserted = asserted_mentioning(base, &region, &stage).map_err(stopped)?;
+        region_facts = facts_mentioning(base, &region, &stage).map_err(stopped)?;
         region_facts.retain(|f| !region_asserted.contains(f) && !inserted_set.contains(f));
         if region_facts.iter().any(|&f| rules.is_program_fact(f)) {
             // Ground instances that bake those facts in are no proofs any more.
@@ -560,14 +596,17 @@ fn update_body<B: Base + ?Sized>(
             for &p in &scratch.transitive {
                 old.scan([None, Some(p), None], Seg::All, &stage, &mut |t| {
                     component.push(t)
-                });
+                })
+                .map_err(stopped)?;
             }
             let mut bodiless = scratch.take_facts();
             // List rules whose list lost a fact: in full as well.
             let mut delta_facts = Vec::new();
-            extra.scan([None, None, None], Seg::Delta, &stage, &mut |f| {
-                delta_facts.push(f)
-            });
+            extra
+                .scan([None, None, None], Seg::Delta, &stage, &mut |f| {
+                    delta_facts.push(f)
+                })
+                .map_err(stopped)?;
             if delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
                 let mut gone: HashSet<Triple> = overdeleted.clone();
                 gone.extend(delta_facts.iter().copied());
@@ -589,7 +628,8 @@ fn update_body<B: Base + ?Sized>(
                         Some(p) => {
                             old.scan([None, Some(p), None], Seg::All, &stage, &mut |t| {
                                 component.push(t)
-                            });
+                            })
+                            .map_err(stopped)?;
                         }
                         None if rule.body.is_empty() => {
                             if let Head::Facts(heads) = &rule.head {
@@ -623,13 +663,15 @@ fn update_body<B: Base + ?Sized>(
             // (sweep M06, M07).
             for &p in &old_program.transitive {
                 let (mut sources, mut targets) = (Vec::new(), Vec::new());
-                extra.scan([None, Some(p), None], Seg::Delta, &stage, &mut |t| {
-                    // The region's equalities are all overdeleted already.
-                    if Some(p) != same_as || !mentions(&region, t) {
-                        sources.push(t[0]);
-                        targets.push(t[2]);
-                    }
-                });
+                extra
+                    .scan([None, Some(p), None], Seg::Delta, &stage, &mut |t| {
+                        // The region's equalities are all overdeleted already.
+                        if Some(p) != same_as || !mentions(&region, t) {
+                            sources.push(t[0]);
+                            targets.push(t[2]);
+                        }
+                    })
+                    .map_err(stopped)?;
                 if sources.is_empty() {
                     continue;
                 }
@@ -638,13 +680,15 @@ fn update_body<B: Base + ?Sized>(
                 for &a in &sources {
                     old.scan([None, Some(p), Some(a)], Seg::All, &stage, &mut |t| {
                         before.insert(t[0]);
-                    });
+                    })
+                    .map_err(stopped)?;
                 }
                 let mut after: HashSet<u64> = targets.iter().copied().collect();
                 for &b in &targets {
                     old.scan([Some(b), Some(p), None], Seg::All, &stage, &mut |t| {
                         after.insert(t[2]);
-                    });
+                    })
+                    .map_err(stopped)?;
                 }
                 // With B/F (instances valid), pairs still connected by base edges keep a
                 // proof: base edges are still-asserted facts and their one-atom images
@@ -653,19 +697,24 @@ fn update_body<B: Base + ?Sized>(
                 let connected: HashSet<(u64, u64)> = if backward {
                     let mut edges = Vec::new();
                     for &u in before.iter().chain(&after) {
+                        // A probe its poller stopped skips its fact: the scan ends at its next
+                        // position and answers `Stopped`.
                         old.scan([Some(u), None, None], Seg::All, &stage, &mut |t| {
-                            if extra.contains(t, &stage) || !base.is_asserted(t, &stage) {
+                            if extra.contains(t, &stage) != Ok(false)
+                                || base.is_asserted(t, &stage) != Ok(true)
+                            {
                                 return;
                             }
                             if t[1] == p {
                                 edges.push((t[0], t[2]));
                             }
                             for image in old_program.one_step_images(t) {
-                                if image[1] == p && !extra.contains(image, &stage) {
+                                if image[1] == p && extra.contains(image, &stage) == Ok(false) {
                                     edges.push((image[0], image[2]));
                                 }
                             }
-                        });
+                        })
+                        .map_err(stopped)?;
                     }
                     // A component read part-way is not closed: the stop ends it here.
                     check_stop()?;
@@ -682,7 +731,8 @@ fn update_body<B: Base + ?Sized>(
                         if after.contains(&t[2]) && !connected.contains(&(t[0], t[2])) {
                             component.push(t);
                         }
-                    });
+                    })
+                    .map_err(stopped)?;
                 }
                 if newly && component.len() == before_len {
                     recloses.remove(&p);
@@ -692,11 +742,11 @@ fn update_body<B: Base + ?Sized>(
                 jobs.extend(Job::full(&old, rule, &stage));
             }
             // Only inferred facts of the old state are overdeleted; asserted ones stay.
-            let overdeletable = |f: Triple, poll: &Poller<'_>| {
-                base.contains(f, poll)
-                    && !base.is_asserted(f, poll)
-                    && !extra.contains(f, poll)
-                    && !inserted_set.contains(&f)
+            let overdeletable = |f: Triple, poll: &Poller<'_>| -> Result<bool, Stopped> {
+                Ok(base.contains(f, poll)?
+                    && !base.is_asserted(f, poll)?
+                    && !extra.contains(f, poll)?
+                    && !inserted_set.contains(&f))
             };
             let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable, stop);
             candidates.extend(run_jobs_acyclic(
@@ -706,8 +756,13 @@ fn update_body<B: Base + ?Sized>(
                 stop,
             ));
             check_stop()?;
-            candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f, &stage)));
-            candidates.extend(component.into_iter().filter(|&f| overdeletable(f, &stage)));
+            // The first probe that finds the stage stopped ends the update (fix check r1,
+            // SW090: a stopped probe read as "keep" walked every candidate after it).
+            for f in bodiless.into_iter().chain(component) {
+                if overdeletable(f, &stage).map_err(stopped)? {
+                    candidates.push(f);
+                }
+            }
             candidates.retain(|&f| !mentions(&region, f));
             drop(jobs);
             // Equalities about to be overdeleted (their premises gone) may split classes
@@ -725,7 +780,8 @@ fn update_body<B: Base + ?Sized>(
                     policy,
                     &mut result.policy,
                     &stage,
-                );
+                )
+                .map_err(stopped)?;
                 // The probes above and the policy's reads: their answers mean something
                 // only if the stop hasn't fired.
                 check_stop()?;
@@ -755,11 +811,18 @@ fn update_body<B: Base + ?Sized>(
                 };
                 candidates.sort_unstable();
                 candidates.dedup();
-                // Independent per candidate: in parallel.
-                candidates = candidates
+                // Independent per candidate: in parallel. The first answer its stop ended ends
+                // them all (rayon's `Result` collect), never a "not derivable" kept.
+                let kept: Vec<Option<Triple>> = candidates
                     .into_par_iter()
-                    .filter(|&f| !old_program.derivable_by(&left, f, &non_recursive, false, stop))
-                    .collect();
+                    .map(|f| {
+                        old_program
+                            .derivable_by(&left, f, &non_recursive, false, stop)
+                            .map(|derivable| (!derivable).then_some(f))
+                    })
+                    .collect::<Result<_, Stopped>>()
+                    .map_err(stopped)?;
+                candidates = kept.into_iter().flatten().collect();
                 check_stop()?;
             }
             if backward {
@@ -782,13 +845,20 @@ fn update_body<B: Base + ?Sized>(
                     budget: PROOF_BUDGET,
                     poll: super::eval::Poller::new(stop),
                 };
-                candidates = candidates
+                // The first proof a stop ended ends them all (fix check r1, rule 2: a stopped
+                // candidate was kept unproved, and every one after it asked the stop again).
+                let kept: Vec<Option<Triple>> = candidates
                     .into_par_iter()
-                    .map_init(fresh_prover, |prover, f| {
-                        (stop() || !prover.prove(&old, &extra, f, 0).0).then_some(f)
-                    })
-                    .flatten()
-                    .collect();
+                    .map_init(
+                        fresh_prover,
+                        |prover, f| -> Result<Option<Triple>, Stopped> {
+                            let (proved, _) = prover.prove(&old, &extra, f, 0)?;
+                            Ok((!proved).then_some(f))
+                        },
+                    )
+                    .collect::<Result<_, Stopped>>()
+                    .map_err(stopped)?;
+                candidates = kept.into_iter().flatten().collect();
                 check_stop()?;
             }
             let delta = extra.advance(candidates);
@@ -862,12 +932,18 @@ fn update_body<B: Base + ?Sized>(
                 .collect();
             // Bodiless instances too: their schema facts are what remains, every open fact
             // hidden.
-            let by_rules: Vec<Triple> = open
+            // The first answer its stop ended ends them all, never a "not derivable" kept.
+            let by_rules: Vec<Option<Triple>> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| program.derivable_by(&remaining, f, &not_equality, true, stop))
-                .collect();
-            let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
+                .map(|f| {
+                    program
+                        .derivable_by(&remaining, f, &not_equality, true, stop)
+                        .map(|derivable| derivable.then_some(f))
+                })
+                .collect::<Result<_, Stopped>>()
+                .map_err(stopped)?;
+            let by_rules: HashSet<Triple> = by_rules.into_iter().flatten().collect();
             check_stop()?;
             // The classes of the remaining equalities: the region's, and those of the
             // other terms its facts mention (a fact of a member may be copied through
@@ -884,11 +960,13 @@ fn update_body<B: Base + ?Sized>(
                 // A scan per term its facts mention, on the stage's poller (sweep M08).
                 for term in others {
                     let pattern = [Some(term), Some(same_as), None];
-                    remaining.scan(pattern, Seg::All, &stage, &mut |f| {
-                        if f[0] != f[2] {
-                            classes.union(f[0], f[2]);
-                        }
-                    });
+                    remaining
+                        .scan(pattern, Seg::All, &stage, &mut |f| {
+                            if f[0] != f[2] {
+                                classes.union(f[0], f[2]);
+                            }
+                        })
+                        .map_err(stopped)?;
                 }
                 // Classes read part-way decide nothing (and settling again grounds).
                 check_stop()?;
@@ -932,22 +1010,23 @@ fn update_body<B: Base + ?Sized>(
         .collect();
     let settled: &GroundProgram = &program;
     // Each task's probe of a candidate counts on its own poller, before the search makes
-    // one of its own.
-    let others: Vec<Triple> = candidates
+    // one of its own. The first answer a stop ended ends them all (fix check r1, rule 2).
+    let others: Vec<Option<Triple>> = candidates
         .par_iter()
         .copied()
         .map_init(
             || Poller::new(stop),
-            |poll, fact| {
-                let poll = poll.as_ref()?;
-                (!base.is_asserted(fact, poll)
-                    && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]), stop))
-                .then_some(fact)
+            |poll, fact| -> Result<Option<Triple>, Stopped> {
+                let poll = poll.as_ref().ok_or(Stopped)?;
+                let recloses = recloses.contains(&fact[1]);
+                Ok((!base.is_asserted(fact, poll)?
+                    && settled.derivable_with(&remaining, fact, !recloses, stop)?)
+                .then_some(fact))
             },
         )
-        .flatten()
-        .collect();
-    rederived.extend(others);
+        .collect::<Result<_, Stopped>>()
+        .map_err(stopped)?;
+    rederived.extend(others.into_iter().flatten());
     check_stop()?;
     let settled_consistency = program.consistency.len();
 
@@ -977,9 +1056,11 @@ fn update_body<B: Base + ?Sized>(
         let evaluated = program.rules.len();
         let transitive_before = program.transitive.clone();
         let mut delta_facts = Vec::new();
-        extra.scan([None, None, None], Seg::Delta, &stage, &mut |f| {
-            delta_facts.push(f)
-        });
+        extra
+            .scan([None, None, None], Seg::Delta, &stage, &mut |f| {
+                delta_facts.push(f)
+            })
+            .map_err(stopped)?;
         // The program grows from these: only from a delta read whole.
         check_stop()?;
         if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
@@ -999,7 +1080,7 @@ fn update_body<B: Base + ?Sized>(
         } else {
             Vec::new()
         };
-        candidates.retain(|&f| !state.contains(f, &stage));
+        candidates = new_in(&state, candidates, &stage).map_err(stopped)?;
         let mut jobs = Vec::new();
         for (r, i) in program.variants(&extra, &stage) {
             if r < evaluated && !replaced(&program.rules[r]) {
@@ -1011,7 +1092,7 @@ fn update_body<B: Base + ?Sized>(
                 jobs.extend(Job::full(&state, rule, &stage));
             }
         }
-        let keep = |fact: Triple, poll: &Poller<'_>| !state.contains(fact, poll);
+        let keep = |fact: Triple, poll: &Poller<'_>| Ok(!state.contains(fact, poll)?);
         candidates.extend(run_jobs(&state, &jobs, &keep, stop));
         check_stop()?;
         if let Some(equality) = &mut equality {
@@ -1025,25 +1106,28 @@ fn update_body<B: Base + ?Sized>(
         for &p in &program.transitive {
             if !transitive_before.contains(&p) || reclose.remove(&p) {
                 let mut all = Vec::new();
-                state.scan([None, Some(p), None], Seg::All, &stage, &mut |t| {
-                    all.push((t[0], t[2]))
-                });
-                produced.extend(
-                    nrese_exec::graph::transitive_closure_until(&all, stop)
-                        .ok_or_else(Interrupted::default)?
-                        .into_iter()
-                        .map(|(s, o)| [s, p, o])
-                        .filter(|&f| !state.contains(f, &stage)),
-                );
+                state
+                    .scan([None, Some(p), None], Seg::All, &stage, &mut |t| {
+                        all.push((t[0], t[2]))
+                    })
+                    .map_err(stopped)?;
+                let closure: Vec<Triple> = nrese_exec::graph::transitive_closure_until(&all, stop)
+                    .ok_or_else(Interrupted::default)?
+                    .into_iter()
+                    .map(|(s, o)| [s, p, o])
+                    .collect();
+                produced.extend(new_in(&state, closure, &stage).map_err(stopped)?);
                 continue;
             }
             let mut edges = Vec::new();
-            state.scan([None, Some(p), None], Seg::Delta, &stage, &mut |t| {
-                if !module_output.contains(&t) {
-                    edges.push((t[0], t[2]));
-                }
-            });
-            produced.extend(close_edges(&state, p, &edges, &stage));
+            state
+                .scan([None, Some(p), None], Seg::Delta, &stage, &mut |t| {
+                    if !module_output.contains(&t) {
+                        edges.push((t[0], t[2]));
+                    }
+                })
+                .map_err(stopped)?;
+            produced.extend(close_edges(&state, p, &edges, &stage).map_err(stopped)?);
         }
         // The closures' reads count on the stage's poller: a round's candidates are only
         // added from reads that weren't stopped.
@@ -1060,20 +1144,29 @@ fn update_body<B: Base + ?Sized>(
     lap(3, &mut result);
     // The changes to the inferred stack.
     let mut added: Vec<Triple> = Vec::new();
-    extra.scan([None, None, None], Seg::All, &stage, &mut |f| added.push(f));
+    extra
+        .scan([None, None, None], Seg::All, &stage, &mut |f| added.push(f))
+        .map_err(stopped)?;
     added.sort_unstable();
     added.dedup();
-    // Two probes per added fact, on the stage's poller; the consistency phase's check and
-    // the update's last one ask the latched stop before any of it is returned.
-    let visible_before =
-        |f: Triple| base.contains(f, &stage) && !hidden.contains(&f) && !inserted_set.contains(&f);
-    result.insert = added
-        .iter()
-        .copied()
-        .filter(|&f| {
-            !base.is_asserted(f, &stage) && !(visible_before(f) || overdeleted.contains(&f))
-        })
-        .collect();
+    // Two probes per added fact, on the stage's poller; the first that finds it stopped ends
+    // the update (fix check r1, rule 2).
+    let visible_before = |f: Triple| -> Result<bool, Stopped> {
+        Ok(base.contains(f, &stage)? && !hidden.contains(&f) && !inserted_set.contains(&f))
+    };
+    // Each added fact's visibility before, asked once (the insert and the split below).
+    let mut before: Vec<bool> = Vec::with_capacity(added.len());
+    for &f in &added {
+        before.push(visible_before(f).map_err(stopped)?);
+    }
+    let mut insert = Vec::new();
+    for (&f, &visible) in added.iter().zip(&before) {
+        if !base.is_asserted(f, &stage).map_err(stopped)? && !(visible || overdeleted.contains(&f))
+        {
+            insert.push(f);
+        }
+    }
+    result.insert = insert;
     let kept: HashSet<Triple> = added.iter().copied().collect();
     result.remove = overdeleted
         .iter()
@@ -1093,9 +1186,13 @@ fn update_body<B: Base + ?Sized>(
     // Consistency through the facts the change added. The overlay holds every fact of
     // phase 3 (rederived ones are hidden in `base`), with the new ones as its delta:
     // existing instances through them, new instances in full.
-    let (new_facts, restored): (Vec<Triple>, Vec<Triple>) = added.iter().copied().partition(|&f| {
-        inserted_set.contains(&f) || (!visible_before(f) && !overdeleted.contains(&f))
-    });
+    let (mut new_facts, mut restored): (Vec<Triple>, Vec<Triple>) = (Vec::new(), Vec::new());
+    for (&f, &visible) in added.iter().zip(&before) {
+        match inserted_set.contains(&f) || (!visible && !overdeleted.contains(&f)) {
+            true => new_facts.push(f),
+            false => restored.push(f),
+        }
+    }
     let mut fresh = Store::new(restored);
     fresh.advance(new_facts);
     let state = Overlay {
@@ -1197,9 +1294,11 @@ fn introduced_violations_body<B: Base + ?Sized>(
     let mut program: Cow<'_, GroundProgram> = Cow::Borrowed(old_program);
     let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
     let mut delta_facts = Vec::new();
-    fresh.scan([None, None, None], Seg::Delta, &stage, &mut |f| {
-        delta_facts.push(f)
-    });
+    fresh
+        .scan([None, None, None], Seg::Delta, &stage, &mut |f| {
+            delta_facts.push(f)
+        })
+        .map_err(|Stopped| Interrupted::default())?;
     if stop() {
         return Err(Interrupted::default());
     }
@@ -1242,7 +1341,7 @@ fn facts_mentioning<B: Base + ?Sized>(
     base: &B,
     terms: &HashSet<u64>,
     poll: &Poller<'_>,
-) -> Vec<Triple> {
+) -> Result<Vec<Triple>, Stopped> {
     let mut facts: Vec<Triple> = Vec::new();
     for &term in terms {
         for position in 0..3 {
@@ -1252,10 +1351,10 @@ fn facts_mentioning<B: Base + ?Sized>(
                 if !t[..position].iter().any(|earlier| terms.contains(earlier)) {
                     facts.push(t);
                 }
-            });
+            })?;
         }
     }
-    facts
+    Ok(facts)
 }
 
 /// The asserted facts of `base` that mention one of `terms`.
@@ -1263,7 +1362,7 @@ fn asserted_mentioning<B: Base + ?Sized>(
     base: &B,
     terms: &HashSet<u64>,
     poll: &Poller<'_>,
-) -> HashSet<Triple> {
+) -> Result<HashSet<Triple>, Stopped> {
     let mut facts = HashSet::new();
     for &term in terms {
         for pattern in [
@@ -1273,10 +1372,27 @@ fn asserted_mentioning<B: Base + ?Sized>(
         ] {
             base.scan_asserted(pattern, poll, &mut |t| {
                 facts.insert(t);
-            });
+            })?;
         }
     }
-    facts
+    Ok(facts)
+}
+
+/// The facts of `facts` that `state` doesn't hold, in order; [`Stopped`] at the first probe
+/// its poller stopped, the partial list dropped (fix check r1, rule 2: a stopped probe read
+/// as "not held" kept every fact after it).
+fn new_in<S: Source + ?Sized>(
+    state: &S,
+    facts: Vec<Triple>,
+    poll: &Poller<'_>,
+) -> Result<Vec<Triple>, Stopped> {
+    let mut out = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if !state.contains(fact, poll)? {
+            out.push(fact);
+        }
+    }
+    Ok(out)
 }
 
 /// Whether `fact` mentions one of `terms`.
@@ -1304,19 +1420,26 @@ struct Outside<'a, S: ?Sized> {
 impl<S: Source + ?Sized> Visits for Outside<'_, S> {
     fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
         // The inner scan counts each position it visits on this visit's poller.
+        // Stopped, the read around this visit answers `Stopped` (the poller is latched).
         let delta = seg.plain() == Seg::Delta;
-        self.source.scan(pattern, seg, visit.poller(), &mut |fact| {
+        let scanned = self.source.scan(pattern, seg, visit.poller(), &mut |fact| {
             if !(delta && mentions(self.region, fact)) {
                 visit.counted(fact);
             }
         });
+        debug_assert!(scanned.is_ok() || visit.stopped());
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         self.source.estimate(pattern, seg, probe.poller())
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         self.source.contains(fact, probe.poller())
     }
 }
@@ -1350,72 +1473,85 @@ const PROOF_DEPTH: usize = 64;
 
 impl<B: Base + ?Sized> Prover<'_, '_, B> {
     /// Whether `fact` is provable over `state` without the facts in `gone`; the second
-    /// value says whether a cycle (or the budget) cut the search.
+    /// value says whether a cycle (or the budget) cut the search. [`Stopped`] at the first
+    /// probe its poller stopped: nothing of that search is memoised (fix check r1, rule 2).
     fn prove<S: Source + ?Sized>(
         &mut self,
         state: &S,
         gone: &Store,
         fact: Triple,
         depth: usize,
-    ) -> (bool, bool) {
+    ) -> Result<(bool, bool), Stopped> {
         if self.proved.contains(&fact) {
-            return (true, false);
+            return Ok((true, false));
         }
-        // The probes below count on the task's poller too (REAS-2): stopped, they answer
-        // "not there", which proves nothing, and the stop cuts the search (not memoised).
+        // The probes below count on the task's poller too (REAS-2).
         let Some(poll) = self.poll.as_ref() else {
-            return (false, true);
+            return Err(Stopped);
         };
-        if self.failed.contains(&fact) || gone.contains(fact, poll) {
-            return (false, false);
+        if self.failed.contains(&fact) || gone.contains(fact, poll)? {
+            return Ok((false, false));
         }
-        if self.base.is_asserted(fact, poll) {
+        if self.base.is_asserted(fact, poll)? {
             self.proved.insert(fact);
-            return (true, false);
+            return Ok((true, false));
         }
         // Transitive properties go through the component path of overdeletion instead (a
         // proof search through a k-clique is O(k^3)): never proved here, so it's a failure
         // that can be memoised.
         if self.program.transitive.contains(&fact[1]) {
-            return (false, false);
+            return Ok((false, false));
         }
         if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
-            return (false, true);
+            return Ok((false, true));
         }
         let bodies = self
             .program
             .derivation_bodies(state, fact, PROOF_BRANCHES, poll);
-        // Stopped: the bodies are incomplete, so a failure here decides nothing (not kept).
-        let mut cut = poll.stopped();
+        // Stopped: the bodies are a part of them, so the search ends here.
+        poll.ended()?;
+        let mut cut = false;
         self.budget -= 1;
         self.active.insert(fact);
-        for body in bodies {
-            let Some(poll) = self.poll.as_ref() else {
-                break;
-            };
-            if body.iter().any(|&g| gone.contains(g, poll)) {
-                continue;
-            }
-            let mut holds = true;
-            for g in body {
-                let (proved, cycle) = self.prove(state, gone, g, depth + 1);
-                cut |= cycle;
-                if !proved {
-                    holds = false;
-                    break;
-                }
-            }
-            if holds {
-                self.active.remove(&fact);
-                self.proved.insert(fact);
-                return (true, false);
-            }
-        }
+        let found = self.prove_bodies(state, gone, bodies, depth, &mut cut);
         self.active.remove(&fact);
+        if found? {
+            self.proved.insert(fact);
+            return Ok((true, false));
+        }
         if !cut {
             self.failed.insert(fact);
         }
-        (false, cut)
+        Ok((false, cut))
+    }
+
+    /// Whether one of `bodies` has every premise proved ([`Self::prove`]), `cut` set where a
+    /// cycle or the budget cut a premise's search.
+    fn prove_bodies<S: Source + ?Sized>(
+        &mut self,
+        state: &S,
+        gone: &Store,
+        bodies: Vec<Vec<Triple>>,
+        depth: usize,
+        cut: &mut bool,
+    ) -> Result<bool, Stopped> {
+        'bodies: for body in bodies {
+            let poll = self.poll.as_ref().ok_or(Stopped)?;
+            for &g in &body {
+                if gone.contains(g, poll)? {
+                    continue 'bodies;
+                }
+            }
+            for &g in &body {
+                let (proved, cycle) = self.prove(state, gone, g, depth + 1)?;
+                *cut |= cycle;
+                if !proved {
+                    continue 'bodies;
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -1423,14 +1559,15 @@ impl<B: Base + ?Sized> Prover<'_, '_, B> {
 /// them: for each edge `(a, b)`, every predecessor of `a` (and `a`) gets every successor
 /// of `b` (and `b`). Edges are processed one at a time over the relation including the
 /// pairs added so far, which keeps it closed. Returns the new pairs. Each scan, each pair
-/// visited and each probe counts on `poll`; once that has stopped it returns what it has,
-/// which is incomplete (sweep M11: a predecessor × successor product per edge).
+/// visited and each probe counts on `poll`; once that has stopped it answers [`Stopped`],
+/// its pairs so far dropped (sweep M11: a predecessor × successor product per edge; fix
+/// check r1, rule 2).
 fn close_edges<S: Source + ?Sized>(
     state: &S,
     p: u64,
     edges: &[(u64, u64)],
     poll: &Poller<'_>,
-) -> Vec<Triple> {
+) -> Result<Vec<Triple>, Stopped> {
     use hashbrown::HashMap;
     let mut added: HashSet<(u64, u64)> = HashSet::new();
     let mut successors: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -1440,12 +1577,12 @@ fn close_edges<S: Source + ?Sized>(
         let mut before = vec![a];
         state.scan([None, Some(p), Some(a)], Seg::All, poll, &mut |t| {
             before.push(t[0])
-        });
+        })?;
         before.extend(predecessors.get(&a).into_iter().flatten().copied());
         let mut after = vec![b];
         state.scan([Some(b), Some(p), None], Seg::All, poll, &mut |t| {
             after.push(t[2])
-        });
+        })?;
         after.extend(successors.get(&b).into_iter().flatten().copied());
         before.sort_unstable();
         before.dedup();
@@ -1454,10 +1591,10 @@ fn close_edges<S: Source + ?Sized>(
         for &x in &before {
             for &y in &after {
                 if poll.tick() {
-                    return out;
+                    return Err(Stopped);
                 }
                 let fact = [x, p, y];
-                if !added.contains(&(x, y)) && !state.contains(fact, poll) && !poll.stopped() {
+                if !added.contains(&(x, y)) && !state.contains(fact, poll)? {
                     added.insert((x, y));
                     successors.entry(x).or_default().push(y);
                     predecessors.entry(y).or_default().push(x);
@@ -1466,7 +1603,7 @@ fn close_edges<S: Source + ?Sized>(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// A [`Base`] over in-memory facts, for tests and tools.
@@ -1493,15 +1630,15 @@ impl VisitsBase for MemoryBase {
         self.facts.visit(pattern, Seg::All, visit);
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         self.facts.size(pattern, Seg::All, probe)
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         self.facts.holds(fact, probe)
     }
 
-    fn asserts(&self, fact: Triple, _: Probe<'_, '_>) -> bool {
-        self.asserted.contains(&fact)
+    fn asserts(&self, fact: Triple, _: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.asserted.contains(&fact))
     }
 }

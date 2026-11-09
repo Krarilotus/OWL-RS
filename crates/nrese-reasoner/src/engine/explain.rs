@@ -5,7 +5,7 @@ use nrese_engine::{GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 
 use super::{Program, decoded, pattern, triple};
 use crate::delta::VisitsBase;
-use crate::eval::{Probe, Visit};
+use crate::eval::{Probe, Stopped, Visit};
 use crate::ir::{Triple, Violation};
 
 /// What an OWL 2 RL consistency rule's violation means, for reject reports.
@@ -342,25 +342,26 @@ impl VisitsBase for SnapshotBase<'_> {
         }
     }
 
-    fn size(&self, bound: [Option<u64>; 3], _: Probe<'_, '_>) -> usize {
+    // Explanations read to their end (`Poller::never()`, fix check r1 triage: NEVER).
+    fn size(&self, bound: [Option<u64>; 3], _: Probe<'_, '_>) -> Result<usize, Stopped> {
         let count = self
             .snapshot
             .estimate_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
-        usize::try_from(count).unwrap_or(usize::MAX)
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
-    fn holds(&self, fact: Triple, _: Probe<'_, '_>) -> bool {
-        self.snapshot.exists_in(
+    fn holds(&self, fact: Triple, _: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.snapshot.exists_in(
             ReadModel::Materialised,
             &pattern(fact.map(Some), GraphSelector::Any),
-        )
+        ))
     }
 
-    fn asserts(&self, fact: Triple, _: Probe<'_, '_>) -> bool {
-        self.axioms.binary_search(&fact).is_ok()
+    fn asserts(&self, fact: Triple, _: Probe<'_, '_>) -> Result<bool, Stopped> {
+        Ok(self.axioms.binary_search(&fact).is_ok()
             || self.snapshot.exists_in(
                 ReadModel::Asserted,
                 &pattern(fact.map(Some), GraphSelector::Any),
-            )
+            ))
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::load;
 use crate::batch::Schema;
 use crate::delta::{Interrupted, MemoryBase, Rules, VisitsBase, update_until};
-use crate::eval::{Probe, Visit};
+use crate::eval::{Probe, Stopped, Visit};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
@@ -31,18 +31,18 @@ impl VisitsBase for Probed {
         self.base.visit(pattern, visit);
     }
 
-    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         self.base.size(pattern, probe)
     }
 
-    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         if self.armed.load(Ordering::Relaxed) {
             self.probes.fetch_add(1, Ordering::Relaxed);
         }
         self.base.holds(fact, probe)
     }
 
-    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         self.base.asserts(fact, probe)
     }
 }

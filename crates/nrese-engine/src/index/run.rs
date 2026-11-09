@@ -67,6 +67,46 @@ impl PermutationRun {
         head + middle + tail
     }
 
+    /// [`Self::tombstones_in`], its bitmap read a run of at most `POLL_UNITS` words at a
+    /// time, `visit(k)` called before each run of `k` words (REAS-2 fix check r1, R2-F1: the
+    /// count lives in the reader). `None` once `visit` returns false, nothing more read.
+    /// Without tombstones, nothing is read and nothing visited.
+    pub(crate) fn tombstones_in_visiting(
+        &self,
+        start: usize,
+        end: usize,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<u64> {
+        if self.tombstones.is_empty() || start >= end {
+            return Some(0);
+        }
+        let (first, last) = (start / 64, (end - 1) / 64);
+        let run = nrese_exec::POLL_UNITS as usize;
+        let (head, tail) = (u64::MAX << (start % 64), u64::MAX >> (63 - (end - 1) % 64));
+        let mut count = 0;
+        let mut at = first;
+        while at <= last {
+            let upto = (at + run).min(last + 1);
+            if !visit((upto - at) as u64) {
+                return None;
+            }
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::TombstoneWords, (upto - at) as u64);
+            for (i, &word) in self.tombstones[at..upto].iter().enumerate() {
+                let i = at + i;
+                let word = match (i == first, i == last) {
+                    (true, true) => word & head & tail,
+                    (true, false) => word & head,
+                    (false, true) => word & tail,
+                    (false, false) => word,
+                };
+                count += u64::from(word.count_ones());
+            }
+            at = upto;
+        }
+        Some(count)
+    }
+
     /// Index range of keys in `[low, high]`. O(log n).
     #[inline]
     pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
