@@ -124,6 +124,124 @@ fn own_length(
     })
 }
 
+/// What an unpublished version's readers built, kept in that version's own slot (3.0c's
+/// `OwnState`; the 3.2 review's R32-N2: every search of one retained pending snapshot
+/// derived again): its corpora by full kind and snapshot identity, and a private snapshot's
+/// own-document indexes by their corpus and stemming language. Views of one version share
+/// the slot (equality modes, stored, canonical, reading budgets), so the key holds the full
+/// identity: two of them never share an entry they shouldn't. Each value keeps the charge of
+/// the request that built it until the version's last holder drops it; each entry's key is
+/// charged there too, before it is made. The locks are leaves, held only to look up or to
+/// insert, never while a corpus is built. The first value kept for a key wins.
+#[derive(Default)]
+pub(crate) struct OwnCorpora {
+    corpora: parking_lot::Mutex<Vec<OwnCorpus>>,
+    locals: parking_lot::Mutex<Vec<OwnLocal>>,
+}
+
+struct OwnCorpus {
+    kind: crate::engine::corpora::CorpusKind,
+    identity: super::SnapshotIdentity,
+    corpus: Arc<Corpus>,
+    _key: nrese_exec::Reservation,
+}
+
+struct OwnLocal {
+    corpus: Arc<Corpus>,
+    language: Option<String>,
+    local: Arc<crate::term::text::Local>,
+    _key: nrese_exec::Reservation,
+}
+
+impl OwnCorpora {
+    /// The corpus kept for `kind` read as `identity`.
+    fn corpus(&self, kind: KindRef<'_>, identity: super::SnapshotIdentity) -> Option<Arc<Corpus>> {
+        let corpora = self.corpora.lock();
+        corpora
+            .iter()
+            .find(|own| own.identity == identity && kind.matches(&own.kind))
+            .map(|own| Arc::clone(&own.corpus))
+    }
+
+    /// Keeps `corpus` for `kind` read as `identity`, its key charged to `request` first
+    /// (an entry and the vector's doubling, the scope's graphs); the one kept first for
+    /// that key where another search kept one meanwhile.
+    fn keep(
+        &self,
+        kind: KindRef<'_>,
+        identity: super::SnapshotIdentity,
+        corpus: Arc<Corpus>,
+        request: &Arc<nrese_exec::Budget>,
+    ) -> Result<Arc<Corpus>, nrese_exec::BudgetExceeded> {
+        let mut key = nrese_exec::Reservation::new(Arc::clone(request));
+        key.charge(2 * size_of::<OwnCorpus>() + scope_bytes(kind.scope))?;
+        let owned = kind.to_owned();
+        let mut corpora = self.corpora.lock();
+        if let Some(own) = corpora
+            .iter()
+            .find(|own| own.identity == identity && kind.matches(&own.kind))
+        {
+            return Ok(Arc::clone(&own.corpus));
+        }
+        corpora.push(OwnCorpus {
+            kind: owned,
+            identity,
+            corpus: Arc::clone(&corpus),
+            _key: key,
+        });
+        Ok(corpus)
+    }
+
+    /// The own-document index kept for `corpus` (by its allocation, which the entry keeps
+    /// alive) stemmed for `language`.
+    fn local(
+        &self,
+        corpus: &Arc<Corpus>,
+        language: Option<&str>,
+    ) -> Option<Arc<crate::term::text::Local>> {
+        let locals = self.locals.lock();
+        locals
+            .iter()
+            .find(|own| Arc::ptr_eq(&own.corpus, corpus) && own.language.as_deref() == language)
+            .map(|own| Arc::clone(&own.local))
+    }
+
+    /// Keeps `local` for `corpus` stemmed for `language`, its key charged to `request`
+    /// first; the one kept first where another search kept one meanwhile.
+    fn keep_local(
+        &self,
+        corpus: &Arc<Corpus>,
+        language: Option<&str>,
+        local: Arc<crate::term::text::Local>,
+        request: &Arc<nrese_exec::Budget>,
+    ) -> Result<Arc<crate::term::text::Local>, nrese_exec::BudgetExceeded> {
+        let mut key = nrese_exec::Reservation::new(Arc::clone(request));
+        key.charge(2 * size_of::<OwnLocal>() + language.map_or(0, str::len))?;
+        let mut locals = self.locals.lock();
+        if let Some(own) = locals
+            .iter()
+            .find(|own| Arc::ptr_eq(&own.corpus, corpus) && own.language.as_deref() == language)
+        {
+            return Ok(Arc::clone(&own.local));
+        }
+        locals.push(OwnLocal {
+            corpus: Arc::clone(corpus),
+            language: language.map(str::to_owned),
+            local: Arc::clone(&local),
+            _key: key,
+        });
+        Ok(local)
+    }
+}
+
+/// Bytes a scope's copy holds beyond itself: its graphs where it lists them.
+fn scope_bytes(scope: &TextScope) -> usize {
+    match scope {
+        TextScope::Merge(graphs) => graphs.len() * size_of::<TermId>(),
+        TextScope::Graphs(_) => 0,
+    }
+}
+
 /// The lexical form of an own term (an overlay entry: `id`, `key`) if it is a vector
 /// literal among `corpus`'s members.
 fn vector_lexical<'k>(id: TermId, key: &'k [u8], corpus: &Corpus) -> Option<&'k str> {
@@ -258,7 +376,7 @@ impl Snapshot {
         &self,
         documents: Documents,
         query: &crate::TextQuery,
-        corpus: &Corpus,
+        corpus: &CorpusRef,
         request: &Arc<nrese_exec::Budget>,
     ) -> Result<Vec<crate::TextMatch>, nrese_exec::BudgetExceeded> {
         let iris = documents == Documents::Subjects;
@@ -268,7 +386,19 @@ impl Snapshot {
                 true => self.underlying().iri_search_in(query, Some(corpus)),
             });
         };
-        let own = self.own_documents(view, documents, corpus, query.stem.as_deref(), request)?;
+        let language = query.stem.as_deref();
+        // A corpus kept in the version's own slot keeps its own-document index beside it
+        // (R32-N2); one built for this search alone builds its index for it alone.
+        let own = match (corpus, self.own_corpora()) {
+            (CorpusRef::Kept(kept), Some(slot)) => match slot.local(kept, language) {
+                Some(local) => local,
+                None => {
+                    let local = self.own_documents(view, documents, corpus, language, request)?;
+                    slot.keep_local(kept, language, Arc::new(local), request)?
+                }
+            },
+            _ => Arc::new(self.own_documents(view, documents, corpus, language, request)?),
+        };
         Ok(self
             .underlying()
             .private_search(iris, query, corpus, view.start(), &own))
@@ -588,6 +718,14 @@ impl Snapshot {
             equality: self.equality,
             canonical: self.canonical,
         };
+        // An unpublished snapshot keeps what it builds in its own version, for that
+        // version's readers (3.0c's slot; R32-N2): found again by the kind and its identity.
+        let own = self.own_corpora();
+        let identity = self.identity();
+        if let Some(corpus) = own.as_ref().and_then(|own| own.corpus(kind, identity)) {
+            self.cover(documents);
+            return Ok(CorpusRef::Kept(corpus));
+        }
         let found = match (store, &admitted) {
             (Some(store), Some(admitted)) => store.find(admitted, kind, request)?,
             (Some(store), None) => Found::Build {
@@ -625,10 +763,26 @@ impl Snapshot {
             }),
             _ => None,
         };
-        Ok(match kept {
-            Some(corpus) => CorpusRef::Kept(corpus),
-            None => CorpusRef::Own(Corpus::finish(&built, span, request)?),
+        Ok(match (kept, own) {
+            (Some(corpus), _) => CorpusRef::Kept(corpus),
+            // Kept in the version's own slot, still on the search's budget: charged to the
+            // request that built it until the version's last holder drops it.
+            (None, Some(own)) => {
+                let corpus = Arc::new(Corpus::finish(&built, span, request)?);
+                CorpusRef::Kept(own.keep(kind, identity, corpus, request)?)
+            }
+            (None, None) => CorpusRef::Own(Corpus::finish(&built, span, request)?),
         })
+    }
+
+    /// This snapshot's version's own corpora ([`OwnCorpora`]), where the snapshot is
+    /// unpublished (3.0c's [`super::Admission::Own`]); `None` for one with the
+    /// shared-state capability, whose corpora the engine's store keeps.
+    fn own_corpora(&self) -> Option<Arc<OwnCorpora>> {
+        match self.admission() {
+            super::Admission::Own(own) => Some(own.get_or_insert_with(OwnCorpora::default)),
+            super::Admission::Shared(_) => None,
+        }
     }
 
     /// The members of the corpus of `documents` in `scope` in `model`: derived from `from`

@@ -667,6 +667,107 @@ fn a_private_global_vector_search_within_the_readers_budget_answers() {
     assert!(reader.read_refused().is_none());
 }
 
+/// R32-N2's own-slot corpora (DICT2 9 Nov 06:00; 3.0c's per-family test): the views of one
+/// unpublished version (as stored, expanded, canonical) share its own slot, and never an
+/// entry. A writer's pending snapshot and a private one, each over a base where
+/// `ex:alias owl:sameAs ex:rep` is inferred and only `ex:rep` is a subject in `ex:g`, are
+/// searched for IRIs in `ex:g` in every mode, in every order, twice: each answer equals an
+/// engine with the same statements read in that mode.
+#[test]
+fn views_of_one_unpublished_version_never_share_a_corpus() {
+    let same_as_iri = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let setup = |pending_label: bool| {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        engine.set_corpus_tuning(CorpusTuning {
+            documents_per_probe: 1,
+            ..CorpusTuning::DEFAULT
+        });
+        let mut tx = engine.transaction();
+        let rep = tx.intern(ex("rep").as_ref().into());
+        let alias = tx.intern(ex("alias").as_ref().into());
+        let same_as = tx.intern(same_as_iri.as_ref().into());
+        assert!(tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        }));
+        for subject in ["rep", "filler0", "filler1"] {
+            tx.insert(Quad::new(ex(subject), ex("p"), ex("o"), ex("g")).as_ref());
+        }
+        if pending_label {
+            tx.insert(label("rep", "rep label", Some("g")).as_ref());
+        }
+        tx.commit().unwrap();
+        (engine, same_as)
+    };
+    let modes = ["stored", "expanded", "canonical"];
+    let read = |snapshot: &Snapshot, same_as, mode: &str| match mode {
+        "stored" => snapshot.with_equality(None),
+        "expanded" => snapshot.with_equality(Some(same_as)),
+        _ => snapshot
+            .with_equality(Some(same_as))
+            .with_canonical_equality(),
+    };
+    let search = |snapshot: &Snapshot| {
+        let g = snapshot.lookup(ex("g").as_ref().into()).unwrap();
+        let mut found = snapshot
+            .iri_search_in(
+                ReadModel::Materialised,
+                &TextScope::Graphs(GraphSelector::Exact(g)),
+                &query("rep alias filler0", false, false),
+                None,
+            )
+            .map(|found| decoded(snapshot, &found))
+            .map_err(|e| format!("{e:?}"));
+        if let Ok(found) = &mut found {
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        found
+    };
+    let (truth, truth_same_as) = setup(true);
+    let truth = truth.snapshot();
+    let want: Vec<_> = modes
+        .iter()
+        .map(|mode| search(&read(&truth, truth_same_as, mode)))
+        .collect();
+    let orders = [[0, 1, 2], [2, 1, 0], [1, 0, 2]];
+    let mut failed = Vec::new();
+    for private in [false, true] {
+        for order in orders {
+            let (engine, same_as) = setup(false);
+            let published = engine.snapshot();
+            let mut tx = engine.transaction();
+            let mut own = engine
+                .speculative_over(&published, Arc::new(nrese_exec::Budget::unlimited()))
+                .unwrap();
+            let pending = match private {
+                false => {
+                    tx.insert(label("rep", "rep label", Some("g")).as_ref());
+                    tx.pending_snapshot()
+                }
+                true => {
+                    own.try_insert(label("rep", "rep label", Some("g")).as_ref())
+                        .unwrap();
+                    own.pending_snapshot().unwrap()
+                }
+            };
+            for round in 0..2 {
+                for &at in &order {
+                    let got = search(&read(&pending, same_as, modes[at]));
+                    if got != want[at] || got.is_err() {
+                        failed.push(format!(
+                            "private {private}, order {order:?}, round {round}, {}: \
+                             {got:?} != {:?}",
+                            modes[at], want[at]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// A vector search's answer decoded: each hit's lexical form and distance, and the
 /// report's space and scan.
 type VectorAnswer = Result<(Vec<(String, f32)>, usize, usize), String>;

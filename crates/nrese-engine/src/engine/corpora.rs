@@ -145,7 +145,7 @@ pub(crate) struct KindRef<'a> {
 }
 
 impl KindRef<'_> {
-    fn matches(&self, kind: &CorpusKind) -> bool {
+    pub(crate) fn matches(&self, kind: &CorpusKind) -> bool {
         kind.0 == self.documents
             && kind.1 == self.model
             && kind.2 == *self.scope
@@ -177,7 +177,7 @@ impl KindRef<'_> {
         self.probed(touched).iter().map(|part| part.len()).sum()
     }
 
-    fn to_owned(self) -> CorpusKind {
+    pub(crate) fn to_owned(self) -> CorpusKind {
         (
             self.documents,
             self.model,
