@@ -136,7 +136,10 @@ pub struct EngineStats {
     pub inferred: u64,
     /// Runs of both stacks.
     pub runs: usize,
-    /// Index memory of both stacks on the heap.
+    /// Index memory of both stacks on the heap: the latest version's own runs, and every
+    /// quad-layout form of a default-graph run alive (shared by pending versions over a base
+    /// that hasn't the quad layout yet, published or not), each once (DUR-6). Array payload,
+    /// not run boxes; older versions held by snapshots aren't counted.
     pub index_bytes: u64,
     /// Index data of both stacks used in place from a mapped checkpoint.
     pub index_mapped_bytes: u64,

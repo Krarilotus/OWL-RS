@@ -350,10 +350,14 @@ impl Run {
     /// This run in the quad layout ([`Self::with_quads_layout`]), made once and shared by
     /// every holder while any keeps it (DUR-6): N pending versions over one base hold one form
     /// of each of its runs, not N. A run of the quad layout is itself. Made without the slot's
-    /// lock (the build is parallel on the caller's pool; no lock is held across pool work);
-    /// two made at once both count in `forms` while they live, and the second to install
-    /// takes the first's and frees its own. Counted in `forms` from when it is made until it
-    /// is freed.
+    /// lock (the build is parallel on the caller's pool; no lock is held across pool work), so
+    /// K callers that miss the slot at once make K conversions: the peak while they build grows
+    /// with concurrent misses, it isn't bounded at one or two forms (review r1 on DUR-6a). Each
+    /// that installs second takes the installed one and frees its own before returning, so
+    /// once they return, all share one form. A form counts in `forms` from when it is made
+    /// (its arrays exist a moment before) until it is freed. The slot's `Weak` keeps the
+    /// form's `Arc` allocation, not its arrays, after the last holder lets it go, until the
+    /// slot is filled again or the run is dropped: bounded metadata per source run.
     pub(crate) fn quads_layout_shared(self: &Arc<Self>, forms: &Forms) -> Arc<Self> {
         if self.layout == Layout::Quads {
             return Arc::clone(self);
