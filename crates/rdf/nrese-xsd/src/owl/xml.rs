@@ -432,6 +432,30 @@ mod tests {
         classify(text).ok()
     }
 
+    /// Nesting depth costs no stack: 100,000 nested elements classify on a thread with a
+    /// 256 KiB stack, as their own canonical form, and with one end tag missing as malformed.
+    /// (A classifier that recursed per element overflows that stack and aborts the test
+    /// binary.)
+    #[test]
+    fn deep_nesting_takes_no_stack() {
+        let depth = 100_000;
+        let balanced = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        let unclosed = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth - 1));
+        let (a, b) = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                (
+                    classify(&balanced).map(|form| form == balanced),
+                    classify(&unclosed),
+                )
+            })
+            .expect("thread")
+            .join()
+            .expect("no panic");
+        assert_eq!(a, Ok(true));
+        assert_eq!(b, Err(NotCanonical::Malformed));
+    }
+
     /// RDF 1.1 Concepts (`rdf:XMLLiteral`: well-balanced, self-contained XML content), XML
     /// 1.0 §2.5–2.6, §4.1 (WFC Entity Declared), Namespaces in XML 1.0 §5: what isn't a
     /// lexical form is malformed, also after a comment or processing instruction; a
