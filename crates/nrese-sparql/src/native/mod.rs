@@ -603,7 +603,7 @@ fn native_pattern<'q>(
                     ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
                 }
             }
-            substitute::Values { terms: values }.top(&pattern)
+            substitute::Values::new(ctx, values)?.top(&pattern)
         }
         None => pattern,
     };
