@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{
-    AssertedIdentity, GraphSelector, QuadPattern, ReadModel, SharedState, Snapshot,
-    SnapshotIdentity, TermId,
+    Admission, AssertedIdentity, GraphSelector, OwnState, QuadPattern, ReadModel, SharedState,
+    Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
 use nrese_rdf::{NamedNodeRef, Term, vocab};
@@ -376,31 +376,52 @@ impl QlRewriting {
 
     /// Whether the data `snapshot` reads has the tree of probe `key` wherever it folds,
     /// memoised per view and probe (`None`: not asked, the query's questions spent;
-    /// `false` then, and nothing kept). Only a published snapshot's answer is kept
-    /// (contract S3); any other is computed each time. Concurrent misses may compute
-    /// independently; the query itself runs outside the cache lock.
+    /// `false` then, and nothing kept). Only a published snapshot's answer is kept by the
+    /// store (contract S3); any other's by its own version alone (dictionary 3.0c).
+    /// Concurrent misses may compute independently; the query itself runs outside the lock.
     pub(crate) fn realised(
         &self,
         snapshot: &Snapshot,
         key: &str,
         compute: impl FnOnce() -> Option<bool>,
     ) -> bool {
-        {
-            let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
-            if cache.0 == Some(snapshot.identity())
-                && let Some(&known) = cache.1.get(key)
-            {
-                return known;
+        let identity = snapshot.identity();
+        match snapshot.admission() {
+            Admission::Shared(state) => {
+                {
+                    let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
+                    if cache.0 == Some(identity)
+                        && let Some(&known) = cache.1.get(key)
+                    {
+                        return known;
+                    }
+                }
+                // Computed without the lock: the check is a query of its own.
+                let Some(known) = compute() else {
+                    return false;
+                };
+                self.remember(&state, key, known);
+                known
+            }
+            Admission::Own(own) => {
+                let mine = own.get_or_insert_with(QlOwn::default);
+                {
+                    let probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(&known) = probes.get(&identity).and_then(|p| p.get(key)) {
+                        return known;
+                    }
+                }
+                let Some(known) = compute() else {
+                    return false;
+                };
+                let mut probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
+                probes
+                    .entry(identity)
+                    .or_default()
+                    .insert(key.to_owned(), known);
+                known
             }
         }
-        // Computed without the lock: the check is a query of its own.
-        let Some(known) = compute() else {
-            return false;
-        };
-        if let Some(state) = snapshot.shared_state() {
-            self.remember(&state, key, known);
-        }
-        known
     }
 
     /// Keeps probe `key`'s answer for the published snapshot `state` gives, replacing
@@ -443,13 +464,20 @@ impl QlRewriting {
     /// schema of those graphs only; one who sees every inference (`"visible"`) the whole
     /// schema, as the closure it reads was computed with it.
     ///
-    /// Only a published snapshot changes what is kept (contract S3): any other reads a
-    /// kept TBox under the same checks, and otherwise compiles its own, keeping nothing.
+    /// Only a published snapshot changes what the store keeps (contract S3). Any other keeps
+    /// what it reads in its own version (dictionary 3.0c; review r1 F1), so a pending
+    /// snapshot read again reads its schema once, and the store's entries stay as they were.
     pub(crate) fn tbox(&self, snapshot: &Snapshot, access: Option<&GraphAccess>) -> Arc<Tbox> {
-        let state = snapshot.shared_state();
-        // With a token, everything below reads the token's own snapshot.
-        let snapshot = state.as_ref().map_or(snapshot, SharedState::snapshot);
         let access = access.filter(|a| a.inferred_by_support);
+        match snapshot.admission() {
+            Admission::Shared(state) => self.shared_tbox(&state, access),
+            Admission::Own(own) => self.own_tbox(&own, access),
+        }
+    }
+
+    /// [`Self::tbox`] of the published snapshot `state` gives, kept in the store's entries.
+    fn shared_tbox(&self, state: &SharedState<'_>, access: Option<&GraphAccess>) -> Arc<Tbox> {
+        let snapshot = state.snapshot();
         let key = snapshot.identity();
         let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
         let at = cached.iter().position(|c| c.access.as_ref() == access);
@@ -458,24 +486,20 @@ impl QlRewriting {
         }
         // A snapshot bounds its dictionary reads, so an identity hit above needs no
         // lookup. Across identities, unchanged statements alone are not sufficient.
-        let thing = snapshot
-            .lookup(nrese_rdf::vocab::owl::THING.into())
-            .map(TermId::raw);
-        let keep = |graph: u64| {
-            access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
-        };
+        let Schema {
+            thing,
+            core,
+            equality,
+        } = Schema::of(snapshot);
         let asserted = snapshot.asserted_identity();
-        let core = read_core(snapshot);
-        let equality = has_equality(snapshot);
         // An entry of this reader whose core and view mode are this snapshot's, with notes
         // from its memberships' asserted state to this one: its memberships are brought
         // forward by the noted changes, in place (P2-C1 probes, 8 Nov: rebuilding every
         // expression's took 188 us a snapshot, rescanning each touched one 1 us). What the
         // schema keeps of an expression is that it has a member, one the reader may see
         // and the OWL reader keeps: an added statement stands in where there was none, and
-        // only the removal of the kept one is read again. It changes the entry in place, so
-        // only a published snapshot takes it.
-        if let (Some(i), Some(state)) = (at, &state) {
+        // only the removal of the kept one is read again.
+        if let Some(i) = at {
             let c = &mut cached[i];
             let changes = (c.thing == thing
                 && c.equality == equality
@@ -489,59 +513,92 @@ impl QlRewriting {
             }
         }
         // Otherwise every expression's membership, read afresh.
-        let expressions = expressions_of(snapshot, &core);
-        #[cfg(test)]
-        count(&EXPRESSIONS_WALKED, expressions.len());
-        let of: HashMap<u64, Member> = expressions
-            .iter()
-            .map(|&node| (node, member_of(snapshot, node, &keep)))
-            .collect();
-        let members = Members {
-            at: asserted,
-            equality: key.equality,
-            canonical: key.canonical,
-            of,
+        let (expressions, members) = fresh_members(snapshot, &core, access);
+        let schema = Schema {
+            thing,
+            core,
+            equality,
         };
-        if let Some(c) = at.map(|i| &mut cached[i]).filter(|c| {
-            c.thing == thing
-                && c.equality == equality
-                && *c.core == *core
-                && present(&c.members.of) == present(&members.of)
-        }) {
-            if let Some(state) = &state {
-                rekey(state, c, members);
-            }
+        if let Some(c) = at
+            .map(|i| &mut cached[i])
+            .filter(|c| schema.reuses(c, &members))
+        {
+            rekey(state, c, members);
             return Arc::clone(&c.tbox);
         }
+        let tbox = self.compile_read(snapshot, &schema, access, &expressions, &members);
+        admit(
+            state,
+            &mut cached,
+            at,
+            schema.entry(access, key, expressions, members, Arc::clone(&tbox)),
+        );
+        tbox
+    }
+
+    /// [`Self::tbox`] of the unpublished snapshot `own` gives, kept in its version alone.
+    /// An entry is this rewriting's (its closure), its reader's and its view's: views of one
+    /// version in other equality modes share the slot, never an entry. A first read reuses
+    /// a TBox its schema matches, the version's or the store's (read only), or compiles.
+    fn own_tbox(&self, own: &OwnState<'_>, access: Option<&GraphAccess>) -> Arc<Tbox> {
+        let snapshot = own.snapshot();
+        let key = snapshot.identity();
+        let mine = own.get_or_insert_with(QlOwn::default);
+        let mut entries = mine.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let ours = |(closure, c): &&(Closure, Cached)| {
+            *closure == self.closure && c.access.as_ref() == access
+        };
+        if let Some((_, c)) = entries.iter().filter(ours).find(|(_, c)| c.key == key) {
+            return Arc::clone(&c.tbox);
+        }
+        let schema = Schema::of(snapshot);
+        let (expressions, members) = fresh_members(snapshot, &schema.core, access);
+        let kept = entries
+            .iter()
+            .filter(ours)
+            .map(|(_, c)| c)
+            .find(|c| schema.reuses(c, &members))
+            .map(|c| Arc::clone(&c.tbox));
+        let reused = kept.or_else(|| {
+            let shared = self.cached.lock().unwrap_or_else(|p| p.into_inner());
+            shared
+                .iter()
+                .filter(|c| c.access.as_ref() == access)
+                .find(|c| schema.reuses(c, &members))
+                .map(|c| Arc::clone(&c.tbox))
+        });
+        let tbox = reused.unwrap_or_else(|| {
+            self.compile_read(snapshot, &schema, access, &expressions, &members)
+        });
+        if entries.len() == READERS {
+            entries.remove(0);
+        }
+        let entry = schema.entry(access, key, expressions, members, Arc::clone(&tbox));
+        entries.push((self.closure, entry));
+        tbox
+    }
+
+    /// The TBox of a schema read afresh: `schema`'s core in the reader's graphs, with
+    /// `members`.
+    fn compile_read(
+        &self,
+        snapshot: &Snapshot,
+        schema: &Schema,
+        access: Option<&GraphAccess>,
+        expressions: &[u64],
+        members: &Members,
+    ) -> Arc<Tbox> {
         let statements = with_members(
-            &reader_core(snapshot, &core, access),
+            &reader_core(snapshot, &schema.core, access),
             expressions.iter().map(|e| &members.of[e]),
         );
-        let tbox = Arc::new(compile(
+        Arc::new(compile(
             snapshot,
             &statements,
             self.closure,
-            thing,
-            equality,
-        ));
-        if let Some(state) = &state {
-            admit(
-                state,
-                &mut cached,
-                at,
-                Cached {
-                    access: access.cloned(),
-                    key,
-                    core: core.into_boxed_slice(),
-                    expressions: expressions.into_boxed_slice(),
-                    thing,
-                    equality,
-                    tbox: Arc::clone(&tbox),
-                    members,
-                },
-            );
-        }
-        tbox
+            schema.thing,
+            schema.equality,
+        ))
     }
 
     /// Brings entry `c`'s memberships forward to the published snapshot `state` gives, by
@@ -595,6 +652,90 @@ impl QlRewriting {
         c.tbox = Arc::clone(&tbox);
         tbox
     }
+}
+
+/// What an unpublished version keeps of the QL rewriting for its own readers (dictionary
+/// 3.0c; review r1 F1), dropped with the version: the schema entries of every rewriting
+/// (by its closure) that read it, at most [`READERS`], and each view's probes.
+#[derive(Debug, Default)]
+struct QlOwn {
+    entries: Mutex<Vec<(Closure, Cached)>>,
+    probes: Mutex<HashMap<SnapshotIdentity, HashMap<String, bool>>>,
+}
+
+/// What decides a snapshot's compiled TBox besides its memberships ([`Cached`]'s checks).
+struct Schema {
+    thing: Option<nrese_owl::Term>,
+    core: Vec<nrese_owl::Statement>,
+    equality: bool,
+}
+
+impl Schema {
+    fn of(snapshot: &Snapshot) -> Self {
+        Self {
+            thing: snapshot
+                .lookup(nrese_rdf::vocab::owl::THING.into())
+                .map(TermId::raw),
+            core: read_core(snapshot),
+            equality: has_equality(snapshot),
+        }
+    }
+
+    /// Whether entry `c`'s TBox is this schema's with `members`: what the TBox reads of
+    /// them is which expressions have one (design §7).
+    fn reuses(&self, c: &Cached, members: &Members) -> bool {
+        c.thing == self.thing
+            && c.equality == self.equality
+            && *c.core == *self.core
+            && present(&c.members.of) == present(&members.of)
+    }
+
+    fn entry(
+        self,
+        access: Option<&GraphAccess>,
+        key: SnapshotIdentity,
+        expressions: Vec<u64>,
+        members: Members,
+        tbox: Arc<Tbox>,
+    ) -> Cached {
+        Cached {
+            access: access.cloned(),
+            key,
+            core: self.core.into_boxed_slice(),
+            expressions: expressions.into_boxed_slice(),
+            thing: self.thing,
+            equality: self.equality,
+            tbox,
+            members,
+        }
+    }
+}
+
+/// The class expressions of `core` and each one's membership in `snapshot`, read afresh,
+/// in the graphs `access` admits.
+fn fresh_members(
+    snapshot: &Snapshot,
+    core: &[nrese_owl::Statement],
+    access: Option<&GraphAccess>,
+) -> (Vec<u64>, Members) {
+    let keep = |graph: u64| {
+        access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
+    };
+    let expressions = expressions_of(snapshot, core);
+    #[cfg(test)]
+    count(&EXPRESSIONS_WALKED, expressions.len());
+    let of = expressions
+        .iter()
+        .map(|&node| (node, member_of(snapshot, node, &keep)))
+        .collect();
+    let key = snapshot.identity();
+    let members = Members {
+        at: snapshot.asserted_identity(),
+        equality: key.equality,
+        canonical: key.canonical,
+        of,
+    };
+    (expressions, members)
 }
 
 /// Entry `c` stands for the published snapshot `state` gives, with its `members`: what
