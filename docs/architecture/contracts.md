@@ -83,6 +83,10 @@ DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not 
 `crates/nrese-engine/src/term/dictionary.rs:24`. Follow writer → checkpoint → compaction → WAL → current version → dictionary; inside the dictionary,
 one index → inner → order → derived bookkeeping, never two locks of one level. Rayon workers use fallible slot admission rather than waiting;
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
+A commit's note (`Transaction::note_commit`, `crates/nrese-engine/src/engine/writer.rs`) runs with the writer slot, the WAL and, where the
+commit converts the stack, the compaction slot held: it takes no lock and calls nothing in the engine, and its journal's sync holds back
+compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
+`WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
 **A version's own slots** (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
 value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
@@ -112,7 +116,9 @@ Known bypasses and gaps:
 **Owners:** `Durable` (`crates/nrese-engine/src/durability/mod.rs:105`), `Transaction::commit` (`crates/nrese-engine/src/engine/transaction.rs:477`),
 `BulkLoad` (`crates/nrese-engine/src/engine/bulk.rs:3`), and application `MutationPipeline`/`MutationTicket`
 (`crates/nrese-store/src/mutation/pipeline.rs:36`; `crates/nrese-store/src/mutation/ticket.rs:21`). Ordinary commit builds, appends/syncs WAL, then
-publishes. `EveryCommit` survives power loss; `OsBuffered` may lose recent commits after OS/power failure. Checkpoint publication writes aside, syncs,
+publishes. A journal beside the log that must agree with it (the quarantine's resolutions) is written as the commit's note, before the record,
+and holds a record in effect only where the recovered store holds its revision; the log is poisoned wherever a journal may name a revision
+no commit published. `EveryCommit` survives power loss; `OsBuffered` may lose recent commits after OS/power failure. Checkpoint publication writes aside, syncs,
 renames and syncs the directory. Bulk/rematerialisation checkpoint before publication without a large WAL record. If cancellation loses to commit,
 await the actual outcome. See [storage ADR](../adr/0002-engine-storage-lsm-permutations.md) and [one engine API](../adr/0007-one-engine-api.md).
 

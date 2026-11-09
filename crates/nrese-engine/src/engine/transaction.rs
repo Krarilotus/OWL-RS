@@ -1,7 +1,7 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
@@ -61,6 +61,8 @@ pub struct Transaction<'e> {
     pending: Pending,
     /// What [`Self::asserted_identity_after`] answered first, which the commit publishes.
     after: OnceLock<super::AssertedIdentity>,
+    /// The commit's note in a journal of the caller's ([`Self::note_commit`]).
+    note: Option<super::CommitNote<'e>>,
 }
 
 impl<'e> Transaction<'e> {
@@ -70,7 +72,35 @@ impl<'e> Transaction<'e> {
             engine,
             _slot: slot,
             after: OnceLock::new(),
+            note: None,
         }
+    }
+
+    /// Proof that this transaction holds the writer slot; `None` for a speculative one.
+    pub fn writer(&self) -> Option<super::WriterHeld<'_>> {
+        self._slot.as_ref().map(|_| super::WriterHeld::new())
+    }
+
+    /// Has the commit note itself in a journal of the caller's, so that the journal and the
+    /// log agree on whether it committed (a store's quarantine resolutions). [`Self::commit`]
+    /// calls `note` once, under the writer slot, with the revision it publishes: after every
+    /// step that can fail leaving the log as it was (its segment's rotation, its record's
+    /// encoding and commit time), and before the record's bytes are written. From the moment
+    /// it returns `Ok` the record alone decides the outcome: published, or the log poisoned by
+    /// its failed write (outcome unknown until the next open, and no later commit in this
+    /// process takes the revision). So a journal that holds the note is in agreement with the
+    /// log where the recovered store holds the revision, and only there.
+    ///
+    /// Not called for a commit that publishes nothing (it keeps the base's revision), nor for
+    /// one that fails before; a speculative transaction never commits. On an engine in memory
+    /// it is called before the publication, which can't fail: there is no log to poison, so
+    /// [`super::NoteError::Unknown`] refuses the commit as `Refused` does. The note runs with
+    /// the writer slot, the WAL and possibly the compaction slot held (contracts.md, lock
+    /// order): it must not call into the engine or wait for a lock, and its own I/O holds back
+    /// compaction and checkpoints for as long as it takes. One note per commit.
+    pub fn note_commit(&mut self, note: super::CommitNote<'e>) {
+        debug_assert!(self.note.is_none(), "one note per commit");
+        self.note = Some(note);
     }
 
     /// The asserted identity the commit will publish
@@ -104,6 +134,167 @@ impl<'e> Transaction<'e> {
         self.pending.base()
     }
 
+    /// [`Self::pending_snapshot`], what it makes charged to `budget` before it is made and held
+    /// by the snapshot (DUR-6): its scratch, its runs of the pending changes, their lists and
+    /// its version. The base's runs read in the quad layout are their shared forms, the
+    /// store's index memory, not charged here. A refusal ([`crate::EngineError::MemoryLimit`])
+    /// returns no snapshot, keeps no charge and records no statistics. It isn't free of every
+    /// effect: it may have let go of the kept snapshot (not current), and a quad-layout form
+    /// built for the asserted stack before the refusal may stay installed in its source run's
+    /// slot (its arrays freed once nothing holds them; review r1 on DUR-6a). An unchanged
+    /// transaction asking under the same budget gets the same snapshot: the last one is kept,
+    /// with its charge, until the next write, a term interned since, or the transaction's drop.
+    pub fn pending_snapshot_within(
+        &self,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> EngineResult<Snapshot> {
+        let generation = self.pending.generation();
+        // Kept only while nothing it shows changed: no write (the generation), no term interned
+        // since (its vocabulary ends at the dictionary's length then: sol-loop r1, S2), the
+        // same budget. Not current: taken out under the same guard (another reader may have
+        // made the current one meanwhile: sol-loop r3, S5) and let go, outside it, before its
+        // replacement is charged. Held through the build, a stale one would count twice against
+        // the same budget (sol-loop r2, S4); a caller still holding it keeps its own share.
+        let stale = {
+            let mut memo = self.pending.memo().lock();
+            if let Some(kept) = memo.as_ref()
+                && kept.generation == generation
+                && kept.snapshot.version().dictionary_len == self.engine.shared.dictionary.len()
+                && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
+            {
+                return Ok(kept.snapshot.clone());
+            }
+            memo.take()
+        };
+        drop(stale);
+        let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+        scratch.charge(self.pending.snapshot_changes_bound())?;
+        // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
+        let SnapshotChanges {
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        } = self.pending.snapshot_changes();
+        let base = self.pending.base();
+        let seen = base.version();
+        let content = super::Content::fresh();
+        let equality = match self.changes_equality() {
+            true => Default::default(),
+            false => std::sync::Arc::clone(&seen.equality),
+        };
+        let snapshot = base.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&inferred_inserts[..], &inferred_deletes[..]],
+            &self.engine.shared.forms,
+            budget,
+            |asserted, inferred| Version {
+                content,
+                // Pending: its own, even without asserted changes (staged terms).
+                asserted_content: super::AssertedIdentity::fresh(),
+                asserted,
+                inferred,
+                revision: seen.revision,
+                committed_micros: seen.committed_micros,
+                dictionary_len: self.engine.shared.dictionary.len(),
+                equality,
+                canonical: Default::default(),
+                // Empty, as every new version's: what this pending version's readers keep
+                // (its memo's hits share it, as they share the version).
+                own: Default::default(),
+            },
+        )?;
+        // Recorded once nothing can be refused any more (a refusal records nothing).
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            let changed = [
+                &asserted_inserts,
+                &asserted_deletes,
+                &inferred_inserts,
+                &inferred_deletes,
+            ];
+            corpora.record(
+                seen.content,
+                content,
+                changed
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
+        drop((
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        ));
+        drop(scratch);
+        *self.pending.memo().lock() = Some(pending::Memo {
+            generation,
+            budget: std::sync::Arc::downgrade(budget),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+
+    /// [`Self::pending_over`], what it makes charged to `budget` before it is made and held by
+    /// the snapshot (DUR-6), as [`Self::pending_snapshot_within`] charges (not kept: it reads
+    /// `view` and `hidden`, a new snapshot each call).
+    pub fn pending_over_within(
+        &self,
+        view: &Snapshot,
+        hidden: &[EncodedQuad],
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> EngineResult<Snapshot> {
+        let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+        let asserted = self.pending.asserted();
+        let lists = 2
+            * (asserted.inserts.len().max(4) + asserted.deletes.len().max(4))
+            * std::mem::size_of::<EncodedQuad>();
+        scratch.charge(self.pending.over_gone_bound(hidden) + lists)?;
+        let seen = view.version();
+        let gone = self.pending.over_gone(&seen.inferred, hidden);
+        let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
+        let content = super::Content::fresh();
+        let equality = match self.changes_equality() {
+            true => Default::default(),
+            false => std::sync::Arc::clone(&seen.equality),
+        };
+        let snapshot = view.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&[][..], &gone[..]],
+            &self.engine.shared.forms,
+            budget,
+            |asserted, inferred| Version {
+                content,
+                // Pending: its own, even without asserted changes (staged terms).
+                asserted_content: super::AssertedIdentity::fresh(),
+                asserted,
+                inferred,
+                revision: seen.revision,
+                committed_micros: seen.committed_micros,
+                dictionary_len: self.engine.shared.dictionary.len(),
+                equality,
+                canonical: Default::default(),
+                // Empty, as every new version's: what this pending version's readers keep.
+                own: Default::default(),
+            },
+        )?;
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            corpora.record(
+                seen.content,
+                content,
+                [&asserted_inserts, &asserted_deletes, &gone]
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
+        drop((gone, asserted_inserts, asserted_deletes));
+        drop(scratch);
+        Ok(snapshot)
+    }
+
     /// The state the transaction would commit, as a snapshot: the base with the pending
     /// changes of each stack as one more run, as a commit publishes them, but not
     /// published. It sees the terms the transaction interned. Costs O(d log d) for d
@@ -122,9 +313,11 @@ impl<'e> Transaction<'e> {
             content,
             // Pending: its own, even without asserted changes (staged terms).
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: base
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            asserted: base.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self.engine.shared.forms,
+            ),
             inferred: base
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
@@ -160,9 +353,11 @@ impl<'e> Transaction<'e> {
             content,
             // Pending: its own, even without asserted changes (staged terms).
             asserted_content: super::AssertedIdentity::fresh(),
-            asserted: seen
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            asserted: seen.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self.engine.shared.forms,
+            ),
             inferred: seen.inferred.with_delta(&[], &gone),
             revision: seen.revision,
             committed_micros: seen.committed_micros,
@@ -276,10 +471,44 @@ impl<'e> Transaction<'e> {
         self.engine.shared.dictionary.decode(id)
     }
 
-    /// Asserts `quad`; returns `false` if it was already asserted.
+    /// Asserts `quad`; returns `false` if it was already asserted. Its growth is uncharged
+    /// ([`Self::try_insert`] charges it).
     pub fn insert(&mut self, quad: QuadRef<'_>) -> bool {
         let encoded = self.engine.shared.dictionary.intern_quad(quad);
         self.insert_encoded(encoded)
+    }
+
+    /// [`Self::insert`], the pending changes' growth charged to the attached budget
+    /// ([`Self::charge_pending_to`]) before it happens, and before `quad`'s terms are interned:
+    /// refused ([`crate::EngineError::MemoryLimit`]), nothing changes and nothing is interned.
+    /// Without a budget attached it is [`Self::insert`].
+    pub fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
+        if self.pending.insert_may_grow() {
+            let dictionary = &self.engine.shared.dictionary;
+            match dictionary.lookup_quad_bounded(quad, u64::MAX) {
+                // Its terms are known: charged only where it is a new entry, not where it
+                // undoes a removal or is asserted already (sol-loop r1 S1).
+                Some(encoded) => return self.try_insert_encoded(encoded),
+                // A term new to the dictionary: the quad is new, and needs the room, charged
+                // before its terms are interned.
+                None => self.pending.try_room_for_insert()?,
+            }
+        }
+        let encoded = self.engine.shared.dictionary.intern_quad(quad);
+        self.try_insert_encoded(encoded)
+    }
+
+    /// [`Self::remove`], the pending changes' growth charged as [`Self::try_insert`]'s is.
+    pub fn try_remove(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
+        match self
+            .engine
+            .shared
+            .dictionary
+            .lookup_quad_bounded(quad, u64::MAX)
+        {
+            Some(encoded) => self.try_remove_encoded(encoded),
+            None => Ok(false),
+        }
     }
 
     /// Retracts the asserted `quad`; returns `false` if it was not asserted. Never interns.
@@ -295,30 +524,69 @@ impl<'e> Transaction<'e> {
         }
     }
 
+    /// Pays for the pending changes' growth from `budget` for their life: what
+    /// [`Self::try_reserve_inserts`] reserves and the charged changes ([`Self::try_insert`],
+    /// [`Self::try_remove`], [`Self::remove_matching`]) grow is charged to it before it is
+    /// allocated, and held until the transaction is dropped or its commit has freed the
+    /// changes. The mutation
+    /// pipeline attaches the request's envelope here. Attaching the same budget again changes
+    /// nothing; another one is refused ([`crate::EngineError::Configuration`]).
+    pub fn charge_pending_to(&mut self, budget: Arc<nrese_exec::Budget>) -> EngineResult<()> {
+        self.pending.charge_to(budget)
+    }
+
+    /// Whether a budget pays for the pending changes' growth ([`Self::charge_pending_to`]): a
+    /// caller that reserves only where one does, as one without a budget has nothing to reserve
+    /// from (an engine user's own transaction, a test).
+    pub fn charges_pending(&self) -> bool {
+        self.pending.charged()
+    }
+
+    /// Room for `more` asserted inserts, charged to the attached budget
+    /// ([`Self::charge_pending_to`]) before the pending table grows: the next `more` inserts
+    /// allocate nothing. Refused ([`crate::EngineError::MemoryLimit`]), nothing changes;
+    /// without a budget attached it is an error ([`crate::EngineError::Configuration`]).
+    pub fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()> {
+        self.pending.try_reserve_inserts(more)
+    }
+
     /// Asserts an already-encoded quad. Its ids must come from this engine's dictionary.
     /// Returns `false` if it was already asserted; asserting an inferred quad returns `true`
-    /// (it becomes explicit).
+    /// (it becomes explicit). Growth past the room [`Self::try_reserve_inserts`] reserved is
+    /// uncharged here ([`Self::try_insert_encoded`] charges it).
     pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
         let changed = self.pending.insert_asserted(quad);
         self.assert_unanswered(changed)
     }
 
-    /// Retracts an asserted quad; inferred quads are unaffected.
+    /// [`Self::insert_encoded`], its growth charged as [`Self::try_insert`]'s is.
+    pub fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_insert_asserted(quad)?;
+        Ok(self.assert_unanswered(changed))
+    }
+
+    /// Retracts an asserted quad; inferred quads are unaffected. Its growth is uncharged
+    /// ([`Self::try_remove_encoded`] charges it).
     pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
         let changed = self.pending.remove_asserted(quad);
         self.assert_unanswered(changed)
     }
 
+    /// [`Self::remove_encoded`], its growth charged as [`Self::try_insert`]'s is.
+    pub fn try_remove_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_remove_asserted(quad)?;
+        Ok(self.assert_unanswered(changed))
+    }
+
     /// Retracts every asserted quad matching `pattern` (SPARQL `CLEAR`/`DROP`, GSP
-    /// `PUT`/`DELETE`). Returns the number of quads removed.
-    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> u64 {
-        let matching: Vec<_> = self
-            .quads_for_pattern_in(ReadModel::Asserted, pattern)
-            .collect();
-        matching
-            .into_iter()
-            .map(|quad| u64::from(self.remove_encoded(quad)))
-            .sum()
+    /// `PUT`/`DELETE`). Returns the number of quads removed. What the retractions grow is
+    /// charged to the attached budget before it is allocated, and nothing else is, however
+    /// many quads match: refused ([`crate::EngineError::MemoryLimit`]) part way, the
+    /// transaction holds part of the removal and is to be dropped.
+    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
+        let removed = self.pending.try_remove_matching(pattern)?;
+        self.assert_unanswered(removed > 0);
+        Ok(removed)
     }
 
     /// Adds an inferred statement (in the default graph). Returns `false` if it is already
@@ -379,8 +647,11 @@ impl<'e> Transaction<'e> {
             _slot,
             pending,
             after,
+            note,
         } = self;
-        let (base, asserted, inferred) = pending.into_parts();
+        // The pending changes' charge, bound first so it drops last: after the sets are freed,
+        // and after the record made of them is published.
+        let (_charge, base, asserted, inferred) = pending.into_parts();
         let promised = after.into_inner();
         let count = |set: &HashSet<EncodedQuad>| set.len() as u64;
         let summary = |revision, asserted_identity| CommitSummary {
@@ -399,6 +670,7 @@ impl<'e> Transaction<'e> {
             summary
         };
         if asserted.is_empty() && inferred.is_empty() {
+            // Nothing published: the note isn't called ([`Self::note_commit`]).
             return Ok(checked(summary(base.revision(), base.asserted_identity())));
         }
         let mut summary = summary(base.revision() + 1, base.asserted_identity());
@@ -425,9 +697,14 @@ impl<'e> Transaction<'e> {
             committed_micros: None,
         };
         // Kept: the base's (single writer; a merge keeps it).
-        if let Some(new) =
-            engine.publish_record(&record, true, reserved, dictionary_len, changes_equality)?
-        {
+        if let Some(new) = engine.publish_record(
+            &record,
+            true,
+            reserved,
+            dictionary_len,
+            changes_equality,
+            note,
+        )? {
             summary.asserted = new;
         }
         Ok(checked(summary))
@@ -447,6 +724,9 @@ impl Inner {
     /// goes to the log, its runs built and its layout converted, and the record and the
     /// version take that one time (review r1, R1-F1). A replicated record keeps the
     /// primary's time, which the clock takes too.
+    ///
+    /// A local commit's `note` ([`Transaction::note_commit`]) is called at the point that
+    /// method names: in the log's append, or, in memory, before the publication.
     pub(super) fn publish_record(
         &self,
         record: &CommitRecord,
@@ -454,11 +734,13 @@ impl Inner {
         reserved: Option<super::AssertedIdentity>,
         dictionary_len: u64,
         changes_equality: bool,
+        note: Option<super::CommitNote<'_>>,
     ) -> EngineResult<Option<super::AssertedIdentity>> {
         // New where the record changes asserted statements; kept for an inferred-only one.
         // Chosen once, for the durable and the in-memory path alike.
         let changes_asserted = !record.inserts.is_empty() || !record.deletes.is_empty();
         debug_assert!(local || reserved.is_none(), "only a local commit reserves");
+        debug_assert!(local || note.is_none(), "only a local commit has a note");
         debug_assert!(
             reserved.is_none() || changes_asserted,
             "the commit's delta and its record agree on an asserted change"
@@ -483,7 +765,7 @@ impl Inner {
         let [asserted_run, inferred_run] = record.runs(asserted_layout);
         let (_compaction, converted) = match converting {
             true => {
-                let (slot, converted) = shared.versions.converted_asserted();
+                let (slot, converted) = shared.versions.converted_asserted(&shared.forms);
                 (Some(slot), Some(converted))
             }
             false => (None, None),
@@ -529,7 +811,7 @@ impl Inner {
                     true => Some(&mut stamp),
                     false => None,
                 };
-                let committed = wal.append(record, stamp)?;
+                let committed = wal.append(record, stamp, note)?;
                 if !local {
                     shared
                         .clock
@@ -541,6 +823,17 @@ impl Inner {
                 wal.bytes_since_checkpoint()
             }
             None => {
+                // No log to poison: an unknown journal refuses the commit as a refusal does.
+                if let Some(note) = note {
+                    match note(revision) {
+                        Ok(()) => {}
+                        Err(
+                            super::NoteError::Refused(error) | super::NoteError::Unknown(error),
+                        ) => {
+                            return Err(crate::EngineError::CommitNoteRefused(error));
+                        }
+                    }
+                }
                 let committed = match local {
                     true => Some(shared.stamp()),
                     false => {

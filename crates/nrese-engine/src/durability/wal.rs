@@ -143,18 +143,19 @@ pub(crate) fn read_open_segment(file: &mut File, path: &Path) -> EngineResult<Se
     })
 }
 
-/// Cuts a torn tail off a segment and syncs the result.
-pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<()> {
+/// Cuts a torn tail off a segment and syncs the result. Whether the segment is still there: one
+/// left without even its header is removed.
+pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<bool> {
     let file = OpenOptions::new().write(true).open(path)?;
     if valid_len < SEGMENT_MAGIC.len() as u64 {
         file.set_len(0)?;
         drop(file);
         fs::remove_file(path)?;
-        return Ok(());
+        return Ok(false);
     }
     file.set_len(valid_len)?;
     file.sync_all()?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) struct Wal {
@@ -171,12 +172,69 @@ pub(crate) struct Wal {
     magic: &'static [u8; 8],
     /// Where released segments go instead of being deleted.
     archive: Option<PathBuf>,
+    /// The names the store's open left to sync before the first durable write.
+    pending_names: PendingNames,
+}
+
+/// The names a store's open leaves to be synced before the first durable write that relies on
+/// them (deferred-sync design note of 8 Nov): the directories holding the levels of the
+/// store's path it found, then the WAL's directory and the store's own. Each is synced once;
+/// a found level's holder this process may not open for its sync is left as it is, as
+/// `place::create_dir_all` leaves it.
+pub(crate) struct PendingNames {
+    /// In the order synced (outermost first), each with whether `PermissionDenied` leaves it.
+    dirs: Vec<(PathBuf, bool)>,
+}
+
+impl PendingNames {
+    /// `holders` (found levels' holders, outermost first), then `own` (the store's
+    /// directories), each once.
+    /// Each directory once by its key: one spelled through a link (the store's root as opened)
+    /// and physically (the holder of its WAL directory's entry, DUR-4 review r1) is the same
+    /// directory. Both come with their keys, made alike (`place::Named::key`).
+    pub(crate) fn new(holders: Vec<(PathBuf, PathBuf)>, own: Vec<(PathBuf, PathBuf)>) -> Self {
+        let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+        let mut keys: Vec<PathBuf> = Vec::new();
+        let named = holders
+            .into_iter()
+            .map(|(dir, key)| (dir, key, true))
+            .chain(own.into_iter().map(|(dir, key)| (dir, key, false)));
+        for (dir, key, found) in named {
+            match keys.iter().position(|seen| *seen == key) {
+                // Both a holder and the store's own (a relative root, a linked root): the
+                // stricter.
+                Some(at) => dirs[at].1 &= found,
+                None => {
+                    keys.push(key);
+                    dirs.push((dir, found));
+                }
+            }
+        }
+        Self { dirs }
+    }
+
+    /// Syncs each, removing it once synced; the first failure is returned, leaving it and the
+    /// rest for the next call.
+    pub(crate) fn settle(&mut self) -> std::io::Result<()> {
+        use std::io::ErrorKind::PermissionDenied;
+        while let Some((dir, tolerant)) = self.dirs.first() {
+            match super::place::sync_dir(dir) {
+                Ok(()) => {}
+                Err(error) if *tolerant && error.kind() == PermissionDenied => {}
+                Err(error) => return Err(error),
+            }
+            self.dirs.remove(0);
+        }
+        Ok(())
+    }
 }
 
 impl Wal {
     /// Opens the log for appending after recovery. Appends to the newest segment, or starts
     /// one for `next_revision` if there is none. New segments are of the store's encoding
-    /// (`integers_in_dictionary`: version 4).
+    /// (`integers_in_dictionary`: version 4). `dir` and `archive` exist, named by the store's
+    /// open (`place::create_store_dir`); `pending_names` are synced before the first record is
+    /// acknowledged ([`Self::settle_names`]).
     pub(crate) fn open(
         dir: &Path,
         next_revision: u64,
@@ -184,15 +242,12 @@ impl Wal {
         sync: SyncPolicy,
         integers_in_dictionary: bool,
         archive: Option<PathBuf>,
+        pending_names: PendingNames,
     ) -> EngineResult<Self> {
         let magic = match integers_in_dictionary {
             true => SEGMENT_MAGIC_V4,
             false => SEGMENT_MAGIC,
         };
-        fs::create_dir_all(dir)?;
-        if let Some(archive) = &archive {
-            fs::create_dir_all(archive)?;
-        }
         // A segment a crash left under its temporary name was never part of the log.
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
@@ -235,7 +290,15 @@ impl Wal {
             buffer: Vec::new(),
             magic,
             archive,
+            pending_names,
         })
+    }
+
+    /// Syncs the names the store's open left pending, before a durable write that relies on
+    /// them and doesn't go through [`Self::append`] (a checkpoint, a bulk publication, the log
+    /// served). A failure is only returned: nothing was written, and the next call tries again.
+    pub(crate) fn settle_names(&mut self) -> EngineResult<()> {
+        Ok(self.pending_names.settle()?)
     }
 
     pub(crate) fn bytes_since_checkpoint(&self) -> u64 {
@@ -249,10 +312,18 @@ impl Wal {
     /// rotation are done and just before it is written and synced: the time is that of the
     /// commit, not of its build (review r1, R1-F1). Without `stamp` (a replicated record)
     /// the record's own time is kept.
+    ///
+    /// A local commit's `note` ([`crate::Transaction::note_commit`]) is called after the
+    /// rotation, the stamp and the encoding, the steps whose failure leaves the log as it was,
+    /// and before the record is written: so the time logged precedes the note's own I/O, as it
+    /// precedes the record's sync. The log is poisoned while the note runs, so that a note that
+    /// panics, having perhaps written its journal, leaves no later commit to take its revision;
+    /// `Ok` and a refusal clear that, an unknown journal keeps it.
     pub(crate) fn append(
         &mut self,
         record: &CommitRecord,
         stamp: Option<&mut dyn FnMut() -> u64>,
+        note: Option<crate::engine::CommitNote<'_>>,
     ) -> EngineResult<Option<u64>> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
@@ -272,13 +343,33 @@ impl Wal {
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
         encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
-        let result = self
-            .active
-            .write_all(&self.buffer)
+        if let Some(note) = note {
+            self.poisoned = true;
+            match note(record.revision) {
+                Ok(()) => self.poisoned = false,
+                Err(crate::engine::NoteError::Refused(error)) => {
+                    self.poisoned = false;
+                    return Err(EngineError::CommitNoteRefused(error));
+                }
+                Err(crate::engine::NoteError::Unknown(error)) => return Err(error.into()),
+            }
+        }
+        #[cfg(test)]
+        let written = super::fault::check(&super::fault::FAIL_RECORD_WRITE, "the record's write");
+        #[cfg(not(test))]
+        let written = Ok(());
+        // The names the open left pending are synced after the record, before it is
+        // acknowledged: the record's sync commits the journal and flushes the device, and the
+        // directories' syncs after it find nothing left to flush (measured on the timing host:
+        // in the other order the record's sync paid a second flush; deferred-sync design note).
+        // A failure there leaves the record written, its outcome unknown: it poisons the log.
+        let result = written
+            .and_then(|()| self.active.write_all(&self.buffer))
             .and_then(|()| match self.sync {
                 SyncPolicy::EveryCommit => self.active.sync_data(),
                 SyncPolicy::OsBuffered => Ok(()),
-            });
+            })
+            .and_then(|()| self.pending_names.settle());
         if let Err(error) = result {
             self.poisoned = true;
             return Err(error.into());
@@ -361,9 +452,10 @@ impl Wal {
 /// Moves a segment into `archive` (a copy where a rename can't cross file systems).
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
-    if fs::rename(path, &target).is_err() {
-        fs::copy(path, &target)?;
-        File::open(&target)?.sync_all()?;
+    if super::place::rename(path, &target).is_err() {
+        // Synced through a writable handle (the read-only one this took before can't be
+        // flushed on Windows), and in place before the original goes.
+        super::place::copy(path, &target)?;
         fs::remove_file(path)?;
     }
     super::sync_dir(archive)?;
@@ -394,7 +486,7 @@ fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineRes
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
-    fs::rename(&temporary, &path)?;
+    super::place::rename(&temporary, &path)?;
     #[cfg(test)]
     super::fault::check(&super::fault::FAIL_SEGMENT_PLACED, "segment directory sync")?;
     super::sync_dir(dir)?;

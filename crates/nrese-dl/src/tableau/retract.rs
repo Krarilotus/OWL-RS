@@ -49,7 +49,8 @@ impl Engine<'_> {
         let exhausted = frame.next + 1 >= frame.alternatives.len();
         let (mark, pending, pending_open) = (frame.mark, frame.pending, frame.pending_open);
         for &i in dependent.iter().rev() {
-            self.frames.remove(i);
+            let gone = self.frames.remove(i);
+            self.abandon_frame(&gone);
         }
         let mut frame = self.frames.remove(at);
         self.retract(&levels, mark, pending, pending_open);
@@ -77,21 +78,29 @@ impl Engine<'_> {
         }
         if exhausted {
             // Every alternative failed: the disjunction's own clash, without `k`.
+            self.abandon_frame(&frame);
             let failed = self.deps.union(frame.premise, frame.failed);
             return Some(Err(super::engine::Stop::Clash(failed)));
         }
-        frame.next += 1;
         // On top, as the most recent decision: a fresh level, and the state as it is now
-        // for a later truncation to it.
-        let point = self.checkpoint();
-        frame.id = self.next_level;
+        // for a later truncation to it. Everything but the decision comes from the
+        // checkpoint, the retraction queues included: a truncation to this frame restores
+        // them, and an older copy lost the disjunctions this retraction reopened (fuzz seed
+        // 710126, case 7).
+        let id = self.next_level;
         self.next_level += 1;
-        frame.mark = point.mark;
-        frame.pending = point.pending;
-        frame.bindings = point.bindings;
-        frame.pending_open = point.pending_open;
-        frame.ni_pending = point.ni_pending;
-        frame.ni_open = point.ni_open;
+        let frame = super::engine::Frame {
+            id,
+            semantic: frame.semantic,
+            alternatives: frame.alternatives,
+            clause: frame.clause,
+            heads: frame.heads,
+            disjunction: frame.disjunction,
+            next: frame.next + 1,
+            premise: frame.premise,
+            failed: frame.failed,
+            ..self.checkpoint()
+        };
         self.frames.push(frame);
         Some(self.take_alternative())
     }
@@ -169,9 +178,13 @@ impl Engine<'_> {
         }
         touched.sort_unstable();
         touched.dedup();
-        // A disjunction a retracted fact satisfied may be open again: only one queued since
-        // `k`'s frame was opened, already passed by the scan, and binding a touched node.
-        for i in pending_open..self.pending_open.min(self.pending.len() as u32) {
+        // A disjunction a retracted fact satisfied may be open again. It binds a touched node
+        // (the fact's), lies behind the scan, and was looked at since `k`'s frame was opened:
+        // by the scan, at or after the cursor `k` saved, or taken from `reopen`, at or after
+        // `reopened_low` (review D16-058 r1: a reopened disjunction a newer choice satisfied,
+        // below that choice's saved cursor).
+        let low = pending_open.min(self.reopened_low);
+        for i in low..self.pending_open.min(self.pending.len() as u32) {
             let p = self.pending[i as usize];
             if self.pending_dead[i as usize] {
                 continue;
@@ -242,6 +255,35 @@ impl Engine<'_> {
             assert!(
                 self.g.full_from <= low || self.g.touched.contains(&low),
                 "a touched node escapes the blocking pass"
+            );
+        }
+    }
+
+    /// The invariant a model rests on (`Config::check_retraction`): no live pending
+    /// disjunction is left without a disjunct that holds. The scan and `reopen` must
+    /// between them reach every one; a retraction that loses one shows here, not as a
+    /// wrong answer (fuzz seed 700160, case 144).
+    pub(super) fn check_decided(&mut self) {
+        for at in 0..self.pending.len() {
+            if self.pending_dead[at] {
+                continue;
+            }
+            let pend = self.pending[at];
+            let clause = &self.p.clauses[pend.clause as usize];
+            let (annotation, heads) = (clause.annotation, clause.head.clone());
+            let bind =
+                &self.bindings[pend.bind as usize..pend.bind as usize + clause.vars as usize];
+            if bind.iter().any(|&n| !self.g.live(n)) {
+                continue;
+            }
+            let bind = bind.to_vec();
+            let decided = heads
+                .iter()
+                .any(|&h| matches!(self.holds(self.lit(h, &bind, annotation)), Ok(true)));
+            assert!(
+                decided,
+                "pending disjunction {at} (clause {}) is left undecided in a model",
+                pend.clause
             );
         }
     }

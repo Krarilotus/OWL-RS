@@ -9,6 +9,8 @@
 //! is the *sum* of its entries across runs (+1 insert, -1 tombstone) and is either 0 or 1,
 //! independent of run order. Merges of any adjacent runs just add the signs.
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use super::Layout;
@@ -46,6 +48,11 @@ impl PermutationRun {
             return 0;
         }
         let (first, last) = (start / 64, (end - 1) / 64);
+        #[cfg(test)]
+        crate::witness::add(
+            crate::witness::Site::TombstoneWords,
+            (last - first + 1) as u64,
+        );
         let mask_from = |bit: usize| u64::MAX << (bit % 64);
         let mask_to = |bit: usize| u64::MAX >> (63 - bit % 64);
         if first == last {
@@ -60,6 +67,46 @@ impl PermutationRun {
             .map(|word| u64::from(word.count_ones()))
             .sum();
         head + middle + tail
+    }
+
+    /// [`Self::tombstones_in`], its bitmap read a run of at most `POLL_UNITS` words at a
+    /// time, `visit(k)` called before each run of `k` words (REAS-2 fix check r1, R2-F1: the
+    /// count lives in the reader). `None` once `visit` returns false, nothing more read.
+    /// Without tombstones, nothing is read and nothing visited.
+    pub(crate) fn tombstones_in_visiting(
+        &self,
+        start: usize,
+        end: usize,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<u64> {
+        if self.tombstones.is_empty() || start >= end {
+            return Some(0);
+        }
+        let (first, last) = (start / 64, (end - 1) / 64);
+        let run = nrese_exec::POLL_UNITS as usize;
+        let (head, tail) = (u64::MAX << (start % 64), u64::MAX >> (63 - (end - 1) % 64));
+        let mut count = 0;
+        let mut at = first;
+        while at <= last {
+            let upto = (at + run).min(last + 1);
+            if !visit((upto - at) as u64) {
+                return None;
+            }
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::TombstoneWords, (upto - at) as u64);
+            for (i, &word) in self.tombstones[at..upto].iter().enumerate() {
+                let i = at + i;
+                let word = match (i == first, i == last) {
+                    (true, true) => word & head & tail,
+                    (true, false) => word & head,
+                    (false, true) => word & tail,
+                    (false, false) => word,
+                };
+                count += u64::from(word.count_ones());
+            }
+            at = upto;
+        }
+        Some(count)
     }
 
     /// Index range of keys in `[low, high]`. O(log n).
@@ -131,6 +178,31 @@ impl PermutationRun {
     }
 }
 
+/// The heap bytes of the quad-layout forms of default-graph runs alive in one engine
+/// ([`Run::quads_layout_shared`], DUR-6): counted in its index memory from when a form is
+/// made until it is freed, published by a commit or not.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Forms(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Forms {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A form's bytes in its engine's [`Forms`], given back when the form is freed.
+#[derive(Debug)]
+struct Accounted {
+    bytes: u64,
+    forms: Forms,
+}
+
+impl Drop for Accounted {
+    fn drop(&mut self) {
+        (self.forms.0).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Invariant: exactly the permutations of `layout` are populated; the others are empty.
 #[derive(Debug, Default)]
 pub(crate) struct Run {
@@ -138,6 +210,11 @@ pub(crate) struct Run {
     perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
+    /// This run's quad-layout form while a holder keeps it (a default-graph run's, made by
+    /// [`Self::quads_layout_shared`]): one form, shared by every holder.
+    quads_form: parking_lot::Mutex<std::sync::Weak<Run>>,
+    /// On a quad-layout form: its bytes in its engine's [`Forms`] while it lives.
+    account: Option<Accounted>,
 }
 
 impl Run {
@@ -254,6 +331,8 @@ impl Run {
             perms,
             inserts,
             deletes,
+            quads_form: Default::default(),
+            account: None,
         }
     }
 
@@ -316,12 +395,46 @@ impl Run {
         for (permutation, run) in built {
             perms[permutation as usize] = run;
         }
-        Self {
-            layout: Layout::Quads,
-            perms,
-            inserts: self.inserts,
-            deletes: self.deletes,
+        Self::from_permutations(Layout::Quads, perms)
+    }
+
+    /// This run in the quad layout ([`Self::with_quads_layout`]), made once and shared by
+    /// every holder while any keeps it (DUR-6): N pending versions over one base hold one form
+    /// of each of its runs, not N. A run of the quad layout is itself. Made without the slot's
+    /// lock (the build is parallel on the caller's pool; no lock is held across pool work), so
+    /// K callers that miss the slot at once make K conversions: the peak while they build grows
+    /// with concurrent misses, it isn't bounded at one or two forms (review r1 on DUR-6a). Each
+    /// that installs second takes the installed one and frees its own before returning, so
+    /// once they return, all share one form. A form counts in `forms` from when it is made
+    /// (its arrays exist a moment before) until it is freed. The slot's `Weak` keeps the
+    /// form's `Arc` allocation, not its arrays, after the last holder lets it go, until the
+    /// slot is filled again or the run is dropped: bounded metadata per source run.
+    pub(crate) fn quads_layout_shared(self: &Arc<Self>, forms: &Forms) -> Arc<Self> {
+        if self.layout == Layout::Quads {
+            return Arc::clone(self);
         }
+        if let Some(form) = self.quads_form.lock().upgrade() {
+            return form;
+        }
+        let mut form = self.with_quads_layout();
+        let bytes = form.memory_bytes();
+        (forms.0).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        form.account = Some(Accounted {
+            bytes,
+            forms: forms.clone(),
+        });
+        let form = Arc::new(form);
+        let mut slot = self.quads_form.lock();
+        if let Some(installed) = slot.upgrade() {
+            return installed;
+        }
+        *slot = Arc::downgrade(&form);
+        form
+    }
+
+    /// Whether this run is a shared quad-layout form, counted in its engine's [`Forms`].
+    pub(crate) fn is_form(&self) -> bool {
+        self.account.is_some()
     }
 
     /// Net contribution to the visible quad count.

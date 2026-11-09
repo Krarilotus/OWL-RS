@@ -146,8 +146,9 @@ fn a_race_keeps_the_first_value_stored() {
 /// another version never sees it (the design note's §1 table).
 ///
 /// - Input: a value made on a writer's pending snapshot; its equality, stored, canonical and
-///   reading-within views and a clone; then a second `pending_snapshot`, a `pending_over`, an
-///   inferred subset, an addition and a private transaction's pending snapshot.
+///   reading-within views and a clone; then a second `pending_snapshot`, a `pending_over`, the
+///   charged `pending_snapshot_within` and `pending_over_within`, an inferred subset, an
+///   addition and a private transaction's pending snapshot.
 /// - Expected: the first group gets the same value; each of the second finds none and makes
 ///   its own.
 #[test]
@@ -188,9 +189,19 @@ fn views_of_one_version_share_its_value_and_no_other_version_does() {
         .speculative_over(&published, Arc::new(Budget::unlimited()))
         .unwrap();
     assert!(private.try_insert(quad("c", "three").as_ref()).unwrap());
+    let unlimited = Arc::new(Budget::unlimited());
     let others = [
         ("another pending snapshot", tx.pending_snapshot()),
         ("pending over", tx.pending_over(&published, &[])),
+        // DUR-6a's charged builders make versions of their own too.
+        (
+            "pending snapshot within",
+            tx.pending_snapshot_within(&unlimited).unwrap(),
+        ),
+        (
+            "pending over within",
+            tx.pending_over_within(&published, &[], &unlimited).unwrap(),
+        ),
         (
             "a subset",
             pending.with_inferred_subset(InferredSubset::Without(Vec::new())),

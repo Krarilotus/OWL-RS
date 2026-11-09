@@ -29,7 +29,11 @@ use crate::results::{CancellationToken, QueryEvaluationError};
 
 /// The cache and what every key of a context starts with.
 pub(super) struct CacheScope {
+    /// The cache the context's snapshot admits into: the store's for a published snapshot,
+    /// its version's own for an unpublished one ([`ResultCache::for_admission`]).
     cache: Arc<ResultCache>,
+    /// The store's, for the contexts this one makes ([`Context::child_cache`]).
+    shared: Arc<ResultCache>,
     snapshot: SnapshotIdentity,
     /// What doesn't change between a context and the ones it makes (the base IRI, the
     /// user's access), for [`Context::child_cache`].
@@ -40,8 +44,16 @@ pub(super) struct CacheScope {
 
 impl Context<'_> {
     /// The cache scope of this context: `fixed` (the base IRI, the access) and the
-    /// options that decide its results.
-    pub(super) fn cache_scope(&self, cache: Arc<ResultCache>, fixed: Arc<[u8]>) -> Arc<CacheScope> {
+    /// options that decide its results, in the cache the context's own snapshot admits into
+    /// beside the store's `shared` one (the lifecycle contract's S3): the store's for a
+    /// published snapshot, its version's own for an unpublished one.
+    pub(super) fn cache_scope(
+        &self,
+        shared: Arc<ResultCache>,
+        fixed: Arc<[u8]>,
+    ) -> Arc<CacheScope> {
+        let admission = self.snapshot.admission();
+        let cache = ResultCache::for_admission(&shared, admission, &self.memory);
         let mut encoder = Encoder::default();
         encoder.bytes.extend_from_slice(&fixed);
         encoder.tag(self.model as u8);
@@ -86,17 +98,24 @@ impl Context<'_> {
         }
         Arc::new(CacheScope {
             cache,
+            shared,
             snapshot: self.snapshot.identity(),
             fixed,
             context: encoder.bytes,
         })
     }
 
-    /// The cache scope of a context made from this one (with its own snapshot and
-    /// options).
+    /// The cache scope of a context made from this one (with its own snapshot, whose
+    /// admission decides its cache, and options).
     pub(super) fn child_cache(&self, child: &Context<'_>) -> Option<Arc<CacheScope>> {
         let scope = self.cache.as_ref()?;
-        Some(child.cache_scope(Arc::clone(&scope.cache), Arc::clone(&scope.fixed)))
+        Some(child.cache_scope(Arc::clone(&scope.shared), Arc::clone(&scope.fixed)))
+    }
+
+    /// The cache scope with the admission of the snapshot it was made for: what an
+    /// admission takes. `None` without a cache.
+    fn admission(&self) -> Option<(&CacheScope, nrese_engine::Admission<'_>)> {
+        Some((self.cache.as_deref()?, self.snapshot.admission()))
     }
 
     /// An encoder holding the start of every key of this context: its options and the
@@ -149,7 +168,7 @@ impl Context<'_> {
         step: Option<usize>,
     ) -> NativeResult<Solutions> {
         let pin = self.pin.borrow_mut().take();
-        let Some(scope) = &self.cache else {
+        let Some((scope, token)) = self.admission() else {
             return self.eval_operator(pattern);
         };
         // Given rows: nothing to save. A basic graph pattern's joins are parts of their
@@ -180,7 +199,7 @@ impl Context<'_> {
                 None => self.eval_operator(pattern),
             };
         }
-        match scope.cache.claim(&key, pin.as_ref()) {
+        match scope.cache.claim(token, &key.part, pin.as_ref()) {
             Claim::Hit(part) => self.solutions_of(&part, &vars, step, "hit"),
             Claim::Wait(flight) => match flight.wait(|| self.cancelled()) {
                 Err(()) => Err(QueryEvaluationError::Cancelled.into()),
@@ -284,7 +303,10 @@ impl Context<'_> {
         let table = match part.computed.is_empty() {
             true => part.table.clone(),
             false => {
-                let ids: Vec<u64> = part.computed.iter().map(|term| self.id(term)).collect();
+                let mut ids = Vec::with_capacity(part.computed.len());
+                for term in &part.computed {
+                    ids.push(self.id(term)?);
+                }
                 IdTable::from_columns(
                     part.table
                         .columns()
@@ -316,7 +338,10 @@ impl Context<'_> {
         pin: Option<&PinRequest>,
     ) -> NativeResult<Solutions> {
         if let Some(pin) = pin {
-            if self.cache.is_none() {
+            // Pins live in the store's cache alone: unpublished state can't pin (S3), as a
+            // transaction view, whose cache is off, can't.
+            let unpublished = matches!(self.snapshot.admission(), nrese_engine::Admission::Own(_));
+            if self.cache.is_none() || unpublished {
                 return Err(QueryEvaluationError::Argument(
                     "the result cache is off: nothing can be pinned".to_owned(),
                 )
@@ -334,14 +359,15 @@ impl Context<'_> {
 /// template, and its pattern as parsed (the answer is the query's, however it is planned);
 /// for a SELECT, the names its answer shows, in order: the pattern numbers its variables
 /// (parts of renamed queries share answers), but these bytes hold the names in their header.
-/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables).
+/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables). These
+/// are its part bytes: the cache keys them by the admission's snapshot.
 pub(crate) fn output_key(
     snapshot: &nrese_engine::Snapshot,
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
     format: &str,
     context: &str,
-) -> Option<Key> {
+) -> Option<Arc<[u8]>> {
     use nrese_sparql_syntax::Query;
     if options.pre_bound.is_some() {
         return None;
@@ -352,9 +378,27 @@ pub(crate) fn output_key(
         super::query_dataset(query),
         super::query_base(query),
     );
+    // A canonical view the budgets refused: the answer is that refusal, never a cached one
+    // (the context reads the snapshot as given meanwhile; sol-loop r2 S2).
+    if ctx.canonical_refused.is_some() {
+        return None;
+    }
     let scope = ctx.cache.as_ref()?;
     let mut encoder = ctx.key_start(scope);
     encoder.tag(b'S');
+    // The answer is the context's reading of `snapshot`, which the cache keys it by: where
+    // the context reads another view of it (canonical answers read a view with an identity
+    // of its own), that view's equality and canonical modes are part of these bytes too
+    // (sol-loop r1 S1). One presence byte first, in the same place in every key, so a key
+    // with them and one without never meet.
+    let read = ctx.snapshot.identity();
+    if read == snapshot.identity() {
+        encoder.tag(b'-');
+    } else {
+        encoder.tag(b'r');
+        encoder.number(read.equality.map_or(u64::MAX, nrese_engine::TermId::raw));
+        encoder.tag(u8::from(read.canonical));
+    }
     encoder.text(format);
     encoder.text(context);
     // The QL rewriting changes the answer of the query as parsed (parts see it in the
@@ -411,10 +455,7 @@ pub(crate) fn output_key(
             encoder.text(name.as_str());
         }
     }
-    Some(Key {
-        snapshot: scope.snapshot,
-        part: encoder.bytes.into(),
-    })
+    Some(encoder.bytes.into())
 }
 
 /// A basic graph pattern as [`Context::bgp`] joins it: its triples, their scans and range
@@ -591,7 +632,7 @@ impl Context<'_> {
         solutions: &Solutions,
         cost: std::time::Duration,
     ) {
-        let (Some(scope), Some(keys)) = (&self.cache, self.prefix_keys(joins)) else {
+        let (Some((scope, token)), Some(keys)) = (self.admission(), self.prefix_keys(joins)) else {
             return;
         };
         if length < 2 {
@@ -600,12 +641,16 @@ impl Context<'_> {
         let Some((key, vars)) = keys.key(length) else {
             return;
         };
-        scope
-            .cache
-            .offer(key, solutions.table.memory_bytes(), cost, || {
+        scope.cache.offer(
+            token,
+            &key.part,
+            solutions.table.memory_bytes(),
+            cost,
+            || {
                 let part = self.to_part(solutions, vars)?;
                 Some(crate::cache::Payload::Part(Arc::new(part)))
-            });
+            },
+        );
     }
 }
 
@@ -622,6 +667,51 @@ mod tests {
     use nrese_sparql_syntax::SparqlParser;
 
     use crate::{QueryOptions, QueryResults, ResultCache, evaluate_query};
+
+    /// Sol-loop r1 S1's key bytes (the lead's condition on writing the reading only where it
+    /// differs): an answer read canonically, which reads a view of the snapshot with an
+    /// identity of its own, and the same answer read as given never share a key, though the
+    /// cache keys both by the same snapshot.
+    ///
+    /// - Input: `Alias owl:sameAs Rep` inferred and `Rep p o`, the store reading equality
+    ///   classes; `?x p o` with early expansion, its output key read canonically and as given.
+    /// - Expected: both keys exist; the canonical one carries the reading (it is longer) and
+    ///   the two differ.
+    #[test]
+    fn a_canonical_answers_key_is_never_the_published_readings() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let iri = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut tx = engine.transaction();
+        let rep = tx.intern(iri("Rep").as_ref().into());
+        let alias = tx.intern(iri("Alias").as_ref().into());
+        let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+        let same_as = tx.intern(same_as.as_ref().into());
+        let quad = Quad::new(iri("Rep"), iri("p"), iri("o"), GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+        tx.insert_inferred(nrese_engine::EncodedTriple::new(alias, same_as, rep));
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let query = SparqlParser::new()
+            .parse_query("SELECT ?x WHERE { ?x <http://e/p> <http://e/o> }")
+            .unwrap();
+        let options = |canonical: bool| QueryOptions {
+            equality_early_expansion: true,
+            equality_canonical: canonical,
+            result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+            ..QueryOptions::default()
+        };
+        let key = |canonical: bool| {
+            super::output_key(&snapshot, &query, &options(canonical), "text/csv", "")
+                .expect("an answer that is cached")
+        };
+        let (canonical, given) = (key(true), key(false));
+        assert!(
+            canonical.len() > given.len(),
+            "the canonical reading is written"
+        );
+        assert_ne!(canonical, given);
+    }
 
     /// A path of n steps is a basic graph pattern of n triples, and each prefix of its join
     /// order a part: their keys are linear in n (each spelled out its whole prefix, O(n²)
