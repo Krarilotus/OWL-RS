@@ -113,6 +113,114 @@ fn ill_formed_shapes_are_errors_that_name_the_shape() {
     }
 }
 
+/// SHACL 1.0 §4.1.2: a literal matches `sh:datatype` only if it isn't ill-typed. Which
+/// lexical forms a datatype has is the engine's one datatype map (nrese-xsd's), as OWL
+/// reads it: the same literal isn't ill-typed to one and well-typed to the other. Each row:
+/// ex:a's one value of ex:v against `sh:datatype`, and whether it is a result. Controls: a
+/// valid binary; a valid form past what the engine represents (a 200-digit integer; a
+/// dateTimeStamp with 30 fractional digits), which is well-typed, only not represented; a
+/// language-tagged literal against rdf:langString. xsd:string takes XML 1.0's characters, as
+/// the map does (XSD 1.1 leaves XML 1.0 or 1.1 to the implementation): a string holding
+/// U+0001 is ill-typed; a plain string is the control.
+#[test]
+fn sh_datatype_rejects_what_the_datatype_map_calls_ill_typed() {
+    let huge = "9".repeat(200);
+    let rows: [(&str, String, &str, bool); 12] = [
+        (
+            "string holding U+0001",
+            "\"a\\u0001b\"^^xsd:string".into(),
+            "xsd:string",
+            true,
+        ),
+        (
+            "control: a plain string",
+            "\"plain\"".into(),
+            "xsd:string",
+            false,
+        ),
+        (
+            "hexBinary GG",
+            "\"GG\"^^xsd:hexBinary".into(),
+            "xsd:hexBinary",
+            true,
+        ),
+        (
+            "base64Binary !!!!",
+            "\"!!!!\"^^xsd:base64Binary".into(),
+            "xsd:base64Binary",
+            true,
+        ),
+        (
+            "dateTimeStamp without a timezone",
+            "\"2026-11-09T00:00:00\"^^xsd:dateTimeStamp".into(),
+            "xsd:dateTimeStamp",
+            true,
+        ),
+        (
+            "token with a double space",
+            "\"a  b\"^^xsd:token".into(),
+            "xsd:token",
+            true,
+        ),
+        (
+            "control: hexBinary 0FA1",
+            "\"0FA1\"^^xsd:hexBinary".into(),
+            "xsd:hexBinary",
+            false,
+        ),
+        (
+            "control: a 200-digit integer",
+            format!("\"{huge}\"^^xsd:integer"),
+            "xsd:integer",
+            false,
+        ),
+        (
+            "control: a 200-digit nonNegativeInteger",
+            format!("\"{huge}\"^^xsd:nonNegativeInteger"),
+            "xsd:nonNegativeInteger",
+            false,
+        ),
+        (
+            "control: dateTimeStamp past the represented precision",
+            "\"2026-11-09T00:00:00.123456789012345678901234567890Z\"^^xsd:dateTimeStamp".into(),
+            "xsd:dateTimeStamp",
+            false,
+        ),
+        (
+            "control: a language-tagged literal",
+            "\"a\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+        // RDF 1.1 Concepts §3.3: a language-tagged string is any lexical form with a tag; the
+        // XML character restriction is xsd:string's (the U+0001 row above), not rdf:langString's.
+        (
+            "language-tagged string holding U+0001",
+            "\"a\\u0001b\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+    ];
+    for (row, value, datatype, result) in rows {
+        let engine = engine(
+            &format!("ex:a ex:v {value} ."),
+            &format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+                   sh:property [ sh:path ex:v ; sh:datatype {datatype} ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(
+            report.results.len(),
+            usize::from(result),
+            "{row}: {:?}",
+            report.results
+        );
+    }
+}
+
 /// The selection decides what is validated: one graph or all, with or without the shapes
 /// graph, asserted statements or also inferred ones.
 #[test]

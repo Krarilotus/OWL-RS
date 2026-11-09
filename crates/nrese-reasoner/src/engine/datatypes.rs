@@ -208,6 +208,19 @@ mod tests {
         );
         // Guard (holds on the base too).
         assert_eq!(rules("ex:a ex:code \"a b\" ."), none, "a token");
+        // rdf:PlainLiteral's strings hold XML's Char only (rdf:PlainLiteral §§2-3): a language
+        // string holding U+0001 is outside it; an ordinary one is inside (SHACL datatype-map
+        // review r2, R2-F1).
+        assert_eq!(
+            rules("ex:plain rdfs:range rdf:PlainLiteral . ex:a ex:plain \"a\\u0001b\"@en ."),
+            ["dt-not-type"],
+            "U+0001 is no PlainLiteral text"
+        );
+        assert_eq!(
+            rules("ex:plain rdfs:range rdf:PlainLiteral . ex:a ex:plain \"a\"@en ."),
+            none,
+            "an ordinary language string is a PlainLiteral"
+        );
         // Every literal of OWL 2's datatype map is judged by its data value (OWL 2 Structural
         // Specification §4, OWL 2 Profiles table 8). An ill-typed literal has no value, so it is
         // in no value space (RDF 1.2 Concepts §3.4: "a semantic inconsistency"). Every row is

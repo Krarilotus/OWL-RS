@@ -42,6 +42,7 @@ fn search(engine: &Engine, text: &str) -> Vec<String> {
             prefix: false,
             stem: None,
         })
+        .unwrap()
         .into_iter()
         .filter_map(|m| snapshot.decode(nrese_engine::TermId::from_raw(m.id)))
         .map(|t| t.to_string())
