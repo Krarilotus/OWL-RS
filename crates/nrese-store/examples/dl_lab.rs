@@ -143,7 +143,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
 /// With `DL_LAB_REALISE`: the store's realisation against U1's memberships beyond L of
 /// named individuals in named classes (the named gap): how many it entails.
 fn realisation(store: &StoreService) -> String {
-    const SKOLEM: &str = "urn:nrese:u1:";
+    const SKOLEM: &str = "<dl u1 "; // nrese_dl::internal::u1, as printed
     const TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
     if std::env::var("DL_LAB_REALISE").is_err() {
         return String::new();
@@ -187,7 +187,7 @@ fn realisation(store: &StoreService) -> String {
 /// U1's facts beyond L per predicate (`a C` for a class), and how many of them name no
 /// Skolem constant: the facts that can make an answer of their own.
 fn gap(store: &StoreService) -> String {
-    const SKOLEM: &str = "urn:nrese:u1:";
+    const SKOLEM: &str = "<dl u1 "; // nrese_dl::internal::u1, as printed
     const TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
     let mut by: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
     for [s, p, o] in store.dl_upper_facts(false).unwrap_or_default() {

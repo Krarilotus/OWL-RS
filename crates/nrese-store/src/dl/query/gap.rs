@@ -101,8 +101,8 @@ pub(super) fn select<'a>(
             })
             .is_some()
     };
-    // Per distinct term of the gap: whether it is a reserved Skolem name (excluded even
-    // where a query expression supplies it) and its decoded bytes.
+    // Per distinct term of the gap: whether it is one of U1's own (excluded even where a
+    // query expression supplies it; no data term is one) and its decoded bytes.
     let mut terms: HashMap<u64, (bool, usize)> = HashMap::new();
     for row in 0..upper.len() {
         if row % 1024 == 0 {
@@ -117,7 +117,7 @@ pub(super) fn select<'a>(
                 continue;
             }
             let term = pair.term(id);
-            let internal = matches!(&term, Some(nrese_rdf::Term::NamedNode(n)) if n.as_str().starts_with(super::U1));
+            let internal = matches!(&term, Some(nrese_rdf::Term::NamedNode(n)) if nrese_dl::internal::is_made(n.as_str()));
             let bytes = term.as_ref().map_or(0, nrese_sparql::cache::term_heap);
             memory.charge(2 * std::mem::size_of::<(u64, (bool, usize))>())?;
             terms.insert(id, (internal, bytes.saturating_mul(2).saturating_add(128)));

@@ -74,8 +74,9 @@ fn unbuilt(n: usize) -> Arc<StoreService> {
 fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     let mut out = std::collections::BTreeMap::new();
     for fact in facts {
-        let key = fact.clone().map(|t| match t.starts_with("<urn:nrese:u1:") {
-            true => "<urn:nrese:u1:*>".to_owned(),
+        let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
+        let key = fact.clone().map(|t| match own(&t) {
+            true => "<U1's own>".to_owned(),
             false => t,
         });
         *out.entry(key).or_insert(0) += 1;
