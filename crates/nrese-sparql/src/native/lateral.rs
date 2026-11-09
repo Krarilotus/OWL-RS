@@ -39,7 +39,7 @@ impl Context<'_> {
         // Each distinct key once, in the order the rows first have it.
         let mut seen: HashMap<Vec<u64>, u64> = HashMap::new();
         let mut keys: Vec<Vec<u64>> = Vec::new();
-        let group_variable = self.synthetic("lateral key");
+        let group_variable = self.synthetic("lateral-key");
         let rows = left.table.len();
         // A bound group identity distinguishes UNDEF from the other substitutions:
         // ordinary SPARQL join compatibility alone would mix their right-side results.
