@@ -31,14 +31,13 @@ use nrese_engine::Transaction;
 use super::consistency::{self, Budget, Checked, Verdict};
 use super::{DlConsistency, DlStatus, source};
 use crate::StoreService;
+use crate::mutation::evidence::{Draft, EvidenceView};
 
-/// What the gate decided: the commit's status, and why it is rejected if it is.
+/// What the gate decided: the commit's status, and why it is rejected if it is, for the
+/// committer ([`rejection`]).
 pub(crate) struct Gate {
     pub checked: Checked,
-    pub reject: Option<String>,
-    /// For a rejection: a known-inconsistent set of axioms, minimal when the budget
-    /// permits, each by its source triples ([`super::explain`]).
-    pub evidence: Vec<nrese_reasoner::RejectEvidence>,
+    pub reject: Option<crate::MutationReject>,
 }
 
 /// Runs `check` with a [`Cancel`] that fires when `cancelled` does (a cancelled commit).
@@ -88,7 +87,15 @@ pub(crate) fn budget(
     cancel: Option<Cancel>,
     memory: &nrese_exec::Envelope,
 ) -> Budget {
-    let dl = &store.config().dl;
+    budget_of(&store.config().dl, cancel, memory)
+}
+
+/// [`budget`] under the settings `dl`.
+fn budget_of(
+    dl: &crate::DlConfig,
+    cancel: Option<Cancel>,
+    memory: &nrese_exec::Envelope,
+) -> Budget {
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),
@@ -112,7 +119,8 @@ pub(crate) fn check_commit(
     tx: &Transaction<'_>,
     cancelled: &(dyn Fn() -> bool + Sync),
     preparation: &mut super::bounds::Preparation,
-    reader: &crate::ReadScope,
+    view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    then: &Then<'_>,
     memory: &nrese_exec::Envelope,
 ) -> Gate {
     let deadline = Deadline::after(store.config().dl.timeout);
@@ -124,7 +132,6 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
-            evidence: Vec::new(),
         };
     }
     if preparation.proves_consistency {
@@ -135,7 +142,6 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
-            evidence: Vec::new(),
         };
     }
     cancellable(&|| cancelled() || deadline.passed(), |cancel| {
@@ -143,7 +149,8 @@ pub(crate) fn check_commit(
             store,
             tx,
             preparation,
-            reader,
+            view,
+            then,
             &budget(store, Some(cancel), memory),
             deadline,
         )
@@ -186,7 +193,8 @@ fn check_with_budget(
     store: &StoreService,
     tx: &Transaction<'_>,
     preparation: &mut super::bounds::Preparation,
-    reader: &crate::ReadScope,
+    view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    then: &Then<'_>,
     operation: &Budget,
     deadline: Deadline,
 ) -> Gate {
@@ -200,7 +208,6 @@ fn check_with_budget(
                 elapsed: started.elapsed(),
             },
             reject: None,
-            evidence: Vec::new(),
         };
     }
     // The check's memory: the request's envelope, its reading of the ontology included.
@@ -220,7 +227,6 @@ fn check_with_budget(
                             elapsed: started.elapsed(),
                         },
                         reject: None,
-                        evidence: Vec::new(),
                     };
                 }
             }
@@ -234,7 +240,6 @@ fn check_with_budget(
         return Gate {
             checked,
             reject: None,
-            evidence: Vec::new(),
         };
     }
     // Inconsistent after the commit: rejected unless it was so before (quarantine).
@@ -254,89 +259,164 @@ fn check_with_budget(
         return Gate {
             checked,
             reject: None,
-            evidence: Vec::new(),
         };
     }
-    rejection(tx, &ontology, reader, checked, operation, deadline)
+    rejection(&ontology, view, then, checked, operation, deadline)
 }
 
+/// What a restricted committer is told of a rejection ([`crate::mutation::evidence`]),
+/// given the view's OWL 2 DL reason found on the gate's own budget.
+pub(crate) type Then<'a> =
+    dyn Fn(&EvidenceView<'_, '_>, &dyn Fn(&EvidenceView<'_, '_>) -> Option<Draft>) -> Draft + 'a;
+
+/// The rejection, for the committer. One that may read every graph is told a minimal set of
+/// axioms with no model, each by its source triples, and which engine found the data
+/// inconsistent in what time. One that may read only some graphs is told what `then` tells
+/// of its view, given its view's own OWL 2 DL reason ([`view_reason`]): a set of the axioms
+/// of its own graphs that have no model by themselves. The set found over every graph, its
+/// size, the engine and the time all
+/// depend on statements it may not read.
 fn rejection(
-    tx: &Transaction<'_>,
     ontology: &nrese_owl::Ontology,
-    reader: &crate::ReadScope,
+    view: &EvidenceView<'_, '_>,
+    then: &Then<'_>,
     checked: Checked,
     operation: &Budget,
     deadline: Deadline,
 ) -> Gate {
-    // Why: a minimal set of axioms that has no model, each by its source triples. One
-    // not decided within the budget leaves the rejection without axioms.
+    let full = || {
+        // Why: a minimal set of axioms that has no model, each by its source triples. One
+        // not decided within the budget leaves the rejection without axioms.
+        let justification = super::explain::justify(
+            ontology,
+            &super::explain::Goal::Inconsistent,
+            &[],
+            &operation.remaining(deadline),
+            deadline,
+        )
+        .ok()
+        .flatten();
+        let explanation = match &justification {
+            Some(justification) => {
+                format!(
+                    "{} axiom(s) have no model together",
+                    justification.axioms.len()
+                )
+            }
+            None => "rejection evidence was not obtained within the operation's budget".to_owned(),
+        };
+        let detail = format!(
+            "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms); \
+             {explanation}",
+            checked.engine,
+            checked.elapsed.as_millis()
+        );
+        let evidence = justification
+            .map(|justification| axiom_evidence(view.tx(), ontology, &justification))
+            .unwrap_or_default();
+        Draft {
+            explanation: Some(nrese_reasoner::RejectExplanation {
+                summary: detail.clone(),
+                violated_constraint: CONSTRAINT.to_owned(),
+                focus_resource: String::new(),
+                evidence,
+            }),
+            detail,
+            attribution: None,
+        }
+    };
+    let reject = view.reject(full, |view| {
+        then(view, &|view| view_reason(view, operation, deadline))
+    });
+    Gate {
+        checked,
+        reject: Some(reject),
+    }
+}
+
+const CONSTRAINT: &str = "owl2-dl-consistency";
+
+/// A justification's axioms, each by its source triples.
+fn axiom_evidence(
+    tx: &Transaction<'_>,
+    ontology: &nrese_owl::Ontology,
+    justification: &super::explain::Justification,
+) -> Vec<nrese_reasoner::RejectEvidence> {
+    let decode = |t: u64| {
+        tx.decode(nrese_engine::TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
+    };
+    super::explain::explained(ontology, justification, &decode)
+        .into_iter()
+        .flat_map(|axiom| axiom.sources)
+        .flat_map(|(_, triples)| triples)
+        .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
+            role: "axiom",
+            subject: s,
+            predicate: p,
+            object: o,
+            origin: "asserted".to_owned(),
+        })
+        .collect()
+}
+
+/// The OWL 2 DL reason a restricted committer's view shows: the ontology of the statements
+/// asserted in graphs it may read has no model by itself; a minimal set of its axioms, each
+/// by its source triples (every one of them from those graphs, whatever graph an axiom's
+/// `Source` names). `None` if it has a model, or that isn't known within `operation`.
+/// Reading the ontology is charged to the operation's memory, as the gate's own is.
+fn view_reason(
+    view: &EvidenceView<'_, '_>,
+    operation: &Budget,
+    deadline: Deadline,
+) -> Option<Draft> {
+    let memory = operation.memory.clone().unwrap_or_default();
+    let ontology = source::read_pending_where(view.tx(), memory, |graph| view.graph(graph)).ok()?;
     let justification = super::explain::justify(
-        ontology,
+        &ontology,
         &super::explain::Goal::Inconsistent,
         &[],
         &operation.remaining(deadline),
         deadline,
     )
-    .ok()
-    .flatten();
-    let decode = |t: u64| {
-        tx.decode(nrese_engine::TermId::from_raw(t))
-            .map_or_else(|| format!("#{t}"), |term| term.to_string())
-    };
-    // The committer sees the axioms of the graphs it may read; the others are withheld,
-    // and counted (graph access: nothing from a graph a reader can't read reaches it).
-    let readable = |graph: &Option<String>| match reader.access() {
-        None => true,
-        Some(access) => match graph {
-            None => access.default_graph,
-            // As the source gives it: `<iri>`.
-            Some(graph) => access.allows(graph.trim_start_matches('<').trim_end_matches('>')),
-        },
-    };
-    let mut withheld = 0usize;
-    let mut evidence: Vec<nrese_reasoner::RejectEvidence> = Vec::new();
-    for axiom in justification
-        .iter()
-        .flat_map(|j| super::explain::explained(ontology, j, &decode))
-    {
-        for (graph, triples) in axiom.sources {
-            if !readable(&graph) {
-                withheld += triples.len();
-                continue;
-            }
-            evidence.extend(
-                triples
-                    .into_iter()
-                    .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
-                        role: "axiom",
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        origin: "asserted".to_owned(),
-                    }),
-            );
-        }
-    }
-    let axioms = justification.as_ref().map_or(0, |j| j.axioms.len());
-    let hidden = match withheld {
-        0 => String::new(),
-        n => format!(" ({n} of their statements are in graphs you can't read, not shown)"),
-    };
-    let explanation = match &justification {
-        Some(_) => format!("{axioms} axiom(s) have no model together{hidden}"),
-        None => "rejection evidence was not obtained within the operation's budget".to_owned(),
-    };
-    let reject = Some(format!(
-        "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms); \
-         {explanation}",
-        checked.engine,
-        checked.elapsed.as_millis()
-    ));
-    Gate {
-        checked,
-        reject,
+    .ok()??;
+    let reason = format!(
+        "the data is inconsistent under OWL 2 DL: these {} axiom(s) have no model together",
+        justification.axioms.len()
+    );
+    let evidence = axiom_evidence(view.tx(), &ontology, &justification);
+    Some(crate::mutation::evidence::shown(
+        reason,
+        CONSTRAINT,
+        String::new(),
         evidence,
+    ))
+}
+
+/// [`view_reason`] where the DL gate didn't run (an earlier gate rejected): on a budget of
+/// its own, the gate's (a commit that passes the earlier gates spends as much). `None`
+/// without the DL gate (`active`, the store's DL mode, and `dl`, its settings).
+///
+/// It reads and can't write: it is given no store, and the view's transaction only by
+/// shared reference ([`EvidenceView::tx`]), which can't commit it (`Transaction::commit`
+/// takes it by value). Its one lasting effect is the fixed vocabulary every gate run
+/// interns.
+pub(crate) fn view_reason_on_its_budget(
+    active: bool,
+    dl: &crate::DlConfig,
+    view: &EvidenceView<'_, '_>,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    memory: &nrese_exec::Envelope,
+) -> Option<Draft> {
+    if !active || dl.consistency == DlConsistency::Off {
+        return None;
     }
+    // The fixed vocabulary every gate run interns (`source::intern_vocabulary`).
+    source::intern_vocabulary(view.tx());
+    let deadline = Deadline::after(dl.timeout);
+    cancellable(&|| cancelled() || deadline.passed(), |cancel| {
+        view_reason(view, &budget_of(dl, Some(cancel), memory), deadline)
+    })
 }
 
 #[cfg(test)]
@@ -423,7 +503,9 @@ mod tests {
             assert!(!prepared.proves_consistency, "U1 clashes: the gate decides");
             assert!(prepared.ontology.is_none(), "the gate reads the ontology");
             let reader = crate::ReadScope::All;
-            check_commit(&store, &tx, &|| false, &mut prepared, &reader, memory).checked
+            let view = EvidenceView::new(&reader, &tx);
+            let then: &Then<'_> = &|_, _| crate::mutation::evidence::nothing_shown();
+            check_commit(&store, &tx, &|| false, &mut prepared, &view, then, memory).checked
         };
         // Guard: with room, the commit is consistent (Ann is a man or a woman).
         let roomy = check(&nrese_exec::Envelope::unlimited());
@@ -471,10 +553,11 @@ mod tests {
             } else {
                 Deadline::after(operation.timeout)
             };
+            let reader = crate::ReadScope::All;
             let gate = rejection(
-                &tx,
                 &ontology,
-                &crate::ReadScope::All,
+                &EvidenceView::new(&reader, &tx),
+                &|_, _| crate::mutation::evidence::nothing_shown(),
                 Checked {
                     verdict: Verdict::Inconsistent,
                     engine: "context-core",
@@ -484,15 +567,17 @@ mod tests {
                 deadline,
             );
             assert_eq!(gate.checked.verdict, Verdict::Inconsistent);
+            let reject = gate.reject.expect("rejected");
+            let evidence = reject.explanation.expect("explained").evidence;
             if stop == "running" {
                 assert!(
-                    !gate.evidence.is_empty(),
+                    !evidence.is_empty(),
                     "the fixture has an explanation with budget"
                 );
-                assert!(gate.reject.unwrap().contains("have no model together"));
+                assert!(reject.detail.contains("have no model together"));
             } else {
-                assert!(gate.evidence.is_empty());
-                assert!(gate.reject.unwrap().contains("not obtained"));
+                assert!(evidence.is_empty());
+                assert!(reject.detail.contains("not obtained"));
             }
         }
         drop(tx);
