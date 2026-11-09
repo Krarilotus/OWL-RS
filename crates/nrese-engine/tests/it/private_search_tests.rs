@@ -461,6 +461,175 @@ fn a_private_same_as_change_searches_its_own_classes() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
+/// Attack item 9, DICT2's condition (b) (sol-loop r1 F1): a private removal of a `sameAs`
+/// statement written representative first (`ex:rep owl:sameAs ex:alias`, `ex:rep` the
+/// smaller id), asserted or inferred, under expanded and canonical readers, the base's IRI
+/// corpus of the default graph warm. Its only IRI subject is `ex:rep`, so a derivation
+/// probing the touched terms alone would keep `ex:alias` (no longer in a class, no longer
+/// a subject): the private state walks instead. Each search equals an engine without the
+/// statement. Red by mutation (the `sameAs` check skipped).
+#[test]
+fn a_private_removal_of_a_same_as_written_representative_first_drops_the_alias() {
+    let same_as_iri = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let setup = |edge: bool, inferred: bool| {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        engine.set_corpus_tuning(CorpusTuning {
+            documents_per_probe: 1,
+            ..CorpusTuning::DEFAULT
+        });
+        let mut tx = engine.transaction();
+        // The representative interned first: the smaller id.
+        let rep = tx.intern(ex("rep").as_ref().into());
+        let alias = tx.intern(ex("alias").as_ref().into());
+        let same_as = tx.intern(same_as_iri.as_ref().into());
+        for subject in ["rep", "filler0", "filler1", "filler2"] {
+            tx.insert(Quad::new(ex(subject), ex("p"), ex("o"), GraphName::DefaultGraph).as_ref());
+        }
+        let triple = EncodedTriple {
+            subject: rep,
+            predicate: same_as,
+            object: alias,
+        };
+        if edge {
+            match inferred {
+                true => assert!(tx.insert_inferred(triple)),
+                false => assert!(tx.insert_encoded(triple.in_default_graph())),
+            }
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        (engine, triple)
+    };
+    let search = |snapshot: &Snapshot| {
+        let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+        let mut found = snapshot
+            .iri_search_in(
+                ReadModel::Materialised,
+                &scope,
+                &query("rep alias filler0", false, false),
+                None,
+            )
+            .map(|found| decoded(snapshot, &found))
+            .map_err(|e| format!("{e:?}"));
+        if let Ok(found) = &mut found {
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        found
+    };
+    let mut failed = Vec::new();
+    for inferred in [false, true] {
+        for canonical in [false, true] {
+            let read = |snapshot: &Snapshot| match canonical {
+                true => snapshot.with_canonical_equality(),
+                false => snapshot.clone(),
+            };
+            let (truth, _) = setup(false, inferred);
+            let want = search(&read(&truth.snapshot()));
+            let (engine, triple) = setup(true, inferred);
+            let published = engine.snapshot();
+            search(&read(&published)).expect("the published search");
+            let mut private = engine
+                .speculative_over(&published, Arc::new(nrese_exec::Budget::unlimited()))
+                .unwrap();
+            match inferred {
+                true => assert!(private.remove_inferred(triple)),
+                false => assert!(private.remove_encoded(triple.in_default_graph())),
+            }
+            let got = search(&read(&private.pending_snapshot().unwrap()));
+            if got != want || got.is_err() {
+                failed.push(format!(
+                    "inferred {inferred}, canonical {canonical}: {got:?} != {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// Sol-loop r1 B1: a private search's own index is charged as an upper bound of what it
+/// allocates. One own literal of 10,000 distinct words (about 60 KB of text; its index
+/// holds 10,000 words with their postings, well past 256 KiB) within a 256 KiB request is
+/// refused; within 64 MiB it is found. Red before the fix: the old estimate (three bytes a
+/// text byte) charged about 180 KB and answered.
+#[test]
+fn a_private_search_charges_its_own_index_before_it_builds_it() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    base(&engine);
+    let published = engine.snapshot();
+    let mut private = engine
+        .speculative_over(&published, Arc::new(nrese_exec::Budget::unlimited()))
+        .unwrap();
+    let text: Vec<String> = (0..10_000).map(|i| format!("w{i:04}")).collect();
+    let text = format!("alpha {}", text.join(" "));
+    private
+        .try_insert(label("big", &text, None).as_ref())
+        .unwrap();
+    let pending = private.pending_snapshot().unwrap();
+    let alpha = query("alpha", false, false);
+    let search = |limit: usize| {
+        let budget = Arc::new(nrese_exec::Budget::new(limit));
+        pending.text_search_in(
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            &alpha,
+            Some(&budget),
+        )
+    };
+    let small = search(256 << 10);
+    assert!(small.is_err(), "within 256 KiB: {small:?}");
+    let found = search(64 << 20).unwrap();
+    assert!(
+        decoded(&pending, &found).iter().any(|(t, _)| *t == text),
+        "within 64 MiB"
+    );
+}
+
+/// Sol-loop r1 B3: a private snapshot that reads within a request's budget (as a SPARQL
+/// query's does), with equality expansion and a cold vector corpus, searched by the global
+/// vector entry point within that same budget, answers: the search charges the budget
+/// through the snapshot's own reads, not through a bridge that holds all its room. Red
+/// before the fix: the bridge reserved the remainder and the expansion's reads were
+/// refused.
+#[test]
+fn a_private_global_vector_search_within_the_readers_budget_answers() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(ex("rep").as_ref().into());
+    let alias = tx.intern(ex("alias").as_ref().into());
+    let same_as = tx.intern(
+        NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+            .as_ref()
+            .into(),
+    );
+    assert!(tx.insert_inferred(EncodedTriple {
+        subject: alias,
+        predicate: same_as,
+        object: rep,
+    }));
+    tx.insert(label("rep", "[1, 0]", None).as_ref());
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let published = engine.snapshot();
+    let mut private = engine
+        .speculative_over(&published, Arc::new(nrese_exec::Budget::unlimited()))
+        .unwrap();
+    private
+        .try_insert(label("own", "[0, 1]", None).as_ref())
+        .unwrap();
+    let budget = Arc::new(nrese_exec::Budget::new(64 << 20));
+    let reader = private
+        .pending_snapshot()
+        .unwrap()
+        .reading_within(Arc::clone(&budget))
+        .unwrap();
+    let near = nrese_engine::VectorQuery::new(vec![0.0, 1.0], 2);
+    let found = reader.vector_search(&near, &|_| true, &budget);
+    assert!(found.is_ok(), "{:?}", found.as_ref().err());
+    let (hits, _) = found.unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(reader.read_refused().is_none());
+}
+
 /// A vector search's answer decoded: each hit's lexical form and distance, and the
 /// report's space and scan.
 type VectorAnswer = Result<(Vec<(String, f32)>, usize, usize), String>;
