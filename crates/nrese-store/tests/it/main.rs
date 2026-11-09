@@ -32,5 +32,6 @@ mod shacl_gate_tests;
 mod shacl_request_shapes_tests;
 mod store_service_tests;
 mod support_cap_tests;
+mod support_round_tests;
 mod user_rules_tests;
 mod write_path_tests;

@@ -12,11 +12,17 @@ use super::vocabulary::LocalVocabulary;
 
 mod attempted;
 mod stops;
+mod support_refusal;
 
 const EX: &str = "http://example.com/";
 
 /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
 /// blank nodes and `"…"^^<…>` literals (without spaces) are taken as they are.
+/// An unlimited working budget, for the support-set evaluations' derivations.
+fn scratch() -> std::sync::Arc<nrese_exec::Budget> {
+    std::sync::Arc::new(nrese_exec::Budget::unlimited())
+}
+
 fn load(vocabulary: &mut LocalVocabulary, text: &str) -> Vec<Triple> {
     let term = |v: &mut LocalVocabulary, t: &str| -> u64 {
         if t.starts_with("_:") || t.starts_with('"') {
@@ -2251,7 +2257,7 @@ fn check_supports(
     case: &str,
 ) -> [u64; 3] {
     use super::delta::{MemoryBase, Rules, program};
-    use super::graph_sets::{Annotation, Limits, closure_within, support_sets};
+    use super::graph_sets::{Annotation, InGraphs, Limits, closure_within, support_sets};
     let compiled = Rules {
         rules,
         lists: Some(lists),
@@ -2274,13 +2280,13 @@ fn check_supports(
         .filter(|f| asserted.binary_search(f).is_err())
         .collect();
     let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
-    let graphs_of = |fact: Triple| -> Vec<u32> {
-        placed
-            .iter()
-            .filter(|&&(f, _)| f == fact)
-            .map(|&(_, g)| g)
-            .collect()
+    let pairs = {
+        let mut pairs = placed.to_vec();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
     };
+    let graphs_of = InGraphs(&pairs);
     let text = |t: &Triple| {
         let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
         format!("{s} {p} {o}")
@@ -2291,12 +2297,20 @@ fn check_supports(
         &[],
         &graphs_of,
         usize::MAX,
-        Limits::UNLIMITED,
+        Limits::unlimited(&scratch()),
     )
     .unwrap();
     let mut counts = [0u64; 3];
     for &cap in caps {
-        let sets = support_sets(&full, &ground, &[], &graphs_of, cap, Limits::UNLIMITED).unwrap();
+        let sets = support_sets(
+            &full,
+            &ground,
+            &[],
+            &graphs_of,
+            cap,
+            Limits::unlimited(&scratch()),
+        )
+        .unwrap();
         for (fact, kept) in &sets {
             match kept.truncated {
                 true => counts[1] += 1,
@@ -2325,7 +2339,7 @@ fn check_supports(
             });
             let within = undecided.then(|| {
                 let read = |fact: Triple| data.binary_search(&fact).is_ok();
-                closure_within(&full, &ground, &[], &read, Limits::UNLIMITED).unwrap()
+                closure_within(&full, &ground, &[], &read, Limits::unlimited(&scratch())).unwrap()
             });
             let visible: Vec<Triple> = full
                 .iter()
@@ -2479,7 +2493,8 @@ pub(super) fn support_sets_against_closures() {
 pub(super) fn support_set_updates_against_recomputation() {
     use super::delta::{MemoryBase, Rules, program};
     use super::graph_sets::{
-        Annotation, Change, Limits, closure_within, support_sets, update_support_sets,
+        Annotation, Change, InGraphs, Limits, Previous, Sets, closure_within, initial_sets,
+        support_sets, update_support_sets,
     };
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
@@ -2591,13 +2606,21 @@ pub(super) fn support_set_updates_against_recomputation() {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        // Each placement as the evaluations read it: sorted, each pair once.
+        let asserted_in = |placed: &[(Triple, u32)]| {
+            let mut pairs = placed.to_vec();
+            pairs.sort_unstable();
+            pairs.dedup();
+            pairs
+        };
+        let (placed_in, old_placed_in) = (asserted_in(&placed), asserted_in(&old_placed));
         let expected = support_sets(
             &after,
             &ground_after,
             &[],
-            &|f| graphs_in(&placed, f),
+            &InGraphs(&placed_in),
             usize::MAX,
-            Limits::UNLIMITED,
+            Limits::unlimited(&scratch()),
         )
         .unwrap();
         let mut served = true;
@@ -2606,31 +2629,57 @@ pub(super) fn support_set_updates_against_recomputation() {
                 &before,
                 &ground_before,
                 &[],
-                &|f| graphs_in(&old_placed, f),
+                &InGraphs(&old_placed_in),
                 cap,
-                Limits::UNLIMITED,
+                Limits::unlimited(&scratch()),
             )
             .unwrap();
             let previous = |f: Triple| sets_before.get(&f).cloned().unwrap_or_default();
-            let change = Change {
-                source: &source,
-                in_closure: &|f| after.binary_search(&f).is_ok(),
-                touched: &touched,
-                previous: &previous,
-                limit: usize::MAX,
-            };
-            let Some(update) = update_support_sets(
-                &change,
-                &ground_after,
-                &[],
-                &|f| graphs_in(&placed, f),
-                cap,
-                Limits::UNLIMITED,
-            )
-            .unwrap() else {
+            // Every fact's sets lent; then as a store keeps them (`nrese-store`
+            // `SupportSets::retain`): a fact whose sets are those it starts with keeps none,
+            // and the update makes them (`Previous::Own`). Both updates are the same.
+            let mut updates = Vec::with_capacity(2);
+            for own_made in [false, true] {
+                let previous = |f: Triple| match sets_before.get(&f) {
+                    Some(sets)
+                        if own_made
+                            && *sets == initial_sets(graphs_in(&old_placed, f), false, cap) =>
+                    {
+                        Previous::Own
+                    }
+                    Some(sets) => Previous::Sets(Sets::of(sets)),
+                    None => Previous::Sets(Sets::NONE),
+                };
+                let change = Change {
+                    source: &source,
+                    in_closure: &|f| after.binary_search(&f).is_ok(),
+                    touched: &touched,
+                    previous: &previous,
+                    limit: usize::MAX,
+                };
+                updates.push(
+                    update_support_sets(
+                        &change,
+                        &ground_after,
+                        &[],
+                        &InGraphs(&placed_in),
+                        cap,
+                        Limits::unlimited(&scratch()),
+                    )
+                    .unwrap(),
+                );
+            }
+            let own_made = updates.pop().expect("two updates");
+            let Some(update) = updates.pop().expect("two updates") else {
                 served = false;
                 break;
             };
+            assert_eq!(
+                own_made.as_ref(),
+                Some(&update),
+                "case {case}, cap {cap}: own sets made, not lent, change the update\nplaced:\n{}",
+                shown()
+            );
             let now = |f: Triple| update.get(&f).cloned().unwrap_or_else(|| previous(f));
             for &fact in &after {
                 let (got, want) = (now(fact), expected.get(&fact).cloned().unwrap_or_default());
@@ -2664,8 +2713,14 @@ pub(super) fn support_set_updates_against_recomputation() {
                 data.dedup();
                 let fresh = closure(&data);
                 let read = |fact: Triple| data.binary_search(&fact).is_ok();
-                let within =
-                    closure_within(&after, &ground_after, &[], &read, Limits::UNLIMITED).unwrap();
+                let within = closure_within(
+                    &after,
+                    &ground_after,
+                    &[],
+                    &read,
+                    Limits::unlimited(&scratch()),
+                )
+                .unwrap();
                 let seen: Vec<Triple> = after
                     .iter()
                     .copied()

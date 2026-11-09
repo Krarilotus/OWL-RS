@@ -15,13 +15,18 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 | code | path -> its git object id at that commit: what a cell can execute in the repository |
 |  | (code_paths(): benches/ by entry less RESULTS, scripts, rust-toolchain.toml, .cargo; and |
 |  | BUILD_PATHS for a compiled NRESE or harness); coarse, exact: any change re-qualifies it |
-| images | image -> the id its containers ran, from the run's pin map (ns.pinned) |
-| build | NRESE's server and the timing harness: built in this run from `commit`, or unknown |
-| settings | the suite settings in force (manifest `settings`) |
+| images | image -> `id`, the one its containers ran (the run's pin map, ns.pinned), and `source`, |
+|  | read off that id, never off the tag: "built from benches/CONTEXT@TREE" (its build label), |
+|  | "pulled, pinned DIGEST" (the id holds its tag's pin, images.toml), else unknown, with why |
+| build | NRESE's server and the timing harness: built in this run from `commit` (its `dirty`), with |
+|  | `target_cpu`, inherited `rustflags_env`, and in Docker `rust_image` and `rustflags`; or unknown |
+| settings | the suite settings in force that change a measurement (manifest `settings` less |
+|  | OPERATIONAL_SETTINGS: where a run keeps its files) |
+| protocol | the attempt's own (manifest `protocol`): runs, query runs, cache modes, order, limits |
 | data | input -> the SHA-256 of its bytes as the cell read them |
-| outcome | its own rows' outcome (summary.Pair.outcome()) |
-| answers | its worst answer verdict this attempt (answers.PRECEDENCE); `not captured` without |
-|  | --answers full; `pending` until the run wrote its answers |
+| outcome | its own rows' outcome (summary.Pair.outcome(): a table, its verdict in `outcome`) |
+| answers | `worst`, `verdicts` (count each) and `qualified` (every query ok or deviates) of this |
+|  | attempt; `not captured` without --answers full; `pending` until the run wrote its answers |
 
 What a cell can't evidence is `{unknown = "why"}`, never an empty map: a driver or kit plan's
 inputs, images and settings (they are its child's), an input outside the datasets, an external
