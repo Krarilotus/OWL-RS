@@ -203,6 +203,7 @@ impl Durable {
         crate::engine::spill::remove_leftovers(root)?;
         let clock = std::time::Instant::now();
         let loaded = checkpoint::load_latest(root, dictionary, config.verify_on_open)?;
+        let checkpoint_path = loaded.as_ref().map(|loaded| loaded.path.clone());
         tracing::debug!(
             seconds = clock.elapsed().as_secs_f64(),
             "recovery: checkpoint read"
@@ -487,7 +488,7 @@ impl Durable {
         }
         // The store's own directories keyed as the holders are (one directory, one key); a
         // made root has no holders to meet.
-        let (holders, own) = match named {
+        let (mut holders, own) = match named {
             Some(named) => {
                 let own = vec![
                     (wal_dir.clone(), named.key(wal_dir.file_name())),
@@ -503,6 +504,15 @@ impl Durable {
                 ],
             ),
         };
+        // The authoritative files reached through links (DUR-5, fix check r2 on DUR-4, R2-F1):
+        // the checkpoint loaded, each segment replayed, and the newest segment, which
+        // `Wal::open` appends to (a covered one included). A file that is a link has its
+        // target's chain named with the found levels; a regular file adds nothing.
+        let newest = wal::list_segments(&wal_dir)?.pop().map(|(_, path)| path);
+        let replayed_files = replayed.iter().map(|path| &**path);
+        for file in checkpoint_path.iter().chain(replayed_files).chain(&newest) {
+            holders.extend(place::file_holders(file)?);
+        }
         let mut pending = wal::PendingNames::new(holders, own);
         if changed {
             pending.settle()?;
