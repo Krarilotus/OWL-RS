@@ -811,3 +811,41 @@ fn a_pending_snapshot_after_a_removal_refused_part_way_holds_its_removals() {
     assert!(tx.len() < 1_000, "refused part way: {:?}", tx.pending());
     assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), tx.len());
 }
+
+/// The kept pending snapshot after a write refused before its first change (V1-engine review
+/// r1, R3; the master's decision of 18:12). A matching removal refused before it removed
+/// anything changed nothing, so the kept snapshot still holds.
+///
+/// - Input: ten committed statements; a private transaction over them, its pending snapshot
+///   taken (so kept); its budget then filled, the removal of all of them refused before the
+///   first, and the budget released.
+/// - Expected: `MemoryLimit` with nothing pending; the next pending snapshot for the same
+///   reader budget is the kept one (its identity).
+#[test]
+fn a_pending_snapshot_is_kept_after_a_removal_refused_before_its_first() {
+    let engine = engine();
+    let mut load = engine.transaction();
+    for n in 0..10 {
+        load.insert(quad("a", "p", literal(&n.to_string())).as_ref());
+    }
+    load.commit().expect("commit");
+    let charged = Arc::new(Budget::new(1 << 20));
+    let mut tx = engine
+        .speculative_over(&engine.snapshot(), Arc::clone(&charged))
+        .unwrap();
+    let reader = budget();
+    let kept = tx.pending_snapshot_within(&reader).unwrap().identity();
+    let room = charged.remaining();
+    charged.charge(room).unwrap();
+    let refused = tx.remove_matching(&QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+    charged.release(room);
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "{refused:?}"
+    );
+    assert_eq!(tx.pending(), (0, 0), "refused before the first removal");
+    assert_eq!(
+        tx.pending_snapshot_within(&reader).unwrap().identity(),
+        kept
+    );
+}
