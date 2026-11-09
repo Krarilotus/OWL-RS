@@ -116,8 +116,12 @@ impl<'e> Transaction<'e> {
         budget: &std::sync::Arc<nrese_exec::Budget>,
     ) -> EngineResult<Snapshot> {
         let generation = self.pending.generation();
+        // Kept only while nothing it shows changed: no write (the generation), no term interned
+        // since (its vocabulary ends at the dictionary's length then: sol-loop r1, S2), the
+        // same budget.
         if let Some(kept) = self.pending.memo().lock().as_ref()
             && kept.generation == generation
+            && kept.snapshot.version().dictionary_len == self.engine.shared.dictionary.len()
             && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
         {
             return Ok(kept.snapshot.clone());
