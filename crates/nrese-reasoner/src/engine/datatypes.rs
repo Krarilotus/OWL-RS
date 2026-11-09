@@ -21,18 +21,11 @@
 //! beyond what the owner represents (`LiteralError::Unsupported`).
 
 use crate::ir::{Triple, Violations};
-use nrese_engine::{TermId, TermKind};
+use nrese_engine::TermId;
 use nrese_exec::Budget;
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::owl::{Datatype, LiteralError, Value, ValueSet};
 use std::sync::Arc;
-
-fn is_literal(id: u64) -> bool {
-    !matches!(
-        TermId::from_raw(id).kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
-}
 
 /// What a literal is under OWL 2's datatype map.
 #[derive(Debug, PartialEq)]
@@ -87,7 +80,7 @@ pub(crate) fn violations(
         if !out.complete() {
             break;
         }
-        if !is_literal(s) {
+        if !TermId::from_raw(s).kind().is_literal() {
             continue;
         }
         if p == rdf_type {
@@ -99,7 +92,7 @@ pub(crate) fn violations(
             {
                 out.record(group, [s, o]);
             }
-        } else if Some(p) == same_as && is_literal(o) && s < o {
+        } else if Some(p) == same_as && TermId::from_raw(o).kind().is_literal() && s < o {
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
                 continue;
             };
