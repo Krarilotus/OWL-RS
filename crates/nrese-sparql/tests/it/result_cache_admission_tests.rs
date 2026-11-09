@@ -561,3 +561,62 @@ fn canonical_and_expanded_answers_keep_their_own_bytes_in_both_orders() {
         assert!(cache.stats().hits > 0, "{:?}", cache.stats());
     }
 }
+
+/// Sol-loop round 2, S2: a canonical answer whose view the budgets refuse is never another
+/// reading's cached bytes.
+///
+/// - Input: `Alias owl:sameAs Rep` inferred, the store reading equality classes, `Rep p o`
+///   and a statement in a graph naming `Alias`; the store's canonical-view budget and the
+///   request's envelope 1 byte; `?x p o` answered expanded and offered to the cache, then
+///   asked canonically.
+/// - Expected: the canonical request finds no cached bytes (canonical answers there fail
+///   with their memory limit; they don't read the expanded answer).
+#[test]
+fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(ex("Rep").as_ref().into());
+    let alias = tx.intern(ex("Alias").as_ref().into());
+    let same_as = nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let same_as = tx.intern(same_as.as_ref().into());
+    tx.insert(quad("Rep", "p", "o").as_ref());
+    let named = Quad::new(
+        ex("Alias"),
+        ex("in"),
+        ex("z"),
+        GraphName::NamedNode(ex("g")),
+    );
+    tx.insert(named.as_ref());
+    tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    engine.set_canonical_view_budget(Arc::new(nrese_exec::Budget::new(1)));
+    let snapshot = engine.snapshot();
+    let text = format!("SELECT ?x WHERE {{ ?x <{EX}p> <{EX}o> }}");
+    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+    let expanded = QueryOptions {
+        equality_early_expansion: true,
+        result_cache: Some(Arc::clone(&cache)),
+        ..QueryOptions::default()
+    };
+    tsv_through_the_cache(&snapshot, &text, &expanded);
+    assert!(matches!(
+        cached_output(&snapshot, &parse(&text), &expanded, TSV, ""),
+        CachedOutput::Hit(_)
+    ));
+    let canonical = QueryOptions {
+        equality_canonical: true,
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(1), None),
+            ..nrese_sparql::Resources::default()
+        },
+        ..expanded
+    };
+    assert!(
+        !matches!(
+            cached_output(&snapshot, &parse(&text), &canonical, TSV, ""),
+            CachedOutput::Hit(_)
+        ),
+        "a canonical request read the expanded answer's bytes"
+    );
+}
