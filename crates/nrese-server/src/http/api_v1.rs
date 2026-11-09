@@ -285,7 +285,8 @@ fn add(
 #[utoipa::path(post, path = "/api/v1/repositories/{id}/sessions/{session}/update", tag = "sessions",
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id")),
     request_body(content = String, content_type = "application/sparql-update"),
-    responses((status = 204, description = "Collected for the commit"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
+    responses((status = 204, description = "Collected for the commit"), (status = 404, description = "No such session, or it expired", body = crate::http::openapi::Problem),
+        (status = 503, description = "No room in the memory queries and sessions share; the operations collected so far are kept", body = crate::http::openapi::Problem)))]
 /// A SPARQL update (as the update endpoint takes it), applied at the commit.
 pub async fn session_update(
     authenticated: crate::auth::Authenticated,
@@ -309,7 +310,8 @@ pub async fn session_update(
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id"), ("graph" = Option<String>, Query, description = "The graph (an IRI); else the graphs the data names")),
     request_body(content = String, description = "RDF in any format NRESE reads (`Content-Type`)"),
     responses((status = 204, description = "Collected: added (`POST`) or removed (`DELETE`) at the commit"),
-        (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
+        (status = 404, description = "No such session, or it expired", body = crate::http::openapi::Problem),
+        (status = 503, description = "No room in the memory queries and sessions share; the operations collected so far are kept", body = crate::http::openapi::Problem)))]
 /// RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`
 /// if given (an IRI), else into the graphs the data names.
 pub async fn session_data(

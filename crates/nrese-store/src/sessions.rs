@@ -373,14 +373,31 @@ mod tests {
 
     /// An ADD of a `bytes`-byte payload.
     fn body(bytes: usize) -> Vec<StatementOp> {
+        filled(b'#', bytes)
+    }
+
+    /// An ADD of `bytes` bytes, each `byte`.
+    fn filled(byte: u8, bytes: usize) -> Vec<StatementOp> {
         vec![StatementOp::Add {
             data: crate::RdfPayload {
-                payload: vec![b'#'; bytes],
+                payload: vec![byte; bytes],
                 format: crate::query::GraphResultFormat::Turtle,
                 base_iri: None,
             },
             contexts: Vec::new(),
         }]
+    }
+
+    /// Each ADD's payload byte, in order (`?` where its payload isn't one byte repeated).
+    fn bytes_of(ops: &[StatementOp]) -> Vec<u8> {
+        let byte = |op: &StatementOp| match op {
+            StatementOp::Add { data, .. } => match data.payload.split_first() {
+                Some((&first, rest)) if rest.iter().all(|&b| b == first) => first,
+                _ => b'?',
+            },
+            _ => b'?',
+        };
+        ops.iter().map(byte).collect()
     }
 
     /// Session `id`, untouched for longer than `sessions` keeps one.
@@ -398,14 +415,17 @@ mod tests {
         let kept = Arc::new(Budget::new(100_000));
         let sessions = Sessions::within(Arc::clone(&kept), SESSION_IDLE);
         let id = sessions.begin(None).unwrap();
-        assert!(sessions.add(&id, None, body(20_000)).unwrap());
+        assert!(sessions.add(&id, None, filled(b'a', 20_000)).unwrap());
         let one = kept.used();
         assert!(one >= 20_000, "{one} charged for a 20 kB body");
-        // A read holds the operations; an add meanwhile copies them, charged.
+        // A read holds the operations; an add meanwhile copies them, charged: the read
+        // keeps what it read, the session has both in order.
         let read = sessions.pending(&id, None).unwrap();
-        assert!(sessions.add(&id, None, body(20_000)).unwrap());
+        assert!(sessions.add(&id, None, filled(b'b', 20_000)).unwrap());
         let both = kept.used();
         assert!(both >= one + 40_000, "{both} with a read held");
+        assert_eq!(bytes_of(&read), b"a");
+        assert_eq!(bytes_of(&sessions.pending(&id, None).unwrap()), b"ab");
         drop(read);
         let two = kept.used();
         assert!((40_000..one + 40_000).contains(&two), "{two} after");

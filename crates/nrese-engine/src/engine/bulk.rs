@@ -312,6 +312,7 @@ impl<'e> BulkLoad<'e> {
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
                     canonical: Default::default(),
+                    own: Default::default(),
                 };
                 let stamp = Stamp {
                     previous: current.committed_micros,
@@ -369,6 +370,7 @@ impl<'e> BulkLoad<'e> {
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
                     canonical: Default::default(),
+                    own: Default::default(),
                 };
                 // It keeps what was there: of unknown time if that is.
                 let stamp = Stamp {
@@ -538,19 +540,27 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let Some(durable) = &shared.durable else {
         next.committed_micros = stamp.take(shared).0;
         let _compaction = shared.versions.compaction_slot.lock();
-        shared.versions.install(Arc::new(next));
+        shared.versions.install(next);
         return Ok(());
     };
-    let next = Arc::new(next);
-    let revision = next.revision;
+    // The checkpoint image's version: an unpublished snapshot's, never installed. The one
+    // installed is made from it as a value, with slots of its own (empty).
+    let imaged = Arc::new(next);
+    let revision = imaged.revision;
     let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
     let image = Snapshot::new(
-        Arc::clone(&next),
+        Arc::clone(&imaged),
         Arc::clone(&shared.dictionary),
         Arc::clone(&shared.statistics),
         None,
         Arc::clone(&shared.views.read()),
     );
+    #[cfg(test)]
+    crate::durability::fault::IMAGE_READER.with_borrow_mut(|reader| {
+        if let Some(read) = reader {
+            read(&image);
+        }
+    });
     let mut committed_micros = None;
     let path = commit_image(durable, revision, || {
         checkpoint::write_stamped(
@@ -576,25 +586,29 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     {
         Some(Ok((dictionary, [asserted, inferred]))) => {
             base = Some(dictionary);
-            Arc::new(Version {
+            Version {
                 // The same statements, mapped from the checkpoint.
-                content: next.content,
-                asserted_content: next.asserted_content,
+                content: imaged.content,
+                asserted_content: imaged.asserted_content,
                 asserted,
                 inferred,
-                equality: Arc::clone(&next.equality),
+                equality: Arc::clone(&imaged.equality),
                 revision,
                 committed_micros,
-                dictionary_len: next.dictionary_len,
+                dictionary_len: imaged.dictionary_len,
                 canonical: Default::default(),
-            })
+                own: Default::default(),
+            }
         }
         Some(Err(error)) => {
             tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
-            Arc::new(next.with_time(committed_micros))
+            imaged.with_time(committed_micros)
         }
-        None => Arc::new(next.with_time(committed_micros)),
+        None => imaged.with_time(committed_micros),
     };
+    // What the image's readers kept in its version's own slots goes with it, before the
+    // slots: nothing of it outlives the load.
+    drop(imaged);
     // The checkpoint covers every logged revision: later commits go to the segment
     // `commit_image` started, and all older segments can go.
     let compaction = shared.versions.compaction_slot.lock();
@@ -641,6 +655,7 @@ fn publish_streamed(
             dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         };
         let len = next.asserted.len();
         publish(engine, Next::Built(next, stamp))?;
@@ -693,7 +708,7 @@ fn publish_streamed(
             return Err(EngineError::CommitUnsettled { revision });
         }
     };
-    let next = Arc::new(Version {
+    let next = Version {
         content: super::Content::fresh(),
         // New: always sound for a cache keyed by it (a rescan), kept only where certain.
         asserted_content: super::AssertedIdentity::fresh(),
@@ -704,7 +719,8 @@ fn publish_streamed(
         dictionary_len,
         equality: Default::default(),
         canonical: Default::default(),
-    });
+        own: Default::default(),
+    };
     let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
@@ -881,6 +897,7 @@ impl<'e> Rematerialisation<'e> {
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         };
         // It keeps the asserted stack: of unknown time if that is.
         let stamp = Stamp {

@@ -143,18 +143,19 @@ pub(crate) fn read_open_segment(file: &mut File, path: &Path) -> EngineResult<Se
     })
 }
 
-/// Cuts a torn tail off a segment and syncs the result.
-pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<()> {
+/// Cuts a torn tail off a segment and syncs the result. Whether the segment is still there: one
+/// left without even its header is removed.
+pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<bool> {
     let file = OpenOptions::new().write(true).open(path)?;
     if valid_len < SEGMENT_MAGIC.len() as u64 {
         file.set_len(0)?;
         drop(file);
         fs::remove_file(path)?;
-        return Ok(());
+        return Ok(false);
     }
     file.set_len(valid_len)?;
     file.sync_all()?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) struct Wal {
