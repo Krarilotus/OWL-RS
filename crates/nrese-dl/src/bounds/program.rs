@@ -290,12 +290,16 @@ pub struct Program {
 pub enum RenderError {
     /// A rule or fact names a blank node, which N3 reads as a variable.
     BlankNode { rule: String },
+    /// A rule or fact names one of U1's own terms as it is (`crate::internal`), which is
+    /// no IRI: the caller's `term` writes each as an IRI its data doesn't hold.
+    OwnTerm { rule: String },
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BlankNode { rule } => write!(f, "{rule} names a blank node"),
+            Self::OwnTerm { rule } => write!(f, "{rule} names one of U1's own terms unwritten"),
         }
     }
 }
@@ -382,7 +386,9 @@ impl Program {
 
     /// Notation3, the store's user-rule language: one `{ body } => { head } .` per rule,
     /// a comment with its provenance before it, and the facts as triples. `term` gives a
-    /// term's N-Triples form (`<iri>`, `"lexical"^^<datatype>`). The reasoner names N3
+    /// term's N-Triples form (`<iri>`, `"lexical"^^<datatype>`); U1's own terms
+    /// ([`Program::is_internal`]) have no IRI, so `term` names each with an IRI the data
+    /// the text is run over doesn't hold ([`RenderError::OwnTerm`] if not). The reasoner names N3
     /// rules by position, so its equality module doesn't replace the copying rules here:
     /// the closure is the same, only slower.
     pub fn to_n3(&self, term: &dyn Fn(Term) -> String) -> Result<String, RenderError> {
@@ -395,6 +401,12 @@ impl Program {
                     let text = term(*t);
                     if blank(&text) {
                         return Err(RenderError::BlankNode {
+                            rule: rule.to_owned(),
+                        });
+                    }
+                    let own = text.strip_prefix('<').is_some_and(crate::internal::is_made);
+                    if own {
+                        return Err(RenderError::OwnTerm {
                             rule: rule.to_owned(),
                         });
                     }

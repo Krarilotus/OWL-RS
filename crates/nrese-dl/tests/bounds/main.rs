@@ -272,10 +272,27 @@ fn pagoda_running_example_gives_the_papers_bound() {
 #[test]
 fn the_n3_form_gives_the_same_closure() {
     let mut e = example(KEX);
+    // U1's own terms have no IRI: written as they are, the text would be no N3.
+    let raw = e.program.to_n3(&|t| e.table.text(t));
+    assert!(
+        matches!(raw, Err(nrese_dl::bounds::RenderError::OwnTerm { .. })),
+        "{raw:?}"
+    );
+    // Written as IRIs KEX doesn't hold, and read back as those terms.
+    let own = |t: u64| format!("urn:test:own:{t}");
     let text = {
-        let table = &e.table;
-        e.program.to_n3(&|t| table.text(t)).expect("no blank nodes")
+        let (table, program) = (&e.table, &e.program);
+        let term = |t| match program.is_internal(t) {
+            true => format!("<{}>", own(t)),
+            false => table.text(t),
+        };
+        e.program.to_n3(&term).expect("no blank nodes")
     };
+    for t in 0..e.table.terms.len() as u64 {
+        if e.program.is_internal(t) {
+            e.table.alias(&own(t), t);
+        }
+    }
     let n3 = nrese_reasoner::n3::compile("u1", &text, &mut e.table).expect("U1 is valid N3");
     let mut input = e.input.clone();
     input.extend(n3.facts);
