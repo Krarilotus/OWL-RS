@@ -30,10 +30,6 @@ impl Vocabulary {
     /// The contract's b(V) (§4.1): ids below it are the dictionary's, the same in every
     /// vocabulary of that dictionary bounded at or past it. `bound` for shared, `start` for
     /// private.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "alignment by value reads it in package 5")
-    )]
     pub(crate) fn shared_bound(&self, bound: u64) -> u64 {
         match self {
             Self::Shared(_) => bound,

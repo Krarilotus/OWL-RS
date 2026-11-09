@@ -1210,6 +1210,13 @@ impl Snapshot {
         self.vocabulary.is_private()
     }
 
+    /// The dictionary lifecycle contract's b(V) (§4.1): a published or shared snapshot's
+    /// dictionary end, a private one's overlay start. Every id below it means the same term
+    /// in every snapshot of this engine whose bound is it or more.
+    pub fn shared_bound(&self) -> u64 {
+        self.vocabulary.shared_bound(self.version.dictionary_len)
+    }
+
     /// Dictionary entries visible to this snapshot.
     pub(crate) fn dictionary_len(&self) -> u64 {
         self.version.dictionary_len
