@@ -2055,48 +2055,8 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
             self.assertIn("## Against main", text)
 
 
-class Tradeoffs(unittest.TestCase):
-    """Only an owner-approved trade-off accepts a loss (benches/release-tradeoffs.toml)."""
-
-    def rounds(self, tradeoffs=()):
-        def records_of(side, n):
-            cand = side == "cand"
-            return [record(samples={"q01": [10.0, 10.1, 9.9],
-                                    "q06": [v * (worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
-                    record(case="kernel-intersect",
-                           samples={"triangles": [v * (worse(0.36, n) if cand else 1) for v in [140.0, 140.5]]})]
-        # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
-        # 0.0083), and which runs a side got in the block's order decided it.
-        return [run_gate(passes(records_of, blocks=3), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
-                for k in (0, 1)]
-
-    def entry(self, **changes):
-        return {"case": "lab-olympics", "dimension": "time/q06", "max_ratio": 1.12, "approved": "2026-10-20",
-                "by": "the owner", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
-                "pays_with": {"case": "kernel-intersect", "dimension": "time/triangles"}, **changes}
-
-    def verdict(self, *entries):
-        return gate_module.verdict(self.rounds(entries), {"passed": True, "errors": []},
-                                   {"passed": True, "errors": [], "guards": 81})
-
-    def test_a_confirmed_loss_blocks_unless_an_approved_trade_off_with_its_win_covers_it(self):
-        self.assertFalse(self.verdict()[0])
-        passed, text = self.verdict(self.entry())
-        self.assertTrue(passed, text)
-        self.assertIn("accepted trade-off", text)
-        for entry in (self.entry(max_ratio=1.05), self.entry(pays_with={"case": "lab-olympics", "dimension": "time/q01"}),
-                      self.entry(dimension="time/q01")):
-            self.assertFalse(self.verdict(entry)[0], entry)
-
-    def test_the_list_starts_empty_and_a_malformed_entry_is_refused(self):
-        entries, errors = gate_module.load_tradeoffs(ROOT / "benches/release-tradeoffs.toml")
-        self.assertEqual((entries, errors), ([], []))
-        with tempfile.TemporaryDirectory() as tmp:
-            bad = Path(tmp) / "t.toml"
-            bad.write_text('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n', encoding="utf-8")
-            entries, errors = gate_module.load_tradeoffs(bad)
-            self.assertEqual(entries, [])
-            self.assertIn("missing approved, by, pays_with, reason", errors[0])
+# The owner-approved trade-offs' tests: test_release_acceptance.py's Tradeoffs (the verdict reads
+# them at the candidate's tree).
 
 
 @patch.object(gate_module, "harness_tables", LOCAL_TABLES, create=True)  # fake harnesses: this tree's metadata
