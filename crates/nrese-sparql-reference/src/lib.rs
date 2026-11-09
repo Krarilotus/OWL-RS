@@ -1267,12 +1267,14 @@ fn merge(dataset: &Dataset, graphs: Option<&[GraphName]>) -> Graph {
 
 /// Blank nodes of a pattern are variables no query can name (§18.2.1): they join where
 /// the parser's translation shares them (a path sequence becomes two paths through one),
-/// and no projection lists them.
+/// and no projection lists them. Each is named as it is written, `_:label`: a colon is in
+/// no SPARQL `VARNAME`, so no variable of the query is spelt like one. (The executor's own
+/// made names are `nrese_sparql_syntax::internal`'s; this evaluator keeps its own.)
 fn blank_variable(b: &nrese_sparql_syntax::term::BlankNode) -> Variable {
     Variable::new_unchecked(format!("{BLANK}{}", b.as_str()))
 }
 
-const BLANK: &str = "__blank_";
+const BLANK: &str = "_:";
 
 fn bind_term(
     pattern: &TermPattern,

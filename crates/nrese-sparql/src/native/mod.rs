@@ -91,6 +91,7 @@ use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
+use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::Integer;
 use numeric::Numeric;
@@ -228,12 +229,12 @@ fn run(
         });
     let pattern = match &pre_bound {
         Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
+            // A blank node is put in as a made constant that stands for the node.
             for term in values.values() {
                 if let Term::BlankNode(b) = term
                     && let Some(id) = snapshot.lookup(term.as_ref())
                 {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
+                    ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
                 }
             }
             substitute::Values { terms: values }.top(&pattern)
@@ -1462,8 +1463,8 @@ impl<'a> Context<'a> {
         ctx
     }
 
-    /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
-    /// blank node.
+    /// The id of a constant of a pattern: a made constant ([`substitute`]) stands for the
+    /// term registered for it, every IRI for itself.
     /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
     /// ([`Snapshot::lookup_charged`]).
     fn lookup_const_charged(
@@ -1472,7 +1473,7 @@ impl<'a> Context<'a> {
         held: &mut Reservation<&nrese_exec::Budget>,
     ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return Ok(self.lookup_const(term));
         }
@@ -1482,7 +1483,7 @@ impl<'a> Context<'a> {
 
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return self
                 .aliases
@@ -2248,9 +2249,7 @@ impl<'a> Context<'a> {
     fn path_end(&self, term: &TermPattern) -> Result<Variable, u64> {
         match term {
             TermPattern::Variable(v) => Ok(v.clone()),
-            TermPattern::BlankNode(b) => {
-                Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-            }
+            TermPattern::BlankNode(b) => Ok(internal::blank_variable(b)),
             TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
             TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
             // A triple term at a path's end matches nothing a path reaches.
@@ -3563,8 +3562,8 @@ impl<'a> Context<'a> {
         graph_tests::checkpoint();
         self.check()?;
         let (predicate, object) = (
-            Variable::new_unchecked("described predicate"),
-            Variable::new_unchecked("described object"),
+            internal::variable("described", "predicate"),
+            internal::variable("described", "object"),
         );
         let Some(graph) = self.graph_slot() else {
             return Ok(Vec::new());
@@ -3641,9 +3640,7 @@ impl<'a> Context<'a> {
         let slot = |term: &TermPattern| -> Option<Slot> {
             Some(match term {
                 TermPattern::Variable(v) => Slot::Var(v.clone()),
-                TermPattern::BlankNode(b) => {
-                    Slot::Var(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-                }
+                TermPattern::BlankNode(b) => Slot::Var(internal::blank_variable(b)),
                 TermPattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
                 TermPattern::Literal(l) => Slot::Const(self.lookup_const(l.as_ref().into())?),
                 TermPattern::Triple(t) => {
@@ -5882,9 +5879,7 @@ fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
     let term = |t: &TermPattern| match t {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(internal::blank_variable(b)),
         _ => None,
     };
     let predicate = match &triple.predicate {

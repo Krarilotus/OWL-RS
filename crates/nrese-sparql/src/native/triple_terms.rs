@@ -24,15 +24,11 @@
 
 use std::collections::HashSet;
 
-use nrese_rdf::{BlankNode, Variable};
+use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
+use nrese_sparql_syntax::internal::{self, blank_variable};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::visit::Node;
-
-/// The variable a blank node of a pattern stands for in the executor.
-pub(super) fn blank_variable(b: &BlankNode) -> Variable {
-    Variable::new_unchecked(format!("_bnode_{}", b.as_str()))
-}
 
 /// Whether a triple term pattern holds no variable and no blank node.
 pub(super) fn ground(t: &TriplePattern) -> bool {
@@ -71,7 +67,7 @@ struct Rewriter {
 
 impl Rewriter {
     fn fresh(&mut self) -> Variable {
-        let v = Variable::new_unchecked(format!("_triple_term_{}", self.next));
+        let v = internal::variable("triple-term", self.next);
         self.next += 1;
         v
     }

@@ -123,9 +123,7 @@ fn bds(triple: &TriplePattern) -> Option<&str> {
 fn subject_variable(term: &TermPattern) -> Option<Variable> {
     match term {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(nrese_sparql_syntax::internal::blank_variable(b)),
         _ => None,
     }
 }
@@ -300,7 +298,8 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
     let (mut searches, mut joins, mut consumed) = (Vec::new(), Vec::new(), Vec::new());
     for (index, triple) in triples.iter().enumerate().filter(|(_, t)| is_jena(t)) {
         let n = searches.len();
-        let fresh = |what: &str| Variable::new_unchecked(format!("_text_{what}_{n}"));
+        let fresh =
+            |what: &str| nrese_sparql_syntax::internal::variable(&format!("text-{what}"), n);
         let variable = |term: &TermPattern| match term {
             TermPattern::Variable(v) => Some(v.clone()),
             _ => None,
