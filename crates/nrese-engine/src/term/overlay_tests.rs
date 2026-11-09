@@ -546,3 +546,44 @@ fn view_end(view: &Vocabulary) -> u64 {
 fn literal_key_len(text: &str) -> usize {
     1 + text.len()
 }
+
+/// Dictionary lifecycle V1, count 2's fix: a lookup through a private vocabulary makes one key
+/// for both of its probes (the dictionary's and its own entries'), never a second copy. The
+/// counted A/B is `dictlc-pv1-count2c-468e813c` (private lookup 973 to 692 instructions a row,
+/// 414,511 to 203,057 allocations); this guards its shape. Measured, alone.
+///
+/// - Input: an overlay with own entries and its view; an IRI of 100,000 bytes neither the
+///   dictionary nor the overlay has, looked up through the overlay and through the view (both
+///   probe the dictionary, then the own entries).
+/// - Expected: no id, and at most one key held at a time: the lookup's peak below twice the
+///   key's length (a second copy of the key for the own probe would hold at least that).
+#[test]
+fn a_private_lookup_holds_one_key_for_both_probes() {
+    if !nrese_exec::measure::alone() {
+        return;
+    }
+    let budget = unlimited();
+    let (_dictionary, overlay) = with_overlay(10, &budget);
+    for i in 0..10 {
+        overlay
+            .intern(LiteralRef::new_simple_literal(&format!("own {i}")).into())
+            .unwrap();
+    }
+    let view = overlay.freeze().unwrap();
+    let absent = NamedNode::new_unchecked(format!("http://example.com/{}", "x".repeat(100_000)));
+    let key = 1 + absent.as_str().len();
+    for (name, lookup) in [
+        (
+            "the overlay",
+            &(|term: TermRef<'_>| overlay.lookup(term)) as &dyn Fn(TermRef<'_>) -> Option<TermId>,
+        ),
+        ("its view", &|term: TermRef<'_>| view.lookup(term)),
+    ] {
+        let (found, peak) = nrese_exec::measure::measure(|| lookup(absent.as_ref().into()));
+        assert_eq!(found, None, "{name}: absent");
+        assert!(
+            peak < 2 * key,
+            "{name}: {peak} bytes held at once for a {key}-byte key: a second copy of it"
+        );
+    }
+}

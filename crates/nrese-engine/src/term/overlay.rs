@@ -230,31 +230,39 @@ impl Overlay {
             ];
             return self.triple_term_below(ids, end);
         }
-        if let Some(id) = self.dictionary.lookup_bounded(term, self.start) {
-            return Some(id);
-        }
+        // One key and one hash for both probes, the dictionary's and the own entries'
+        // (dictionary lifecycle V1, count 2: a second encoding, hash and allocation made an
+        // absent term's private lookup ×1.36 the shared one's).
         let mut key = Vec::with_capacity(encoded_len(term));
         let kind = encode_key(term, &mut key);
-        self.find_below(&key, end).map(|id| TermId::new(kind, id))
+        self.probe_below(&key, kind, end)
     }
 
     /// The triple term of `components` below `end`: the dictionary's below `start`, else own.
     fn triple_term_below(&self, components: [TermId; 3], end: u64) -> Option<TermId> {
-        if let Some(id) = self.dictionary.triple_term_bounded(components, self.start) {
-            return Some(id);
-        }
         let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
         triple_key(components, &mut key);
-        self.find_below(&key, end)
-            .map(|id| TermId::new(TermKind::Triple, id))
+        self.probe_below(&key, TermKind::Triple, end)
     }
 
-    /// `key`'s own id, if it is below `end`.
-    fn find_below(&self, key: &[u8], end: u64) -> Option<u64> {
+    /// `key`'s id below `end`: the dictionary's below `start`, else own. No own probe where
+    /// there can be no own entry below `end`.
+    fn probe_below(&self, key: &[u8], kind: TermKind, end: u64) -> Option<TermId> {
+        let hash = key_hash(key);
+        if let Some(id) = self
+            .dictionary
+            .lookup_key_bounded(key, hash, kind, self.start)
+        {
+            return Some(id);
+        }
+        if end <= self.start {
+            return None;
+        }
         self.suffix
             .lock()
-            .find(key_hash(key), key)
+            .find(hash, key)
             .filter(|&id| id < end)
+            .map(|id| TermId::new(kind, id))
     }
 
     /// The entries now, for a snapshot to hold: later interns don't change it. Its lists and
