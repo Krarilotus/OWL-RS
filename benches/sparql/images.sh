@@ -36,16 +36,10 @@ labels() {  # CONTEXT (under the repository) COMMIT -> LABELS
 }
 # The source commit a context declares, the one place it is named: every `ARG NAME=` default of its
 # Dockerfile, one non-empty value. Absent, empty or two values: the build refuses (r1 follow-up),
-# also with a commit given, which a Dockerfile without the ARG wouldn't build.
+# also with a commit given, which a Dockerfile without the ARG wouldn't build. Read by
+# suitekit/dockerfile.py, the one reader suite.py coverage shares.
 declared() {  # CONTEXT NAME -> the value
-  local values
-  values=$(sed -n "s/^ARG $2=//p" "$ROOT/benches/competitors/$1/Dockerfile" | tr -d '\r' | sort -u)
-  if [ -z "$values" ] || [ "$(printf '%s\n' "$values" | wc -l)" -ne 1 ]; then
-    echo "images.sh: benches/competitors/$1/Dockerfile declares $2 with no single non-empty default" \
-      "(ARG $2=...): ${values:-none}" >&2
-    return 1
-  fi
-  printf '%s\n' "$values"
+  ns_python "$NS_SUITE/suitekit/dockerfile.py" "$ROOT/benches/competitors/$1/Dockerfile" "$2"
 }
 case ${1:-} in
   millenniumdb)
