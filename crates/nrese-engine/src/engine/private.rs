@@ -134,17 +134,20 @@ impl<'e> PrivateTransaction<'e> {
     }
 
     /// Asserts `quad`, its terms interned as [`Self::try_intern`] does; `false` if it was
-    /// already asserted.
+    /// already asserted. The pending changes' growth is charged as
+    /// [`Self::try_insert_encoded`]'s; refused there, the terms interned for it stay, its own and
+    /// charged, as a refused triple term's components do.
     pub fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
         let encoded = self.overlay.intern_quad(quad)?;
-        Ok(self.insert_encoded(encoded))
+        self.try_insert_encoded(encoded)
     }
 
-    /// Retracts the asserted `quad`; `false` if it was not asserted. Never interns.
-    pub fn remove(&mut self, quad: QuadRef<'_>) -> bool {
+    /// Retracts the asserted `quad`; `false` if it was not asserted. Never interns. Its growth
+    /// is charged as [`Self::try_insert_encoded`]'s.
+    pub fn remove(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
         match self.overlay.lookup_quad(quad) {
-            Some(encoded) => self.remove_encoded(encoded),
-            None => false,
+            Some(encoded) => self.try_remove_encoded(encoded),
+            None => Ok(false),
         }
     }
 
@@ -355,26 +358,35 @@ impl<'e> PrivateTransaction<'e> {
     }
 
     /// Asserts an encoded quad, its ids from this transaction's vocabulary ([`Self::try_intern`]
-    /// or the base's). `false` if it was already asserted.
-    pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
-        let changed = self.pending.insert_asserted(quad);
-        self.note(changed)
+    /// or the base's). `false` if it was already asserted. The pending changes' growth is
+    /// charged to the transaction's budget before it happens (D16-039's `Pending` charge, which
+    /// this transaction's opening attached): refused ([`EngineError::MemoryLimit`]), nothing
+    /// changes. Every private write is fallible and charged (§1.1).
+    pub fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_insert_asserted(quad)?;
+        Ok(self.note(changed))
     }
 
-    pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
-        let changed = self.pending.remove_asserted(quad);
-        self.note(changed)
+    /// Retracts an asserted encoded quad; `false` if it was not asserted. Its growth is charged
+    /// as [`Self::try_insert_encoded`]'s.
+    pub fn try_remove_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_remove_asserted(quad)?;
+        Ok(self.note(changed))
     }
 
-    /// Retracts every asserted quad matching `pattern`; the number removed.
-    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> u64 {
-        let matching: Vec<_> = self
-            .quads_for_pattern_in(ReadModel::Asserted, pattern)
-            .collect();
-        matching
-            .into_iter()
-            .map(|quad| u64::from(self.remove_encoded(quad)))
-            .sum()
+    /// Retracts every asserted quad matching `pattern`; the number removed. What the
+    /// retractions grow is charged as [`Self::try_insert_encoded`]'s; refused part way, the
+    /// retractions made before the refusal stay.
+    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
+        let removed = self.pending.try_remove_matching(pattern)?;
+        self.note(removed > 0);
+        Ok(removed)
+    }
+
+    /// Room for `more` asserted inserts, charged to the transaction's budget before the pending
+    /// changes grow: the next `more` inserts allocate nothing (SPARQL `ADD`/`MOVE`/`COPY`).
+    pub fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()> {
+        self.pending.try_reserve_inserts(more)
     }
 
     /// Adds an inferred statement (in the default graph); `false` if it is already inferred,

@@ -412,8 +412,11 @@ fn private_transactions_at_the_edges() {
     assert_eq!(own.payload(), 0);
     let statement = quad("a", "p", literal("first"));
     assert!(tx.try_insert(statement.as_ref()).unwrap());
-    assert!(tx.remove(statement.as_ref()), "removed once");
-    assert!(!tx.remove(statement.as_ref()), "then nothing to remove");
+    assert!(tx.remove(statement.as_ref()).unwrap(), "removed once");
+    assert!(
+        !tx.remove(statement.as_ref()).unwrap(),
+        "then nothing to remove"
+    );
     assert_eq!(tx.len(), 0);
 }
 

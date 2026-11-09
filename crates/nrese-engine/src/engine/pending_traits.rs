@@ -112,6 +112,20 @@ pub trait PendingWrite: PendingView {
     /// Retracts every asserted quad matching `pattern`; the number removed.
     fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64>;
 
+    /// Whether a budget pays for the pending changes' growth: a write transaction's where one
+    /// is attached, a private one's always (its budget, from its opening).
+    fn charges_pending(&self) -> bool;
+
+    /// Room for `more` asserted inserts, charged before the pending changes grow: the next
+    /// `more` inserts allocate nothing. A write transaction without a budget attached refuses
+    /// it ([`crate::EngineError::Configuration`]), so a caller asks [`Self::charges_pending`]
+    /// first (SPARQL `ADD`/`MOVE`/`COPY`).
+    fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()>;
+
+    /// Asserts an encoded quad, its ids from this transaction's vocabulary, its growth charged;
+    /// `false` if it was already asserted.
+    fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool>;
+
     /// Adds an inferred statement (in the default graph); `false` if it is already inferred,
     /// or asserted. Reasoner only.
     fn insert_inferred(&mut self, triple: EncodedTriple) -> EngineResult<bool>;
@@ -120,8 +134,9 @@ pub trait PendingWrite: PendingView {
     fn remove_inferred(&mut self, triple: EncodedTriple) -> EngineResult<bool>;
 }
 
-/// A write transaction answers `Ok` of its inherent methods. DUR-6 charges its pending
-/// snapshots to the budget; until then the budget is not read.
+/// A write transaction answers its inherent methods, each the charged one where it has one
+/// (DUR-6's pending snapshots, D16-039's pending growth), so a caller through the trait is
+/// charged as one calling the transaction itself.
 impl<'e> PendingView for Transaction<'e> {
     #[inline]
     fn base(&self) -> &Snapshot {
@@ -129,8 +144,8 @@ impl<'e> PendingView for Transaction<'e> {
     }
 
     #[inline]
-    fn pending_snapshot_within(&self, _budget: &Arc<Budget>) -> EngineResult<Snapshot> {
-        Ok(Transaction::pending_snapshot(self))
+    fn pending_snapshot_within(&self, budget: &Arc<Budget>) -> EngineResult<Snapshot> {
+        Transaction::pending_snapshot_within(self, budget)
     }
 
     #[inline]
@@ -138,9 +153,9 @@ impl<'e> PendingView for Transaction<'e> {
         &self,
         view: &Snapshot,
         hidden: &[EncodedQuad],
-        _budget: &Arc<Budget>,
+        budget: &Arc<Budget>,
     ) -> EngineResult<Snapshot> {
-        Ok(Transaction::pending_over(self, view, hidden))
+        Transaction::pending_over_within(self, view, hidden, budget)
     }
 
     #[inline]
@@ -226,12 +241,27 @@ impl PendingWrite for Transaction<'_> {
 
     #[inline]
     fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
-        Ok(Transaction::insert(self, quad))
+        Transaction::try_insert(self, quad)
     }
 
     #[inline]
     fn remove(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
-        Ok(Transaction::remove(self, quad))
+        Transaction::try_remove(self, quad)
+    }
+
+    #[inline]
+    fn charges_pending(&self) -> bool {
+        Transaction::charges_pending(self)
+    }
+
+    #[inline]
+    fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()> {
+        Transaction::try_reserve_inserts(self, more)
+    }
+
+    #[inline]
+    fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        Transaction::try_insert_encoded(self, quad)
     }
 
     #[inline]
@@ -362,12 +392,27 @@ impl PendingWrite for PrivateTransaction<'_> {
 
     #[inline]
     fn remove(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
-        Ok(PrivateTransaction::remove(self, quad))
+        PrivateTransaction::remove(self, quad)
     }
 
     #[inline]
     fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
-        Ok(PrivateTransaction::remove_matching(self, pattern))
+        PrivateTransaction::remove_matching(self, pattern)
+    }
+
+    #[inline]
+    fn charges_pending(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()> {
+        PrivateTransaction::try_reserve_inserts(self, more)
+    }
+
+    #[inline]
+    fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        PrivateTransaction::try_insert_encoded(self, quad)
     }
 
     #[inline]
