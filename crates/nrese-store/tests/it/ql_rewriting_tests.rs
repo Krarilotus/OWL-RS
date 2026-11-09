@@ -1501,6 +1501,11 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - Sol r3 S4: `C ⊑ ≤ 0 R.¬∃S.(∀S⁻.{a})` with `R(c, x)`, `a : D`: `x = a`, so `x : D`.
 /// - Fix check r1 F1: `C ⊑ ≤ 0 R.¬∃S.({a} ⊓ {b})` with `R(c, x)`, `a : D`: `x`'s
 ///   `S`-successor is `a` and `b`, so `b : D`.
+/// - DL44: a reflexive `p2` and a named `a0`: `p2(a0, a0)` (Direct Semantics §2.3.2,
+///   Table 6). RL's rules make no such loop (it is outside RL, Profiles §4.2.5); QL's do.
+/// - The same with `p2` of domain `D`: `a0 : D`, a consequence of the missing loop.
+///
+/// Answered false, or reported `unsound`: under DL44's schema, `NOT EXISTS` of the loop.
 ///
 /// Guards, each with its specified answer, compared first:
 /// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
@@ -1511,6 +1516,8 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - R1-F4 `C ⊑ ∀R.¬{a}`, Sol r1 S2 `C ⊑ = 0 R.{a}`, Sol r2 S3 `C ⊑ ≤ 0 R.¬∃S.{a}`: `Z` is
 ///   `z`. They equate nobody, but equality is fail-closed for any nominal (master, 8 Nov
 ///   12:41), so their status isn't required.
+/// - DL44 under owl2-ql, whose rules make the loop: the `p2` edge `(a0, a0)`, complete.
+/// - A reflexive `p2` beside an unrelated `r` edge: `(a0, a1)`, complete (both).
 #[test]
 fn axioms_outside_the_profile_are_answered_or_reported() {
     let head = format!(
@@ -1618,9 +1625,29 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}b> a <{E}D> }}"),
         ),
+        // DL44 (base 44, case 99), reduced to its two statements.
+        (
+            format!("{head}:p2 a owl:ReflexiveProperty . :a0 a owl:NamedIndividual ."),
+            format!("ASK {{ <{E}a0> <{E}p2> <{E}a0> }}"),
+        ),
+        (
+            format!(
+                "{head}:p2 a owl:ReflexiveProperty ; rdfs:domain :D . :a0 a owl:NamedIndividual ."
+            ),
+            format!("ASK {{ <{E}a0> a <{E}D> }}"),
+        ),
     ];
+    // Not entailed: a missed loop must not certify `true` (sound-only is no cover).
+    let negated = [(
+        cases[11].0.clone(),
+        format!("ASK {{ FILTER NOT EXISTS {{ <{E}a0> <{E}p2> <{E}a0> }} }}"),
+    )];
+    let asks = cases
+        .iter()
+        .map(|c| (c, true))
+        .chain(negated.iter().map(|c| (c, false)));
     let mut wrong = Vec::new();
-    for (n, (turtle, query)) in cases.iter().enumerate() {
+    for (n, ((turtle, query), entailed)) in asks.enumerate() {
         for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
             let dir = tempfile::tempdir().unwrap();
             let store = store(turtle, dir.path(), ruleset, true);
@@ -1629,7 +1656,11 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                 .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
             let answer = String::from_utf8(result.payload).unwrap();
             let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
-            if !answer.contains("true") && matches!(status, "complete" | "none") {
+            let claimed = match entailed {
+                true => matches!(status, "complete" | "none"),
+                false => matches!(status, "complete" | "sound-only" | "none"),
+            };
+            if answer.contains("true") != entailed && claimed {
                 wrong.push(format!(
                     "case {n}, {}, {query}: {answer}, {status}",
                     ruleset.name()
@@ -1670,6 +1701,8 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                  owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
          :c a :C . :z a :Z ."
     );
+    let unrelated =
+        format!("{head}:p2 a owl:ReflexiveProperty . :a0 a owl:NamedIndividual ; :r :a1 .");
     let both = vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl];
     let ql = vec![Ruleset::Owl2Ql];
     let z_query = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
@@ -1694,9 +1727,23 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
         ),
         (
             &universal,
-            ql,
+            ql.clone(),
             format!("SELECT ?x ?y WHERE {{ ?x <{E}R> ?y }}"),
             vec![format!("x={E}c y={E}z")],
+            true,
+        ),
+        (
+            &cases[11].0,
+            ql,
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}p2> ?y }}"),
+            vec![format!("x={E}a0 y={E}a0")],
+            true,
+        ),
+        (
+            &unrelated,
+            both.clone(),
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}r> ?y }}"),
+            vec![format!("x={E}a0 y={E}a1")],
             true,
         ),
         (&not_a, both.clone(), z_query.clone(), z.clone(), false),
