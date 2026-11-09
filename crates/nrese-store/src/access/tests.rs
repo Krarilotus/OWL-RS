@@ -107,9 +107,11 @@ fn roles_union_their_rules_and_a_deny_wins() {
     assert!(!view.can_write(&named("https://kg.example/public/hr/salaries")));
     assert!(!view.can_read(&GraphName::DefaultGraph));
 
-    let mut settings = state.settings.clone();
-    settings.fallback = Fallback::Allow;
-    settings.inferred = Inferred::Visible;
+    let settings = SettingsPatch {
+        fallback: Some(Fallback::Allow),
+        inferred: Some(Inferred::Visible),
+        ..SettingsPatch::default()
+    };
     state.apply(&admin(), Change::Settings(settings)).unwrap();
     assert!(state.view(&roles(&["guest"]), "nrese").reads_everything());
     assert!(state.view(&roles(&["analyst"]), "nrese").sees_inferred());

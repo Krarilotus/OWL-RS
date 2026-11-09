@@ -173,6 +173,36 @@ impl Default for Settings {
     }
 }
 
+/// A change of some settings: the fields given; the others stay as they are when the
+/// change applies (not as a requester read them: two changes at once keep each other).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsPatch {
+    pub enforced: Option<bool>,
+    pub fallback: Option<Fallback>,
+    pub inferred: Option<Inferred>,
+    pub users_create_workspaces: Option<bool>,
+    pub min_password_length: Option<u32>,
+    pub session_hours: Option<u32>,
+}
+
+impl SettingsPatch {
+    /// `settings` with this patch's fields.
+    fn applied_to(&self, settings: &Settings) -> Settings {
+        Settings {
+            enforced: self.enforced.unwrap_or(settings.enforced),
+            fallback: self.fallback.unwrap_or(settings.fallback),
+            inferred: self.inferred.unwrap_or(settings.inferred),
+            users_create_workspaces: self
+                .users_create_workspaces
+                .unwrap_or(settings.users_create_workspaces),
+            min_password_length: self
+                .min_password_length
+                .unwrap_or(settings.min_password_length),
+            session_hours: self.session_hours.unwrap_or(settings.session_hours),
+        }
+    }
+}
+
 /// A user the state records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct User {
@@ -268,7 +298,8 @@ impl AccessView {
 /// A change of the state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Settings(Settings),
+    /// Changes the settings the patch gives, in the state it applies to.
+    Settings(SettingsPatch),
     PutRole(RoleRule),
     RemoveRole(String),
     /// Creates or updates a user; fields left `None` keep their value. `password_hash`:
@@ -635,8 +666,9 @@ impl AccessState {
             }
         };
         match change {
-            Change::Settings(settings) => {
+            Change::Settings(patch) => {
                 only_admins("change the access settings")?;
+                let settings = patch.applied_to(&self.settings);
                 if settings.session_hours == 0 {
                     return Err(AccessError::Invalid(
                         "sessions must last an hour at least".to_owned(),

@@ -629,6 +629,17 @@ impl Catalog {
     /// the settings written, then a write path over the store with it published. A failure
     /// publishes the old reasoning again, its inferences recomputed if they had changed.
     pub fn change(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
+        self.patch(id, |_| Ok(settings))
+    }
+
+    /// [`Self::change`] to the settings `edit` makes of the current ones, read under the
+    /// repository's lifecycle lock: a change made meanwhile is kept (C-1001), never undone
+    /// by a copy read before it. `edit` must not call the catalog (that lock is held).
+    pub fn patch(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&RepositorySettings) -> Result<RepositorySettings, CatalogError>,
+    ) -> Result<(), CatalogError> {
         let missing = || CatalogError::NotFound(format!("no repository '{id}'"));
         let repository = self.get(id).ok_or_else(missing)?;
         let _lifecycle = repository.lifecycle.lock();
@@ -642,8 +653,9 @@ impl Catalog {
         {
             return Err(missing());
         }
-        check(&settings)?;
         let before = repository.settings.read().clone();
+        let settings = edit(&before)?;
+        check(&settings)?;
         // A settings file in place but not made durable: neither the old state nor the new
         // one is known to survive, so the repository serves nothing until a restart, which
         // reads the file again.
