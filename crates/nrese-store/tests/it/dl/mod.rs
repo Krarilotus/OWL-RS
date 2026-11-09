@@ -12,6 +12,7 @@ mod queries;
 mod review;
 mod routing;
 mod safety;
+mod speculative;
 mod versions;
 
 use std::sync::Arc;
