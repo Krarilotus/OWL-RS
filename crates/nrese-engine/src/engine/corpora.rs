@@ -153,6 +153,38 @@ impl KindRef<'_> {
             && kind.4 == self.canonical
     }
 
+    /// The touched terms whose probes can change this kind's members, of a step's or a
+    /// delta's `touched` (sorted raw ids). Blank nodes are never documents: they matter only
+    /// to a reader of equality classes of IRIs (the IRIs' corpora, in a model with inferred
+    /// statements), whose classes may hold them; to any other kind they are left out. Ids
+    /// sort by kind first (its tag is the high bits), so the blank nodes are one range.
+    fn probed<'t>(&self, touched: &'t [u64]) -> [&'t [u64]; 2] {
+        if self.reads_classes() {
+            return [touched, &[]];
+        }
+        let start = touched.partition_point(|&raw| tag(raw) < BLANK);
+        let end = touched.partition_point(|&raw| tag(raw) <= BLANK);
+        [&touched[..start], &touched[end..]]
+    }
+
+    /// Whether [`Self::probed`] keeps `raw`, for terms not yet sorted.
+    fn probes(&self, raw: u64) -> bool {
+        self.reads_classes() || tag(raw) != BLANK
+    }
+
+    /// Whether this kind's reader may expand equality classes of IRIs (as
+    /// `Snapshot::corpus_classes` does where a class of two or more exists).
+    fn reads_classes(&self) -> bool {
+        self.documents == Documents::Subjects
+            && self.model != ReadModel::Asserted
+            && self.equality.is_some()
+    }
+
+    /// How many of `touched` [`Self::probed`] keeps.
+    fn probed_len(&self, touched: &[u64]) -> usize {
+        self.probed(touched).iter().map(|part| part.len()).sum()
+    }
+
     fn to_owned(self) -> CorpusKind {
         (
             self.documents,
@@ -292,8 +324,17 @@ pub(crate) enum Found {
     },
 }
 
-/// The terms of a statement a corpus may hold: its object if a string literal or a typed
-/// one (a vector, for the corpora of vector searches), its subject if an IRI (raw ids).
+/// A raw id's kind tag, and a blank node's.
+fn tag(raw: u64) -> u64 {
+    raw >> crate::term::PAYLOAD_BITS
+}
+const BLANK: u64 = TermKind::BlankNode as u64;
+
+/// The terms of a statement whose membership it may change (raw ids): its object if a
+/// string literal or a typed one (a vector, for the corpora of vector searches), and its
+/// subject of any kind. A blank node's or literal's class can hold IRIs, which a reader of
+/// equality classes shows as subjects of the statement: the derivation expands each term to
+/// its class and keeps the identities the corpus's documents hold (sol-loop r1 R1-S1).
 fn terms(
     subject: TermId,
     object: TermId,
@@ -303,8 +344,7 @@ fn terms(
         TermKind::String | TermKind::LangString | TermKind::TypedLiteral
     )
     .then_some(object.raw());
-    let subject = (subject.kind() == TermKind::Iri).then_some(subject.raw());
-    object.into_iter().chain(subject)
+    object.into_iter().chain(Some(subject.raw()))
 }
 
 /// The most touched terms worth probing to derive a corpus of `documents` rather than
@@ -647,7 +687,7 @@ impl CorpusStore {
             if same_as.is_some_and(|same_as| step.predicates.binary_search(&same_as).is_ok()) {
                 break;
             }
-            terms += step.touched.len();
+            terms += kind.probed_len(&step.touched);
             count += 1;
             let at = step.parent;
             if let Some(corpus) = state
@@ -667,7 +707,7 @@ impl CorpusStore {
             Some(base) if worth_deriving(terms, base.documents(), per_probe) => {
                 let all = up(&state.steps, content)
                     .take(count)
-                    .flat_map(|step| step.touched.iter().copied());
+                    .flat_map(|step| kind.probed(&step.touched).into_iter().flatten().copied());
                 let mut touched = ChargedVec::collect(Arc::clone(request), terms, all)?;
                 sort_dedup(&mut touched);
                 Some((base, touched))
@@ -848,6 +888,7 @@ impl CorpusStore {
         let all = extra.iter().flat_map(|run| {
             run.statements()
                 .flat_map(|[s, _, o, _]| terms(TermId::from_raw(s), TermId::from_raw(o)))
+                .filter(|&raw| kind.probes(raw))
         });
         // Where the request has no room for the touched terms, the walk is the way left (it
         // charges what it needs itself).
