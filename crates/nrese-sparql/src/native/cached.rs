@@ -378,6 +378,12 @@ pub(crate) fn output_key(
     let scope = ctx.cache.as_ref()?;
     let mut encoder = ctx.key_start(scope);
     encoder.tag(b'S');
+    // The answer is the context's reading of `snapshot` (canonical answers read a view of
+    // it, an identity of its own), but the cache keys it by `snapshot`'s: its equality and
+    // canonical modes are part of these bytes (sol-loop r1 S1).
+    let read = ctx.snapshot.identity();
+    encoder.number(read.equality.map_or(u64::MAX, nrese_engine::TermId::raw));
+    encoder.tag(u8::from(read.canonical));
     encoder.text(format);
     encoder.text(context);
     // The QL rewriting changes the answer of the query as parsed (parts see it in the
