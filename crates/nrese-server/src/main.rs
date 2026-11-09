@@ -82,21 +82,22 @@ async fn run() -> Result<()> {
         )?;
         return print_query(&store, print.clone());
     }
-    let mut config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
+    let config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
     config.install_process_memory_policy()?;
-    // The default repository's reasoning as changed through the engine API overrides the
-    // configuration's (it is kept in the data directory).
-    if let Some(settings) = nrese_server::repositories::stored_default_settings(&config.store)
-        .map_err(|error| anyhow::anyhow!(error))?
-        && let Some(reasoner) = settings
-            .reasoner_config()
-            .map_err(|error| anyhow::anyhow!(error))?
-    {
+    // The default repository's settings as changed through the engine API (kept in the data
+    // directory) are in effect for it: its reasoning and its store's modes. The configured
+    // reasoning stays the server's, for the repositories that name none.
+    let default = nrese_server::repositories::Effective::of_default(&config.store)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let default_reasoner = default
+        .reasoning
+        .clone()
+        .unwrap_or_else(|| config.reasoner.clone());
+    if default.reasoning.is_some() {
         tracing::info!(
-            reasoning = ?reasoner.mode(),
+            reasoning = ?default_reasoner.mode(),
             "the default repository's stored settings choose its reasoning"
         );
-        config.reasoner = reasoner;
     }
     if cli.command == CliCommand::CheckConfig {
         // Loading validated everything; show what takes effect.
@@ -141,6 +142,7 @@ async fn run() -> Result<()> {
         }
     }
     let store = StoreService::new(config.store.clone())?;
+    default.apply(&store);
     if let CliCommand::Backup(dir) = &cli.command {
         let manifest = store
             .backup_image(dir)
@@ -154,7 +156,7 @@ async fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let program = config.reasoner.materialised_program();
+    let program = default_reasoner.materialised_program();
     if let CliCommand::Query(query) = cli.command {
         bring_inferences_up_to_date(&store, program.as_ref(), replica)?;
         return query_once(&store, query);
