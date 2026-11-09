@@ -26,8 +26,8 @@ pub fn individual(i: usize) -> String {
 pub fn u1(name: impl Display) -> String {
     let name = name.to_string();
     debug_assert!(
-        !name.is_empty() && !name.contains([' ', ':']),
-        "a U1 name is one word, without a colon (`Program::to_n3` writes spaces as colons)"
+        !name.is_empty() && !name.contains(' '),
+        "a U1 name is one word"
     );
     format!("{PREFIX}u1 {name}")
 }
