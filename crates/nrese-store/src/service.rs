@@ -37,6 +37,10 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
+    /// odd while one is in progress (under the writer slot, [`CertificateTransition`]), even
+    /// once it is settled in memory and on disk.
+    certificate_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
     /// repository's own, [`Self::set_ql_rewriting`]).
     ql_mode: std::sync::Arc<std::sync::RwLock<crate::QlRewritingMode>>,
@@ -66,6 +70,17 @@ pub struct StoreService {
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
 const REASONING_MARKER: &str = "reasoning.state";
+
+/// A change of the reasoning certificate in progress
+/// ([`StoreService::certificate_epoch`]): made odd by its start, the epoch is even again when
+/// this drops, the change settled or failed, on every way out (`?` and unwinding included).
+struct CertificateTransition<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for CertificateTransition<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// The memory stop of one operation ([`StoreService::memory_stop`]).
 pub(crate) struct MemoryStop(Option<nrese_exec::memory::MemoryWatch>);
@@ -198,6 +213,12 @@ impl StoreService {
             );
         }
         let before = engine.snapshot().revision();
+        // At the revision the engine recovered, before anything commits (the ontology's
+        // preload may): its readmissions are in effect only where the store holds theirs.
+        let quarantine = crate::quarantine::Quarantine::open(
+            (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
+            before,
+        )?;
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
         let settings = crate::query_executor::StoreSettings {
@@ -221,9 +242,6 @@ impl StoreService {
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
             std::sync::Arc::clone(&unavailable),
-        )?;
-        let quarantine = crate::quarantine::Quarantine::open(
-            (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
         )?;
         // The support graph sets and restricted views draw on the memory the queries do,
         // as the canonical views.
@@ -252,6 +270,7 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
@@ -265,17 +284,21 @@ impl StoreService {
             .dl
             .bounds
             .set_kept(std::sync::Arc::new(service.envelope(None).part()));
+        // Under the writer slot, as every change of the certificate (Q06 remainder, invariant C).
+        let tx = service.engine.transaction();
+        let writer = tx.writer().expect("a transaction holds the writer slot");
         if service.engine.snapshot().revision() != before {
-            service.invalidate_reasoning()?;
+            service.invalidate_held(writer)?;
         }
         if let Some(state) = service.reasoning_state() {
-            service.note_equality(&state);
+            service.note_equality(writer, &state);
             // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
             *service
                 .materialised
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
+        drop(tx);
         service.pin_configured_queries()?;
         Ok(service)
     }
@@ -285,8 +308,8 @@ impl StoreService {
     ///
     /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
     /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
-    fn note_equality(&self, state: &crate::ReasoningState) {
-        self.note_ql(state);
+    fn note_equality(&self, writer: nrese_engine::WriterHeld<'_>, state: &crate::ReasoningState) {
+        self.note_ql(writer, state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
@@ -306,7 +329,7 @@ impl StoreService {
     /// ql-rewriting.md §4): `owl2-ql` and `owl2-rl` make the data H-complete, `owl2-rl`
     /// with its list rules; the others don't close inverses or the domains of restrictions.
     /// Under `owl2-dl` the bounds give those answers ([`crate::dl`]): no rewriting.
-    fn note_ql(&self, state: &crate::ReasoningState) {
+    fn note_ql(&self, _writer: nrese_engine::WriterHeld<'_>, state: &crate::ReasoningState) {
         use nrese_sparql::ql::{Closure, QlRewriting};
         let closure = match state.ruleset.as_str() {
             "owl2-rl" => Some(Closure { lists: true }),
@@ -387,10 +410,17 @@ impl StoreService {
     }
 
     /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
+    /// Under the writer slot: the certificate it reads can't be cleared meanwhile.
     pub fn set_ql_rewriting(&self, mode: crate::QlRewritingMode) {
+        let tx = self.engine.transaction();
         *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
         if let Some(state) = self.reasoning_state() {
-            self.note_ql(&state);
+            #[cfg(test)]
+            hooks::run(&hooks::AFTER_QL_READ);
+            self.note_ql(
+                tx.writer().expect("a transaction holds the writer slot"),
+                &state,
+            );
         }
     }
 
@@ -453,8 +483,62 @@ impl StoreService {
             })
     }
 
+    /// Whether the certificate covers `program` for a holder of the writer slot: no write can
+    /// change it, or the data it covers, until the holder lets the slot go. A writer that maintains
+    /// the closure checks it here, under its own transaction (review r1, F1).
+    pub(crate) fn reasoning_is_current_held(
+        &self,
+        _writer: nrese_engine::WriterHeld<'_>,
+        program: &nrese_reasoner::RuleProgram,
+    ) -> bool {
+        self.reasoning_is_current(program)
+    }
+
+    /// The certificate's epoch, a sequence lock over its changes. Odd: a change is in progress,
+    /// and what a reader sees of the certificate (in memory or on disk) may be the old one; it
+    /// takes nothing then. Even and the same before and after a reader's reads: no change
+    /// began meanwhile, so the certificate it checked covers every snapshot those reads took
+    /// (every commit in between maintained the closure). Each change runs its whole course,
+    /// marker included, inside one [`CertificateTransition`], before the commit it precedes.
+    pub(crate) fn certificate_epoch(&self) -> u64 {
+        self.certificate_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Starts a change of the certificate, under the writer slot: the epoch is odd until the
+    /// returned transition drops, on every way out of the change.
+    fn certificate_transition(
+        &self,
+        _writer: nrese_engine::WriterHeld<'_>,
+    ) -> CertificateTransition<'_> {
+        let before = self
+            .certificate_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(
+            before.is_multiple_of(2),
+            "one change of the certificate at a time"
+        );
+        CertificateTransition(&self.certificate_epoch)
+    }
+
+    /// Forgets what the inferred stack is exact for, taking the writer slot to do so: no
+    /// rematerialisation certifies it meanwhile. Never call it under the slot (it isn't
+    /// reentrant): a holder calls [`Self::invalidate_held`].
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
+        let tx = self.engine.transaction();
+        self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
+    }
+
+    /// [`Self::invalidate_reasoning`] by a holder of the writer slot, before a commit that
+    /// doesn't maintain the inferences: the certificate changes only between commits (the Q06
+    /// remainder's invariant C), so no rematerialisation can certify data this write changes.
+    pub(crate) fn invalidate_held(&self, writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
+        // Before the commit it precedes, until the marker is settled: no reader takes the old
+        // certificate for the data this write changes (fix check r1 on review r1, F1).
+        let _transition = self.certificate_transition(writer);
+        #[cfg(test)]
+        hooks::run(&hooks::INSIDE_INVALIDATION);
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
@@ -480,8 +564,15 @@ impl StoreService {
         Ok(())
     }
 
-    fn record_reasoning(&self, state: crate::ReasoningState) -> StoreResult<()> {
-        self.note_equality(&state);
+    /// Certifies `state` for the inferred stack just published, still under the writer slot
+    /// of its publication ([`nrese_engine::Finished`]): no other write comes between them.
+    fn record_reasoning(
+        &self,
+        writer: nrese_engine::WriterHeld<'_>,
+        state: crate::ReasoningState,
+    ) -> StoreResult<()> {
+        let _transition = self.certificate_transition(writer);
+        self.note_equality(writer, &state);
         let text = state.to_text();
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         let Some(path) = self.marker_path() else {
@@ -501,9 +592,9 @@ impl StoreService {
 
     /// Empties the inferred stack (reasoning switched off), forgetting the marker.
     pub fn clear_inferred(&self) -> StoreResult<u64> {
-        self.invalidate_reasoning()?;
-        self.engine.set_equality(None);
         let rematerialisation = self.engine.rematerialisation();
+        self.invalidate_held(rematerialisation.writer())?;
+        self.engine.set_equality(None);
         if rematerialisation.base().len_in(ReadModel::Inferred) == 0 {
             return Ok(0);
         }
@@ -733,6 +824,8 @@ impl StoreService {
     /// pipeline running the reasoner's `owl2-dl` mode registers it, and whether user rules
     /// run with it.
     pub fn use_dl(&self, active: bool, user_rules: bool) {
+        // Under the writer slot, as every change of the certificate's QL schema.
+        let tx = self.engine.transaction();
         self.dl.set_active(active, user_rules);
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
@@ -741,7 +834,10 @@ impl StoreService {
             // Off: the rewriting the closure and the setting call for, whatever came first
             // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
             // path, which switches the bounds off, exists).
-            self.note_ql(&state);
+            self.note_ql(
+                tx.writer().expect("a transaction holds the writer slot"),
+                &state,
+            );
         }
     }
 
@@ -1661,8 +1757,8 @@ impl StoreService {
         command: &MutationCommand,
         requester: &crate::Requester,
     ) -> StoreResult<MutationCommitReport> {
-        self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
+        self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))?;
         let cancellation = CancellationToken::new();
         let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
@@ -1720,9 +1816,17 @@ impl StoreService {
         request: &BulkLoadRequest,
         progress: &crate::LoadProgress,
     ) -> StoreResult<BulkLoadReport> {
-        self.invalidate_reasoning()?;
         let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
-        bulk_load(&self.engine, request, progress, invalid, &self.quarantine)
+        // Cleared under the load's writer slot, before it commits (invariant C).
+        let invalidate = |writer: nrese_engine::WriterHeld<'_>| self.invalidate_held(writer);
+        bulk_load(
+            &self.engine,
+            request,
+            progress,
+            invalid,
+            &self.quarantine,
+            &invalidate,
+        )
     }
 
     /// Builds the query planner's statistics of the store as it is now and saves them
@@ -1997,21 +2101,33 @@ impl StoreService {
         if stop() {
             return Err(stopped(nrese_reasoner::delta::Interrupted::default()));
         }
+        // The certificate of the closure about to be replaced goes first, durably: a stop or
+        // a failed certificate between the publication and the new certificate must not leave
+        // the old one describing the new closure after a start (review r1, F3).
+        self.invalidate_held(rematerialisation.writer())?;
         // Where asked, what the reasoner freed goes back before the inferred stack, the
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
-        let summary = rematerialisation.finish(closure.inferred)?;
+        // Published with the writer slot still held: certified before any other write.
+        let finished = rematerialisation.finish_held(closure.inferred)?;
+        let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_PUBLICATION);
         // From here the new inferences are published: a failure says so.
-        self.record_reasoning(crate::ReasoningState::of_with(
-            rules,
-            self.config.hide_unnamed_classes,
-            self.config.equality_compact,
-            violations,
-        ))
+        self.record_reasoning(
+            finished.writer(),
+            crate::ReasoningState::of_with(
+                rules,
+                self.config.hide_unnamed_classes,
+                self.config.equality_compact,
+                violations,
+            ),
+        )
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        drop(finished);
         if violations > 0 {
             tracing::error!(
                 ruleset = %rules.name(),
@@ -2147,6 +2263,507 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+/// Test seams in the reasoning certificate's lifecycle: each runs a test's closure once, on the
+/// thread that reaches it.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+    thread_local! {
+        /// A bulk load has cleared the reasoning certificate and is about to load.
+        pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
+        /// A rematerialisation has published its inferences and is about to certify them.
+        pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
+        /// A change of the QL rewriting setting has read the certificate and is about to
+        /// install the rewriting it calls for.
+        pub(crate) static AFTER_QL_READ: Hook = const { RefCell::new(None) };
+        /// A pipeline write has passed its preflight certificate check and is about to take
+        /// its transaction.
+        pub(crate) static AFTER_PREFLIGHT: Hook = const { RefCell::new(None) };
+        /// An entailment check has found the certificate current and is about to read the
+        /// closure.
+        pub(crate) static AFTER_CERTIFIED: Hook = const { RefCell::new(None) };
+        /// An invalidation of the certificate has begun its change of the epoch, and the old
+        /// certificate is still in place.
+        pub(crate) static INSIDE_INVALIDATION: Hook = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn run(hook: &'static LocalKey<Hook>) {
+        if let Some(hook) = hook.with_borrow_mut(Option::take) {
+            hook();
+        }
+    }
+}
+
+/// The reasoning certificate says what the inferred stack is exact for (`reasoning_state`,
+/// `reasoning_is_current`, `consistency`). It must never claim a ruleset current for data that
+/// ruleset's closure wasn't computed over: queries and the pipeline rely on it (the pipeline
+/// then skips its rematerialisation, `MutationPipeline::apply`). Each witness races a bulk load
+/// that adds `C subClassOf D` against an RDFS rematerialisation over `a a C`, at one point of
+/// the race, and then asks: if RDFS is certified current, `a a D` must hold. Where the writer
+/// slot is free at that point the other operation completes there; where it is held, it waits
+/// for the slot (the test waits for it up to `WAIT`, then lets the first one go on), and every
+/// order then reaches the same answer.
+#[cfg(test)]
+mod certificate_tests {
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+
+    use super::{StoreService, hooks};
+    use crate::StoreConfig;
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    const A_C: &str = "<http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                       <http://example.com/C> .\n";
+    const C_D: &str = "<http://example.com/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+                       <http://example.com/D> .\n";
+
+    fn rdfs() -> nrese_reasoner::RuleProgram {
+        nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
+            .materialised_program()
+            .expect("RDFS reasons")
+    }
+
+    fn load(store: &StoreService, file: &std::path::Path) {
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file.to_path_buf()],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+    }
+
+    /// Makes `hook` run `other` on a thread of its own, waiting for it up to `WAIT`; the
+    /// returned slot holds that thread, to be joined once the operation that reached the hook
+    /// is done.
+    fn interleave(
+        hook: &'static std::thread::LocalKey<hooks::Hook>,
+        other: impl FnOnce() + Send + 'static,
+    ) -> Arc<Mutex<Option<JoinHandle<()>>>> {
+        let joined = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&joined);
+        hook.set(Some(Box::new(move || {
+            let (done, finished) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                other();
+                let _ = done.send(());
+            });
+            let _ = finished.recv_timeout(WAIT);
+            *slot.lock().unwrap() = Some(thread);
+        })));
+        joined
+    }
+
+    fn join(joined: &Mutex<Option<JoinHandle<()>>>) {
+        let thread = joined.lock().unwrap().take().expect("the hook ran");
+        thread.join().expect("the interleaved operation succeeds");
+    }
+
+    /// What is wrong with the certificate: RDFS claimed current without `a a D`.
+    fn stale(store: &StoreService, when: &str, wrong: &mut Vec<String>) {
+        let answer = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        let derived = String::from_utf8_lossy(&answer.payload).contains("true");
+        let current = store.reasoning_is_current(rdfs());
+        eprintln!("{when}: RDFS certified current {current}, a a D {derived}");
+        if current && !derived {
+            wrong.push(format!(
+                "{when}: RDFS certified current over data it wasn't computed for"
+            ));
+        }
+    }
+
+    fn files(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (a, b) = (dir.join("a.nt"), dir.join("b.nt"));
+        std::fs::write(&a, A_C).unwrap();
+        std::fs::write(&b, C_D).unwrap();
+        (a, b)
+    }
+
+    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its load.
+    /// Before the fix the load cleared the certificate before it took the writer slot: the
+    /// rematerialisation then certified RDFS, and the load committed `C subClassOf D` under it.
+    #[test]
+    fn a_bulk_load_raced_by_a_rematerialisation_leaves_no_stale_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        load(&store, &a);
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_INVALIDATION, move || {
+            racer.rematerialise(rdfs()).unwrap();
+        });
+        load(&store, &b);
+        join(&joined);
+        let mut wrong = Vec::new();
+        stale(&store, "in process", &mut wrong);
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        stale(&store, "after a reopen", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The QL schema is part of the certificate (sol-loop r1, S3): a bulk load between a QL
+    /// setting's read of the certificate and its installing the rewriting. The rewriting
+    /// relies on the `owl2-rl` closure; once the load leaves no certificate, none may be
+    /// installed. Before the fix the setter read the certificate without the writer slot,
+    /// the load cleared it and committed, and the setter installed the rewriting after.
+    #[test]
+    fn a_ql_setting_raced_by_a_bulk_load_installs_no_rewriting_without_a_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &a);
+        let rl = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+            .materialised_program()
+            .expect("OWL 2 RL reasons");
+        store.rematerialise(rl).unwrap();
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_QL_READ, move || load(&racer, &b));
+        store.set_ql_rewriting(crate::QlRewritingMode::On);
+        join(&joined);
+        let rewriting = store.query_settings().ql().is_some();
+        let certified = store.reasoning_state().is_some();
+        eprintln!("QL rewriting {rewriting}, certificate {certified}");
+        assert!(
+            !rewriting || certified,
+            "QL rewriting installed over data no certificate covers"
+        );
+    }
+
+    fn rl() -> nrese_reasoner::RuleProgram {
+        nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+            .materialised_program()
+            .expect("OWL 2 RL reasons")
+    }
+
+    fn holds(store: &StoreService, pattern: &str) -> bool {
+        let answer = store
+            .execute_query_str(&format!("ASK {{ {pattern} }}"))
+            .unwrap();
+        String::from_utf8_lossy(&answer.payload).contains("true")
+    }
+
+    /// A reasoning write leaves the closure of the data it commits over (review r1, F1): a bulk
+    /// load between a write's preflight check of the certificate and its transaction commits
+    /// `C subClassOf D` and clears the certificate. The write (`a a C` again, which adds
+    /// nothing) must not maintain from the stale closure: afterwards `a a D` holds. Before the
+    /// fix the pipeline trusted its preflight check, committed over the load, and `a a D` was
+    /// missing under its RDFS reasoning.
+    #[test]
+    fn a_reasoning_write_raced_by_a_bulk_load_commits_over_a_complete_closure() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &a);
+        let pipeline = crate::MutationPipeline::new(
+            Arc::new(store.clone()),
+            Arc::new(nrese_reasoner::ReasonerService::new(
+                nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs),
+            )),
+        );
+        let write = "INSERT DATA { <http://example.com/a> \
+                     <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/C> }";
+        pipeline.execute_update_str(write).unwrap();
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_PREFLIGHT, move || load(&racer, &b));
+        pipeline.execute_update_str(write).unwrap();
+        join(&joined);
+        let derived = holds(&store, "<http://example.com/a> a <http://example.com/D>");
+        eprintln!("after the write: a a D {derived}");
+        assert!(
+            derived,
+            "the write committed over a closure the load made stale"
+        );
+    }
+
+    /// An entailment answers from one certified closure (review r1, F1, the read side): a bulk
+    /// replace with the same statements (it clears the inferred stack and the certificate)
+    /// between the check of the certificate and the read of the closure. The data entails
+    /// `a a D` before and after; the answer must not be `NotEntailed` (refusing as not current
+    /// is right). Before the fix the check passed and the read found the cleared stack.
+    #[test]
+    fn an_entailment_raced_by_a_bulk_replace_answers_from_a_certified_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_CERTIFIED, move || {
+            racer
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![both],
+                    replace: true,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .unwrap();
+        });
+        let node =
+            |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        let conclusion = [nrese_rdf::Triple::new(
+            node("a"),
+            nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            node("D"),
+        )];
+        let answer = store.entails(rdfs(), &conclusion);
+        join(&joined);
+        eprintln!("the answer: {answer:?}");
+        assert!(
+            !matches!(answer, Ok(crate::Entailment::NotEntailed)),
+            "NotEntailed for a conclusion the data entails"
+        );
+    }
+
+    /// An entailment that starts inside an invalidation answers from a certified closure
+    /// (fix check r1 on review r1, F1's read side): a bulk replace with the same statements has
+    /// begun clearing the certificate, the old one still in place, when an entailment starts
+    /// and finds it current; the replace then clears it, commits an empty inferred stack, and
+    /// only then does the entailment read the closure. The data entails `a a D` before and
+    /// after; the answer must not be `NotEntailed`. Before the fix the reader's epoch was taken
+    /// after the invalidation's one increment, so it was the same after its reads, and the
+    /// answer from the cleared stack stood.
+    #[test]
+    fn an_entailment_started_inside_an_invalidation_answers_from_a_certified_closure() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let (certified, has_certified) = mpsc::channel();
+        let (go, gone) = mpsc::channel::<()>();
+        let reader = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&reader);
+        let racer = store.clone();
+        hooks::INSIDE_INVALIDATION.set(Some(Box::new(move || {
+            let thread = std::thread::spawn(move || {
+                hooks::AFTER_CERTIFIED.set(Some(Box::new(move || {
+                    let _ = certified.send(());
+                    let _ = gone.recv_timeout(WAIT);
+                })));
+                let node = |name: &str| {
+                    nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"))
+                };
+                racer.entails(
+                    rdfs(),
+                    &[nrese_rdf::Triple::new(
+                        node("a"),
+                        nrese_rdf::NamedNode::new_unchecked(
+                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                        ),
+                        node("D"),
+                    )],
+                )
+            });
+            let _ = has_certified.recv_timeout(WAIT);
+            *slot.lock().unwrap() = Some(thread);
+        })));
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![both],
+                replace: true,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let _ = go.send(());
+        let thread = reader
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the invalidation ran its hook");
+        let answer = thread.join().expect("the entailment returns");
+        eprintln!("the answer: {answer:?}");
+        assert!(
+            !matches!(answer, Ok(crate::Entailment::NotEntailed)),
+            "NotEntailed for a conclusion the data entails"
+        );
+    }
+
+    /// Spec (Q06 fix check r2): an open certificate transition refuses without waiting;
+    /// once settled and certified, the RDFS subclass conclusion still holds.
+    #[test]
+    fn an_entailment_refuses_an_open_certificate_transition_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let conclusion = [nrese_rdf::Triple::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/a"),
+            nrese_rdf::vocab::rdf::TYPE.into_owned(),
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/D"),
+        )];
+        let racer = store.clone();
+        let during = conclusion.clone();
+        hooks::INSIDE_INVALIDATION.set(Some(Box::new(move || {
+            // Synchronous: the transition cannot settle until this call returns.
+            // The fleet red's external timeout witnesses the old unbounded loop.
+            assert!(matches!(
+                racer.entails(rdfs(), &during),
+                Err(crate::StoreError::Configuration(message))
+                    if message == "the inferred statements aren't rdfs's closure: rematerialise first"
+            ));
+        })));
+        store.invalidate_reasoning().unwrap();
+        store.rematerialise(rdfs()).unwrap();
+        assert_eq!(
+            store.entails(rdfs(), &conclusion).unwrap(),
+            crate::Entailment::Entailed
+        );
+    }
+
+    /// Spec (Q06 fix check r2): a certificate changed during reads refuses even when
+    /// the replacement is certified, instead of retrying to an answer.
+    #[test]
+    fn an_entailment_refuses_a_certificate_changed_during_its_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = dir.path().join("both.nt");
+        std::fs::write(&both, format!("{A_C}{C_D}")).unwrap();
+        let store = StoreService::new(StoreConfig::on_disk(dir.path().join("store"))).unwrap();
+        load(&store, &both);
+        store.rematerialise(rdfs()).unwrap();
+        let racer = store.clone();
+        hooks::AFTER_CERTIFIED.set(Some(Box::new(move || {
+            racer.invalidate_reasoning().unwrap();
+            racer.rematerialise(rdfs()).unwrap();
+        })));
+        let conclusion = [nrese_rdf::Triple::new(
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/a"),
+            nrese_rdf::vocab::rdf::TYPE.into_owned(),
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/D"),
+        )];
+        assert!(matches!(
+            store.entails(rdfs(), &conclusion),
+            Err(crate::StoreError::Configuration(message))
+                if message == "the inferred statements aren't rdfs's closure: rematerialise first"
+        ));
+        assert_eq!(
+            store.entails(rdfs(), &conclusion).unwrap(),
+            crate::Entailment::Entailed
+        );
+    }
+
+    const INVERSE: &str = "<http://example.com/p> <http://www.w3.org/2002/07/owl#inverseOf> \
+                           <http://example.com/q> .\n<http://example.com/a> <http://example.com/p> \
+                           <http://example.com/b> .\n";
+    const B_Q_A: &str = "<http://example.com/b> <http://example.com/q> <http://example.com/a>";
+
+    /// An on-disk store in `dir` whose closure and certificate are OWL 2 RL's over `INVERSE`
+    /// (`b q a` inferred).
+    fn rl_certified(dir: &std::path::Path) -> std::path::PathBuf {
+        let data = dir.join("inverse.nt");
+        std::fs::write(&data, INVERSE).unwrap();
+        let store_dir = dir.join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        load(&store, &data);
+        store.rematerialise(rl()).unwrap();
+        assert!(holds(&store, B_Q_A), "OWL 2 RL infers b q a");
+        store_dir
+    }
+
+    /// What is wrong after a start: OWL 2 RL certified over a closure without `b q a`.
+    fn rl_certified_wrongly(store_dir: &std::path::Path, row: &str, wrong: &mut Vec<String>) {
+        let store = StoreService::new(StoreConfig::on_disk(store_dir)).unwrap();
+        let current = store.reasoning_is_current(rl());
+        let inferred = holds(&store, B_Q_A);
+        eprintln!("row {row}: OWL 2 RL certified current {current}, b q a {inferred}");
+        if current && !inferred {
+            wrong.push(format!("{row}: OWL 2 RL certified over the RDFS closure"));
+        }
+    }
+
+    const F3_CHILD: &str = "NRESE_Q06_F3_CHILD";
+
+    /// A replacement closure never reopens under the certificate of the one it replaced
+    /// (review r1, F3): over an OWL 2 RL closure and certificate, an RDFS rematerialisation
+    /// publishes and the process stops before its certificate (a child process of this test
+    /// binary exits at the seam, unwinding nothing); in the other row the new certificate's
+    /// write fails before its rename. After a start the store must not certify OWL 2 RL over
+    /// the RDFS closure. Before the fix the old certificate stayed in place until the new one
+    /// replaced it, and the start took it.
+    #[test]
+    fn a_replacement_closure_never_reopens_under_the_old_certificate() {
+        if let Ok(store_dir) = std::env::var(F3_CHILD) {
+            let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+            hooks::AFTER_PUBLICATION.set(Some(Box::new(|| {
+                std::process::exit(86);
+            })));
+            let _ = store.rematerialise(rdfs());
+            return;
+        }
+        let mut wrong = Vec::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = rl_certified(dir.path());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "service::certificate_tests::a_replacement_closure_never_reopens_under_the_old_certificate",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(F3_CHILD, &store_dir)
+            .status()
+            .unwrap();
+        eprintln!("row stopped after publication: the child {status}");
+        if status.code() != Some(86) {
+            wrong.push(format!(
+                "stopped after publication: the child didn't stop there: {status}"
+            ));
+        }
+        rl_certified_wrongly(&store_dir, "stopped after publication", &mut wrong);
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = rl_certified(dir.path());
+        {
+            let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+            crate::metadata::tests::FAIL_NAMING_OF.set(Some(store_dir.clone()));
+            let rematerialised = store.rematerialise(rdfs());
+            crate::metadata::tests::FAIL_NAMING_OF.set(None);
+            eprintln!(
+                "row certificate write fails: {:?}",
+                rematerialised.as_ref().err()
+            );
+        }
+        rl_certified_wrongly(&store_dir, "certificate write fails", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C2: a bulk load between a rematerialisation's publication and its certificate. Before
+    /// the fix the rematerialisation released the writer slot when it published: the load then
+    /// committed `C subClassOf D`, and the certificate came after it.
+    #[test]
+    fn a_rematerialisation_raced_by_a_bulk_load_leaves_no_stale_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        load(&store, &a);
+        let racer = store.clone();
+        let joined = interleave(&hooks::AFTER_PUBLICATION, move || load(&racer, &b));
+        store.rematerialise(rdfs()).unwrap();
+        join(&joined);
+        let mut wrong = Vec::new();
+        stale(&store, "in process", &mut wrong);
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        stale(&store, "after a reopen", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
 
 #[cfg(test)]

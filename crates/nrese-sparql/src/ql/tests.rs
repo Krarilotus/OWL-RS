@@ -93,7 +93,7 @@ fn equal_count_pending_schema_replacements_and_rollback_use_their_own_tbox() {
 }
 
 #[test]
-fn equal_count_pending_witness_replacements_and_rollback_recheck_the_data() {
+fn equal_count_pending_witness_replacements_and_rollback_keep_the_published_probes() {
     let engine = engine(":ann :worksFor :acme .");
     let options = options();
     let base = engine.snapshot();
@@ -110,10 +110,561 @@ fn equal_count_pending_witness_replacements_and_rollback_recheck_the_data() {
     let report = check(&pending, &options, &["<http://example.org/ann>"]);
     assert_eq!((report.patterns, report.realised, report.checks), (1, 0, 1));
     drop(tx);
+    // The pending read kept nothing (contract S3), so the published snapshot's own probe
+    // still answers: no check is asked again.
     let report = check(&engine.snapshot(), &options, &["<http://example.org/ann>"]);
-    assert_eq!((report.patterns, report.realised, report.checks), (0, 1, 1));
+    assert_eq!((report.patterns, report.realised, report.checks), (0, 1, 0));
     let report = check(&engine.snapshot(), &options, &["<http://example.org/ann>"]);
     assert_eq!((report.realised, report.checks), (1, 0));
+}
+
+/// Each entry the rewriting keeps for other operations (contract S3): its key, the asserted
+/// state its memberships were read at, and its TBox.
+fn kept_entries(ql: &QlRewriting) -> Vec<(SnapshotIdentity, AssertedIdentity, *const Tbox)> {
+    let cached = ql.cached.lock().unwrap();
+    cached
+        .iter()
+        .map(|c| (c.key, c.members.at, Arc::as_ptr(&c.tbox)))
+        .collect()
+}
+
+/// The probes the rewriting keeps for other operations (contract S3): the view they were
+/// asked of, and each probe with its truth value.
+fn kept_probes(ql: &QlRewriting) -> (Option<SnapshotIdentity>, ProbeAnswers) {
+    let realised = ql.realised.lock().unwrap();
+    (realised.0, realised.1.all())
+}
+
+/// Rewriting options with `ql`, sharing its state.
+fn sharing(ql: &Arc<QlRewriting>) -> QueryOptions {
+    QueryOptions {
+        ql: Some(Arc::clone(ql)),
+        ..QueryOptions::default()
+    }
+}
+
+/// The schema's restriction, as the store holds it.
+fn restriction(snapshot: &Snapshot) -> TermId {
+    let on = iri(snapshot, OWL, "onProperty").unwrap();
+    snapshot
+        .quads_for_pattern_in(
+            ReadModel::Asserted,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(on),
+                object: None,
+                graph: GraphSelector::Any,
+            },
+        )
+        .next()
+        .unwrap()
+        .subject
+}
+
+/// The statement that `s` is in `class`, by ids the store has.
+fn membership(snapshot: &Snapshot, s: &str, class: TermId) -> EncodedQuad {
+    EncodedQuad {
+        subject: snapshot
+            .lookup(NamedNodeRef::new_unchecked(&format!("{EX}{s}")).into())
+            .unwrap(),
+        predicate: iri(snapshot, RDF, "type").unwrap(),
+        object: class,
+        graph: TermId::DEFAULT_GRAPH,
+    }
+}
+
+/// The snapshots no commit published that `changes` (each added or removed, by ids the
+/// store has) make over the latest: a writer's pending one, its canonical view, a
+/// speculative one and a private one (contract S3, review r0 §5 items 1 and 2). None has a
+/// `SharedState`.
+fn unpublished(engine: &Engine, changes: &[(EncodedQuad, bool)]) -> Vec<(&'static str, Snapshot)> {
+    let apply = |tx: &mut nrese_engine::Transaction<'_>| {
+        for &(quad, added) in changes {
+            match added {
+                true => tx.insert_encoded(quad),
+                false => tx.remove_encoded(quad),
+            };
+        }
+    };
+    let mut out = Vec::new();
+    let mut tx = engine.transaction();
+    apply(&mut tx);
+    let pending = tx.pending_snapshot();
+    drop(tx);
+    out.push((
+        "the canonical view of a pending",
+        pending.with_canonical_equality(),
+    ));
+    out.push(("a pending", pending));
+    let mut tx = engine.speculative();
+    apply(&mut tx);
+    out.push(("a speculative", tx.pending_snapshot()));
+    drop(tx);
+    let budget = Arc::new(nrese_exec::Budget::unlimited());
+    let mut tx = engine.speculative_over(&engine.snapshot(), budget).unwrap();
+    for &(quad, added) in changes {
+        match added {
+            true => tx.insert_encoded(quad),
+            false => tx.remove_encoded(quad),
+        };
+    }
+    out.push(("a private", tx.pending_snapshot().unwrap()));
+    for (name, snapshot) in &out {
+        assert!(
+            snapshot.shared_state().is_none(),
+            "{name} snapshot is published"
+        );
+    }
+    out
+}
+
+/// Contract S3, the TBox family (dictionary 3.3, G1): a snapshot no commit published whose
+/// restriction gains a member reads its own schema, answering as a fresh rewriting does,
+/// and leaves the kept entry as it found it. The next published read is the kept TBox,
+/// with no membership scanned.
+#[test]
+fn unpublished_schema_reads_leave_the_kept_tbox() {
+    let engine = engine("");
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = sharing(&ql);
+    let published = engine.snapshot();
+    let expected = ["<http://example.org/ann>"];
+    check(&published, &options, &expected);
+    let before = kept_entries(&ql);
+    let gains = membership(&published, "ann", restriction(&published));
+    // A version keeps what any rewriting reads of it (dictionary 3.0c), so the fresh
+    // rewriting reads equal snapshots of versions of their own.
+    let alike = unpublished(&engine, &[(gains, true)]);
+    for ((name, snapshot), (_, same)) in unpublished(&engine, &[(gains, true)]).iter().zip(&alike) {
+        let fresh = sharing(&Arc::new(QlRewriting::new(Closure { lists: true })));
+        let own = check(same, &fresh, &expected);
+        assert_eq!(check(snapshot, &options, &expected), own, "{name} snapshot");
+        assert_eq!(kept_entries(&ql), before, "{name} snapshot");
+    }
+    MEMBER_SCANS.set(0);
+    check(&published, &options, &expected);
+    assert_eq!((kept_entries(&ql), MEMBER_SCANS.get()), (before, 0));
+}
+
+/// Contract S3, the memberships family (G2): snapshots no commit published that leave the
+/// same expressions with a member (one more, one swapped, or no change) reuse the kept
+/// TBox and leave its key and memberships as they were. The next published read scans no
+/// membership.
+#[test]
+fn unpublished_membership_reads_leave_the_kept_memberships() {
+    let engine = engine(":m0 a _:restriction .");
+    let ql = QlRewriting::new(Closure { lists: true });
+    let published = engine.snapshot();
+    let original = ql.tbox(&published, None);
+    let before = kept_entries(&ql);
+    let class = restriction(&published);
+    let (added, kept) = (
+        membership(&published, "ann", class),
+        membership(&published, "m0", class),
+    );
+    for changes in [
+        &[(added, true)][..],
+        &[(added, true), (kept, false)][..],
+        &[][..],
+    ] {
+        for (name, snapshot) in unpublished(&engine, changes) {
+            let tbox = ql.tbox(&snapshot, None);
+            assert!(
+                Arc::ptr_eq(&original, &tbox),
+                "{name} snapshot, {changes:?}"
+            );
+            assert_eq!(kept_entries(&ql), before, "{name} snapshot, {changes:?}");
+        }
+    }
+    MEMBER_SCANS.set(0);
+    assert!(Arc::ptr_eq(&original, &ql.tbox(&published, None)));
+    assert_eq!((kept_entries(&ql), MEMBER_SCANS.get()), (before, 0));
+}
+
+/// Contract S3, the probes family (G3): a probe asked of a snapshot no commit published is
+/// answered from that snapshot's data and kept by its own version alone (dictionary 3.0c;
+/// review r1 F1), so asked again of the same snapshot it is answered without a check; the
+/// published view's probes stay and answer it again. A probe the budget leaves unasked
+/// keeps no truth value (review r0 §5 item 4).
+#[test]
+fn unpublished_probes_are_kept_by_their_own_version_alone() {
+    let engine = engine(":ann :worksFor :acme .");
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = sharing(&ql);
+    let published = engine.snapshot();
+    let expected = ["<http://example.org/ann>"];
+    let report = check(&published, &options, &expected);
+    assert_eq!((report.realised, report.checks), (1, 1));
+    let before = kept_probes(&ql);
+    assert!(!before.1.is_empty());
+    let id = |s: &str| {
+        published
+            .lookup(NamedNodeRef::new_unchecked(&format!("{EX}{s}")).into())
+            .unwrap()
+    };
+    let witness = EncodedQuad {
+        subject: id("ann"),
+        predicate: id("worksFor"),
+        object: id("acme"),
+        graph: TermId::DEFAULT_GRAPH,
+    };
+    let unasked = || {
+        Arc::new(
+            QlRewriting::new(Closure { lists: true }).with_limits(Limits {
+                checks: 0,
+                ..Limits::default()
+            }),
+        )
+    };
+    for (name, snapshot) in unpublished(&engine, &[(witness, false)]) {
+        // Left unasked first, the version keeps nothing, so the next asks it.
+        let report = check(&snapshot, &sharing(&unasked()), &expected);
+        assert_eq!(report.checks, 0, "{name} snapshot, unasked");
+        for (ask, checks) in [(0, 1), (1, 0)] {
+            let report = check(&snapshot, &options, &expected);
+            assert_eq!(
+                (report.realised, report.checks),
+                (0, checks),
+                "{name} snapshot, ask {ask}"
+            );
+        }
+        assert_eq!(kept_probes(&ql), before, "{name} snapshot");
+    }
+    let report = check(&published, &options, &expected);
+    assert_eq!((report.realised, report.checks), (1, 0));
+    let unasked = unasked();
+    check(&published, &sharing(&unasked), &expected);
+    assert!(kept_probes(&unasked).1.is_empty());
+}
+
+/// Review r1 F1 (dictionary 3.0c): a pending snapshot read again, as a store session's is,
+/// reads its schema once. Its first read compiles, or reuses a published TBox its schema
+/// matches; later reads of it scan no membership and give the same TBox, and the store's
+/// shared entries stay as they were. A new pending snapshot is a new version, read afresh.
+#[test]
+fn a_retained_pending_snapshot_reads_its_schema_once() {
+    for (data, gains, reuses) in [
+        // The memberless restriction gains a member: its own TBox.
+        ("", "ann", false),
+        // The restriction has one, and gets another: the published TBox.
+        (":m0 a _:restriction .", "ann", true),
+    ] {
+        let engine = engine(data);
+        let ql = QlRewriting::new(Closure { lists: true });
+        let published = engine.snapshot();
+        let original = ql.tbox(&published, None);
+        let before = kept_entries(&ql);
+        let member = membership(&published, gains, restriction(&published));
+        let mut tx = engine.transaction();
+        tx.insert_encoded(member);
+        let pending = tx.pending_snapshot();
+        let first = ql.tbox(&pending, None);
+        assert_eq!(Arc::ptr_eq(&original, &first), reuses, "{data:?}");
+        for read in 0..3 {
+            MEMBER_SCANS.set(0);
+            let again = ql.tbox(&pending, None);
+            assert!(Arc::ptr_eq(&first, &again), "{data:?}, read {read}");
+            assert_eq!(MEMBER_SCANS.get(), 0, "{data:?}, read {read}");
+        }
+        assert_eq!(kept_entries(&ql), before, "{data:?}");
+        MEMBER_SCANS.set(0);
+        ql.tbox(&tx.pending_snapshot(), None);
+        assert!(MEMBER_SCANS.get() > 0, "{data:?}: a new pending snapshot");
+    }
+}
+
+/// Dictionary 3.0c's required guard: views of one version with other equality modes (the
+/// canonical view of a pending snapshot) share its slot but never an entry. Each reads its
+/// own schema once, and answers as a fresh rewriting does.
+#[test]
+fn views_of_one_version_in_other_equality_modes_keep_their_own_entries() {
+    let engine = engine("");
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = sharing(&ql);
+    let published = engine.snapshot();
+    let member = membership(&published, "ann", restriction(&published));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(member);
+    let pending = tx.pending_snapshot();
+    let canonical = pending.with_canonical_equality();
+    assert_ne!(canonical.identity(), pending.identity());
+    // The fresh rewriting reads equal views of a version of their own.
+    let alike = tx.pending_snapshot();
+    let alike_canonical = alike.with_canonical_equality();
+    let expected = ["<http://example.org/ann>"];
+    for (view, same) in [(&pending, &alike), (&canonical, &alike_canonical)] {
+        let fresh = sharing(&Arc::new(QlRewriting::new(Closure { lists: true })));
+        let own = check(same, &fresh, &expected);
+        MEMBER_SCANS.set(0);
+        assert_eq!(check(view, &options, &expected), own);
+        assert!(MEMBER_SCANS.get() > 0, "the first read of each view");
+    }
+    for view in [&pending, &canonical, &pending] {
+        MEMBER_SCANS.set(0);
+        check(view, &options, &expected);
+        assert_eq!(MEMBER_SCANS.get(), 0, "a view read again");
+    }
+}
+
+/// A version's schema is read and compiled with none of QL's locks held (DICT2, 9 Nov): a
+/// lock held across a membership build or a compile serialises the version's other views,
+/// and deadlocks once that work reaches a pool that can run another read on this thread.
+/// The version's entries and the store's are free whenever a pending snapshot's read
+/// builds its memberships or compiles; looked at with `try_lock`, so the test can't hang.
+#[test]
+fn a_versions_schema_is_read_and_compiled_outside_qls_locks() {
+    let engine = engine("");
+    let published = engine.snapshot();
+    let member = membership(&published, "ann", restriction(&published));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(member);
+    let pending = tx.pending_snapshot();
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (looked, view, store) = (std::rc::Rc::clone(&seen), pending.clone(), Arc::clone(&ql));
+    BUILDING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let nrese_engine::Admission::Own(own) = view.admission() else {
+                panic!("a pending snapshot is unpublished");
+            };
+            let version = own
+                .get::<QlOwn>()
+                .is_none_or(|mine| mine.entries.try_lock().is_ok());
+            let shared = store.cached.try_lock().is_ok();
+            looked.borrow_mut().push((version, shared));
+        }))
+    });
+    let tbox = ql.tbox(&pending, None);
+    BUILDING.with(|hook| *hook.borrow_mut() = None);
+    let seen = seen.borrow();
+    assert!(!seen.is_empty(), "the read built its memberships");
+    assert!(
+        seen.iter().all(|&(version, shared)| version && shared),
+        "locks held (version's, store's) at each build: {seen:?}"
+    );
+    assert!(Arc::ptr_eq(&tbox, &ql.tbox(&pending, None)));
+}
+
+/// What the TBox compiles to depends on the closure, so two rewritings with other closures
+/// reading one pending snapshot never get each other's TBox from its version.
+#[test]
+fn rewritings_with_other_closures_keep_their_own_tboxes_of_a_version() {
+    let engine = engine("");
+    let published = engine.snapshot();
+    let member = membership(&published, "ann", restriction(&published));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(member);
+    let pending = tx.pending_snapshot();
+    let rl = QlRewriting::new(Closure { lists: true });
+    let ql = QlRewriting::new(Closure { lists: false });
+    let on_rl = rl.tbox(&pending, None);
+    let on_ql = ql.tbox(&pending, None);
+    assert!(!Arc::ptr_eq(&on_rl, &on_ql));
+    assert!(Arc::ptr_eq(&on_rl, &rl.tbox(&pending, None)));
+    assert!(Arc::ptr_eq(&on_ql, &ql.tbox(&pending, None)));
+}
+
+/// A probe asks the default graph the query reads, which the union mode decides (sol-loop
+/// r1 S1): a store's own snapshot and a pending one, read in one mode then the other, each
+/// get their answers, whether the probes are the store's or the version's. Here the witness
+/// is only in a named graph: in the union it is realised, outside it the rewriting answers.
+#[test]
+fn probes_are_kept_per_default_graph_mode() {
+    let engine = engine("");
+    let mut tx = engine.transaction();
+    tx.insert(
+        Quad::new(
+            NamedNode::new_unchecked(format!("{EX}ann")),
+            NamedNode::new_unchecked(format!("{EX}worksFor")),
+            NamedNode::new_unchecked(format!("{EX}acme")),
+            GraphName::NamedNode(NamedNode::new_unchecked(format!("{EX}g"))),
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(quad("bob", &format!("{EX}knows"), "acme").as_ref());
+    let pending = tx.pending_snapshot();
+    let expected = ["<http://example.org/ann>"];
+    for snapshot in [&engine.snapshot(), &pending] {
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        for union in [true, false, true] {
+            let options = QueryOptions {
+                union_default_graph: union,
+                ..sharing(&ql)
+            };
+            let report = check(snapshot, &options, &expected);
+            assert_eq!(report.realised, usize::from(union), "union {union}");
+        }
+    }
+}
+
+/// A probe's answer depends on whether GeoSPARQL relations are computed from the geometries
+/// or only read as stated (sol-loop r2 S2): `ann` intersects `acme` by their points, and
+/// states no relation. A published and a pending snapshot, read computing, stated only,
+/// then computing again with one rewriting, each answer as a fresh rewriting does on a
+/// snapshot of its own; stated only, the existential gives `ann` alone.
+#[test]
+fn probes_are_kept_per_geosparql_mode() {
+    let engine = engine(
+        "@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+        :Worker rdfs:subClassOf [ a owl:Restriction ; owl:onProperty geo:sfIntersects ;
+            owl:someValuesFrom :Site ] .
+        :ann a :Worker ; geo:hasGeometry :ga .
+        :ga geo:asWKT \"POINT(1 1)\"^^geo:wktLiteral .
+        :acme a :Site ; geo:hasGeometry :gb .
+        :gb geo:asWKT \"POINT(1 1)\"^^geo:wktLiteral .",
+    );
+    let query = SparqlParser::new()
+        .parse_query(
+            "SELECT ?x WHERE { ?x <http://www.opengis.net/ont/geosparql#sfIntersects> ?y }",
+        )
+        .unwrap();
+    let answers = |snapshot: &Snapshot, options: &QueryOptions| {
+        let QueryResults::Solutions(rows) = evaluate_query(snapshot, &query, options).unwrap()
+        else {
+            panic!("solutions expected");
+        };
+        let mut got: Vec<String> = rows
+            .map(|row| row.unwrap().get("x").unwrap().to_string())
+            .collect();
+        got.sort();
+        got.dedup();
+        got
+    };
+    let mut tx = engine.transaction();
+    tx.insert(quad("bob", &format!("{EX}knows"), "acme").as_ref());
+    let pending = tx.pending_snapshot();
+    let published = engine.snapshot();
+    for (name, snapshot) in [("published", &published), ("pending", &pending)] {
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        for stated_only in [false, true, false] {
+            let options = QueryOptions {
+                geosparql_stated_only: stated_only,
+                ..sharing(&ql)
+            };
+            // A fresh rewriting on a snapshot of its own: a pending one is a new version.
+            let own = match name {
+                "published" => published.clone(),
+                _ => tx.pending_snapshot(),
+            };
+            let fresh = QueryOptions {
+                geosparql_stated_only: stated_only,
+                ..sharing(&Arc::new(QlRewriting::new(Closure { lists: true })))
+            };
+            let expected = answers(&own, &fresh);
+            if stated_only {
+                assert_eq!(expected, ["<http://example.org/ann>"], "{name}");
+            }
+            assert_eq!(
+                answers(snapshot, &options),
+                expected,
+                "{name}, stated only {stated_only}"
+            );
+        }
+    }
+}
+
+/// A mask of a published snapshot is published (dictionary 3.0): changing only its
+/// inferred mask, the schema read reuses the kept TBox, and its answers and probes are what
+/// a fresh rewriting gives it (review r0 §5 item 4).
+#[test]
+fn a_published_mask_reuses_the_tbox_and_answers_as_a_fresh_read() {
+    let engine = engine(":ann :worksFor :acme .");
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = sharing(&ql);
+    let published = engine.snapshot();
+    let expected = ["<http://example.org/ann>"];
+    check(&published, &options, &expected);
+    let original = ql.tbox(&published, None);
+    let mask = published.with_inferred_subset(InferredSubset::Only(Vec::new()));
+    assert!(mask.shared_state().is_some());
+    assert_ne!(mask.identity(), published.identity());
+    let fresh = sharing(&Arc::new(QlRewriting::new(Closure { lists: true })));
+    assert_eq!(
+        check(&mask, &options, &expected),
+        check(&mask, &fresh, &expected)
+    );
+    assert!(Arc::ptr_eq(&original, &ql.tbox(&mask, None)));
+}
+
+/// The probe gate (review r0 §1, "QL realised probes"): a reader of some graphs asks no
+/// probe of the data, so the store's probes stay as they were.
+#[test]
+fn graph_restricted_readers_keep_no_probes() {
+    let engine = engine(":ann :worksFor :acme .");
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = QueryOptions {
+        access: Some(Arc::new(GraphAccess {
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        })),
+        ..sharing(&ql)
+    };
+    let report = check(&engine.snapshot(), &options, &["<http://example.org/ann>"]);
+    assert_eq!(report.checks, 0);
+    assert_eq!(kept_probes(&ql), (None, Vec::new()));
+}
+
+/// A view that adds inferred statements to a published snapshot, as the DL bounds derive
+/// (master, 8 Nov 23:20), and its base: in either order of reading, each gets what a fresh
+/// rewriting gives it.
+/// - Their TBoxes may be one: what the TBox reads (the core, the memberships, the equality
+///   probe) is asserted only (`read_core`, `member_of`, `has_equality`).
+/// - Their probes ask the materialised data, which differs (here the witness is only in the
+///   view), so they're kept apart by the view's identity (`realised`'s lookup).
+#[test]
+// The DL bounds' own constructor (dictionary 3.0b): only they and their tests may call it.
+#[allow(clippy::disallowed_methods)]
+fn an_added_view_and_its_base_keep_their_own_probes() {
+    let engine = engine(":other :knows :acme .");
+    let base = engine.snapshot();
+    let id = |s: &str| {
+        base.lookup(NamedNodeRef::new_unchecked(&format!("{EX}{s}")).into())
+            .unwrap()
+    };
+    let witness = nrese_engine::EncodedTriple {
+        subject: id("ann"),
+        predicate: id("worksFor"),
+        object: id("acme"),
+    };
+    // The view keeps its base's publication, so it may keep what it reads (3.0b).
+    let added = base
+        .with_inferred_derived_within(&[witness], &Arc::new(nrese_exec::Budget::unlimited()))
+        .unwrap();
+    assert!(added.shared_state().is_some());
+    assert_ne!(added.identity(), base.identity());
+    assert_eq!(added.asserted_identity(), base.asserted_identity());
+    let expected = ["<http://example.org/ann>"];
+    let fresh = |snapshot: &Snapshot| {
+        let report = check(
+            snapshot,
+            &sharing(&Arc::new(QlRewriting::new(Closure { lists: true }))),
+            &expected,
+        );
+        (report.patterns, report.realised, report.completeness)
+    };
+    let (on_base, on_added) = (fresh(&base), fresh(&added));
+    // The case is one only where the two answer their probes differently.
+    assert_ne!(on_base.1, on_added.1);
+    for order in [[&base, &added, &base], [&added, &base, &added]] {
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        let options = sharing(&ql);
+        for snapshot in order {
+            let report = check(snapshot, &options, &expected);
+            let own = match snapshot.identity() == base.identity() {
+                true => &on_base,
+                false => &on_added,
+            };
+            assert_eq!(
+                &(report.patterns, report.realised, report.completeness),
+                own
+            );
+        }
+        assert!(Arc::ptr_eq(&ql.tbox(&base, None), &ql.tbox(&added, None)));
+    }
 }
 
 #[test]

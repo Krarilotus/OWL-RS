@@ -39,12 +39,12 @@ pub mod witness;
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
 pub use engine::{
-    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitSummary, Content, CorpusTuning,
-    Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats,
-    EqualityClasses, HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch,
-    LogExpectation, OwnState, PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation,
-    SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope,
-    Transaction,
+    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitSummary, Content,
+    CorpusTuning, Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig,
+    EngineStats, EqualityClasses, Finished, HeavyGroups, ImageInfo, InferredMask, InferredSubset,
+    LogBatch, LogExpectation, NoteError, OwnState, PrivateTransaction, ProbeCursor, ReadModel,
+    Rematerialisation, SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity,
+    TextCorpusStats, TextScope, Transaction, WriterHeld,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

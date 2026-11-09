@@ -41,6 +41,7 @@ mod snapshot;
 pub(crate) mod spill;
 mod statistics;
 mod transaction;
+mod writer;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,6 +69,7 @@ pub use snapshot::{
     ProbeCursor, SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
+pub use writer::{CommitNote, Finished, NoteError, WriterHeld};
 
 /// `slot` (the writer or checkpoint slot, `name`d), taken if free; otherwise waited for off
 /// the Rayon pool, and refused on a pool thread ([`EngineError::SlotBusy`]). Its holder runs
