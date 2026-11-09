@@ -280,6 +280,28 @@ fn a_kept_pending_snapshot_is_not_returned_after_an_intern() {
     );
 }
 
+/// A kept pending snapshot no longer current (a term interned since) is let go before its
+/// replacement is charged (sol-loop r2 on DUR-6, S4): a budget just enough for one pending
+/// snapshot (the highest a first one used) makes the replacement too, once the caller has dropped
+/// its own. Before the fix the stale snapshot kept its charge through the replacement's build,
+/// which the budget then refused.
+#[test]
+fn a_stale_kept_pending_snapshot_is_let_go_before_its_replacement_is_charged() {
+    let engine = store(10);
+    let mut tx = engine.speculative();
+    tx.insert(named(0).as_ref());
+    let calibration = unlimited();
+    drop(tx.pending_snapshot_within(&calibration).unwrap());
+    let budget = Arc::new(Budget::new(calibration.peak()));
+    drop(tx.pending_snapshot_within(&budget).unwrap());
+    let fresh = node("fresh_after_memo");
+    let id = tx.intern(fresh.as_ref().into());
+    let snapshot = tx
+        .pending_snapshot_within(&budget)
+        .expect("a budget enough for one pending snapshot");
+    assert_eq!(snapshot.lookup(fresh.as_ref().into()), Some(id));
+}
+
 /// A pending snapshot refused at any point of what it makes (sol-loop r1 on DUR-6, S3: the
 /// inferred stack's run refused after the asserted one was made) holds nothing beyond its charge
 /// at any moment, and keeps nothing: budgets from nothing up, each a fiftieth of what the made
