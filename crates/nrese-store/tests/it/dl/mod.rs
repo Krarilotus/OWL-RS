@@ -7,6 +7,7 @@ mod entailment;
 mod explain;
 mod gap;
 mod gates;
+mod identity;
 mod mode;
 mod queries;
 mod review;
