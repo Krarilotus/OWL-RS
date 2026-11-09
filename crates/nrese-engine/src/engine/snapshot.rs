@@ -2031,10 +2031,11 @@ impl Snapshot {
         self.vocabulary.decode(id)
     }
 
-    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
-    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
-    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
-    /// snapshot doesn't know.
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, once, for
+    /// every kind of term: inline, the dictionary's, a private snapshot's own, and a triple
+    /// term with its components ([`Dictionary::decode_charged`]: the bound and the decoding
+    /// read one state of the dictionary). `Ok(None)` for an id that isn't a term this
+    /// snapshot knows.
     pub fn decode_charged<E>(
         &self,
         id: TermId,
@@ -2046,8 +2047,8 @@ impl Snapshot {
 
     /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
     /// as stored now: a checkpoint may store the term compressed after, so a charge for a
-    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
-    /// ids this snapshot doesn't know.
+    /// decode goes through [`Self::decode_charged`]. `None` for ids this snapshot doesn't
+    /// know.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
         self.vocabulary
             .decode_bound(id, self.version.dictionary_len)

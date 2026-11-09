@@ -33,6 +33,8 @@
 //! `inner`'s write lock, which must not use the dictionary at all. A vector search's `accept`
 //! runs with none ([`super::vectors::SearchInput`]).
 
+use std::cell::OnceCell;
+
 use hashbrown::HashTable;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{
@@ -42,6 +44,7 @@ use nrese_rdf::{
 use parking_lot::RwLock;
 
 use super::hash::key_hash;
+use super::inline::inline_bound;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
 use super::pending::{Adopted, NEW, Pending};
@@ -1307,78 +1310,37 @@ impl Dictionary {
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this
     /// dictionary (or the default-graph marker).
     pub fn decode(&self, id: TermId) -> Option<Term> {
-        match id.kind() {
-            TermKind::Integer
-            | TermKind::Boolean
-            | TermKind::Decimal
-            | TermKind::Date
-            | TermKind::DateTime
-            | TermKind::DerivedInteger => inline_to_literal(id).map(Term::from),
-            TermKind::DefaultGraph => None,
-            TermKind::Iri
-            | TermKind::BlankNode
-            | TermKind::String
-            | TermKind::LangString
-            | TermKind::TypedLiteral
-            | TermKind::Triple => {
-                let ids = {
-                    // Recursive: callers may hold a read lock already (`with_views`), and a
-                    // plain read would queue behind a waiting writer, which waits for them.
-                    let inner = self.inner.read_recursive();
-                    if id.payload() >= inner.len() {
-                        return None;
-                    }
-                    let key = inner.key(id.payload());
-                    match triple_ids(&key) {
-                        Some(ids) => ids,
-                        None => return Some(decode_key(&key)),
-                    }
-                };
-                let [s, p, o] = ids;
-                let Term::NamedNode(predicate) = self.decode(p)? else {
-                    return None;
-                };
-                Some(
-                    nrese_rdf::Triple::new(
-                        NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
-                        predicate,
-                        self.decode(o)?,
-                    )
-                    .into(),
-                )
-            }
-        }
+        self.terms(None).decode(id)
     }
 
-    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first through
-    /// `charge`: the term's text, and for a key stored compressed the buffers it is
-    /// decompressed through. The bound and the decoding read one state of the dictionary,
-    /// under one read guard. `Ok(None)` for inline ids, triple terms (decoded part by part)
-    /// and unknown ids, which it doesn't decode.
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, once, for
+    /// the whole term: an inline literal's text, a dictionary term's text and for a key stored
+    /// compressed the buffers it is decompressed through, a triple term's components so and
+    /// its boxes. The bound and the decoding read one state of the dictionary, under one read
+    /// guard. `Ok(None)` for an id that isn't a term of the dictionary (charged first if only
+    /// its decode tells, as for a triple term whose predicate isn't an IRI).
     pub fn decode_charged<E>(
         &self,
         id: TermId,
         charge: impl FnOnce(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        if !id.kind().is_dictionary() || id.kind() == TermKind::Triple {
-            return Ok(None);
-        }
-        let inner = self.inner.read_recursive();
-        if id.payload() >= inner.len() {
-            return Ok(None);
-        }
-        charge(inner.decode_bound(id.payload()))?;
-        Ok(Some(decode_key(&inner.key(id.payload()))))
+        self.terms(None).decode_charged(id, charge)
     }
 
-    /// [`Self::decode_charged`]'s bound for the dictionary term `id`, as the dictionary
-    /// stores it now; `None` for inline ids, triple terms and unknown ids.
+    /// [`Self::decode_charged`]'s bound for `id`, as the dictionary stores it now; `None` for
+    /// an id that isn't a term of the dictionary.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
-        if !id.kind().is_dictionary() || id.kind() == TermKind::Triple {
-            return None;
+        self.terms(None).bound(id)
+    }
+
+    /// The one way to decode a term of the dictionary, and of a private view of it with `own`
+    /// entries ([`Terms`]).
+    pub(super) fn terms<'a>(&'a self, own: Option<&'a dyn OwnKeys>) -> Terms<'a> {
+        Terms {
+            dictionary: self,
+            inner: OnceCell::new(),
+            own,
         }
-        let inner = self.inner.read_recursive();
-        (id.payload() < inner.len()).then(|| inner.decode_bound(id.payload()))
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id`, without allocating: the
@@ -2166,6 +2128,167 @@ pub(super) fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
         TermId::from_raw(u64::from_be_bytes(bytes))
     };
     Some([id(0), id(1), id(2)])
+}
+
+/// A private view's own entries ([`super::overlay::OverlayView`]), which [`Terms`] reads
+/// before the dictionary's.
+pub(super) trait OwnKeys {
+    /// Whether `id` is the view's own: a dictionary kind at or past its start.
+    fn is_own(&self, id: TermId) -> bool;
+    /// The own entry `id`'s key, plain; `None` for one the view doesn't have.
+    fn own_key(&self, id: TermId) -> Option<&[u8]>;
+}
+
+/// Terms read for one decode or its bound: the dictionary's entries in one state of it, its
+/// read guard taken at the first such entry and held to the end, and a private view's own
+/// entries first where there is one. Every kind of term is answered by [`Self::entry`], which
+/// [`Self::decode`] and [`Self::bound`] share, so a charged decode covers every kind the plain
+/// one decodes.
+pub(super) struct Terms<'a> {
+    dictionary: &'a Dictionary,
+    /// Recursive: callers may hold a read lock already (`with_views`), and a plain read would
+    /// queue behind a waiting writer, which waits for them.
+    inner: OnceCell<parking_lot::RwLockReadGuard<'a, Inner>>,
+    own: Option<&'a dyn OwnKeys>,
+}
+
+/// What a term's decode reads.
+enum Entry<'k> {
+    /// An inline literal: its id carries its value.
+    Inline(TermId),
+    /// A triple term keyed by its components' ids.
+    Triple([TermId; 3]),
+    /// A dictionary entry: its key, by index, decoded.
+    Shared(u64),
+    /// A private view's own entry: its key, plain, decoded.
+    Own(&'k [u8]),
+}
+
+/// A triple term's key copied out of a compressed base is decompressed into this much room on
+/// the stack: FSST's bound for the most a 25-byte key stores (its tag and each of 24 bytes an
+/// escape, 49 bytes), 401 ([`Codec::decompress_in`]), with room to spare. A longer stored key
+/// isn't a triple term's by ids.
+const TRIPLE_KEY_ROOM: usize = 512;
+
+/// What a triple term keyed by its text (the first RDF 1.2 version's) holds while its text
+/// is parsed beyond the key's own bound, per byte of that bound: the line it is parsed as,
+/// the parser's buffers and the term it makes.
+const TEXT_TRIPLE_BYTES_PER_KEY_BYTE: usize = 16;
+
+/// And beside that, the parser's own state.
+const TEXT_TRIPLE_PARSER: usize = 4096;
+
+impl Terms<'_> {
+    fn inner(&self) -> &Inner {
+        self.inner
+            .get_or_init(|| self.dictionary.inner.read_recursive())
+    }
+
+    fn entry(&self, id: TermId) -> Option<Entry<'_>> {
+        match id.kind() {
+            TermKind::Integer
+            | TermKind::Boolean
+            | TermKind::Decimal
+            | TermKind::Date
+            | TermKind::DateTime
+            | TermKind::DerivedInteger => Some(Entry::Inline(id)),
+            TermKind::DefaultGraph => None,
+            TermKind::Iri
+            | TermKind::BlankNode
+            | TermKind::String
+            | TermKind::LangString
+            | TermKind::TypedLiteral
+            | TermKind::Triple => {
+                if let Some(own) = self.own.filter(|own| own.is_own(id)) {
+                    let key = own.own_key(id)?;
+                    return Some(triple_ids(key).map_or(Entry::Own(key), Entry::Triple));
+                }
+                let inner = self.inner();
+                let index = id.payload();
+                if index >= inner.len() {
+                    return None;
+                }
+                if id.kind() == TermKind::Triple
+                    && let Some(ids) = stored_triple_ids(inner, index)
+                {
+                    return Some(Entry::Triple(ids));
+                }
+                Some(Entry::Shared(index))
+            }
+        }
+    }
+
+    pub(super) fn decode(&self, id: TermId) -> Option<Term> {
+        match self.entry(id)? {
+            Entry::Inline(id) => inline_to_literal(id).map(Term::from),
+            Entry::Own(key) => Some(decode_key(key)),
+            Entry::Shared(index) => Some(decode_key(&self.inner().key(index))),
+            Entry::Triple([s, p, o]) => {
+                let Term::NamedNode(predicate) = self.decode(p)? else {
+                    return None;
+                };
+                Some(
+                    nrese_rdf::Triple::new(
+                        NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
+                        predicate,
+                        self.decode(o)?,
+                    )
+                    .into(),
+                )
+            }
+        }
+    }
+
+    /// The most bytes [`Self::decode`] of `id` holds at once, allocating nothing; `None`
+    /// where it decodes nothing, as an unknown id or component.
+    pub(super) fn bound(&self, id: TermId) -> Option<usize> {
+        let key_bound = |bound: usize| match id.kind() {
+            TermKind::Triple => TEXT_TRIPLE_BYTES_PER_KEY_BYTE
+                .saturating_mul(bound)
+                .saturating_add(TEXT_TRIPLE_PARSER)
+                .saturating_add(bound),
+            _ => bound,
+        };
+        Some(match self.entry(id)? {
+            Entry::Inline(id) => inline_bound(id)?,
+            Entry::Own(key) => key_bound(key.len()),
+            Entry::Shared(index) => key_bound(self.inner().decode_bound(index)),
+            Entry::Triple([s, p, o]) => std::mem::size_of::<nrese_rdf::Triple>()
+                .saturating_add(self.bound(s)?)
+                .saturating_add(self.bound(p)?)
+                .saturating_add(self.bound(o)?),
+        })
+    }
+
+    /// [`Self::decode`] of `id`, [`Self::bound`] charged first through `charge`.
+    pub(super) fn decode_charged<E>(
+        &self,
+        id: TermId,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<Term>, E> {
+        let Some(bound) = self.bound(id) else {
+            return Ok(None);
+        };
+        charge(bound)?;
+        Ok(self.decode(id))
+    }
+}
+
+/// The component ids of the dictionary entry `index` if it is a triple term keyed by them,
+/// read in place or, from a compressed base, decompressed on the stack: nothing allocated.
+fn stored_triple_ids(inner: &Inner, index: u64) -> Option<[TermId; 3]> {
+    if index >= inner.base_len() {
+        return triple_ids(inner.added_key(index));
+    }
+    let base = inner.base.as_ref()?;
+    let stored = base.key(index);
+    match &base.codec {
+        None => triple_ids(stored),
+        Some(codec) => {
+            let mut room = [std::mem::MaybeUninit::<u8>::uninit(); TRIPLE_KEY_ROOM];
+            triple_ids(codec.decompress_in(stored, &mut room)?)
+        }
+    }
 }
 
 /// A triple term from the N-Triples text of a key the first RDF 1.2 version wrote.
