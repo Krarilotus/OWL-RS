@@ -590,6 +590,9 @@ impl Shared {
                     self.dictionary.save_derived();
                     return Ok(snapshot.revision());
                 }
+                // The names a reopen left pending, before anything is written (deferred-sync
+                // design note of 8 Nov): a failure leaves the log as it was.
+                wal.settle_names()?;
                 wal.rotate(snapshot.revision() + 1)?;
                 (snapshot, clock)
             };

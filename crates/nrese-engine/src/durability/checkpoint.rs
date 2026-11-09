@@ -734,7 +734,7 @@ pub(crate) fn write_parts<'a>(
     file.sync_all()?;
     drop(file);
     let path = checkpoint_path(dir, revision, EXTENSION);
-    fs::rename(&tmp, &path)?;
+    super::place::rename(&tmp, &path)?;
     #[cfg(test)]
     super::fault::check(&super::fault::FAIL_DIR_SYNC, "directory sync")?;
     super::sync_dir(dir)?;

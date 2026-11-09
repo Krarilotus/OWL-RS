@@ -16,6 +16,7 @@ import argparse
 import atexit
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -24,9 +25,13 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import tomllib
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
@@ -36,7 +41,7 @@ from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, Proces
                       run_quiet, shell)
 from . import receipts
 from .datasets import Store
-from .manifest import Manifest, ManifestError, append_attempts, image_ids
+from .manifest import OPERATIONAL_SETTINGS, Manifest, ManifestError, append_attempts, image_ids
 from .manifest import git as checkout_state
 from .schema import FIELDS, Result, Writer, problems, read
 from .summary import adjudications, summarise
@@ -46,6 +51,9 @@ EXE = ".exe" if os.name == "nt" else ""
 # Systems a default run leaves out: AnzoGraph needs registration beyond 8 GB and takes
 # minutes to start; name it to run it.
 EXPLICIT_ONLY = {"anzograph"}
+IMAGE_LABEL = "owlrs.built-from"  # a suite-built image's context and its tree id (receipts: images)
+SOURCE_LABEL = "owlrs.source-commit"  # the source commit an image built from a checkout compiled (images.sh)
+QUALIFIED_ANSWERS = {"ok", "deviates"}  # a cell's answers qualify when every query's verdict is one of these
 
 
 def arguments(argv: list[str]) -> argparse.Namespace:
@@ -220,10 +228,12 @@ class Suite:
         self._writer: Writer | None = None
         self.made_files: list[str] = []  # datasets this run made, as /data paths
         self.made_volumes: list[str] = []
+        self.made_exports: list[Path] = []  # build exports (P1e), removed after each build
         self.made_images: list[str] = []
         self.written: list[Result] = []
         self.hashed: dict[str, str | None] = {}  # /data input -> its SHA-256 (data_hashes)
         self.built: dict[str, dict] = {}  # program -> the checkout it was built from in this run
+        self.image_sources: dict[str, object] = {}  # image id -> where it came from (image_source)
         self.hash_s = 0.0
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
@@ -248,15 +258,15 @@ class Suite:
         print(text, flush=True)
 
     def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None,
-                     cwd: Path | None = None, env: dict | None = None) -> int:
+                     cwd: Path | None = None, env: dict | None = None, environ: dict | None = None) -> int:
         """Runs a command on the host, from the repository root unless `cwd` says otherwise
-        (echoed in a dry run)."""
+        (echoed in a dry run): in this process's environment with `env` added, or in `environ` alone."""
         if command[0] == "bash":
             command = [bash(), *command[1:]]
         if self.args.dry_run:
             self.say(f"    [host] {shell(command)}")
             return 0
-        environment = {**os.environ, **env} if env else None
+        environment = environ if environ is not None else ({**os.environ, **env} if env else None)
         if log is None:
             return subprocess.run(command, cwd=cwd or self.root, timeout=timeout, env=environment).returncode
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -288,30 +298,108 @@ class Suite:
         return chosen or None
 
     # --- preparation ---
-    def ensure_images(self, needed: dict[str, str | None]):
-        """needed: image -> build context under benches/ (None: pulled)."""
+    def ensure_images(self, needed: dict[str, str | None]) -> bool:
+        """needed: image -> build context under benches/ (None: pulled). False, said why, when a pinned
+        image's digest can't be pulled or tagged: the tag may still name other content, so the run
+        stops before anything is pinned or timed (P1c review r1 F1)."""
         if self.args.runtime != "docker":
-            return
+            return True
+        pins = image_pins(self.root)
         for image, context in needed.items():
-            if self.runtime.image_present(image):
+            pin = None if context else pins.get(image)
+            if self.runtime.image_present(image) and (pin is None or pin in repo_digests(image)):
                 continue
-            if context:
+            if pin:
+                # A tag names no content, its digest does: pulled by its pin and tagged, so what runs
+                # is the pinned content (P1c), one present that isn't it included.
+                self.say(f"pulling {image} at its pin {pin[:19]}")
+                for step in (["docker", "pull", "-q", f"{repository(image)}@{pin}"],
+                             ["docker", "tag", f"{repository(image)}@{pin}", image]):
+                    if (rc := self.host_command(step)) != 0:
+                        self.say(f"images: {image}: `{' '.join(step[:2])}` of its pin failed (exit {rc}): "
+                                 "not run, since its tag may name other content")
+                        return False
+            elif context:
+                # What it is built from, on the image itself: its context's git tree id in this run's
+                # commit, when that is clean (P2 design review F5). The receipt reads it off the id
+                # that runs (image_source), never off this tag (P1b review r1 F1).
+                state = checkout_state(self.root)
+                tree = (receipts.object_ids(self.root, state["commit"] or "", [f"benches/{context}"])[f"benches/{context}"]
+                        if state.get("dirty") == 0 else None)
+                made = f"benches/{context}@{tree}" if isinstance(tree, str) else ""
                 self.say(f"building {image}")
-                self.host_command(["docker", "build", "-q", "-t", image, str(self.root / "benches" / context)])
+                self.host_command(["docker", "build", "-q", "-t", image,
+                                   *(["--label", f"{IMAGE_LABEL}={made}"] if made else []),
+                                   str(self.root / "benches" / context)])
             else:
                 self.say(f"pulling {image}")
                 self.host_command(["docker", "pull", "-q", image])
             self.made_images.append(image)
+        return True
+
+    def image_source(self, image: str, image_id: str, compiles_source: bool = False):
+        """Where the image with this id came from, read off that id (the one the run's containers
+        run, its pin), never off a tag that may name another by now (P1b review r1 F1): its build
+        label; or, for a tag with a digest pin (images.toml), "pulled, pinned DIGEST" when that id
+        holds the pin (P1c); else unknown, with why. An image that `compiles_source` (its adapter's
+        script_builds) is known only with its source commit label too (review image-source-commit
+        r1 F2). Unreadable is unknown with its reason, never an exception: a receipt is written on
+        a host without docker too (#161's Windows gate, gate-windows-59532fff57-1794140734)."""
+        key = (image, image_id, compiles_source)
+        if key not in self.image_sources:
+            self.image_sources[key] = self._image_source(image, image_id, compiles_source)
+        return self.image_sources[key]
+
+    def _image_source(self, image: str, image_id: str, compiles_source: bool):
+        try:
+            label = run_quiet(["docker", "image", "inspect", "--format",
+                               f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}|'
+                               f'{{{{index .Config.Labels "{SOURCE_LABEL}"}}}}', image_id])
+        except OSError as error:
+            return receipts.unknown(f"docker not available: {error}")
+        if label.returncode != 0:
+            said = (label.stderr or label.stdout or "").strip().splitlines()
+            return receipts.unknown(f"docker image inspect failed (exit {label.returncode}): "
+                                    f"{said[-1] if said else 'no output'}")
+        found, _, commit = label.stdout.strip().replace("<no value>", "").partition("|")
+        if found and commit:
+            return f"built from {found}, source commit {commit}"
+        if found and compiles_source:
+            return receipts.unknown(f"built from {found}, but no source commit label: its adapter builds it from "
+                                    "a source chosen apart from its context (script_builds)")
+        if found:
+            return f"built from {found}"
+        pin = image_pins(self.root).get(image)
+        if not pin:
+            return receipts.unknown("no build label and no digest pin (benches/suite/images.toml)")
+        held = repo_digests(image_id)
+        return (f"pulled, pinned {pin}" if pin in held else
+                receipts.unknown(f"pulled: its digests ({', '.join(sorted(held)) or 'none'}) aren't its pin {pin}"))
 
     def build_nrese(self, nrese) -> bool:
         """Builds an NRESE server (`nrese` or `nrese-oxigraph`) from its source tree."""
         if self.args.skip_build:
             return True
         ctx = self.context_for_images()
-        source = nrese.source(ctx)
-        self.built[nrese.key] = {k: v for k, v in checkout_state(Path(source)).items() if k in ("commit", "dirty")}
+        source = Path(nrese.source(ctx))
+        # What it is built from and with (P2 design review F4): its checkout when the build starts, and
+        # the build's own configuration, never an environment list taken for its defaults.
+        self.built[nrese.key] = built_from(source, "nrese")
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
+        # From a clean export of its commit, never the worktree (P1e: r5 F17 and every file git
+        # doesn't hold); removed after the build, its binary in the build's own target.
+        tree = self.export_build(source, nrese.key, self.built[nrese.key].get("commit"))
+        if tree is None:
+            return False
+        try:
+            return self.build_nrese_in(nrese, ctx, tree, log)
+        finally:
+            self.remove_export(tree)
+
+    def build_nrese_in(self, nrese, ctx, tree: Path, log: Path) -> bool:
+        if tree != Path(nrese.source(ctx)):
+            self.built[nrese.key]["inputs"] = build_inputs(tree, "nrese")
         if self.args.runtime == "docker":
             # Its own build volume, labelled, removed with the run; the Cargo registry is the
             # host's shared cache, never removed by a run.
@@ -326,24 +414,88 @@ class Suite:
             # scripts/lib/target-cpu.sh reads it; `portable` for none).
             cpu = os.environ.get("NRESE_TARGET_CPU", "native")
             rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
-            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
+            # In the run's pinned id of its Rust image, as every container (ns.pin_images), never
+            # its tag looked up again; a dry run's echo names the tag.
+            tag = nrese.rust_image(ctx)
+            image = ns.pinned(self.root).get(tag) or (tag if self.args.dry_run else None)
+            if image is None:
+                self.say(f"the {nrese.key} build: its Rust image {tag} isn't pinned for this run")
+                return False
+            self.built[nrese.key].update(rust_image=tag, rust_image_id=image, rustflags=rustflags)
+            # The image's toolchain, in its environment (its own and RUSTFLAGS); its config is the
+            # pinned image's, the source mount the export (r5 F16, F17).
+            toolchain = toolchain_in(image, tree) if not self.args.dry_run else receipts.unknown("a dry run")
+            self.built[nrese.key].update(toolchain=toolchain,
+                                         controlled=controlled(tree, None, toolchain, declared_toolchain(tree)))
+            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{tree.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
                                     "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
-                                    "-w", "/src", nrese.rust_image(ctx),
+                                    "-w", "/src", image,
                                     "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
         else:
-            # From the source tree: its own toolchain, budget and target directory.
+            # Its own toolchain, budget and target directory, in the controlled environment (r4 F15).
+            environment = {**controlled_environment(os.environ), "CARGO_TARGET_DIR": str(nrese.target_dir(ctx))}
+            self.built[nrese.key].update(self.host_control(tree, environment))
             rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked",
-                                    "-p", "nrese-server"], log, cwd=source)
+                                    "-p", "nrese-server"], log, cwd=tree, environ=environment)
         if rc != 0:
             self.say(f"the {nrese.key} build failed; see {log}")
         return rc == 0
 
-    def harness(self) -> str:
+    def record_builds(self) -> None:
+        """The build records so far into the manifest (`builds`, what the receipts copy), after each
+        build, a failed one too, whether or not a cell runs (P1e sol-loop r1 S2)."""
+        if self.manifest and self.built:
+            self.manifest.update(builds=dict(self.built))
+
+    def export_build(self, source: Path, program: str, commit: str | None) -> Path | None:
+        """A fresh export of `source`'s commit for a build of `program` (P1e), in a directory of this
+        run's own, outside any checkout (cargo reads .cargo/config in every ancestor of the directory
+        it builds in): build_export_base. Its commit is the one the build's record names (built_from's),
+        never HEAD read again (P1e review r1 F1). None, said why, where it can't be made; never the
+        worktree in its place. A dry run builds nothing: the source, for its echo."""
+        if self.args.dry_run:
+            return source
+        if not commit:
+            self.say(f"the {program} build: {source} has no commit to export")
+            return None
+        try:
+            tree = Path(tempfile.mkdtemp(prefix=f"nrese-build-{program}-", dir=build_export_base(source)))
+        except OSError as error:
+            self.say(f"the {program} build: no directory for its export: {error}")
+            return None
+        self.made_exports.append(tree)
+        try:
+            export_commit(source, commit, tree)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.say(f"the {program} build: exporting {commit[:12]} failed: {error}")
+            self.remove_export(tree)
+            return None
+        return tree
+
+    def remove_export(self, tree: Path) -> None:
+        """An export this run made goes (a failure to is in the run's cleanup errors, and the export
+        stays in made_exports, a residual)."""
+        if tree in self.made_exports and self.runtime.attempt(shutil.rmtree, tree):
+            self.made_exports.remove(tree)
+
+    def host_control(self, tree: Path, environment: dict) -> dict:
+        """A host build's `toolchain` (rustc and cargo as they run in `tree` with `environment`) and
+        whether it is `controlled` (r5 F16-F18)."""
+        toolchain = toolchain_here(tree, environment) if not self.args.dry_run else receipts.unknown("a dry run")
+        return {"toolchain": toolchain,
+                "controlled": controlled(tree, environment, toolchain, declared_toolchain(tree))}
+
+    def harness_target(self) -> Path:
+        """The harness build's output directory; a relative CARGO_TARGET_DIR is the repository's, where
+        the build and the run both find it (it builds in an export, removed after it: P1e sol-loop r1 S1)."""
         target = Path(self.settings.get("CARGO_TARGET_DIR") or self.root / "target")
-        return self.settings.get("HARNESS") or str(target / "release" / f"nrese-bench-harness{EXE}")
+        return target if target.is_absolute() else self.root / target
+
+    def harness(self) -> str:
+        return self.settings.get("HARNESS") or str(self.harness_target() / "release" / f"nrese-bench-harness{EXE}")
 
     def build_harness(self) -> bool:
         if self.args.skip_build:
@@ -352,10 +504,21 @@ class Suite:
             self.say(f"--skip-build requires an existing harness: {self.harness()} (set HARNESS)")
             return False
         self.say("building the harness (release)")
-        self.built["harness"] = {k: v for k, v in checkout_state(self.root).items() if k in ("commit", "dirty")}
+        self.built["harness"] = built_from(self.root, "harness")
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
-        rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
-                                "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log)
+        tree = self.export_build(self.root, "harness", self.built["harness"].get("commit"))
+        if tree is None:
+            return False
+        try:
+            if tree != self.root:
+                self.built["harness"]["inputs"] = build_inputs(tree, "harness")
+            environment = {**controlled_environment(os.environ), "CARGO_TARGET_DIR": str(self.harness_target())}
+            self.built["harness"].update(self.host_control(tree, environment))
+            rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
+                                    "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log,
+                                   cwd=tree, environ=environment)
+        finally:
+            self.remove_export(tree)
         return rc == 0
 
     def data_missing(self, inputs: list[str]) -> list[str]:
@@ -825,7 +988,8 @@ class Suite:
                 images[image] = context
         if self.args.runtime == "docker":
             images.setdefault("alpine:latest", None)
-        self.ensure_images(images)
+        if not self.ensure_images(images):
+            return 1
         # Every image the run's containers use, resolved to its ID now, before anything is timed
         # (ns.pin_images): one that can't be stops the run; none is pulled or re-resolved later.
         if self.args.runtime == "docker" and not self.args.dry_run:
@@ -837,10 +1001,18 @@ class Suite:
         if self.manifest and self.args.runtime == "docker":
             self.manifest.update(images=image_ids(list(images)), pinned_images=ns.pinned(self.root))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
-            if not self.build_nrese(adapter(key)):
+            try:
+                built = self.build_nrese(adapter(key))
+            finally:
+                self.record_builds()  # a builder that raises too (P1e review r1 F2)
+            if not built:
                 return 1
         if any(system is not None and plan.kind != "kit" for plan, _, system, _ in chosen):
-            if not self.build_harness():
+            try:
+                built = self.build_harness()
+            finally:
+                self.record_builds()
+            if not built:
                 self.say("the harness build failed")
                 return 1
         unavailable: dict[int, str] = {}
@@ -911,6 +1083,7 @@ class Suite:
             return
         entry = self.manifest.entry
         commit = entry["git"].get("commit") or ""
+        moved = checkout_moved(self.root, entry["git"])
         ctx = self.context_for_images()
         pins = ns.pinned(self.root)  # the ids the containers ran (runtime.py), never a tag looked up again
         child = plan.kind in ("kit", "driver")
@@ -921,15 +1094,23 @@ class Suite:
                     if (r.workload, r.tier, r.system) == (plan.workload, plan.tier, key)]
             pair = summarise(rows).get((plan.workload, plan.tier, key))
             compiled = isinstance(system, Nrese) or plan.kind == "cycle"
+            scripted = set() if child else {tag for tag, _, _ in system.script_builds(ctx)}
             mine = receipts.unknown(f"a {plan.kind} plan's: its child's, not recorded here")
             out[cell] = {
-                **attempts[cell], "complete": True, "commit": commit, "dirty": entry["git"].get("dirty"),
+                **attempts[cell], "complete": True, "commit": receipts.unknown(moved) if moved else commit,
+                "dirty": entry["git"].get("dirty"),
                 "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
-                "images": mine if child else {i: pins.get(i) or receipts.unknown("not in the run's pin map")
-                                              for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
+                "images": mine if child else {
+                    i: {"id": pins[i], "source": self.image_source(i, pins[i], i in scripted)} if pins.get(i) else
+                       {"id": receipts.unknown("not in the run's pin map"),
+                        "source": receipts.unknown("no image pinned: none known to have run")}
+                    for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
                 "build": mine if child else self.build_receipt(system),
-                "settings": mine if child else dict(entry.get("settings") or {}),
+                # The settings that change a measurement; where a run keeps its files doesn't (F8).
+                "settings": mine if child else {k: v for k, v in (entry.get("settings") or {}).items()
+                                                if k not in OPERATIONAL_SETTINGS},
+                "protocol": dict(entry.get("protocol") or {}),  # the attempt's own (F3), not the record's
                 "data": mine if child else self.data_receipt(plan, key),
                 "outcome": pair.outcome() if pair else {"outcome": "skipped"},
                 "answers": "pending" if self.answers else "not captured"}
@@ -960,13 +1141,23 @@ class Suite:
         if not self.manifest or not self.answers:
             return
         from .answers import PRECEDENCE
-        worst: dict[str, str] = {}
-        for v in self.answers.verdicts():
+        counts: dict[str, dict[str, int]] = {}
+        for v in self.answers.verdicts():  # one per query the cell was to answer (captured or not)
             cell = receipts.cell_key(v["workload"], str(v["tier"]), v["system"])
-            if cell not in worst or PRECEDENCE.index(v["verdict"]) < PRECEDENCE.index(worst[cell]):
-                worst[cell] = v["verdict"]
+            counts.setdefault(cell, {}).setdefault(v["verdict"], 0)
+            counts[cell][v["verdict"]] += 1
+
+        def of(cell: str):
+            # Not one worst verdict: `deviates` ranks above `incomplete` (PRECEDENCE, the reports'), so it
+            # could stand for a query never captured (P2 design review F2). Qualified: every query ok or
+            # deviating only across datatypes (rule.owl-rs-answer-comparison), none without its answer.
+            found = counts.get(cell)
+            if not found:
+                return "not captured"
+            return {"worst": min(found, key=PRECEDENCE.index), "verdicts": dict(sorted(found.items())),
+                    "qualified": set(found) <= QUALIFIED_ANSWERS}
         cells = self.manifest.entry.get("cells") or {}
-        done = {cell: {**r, "answers": worst.get(cell, "not captured")} for cell, r in cells.items() if r.get("complete")}
+        done = {cell: {**r, "answers": of(cell)} for cell, r in cells.items() if r.get("complete")}
         if done:
             self.manifest.update(cells=done)
 
@@ -1013,6 +1204,8 @@ class Suite:
             self.runtime.attempt(shutil.rmtree, self.runtime.owned_path(str(self.results)))
         if self.scratch.exists() and not self.runtime.workers() and not self.runtime.created_stores:
             self.runtime.attempt(self.scratch.rmdir)
+        for tree in list(self.made_exports):  # scratch, whatever is kept
+            self.remove_export(tree)
         if self.args.dry_run:
             return
         if not self.keep and not self.runtime.workers():
@@ -1028,6 +1221,316 @@ class Suite:
                         self.made_images.remove(image)
 
 
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def image_pins(root: Path) -> dict[str, str]:
+    """The digest pins of the images the suite pulls (benches/suite/images.toml `[pins]`: tag =
+    "sha256:..."); none, none. A pin that isn't a digest is refused: a tag names no content."""
+    path = root / "benches/suite/images.toml"
+    if not path.is_file():
+        return {}
+    pins = tomllib.loads(path.read_text(encoding="utf-8")).get("pins", {})
+    if not isinstance(pins, dict) or not all(isinstance(v, str) and DIGEST.fullmatch(v) for v in pins.values()):
+        raise ValueError(f"{path}: [pins] maps each tag to its digest, sha256: and 64 hex digits")
+    return pins
+
+
+def repository(image: str) -> str:
+    """An image reference without its tag (`qlever/qlever:latest` -> `qlever/qlever`)."""
+    name, colon, tag = image.rpartition(":")
+    return name if colon and "/" not in tag else image
+
+
+def repo_digests(image: str) -> set[str]:
+    """The registry digests a local image (tag or id) holds (`docker image inspect` RepoDigests)."""
+    try:
+        done = run_quiet(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image])
+    except OSError:  # no docker here: it holds none
+        return set()
+    try:
+        return {d.rpartition("@")[2] for d in json.loads(done.stdout or "[]") or []} if done.returncode == 0 else set()
+    except ValueError:
+        return set()
+
+
+def built_from(source: Path, program: str) -> dict:
+    """What a build of `program` ("nrese", "harness") is made from, as it starts: its checkout's commit
+    and dirty count (the build's own, recorded apart from the invocation's), the git ids of its
+    declared dependency envelope (receipts.BUILD_SOURCES) at that commit, what its build scripts read
+    outside git (build_inputs), and its configuration (build_settings, this process's)."""
+    state = {k: v for k, v in checkout_state(source).items() if k in ("commit", "dirty")}
+    return {**state, "sources": receipts.object_ids(source, state.get("commit") or "", receipts.BUILD_SOURCES[program]),
+            "inputs": build_inputs(source, program), **build_settings(os.environ)}
+
+
+# The environment a host build runs cargo in, and nothing else (P2 design check r4 F15; an allowlist,
+# as hermetic builds clear theirs): where the toolchain and outputs are, the recorded settings, the
+# launcher's own knobs (NRESE_*, FLEET_SLICE, NS_HELD_*), and the platform's base. Any other variable
+# (CARGO_ENCODED_RUSTFLAGS, CARGO_PROFILE_*, cc's CFLAGS or CRATE_CC_NO_DEFAULTS, ...) never reaches
+# cargo, rustc or a build script. Windows names are upper case there (os.environ).
+BUILD_ENVIRONMENT = frozenset({
+    "PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP",
+    "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_AUTO_INSTALL", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTFLAGS",
+    "FLEET_SLICE",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "USERNAME",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)", "MSYSTEM"})
+BUILD_ENVIRONMENT_PREFIXES = ("NRESE_", "NS_HELD_")
+# Read by our sources at compile time (option_env!): a different binary, so never passed, whatever the
+# prefix (test_receipts checks every such name).
+COMPILE_TIME_NAMES = frozenset({"NRESE_BUILD_REVISION"})
+
+
+def controlled_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """`env` less everything a build doesn't need (BUILD_ENVIRONMENT): pure."""
+    def passed(name: str) -> bool:
+        name = name.upper() if os.name == "nt" else name
+        return name not in COMPILE_TIME_NAMES and (name in BUILD_ENVIRONMENT
+                                                   or name.startswith(BUILD_ENVIRONMENT_PREFIXES))
+    return {k: v for k, v in env.items() if passed(k)}
+
+
+def build_export_base(checkout: Path) -> Path:
+    """Where a build's export goes: beside the build's own checkout (its parent directory), outside it
+    (cargo would read the checkout's .cargo too), on the filesystem the launcher's free-disk guard
+    measures (it measures where it runs from: an export in a small /tmp refused a build whose target
+    had room, build-controlled-build-3). Cargo configs above it are still checked (cargo_configs)."""
+    return checkout.resolve().parent
+
+
+# The names an export writes (P1e review r2 F1, attack 19): Windows reads a backslash as a directory,
+# a colon as a drive or an alternate stream, a device name as a device, and drops a trailing dot or
+# space, all of which git keeps as plain characters. A component is written only if it is one or more
+# of these characters, not . or .., not ending in a dot or a space, and not a device name before its
+# first dot; anything else refuses the whole export. OWL-RS's tree has none of the others.
+PORTABLE_NAME = re.compile(r"[A-Za-z0-9._+@ -]+")
+DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                          *(f"LPT{i}" for i in range(1, 10))})
+
+
+def portable_name(component: str) -> bool:
+    """Whether `component` names the same file on every filesystem the suite builds on."""
+    return (PORTABLE_NAME.fullmatch(component) is not None and component not in (".", "..")
+            and not component.endswith((".", " ")) and component.split(".")[0].rstrip(" ").upper() not in DEVICE_NAMES)
+
+
+def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600) -> None:
+    """`dest` <- the tree of `commit` in `checkout`, exactly: every entry of its tree (git ls-tree)
+    written with its object's bytes (git cat-file --batch), so no attribute applies (export-ignore,
+    export-subst, a filter, from the commit or outside it: P1e review r1 F1), nor a replace ref
+    (--no-replace-objects). A plain file or an executable only, under a portable name
+    (portable_name) whose destination is inside `dest`: a symlink, a submodule, any other name, or two
+    paths this filesystem can't tell apart refuse it, before anything is written. Its files have the time they're
+    written, never the commit's (cargo decides freshness by mtimes: an older commit's would read as
+    older than the last build's outputs, a stale binary). One deadline for the whole export, its git
+    children killed at it (r1 F4). Raises OSError where it can't be made exactly."""
+    started = time.monotonic()
+    git = ["git", "--no-replace-objects", "-C", str(checkout)]
+
+    def left() -> float:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise OSError(f"exporting {commit[:12]}: past its deadline ({timeout} s)")
+        return remaining
+    try:
+        listed = subprocess.run([*git, "ls-tree", "-r", "-z", "--full-tree", commit], capture_output=True,
+                                timeout=left())
+    except subprocess.TimeoutExpired as error:
+        raise OSError(f"exporting {commit[:12]}: past its deadline ({timeout} s)") from error
+    if listed.returncode != 0:
+        said = listed.stderr.decode(errors="replace").strip().splitlines()
+        raise OSError(f"git ls-tree {commit[:12]} exited {listed.returncode}: {said[-1] if said else 'no output'}")
+    entries, seen, spelled = [], set(), {}
+    root = dest.resolve()
+    for record in filter(None, listed.stdout.split(b"\0")):
+        meta, _, raw = record.partition(b"\t")
+        mode, kind, oid = meta.split(b" ")
+        path = raw.decode("utf-8", "surrogateescape")
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            raise OSError(f"{path}: a {kind.decode()} of mode {mode.decode()}, not a plain file: not exported")
+        parts = path.split("/")
+        if not all(map(portable_name, parts)):
+            raise OSError(f"{path}: not a portable name (P1e attack 19): not exported")
+        if not dest.joinpath(*parts).resolve().is_relative_to(root):
+            raise OSError(f"{path}: outside the export")
+        # Every directory on the way, and the file, as this filesystem names it: two spellings git keeps
+        # apart and it merges (case on Windows) refuse (sol-loop r3 S3).
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            folded = os.path.normcase(prefix)
+            if spelled.setdefault(folded, prefix) != prefix or (depth == len(parts) and folded in seen):
+                raise OSError(f"{path}: the same name here as {spelled[folded]}")
+        seen.add(os.path.normcase(path))
+        entries.append((mode, oid, path))
+    with subprocess.Popen([*git, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as batch:
+        watchdog = threading.Timer(max(0.0, timeout - (time.monotonic() - started)), batch.kill)
+        watchdog.start()
+        try:
+            for mode, oid, path in entries:
+                left()
+                batch.stdin.write(oid + b"\n")
+                batch.stdin.flush()
+                header = batch.stdout.readline().split()
+                if len(header) != 3 or header[0] != oid or header[1] != b"blob":
+                    left()  # killed at the deadline: that, not a garbled answer (sol-loop r3 S4)
+                    said = b" ".join(header).decode(errors="replace") or "nothing"
+                    raise OSError(f"{path}: git cat-file gave {said}")
+                size = int(header[2])
+                data = batch.stdout.read(size)
+                if len(data) != size or batch.stdout.read(1) != b"\n":
+                    left()
+                    raise OSError(f"{path}: git cat-file stopped inside its object")
+                target = dest.joinpath(*path.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "xb") as out:
+                    out.write(data)
+                if mode == b"100755":
+                    target.chmod(0o755)
+            left()
+        except (BrokenPipeError, ValueError) as error:
+            raise OSError(f"exporting {commit[:12]}: git cat-file ended: {error}") from error
+        finally:
+            watchdog.cancel()
+            batch.kill()
+
+
+def declared_toolchain(root: Path) -> str | None:
+    """The toolchain channel `root`'s rust-toolchain.toml declares (the owner's: P2 compares it), or
+    None where it can't be read."""
+    try:
+        return tomllib.loads((root / "rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]["channel"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def parse_toolchain(text: str):
+    """`rustc -vV` then `cargo -vV`'s output -> {rustc, cargo, host}, or unknown."""
+    releases = re.findall(r"^release: (\S+)", text, re.M)
+    hosts = re.findall(r"^host: (\S+)", text, re.M)
+    if len(releases) != 2 or not hosts:
+        return receipts.unknown(f"rustc -vV and cargo -vV said: {text.strip()[-200:] or 'nothing'}")
+    return {"rustc": releases[0], "cargo": releases[1], "host": hosts[0]}
+
+
+def toolchain_here(directory: Path, env: Mapping[str, str]):
+    """The toolchain a host build in `directory` with `env` runs (r5 F16): rustc and cargo found on
+    its PATH and run there, as rustup's proxies or a toolchain's own bin would be for the build."""
+    out = []
+    for tool in ("rustc", "cargo"):
+        exe = shutil.which(tool, path=env.get("PATH") or env.get("Path"))
+        if exe is None:
+            return receipts.unknown(f"no {tool} on the build's PATH")
+        try:
+            done = subprocess.run([exe, "-vV"], cwd=directory, env=dict(env), capture_output=True, text=True,
+                                  timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            return receipts.unknown(f"{tool} -vV: {error}")
+        if done.returncode != 0:
+            said = (done.stderr or done.stdout or "").strip().splitlines()
+            return receipts.unknown(f"{tool} -vV exited {done.returncode}: {said[-1] if said else 'no output'}")
+        out.append(done.stdout)
+    return parse_toolchain("".join(out))
+
+
+def toolchain_in(image: str, tree: Path):
+    """The toolchain the pinned image `image` runs, in the export mounted as a Docker build mounts it."""
+    try:
+        done = subprocess.run(["docker", "run", "--rm", "-v", f"{tree.as_posix()}:/src:ro", "-w", "/src", image,
+                               "sh", "-c", "rustc -vV && cargo -vV"], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as error:
+        return receipts.unknown(f"docker run {image}: {error}")
+    if done.returncode != 0:
+        said = (done.stderr or done.stdout or "").strip().splitlines()
+        return receipts.unknown(f"docker run {image} exited {done.returncode}: {said[-1] if said else 'no output'}")
+    return parse_toolchain(done.stdout)
+
+
+def cargo_configs(directory: Path, env: Mapping[str, str]) -> list[str]:
+    """The cargo configuration files a build in `directory` reads that its export doesn't hold: a
+    .cargo/config or .cargo/config.toml in any ancestor of it, and in its Cargo home (CARGO_HOME,
+    relative to `directory`, the build's own working directory, where it isn't absolute: r5 F18;
+    else ~/.cargo). Its own .cargo is its commit's."""
+    home = Path(env["CARGO_HOME"]) if env.get("CARGO_HOME") else Path.home() / ".cargo"
+    if not home.is_absolute():
+        home = directory / home
+    found = []
+    for folder in [parent / ".cargo" for parent in directory.resolve().parents] + [home]:
+        for name in ("config", "config.toml"):
+            path = str((folder / name).resolve())
+            if (folder / name).is_file() and path not in found:
+                found.append(path)
+    return found
+
+
+def controlled(directory: Path, env: Mapping[str, str] | None, toolchain, declared: str | None):
+    """True when a build in `directory` (an export) reads no cargo config outside it (`env`, a host
+    build's; None in a container, whose config is its pinned image's) and runs the declared
+    toolchain; else unknown, every reason why (r4 F15, r5 F16-F18)."""
+    why = []
+    configs = cargo_configs(directory, env) if env is not None else []
+    if configs:
+        why.append(f"cargo also reads {', '.join(configs)}")
+    if declared is None:
+        why.append("rust-toolchain.toml declares no channel that can be read")
+    if not isinstance(toolchain, dict) or "unknown" in toolchain:
+        why.append(f"its toolchain can't be read: {(toolchain or {}).get('unknown', 'nothing')}")
+    elif declared is not None:
+        why += [f"{tool} {toolchain[tool]} selected, rust-toolchain.toml declares {declared}"
+                for tool in ("rustc", "cargo") if toolchain[tool] != declared]
+    return receipts.unknown("; ".join(why)) if why else True
+
+
+def expected_build_inputs(program: str) -> dict:
+    """What a default build of `program` has for build_inputs: none of them holds a file (a fresh
+    checkout: the console build is ignored, never committed)."""
+    return {path: "no files" for path in receipts.BUILD_INPUTS[program]}
+
+
+def build_inputs(source: Path, program: str) -> dict:
+    """receipts.BUILD_INPUTS of `program` under `source` -> "no files" (missing or empty: a build
+    script embeds nothing either way), else "sha256:" over each file's path and SHA-256, in path
+    order; unknown, why, where it can't be read."""
+    out = {}
+    for path in receipts.BUILD_INPUTS[program]:
+        top = source / path
+        try:
+            def fail(error):
+                raise error
+            files = sorted((Path(folder, name) for folder, _, names in os.walk(top, onerror=fail, followlinks=True)
+                            for name in names), key=lambda f: f.relative_to(top).as_posix()) if top.is_dir() else []
+            digest = hashlib.sha256()
+            for f in files:
+                named = f.relative_to(top).as_posix()
+                digest.update(f"{named}\0{hashlib.sha256(f.read_bytes()).hexdigest()}\n".encode())
+            out[path] = f"sha256:{digest.hexdigest()}" if files else "no files"
+        except OSError as error:
+            out[path] = receipts.unknown(f"can't be read: {error}")
+    return out
+
+
+def checkout_moved(root: Path, start: dict) -> str:
+    """Why the checkout isn't the one a run started from (its manifest `git`), read again as a tier's
+    receipts are written, or "" (P2 design r4 R1): another commit, or changed since a clean start (a
+    dirty start is unqualified already). One that moves and comes back between two reads isn't seen."""
+    now = checkout_state(root)
+    if now.get("commit") != start.get("commit"):
+        return f"checkout moved during the run: {start.get('commit')} -> {now.get('commit')}"
+    if start.get("dirty") == 0 and now.get("dirty") != 0:
+        return f"checkout changed during the run: clean at its start, {now.get('dirty')} changed paths now"
+    return ""
+
+
+def build_settings(env: Mapping[str, str]) -> dict[str, str]:
+    """A build's configuration from the environment `env` it runs in, and nothing else: the CPU it
+    compiles for (NRESE_TARGET_CPU, scripts/lib/target-cpu.sh's; `native` unset) and the RUSTFLAGS it
+    inherits. build_settings({}) is the default build's (P2 design review r3 F14). The toolchain is the
+    checkout's (rust-toolchain.toml, in the build's sources)."""
+    return {"target_cpu": env.get("NRESE_TARGET_CPU", "native"), "rustflags_env": env.get("RUSTFLAGS", "")}
+
+
 @contextlib.contextmanager
 def held_lock(name: str):
     """The scripts this process runs see the host lock `name` as held (scripts/lib/ns.sh)."""
@@ -1040,8 +1543,11 @@ def held_lock(name: str):
 
 
 def images(argv: list[str], systems: dict, root: Path) -> int:
-    """`suite.py images [systems]`: the images the systems need, one per line, with the
-    directory under benches/ an image is built from ("-": pulled from its registry)."""
+    """`suite.py images [--digests] [systems]`: the images the systems need, one per line, with the
+    directory under benches/ an image is built from ("-": pulled from its registry). --digests: the
+    pulled ones' registry digests as this host has them, as images.toml's [pins] lines."""
+    digests = "--digests" in argv
+    argv = [a for a in argv if a != "--digests"]
     keys = argv or [k for k in systems if k in ADAPTERS]
     ctx = Context(None, root, root, root, Mount("-", "/data"), [], 0, dict(os.environ), "images")
     seen = {}
@@ -1054,7 +1560,12 @@ def images(argv: list[str], systems: dict, root: Path) -> int:
         for image, context in system.builds():
             seen[image] = context
     for image, context in seen.items():
-        print(f"{image}\t{context}")
+        if not digests:
+            print(f"{image}\t{context}")
+        elif context == "-":
+            held = sorted(repo_digests(image))
+            print(f'"{image}" = "{held[0]}"' if len(held) == 1 else
+                  f"# {image}: {'not on this host' if not held else 'several digests: ' + ', '.join(held)}")
     return 0
 
 
@@ -1093,6 +1604,7 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
                                               "residuals": {**suite.runtime.residuals(),
                                                             "scratch": str(suite.scratch) if suite.scratch.exists() else None,
                                                             "files": suite.made_files, "volumes": suite.made_volumes,
+                                                            "exports": [str(t) for t in suite.made_exports],
                                                             "images": suite.made_images}})
 
             if not suite.runtime.attempt(record_cleanup) and code == 0:

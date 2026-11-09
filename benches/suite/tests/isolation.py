@@ -96,10 +96,18 @@ def environment(**values: str) -> dict[str, str]:
     return {**{k: v for k, v in os.environ.items() if k in LAUNCH}, **GIT, **values}
 
 
+#: scripts/lib/ns.sh and what it runs: where there is no flock (Git Bash), it locks with
+#: suitekit/lock.py. A fixture copies them together, through this (#153's Windows gate failed on one
+#: that copied ns.sh alone).
+NS_SH = ("scripts/lib/ns.sh", "benches/suite/suitekit/lock.py")
+
+
 def checkout(dest: Path, *paths: str) -> Path:
     """A private checkout at `dest` holding copies of this repository's `paths`: a script that
     finds its repository from its own location acts on this one, not on the checkout the run
-    started in (bench-cleanup.sh removes files there)."""
+    started in (bench-cleanup.sh removes files there). ns.sh comes with its lock (NS_SH) or not at all."""
+    if NS_SH[0] in paths and not set(NS_SH) <= set(paths):
+        raise ValueError(f"a checkout with {NS_SH[0]} needs all of NS_SH: {', '.join(NS_SH)}")
     for rel in paths:
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / rel, dest / rel)

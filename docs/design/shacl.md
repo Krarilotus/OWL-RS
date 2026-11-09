@@ -69,7 +69,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - A boolean parameter (`sh:closed`, `sh:deactivated`, `sh:uniqueLang`, `sh:qualifiedValueShapesDisjoint`) is on only for the literal `true`; `"1"^^xsd:boolean` doesn't switch it on (the W3C suite pins this).
 - A path node that is an RDF list is a sequence path, whatever else it says (also pinned by the suite).
 - An implicit class target needs the shape to be typed `sh:NodeShape` or `sh:PropertyShape` and `rdfs:Class` or `owl:Class`.
-- `sh:datatype` rejects ill-formed literals of the XSD types it knows (numbers with their ranges, booleans, dates, times, durations); unknown datatypes accept any lexical form.
+- `sh:datatype` rejects ill-typed literals (SHACL 1.0 §4.1.2 asks it for the types SPARQL 1.1 supports, and allows more). Which lexical forms a datatype has is the engine's one datatype map, nrese-xsd's (`nrese_xsd::owl::Value::parse`, which OWL reads too), beside the XSD types SPARQL compares (numbers with their ranges, booleans, dates, times, durations): binaries, `dateTimeStamp`, `anyURI`, the string types and `rdf:XMLLiteral` included. A valid form past what the map represents (a number beyond 128 bits) is well-typed; datatypes outside the map accept any lexical form. `rdf:langString` is matched by its datatype IRI alone, until the map's text model holds all of Unicode (RDF 1.1 Concepts §3.3 allows any characters in a language string; the map holds XML's Char only).
 
 ## 6. The report
 

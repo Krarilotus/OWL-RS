@@ -38,6 +38,7 @@ spec = importlib.util.spec_from_file_location("release_gate", ROOT / "benches/fa
 gate_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate_module)
 import fast  # noqa: E402
+import isolation  # noqa: E402
 from suitekit import gatestats  # noqa: E402
 
 def LOCAL_TABLES(checkout, harness):  # noqa: N802
@@ -59,8 +60,8 @@ def commit_all(repo: Path) -> str:
 LUBM_MAKER = "bash benches/reasoning/prepare-lubm.sh"
 
 
-MAKER_SCRIPTS = ("scripts/lib/ns.sh", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
-                 "benches/sparql/prepare.sh")
+MAKER_SCRIPTS = (*isolation.NS_SH, "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+                 "benches/sparql/prepare.sh")  # ns.sh with its lock (isolation.NS_SH)
 
 
 def harness_commit(repo: Path, lubm_size: tuple | None = (4, 8), lubm_made_by: str | None = None,

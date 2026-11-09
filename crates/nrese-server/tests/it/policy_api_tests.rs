@@ -201,6 +201,42 @@ async fn query_endpoint_enforces_rate_limit_policy() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+// Spec: master's D16-310 S1 fix check: an exhausted read bucket cannot block admin
+// health/summary, whose details cost one admin request; /info still costs a read.
+#[tokio::test]
+async fn readiness_diagnostics_use_only_their_own_rate_bucket()
+-> Result<(), Box<dyn std::error::Error>> {
+    for uri in ["/api/v1/health", "/api/v1/repositories/nrese/summary"] {
+        let mut policy = static_policy();
+        policy.rate_limits = RateLimitConfig {
+            read_requests_per_window: 1,
+            admin_requests_per_window: 1,
+            ..RateLimitConfig::default()
+        };
+        let app = test_app_with_policy(policy)?;
+        let get = |uri: &str, token: &str| {
+            Request::builder()
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+        };
+        let query = "/dataset/query?query=ASK%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D";
+        let response = app.clone().oneshot(get(query, "reader")?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(get(uri, "admin")?).await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let json: serde_json::Value =
+            serde_json::from_str(&crate::support::body_text(response).await?)?;
+        assert_eq!(json["quad_count"], 0, "{uri}: {json}");
+        assert_eq!(json["named_graph_count"], 0, "{uri}: {json}");
+        let response = app.clone().oneshot(get(uri, "admin")?).await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
+        let response = app.oneshot(get("/dataset/info", "reader")?).await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn invalid_sparql_query_can_return_plain_text_for_fuseki_compat()
 -> Result<(), Box<dyn std::error::Error>> {
