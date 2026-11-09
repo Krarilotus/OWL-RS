@@ -519,3 +519,131 @@ fn dl_reason_of_the_view_doesnt_depend_on_the_dl_verdict() {
     assert!(dl.detail.contains("OWL 2 DL"), "{}", dl.detail);
     same_for_both(dl, shacl);
 }
+
+// Package review r1: what is shown, and in which order, doesn't follow term ids, and a
+// refused shapes graph a committer may not read isn't described to it.
+
+/// The rejection `requester` gets for `commit` on a fresh store where `first` was committed
+/// before `data`: `first` only decides which terms are interned first.
+fn after_first(
+    config: StoreConfig,
+    mode: ReasoningMode,
+    first: &str,
+    data: &str,
+    commit: &str,
+    requester: &Requester,
+) -> MutationReject {
+    let p = MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
+    );
+    for setup in [first, data] {
+        p.apply(update(setup), &Requester::all(), &MutationTicket::new())
+            .expect("setup commits");
+    }
+    reject_on(&p, commit, requester)
+}
+
+/// R1-D1 (SHACL): two readable focus nodes break the shape; which one is shown doesn't
+/// depend on which of them a secret statement made the dictionary know first.
+#[test]
+fn shacl_focus_shown_doesnt_follow_term_ids() {
+    let run = |first: &str| {
+        let config = StoreConfig {
+            shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+            ..StoreConfig::in_memory()
+        };
+        let shapes = format!(
+            "GRAPH <{}> {{ :S a sh:NodeShape ; sh:targetClass :T ; \
+             sh:property [ sh:path :p ; sh:minCount 1 ] }}",
+            config.shapes_graph
+        );
+        let commit = "GRAPH :open { :q07FocusA a :T . :q07FocusB a :T }";
+        let mode = ReasoningMode::Disabled;
+        after_first(config, mode, first, &shapes, commit, &shapes_reader())
+    };
+    let (a, b) = (
+        run("GRAPH :secret { :q07FocusA :marker :v }"),
+        run("GRAPH :secret { :q07FocusB :marker :v }"),
+    );
+    assert!(a.detail.contains("q07Focus"), "{}", a.detail);
+    same_for_both(a, b);
+}
+
+/// R1-D1 (DL): the committer's graphs have two minimal inconsistent sets (`:x` in `:A` and
+/// `:B`, or in `:A` and `:C`, each pair disjoint); which one is shown doesn't depend on
+/// which of `:B` and `:C` a secret statement made the dictionary know first.
+#[test]
+fn dl_justification_shown_doesnt_follow_term_ids() {
+    let run = |first: &str| {
+        let data = "GRAPH :open { :A owl:disjointWith :B . :A owl:disjointWith :C }";
+        let commit = "GRAPH :open { :x a :A, :B, :C }";
+        let (config, mode) = (StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+        after_first(config, mode, first, data, commit, &open_reader())
+    };
+    let (b, c) = (
+        run("GRAPH :secret { :B :marker :v }"),
+        run("GRAPH :secret { :C :marker :v }"),
+    );
+    assert!(b.detail.contains("OWL 2 DL"), "{}", b.detail);
+    same_for_both(b, c);
+}
+
+/// A shapes graph `:SECRET_*` names, with a one-member `sh:or` list, and a committer that
+/// may read `:open` only but write the shapes graph: it adds a second head to the list.
+fn shapes_refusal(secret: &str, requester: &Requester) -> String {
+    let config = StoreConfig::in_memory();
+    let shapes = config.shapes_graph.clone();
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let p = MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Disabled,
+        ))),
+    );
+    let data = format!(
+        "GRAPH <{shapes}> {{ :{secret} sh:targetNode :x ; sh:or :L . \
+         :L <{rdf}first> :OK ; <{rdf}rest> <{rdf}nil> }}"
+    );
+    p.apply(update(&data), &Requester::all(), &MutationTicket::new())
+        .expect("valid shapes");
+    let commit = format!("GRAPH <{shapes}> {{ :L <{rdf}first> :OTHER }}");
+    match p.apply(update(&commit), requester, &MutationTicket::new()) {
+        Err(MutationError::Store { source, .. }) => source.to_string(),
+        other => panic!("must refuse the shapes: {other:?}"),
+    }
+}
+
+/// May read `:open`, and write `:open` and the shapes graph.
+fn shapes_writer() -> Requester {
+    let read = Arc::new(GraphAccess {
+        graphs: vec!["http://example.com/open".into()],
+        ..GraphAccess::default()
+    });
+    let write = Arc::new(GraphAccess {
+        graphs: vec![
+            "http://example.com/open".into(),
+            StoreConfig::in_memory().shapes_graph,
+        ],
+        ..GraphAccess::default()
+    });
+    Requester::new(ReadScope::Graphs(read), WriteScope::Graphs(write))
+}
+
+/// R1-D2: the problems of a shapes graph the committer may not read don't name its shapes.
+#[test]
+fn shapes_refusal_doesnt_describe_an_unreadable_shapes_graph() {
+    let (a, b) = (
+        shapes_refusal("SECRET_A", &shapes_writer()),
+        shapes_refusal("SECRET_B", &shapes_writer()),
+    );
+    assert!(!a.contains("SECRET"), "{a}");
+    assert_eq!(a, b);
+}
+
+/// Control: a committer that may read every graph is told which shape.
+#[test]
+fn shapes_refusal_full_reader_names_the_shape() {
+    let refusal = shapes_refusal("SECRET_A", &Requester::all());
+    assert!(refusal.contains("SECRET_A"), "{refusal}");
+}
