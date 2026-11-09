@@ -385,6 +385,21 @@ impl PackedKeys {
             .unwrap_or_else(|_| unreachable!("nothing is charged"))
     }
 
+    /// At most what [`Self::from_sorted`] of `n` keys allocates: what the packed keys keep
+    /// (headers, firsts, data), and what the packing holds beside them while it runs (its
+    /// list of slices). The data is at most the raw keys' words and its spare word: per key
+    /// position a block's frame takes the tag's width plus the payload's, at most
+    /// `64 - TAG_SHIFT` plus `TAG_SHIFT` bits, and a palette is chosen only where it is
+    /// smaller ([`Header::of`]), so a block of `n` keys packs into at most `4n` words (DUR-6
+    /// slice 2: what a pending snapshot charges before it builds).
+    pub(crate) fn bound(n: usize) -> (usize, usize) {
+        use std::mem::size_of;
+        let blocks = n.div_ceil(BLOCK);
+        let data = (n * (size_of::<Key>() / size_of::<u64>()) + 1) * size_of::<u64>();
+        let kept = blocks * (size_of::<Header>() + size_of::<Key>()) + data;
+        (kept, blocks * size_of::<&mut [u64]>())
+    }
+
     /// [`Self::from_sorted`], each array reserved on `charge` before it is made (what the
     /// keys keep stays reserved; the packing's working memory is released), on one thread.
     pub(crate) fn from_sorted_within(

@@ -238,6 +238,32 @@ impl Run {
         )
     }
 
+    /// Whether [`super::IndexVersion::with_change_within`] builds a delta of `n` entries
+    /// charged array by array ([`Self::from_delta_within_parallel`]: at or above the parallel
+    /// threshold, where those charges are noise against the build and a bound's slack would
+    /// be large) rather than as [`Self::from_delta`] within [`Self::delta_bound`], charged
+    /// before it builds (DUR-6 slice 2: one reservation per pending snapshot).
+    pub(crate) fn charged_exactly(n: usize) -> bool {
+        n >= PARALLEL_BUILD_THRESHOLD
+    }
+
+    /// At most what [`Self::from_delta`] allocates at once for `n` entries in `layout` below
+    /// the parallel threshold, where it builds one permutation after another: what every
+    /// permutation keeps (its tombstone words and packed keys, [`PackedKeys::bound`]), plus
+    /// what one holds while it builds (its entries, then their keys collected in place, whose
+    /// shrinking reallocation may hold both blocks at once, and the packing's own).
+    pub(crate) fn delta_bound(layout: Layout, n: usize) -> usize {
+        use std::mem::size_of;
+        debug_assert!(
+            !Self::charged_exactly(n),
+            "built in parallel above the threshold"
+        );
+        let (packed, packing) = PackedKeys::bound(n);
+        let kept = n.div_ceil(64) * size_of::<u64>() + packed;
+        let building = n * (size_of::<(Key, bool)>() + size_of::<Key>()) + packing;
+        layout.permutations().len() * kept + building
+    }
+
     /// [`Self::from_delta`], on one thread, every array reserved on `held` before it is
     /// made; what the run keeps stays reserved there, for its maker to hold while the run
     /// lives (`engine::equality::View`). A refusal leaves nothing made.

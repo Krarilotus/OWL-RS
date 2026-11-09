@@ -1086,6 +1086,12 @@ impl Snapshot {
     /// version `make` builds of the two. What it makes is charged to `budget` before it is
     /// made and held by the result until its last holder lets it go: its version, its runs,
     /// their lists, the charge's own box and parts. A refusal leaves nothing made.
+    ///
+    /// One reservation (DUR-6 slice 2): charged once, before anything is made, with the
+    /// fixed part and each delta's bound ([`crate::index::IndexVersion::change_bound`]: the
+    /// build engine-v2's uncharged path runs, its working memory included); a delta at or
+    /// above the parallel threshold adds its exact charges as it builds. Once built, the
+    /// bound's rest is released at once, and the reservation is the snapshot's.
     pub(super) fn pending_within(
         &self,
         asserted: [&[EncodedQuad]; 2],
@@ -1096,34 +1102,47 @@ impl Snapshot {
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
         use std::mem::size_of;
         let version = &self.version;
+        let bounds = [
+            version.asserted.change_bound(asserted[0], asserted[1]),
+            version.inferred.change_bound(inferred[0], inferred[1]),
+        ];
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
         held.charge(
             boxed(size_of::<Version>())
                 + version.asserted.runs_bytes(1)
                 + version.inferred.runs_bytes(1)
                 + 2 * boxed(size_of::<crate::index::run::Run>())
-                + Held::overhead(self.held.count()),
+                + Held::overhead(self.held.count())
+                + bounds[0]
+                + bounds[1],
         )?;
-        let (asserted, asserted_held) =
-            version
-                .asserted
-                .with_change_within(asserted[0], asserted[1], forms, budget)?;
-        let (inferred, inferred_held) =
-            match version
-                .inferred
-                .with_change_within(inferred[0], inferred[1], forms, budget)
-            {
-                Ok(built) => built,
-                Err(refused) => {
-                    // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
-                    drop(asserted);
-                    drop(asserted_held);
-                    return Err(refused);
-                }
-            };
-        let held = nrese_exec::Reservation::adopt(
-            Arc::clone(budget),
-            held.transfer() + asserted_held.transfer() + inferred_held.transfer(),
+        let (asserted, asserted_kept) = version.asserted.with_change_within(
+            asserted[0],
+            asserted[1],
+            forms,
+            budget,
+            &mut held,
+        )?;
+        let (inferred, inferred_kept) = match version.inferred.with_change_within(
+            inferred[0],
+            inferred[1],
+            forms,
+            budget,
+            &mut held,
+        ) {
+            Ok(built) => built,
+            Err(refused) => {
+                // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
+                drop(asserted);
+                drop(held);
+                return Err(refused);
+            }
+        };
+        // What the builds held beside what their runs keep: their working memory, freed now.
+        // A run never keeps more than its bound (`with_change_within` asserts it): saturating,
+        // so a wrong bound could only keep too much charged, never release what is still held.
+        held.release(
+            bounds[0].saturating_sub(asserted_kept) + bounds[1].saturating_sub(inferred_kept),
         );
         let held = Held::new(self.held.with(0), held);
         let mut snapshot = self.with_version(make(asserted, inferred));
