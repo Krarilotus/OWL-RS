@@ -140,6 +140,9 @@ class GateNode(unittest.TestCase):
                                       text=True).stdout.strip()
             self.assertEqual(reported, f"v{VERSION}", f"SPEC gate-node: the pinned build's node ({attempt})")
             self.assertEqual(self.seen.read_text(), url, f"SPEC gate-node: fetched once ({attempt})")
+            # The gate jobs' use marks, at the entry and beside its programs, aren't its payload.
+            for marked in {entry, bin_dir}:
+                (marked / ".last-used").write_text("1\n")
         self.assertNotIn(".partial", " ".join(self.entries()), "SPEC gate-node: nothing made aside is left")
 
     def test_an_archive_not_of_the_pinned_sha256_is_never_taken(self):
@@ -251,15 +254,16 @@ class GateNode(unittest.TestCase):
                 shutil.rmtree(self.cache, ignore_errors=True)
                 self.seen.unlink(missing_ok=True)
                 self.assertEqual(self.gate_node(tools).returncode, 0, "a genuine install first")
-                records = {p: (entry / p).read_bytes() for p in (".provenance", ".manifest")}
+                records = {p: (entry / p).read_bytes() if (entry / p).exists() else None
+                           for p in (".provenance", ".manifest")}
                 damage()
                 done = self.gate_node(tools, console, path=host.as_posix())
                 self.assertFalse(marker.exists(), f"SPEC gate-node: the host's npx ran ({name})\n{done.stdout}{done.stderr}")
                 self.assertEqual((done.returncode, done.stdout.strip(), self.fetches()), (0, "10.9.9", 2),
                                  f"SPEC gate-node: made again from the archive ({name})\n{done.stderr}")
                 self.assertEqual(support.read_bytes(), SUPPORT, f"SPEC gate-node: the archive's payload ({name})")
-                self.assertEqual({p: (entry / p).read_bytes() for p in records}, records,
-                                 f"SPEC gate-node: records of the same archive and payload ({name})")
+                self.assertEqual({p: (entry / p).read_bytes() if (entry / p).exists() else None for p in records},
+                                 records, f"SPEC gate-node: records of the same archive and payload ({name})")
         # Damaged, and the archive can't be had: no Node, and nothing of the host's runs.
         (bin_dir / "npx").write_bytes(b"")
         (self.dist / f"v{VERSION}" / self.name).unlink()
