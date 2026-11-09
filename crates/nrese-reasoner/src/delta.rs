@@ -525,11 +525,12 @@ fn update_body<B: Base + ?Sized>(
             hidden: &inserted_set,
             extra: &Store::new(deleted.to_vec()),
         };
-        // A term of the program's rules a stop cut short counts as without partners: the loop
-        // asking is the program's (bounded), and the next stage's reads answer `Stopped`.
+        // A partner read a stop cut short ends the update: the keys asked about are the
+        // grounded rules', which grow with the schema (fix check r2, R3-F1).
         super::recursion::non_recursive(&old_program.rules, schema.rdf_type(), &|term| {
-            super::recursion::same_as_partners(&before, same_as, term, &stage).unwrap_or_default()
+            super::recursion::same_as_partners(&before, same_as, term, &stage)
         })
+        .map_err(stopped)?
     };
 
     lap(0, &mut result);
@@ -648,12 +649,13 @@ fn update_body<B: Base + ?Sized>(
                 region: &region,
             };
             let (mut jobs, mut equality_jobs) = (Vec::new(), Vec::new());
-            for (r, i) in old_program.variants(&extra, &stage) {
+            // A stopped read ends the job list (fix check r2, R3-F1).
+            for (r, i) in old_program.variants(&extra, &stage).map_err(stopped)? {
                 let rule = &old_program.rules[r];
                 if !region.is_empty() && is_equality_rule(rule) {
-                    equality_jobs.extend(Job::variant(&outside, rule, i, &stage));
+                    equality_jobs.extend(Job::variant(&outside, rule, i, &stage).map_err(stopped)?);
                 } else {
-                    jobs.extend(Job::variant(&old, rule, i, &stage));
+                    jobs.extend(Job::variant(&old, rule, i, &stage).map_err(stopped)?);
                 }
             }
             // Transitive properties, by component: a lost edge (a, b) may support every pair
@@ -708,9 +710,17 @@ fn update_body<B: Base + ?Sized>(
                             if t[1] == p {
                                 edges.push((t[0], t[2]));
                             }
+                            // A fact's images grow with the grounded rules that match it: a
+                            // stopped probe ends them, and the scan at its next position (fix
+                            // check r2, sweep B2-051).
                             for image in old_program.one_step_images(t) {
-                                if image[1] == p && extra.contains(image, &stage) == Ok(false) {
-                                    edges.push((image[0], image[2]));
+                                if image[1] != p {
+                                    continue;
+                                }
+                                match extra.contains(image, &stage) {
+                                    Ok(false) => edges.push((image[0], image[2])),
+                                    Ok(true) => {}
+                                    Err(Stopped) => return,
                                 }
                             }
                         })
@@ -739,7 +749,7 @@ fn update_body<B: Base + ?Sized>(
                 }
             }
             for rule in &fresh {
-                jobs.extend(Job::full(&old, rule, &stage));
+                jobs.extend(Job::full(&old, rule, &stage).map_err(stopped)?);
             }
             // Only inferred facts of the old state are overdeleted; asserted ones stay.
             let overdeletable = |f: Triple, poll: &Poller<'_>| -> Result<bool, Stopped> {
@@ -748,13 +758,12 @@ fn update_body<B: Base + ?Sized>(
                     && !extra.contains(f, poll)?
                     && !inserted_set.contains(&f))
             };
-            let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable, stop);
-            candidates.extend(run_jobs_acyclic(
-                &outside,
-                &equality_jobs,
-                &overdeletable,
-                stop,
-            ));
+            let mut candidates =
+                run_jobs_acyclic(&old, &jobs, &overdeletable, stop).map_err(stopped)?;
+            candidates.extend(
+                run_jobs_acyclic(&outside, &equality_jobs, &overdeletable, stop)
+                    .map_err(stopped)?,
+            );
             check_stop()?;
             // The first probe that finds the stage stopped ends the update (fix check r1,
             // SW090: a stopped probe read as "keep" walked every candidate after it).
@@ -1082,18 +1091,19 @@ fn update_body<B: Base + ?Sized>(
         };
         candidates = new_in(&state, candidates, &stage).map_err(stopped)?;
         let mut jobs = Vec::new();
-        for (r, i) in program.variants(&extra, &stage) {
+        // A stopped read ends the job list (fix check r2, R3-F1).
+        for (r, i) in program.variants(&extra, &stage).map_err(stopped)? {
             if r < evaluated && !replaced(&program.rules[r]) {
-                jobs.extend(Job::variant(&state, &program.rules[r], i, &stage));
+                jobs.extend(Job::variant(&state, &program.rules[r], i, &stage).map_err(stopped)?);
             }
         }
         for rule in &program.rules[evaluated..] {
             if !replaced(rule) {
-                jobs.extend(Job::full(&state, rule, &stage));
+                jobs.extend(Job::full(&state, rule, &stage).map_err(stopped)?);
             }
         }
         let keep = |fact: Triple, poll: &Poller<'_>| Ok(!state.contains(fact, poll)?);
-        candidates.extend(run_jobs(&state, &jobs, &keep, stop));
+        candidates.extend(run_jobs(&state, &jobs, &keep, stop).map_err(stopped)?);
         check_stop()?;
         if let Some(equality) = &mut equality {
             candidates.extend(equality.run(&state, operation)?);
@@ -1202,6 +1212,7 @@ fn update_body<B: Base + ?Sized>(
     };
     let variants: Vec<(usize, usize)> = program
         .consistency_variants(&fresh, &stage)
+        .map_err(|Stopped| Interrupted::default())?
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
@@ -1318,6 +1329,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
     }
     let variants: Vec<(usize, usize)> = program
         .consistency_variants(&fresh, &stage)
+        .map_err(|Stopped| Interrupted::default())?
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
@@ -1505,11 +1517,10 @@ impl<B: Base + ?Sized> Prover<'_, '_, B> {
         if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
             return Ok((false, true));
         }
+        // Stopped: the bodies are a part of them, so the search ends here.
         let bodies = self
             .program
-            .derivation_bodies(state, fact, PROOF_BRANCHES, poll);
-        // Stopped: the bodies are a part of them, so the search ends here.
-        poll.ended()?;
+            .derivation_bodies(state, fact, PROOF_BRANCHES, poll)?;
         let mut cut = false;
         self.budget -= 1;
         self.active.insert(fact);
