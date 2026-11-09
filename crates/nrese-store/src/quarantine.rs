@@ -988,6 +988,87 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// A resolution appended through a log that is a link to a file elsewhere is acknowledged
+    /// only once the names its target's resolution reads are durable (DUR-5, fix check r2 on
+    /// DUR-4, R2-F1). The first discard makes the log; the store closed, the log moved to
+    /// `data/new-parent/` and linked back, the store reopened. With the sync of `data/new-parent`
+    /// (a target ancestor) failing with a non-permission error, a discard is refused. Once the
+    /// sync works it is acknowledged, and after a reopen nothing is open. Windows runs it on a
+    /// file symlink where the host may make one, else "not run". Before the fix the discard was
+    /// acknowledged with `data/new-parent` never synced: a power loss could leave the link
+    /// dangling, and the acknowledged resolutions with it.
+    #[test]
+    fn a_discard_through_a_linked_log_waits_for_its_targets_names() {
+        use nrese_engine::fault_points::fail_dir_sync_of;
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let file = dir.path().join("bad.nt");
+        fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> .\n\
+             <http://example.com/b> \"no predicate\" .\n",
+        )
+        .unwrap();
+        let ids: Vec<String> = {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            store
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .unwrap();
+            let ids: Vec<String> = store
+                .quarantine()
+                .list(&QuarantineFilter::default())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.statement.id)
+                .collect();
+            assert_eq!(ids.len(), 2);
+            assert!(matches!(store.quarantine().discard(&ids[..1], None), Ok(1)));
+            ids
+        };
+        let log = store_dir.join(DIR).join(RESOLUTIONS);
+        let parent = dir.path().join("data").join("new-parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::rename(&log, parent.join(RESOLUTIONS)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(parent.join(RESOLUTIONS), &log).unwrap();
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_file(parent.join(RESOLUTIONS), &log) {
+            Ok(()) => {}
+            // ERROR_PRIVILEGE_NOT_HELD
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("not run (no privilege to make a file symlink on this host)");
+                return;
+            }
+            Err(error) => panic!("symlink {}: {error}", log.display()),
+        }
+        let mut wrong = Vec::new();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        fail_dir_sync_of(Some((&parent, std::io::ErrorKind::Other)));
+        let discarded = store.quarantine().discard(&ids[1..], None);
+        fail_dir_sync_of(None);
+        if discarded.is_ok() {
+            wrong.push("acknowledged though a target ancestor's sync failed".to_owned());
+        }
+        let discarded = store.quarantine().discard(&ids[1..], None);
+        if !matches!(discarded, Ok(1)) {
+            wrong.push(format!("once the sync works: {discarded:?}"));
+        }
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.quarantine().open_count() != 0 {
+            wrong.push(format!(
+                "after a reopen {} are open, not 0",
+                store.quarantine().open_count()
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn repairs_encode_inside_iris_only() {
         let repaired = percent_encode_iris(

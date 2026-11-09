@@ -466,6 +466,14 @@ pub fn name_existing(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Makes the names the existing file `path` is reached through durable beyond its own
+/// directory's (DUR-5, R2-F1): for a file that is a link, each directory entry its target's
+/// resolution reads. Not yet done: the tests come first.
+pub fn name_existing_file(path: &Path) -> std::io::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
 /// Names `dir`, a directory in the store's root, and returns whether it made it, so that a
 /// reopen of a store at an absolute path syncs each directory once (timing of 8 Nov; a
 /// relative or `.` root still syncs `.` twice: fix check ONCE-N1):
