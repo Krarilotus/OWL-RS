@@ -700,7 +700,7 @@ class GateJob(Repo):
         stubs.mkdir()
         for name, body in {
             "rustup": "exit 0",
-            "rustc": 'case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
+            "rustc": '[ "${1#+}" != "$1" ] && shift; case "$1" in -vV) echo "release: 1.98.1"; echo "commit-hash: abcdef1234567890" ;;'
                      ' --print) echo "    native - Select the CPU of the current host (currently znver3)." ;; esac',
             "cargo": 'echo "cargo-nextest 0.9.146"',  # the pinned one (Miri's too): nothing to install
             "cc-links": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && { shift; : > "$1"; }; shift; done',
