@@ -311,3 +311,82 @@ fn a_service_pattern_keeps_a_blank_node_one_node_beside_a_triple_term() {
     );
     assert_rows(&engine(&[]), &text, &options, &["<urn:o>"]);
 }
+
+/// SERVICE options over an endpoint holding `quads`, with `variable` pre-bound to `value`.
+fn remote_with(
+    quads: &[(Term, &str, Term)],
+    variable: &str,
+    value: Term,
+) -> (QueryOptions, Arc<Endpoint>) {
+    let endpoint = Arc::new(Endpoint(engine(quads), Mutex::default()));
+    let options = QueryOptions {
+        services: Some(Services(endpoint.clone())),
+        pre_bound: Some(Arc::new(HashMap::from([(
+            Variable::new_unchecked(variable),
+            value,
+        )]))),
+        ..QueryOptions::default()
+    };
+    (options, endpoint)
+}
+
+/// A literal pre-bound where only an IRI may stand matches nothing (no triple has a
+/// literal predicate), at an endpoint too, whatever IRIs the endpoint holds.
+#[test]
+fn a_pre_bound_literal_in_an_iri_position_matches_nothing_at_an_endpoint() {
+    let (options, _) = remote_with(
+        &[(
+            iri("urn:s").into(),
+            &format!("{SENTINEL}nothing"),
+            iri("urn:o").into(),
+        )],
+        "p",
+        nrese_rdf::Literal::new_simple_literal("p").into(),
+    );
+    let text = "SELECT ?s WHERE { SERVICE <http://remote.example/sparql> { ?s ?p <urn:o> } }";
+    assert_rows(&engine(&[]), text, &options, &[]);
+}
+
+/// A local blank node pre-bound into a SERVICE pattern matches nothing there: an
+/// endpoint's terms are its own, and no IRI is that node, whatever it spells.
+#[test]
+fn a_pre_bound_blank_node_matches_nothing_at_an_endpoint() {
+    let (options, _) = remote_with(
+        &[(
+            iri("urn:s").into(),
+            "urn:p",
+            iri(&format!("{SENTINEL}blank-b7")).into(),
+        )],
+        "o",
+        nrese_rdf::BlankNode::new_unchecked("b7").into(),
+    );
+    let text = "SELECT ?s WHERE { SERVICE <http://remote.example/sparql> { ?s <urn:p> ?o } }";
+    assert_rows(&engine(&[]), text, &options, &[]);
+}
+
+/// An endpoint pre-bound to a blank node or a literal is no IRI: the SERVICE fails, or
+/// under SILENT gives one empty solution, as a variable endpoint without an IRI does; no
+/// client is called with it.
+#[test]
+fn a_pre_bound_endpoint_that_is_no_iri_is_never_called() {
+    let quads = [(iri("urn:s").into(), "urn:p", iri("urn:o").into())];
+    for value in [
+        Term::from(nrese_rdf::BlankNode::new_unchecked("b7")),
+        nrese_rdf::Literal::new_simple_literal("x").into(),
+    ] {
+        let (options, endpoint) = remote_with(&quads, "e", value.clone());
+        let failing = SparqlParser::new()
+            .parse_query("SELECT ?s WHERE { SERVICE ?e { ?s <urn:p> <urn:o> } }")
+            .unwrap();
+        let local = engine(&[]);
+        let snapshot = local.snapshot();
+        match evaluate_query(&snapshot, &failing, &options) {
+            Err(QueryEvaluationError::Service(_)) => {}
+            Err(other) => panic!("{value}: {other}"),
+            Ok(_) => panic!("{value}: answered"),
+        }
+        let silent = "SELECT ?s WHERE { SERVICE SILENT ?e { ?s <urn:p> <urn:o> } }";
+        assert_rows(&local, silent, &options, &["-"]);
+        assert_eq!(endpoint.1.lock().unwrap().len(), 0, "{value}: called");
+    }
+}
