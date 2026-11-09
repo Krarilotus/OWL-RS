@@ -27,7 +27,7 @@ The tools that exist, so none is built twice. Each one's own header or README is
 |---|---|
 | Build, test, format, land: the gate's tiers | `scripts/check.sh commit\|push\|windows\|all`, [CONTRIBUTING.md](../CONTRIBUTING.md#checks); the hooks in `.githooks/` |
 | Builds and tests on other machines | fleet jobs: the push hook and `scripts/check.sh windows` submit them ([CONTRIBUTING.md](../CONTRIBUTING.md#building-and-measuring)); `scripts/lib/fleet-job.sh`, `scripts/lib/gate-job.sh` |
-| The release gate | `scripts/release-gate.sh` (its header), the checklist §4 in [plan/2026-10-05-v2-merge-checklist.md](plan/2026-10-05-v2-merge-checklist.md), the approved trade-offs in `benches/release-tradeoffs.toml` |
+| The release gate | `scripts/release-gate.sh` (its header), the checklist §4 in [plan/2026-10-05-v2-merge-checklist.md](plan/2026-10-05-v2-merge-checklist.md), the approved trade-offs and exceptions in `benches/release-tradeoffs.toml` |
 | Benchmarks: cases, workloads, systems, results | [benches/README.md](../benches/README.md); the cases in `benches/cases/`, the catalogue [benches/CATALOG.md](../benches/CATALOG.md), the generated [STATUS](../benches/STATUS.md) and [STANDINGS](../benches/STANDINGS.md), the runner `benches/suite/suite.py` |
 | Timing a change against its base, or bisecting a slowdown (one family per candidate commit) | `benches/suite/abba.py` on the fleet, [benches/abba/README.md](../benches/abba/README.md); the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
 | Proving HTTP behaviour on a real server | [scripts/verify/README.md](../scripts/verify/README.md) |
