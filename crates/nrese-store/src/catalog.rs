@@ -629,6 +629,17 @@ impl Catalog {
     /// the settings written, then a write path over the store with it published. A failure
     /// publishes the old reasoning again, its inferences recomputed if they had changed.
     pub fn change(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
+        self.patch(id, |_| Ok(settings))
+    }
+
+    /// [`Self::change`] to the settings `edit` makes of the current ones, read under the
+    /// repository's lifecycle lock: a change made meanwhile is kept (C-1001), never undone
+    /// by a copy read before it. `edit` must not call the catalog (that lock is held).
+    pub fn patch(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&RepositorySettings) -> Result<RepositorySettings, CatalogError>,
+    ) -> Result<(), CatalogError> {
         let missing = || CatalogError::NotFound(format!("no repository '{id}'"));
         let repository = self.get(id).ok_or_else(missing)?;
         let _lifecycle = repository.lifecycle.lock();
@@ -642,8 +653,9 @@ impl Catalog {
         {
             return Err(missing());
         }
-        check(&settings)?;
         let before = repository.settings.read().clone();
+        let settings = edit(&before)?;
+        check(&settings)?;
         // A settings file in place but not made durable: neither the old state nor the new
         // one is known to survive, so the repository serves nothing until a restart, which
         // reads the file again.
@@ -864,7 +876,8 @@ impl Catalog {
             // could bring it back, and the next start would reclaim the new repository. A sync
             // of the directory makes every such unlink durable, else nothing is created.
             // (A new directory holds no tombstone: its first sync is as good.)
-            let synced = std::fs::create_dir_all(root).and_then(|()| crate::metadata::sync(root));
+            let synced = nrese_engine::place::create_dir_all(root)
+                .and_then(|()| crate::metadata::sync(root));
             if let Err(error) = synced {
                 return Err(CatalogError::Store(format!(
                     "{}: {error}; no repository is created until the directory can be synced (a removal's tombstone may not be durably gone)",
@@ -883,7 +896,7 @@ impl Catalog {
                     dir.display()
                 )));
             }
-            std::fs::create_dir_all(&dir)
+            nrese_engine::place::create_dir_all(&dir)
                 .map_err(|error| CatalogError::Store(format!("{}: {error}", dir.display())))?;
             write_settings(&dir.join(SETTINGS_FILE), &settings)?;
         }

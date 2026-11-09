@@ -159,6 +159,79 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
     reader.finish()
 }
 
+/// What makes a blank node a class expression to [`read`], by the source's ids: its types,
+/// or a statement with one of its properties. Such a node in a class's place is read, or
+/// reported when it can't be (malformed, unsupported).
+///
+/// `Reader::blank_class` reads exactly these, and a caller choosing input (the store's QL
+/// reader, by memberships) finds class expressions by the same definition (I24c-2 review
+/// r1 F2, r2 F5). Both take it apart field by field, so a marker added here doesn't compile
+/// until each of them handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassExpressionMarkers {
+    /// `owl:Class`, `rdfs:Class`, `owl:Restriction`.
+    pub types: [Option<Term>; 3],
+    /// `owl:intersectionOf`, `owl:unionOf`, `owl:complementOf`, `owl:oneOf`.
+    pub set_operators: [Option<Term>; 4],
+    /// `owl:onProperties`: an n-ary data restriction, reported as unsupported.
+    pub on_properties: Option<Term>,
+    /// `owl:onProperty`: a restriction.
+    pub on_property: Option<Term>,
+}
+
+impl ClassExpressionMarkers {
+    pub fn of(v: &Vocabulary) -> Self {
+        Self {
+            types: [v.owl_class, v.rdfs_class, v.owl_restriction],
+            set_operators: [
+                v.owl_intersection_of,
+                v.owl_union_of,
+                v.owl_complement_of,
+                v.owl_one_of,
+            ],
+            on_properties: v.owl_on_properties,
+            on_property: v.owl_on_property,
+        }
+    }
+
+    /// [`Self::of`] the source's vocabulary, looking up only these terms, by their
+    /// compile-time IRIs: a caller needing nothing else of the vocabulary looks nothing else
+    /// up. The QL reader does this once per fresh read, where a whole [`Vocabulary::new`]
+    /// cost 0.6 % of a compile (count i24c-attrib2-f6ec07c9).
+    pub fn lookup(id_of: &dyn Fn(&str) -> Option<Term>) -> Self {
+        Self {
+            types: [
+                id_of(const { Vocabulary::iri("owl_class") }),
+                id_of(const { Vocabulary::iri("rdfs_class") }),
+                id_of(const { Vocabulary::iri("owl_restriction") }),
+            ],
+            set_operators: [
+                id_of(const { Vocabulary::iri("owl_intersection_of") }),
+                id_of(const { Vocabulary::iri("owl_union_of") }),
+                id_of(const { Vocabulary::iri("owl_complement_of") }),
+                id_of(const { Vocabulary::iri("owl_one_of") }),
+            ],
+            on_properties: id_of(const { Vocabulary::iri("owl_on_properties") }),
+            on_property: id_of(const { Vocabulary::iri("owl_on_property") }),
+        }
+    }
+
+    /// The properties, those the source has.
+    pub fn properties(&self) -> Vec<Term> {
+        let Self {
+            types: _,
+            set_operators,
+            on_properties,
+            on_property,
+        } = *self;
+        set_operators
+            .into_iter()
+            .chain([on_properties, on_property])
+            .flatten()
+            .collect()
+    }
+}
+
 /// What every reader adds to the axioms it read: the literals' parts, the anonymous
 /// individuals, and the diagnostics of OWL 2 DL's global restrictions.
 pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
@@ -614,31 +687,33 @@ impl<'a> Reader<'a> {
         terms.iter().map(|&t| self.class(t)).collect()
     }
 
+    /// A blank class expression, by [`ClassExpressionMarkers`].
     fn blank_class(&mut self, node: Term) -> Option<ExprId> {
         let v = self.v;
-        for class_type in [v.owl_class, v.rdfs_class, v.owl_restriction] {
+        let ClassExpressionMarkers {
+            types,
+            set_operators,
+            on_properties,
+            on_property,
+        } = ClassExpressionMarkers::of(&v);
+        for class_type in types {
             if self.has_type(node, class_type) {
                 self.collect([node, v.rdf_type?, class_type?]);
             }
         }
-        for operator in [
-            v.owl_intersection_of,
-            v.owl_union_of,
-            v.owl_complement_of,
-            v.owl_one_of,
-        ] {
+        for operator in set_operators {
             if let Some(operand) = self.one(node, operator) {
                 return self.set_operator(operator?, operand);
             }
         }
-        if !self.objects(node, v.owl_on_properties).is_empty() {
+        if !self.objects(node, on_properties).is_empty() {
             self.report(Diagnostic::Unsupported {
                 node,
                 what: "n-ary data restrictions (owl:onProperties)",
             });
             return None;
         }
-        let Some(property) = self.one(node, v.owl_on_property) else {
+        let Some(property) = self.one(node, on_property) else {
             self.report(Diagnostic::Malformed {
                 node,
                 what: "a class expression without an operator",
