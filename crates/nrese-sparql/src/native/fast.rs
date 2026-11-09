@@ -391,13 +391,13 @@ impl Fast {
             Err(undecided) => undecided,
         };
         let language = |id: TermId, test: &dyn Fn(&str) -> bool| match id.kind() {
-            TermKind::Iri | TermKind::BlankNode => Tri::Error,
             TermKind::LangString => match view(id) {
                 Some(TermView::LangString { language, .. }) => Tri::of(test(language)),
                 _ => Tri::Unknown,
             },
             // Any other literal has the empty language tag.
-            _ => Tri::of(test("")),
+            kind if is_literal(kind) => Tri::of(test("")),
+            _ => Tri::Error,
         };
         match self {
             Self::And(a, b) => match (a.eval(value, view, snapshot), b.eval(value, view, snapshot))
@@ -423,12 +423,7 @@ impl Fast {
             Self::Bound(v) => Tri::of(value(v) != UNDEF),
             Self::IsIri(v) => on_kind(v, &|k| k == TermKind::Iri),
             Self::IsBlank(v) => on_kind(v, &|k| k == TermKind::BlankNode),
-            Self::IsLiteral(v) => on_kind(v, &|k| {
-                !matches!(
-                    k,
-                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-                )
-            }),
+            Self::IsLiteral(v) => on_kind(v, &is_literal),
             Self::SameIri(v, iri) => match stored(v) {
                 Ok(id) => Tri::of(Some(id.raw()) == *iri),
                 Err(undecided) => undecided,
@@ -480,6 +475,11 @@ impl Fast {
             },
         }
     }
+}
+
+/// The dictionary and inline literal classes are shared by classification and LANG.
+fn is_literal(kind: TermKind) -> bool {
+    kind.is_dictionary_literal() || kind.is_inline()
 }
 
 /// A string test on a term (a string literal) or on its `STR` (also IRIs and every literal).
