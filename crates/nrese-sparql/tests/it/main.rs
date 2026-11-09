@@ -19,6 +19,7 @@ mod native_facets_tests;
 mod plan_guard_tests;
 mod pre_bound_delivery_tests;
 mod private_view_tests;
+mod ql_overlay_tests;
 mod ql_tests;
 mod resource_tests;
 mod result_cache_admission_tests;
