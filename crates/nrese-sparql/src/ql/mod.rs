@@ -539,20 +539,33 @@ impl QlRewriting {
     /// An entry is this rewriting's (its closure), its reader's and its view's: views of one
     /// version in other equality modes share the slot, never an entry. A first read reuses
     /// a TBox its schema matches, the version's or the store's (read only), or compiles.
+    ///
+    /// The version's entries are locked only to look up and to install: the schema is read
+    /// and compiled outside the lock (DICT2, 9 Nov), and a read of the same view installed
+    /// meanwhile stands.
     fn own_tbox(&self, own: &OwnState<'_>, access: Option<&GraphAccess>) -> Arc<Tbox> {
         let snapshot = own.snapshot();
         let key = snapshot.identity();
         let mine = own.get_or_insert_with(QlOwn::default);
-        let mut entries = mine.entries.lock().unwrap_or_else(|p| p.into_inner());
         let ours = |(closure, c): &&(Closure, Cached)| {
             *closure == self.closure && c.access.as_ref() == access
         };
-        if let Some((_, c)) = entries.iter().filter(ours).find(|(_, c)| c.key == key) {
-            return Arc::clone(&c.tbox);
+        let exact = |entries: &[(Closure, Cached)]| {
+            entries
+                .iter()
+                .filter(ours)
+                .find(|(_, c)| c.key == key)
+                .map(|(_, c)| Arc::clone(&c.tbox))
+        };
+        if let Some(tbox) = exact(&mine.entries.lock().unwrap_or_else(|p| p.into_inner())) {
+            return tbox;
         }
         let schema = Schema::of(snapshot);
         let (expressions, members) = fresh_members(snapshot, &schema.core, access);
-        let kept = entries
+        let kept = mine
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(ours)
             .map(|(_, c)| c)
@@ -569,6 +582,10 @@ impl QlRewriting {
         let tbox = reused.unwrap_or_else(|| {
             self.compile_read(snapshot, &schema, access, &expressions, &members)
         });
+        let mut entries = mine.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(installed) = exact(&entries) {
+            return installed;
+        }
         if entries.len() == READERS {
             entries.remove(0);
         }
