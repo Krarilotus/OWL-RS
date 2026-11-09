@@ -55,6 +55,13 @@ fn e1_followup_alias_retention_is_charged_once() {
         limited.aliases.borrow().is_empty(),
         "nothing kept on refusal"
     );
+    let query = SparqlParser::new()
+        .parse_query("SELECT * WHERE {}")
+        .unwrap();
+    assert!(
+        native_pattern(&query, &options, &limited).is_err(),
+        "preparation must propagate the alias refusal too"
+    );
 }
 
 fn node(local: &str) -> NamedNode {
