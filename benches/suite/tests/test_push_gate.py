@@ -43,11 +43,19 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/suite-python.sh", *isolation.NS_SH, "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
+answer() {
+  tier=$(cat "$FAKE/tier" 2> /dev/null)
+  if [ -d "$FAKE/$tier" ]; then echo "$FAKE/$tier"; else echo "$FAKE"; fi
+}
 case "$1" in
-  submit) n=$(ls "$FAKE"/job-*.toml 2> /dev/null | wc -l); cp "$2" "$FAKE/job-$n.toml"; echo gate-1 ;;
-  status) cat "$FAKE/status" ;;
+  submit) n=$(ls "$FAKE"/job-*.toml 2> /dev/null | wc -l)
+    cp "$2" "$FAKE/job-$n.toml" || exit $?
+    tier=push; grep -q windows-job.ps1 "$2" && tier=windows
+    printf '%s\\n' "$tier" > "$FAKE/tier" || exit $?
+    echo gate-1 ;;
+  status) cat "$(answer)/status" ;;
   cancel) echo "$2" >> "$FAKE/cancelled" ;;
-  results) echo "$FAKE/results" ;;
+  results) echo "$(answer)/results" ;;
 esac
 """
 # A stand-in for rustc: the toolchain a gate's identity names.
@@ -127,12 +135,14 @@ class Repo(unittest.TestCase):
         *runtime, name = done.stdout.rstrip("\n").split("\n")
         return "\n".join(runtime), name
 
-    def fleet(self, state, tree=None, files=(), tier="push", runtime="declared"):
+    def fleet(self, state, tree=None, files=(), tier="push", runtime="declared", separate=False):
         """The fleet's answer: the job's state and, with TREE, a whole, consistent passing result
         of its gate (TIER) for TREE and FILES; a Windows one, as its job records it, under the
         Python runtime HEAD declares, if it declares one, or under RUNTIME (None: it states none)."""
-        (self.fake / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
-        out = self.fake / "results" / "out"
+        where = self.fake / tier if separate else self.fake
+        out = where / "results" / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        (where / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
         for name in ("gate.json", "attempt", "gate.log"):
             if (out / name).exists():
                 (out / name).unlink()
@@ -216,21 +226,26 @@ class PushGate(Repo):
         Windows check is a merge gate with nothing in the environment too."""
         gate = 'priority_class = "merge-gate"'
         tip = self.commit("a.txt", "a changed\n")
-        self.fleet("done", self.tree(tip), ["a.txt"])  # the push tier passes, so the Windows check follows
+        self.fleet("done", self.tree(tip), ["a.txt"], separate=True)
+        self.fleet("done", self.tree(tip), tier="windows", separate=True)
         self.env["NRESE_PUSH_REF"] = "refs/heads/refactor/engine-v2"  # left in the pusher's environment
-        self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO),
-                  ("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        first = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO),
+                          ("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
         del self.env["NRESE_PUSH_REF"]
         tip = self.commit("b.txt", "b changed\n")
-        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
-        self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"], separate=True)
+        self.fleet("done", self.tree(tip), tier="windows", separate=True)
+        second = self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        diagnostics = "\n".join(f"hook {i}: rc={d.returncode}\nstdout:\n{d.stdout}\nstderr:\n{d.stderr}"
+                                for i, d in enumerate((first, second), 1))
+        self.assertEqual([first.returncode, second.returncode], [0, 0], diagnostics)
         jobs = [("windows" if "windows-job.ps1" in path.read_text() else "push",
                  re.findall(r"^priority_class = .*$", path.read_text(), re.M))
                 for path in sorted(self.fake.glob("job-*.toml"))]
         # The package's push tier; engine-v2's passed before for this tree, then its Windows check;
         # the next push's two.
         self.assertEqual(jobs, [("push", []), ("windows", [gate]), ("push", [gate]), ("windows", [gate])],
-                         "SPEC merge-gate: by the hook, each check told its own ref")
+                         "SPEC merge-gate: by the hook, each check told its own ref\n" + diagnostics)
 
     def test_a_build_host_variable_in_the_pushers_environment_changes_nothing(self):
         """NRESE_ON_BUILD_HOST, the gate's own mark for a run on a build host, in the pusher's
