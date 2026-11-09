@@ -110,7 +110,11 @@ fn remove_matching_clears_one_graph() {
 
     let mut tx = engine.transaction();
     let graph_id = tx.lookup(graph.as_ref().into()).unwrap();
-    assert_eq!(tx.remove_matching(&QuadPattern::in_graph(graph_id)), 5);
+    assert_eq!(
+        tx.remove_matching(&QuadPattern::in_graph(graph_id))
+            .unwrap(),
+        5
+    );
     tx.commit().expect("commit");
     let snapshot = engine.snapshot();
     assert_eq!(snapshot.len(), 1);
