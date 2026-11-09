@@ -30,8 +30,8 @@ mod mapped;
 pub mod memory;
 pub mod quad;
 pub mod term;
-#[cfg(test)]
-mod witness;
+#[cfg(any(test, feature = "witness"))]
+pub mod witness;
 
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
