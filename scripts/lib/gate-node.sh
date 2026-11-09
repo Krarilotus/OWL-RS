@@ -39,11 +39,12 @@ gate_node_provenance() {
 }
 
 # DIR: DIR's payload, every regular file by its sha256 and every symlink by its target, in a fixed
-# order; the entry's own metadata (.provenance, .manifest, .last-used) left out.
+# order; the entry's own metadata left out: its records (.provenance, .manifest) and the use marks the
+# gate jobs write (.last-used, at the entry or beside its programs).
 gate_node_manifest() {
   (cd "$1" && {
     find . -type l ! -name '.*' -printf 'link %p -> %l\n' | LC_ALL=C sort
-    find . -type f ! -path ./.provenance ! -path ./.manifest ! -path ./.last-used -print0 | LC_ALL=C sort -z \
+    find . -type f ! -path ./.provenance ! -path ./.manifest ! -name .last-used -print0 | LC_ALL=C sort -z \
       | xargs -0 -r sha256sum -b
   })
 }
