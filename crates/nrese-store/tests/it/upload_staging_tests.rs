@@ -300,3 +300,55 @@ fn guard_contexts_dont_multiply_a_documents_charge() {
         "every statement in every context"
     );
 }
+
+/// Every kind of RDF 1.2 term in one document: a simple, a language-tagged, a directional and
+/// a typed literal, and a triple term (twice) holding a directional literal.
+const TERM_KINDS: &str = "<urn:t:s> <urn:t:p> \"plain\" .\n\
+                          <urn:t:s> <urn:t:p> \"tagged\"@en .\n\
+                          <urn:t:s> <urn:t:p> \"rtl\"@ar--rtl .\n\
+                          <urn:t:s> <urn:t:p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+                          <urn:t:s> <urn:t:p> <<( <urn:t:a> <urn:t:b> \"x\"@en--ltr )>> .\n\
+                          <urn:t:s> <urn:t:q> <<( <urn:t:a> <urn:t:b> \"x\"@en--ltr )>> .\n";
+
+/// The store's statements without their graphs, the base's left out, sorted.
+fn triples(store: &StoreService) -> Vec<String> {
+    let mut triples: Vec<String> = store
+        .statements(&ReadContext::all(), &StatementPattern::default())
+        .expect("read")
+        .iter()
+        .filter(|quad| quad.subject.to_string() != "<urn:base:s>")
+        .map(|quad| format!("{} {} {}", quad.subject, quad.predicate, quad.object))
+        .collect();
+    triples.sort();
+    triples.dedup();
+    triples
+}
+
+/// Guard: every route that keeps a document writes each term kind as a SPARQL update of the
+/// same statements does (which reads them its own way, unstaged).
+#[test]
+fn guard_every_term_kind_is_written_as_a_sparql_update_writes_it() {
+    let expected = {
+        let pipeline = pipeline(256 << 20);
+        let update = format!("INSERT DATA {{ {TERM_KINDS} }}");
+        let command = MutationCommand::Update(nrese_store::SparqlUpdateRequest::new(&update));
+        assert_eq!(apply(&pipeline, command), Outcome::Written);
+        triples(pipeline.store())
+    };
+    assert_eq!(
+        expected.len(),
+        6,
+        "the oracle holds the document: {expected:#?}"
+    );
+    let mut wrong = Vec::new();
+    // The routes that keep it: the first four.
+    for (route, send) in routes().into_iter().take(4) {
+        let pipeline = pipeline(256 << 20);
+        let outcome = send(&pipeline, TERM_KINDS);
+        let got = triples(pipeline.store());
+        if outcome != Outcome::Written || got != expected {
+            wrong.push(format!("{route}: {outcome:?}, {got:#?}"));
+        }
+    }
+    none_wrong(&wrong);
+}
