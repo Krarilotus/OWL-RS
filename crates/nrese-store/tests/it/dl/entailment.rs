@@ -19,7 +19,7 @@ fn turtle(text: &str) -> Vec<Triple> {
         .collect()
 }
 
-fn entailed(premise: &str, conclusion: &str) -> Entailed {
+pub(super) fn entailed(premise: &str, conclusion: &str) -> Entailed {
     let dl = pipeline();
     super::insert(&dl, premise).expect("premise");
     dl.store()
