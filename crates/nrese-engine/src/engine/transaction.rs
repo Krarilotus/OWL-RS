@@ -467,10 +467,44 @@ impl<'e> Transaction<'e> {
         self.engine.shared.dictionary.decode(id)
     }
 
-    /// Asserts `quad`; returns `false` if it was already asserted.
+    /// Asserts `quad`; returns `false` if it was already asserted. Its growth is uncharged
+    /// ([`Self::try_insert`] charges it).
     pub fn insert(&mut self, quad: QuadRef<'_>) -> bool {
         let encoded = self.engine.shared.dictionary.intern_quad(quad);
         self.insert_encoded(encoded)
+    }
+
+    /// [`Self::insert`], the pending changes' growth charged to the attached budget
+    /// ([`Self::charge_pending_to`]) before it happens, and before `quad`'s terms are interned:
+    /// refused ([`crate::EngineError::MemoryLimit`]), nothing changes and nothing is interned.
+    /// Without a budget attached it is [`Self::insert`].
+    pub fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
+        if self.pending.insert_may_grow() {
+            let dictionary = &self.engine.shared.dictionary;
+            match dictionary.lookup_quad_bounded(quad, u64::MAX) {
+                // Its terms are known: charged only where it is a new entry, not where it
+                // undoes a removal or is asserted already (sol-loop r1 S1).
+                Some(encoded) => return self.try_insert_encoded(encoded),
+                // A term new to the dictionary: the quad is new, and needs the room, charged
+                // before its terms are interned.
+                None => self.pending.try_room_for_insert()?,
+            }
+        }
+        let encoded = self.engine.shared.dictionary.intern_quad(quad);
+        self.try_insert_encoded(encoded)
+    }
+
+    /// [`Self::remove`], the pending changes' growth charged as [`Self::try_insert`]'s is.
+    pub fn try_remove(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
+        match self
+            .engine
+            .shared
+            .dictionary
+            .lookup_quad_bounded(quad, u64::MAX)
+        {
+            Some(encoded) => self.try_remove_encoded(encoded),
+            None => Ok(false),
+        }
     }
 
     /// Retracts the asserted `quad`; returns `false` if it was not asserted. Never interns.
@@ -487,8 +521,10 @@ impl<'e> Transaction<'e> {
     }
 
     /// Pays for the pending changes' growth from `budget` for their life: what
-    /// [`Self::try_reserve_inserts`] reserves is charged to it before it is allocated, and held
-    /// until the transaction is dropped or its commit has freed the changes. The mutation
+    /// [`Self::try_reserve_inserts`] reserves and the charged changes ([`Self::try_insert`],
+    /// [`Self::try_remove`], [`Self::remove_matching`]) grow is charged to it before it is
+    /// allocated, and held until the transaction is dropped or its commit has freed the
+    /// changes. The mutation
     /// pipeline attaches the request's envelope here. Attaching the same budget again changes
     /// nothing; another one is refused ([`crate::EngineError::Configuration`]).
     pub fn charge_pending_to(&mut self, budget: Arc<nrese_exec::Budget>) -> EngineResult<()> {
@@ -513,28 +549,40 @@ impl<'e> Transaction<'e> {
     /// Asserts an already-encoded quad. Its ids must come from this engine's dictionary.
     /// Returns `false` if it was already asserted; asserting an inferred quad returns `true`
     /// (it becomes explicit). Growth past the room [`Self::try_reserve_inserts`] reserved is
-    /// uncharged, as it is for every insert without a reserve: only a reserve charges.
+    /// uncharged here ([`Self::try_insert_encoded`] charges it).
     pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
         let changed = self.pending.insert_asserted(quad);
         self.assert_unanswered(changed)
     }
 
-    /// Retracts an asserted quad; inferred quads are unaffected.
+    /// [`Self::insert_encoded`], its growth charged as [`Self::try_insert`]'s is.
+    pub fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_insert_asserted(quad)?;
+        Ok(self.assert_unanswered(changed))
+    }
+
+    /// Retracts an asserted quad; inferred quads are unaffected. Its growth is uncharged
+    /// ([`Self::try_remove_encoded`] charges it).
     pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
         let changed = self.pending.remove_asserted(quad);
         self.assert_unanswered(changed)
     }
 
+    /// [`Self::remove_encoded`], its growth charged as [`Self::try_insert`]'s is.
+    pub fn try_remove_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_remove_asserted(quad)?;
+        Ok(self.assert_unanswered(changed))
+    }
+
     /// Retracts every asserted quad matching `pattern` (SPARQL `CLEAR`/`DROP`, GSP
-    /// `PUT`/`DELETE`). Returns the number of quads removed.
-    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> u64 {
-        let matching: Vec<_> = self
-            .quads_for_pattern_in(ReadModel::Asserted, pattern)
-            .collect();
-        matching
-            .into_iter()
-            .map(|quad| u64::from(self.remove_encoded(quad)))
-            .sum()
+    /// `PUT`/`DELETE`). Returns the number of quads removed. What the retractions grow is
+    /// charged to the attached budget before it is allocated, and nothing else is, however
+    /// many quads match: refused ([`crate::EngineError::MemoryLimit`]) part way, the
+    /// transaction holds part of the removal and is to be dropped.
+    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
+        let removed = self.pending.try_remove_matching(pattern)?;
+        self.assert_unanswered(removed > 0);
+        Ok(removed)
     }
 
     /// Adds an inferred statement (in the default graph). Returns `false` if it is already

@@ -964,12 +964,15 @@ fn a_planned_read_charges_its_view_to_the_query() {
     })
     .unwrap();
     let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
-    store
-        .execute_update(&SparqlUpdateRequest::new(format!(
-            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-             INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
-        )))
-        .unwrap();
+    // Loaded past the pipeline: a write's pending changes draw on the same 64 KiB (D16-039),
+    // and the data is the read's, not what this tests.
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix ex: <{EX}> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }}"
+        ),
+    );
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
     store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
     let mut request = SparqlQueryRequest::new(
