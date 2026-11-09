@@ -224,6 +224,45 @@ fn decoded_update_quads_are_charged_while_held() {
     assert_eq!(committed(&engine).0, 0, "every statement is deleted");
 }
 
+/// Guard (and the A/B instruction-count workload): on a transaction charged to an ample
+/// envelope, each update form this module charges does what it says, statement counts after
+/// each from the data, and a commit leaves nothing charged.
+#[test]
+fn guard_charged_updates_do_what_they_say() {
+    let engine = many();
+    let envelope = Envelope::new(None, None);
+    let mut tx = charged(&engine, &envelope);
+    let n = N as u64;
+    let data: String = (0..N)
+        .map(|i| format!("<ex:t{i}> <ex:p> \"{i}\" . "))
+        .collect();
+    let steps = [
+        (
+            format!("INSERT DATA {{ GRAPH <ex:c> {{ {data} }} }}"),
+            3 * n,
+        ),
+        (
+            "DELETE { GRAPH <ex:a> { ?s ?p ?o } } INSERT { GRAPH <ex:d> { ?s ?p ?o } } \
+             WHERE { GRAPH <ex:a> { ?s ?p ?o } }"
+                .to_owned(),
+            3 * n,
+        ),
+        ("CLEAR GRAPH <ex:b>".to_owned(), 2 * n),
+        (
+            "DELETE DATA { GRAPH <ex:c> { <ex:t0> <ex:p> \"0\" } }".to_owned(),
+            2 * n - 1,
+        ),
+        ("DROP ALL".to_owned(), 0),
+    ];
+    for (text, after) in steps {
+        apply_update(&mut tx, &update(&text), &within(&envelope)).unwrap();
+        assert_eq!(tx.len_in(ReadModel::Asserted), after, "after `{text:.60}`");
+    }
+    tx.commit().unwrap();
+    assert_eq!(envelope.used(), 0, "a commit releases the charge");
+    assert_eq!(committed(&engine).0, 0, "everything is dropped");
+}
+
 /// `INSERT DATA` of `N` new statements needs room for `N` pending inserts: an envelope of `N`
 /// encoded quads' bytes can't hold it. The update text is parsed before it is applied, outside
 /// the envelope, as the store does.
