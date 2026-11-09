@@ -571,3 +571,36 @@ fn a_private_transactions_pending_growth_is_charged_to_its_budget() {
     );
     assert_eq!(tx.pending(), (0, 0));
 }
+
+/// A private transaction's pending snapshots are charged to the reader's budget, as a write
+/// transaction's are (DUR-6; V1-engine review r1, F2): what they make is charged before it is
+/// made and held while they live.
+///
+/// - Input: a private transaction with a statement of its own; through `PendingView`, its
+///   pending snapshot and its pending snapshot over the base, within an empty budget, then the
+///   latter within an unlimited one.
+/// - Expected: both refused for memory within the empty budget; within the other, charged
+///   while the snapshot lives, nothing once it goes.
+#[test]
+fn a_private_transactions_pending_snapshots_are_charged_to_their_budget() {
+    let engine = engine();
+    let base = engine.snapshot();
+    let mut tx = engine.speculative(Arc::new(Budget::unlimited()));
+    tx.try_insert(quad("b", "own").as_ref()).unwrap();
+    let empty = Arc::new(Budget::new(0));
+    let snapshot = PendingView::pending_snapshot_within(&tx, &empty).map(|_| ());
+    assert!(
+        matches!(snapshot, Err(crate::EngineError::MemoryLimit(_))),
+        "{snapshot:?}"
+    );
+    let over = PendingView::pending_over_within(&tx, &base, &[], &empty).map(|_| ());
+    assert!(
+        matches!(over, Err(crate::EngineError::MemoryLimit(_))),
+        "{over:?}"
+    );
+    let reader = Arc::new(Budget::unlimited());
+    let over = PendingView::pending_over_within(&tx, &base, &[], &reader).unwrap();
+    assert!(reader.used() > 0, "charged while it lives");
+    drop(over);
+    assert_eq!(reader.used(), 0, "released with it");
+}
