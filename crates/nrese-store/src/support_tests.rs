@@ -133,7 +133,7 @@ fn an_updates_read_source_stops_with_its_cancellation() {
         .expect("a reader by support reads its view");
     let before = store.support_statistics();
     let tx = store.engine().transaction();
-    let state = nrese_sparql::ReadSource::state(&*read, &tx);
+    let state = nrese_sparql::ReadSource::state(&*read, &tx, &Arc::new(Budget::unlimited()));
     assert!(
         matches!(state, Err(nrese_sparql::QueryEvaluationError::Cancelled)),
         "{:?}",
@@ -333,7 +333,11 @@ fn a_pending_read_is_the_gathered_one() {
                 data.push(quad);
             }
             assert_eq!(
-                statements(&reading.pending(&tx).unwrap()),
+                statements(
+                    &reading
+                        .pending(&tx, &Arc::new(Budget::unlimited()))
+                        .unwrap()
+                ),
                 statements(&gathered(&reading, &tx)),
                 "seed {seed}, round {round}"
             );

@@ -82,7 +82,7 @@ pub fn print<V: ReadView>(
     query: &Query,
     form: PrintForm,
 ) -> Result<Printed, QueryEvaluationError> {
-    let snapshot = view.evaluation_snapshot();
+    let snapshot = view.evaluation_snapshot()?;
     let snapshot: &Snapshot = &snapshot;
     let statements = schema_statements(snapshot, &|_| true);
     let ontology = nrese_owl::read(&statements, &SnapshotTerms(snapshot));

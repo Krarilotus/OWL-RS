@@ -1299,7 +1299,7 @@ impl StoreService {
             crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
         })?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
-            Some(reading) => reading.pending(&tx)?,
+            Some(reading) => reading.pending(&tx, &std::sync::Arc::new(memory.part()))?,
             None => tx.pending_snapshot(),
         };
         self.sessions.keep_view(

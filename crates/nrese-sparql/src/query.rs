@@ -161,7 +161,7 @@ pub fn evaluate_query<'a, V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    crate::native::evaluate(view.evaluation_snapshot(), query, &for_view(view, options))
+    crate::native::evaluate(view.evaluation_snapshot()?, query, &for_view(view, options))
 }
 
 /// Retains the evaluator's ID columns and their decoding context for bound comparison.
@@ -171,7 +171,7 @@ pub fn evaluate_query_typed(
     options: &QueryOptions,
 ) -> Result<crate::TypedResults, QueryEvaluationError> {
     crate::native::typed_results::evaluate(
-        view.evaluation_snapshot().into_owned(),
+        view.evaluation_snapshot()?.into_owned(),
         query,
         &for_view(view, options),
     )
@@ -308,7 +308,7 @@ pub fn explain_query<V: ReadView>(
     options: &QueryOptions,
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
-    let snapshot = view.evaluation_snapshot();
+    let snapshot = view.evaluation_snapshot()?;
     let (rewrites, steps, rows, decoded, ql) =
         crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
@@ -357,7 +357,7 @@ pub fn plan_query<V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<PlannedQuery, QueryEvaluationError> {
-    let snapshot = view.evaluation_snapshot();
+    let snapshot = view.evaluation_snapshot()?;
     let (rewrites, steps, ql) = crate::native::plan(&snapshot, query, options)?;
     Ok(PlannedQuery {
         rewrites,
@@ -387,7 +387,8 @@ pub fn prepare_ql_query<'q, V: ReadView>(
     query: &'q Query,
     options: &QueryOptions,
 ) -> Result<(Cow<'q, Query>, Option<crate::ql::QlReport>), QueryEvaluationError> {
-    crate::native::prepare_ql_query(&view.evaluation_snapshot(), query, options)
+    let snapshot = view.evaluation_snapshot()?;
+    crate::native::prepare_ql_query(&snapshot, query, options)
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.

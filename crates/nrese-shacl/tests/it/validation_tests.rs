@@ -646,7 +646,7 @@ impl<'v> ReadView for CancelAfter<'v> {
         Some(self.inner)
     }
 
-    fn evaluation_snapshot(&self) -> std::borrow::Cow<'_, Snapshot> {
+    fn evaluation_snapshot(&self) -> Result<std::borrow::Cow<'_, Snapshot>, QueryEvaluationError> {
         let n = self
             .evaluations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -654,7 +654,7 @@ impl<'v> ReadView for CancelAfter<'v> {
         if !self.in_report && n == self.at {
             self.token.cancel();
         }
-        std::borrow::Cow::Borrowed(self.inner)
+        Ok(std::borrow::Cow::Borrowed(self.inner))
     }
 }
 
