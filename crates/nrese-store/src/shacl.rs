@@ -346,16 +346,19 @@ pub(crate) fn view_reason(
     let rejecting: Vec<_> = report.results.iter().filter(|r| rejects(r)).collect();
     // The first by what the view's statements say, never by the results' order, which is
     // the dictionary's: term ids follow what was interned first, in any graph.
-    // Blank node labels are cut from the key (`without_blank_labels`): a store's own names.
-    let label_free =
-        |term: &Term| crate::mutation::evidence::without_blank_labels(&term.to_string());
+    // Every field, as decoded terms (`nrese_rdf::Term`'s order: the kind, then the value; a
+    // blank node by its label, the store's name for it in the committer's view), never
+    // their text: equal keys are equal results, so either is shown the same.
     let first = rejecting.iter().min_by_key(|result| {
         (
-            label_free(&result.focus_node),
-            result.component.as_str().to_owned(),
+            result.focus_node.clone(),
+            result.component.clone(),
             result.path.clone(),
-            result.value.as_ref().map(label_free),
-            label_free(&result.source_shape),
+            result.value.clone(),
+            result.source_shape.clone(),
+            result.severity.clone(),
+            result.source_constraint.clone(),
+            result.messages.clone(),
         )
     })?;
     let reason = format!(
