@@ -52,6 +52,15 @@ fn user_iri(name: &str) -> NamedNode {
     iri(&format!("{USER}{}", encode_name(name)))
 }
 
+/// The name of the user whose resource `subject` (as N-Triples writes it, `<…>`) is.
+pub(super) fn user_named(subject: &str) -> Option<String> {
+    let local = subject
+        .strip_prefix('<')?
+        .strip_suffix('>')?
+        .strip_prefix(USER)?;
+    Some(decode_name(local))
+}
+
 /// `text` with percent-encoded bytes decoded.
 fn decode_name(text: &str) -> String {
     let bytes = text.as_bytes();

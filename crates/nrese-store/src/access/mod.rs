@@ -185,9 +185,11 @@ pub struct User {
     /// identity. A record isn't evidence of a person by its password (package review R1-D1):
     /// this tells a new record from a continuing one.
     pub created: Option<u64>,
-    /// The change that first gave this record, created after ids, a local login: its
-    /// personal space's prefix carries it ([`AccessState::prefix`]). `None` for a user from
-    /// before ids, or one its credentials name (a token's subject) without a local login.
+    /// The change that created this record, if a new person could be starting then: it was
+    /// created with a local login, or its name had one before (the access history). Its
+    /// personal space's prefix carries it ([`AccessState::prefix`]); nothing later changes
+    /// it. `None` for a user from before ids, or a name its credentials give (a token's
+    /// subject), which keeps its space.
     pub id: Option<u64>,
 }
 
@@ -484,10 +486,11 @@ impl AccessState {
 
     /// Names what the change numbered `number` (which made this state from `before`; one
     /// change creates one record at most) creates: each workspace this state has and `before`
-    /// hadn't gets the id `number`; each user it has and `before` hadn't gets `created`; and
-    /// each user created after ids that has a local login and no id yet gets the id `number`,
-    /// at creation or at the later change that gives it one (R1-D1).
-    fn identify_new(&mut self, before: &AccessState, number: u64) {
+    /// hadn't gets the id `number`; each user it has and `before` hadn't gets `created`, and
+    /// the id `number` too if a new person can be starting: it is created with a local login,
+    /// or its name is in `local_past` (it had one before: R1-D1). Nothing else ever sets or
+    /// changes an id, so a password added or removed later moves no one's space (R2-L1).
+    fn identify_new(&mut self, before: &AccessState, number: u64, local_past: &BTreeSet<String>) {
         // A personal space's record (its sharing) takes its user's id.
         for (name, workspace) in &mut self.workspaces {
             if !name.starts_with('~') && !before.workspaces.contains_key(name) {
@@ -497,9 +500,9 @@ impl AccessState {
         for (name, user) in &mut self.users {
             if !before.users.contains_key(name) {
                 user.created = Some(number);
-            }
-            if user.created.is_some() && user.id.is_none() && user.password_hash.is_some() {
-                user.id = Some(number);
+                if user.password_hash.is_some() || local_past.contains(name) {
+                    user.id = Some(number);
+                }
             }
         }
     }
