@@ -726,7 +726,13 @@ fn commit_image(
     revision: u64,
     write: impl FnOnce() -> EngineResult<PathBuf>,
 ) -> EngineResult<PathBuf> {
-    durable.wal.lock().rotate(revision)?;
+    {
+        let mut wal = durable.wal.lock();
+        // The names a reopen left pending, before anything is written (deferred-sync design
+        // note of 8 Nov): a failure leaves the log as it was.
+        wal.settle_names()?;
+        wal.rotate(revision)?;
+    }
     let error = match write() {
         Ok(path) => return Ok(path),
         Err(error) => error,

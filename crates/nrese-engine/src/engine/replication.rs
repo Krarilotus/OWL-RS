@@ -132,6 +132,9 @@ impl Engine {
         let Some(durable) = &shared.durable else {
             return Err(EngineError::LogTruncated { oldest: latest });
         };
+        // Nothing leaves the process before the store's names are durable (deferred-sync
+        // design note of 8 Nov): a follower must never hold what a power loss here could undo.
+        durable.settle_names()?;
         // Segments that kept moving: the follower starts again from an image, as for a log a
         // checkpoint has covered.
         let Some(segments) = open_segments(durable.root(), after)? else {

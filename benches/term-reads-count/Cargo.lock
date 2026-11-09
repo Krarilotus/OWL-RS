@@ -334,6 +334,7 @@ dependencies = [
  "rust-stemmers",
  "thiserror",
  "tracing",
+ "windows-sys",
 ]
 
 [[package]]

@@ -29,7 +29,7 @@ require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 # which the scorecards run when they exit.
 export MSYS_NO_PATHCONV=1
 
-OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.11}
+OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.13}
 PYTHON_IMAGE=${PYTHON_IMAGE:-python:3.13-alpine}
 HERE=$(cd "$(dirname "$0")" && pwd)
 HERE=$(cygpath -m "$HERE" 2>/dev/null || echo "$HERE")
