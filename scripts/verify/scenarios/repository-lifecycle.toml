@@ -66,12 +66,12 @@ path = "/api/v1/repositories/${repo}/sessions"
 [step.expect]
 status = 201
 [step.capture]
-session = { json = "$.path" }
+session = { json = "$.id" }
 
 [[step]]
 name = "load a class hierarchy and an instance into the session"
 method = "POST"
-path = "${session}/data"
+path = "/api/v1/repositories/${repo}/sessions/${session}/data"
 headers = { Content-Type = "text/turtle" }
 body = """
   <${ex}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <${ex}Animal> .
@@ -82,7 +82,7 @@ status = 204
 
 [[step]]
 name = "query and reason over the uncommitted load"
-path = "${session}/query"
+path = "/api/v1/repositories/${repo}/sessions/${session}/query"
 params = { query = "ASK { <http://example.com/verify/tom> a <http://example.com/verify/Animal> }" }
 headers = { Accept = "application/sparql-results+json" }
 [step.expect]
@@ -99,9 +99,34 @@ status = 200
 json = { "$.boolean" = false }
 
 [[step]]
+name = "open an independent session"
+method = "POST"
+path = "/api/v1/repositories/${repo}/sessions"
+[step.expect]
+status = 201
+[step.capture]
+other = { json = "$.id" }
+
+[[step]]
+name = "the independent session cannot see the private load"
+path = "/api/v1/repositories/${repo}/sessions/${other}/query"
+params = { query = "ASK { <http://example.com/verify/tom> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = false }
+
+[[step]]
+name = "close the independent session"
+method = "DELETE"
+path = "/api/v1/repositories/${repo}/sessions/${other}"
+[step.expect]
+status = 204
+
+[[step]]
 name = "commit the load and its reasoning"
 method = "POST"
-path = "${session}/commit"
+path = "/api/v1/repositories/${repo}/sessions/${session}/commit"
 [step.expect]
 status = 204
 
