@@ -374,16 +374,16 @@ impl QlRewriting {
         Some(out)
     }
 
-    /// Whether the data `snapshot` reads, its default graph the union of its graphs or not
-    /// (`union`), has the tree of probe `key` wherever it folds, memoised per view, mode and
-    /// probe (`None`: not asked, the query's questions spent; `false` then, and nothing
-    /// kept). Only a published snapshot's answer is kept by the store (contract S3); any
-    /// other's by its own version alone (dictionary 3.0c). Concurrent misses may compute
-    /// independently; the query itself runs outside the lock.
+    /// Whether the data `snapshot` reads, as a query in `mode` reads it, has the tree of
+    /// probe `key` wherever it folds, memoised per view, mode and probe (`None`: not asked,
+    /// the query's questions spent; `false` then, and nothing kept). Only a published
+    /// snapshot's answer is kept by the store (contract S3); any other's by its own version
+    /// alone (dictionary 3.0c). Concurrent misses may compute independently; the query
+    /// itself runs outside the lock.
     pub(crate) fn realised(
         &self,
         snapshot: &Snapshot,
-        union: bool,
+        mode: ProbeMode,
         key: &str,
         compute: impl FnOnce() -> Option<bool>,
     ) -> bool {
@@ -393,7 +393,7 @@ impl QlRewriting {
                 {
                     let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
                     if cache.0 == Some(identity)
-                        && let Some(known) = cache.1.get(union, key)
+                        && let Some(known) = cache.1.get(mode, key)
                     {
                         return known;
                     }
@@ -402,14 +402,14 @@ impl QlRewriting {
                 let Some(known) = compute() else {
                     return false;
                 };
-                self.remember(&state, union, key, known);
+                self.remember(&state, mode, key, known);
                 known
             }
             Admission::Own(own) => {
                 let mine = own.get_or_insert_with(QlOwn::default);
                 {
                     let probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(known) = probes.get(&identity).and_then(|p| p.get(union, key)) {
+                    if let Some(known) = probes.get(&identity).and_then(|p| p.get(mode, key)) {
                         return known;
                     }
                 }
@@ -417,24 +417,21 @@ impl QlRewriting {
                     return false;
                 };
                 let mut probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
-                probes
-                    .entry(identity)
-                    .or_default()
-                    .insert(union, key, known);
+                probes.entry(identity).or_default().insert(mode, key, known);
                 known
             }
         }
     }
 
-    /// Keeps probe `key`'s answer in mode `union` for the published snapshot `state`
-    /// gives, replacing another view's probes.
-    fn remember(&self, state: &SharedState<'_>, union: bool, key: &str, known: bool) {
+    /// Keeps probe `key`'s answer in `mode` for the published snapshot `state` gives,
+    /// replacing another view's probes.
+    fn remember(&self, state: &SharedState<'_>, mode: ProbeMode, key: &str, known: bool) {
         let identity = state.snapshot().identity();
         let mut cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
         if cache.0 != Some(identity) {
             *cache = (Some(identity), Probes::default());
         }
-        cache.1.insert(union, key, known);
+        cache.1.insert(mode, key, known);
     }
 
     /// The same with other bounds (tests make them small).
@@ -665,35 +662,85 @@ struct QlOwn {
     probes: Mutex<HashMap<SnapshotIdentity, Probes>>,
 }
 
-/// One view's probe answers, by default-graph mode, then by probe. A probe asks the
-/// default graph its query reads, the union of the graphs or not, and neither the view's
-/// identity nor the probe's text says which (sol-loop r1 S1).
+/// What, besides the view and its text, decides a probe's answer: the query options that
+/// change what an ASK means (sol-loop r1 S1, r2 S2). Neither the view's identity nor the
+/// probe's text says them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ProbeMode {
+    union_default_graph: bool,
+    geosparql_stated_only: bool,
+    equality_canonical: bool,
+}
+
+impl ProbeMode {
+    /// The mode of a probe asked with `options`. Every option is named: one added to
+    /// [`crate::QueryOptions`] doesn't compile here until it is sorted into the mode or
+    /// out of it.
+    pub(crate) fn of(options: &crate::QueryOptions) -> Self {
+        let crate::QueryOptions {
+            // What the default graph is, and whether relations are computed: an ASK's
+            // answer.
+            union_default_graph,
+            geosparql_stated_only,
+            // A term the probe names stands for its identity class.
+            equality_canonical,
+            // Fixed for every probe by the rewriting's applicability (`ql_rewriting`) and
+            // its data check: no dataset, the materialised statements, no pre-bound
+            // variables, no access restriction, no rewriting of the probe itself.
+            dataset: _,
+            read_model: _,
+            pre_bound: _,
+            access: _,
+            ql: _,
+            // The same answers, by other means or bounds.
+            resources: _,
+            as_written: _,
+            equality_closed: _,
+            equality_early_expansion: _,
+            cross_chunk_rows: _,
+            stream_rows: _,
+            index_joins: _,
+            // Nothing a probe's triple patterns read: federation, search, the result cache.
+            services: _,
+            search_scope: _,
+            result_cache: _,
+            pin: _,
+        } = options;
+        Self {
+            union_default_graph: *union_default_graph,
+            geosparql_stated_only: *geosparql_stated_only,
+            equality_canonical: *equality_canonical,
+        }
+    }
+}
+
+/// One view's probe answers, by mode ([`ProbeMode`]), then by probe.
 #[derive(Debug, Default)]
-pub(crate) struct Probes([HashMap<String, bool>; 2]);
+pub(crate) struct Probes(HashMap<ProbeMode, HashMap<String, bool>>);
 
 /// [`Probes::all`]: each probe's answer, with its mode and its query, sorted.
 #[cfg(test)]
-pub(crate) type ProbeAnswers = Vec<((bool, String), bool)>;
+pub(crate) type ProbeAnswers = Vec<((ProbeMode, String), bool)>;
 
 impl Probes {
-    fn get(&self, union: bool, key: &str) -> Option<bool> {
-        self.0[usize::from(union)].get(key).copied()
+    fn get(&self, mode: ProbeMode, key: &str) -> Option<bool> {
+        self.0.get(&mode)?.get(key).copied()
     }
 
-    fn insert(&mut self, union: bool, key: &str, known: bool) {
-        self.0[usize::from(union)].insert(key.to_owned(), known);
+    fn insert(&mut self, mode: ProbeMode, key: &str, known: bool) {
+        self.0
+            .entry(mode)
+            .or_default()
+            .insert(key.to_owned(), known);
     }
 
     /// Every answer, with its mode.
     #[cfg(test)]
     pub(crate) fn all(&self) -> ProbeAnswers {
-        let mut out: Vec<_> = [false, true]
-            .into_iter()
-            .flat_map(|union| {
-                self.0[usize::from(union)]
-                    .iter()
-                    .map(move |(k, &v)| ((union, k.clone()), v))
-            })
+        let mut out: Vec<_> = self
+            .0
+            .iter()
+            .flat_map(|(&mode, probes)| probes.iter().map(move |(k, &v)| ((mode, k.clone()), v)))
             .collect();
         out.sort();
         out
