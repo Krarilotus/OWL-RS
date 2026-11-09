@@ -71,18 +71,18 @@ impl StoreService {
         // One certified closure (review r1, F1): reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their
-        // snapshots; else it is asked again, and a change that left no certificate refuses then.
-        loop {
-            let epoch = self.certificate_epoch();
-            if !epoch.is_multiple_of(2) {
-                std::thread::yield_now();
-                continue;
-            }
+        // snapshots. An open or changed certificate refuses without waiting or retrying.
+        let epoch = self.certificate_epoch();
+        if epoch.is_multiple_of(2) {
             let answer = self.entails_once(&program, conclusion)?;
             if self.certificate_epoch() == epoch {
                 return Ok(answer);
             }
         }
+        Err(StoreError::Configuration(format!(
+            "the inferred statements aren't {}'s closure: rematerialise first",
+            program.name()
+        )))
     }
 
     /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
