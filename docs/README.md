@@ -30,7 +30,7 @@ The tools that exist, so none is built twice. Each one's own header or README is
 | The release gate | `scripts/release-gate.sh` (its header), the checklist §4 in [plan/2026-10-05-v2-merge-checklist.md](plan/2026-10-05-v2-merge-checklist.md), the approved trade-offs in `benches/release-tradeoffs.toml` |
 | Benchmarks: cases, workloads, systems, results | [benches/README.md](../benches/README.md); the cases in `benches/cases/`, the catalogue [benches/CATALOG.md](../benches/CATALOG.md), the generated [STATUS](../benches/STATUS.md) and [STANDINGS](../benches/STANDINGS.md), the runner `benches/suite/suite.py` |
 | Timing a change against its base, or bisecting a slowdown (one family per candidate commit) | `benches/suite/abba.py` on the fleet, [benches/abba/README.md](../benches/abba/README.md); the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
-| Proving HTTP behaviour on a real server | [scripts/verify/README.md](../scripts/verify/README.md) |
+| Proving HTTP behaviour on a real server | [scripts/verify/README.md](../scripts/verify/README.md), with [which scenario to run](../scripts/verify/README.md#choose-a-scenario) |
 | W3C and other conformance suites | `scripts/fetch-w3c-tests.sh`; each suite's runner and expected failures in its crate's `tests/` |
 | Fuzzing, seed sweeps, Miri | [fuzz/README.md](../fuzz/README.md), `scripts/fuzz-campaign.sh`; `scripts/seed-sweep.py` with `benches/seed-sweeps.toml`; `scripts/miri.sh` |
 | Checked files and lints | `scripts/check-locks.sh` (Cargo lock files current), `scripts/check-names.sh` (Docker names), `scripts/check-doc-paths.py` (paths the docs name exist) |

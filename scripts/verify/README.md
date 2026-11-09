@@ -18,6 +18,17 @@ the commands and the exit codes: `verify.py`'s docstring (`python scripts/verify
 
 Tests: `benches/suite/tests/test_verify.py` (the suite's contracts; no server built).
 
+## Choose a scenario
+
+Run an existing scenario before you write a new one. Each file's `description` says what it proves, and where that's specified.
+
+| To show | Scenario |
+|---|---|
+| A repository's lifecycle: create, configure, restart, remove, and the catalog's listings | `scenarios/repository-lifecycle.toml` |
+| RDF4J transactions and their isolation levels | `scenarios/rdf4j-isolation.toml` |
+| The `NRESE-Completeness` header under `owl2-dl` | `scenarios/owl2-dl-completeness.toml` |
+| Graph Store Protocol CRUD on a named graph | `scenarios/gsp-named-graph.toml` |
+
 ## Scenario files
 
 TOML, one file per scenario. Every key is known: a misspelt one is an error naming it, so a typo
