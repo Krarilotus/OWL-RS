@@ -31,7 +31,7 @@ use nrese_engine::Transaction;
 use super::consistency::{self, Budget, Checked, Verdict};
 use super::{DlConsistency, DlStatus, source};
 use crate::StoreService;
-use crate::mutation::evidence::{Draft, EvidenceView};
+use crate::mutation::evidence::{Draft, EvidenceView, without_blank_labels};
 
 /// What the gate decided: the commit's status, and why it is rejected if it is, for the
 /// committer ([`rejection`]).
@@ -360,6 +360,52 @@ fn axiom_evidence(
         .collect()
 }
 
+/// The axioms of `ontology` but its declarations, in the order of what they say: each by
+/// its functional-syntax form and its source triples, decoded. Never the ontology's own
+/// order, which follows term ids, so what was interned first in any graph (package review
+/// r1-D1): the justification [`super::explain::justify_among`] finds in this order depends
+/// on the view's statements alone. The keys are charged to `memory`; `None` past it or the
+/// deadline.
+fn canonical_candidates(
+    tx: &Transaction<'_>,
+    ontology: &nrese_owl::Ontology,
+    memory: nrese_exec::Envelope,
+    deadline: Deadline,
+) -> Option<Vec<usize>> {
+    let decode = |t: u64| {
+        tx.decode(nrese_engine::TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
+    };
+    let mut grant = nrese_exec::Grant::new(memory);
+    let mut keyed: Vec<(String, usize)> = Vec::new();
+    for (i, axiom) in ontology.axioms.iter().enumerate() {
+        if matches!(axiom, nrese_owl::Axiom::Declaration(..)) {
+            continue;
+        }
+        if deadline.passed() {
+            return None;
+        }
+        let mut triples: Vec<String> = ontology.sources[i]
+            .iter()
+            .flat_map(|source| source.triples.iter())
+            .map(|t| without_blank_labels(&t.map(&decode).join(" ")))
+            .collect();
+        triples.sort_unstable();
+        let key = format!(
+            "{}\n{}",
+            without_blank_labels(&ontology.functional(axiom, &decode)),
+            triples.join("\n")
+        );
+        grant
+            .take(key.capacity() + std::mem::size_of::<(String, usize)>())
+            .ok()?;
+        keyed.push((key, i));
+    }
+    // Stable: axioms that differ only in which blank node they name keep their order.
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(keyed.into_iter().map(|(_, i)| i).collect())
+}
+
 /// The OWL 2 DL reason a restricted committer's view shows: the ontology of the statements
 /// asserted in graphs it may read has no model by itself; a minimal set of its axioms, each
 /// by its source triples (every one of them from those graphs, whatever graph an axiom's
@@ -371,20 +417,27 @@ fn view_reason(
     deadline: Deadline,
 ) -> Option<Draft> {
     let memory = operation.memory.clone().unwrap_or_default();
-    let ontology = source::read_pending_where(view.tx(), memory, |graph| view.graph(graph)).ok()?;
-    let justification = super::explain::justify(
+    let ontology =
+        source::read_pending_where(view.tx(), memory.clone(), |graph| view.graph(graph)).ok()?;
+    let candidates = canonical_candidates(view.tx(), &ontology, memory, deadline)?;
+    let justification = super::explain::justify_among(
         &ontology,
         &super::explain::Goal::Inconsistent,
         &[],
         &operation.remaining(deadline),
         deadline,
+        candidates,
     )
     .ok()??;
     let reason = format!(
         "the data is inconsistent under OWL 2 DL: these {} axiom(s) have no model together",
         justification.axioms.len()
     );
-    let evidence = axiom_evidence(view.tx(), &ontology, &justification);
+    let mut evidence = axiom_evidence(view.tx(), &ontology, &justification);
+    evidence.sort_by_cached_key(|e| {
+        [&e.subject, &e.predicate, &e.object].map(|term| without_blank_labels(term))
+    });
+    evidence.dedup();
     Some(crate::mutation::evidence::shown(
         reason,
         CONSTRAINT,

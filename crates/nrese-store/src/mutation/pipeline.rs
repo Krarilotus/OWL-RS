@@ -336,8 +336,12 @@ impl MutationPipeline {
             {
                 return Err(MutationError::Rejected(Box::new(reject)));
             }
-            crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
-                .map_err(store_error)?;
+            crate::shacl::check_shapes(
+                &tx,
+                &self.store.config().shapes_graph,
+                &evidence::EvidenceView::new(&requester.read, &tx),
+            )
+            .map_err(store_error)?;
             // The view's OWL 2 DL reason is looked for even where the whole data is
             // consistent: the RDF mapping isn't monotone (an annotation property declared in
             // another graph changes what the view's statements say).
@@ -400,7 +404,12 @@ impl MutationPipeline {
 
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
-        crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph).map_err(store_error)?;
+        crate::shacl::check_shapes(
+            &tx,
+            &self.store.config().shapes_graph,
+            &evidence::EvidenceView::new(&requester.read, &tx),
+        )
+        .map_err(store_error)?;
         // No OWL 2 reasoning: no OWL 2 reason to look for.
         let resources = context.resources();
         self.shacl_gate(
@@ -443,7 +452,11 @@ impl MutationPipeline {
             match crate::shacl::introduced(tx, &self.store.config().shapes_graph, resources) {
                 Ok(report) => report,
                 Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
-                Err(error) => return Err(MutationError::Gate(error.to_string())),
+                // The stored shapes' problems, as the committer may be told them.
+                Err(error) => {
+                    let error = view.shapes_error(&self.store.config().shapes_graph, error);
+                    return Err(MutationError::Gate(error.to_string()));
+                }
             };
         let Some(report) = report else {
             return Ok(());

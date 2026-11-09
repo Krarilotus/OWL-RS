@@ -198,8 +198,14 @@ fn validate_view<V: ReadView + Sync>(
 /// Fails if the commit in `tx` changes the graph `shapes_graph` and leaves shapes in it that
 /// don't compile: the shapes graph is a managed object, well-formed whatever wrote it and
 /// whether or not the SHACL gate is on ([`StoreError::ShaclShapes`], one message per
-/// problem).
-pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreResult<()> {
+/// problem, as `view`'s committer may be told them: [`EvidenceView::shapes_error`]).
+///
+/// [`EvidenceView::shapes_error`]: crate::mutation::evidence::EvidenceView::shapes_error
+pub(crate) fn check_shapes(
+    tx: &Transaction<'_>,
+    shapes_graph: &str,
+    view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+) -> StoreResult<()> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
         return Ok(());
@@ -216,7 +222,7 @@ pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreRes
         Selection::asserted(GraphSelector::Exact(shapes_id)),
     )
     .map(drop)
-    .map_err(shapes_error)
+    .map_err(|errors| view.shapes_error(shapes_graph, shapes_error(errors)))
 }
 
 /// What the commit in `tx` introduces against the shapes in the graph `shapes_graph` (the
@@ -338,7 +344,20 @@ pub(crate) fn view_reason(
     )
     .ok()??;
     let rejecting: Vec<_> = report.results.iter().filter(|r| rejects(r)).collect();
-    let first = rejecting.first()?;
+    // The first by what the view's statements say, never by the results' order, which is
+    // the dictionary's: term ids follow what was interned first, in any graph.
+    // Blank node labels are cut from the key (`without_blank_labels`): a store's own names.
+    let label_free =
+        |term: &Term| crate::mutation::evidence::without_blank_labels(&term.to_string());
+    let first = rejecting.iter().min_by_key(|result| {
+        (
+            label_free(&result.focus_node),
+            result.component.as_str().to_owned(),
+            result.path.clone(),
+            result.value.as_ref().map(label_free),
+            label_free(&result.source_shape),
+        )
+    })?;
     let reason = format!(
         "the commit introduces {} SHACL result(s) the gate rejects; first: focus node {}, {}",
         rejecting.len(),

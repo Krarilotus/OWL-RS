@@ -23,6 +23,7 @@ use std::borrow::Cow;
 
 use super::MutationReject;
 use super::attribution::RejectAttribution;
+use crate::error::StoreError;
 
 /// Proof that a [`MutationReject`] was made by [`EvidenceView::reject`].
 #[derive(Debug, Clone)]
@@ -37,6 +38,11 @@ pub(crate) struct Draft {
 
 /// Ends every restricted committer's rejection.
 pub(crate) const ONLY_READABLE: &str = "Only statements in graphs you can read are shown.";
+
+/// The one problem told of a shapes graph the committer may not read
+/// ([`EvidenceView::shapes_error`]).
+pub(crate) const SHAPES_UNREADABLE: &str =
+    "the shapes graph has problems; it is a graph you can't read, so they aren't shown";
 
 /// The committer's view of a transaction's state, for its rejection.
 pub(crate) struct EvidenceView<'v, 'e> {
@@ -75,6 +81,24 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
         'v: 'w,
     {
         self.access.map(|access| Readable { view, access })
+    }
+
+    /// `error` as the committer may be told it. The problems of a shapes graph it may not
+    /// read ([`StoreError::ShaclShapes`]: which shape, which list, which term) tell of that
+    /// graph's statements: such a refusal comes with one message, the same for every such
+    /// graph. That it is refused is the gate's answer (D-1). Any other error, and every
+    /// error for a committer that may read the shapes graph, is as it was.
+    pub fn shapes_error(&self, shapes_graph: &str, error: StoreError) -> StoreError {
+        match error {
+            StoreError::ShaclShapes(_)
+                if self
+                    .access
+                    .is_some_and(|access| !access.allows(shapes_graph)) =>
+            {
+                StoreError::ShaclShapes(vec![SHAPES_UNREADABLE.to_owned()])
+            }
+            error => error,
+        }
     }
 
     /// The rejection: `full` for a committer that may read every graph, else `view`,
@@ -134,6 +158,21 @@ pub(crate) fn shown(
         }),
         attribution: None,
     }
+}
+
+/// `text` (N-Triples terms) with each blank node label cut to `_:`: what orders a view's
+/// evidence. Labels are a store's own names, fresh per store and in no statement's content;
+/// the rest is what the view's statements say. Evidence that differs only in which blank
+/// node it names stays in the order it came in.
+pub(crate) fn without_blank_labels(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("_:") {
+        out.push_str(&rest[..at + 2]);
+        rest = rest[at + 2..].trim_start_matches(|c: char| c.is_ascii_alphanumeric());
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The likely commit-local trigger sentence of `attribution`, or nothing.
