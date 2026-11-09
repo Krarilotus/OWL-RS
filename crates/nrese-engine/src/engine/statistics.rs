@@ -543,7 +543,11 @@ impl Statistics {
             return;
         };
         let covered = snapshot.dictionary_len();
-        let Some(fingerprint) = snapshot.dictionary().fingerprint(covered) else {
+        // A private snapshot's sets name ids the dictionary doesn't have: never saved.
+        let Some(fingerprint) = snapshot
+            .shared_dictionary()
+            .and_then(|dictionary| dictionary.fingerprint(covered))
+        else {
             return;
         };
         let written =
@@ -566,7 +570,8 @@ impl Statistics {
     /// keep, the size they were built at).
     fn load_sets(&self, snapshot: &Snapshot, model: ReadModel) -> Option<(Option<Gathered>, u64)> {
         let dir = self.dir.lock().clone()?;
-        let dictionary = snapshot.dictionary();
+        // None for a private snapshot: saved sets are the published dictionary's.
+        let dictionary = snapshot.shared_dictionary()?;
         let (_, loaded) = crate::term::derived::load(&dir, &Self::sets_name(model), |covered| {
             dictionary.fingerprint(covered)
         })?;
