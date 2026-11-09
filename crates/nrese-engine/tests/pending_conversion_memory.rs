@@ -201,7 +201,9 @@ fn pending_versions_converting_one_base_at_once_share_one_form() {
 
 /// An unchanged transaction reading under the same budget gets the same pending snapshot (its
 /// asserted identity, its own per version made, is the same); a write in between, or another
-/// budget, gets a new one (DICT2's memo, keyed by the change generation and the budget).
+/// budget, gets a new one (DICT2's memo, keyed by the change generation and the budget). A
+/// write transaction's commit lets its kept snapshot go: the budget is back where it was
+/// before the read (merge with engine-v2 e2e29dd2: `Pending::into_parts` drops the memo).
 #[test]
 fn an_unchanged_transaction_keeps_its_pending_snapshot_per_budget() {
     let engine = store(10);
@@ -216,6 +218,19 @@ fn an_unchanged_transaction_keeps_its_pending_snapshot_per_budget() {
     tx.insert(named(1).as_ref());
     let after = tx.pending_snapshot_within(&a).unwrap().asserted_identity();
     assert_ne!(first, after, "after a write: the same snapshot");
+    drop(tx);
+    let budget = unlimited();
+    let before = budget.used();
+    let mut writer = engine.transaction();
+    writer.insert(named(2).as_ref());
+    drop(writer.pending_snapshot_within(&budget).unwrap());
+    assert!(budget.used() > before, "the kept snapshot holds no charge");
+    writer.commit().unwrap();
+    assert_eq!(
+        budget.used(),
+        before,
+        "the commit kept the kept snapshot's charge"
+    );
 }
 
 /// The statement `s{i} p o{i}` of [`store`] as the transaction's ids, a default-graph triple.

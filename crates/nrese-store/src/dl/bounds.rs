@@ -38,6 +38,10 @@ use crate::StoreService;
 mod memory_tests;
 
 #[cfg(test)]
+#[path = "bounds_token_tests.rs"]
+mod token_tests;
+
+#[cfg(test)]
 #[path = "bounds_lock_tests.rs"]
 mod lock_tests;
 
@@ -872,7 +876,11 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
     } = parts;
     let revision = view.revision;
     if !lower.is_empty() {
-        match snapshot.with_inferred_added_within(&lower, kept) {
+        // Derived from `snapshot` alone, so the view keeps its publication (dictionary 3.0b):
+        // one of the method's two allowed callers (the workspace's clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let derived = snapshot.with_inferred_derived_within(&lower, kept);
+        match derived {
             Ok(lower) => view.lower = lower,
             Err(_) => return (refused(snapshot, revision), false),
         }
@@ -888,7 +896,9 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
             return (refused(snapshot, revision), false);
         }
         drop(facts);
-        let Ok(upper_view) = snapshot.with_inferred_added_within(&triples, kept) else {
+        // The other allowed caller.
+        #[allow(clippy::disallowed_methods)]
+        let Ok(upper_view) = snapshot.with_inferred_derived_within(&triples, kept) else {
             return (refused(snapshot, revision), false);
         };
         // Read expanded to every identity of U1's classes (the stack keeps representatives).

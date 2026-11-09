@@ -210,7 +210,7 @@ fn read_error(error: nrese_store::StoreError) -> ApiError {
 
 pub(crate) async fn apply(
     state: &AppState,
-    ops: Vec<StatementOp>,
+    ops: impl Into<nrese_store::StatementOps>,
     access: &AccessView,
 ) -> Result<(), ApiError> {
     mutation::run(
@@ -915,8 +915,9 @@ pub async fn transaction_action(
     };
     if let Some(ops) = ops {
         return match sessions.add(&txid, owner, ops) {
-            true => Ok(StatusCode::OK.into_response()),
-            false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+            Ok(true) => Ok(StatusCode::OK.into_response()),
+            Ok(false) => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+            Err(refused) => Err(sparql::map_query_error(&state.policy(), refused.into())),
         };
     }
     match action.as_str() {

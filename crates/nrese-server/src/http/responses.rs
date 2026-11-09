@@ -173,7 +173,25 @@ pub struct AdminRestoreResponse {
     pub replaced_existing: bool,
 }
 
-pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError> {
+/// Public readiness has no dataset diagnostics, even when authentication is off.
+pub fn build_readiness_response(state: &AppState) -> StatusResponse {
+    StatusResponse {
+        status: if !state.is_started() {
+            "starting"
+        } else if state.is_quarantined() {
+            "quarantined"
+        } else {
+            "ready"
+        },
+    }
+}
+
+/// Every consumer of global figures checks scope here, after authorizing its action.
+pub fn build_ready_response(
+    state: &AppState,
+    identity: &crate::auth::Identity,
+) -> Result<ReadyResponse, ApiError> {
+    super::guard::whole_read_scope(state.access_view(identity))?;
     let stats = state
         .store()
         .stats()
@@ -182,13 +200,7 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
 
     let consistency = state.store().consistency();
     Ok(ReadyResponse {
-        status: if !state.is_started() {
-            "starting"
-        } else if state.is_quarantined() {
-            "quarantined"
-        } else {
-            "ready"
-        },
+        status: build_readiness_response(state).status,
         consistency: consistency.as_str(),
         violations: match consistency {
             nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
