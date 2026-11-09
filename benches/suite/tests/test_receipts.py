@@ -13,10 +13,12 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -27,6 +29,19 @@ from suitekit import driver, ledger, manifest, receipts, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[3]  # this repository
+
+
+def no_cargo_config_at_or_above(path) -> bool:
+    """Whether no .cargo/config or .cargo/config.toml sits in `path` or any directory above it: a plain
+    walk, the test's own, independent of the producer's cargo_configs."""
+    here = os.path.abspath(path)
+    while True:
+        if any(os.path.isfile(os.path.join(here, ".cargo", name)) for name in ("config", "config.toml")):
+            return False
+        parent = os.path.dirname(here)
+        if parent == here:
+            return True
+        here = parent
 
 HEADER = ("date,host,runtime,system,version,publish,workload,tier,regime,run,task,item,repeat,status,ms,"
           "peak_mib,rows,bytes,note,cache,order,recall\n")
@@ -407,6 +422,7 @@ class Driver(unittest.TestCase):
         """P2 design review F3, F4, F8: the attempt's own protocol (a smoke run isn't the standard
         cell); the build's CPU, flags and Rust image (an empty settings list proved no defaults); and
         the settings that change a measurement, not where the run keeps its files."""
+        self.checkout(self.root, "suite")  # a checkout to export, as a run's source is (P1e)
         with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
             suite = self.suite(runs=1, skip_build=False)
         suite.manifest.update(settings={"JAVA_HEAP": "8g", "NRESE_BENCH_SCRATCH": "/x", "NRESE_BENCH_KEEP": "1"})
@@ -418,6 +434,7 @@ class Driver(unittest.TestCase):
         with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}), \
                 patch.object(suite, "host_command", return_value=0), patch.object(driver.ns, "docker"), \
                 patch.object(driver.ns, "pinned", return_value={"rust:1.98.1-bookworm": "sha256:" + "r" * 64}), \
+                patch.object(driver, "toolchain_in", return_value=dict(self.DECLARED)), \
                 patch.object(suite.args, "runtime", "docker"):  # pinned before any build, as a run's are
             self.assertTrue(suite.build_nrese(nrese))
         plan = Plan("w", "1")
@@ -454,28 +471,68 @@ class Driver(unittest.TestCase):
         done = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True)
         return done.stdout.strip()
 
-    def built(self, source: Path | None = None, results: str = "results") -> dict:
+    DECLARED = {"rustc": "1.98.1", "cargo": "1.98.1", "host": "x86_64-unknown-linux-gnu"}  # the fixture's channel
+
+    def clean_root(self) -> Path:
+        """A directory of this test's own under a root with no cargo config at or above it, for a
+        build's export: the precondition of every `controlled: true`, checked first by the test's own
+        walk. A fleet Windows job's TEMP is inside its checkout (whose .cargo a build there would
+        read), so its own output directory and the user's temporary directory are tried too. None
+        on this host: the test fails, saying so; its expectation never bends to the host."""
+        local = os.environ.get("LOCALAPPDATA")
+        tried = []
+        for base in (tempfile.gettempdir(), os.environ.get("FLEET_OUT"), local and os.path.join(local, "Temp"),
+                     str(Path.home())):
+            if not base or not os.path.isdir(base):
+                continue
+            tried.append(base)
+            if no_cargo_config_at_or_above(base):
+                root = Path(tempfile.mkdtemp(prefix="p1e-clean-", dir=base)).resolve()
+                self.addCleanup(shutil.rmtree, root, True)
+                self.assertTrue(no_cargo_config_at_or_above(root))
+                return root
+        self.fail(f"no directory on this host without a cargo config at or above it; tried {tried}")
+
+    def built(self, source: Path | None = None, results: str = "results", toolchain=None,
+              settings: dict | None = None, export_base: Path | None = None) -> dict:
         """The receipt's `build` of one NRESE cell after this run built NRESE (from `source`, else the
-        repository) and the harness (from the repository), into `results`."""
+        repository) and the harness (from the repository), into `results`, both host builds. Each
+        build's directory, file list there and environment are in self.builds; the toolchain probe
+        answers `toolchain` (the fixture's declared one by default)."""
         suite = self.suite(runs=1, skip_build=False, results=results)
+        suite.settings.update(settings or {})
+        self.suite_built = suite
         nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
                      script_builds=Mock(return_value=[]), regimes={"none": ""}, supports=Mock(return_value=None),
-                     source=Mock(return_value=source or self.root), target_volume="v")
-        with patch.object(suite, "host_command", return_value=0):
+                     source=Mock(return_value=source or self.root), target_volume="v",
+                     target_dir=Mock(return_value=self.root / "nrese-target"))
+        self.builds = []
+
+        def build(command, log=None, *a, cwd=None, environ=None, **k):
+            files = sorted(f.relative_to(cwd).as_posix() for f in Path(cwd).rglob("*") if f.is_file()) if cwd else []
+            self.builds.append({"cwd": Path(cwd) if cwd else None, "files": files, "environ": environ})
+            return 0
+        with patch.object(suite, "host_command", side_effect=build), contextlib.ExitStack() as stack, \
+                patch.object(driver, "toolchain_here", return_value=toolchain or dict(self.DECLARED)):
+            if export_base is not None:
+                stack.enter_context(patch.object(driver, "build_export_base", return_value=export_base))
             self.assertTrue(suite.build_nrese(nrese))
             self.assertTrue(suite.build_harness())
+        self.assertEqual(suite.made_exports, [])  # each export went with its build
+        self.assertTrue(all(not b["cwd"].exists() for b in self.builds if b["cwd"]))
         plan = Plan("w", "1")
         suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
         return self.cells(suite)["w/1/x"]["build"]
 
     def test_a_build_names_the_trees_it_compiled_at_its_own_commit(self):
-        """Orchestrator, 8 Nov (P1d, design r2 F10; r3 F10): each build records the git ids of what it
-        compiled at its own source's commit, so a receipt is compared by content. NRESE: crates,
+        """Orchestrator, 8 Nov (P1d, design r2 F10; r3 F10): each build records the git ids of its
+        program's declared dependency envelope (P1d review r1 F2: what its build can read, not an exact
+        read set) at its own source's commit, so a receipt is compared by content. NRESE: crates,
         Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo, from its source, which can be another
         checkout. The harness, a workspace of its own built with --manifest-path whose path
         dependencies are crates/ members inheriting from the root Cargo.toml: its workspace
         directory, crates, Cargo.toml, rust-toolchain.toml, .cargo, from the repository. Both: the
-        launcher they build through, scripts/cargo-guarded.sh and what it sources (r4 B)."""
+        launcher, scripts/cargo-guarded.sh and what it sources (r4 B)."""
         self.checkout(self.root, "suite")
         source = self.checkout(self.root / "data" / "nrese-src", "nrese")
         build = self.built(source)
@@ -485,9 +542,11 @@ class Driver(unittest.TestCase):
                              *launcher)}
         for program, checkout in (("nrese", source), ("harness", self.root)):
             with self.subTest(program):
+                self.assertIn("sources", build[program], "the build names its sources")
                 self.assertEqual(build[program]["sources"], {p: self.git(checkout, "rev-parse", f"HEAD:{p}")
                                                             for p in paths[program]})
-                self.assertEqual(build[program]["commit"], self.git(checkout, "rev-parse", "HEAD"))
+                self.assertEqual(build[program].get("commit"), self.git(checkout, "rev-parse", "HEAD"))
+        self.assertTrue(all("sources" in build[p] for p in ("nrese", "harness")), "both builds name their sources")
         self.assertNotEqual(build["nrese"]["sources"]["crates"], build["harness"]["sources"]["crates"])
 
     def test_a_harness_built_from_other_source_says_so_where_nrese_s_trees_are_the_same(self):
@@ -498,6 +557,8 @@ class Driver(unittest.TestCase):
         first = self.built()
         self.checkout(self.root, "suite", harness="fn main() { println!(); }\n")
         second = self.built(results="results-2")
+        for build in (first, second):
+            self.assertTrue(all("sources" in build[p] for p in ("nrese", "harness")), "both builds name their sources")
         self.assertNotEqual(first["harness"]["sources"]["benches/nrese-bench-harness"],
                             second["harness"]["sources"]["benches/nrese-bench-harness"])
         self.assertEqual(first["nrese"]["sources"], second["nrese"]["sources"])
@@ -538,9 +599,10 @@ class Driver(unittest.TestCase):
     def test_a_build_names_what_its_build_scripts_read_from_outside_git(self):
         """P2 design check r4 A (orchestrator 17:56): crates/nrese-server/build.rs embeds every file of
         the ignored apps/nrese-console/dist, so equal trees with other console bytes are another binary.
-        NRESE's build records them: "no files" when the directory is missing or empty (the same empty
-        table), else a digest of every file's path and bytes, which changes with them. The harness reads
-        none."""
+        build_inputs names them: "no files" when the directory is missing or empty (the same empty
+        table), else a digest of every file's path and bytes, which changes with them. P1e (orchestrator
+        18:34): a build compiles a clean export of its commit, which never holds the ignored bundle, so
+        whatever the checkout has, the build's record is "no files", the default build's."""
         self.checkout(self.root, "suite")
         dist = self.root / "apps" / "nrese-console" / "dist"
         seen = []
@@ -551,21 +613,488 @@ class Driver(unittest.TestCase):
                 for name, text in files.items():
                     (dist / name).parent.mkdir(parents=True, exist_ok=True)
                     (dist / name).write_text(text, encoding="utf-8")
+            seen.append((case, driver.build_inputs(self.root, "nrese")["apps/nrese-console/dist"]))
             build = self.built(results=f"results-{len(seen)}")
-            seen.append((case, build["nrese"]["inputs"], build["nrese"]["sources"]))
+            for field in ("inputs", "sources"):
+                self.assertIn(field, build["nrese"], f"NRESE's build names its {field}")
+            self.assertIn("inputs", build["harness"], "the harness's build names its inputs")
+            self.assertEqual(build["nrese"]["inputs"], {"apps/nrese-console/dist": "no files"}, case)
             self.assertEqual(build["harness"]["inputs"], {})
-        values = {case: inputs["apps/nrese-console/dist"] for case, inputs, _ in seen}
+            self.assertFalse(any(f.startswith("apps/nrese-console/dist/") for b in self.builds for f in b["files"]))
+        values = dict(seen)
         self.assertEqual(values["missing"], "no files")
         self.assertEqual(values["empty"], "no files")
         self.assertEqual(driver.expected_build_inputs("nrese"), {"apps/nrese-console/dist": "no files"})
         self.assertEqual(driver.expected_build_inputs("harness"), {})
         self.assertRegex(values["bundle a"], "^sha256:[0-9a-f]{64}$")
         self.assertEqual(len({values["bundle a"], values["bundle b"], values["nested"], "no files"}), 4)
-        self.assertEqual(len({str(sources) for _, _, sources in seen}), 1)  # the git trees never told them apart
+
+    def test_a_host_build_runs_cargo_in_the_controlled_environment_only(self):
+        """P2 design check r4 F15 (orchestrator 17:56; P2 second lead 18:00, an allowlist): cargo,
+        rustc and every build script see only the variables the build owner names, so encoded flags
+        (the counting allocator), a profile override, cc's knobs or a compile-time revision string
+        never change a binary whose record says default. What a build is told to use is kept; its
+        target directory is its program's own."""
+        self.checkout(self.root, "suite")
+        given = {"CARGO_ENCODED_RUSTFLAGS": "--cfg\x1falloc_profile", "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
+                 "CRATE_CC_NO_DEFAULTS": "1", "CFLAGS": "-O0", "RUSTC_WRAPPER": "w", "RUSTUP_TOOLCHAIN": "nightly",
+                 "NRESE_BUILD_REVISION": "r", "SOMETHING_ELSE": "x",
+                 "RUSTFLAGS": "-g", "NRESE_TARGET_CPU": "znver3", "CARGO_TARGET_DIR": str(self.root / "t"),
+                 "CARGO_HOME": str(self.root / "data" / "cargo-home"), "NRESE_QUIET_DIR": "q", "FLEET_SLICE": "s"}
+        base = self.clean_root()
+        with patch.dict(driver.os.environ, given):
+            build = self.built(export_base=base)
+            expected = dict(driver.os.environ)
+        self.assertEqual(len(self.builds), 2)  # NRESE's and the harness's host builds
+        for made in self.builds:
+            environment = made["environ"]
+            self.assertIsNotNone(environment)  # a full environment, never one merged onto this process's
+            for name in ("CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CRATE_CC_NO_DEFAULTS", "CFLAGS",
+                         "RUSTC_WRAPPER", "RUSTUP_TOOLCHAIN", "NRESE_BUILD_REVISION", "SOMETHING_ELSE"):
+                self.assertNotIn(name, environment)
+            for name in ("RUSTFLAGS", "NRESE_TARGET_CPU", "CARGO_HOME", "NRESE_QUIET_DIR", "FLEET_SLICE", "PATH"):
+                self.assertEqual(environment.get(name), expected.get(name), name)
+        self.assertEqual(self.builds[0]["environ"]["CARGO_TARGET_DIR"], str(self.root / "nrese-target"))
+        self.assertEqual((build["nrese"]["target_cpu"], build["nrese"]["rustflags_env"]), ("znver3", "-g"))
+        self.assertIs(build["nrese"]["controlled"], True)
+
+    def test_a_build_compiles_a_clean_export_of_its_commit(self):
+        """P1e (orchestrator 18:34; P2 design check r5 F17): a build runs in a fresh export of its
+        checkout's commit, never the worktree: a file git ignores (a legacy .cargo/config with
+        opt-level 0, excluded through .git/info/exclude) or a tracked file changed since the commit
+        isn't there; the export is outside the checkout and goes with the build."""
+        self.checkout(self.root, "suite")
+        (self.root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (self.root / ".git" / "info" / "exclude").write_text(".cargo/config\n", encoding="utf-8")
+        (self.root / ".cargo" / "config").write_text("[profile.release]\nopt-level = 0\n", encoding="utf-8")
+        (self.root / "Cargo.lock").write_text("changed since the commit", encoding="utf-8")
+        base = self.clean_root()
+        with patch.dict(driver.os.environ, {"CARGO_HOME": str(self.root / "no-cargo-home")}):
+            build = self.built(export_base=base)
+        for made in self.builds:
+            self.assertFalse(made["cwd"].resolve().is_relative_to(self.root.resolve()), made["cwd"])
+            self.assertIn(".cargo/config.toml", made["files"])
+            self.assertNotIn(".cargo/config", made["files"])
+        self.assertIs(build["nrese"]["controlled"], True)
+        self.assertEqual(self.export_text("Cargo.lock"), "suite")  # the commit's, not the worktree's
+
+    def export_text(self, name: str) -> str:
+        """`name` as an export of self.root's HEAD has it."""
+        with tempfile.TemporaryDirectory() as d:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d))
+            return (Path(d) / name).read_text(encoding="utf-8")
+
+    def test_an_export_s_files_are_newer_than_any_earlier_build_whatever_their_commit_s_date(self):
+        """P1e: cargo decides freshness by mtimes; an export stamped with its commit's (an older
+        commit's) time would read as older than the last build's outputs and keep a stale binary. Every
+        file and directory of an export has the time it was made."""
+        self.checkout(self.root, "suite")
+        old = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                              "--allow-empty", "-m", "old"], capture_output=True, text=True, check=True,
+                             env={**os.environ, "GIT_COMMITTER_DATE": "2000-01-01T00:00:00", "GIT_AUTHOR_DATE":
+                                  "2000-01-01T00:00:00"})
+        self.assertEqual(old.returncode, 0)
+        began = time.time() - 2
+        with tempfile.TemporaryDirectory() as d:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d))
+            stamps = [f.stat().st_mtime for f in Path(d).rglob("*")]
+        self.assertTrue(stamps)
+        self.assertGreaterEqual(min(stamps), began)
+
+    def test_a_build_whose_commit_can_t_be_exported_doesn_t_run(self):
+        """P1e attack 6: no commit (not a checkout), or an export that fails: the build doesn't start,
+        says why, and nothing of it is left; never a build from the worktree in its place."""
+        suite = self.suite(runs=1, skip_build=False)
+        nrese = Mock(spec=driver.Nrese, key="nrese", source=Mock(return_value=self.root), target_volume="v",
+                     target_dir=Mock(return_value=self.root / "t"))
+        with patch.object(suite, "host_command", return_value=0) as run:
+            self.assertFalse(suite.build_nrese(nrese))  # self.root is no checkout here
+            self.checkout(self.root, "suite")
+            with patch.object(driver, "export_commit", side_effect=OSError("disk full")):
+                self.assertFalse(suite.build_harness())
+        run.assert_not_called()
+        self.assertEqual(suite.made_exports, [])
+        said = " ".join(str(c.args[0]) for c in suite.say.call_args_list)
+        self.assertIn("no commit to export", said)
+        self.assertIn("disk full", said)
+
+    def test_a_build_running_another_toolchain_than_declared_is_uncontrolled(self):
+        """P2 design check r5 F16: a saved rustup override for the build directory, or a PATH straight at
+        another toolchain's bin, selects another compiler. The build records what rustc and cargo
+        report there (toolchain_here) and is controlled only when both are rust-toolchain.toml's
+        channel. A PATH whose first rustc and cargo report 1.97.0: unknown, naming both."""
+        self.checkout(self.root, "suite")
+        bin_ = self.root / "data" / "other-toolchain"
+        bin_.mkdir(parents=True)
+        for tool in ("rustc", "cargo"):
+            if os.name == "nt":
+                (bin_ / f"{tool}.cmd").write_text(f"@echo {tool} 1.97.0\r\n@echo release: 1.97.0\r\n@echo host: x\r\n",
+                                                  encoding="utf-8")
+            else:
+                (bin_ / tool).write_text(f"#!/bin/sh\necho '{tool} 1.97.0'\necho 'release: 1.97.0'\necho 'host: x'\n",
+                                         encoding="utf-8", newline="\n")
+                (bin_ / tool).chmod(0o755)
+        seen = driver.toolchain_here(self.root, {**os.environ, "PATH": str(bin_)})
+        self.assertEqual(seen, {"rustc": "1.97.0", "cargo": "1.97.0", "host": "x"})
+        build = self.built(toolchain=seen)
+        for program in ("nrese", "harness"):
+            with self.subTest(program):
+                self.assertEqual(build[program]["toolchain"], seen)
+                self.assertIsInstance(build[program]["controlled"], dict, "another toolchain isn't controlled")
+                self.assertIn("rustc 1.97.0 selected, rust-toolchain.toml declares 1.98.1",
+                              build[program]["controlled"]["unknown"])
+                self.assertIn("cargo 1.97.0 selected", build[program]["controlled"]["unknown"])
+        self.assertEqual(driver.declared_toolchain(self.root), "1.98.1")
+        self.assertIn("no rustc", driver.toolchain_here(self.root, {"PATH": str(self.root / "nothing")})["unknown"])
+
+    def test_cargo_config_outside_the_export_makes_a_build_uncontrolled(self):
+        """P2 design check r4 F15, r5 F18: cargo also reads .cargo/config(.toml) in every ancestor of the
+        directory it builds in and in its Cargo home; a build where one is there is `controlled`
+        unknown, naming it. A relative CARGO_HOME is the child's, resolved against the build's own
+        directory, never this process's (the suite launched from elsewhere). Neither: controlled."""
+        self.checkout(self.root, "suite")
+        outer = self.clean_root()  # outside the checkout, no config at or above it
+        base = outer / "exports"
+        base.mkdir()
+        home = outer / "cargo-home"
+        home.mkdir()
+        for case in ("none", "ancestor", "cargo home", "relative cargo home"):
+            with self.subTest(case), patch.object(driver, "build_export_base", return_value=base):
+                env = {"CARGO_HOME": str(home)}
+                if case == "ancestor":
+                    (outer / ".cargo").mkdir()
+                    (outer / ".cargo" / "config.toml").write_text("[build]\n", encoding="utf-8")
+                if case == "cargo home":
+                    (outer / ".cargo" / "config.toml").unlink()
+                    (home / "config.toml").write_text("[build]\n", encoding="utf-8")
+                if case == "relative cargo home":
+                    (home / "config.toml").unlink()
+                    env = {"CARGO_HOME": "relative-home"}
+                    elsewhere = outer / "elsewhere"
+                    (elsewhere / "relative-home").mkdir(parents=True)  # where this process would look: empty
+                with patch.dict(driver.os.environ, env):
+                    if case == "relative cargo home":
+                        # The child's: inside its export, which a commit can hold; here, a config put there
+                        # by the commit itself, so the build reads it.
+                        (self.root / "relative-home").mkdir()
+                        (self.root / "relative-home" / "config.toml").write_text("[build]\n", encoding="utf-8")
+                        self.checkout(self.root, "suite")
+                        cwd = os.getcwd()
+                        os.chdir(elsewhere)
+                        try:
+                            build = self.built(results=f"results-{case.replace(' ', '-')}")
+                        finally:
+                            os.chdir(cwd)
+                    else:
+                        build = self.built(results=f"results-{case.replace(' ', '-')}")
+                controlled = build["nrese"]["controlled"]
+                if case == "none":
+                    self.assertIs(controlled, True)
+                    continue
+                self.assertIsInstance(controlled, dict, f"{case}: a config outside the export isn't controlled")
+                if case == "relative cargo home":
+                    self.assertIn("relative-home", controlled["unknown"])
+                    self.assertNotIn("elsewhere", controlled["unknown"])
+                else:
+                    where = outer / ".cargo" / "config.toml" if case == "ancestor" else home / "config.toml"
+                    self.assertIn(str(where.resolve()), controlled["unknown"])
+
+    def test_an_export_goes_beside_its_checkout_and_a_config_there_is_named(self):
+        """P1e (build-controlled-build-3, phuoc-yu): the launcher's free-disk guard measures the
+        filesystem it runs from, the export's; one in the system's temporary directory (a small /tmp)
+        refused a build whose target had room. The export goes beside the build's own checkout,
+        wherever TEMP is, on the filesystem the guard always measured. Cargo reads a .cargo/config
+        above it there too: a build with one beside its checkout says so, naming the file the test
+        wrote (the layout of a fleet Windows job's checkout, master 22:34)."""
+        outer = self.clean_root()
+        source = self.checkout(outer / "repo", "nrese")
+        (outer / ".cargo").mkdir()
+        (outer / ".cargo" / "config.toml").write_text("[build]\n", encoding="utf-8")
+        self.checkout(self.root, "suite")
+        elsewhere = self.clean_root()  # TEMP, somewhere else
+        with patch.object(driver.tempfile, "gettempdir", return_value=str(elsewhere)), \
+                patch.dict(driver.os.environ, {"CARGO_HOME": str(self.root / "no-cargo-home")}):
+            build = self.built(source=source)
+        self.assertEqual(self.builds[0]["cwd"].resolve().parent, outer.resolve())  # NRESE's, beside its checkout
+        self.assertEqual(self.builds[1]["cwd"].resolve().parent, self.root.resolve().parent)  # the harness's
+        controlled = build["nrese"]["controlled"]
+        self.assertIsInstance(controlled, dict, "a config above the export isn't controlled")
+        self.assertIn(str((outer / ".cargo" / "config.toml").resolve()), controlled["unknown"])
+
+    def test_an_export_is_the_commit_s_tree_byte_for_byte_whatever_git_s_attributes_say(self):
+        """P1e review r1 F1 (master 23:12): git archive applies export-ignore and export-subst, from
+        attributes outside the commit too (core.attributesFile, .git/info/attributes), and replace refs
+        swap an object under its id: an export without .cargo/config.toml read as controlled. The
+        export holds every file of the commit's tree with its committed bytes, nothing else; a build
+        in it reads its committed .cargo/config.toml and is controlled."""
+        self.checkout(self.root, "suite")
+        raw = {"version.txt": (b"$Format:%H$\n", "100644"), "crlf.txt": (b"a\r\nb\r\n", "100644"),
+               "no-newline.txt": (b"no newline", "100644"), "bin.dat": (bytes(range(256)), "100644"),
+               "run.sh": (b"#!/bin/sh\nexit 0\n", "100755")}
+        for path, (data, mode) in raw.items():  # as committed bytes, no filter on the way in either
+            blob = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--no-filters", "--stdin"],
+                                  input=data, capture_output=True, check=True).stdout.decode().strip()
+            self.git(self.root, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "raw")
+        commit = self.git(self.root, "rev-parse", "HEAD")
+        attributes = self.root / "data" / "attributes"
+        attributes.write_text(".cargo/config.toml export-ignore\nversion.txt export-subst\n", encoding="utf-8")
+        (self.root / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (self.root / ".git" / "info" / "attributes").write_text("Cargo.lock export-ignore\n", encoding="utf-8")
+        lock = self.git(self.root, "rev-parse", "HEAD:Cargo.lock")
+        other = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="replaced",
+                               capture_output=True, text=True, check=True).stdout.strip()
+        self.git(self.root, "replace", lock, other)
+        external = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.attributesFile",
+                    "GIT_CONFIG_VALUE_0": str(attributes)}
+        def blob(path: str) -> bytes:
+            return subprocess.run(["git", "-C", str(self.root), "--no-replace-objects", "cat-file", "blob",
+                                   f"{commit}:{path}"], capture_output=True, check=True).stdout
+        listed = self.git(self.root, "ls-tree", "-r", "--name-only", commit).splitlines()
+        expected = {path: blob(path) for path in listed}
+        for path, (data, _) in raw.items():
+            self.assertEqual(expected[path], data)  # the fixture is what the commit holds
+        with tempfile.TemporaryDirectory() as d, patch.dict(driver.os.environ, external):
+            driver.export_commit(self.root, commit, Path(d))
+            got = {f.relative_to(d).as_posix(): f.read_bytes() for f in Path(d).rglob("*") if f.is_file()}
+            executable = os.access(Path(d) / "run.sh", os.X_OK)
+            plain = os.access(Path(d) / "crlf.txt", os.X_OK)
+        self.assertEqual(set(got), set(expected))  # .cargo/config.toml and Cargo.lock both there
+        self.assertEqual(got, expected)  # byte for byte: $Format$ kept, Cargo.lock not replaced, CRLF as committed
+        if os.name != "nt":  # Windows has no mode bits
+            self.assertTrue(executable)
+            self.assertFalse(plain)
+        base = self.clean_root()
+        with patch.dict(driver.os.environ, {**external, "CARGO_HOME": str(self.root / "no-cargo-home")}):
+            build = self.built(export_base=base)
+        for made in self.builds:
+            self.assertIn(".cargo/config.toml", made["files"])
+        self.assertIs(build["nrese"]["controlled"], True)
+
+    def commit_with(self, entries: dict) -> str:
+        """A commit of self.root whose tree is `entries` (path -> bytes), built with git mktree, which
+        keeps any name (git's index refuses some on Windows): for names an export must refuse."""
+        def blob(data: bytes) -> str:
+            return subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--no-filters", "--stdin"],
+                                  input=data, capture_output=True, check=True).stdout.decode().strip()
+
+        def tree(level: dict) -> str:
+            lines = b""
+            for name, value in sorted(level.items()):
+                kind, oid = ("tree", tree(value)) if isinstance(value, dict) else ("blob", blob(value))
+                lines += f"{'040000' if kind == 'tree' else '100644'} {kind} {oid}\t{name}".encode() + b"\0"
+            return subprocess.run(["git", "-C", str(self.root), "mktree", "-z"], input=lines, capture_output=True,
+                                  check=True).stdout.decode().strip()
+        nested = {}
+        for path, data in entries.items():
+            level = nested
+            *dirs, name = path.split("/")
+            for d in dirs:
+                level = level.setdefault(d, {})
+            level[name] = data
+        return self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", "-m", "names",
+                        tree(nested))
+
+    def test_an_export_refuses_every_name_its_filesystem_would_read_otherwise(self):
+        """P1e review r2 F1 (master 00:03): Windows reads names git keeps as plain characters: a
+        backslash as a directory, `..\\x` outside the export (surviving its removal), a colon as a
+        drive or an alternate stream, a device name, a trailing dot or space dropped. An export accepts
+        only portable names (attack 19) and refuses the whole tree otherwise, before writing anything:
+        the export directory stays empty and nothing appears beside it, on every system."""
+        self.checkout(self.root, "suite")
+        bad = ["dir\\file", "..\\outside.txt", "normal:stream", "C:x", "CON", "con.txt", "nul/x", "Aux .txt",
+               "COM1", "lpt9.log", "trail.", "trail ", "na\u00efve", "a*b", "q?", 'quote"', "lt<", "pipe|",
+               "tab\tname", "nested/dir\\file"]
+        for name in bad:
+            with self.subTest(name):
+                commit = self.commit_with({"Cargo.toml": b"[workspace]\n", name: b"x"})
+                with tempfile.TemporaryDirectory() as d:
+                    outer = Path(d)
+                    export = outer / "export"
+                    export.mkdir()
+                    with self.assertRaises(OSError):
+                        driver.export_commit(self.root, commit, export)
+                    self.assertEqual(list(export.iterdir()), [])  # nothing written, not even the good file
+                    self.assertEqual([p.name for p in outer.iterdir()], ["export"])  # nothing beside it
+        good = self.commit_with({"a/b c/d+e@f-g_h.txt": b"ok", ".cargo/config.toml": b"[build]\n", "..x": b"y"})
+        with tempfile.TemporaryDirectory() as d:
+            driver.export_commit(self.root, good, Path(d))
+            self.assertEqual((Path(d) / "a" / "b c" / "d+e@f-g_h.txt").read_bytes(), b"ok")
+
+    def test_an_export_refuses_what_isn_t_a_plain_file(self):
+        """P1e review r1 F1, attack 14: a symlink (or submodule) entry is refused, never followed nor
+        dropped: the build doesn't run."""
+        self.checkout(self.root, "suite")
+        target = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="Cargo.toml",
+                                capture_output=True, text=True, check=True).stdout.strip()
+        self.git(self.root, "update-index", "--add", "--cacheinfo", f"120000,{target},link")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "a link")
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(OSError) as refused:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d))
+        self.assertIn("link", str(refused.exception))
+
+    def test_the_commit_exported_is_the_one_the_build_s_record_names(self):
+        """P1e review r1 F1: the export binds to the commit built_from recorded, never HEAD read again
+        (a checkout that moves between the two would build another commit than its record names)."""
+        self.checkout(self.root, "suite")
+        recorded = self.git(self.root, "rev-parse", "HEAD")
+        suite = self.suite(runs=1, skip_build=False)
+        states = iter([{"commit": recorded, "dirty": 0}] + [{"commit": "f" * 40, "dirty": 0}] * 5)
+        with patch.object(driver, "checkout_state", side_effect=lambda *a: next(states)), \
+                patch.object(driver, "export_commit") as exported, \
+                patch.object(suite, "host_command", return_value=0), \
+                patch.object(driver, "toolchain_here", return_value=dict(self.DECLARED)):
+            suite.build_harness()
+        self.assertEqual(exported.call_args.args[1], recorded)
+
+    def test_a_build_that_raises_still_has_its_record_in_the_manifest(self):
+        """P1e review r1 F2: a builder that raises (an OSError at launch, a log it can't create, an
+        interrupt) still leaves its record in the run's manifest."""
+        suite = self.suite(runs=1, skip_build=False)
+
+        def raising(*a):
+            suite.built["nrese"] = {"commit": "a" * 40, "controlled": True}
+            raise OSError("no bash")
+        nrese = Mock(spec=driver.Nrese, key="nrese", regimes={"none": ""}, images=Mock(return_value=[]),
+                     builds=Mock(return_value=[]), script_builds=Mock(return_value=[]),
+                     supports=Mock(return_value=None), definition_paths=())
+        with patch.object(suite, "build_nrese", side_effect=raising), \
+                patch.object(driver, "plans", return_value=[Plan("w", "1")]), \
+                patch.object(driver, "adapter", return_value=nrese), \
+                patch.object(suite, "ensure_data", return_value=None), \
+                patch.object(suite, "sif_missing", return_value=None), self.assertRaises(OSError):
+            suite.run()
+        entry = json.loads((suite.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][-1]
+        self.assertEqual(entry.get("builds"), {"nrese": {"commit": "a" * 40, "controlled": True}})
+
+    def test_an_export_past_its_deadline_stops_its_git_and_fails(self):
+        """P1e review r1 F4: one deadline for the whole export, its git children killed at it."""
+        self.checkout(self.root, "suite")
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(OSError) as late:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d), timeout=0)
+        self.assertIn("deadline", str(late.exception))
+
+    def test_an_export_refuses_two_directory_spellings_one_filesystem_merges(self):
+        """P1e sol-loop r3 S3: `Dir/a` and `dir/b` are two trees in git, one directory where case
+        folds (Windows): the export refuses rather than merge them (case folding emulated here)."""
+        self.checkout(self.root, "suite")
+        blob = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="x",
+                              capture_output=True, text=True, check=True).stdout.strip()
+        for path in ("Dir/a", "dir/b"):
+            self.git(self.root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "two spellings")
+        with tempfile.TemporaryDirectory() as d, patch.object(driver.os.path, "normcase", side_effect=str.lower), \
+                self.assertRaises(OSError) as refused:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d))
+        self.assertIn("same", str(refused.exception))
+
+    def test_a_stalled_export_is_killed_at_its_deadline(self):
+        """P1e sol-loop r3 S4: a cat-file that never answers is killed at the export's deadline, and
+        the export fails saying so, well within it plus a margin."""
+        self.checkout(self.root, "suite")
+        real = subprocess.Popen
+        started = []
+
+        def stalled(argv, *a, **k):
+            if "cat-file" in argv:
+                child = real([sys.executable, "-c", "import time; time.sleep(120)"], *a, **k)
+                started.append(child)
+                return child
+            return real(argv, *a, **k)
+        began = time.monotonic()
+        with tempfile.TemporaryDirectory() as d, patch.object(driver.subprocess, "Popen", side_effect=stalled), \
+                self.assertRaises(OSError) as late:
+            driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d), timeout=2)
+        self.assertLess(time.monotonic() - began, 30)
+        self.assertIn("deadline", str(late.exception))
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll())  # killed, not left running
+
+    def test_every_compile_time_variable_our_sources_read_is_set_by_cargo_or_never_passed(self):
+        """P2 second lead 17:59 (rule: fix recurring mistakes mechanically): a variable our Rust sources
+        read at compile time (env!, option_env!) or a build script reads (env::var) changes the binary;
+        each is one cargo sets for the build, or controlled_environment doesn't pass it. A new one
+        fails here until the build owner decides."""
+        import re
+        names = set()
+        sources = [*ROOT.glob("crates/**/src/**/*.rs"), *ROOT.glob("benches/nrese-bench-harness/src/**/*.rs")]
+        for path in sources:
+            names |= set(re.findall(r'(?:option_env|env)!\(\s*"([A-Za-z0-9_]+)"', path.read_text(encoding="utf-8")))
+        for path in ROOT.glob("crates/**/build.rs"):
+            names |= set(re.findall(r'env::var(?:_os)?\(\s*"([A-Za-z0-9_]+)"', path.read_text(encoding="utf-8")))
+        self.assertIn("NRESE_BUILD_REVISION", names)  # the scan finds today's one (draft_check.rs)
+        cargo_sets = re.compile(r"^(CARGO_.*|OUT_DIR|TARGET|HOST|PROFILE|OPT_LEVEL|DEBUG|NUM_JOBS|RUSTC|RUSTDOC)$")
+        for name in sorted(names):
+            if not cargo_sets.match(name):
+                with self.subTest(name):
+                    self.assertNotIn(name, driver.controlled_environment({name: "x"}))
+
+    def test_a_run_s_manifest_holds_what_it_built_whether_or_not_a_cell_ran(self):
+        """Orchestrator 18:09 (P1e's Windows proof): the build records a cell's receipt copies are in
+        its invocation's manifest entry too (`builds`), as the builds end: a run whose cells all skip
+        (no data) still says what it built and how."""
+        suite = self.suite(runs=1)
+        record = {"commit": "c" * 40, "dirty": 0, "controlled": True}
+
+        def built():
+            suite.built["harness"] = record
+            return True
+        with patch.object(driver.Suite, "build_harness", side_effect=built):
+            with patch.object(driver, "plans", return_value=[Plan("w", "1", inputs=["/data/missing.nt"])]), \
+                    patch.object(driver, "adapter", return_value=self.system()), \
+                    patch.object(suite, "sif_missing", return_value=None):
+                suite.run()
+        entry = json.loads((suite.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][-1]
+        self.assertEqual(entry["builds"], {"harness": record})
+        self.assertEqual(entry.get("cells", {}), {})  # its one cell skipped: no receipt
+
+    def test_a_relative_target_directory_is_the_checkout_s_never_the_export_s(self):
+        """P1e sol-loop r1 S1: a build now runs in its export, which goes after the build; a relative
+        CARGO_TARGET_DIR ("target") resolved there would put the binary in the export, removed with it,
+        while the run executes the checkout's, maybe stale. Both owners resolve it against the
+        repository: the harness's build and the harness the run executes, and NRESE's target_dir (its
+        binary and its build) alike."""
+        self.checkout(self.root, "suite")
+        self.built(settings={"CARGO_TARGET_DIR": "target"})
+        self.assertEqual(self.builds[1]["environ"]["CARGO_TARGET_DIR"], str(self.root / "target"))  # the harness's
+        self.assertEqual(Path(self.suite_built.harness()),
+                         self.root / "target" / "release" / f"nrese-bench-harness{driver.EXE}")
+        nrese = driver.adapter("nrese")
+        for given, expected in (("target", ROOT / "target"), (str(self.root / "t"), self.root / "t")):
+            with self.subTest(given):
+                ctx = driver.Context(None, ROOT, ROOT, ROOT, driver.Mount("-", "/data"), [], 0,
+                                     {"CARGO_TARGET_DIR": given}, "images")
+                self.assertEqual(nrese.target_dir(ctx), expected)
+
+    def test_a_run_records_each_build_as_it_ends_a_failed_one_too(self):
+        """P1e sol-loop r1 S2: the manifest's `builds` is written after each build, so a run whose
+        harness build fails after NRESE's succeeded still says what it built and how."""
+        suite = self.suite(runs=1, skip_build=False)
+        records = {program: {"commit": "a" * 40, "controlled": True} for program in ("nrese", "harness")}
+
+        def build(key, ok):
+            def run(*a):
+                suite.built[key] = records[key]
+                return ok
+            return run
+        nrese = Mock(spec=driver.Nrese, key="nrese", regimes={"none": ""}, images=Mock(return_value=[]),
+                     builds=Mock(return_value=[]), script_builds=Mock(return_value=[]),
+                     supports=Mock(return_value=None), definition_paths=())
+        with patch.object(suite, "build_nrese", side_effect=build("nrese", True)), \
+                patch.object(suite, "build_harness", side_effect=build("harness", False)), \
+                patch.object(driver, "plans", return_value=[Plan("w", "1")]), \
+                patch.object(driver, "adapter", return_value=nrese), \
+                patch.object(suite, "ensure_data", return_value=None), \
+                patch.object(suite, "sif_missing", return_value=None):
+            self.assertEqual(suite.run(), 1)
+        entry = json.loads((suite.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][-1]
+        self.assertEqual(entry.get("builds"), records)
 
     def test_build_settings_are_read_from_the_environment_given_only(self):
         """P2 design check r3 F14 (orchestrator 17:39): the default build's settings come from the build
-        owner with an empty environment, whatever this process's environment holds; a given one is read."""
+        owner with an empty environment, whatever this process's environment holds; a given one is read.
+        (Its witness against an owner that takes `env` but reads os.environ is a mutation of that one
+        read, run in the proof: P1d review r1 F1.)"""
         with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
             self.assertEqual(driver.build_settings({}), {"target_cpu": "native", "rustflags_env": ""})
         self.assertEqual(driver.build_settings({"NRESE_TARGET_CPU": "portable", "RUSTFLAGS": "-g"}),
@@ -574,13 +1103,16 @@ class Driver(unittest.TestCase):
     def test_a_docker_build_runs_in_its_rust_image_s_pinned_id(self):
         """Orchestrator, 8 Nov (P1d): the Rust image a Docker build compiles in is the run's pinned
         one (ns.pinned, as every container's), by id, never its tag looked up again, and the receipt
-        names that id; a build whose image isn't pinned doesn't start."""
+        names that id; a build whose image isn't pinned doesn't start. P1e: the source it mounts is the
+        export of its commit, never the worktree, and its toolchain is the image's, checked."""
+        self.checkout(self.root, "suite")  # a checkout to export, as a run's source is (P1e)
         suite = self.suite(runs=1, skip_build=False)
         nrese = Mock(spec=driver.Nrese, key="nrese", source=Mock(return_value=self.root),
                      rust_image=Mock(return_value="rust:1.98.1-bookworm"), target_volume="v")
         for pins, built in (({"rust:1.98.1-bookworm": "sha256:" + "r" * 64}, True), ({}, False)):
             with self.subTest(pinned=bool(pins)), patch.object(suite.args, "runtime", "docker"), \
                     patch.object(suite, "host_command", return_value=0) as run, patch.object(driver.ns, "docker"), \
+                    patch.object(driver, "toolchain_in", return_value=dict(self.DECLARED)) as probe, \
                     patch.object(driver.ns, "pinned", return_value=pins):
                 self.assertIs(suite.build_nrese(nrese), built)
                 if built:
@@ -588,6 +1120,12 @@ class Driver(unittest.TestCase):
                     self.assertIn("sha256:" + "r" * 64, command)
                     self.assertNotIn("rust:1.98.1-bookworm", command)
                     self.assertEqual(suite.built["nrese"]["rust_image_id"], "sha256:" + "r" * 64)
+                    mounted = command[command.index("-v") + 1].rsplit(":/src", 1)[0]
+                    self.assertNotEqual(Path(mounted).resolve(), self.root.resolve())
+                    self.assertEqual(probe.call_args.args[1].as_posix(), mounted)
+                    self.assertEqual(suite.built["nrese"]["toolchain"], self.DECLARED)
+                    self.assertIs(suite.built["nrese"]["controlled"], True)
+                    self.assertEqual(suite.made_exports, [])
                 else:
                     run.assert_not_called()
 
