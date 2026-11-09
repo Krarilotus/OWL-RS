@@ -1543,7 +1543,11 @@ class Parts(unittest.TestCase):
                 "  QueryEvaluation: 239 / 0 / 0 (0)\n  total: 505 / 0 / 0 (0)\n")
             (logs / "tableau-w3c.tsv").write_text("a\tConsistencyTest\tAL\tpass\t0\n" * 410 +
                                                   "b\tInconsistencyTest\tAL\tdisputed\t0\n")
-            counts = gate_module.w3c_counts(logs)
+            # Each suite's counts from its own kit's log or table (the gate's declared kits).
+            _, kits, bad = gate_module.load_w3c_expected(
+                (ROOT / "benches/fast/w3c-expected.toml").read_text(encoding="utf-8"))
+            self.assertEqual(bad, [])
+            counts = gate_module.kit_counts(logs, kits)
             expected = {"OWL 2 RL": {"passed": 86, "skipped": 3}, "SHACL Core": {"passed": 98},
                         "SPARQL 1.1": {"passed": 505}, "OWL 2 DL": {"passed": 410, "disputed": 1},
                         "SHACL-SPARQL": {"passed": 22}}
