@@ -108,9 +108,12 @@ impl<'e> Transaction<'e> {
     /// by the snapshot (DUR-6): its scratch, its runs of the pending changes, their lists and
     /// its version. The base's runs read in the quad layout are their shared forms, the
     /// store's index memory, not charged here. A refusal ([`crate::EngineError::MemoryLimit`])
-    /// makes nothing and records nothing. An unchanged transaction asking under the same
-    /// budget gets the same snapshot: the last one is kept, with its charge, until the next
-    /// write or the transaction's drop.
+    /// returns no snapshot, keeps no charge and records no statistics. It isn't free of every
+    /// effect: it may have let go of the kept snapshot (not current), and a quad-layout form
+    /// built for the asserted stack before the refusal may stay installed in its source run's
+    /// slot (its arrays freed once nothing holds them; review r1 on DUR-6a). An unchanged
+    /// transaction asking under the same budget gets the same snapshot: the last one is kept,
+    /// with its charge, until the next write, a term interned since, or the transaction's drop.
     pub fn pending_snapshot_within(
         &self,
         budget: &std::sync::Arc<nrese_exec::Budget>,

@@ -366,3 +366,69 @@ fn a_refused_pending_snapshot_releases_nothing_before_it_frees_it() {
     assert!(refused > 0, "no budget refused");
     drop(other);
 }
+
+/// A pending version as a reader of a restricted view reads it (`pending_over_within`, review r1
+/// on DUR-6a, N2): what it makes is charged to its reader's budget before it is made and held by
+/// the snapshot, with its own scratch (the inferred statements gone: the pending deletes, the
+/// pending asserts and `hidden`), over a view of a base with inferred statements, a named-graph
+/// insert pending; the charge goes with the snapshot (nothing is kept: it is a new one each call).
+/// A 16-byte budget refuses it with the typed memory error, and nothing stays charged. A guard of
+/// the over path's own bounds, which the pending snapshot's tests don't reach.
+#[test]
+fn a_pending_version_over_a_view_is_charged_for_what_it_makes() {
+    if !measure::alone() {
+        return;
+    }
+    let engine = store(2_000);
+    {
+        let mut tx = engine.transaction();
+        for i in 0..200 {
+            let inferred = nrese_engine::EncodedTriple {
+                object: triple(&tx, i + 200).object,
+                ..triple(&tx, i)
+            };
+            tx.insert_inferred(inferred);
+        }
+        tx.commit().unwrap();
+    }
+    let other = pending(&engine, 0, &unlimited());
+    let base = engine.snapshot();
+    let view = base.with_inferred_subset(nrese_engine::InferredSubset::Without(Vec::new()));
+    let mut tx = engine.speculative();
+    tx.insert(named(1).as_ref());
+    for i in 0..50 {
+        let quad = Quad::new(
+            node(&format!("s{i}")),
+            node("p"),
+            node(&format!("o{}", i + 200)),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    let hidden: Vec<nrese_engine::EncodedQuad> = (50..100)
+        .map(|i| {
+            nrese_engine::EncodedTriple {
+                object: triple(&tx, i + 200).object,
+                ..triple(&tx, i)
+            }
+            .in_default_graph()
+        })
+        .collect();
+    let budget = unlimited();
+    let (snapshot, excess) = measure::measure_within(&budget, || {
+        tx.pending_over_within(&view, &hidden, &budget).unwrap()
+    });
+    assert!(excess == 0, "held {excess} bytes beyond its charge");
+    assert!(budget.used() > 0, "nothing charged");
+    drop(snapshot);
+    assert_eq!(budget.used(), 0, "the charge outlived the snapshot");
+    let tiny = Arc::new(Budget::new(16));
+    let refused = tx.pending_over_within(&view, &hidden, &tiny);
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "a 16-byte budget: {:?}",
+        refused.map(|_| ())
+    );
+    assert_eq!(tiny.used(), 0, "a refusal kept a charge");
+    drop((tx, view, base, other));
+}
