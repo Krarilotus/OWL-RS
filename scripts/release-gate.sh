@@ -745,6 +745,9 @@ report)
 
 w3c)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks} NRESE_W3C_REQUIRED=1
+  # This attempt's record first, before the earlier result is touched: the verdict takes only a result
+  # of the latest attempt, so an earlier one that can't be removed stands for nothing (fix check r2).
+  attempt=$(py benches/fast/release_gate.py attempt w3c "$OUT") || { log "w3c: no attempt record: no run"; exit 1; }
   # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
   # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
   { rm -f "$OUT/w3c.json" && [ ! -e "$OUT/w3c.json" ]; } \
@@ -766,7 +769,7 @@ w3c)
   # the data, the identity or the result couldn't be had, or the checker exited otherwise.
   identity=$(gate_identity HEAD) || { log "w3c: the gate can't name its toolchain and flags: no receipt"; exit 1; }
   py benches/fast/release_gate.py w3c "$OUT/w3c" --expected benches/fast/w3c-expected.toml --run \
-    --identity "$identity" --json "$OUT/w3c.json" > "$OUT/w3c/counts.txt" 2> >(tee -a "$OUT/gate.log" >&2)
+    --identity "$identity" --attempt "$attempt" --json "$OUT/w3c.json" > "$OUT/w3c/counts.txt" 2> >(tee -a "$OUT/gate.log" >&2)
   code=$?
   { [ "$code" -le 1 ] && [ -f "$OUT/w3c.json" ]; } || { log "w3c: no result (the checker exited $code)"; exit "$(( code > 1 ? code : 1 ))"; }
   log "w3c: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print("passed" if d["passed"] else "NOT passed: " + "; ".join(d["errors"]))' "$OUT/w3c.json")"
@@ -774,6 +777,8 @@ w3c)
 
 guards)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks}
+  # This attempt's record first, before the earlier result is touched (as w3c's, fix check r2).
+  attempt=$(py benches/fast/release_gate.py attempt guards "$OUT") || { log "guards: no attempt record: no run"; exit 1; }
   # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
   # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
   { rm -f "$OUT/guards.json" && [ ! -e "$OUT/guards.json" ]; } \
@@ -784,7 +789,7 @@ guards)
   # when the identity or the result couldn't be had, or the checker exited otherwise.
   identity=$(gate_identity HEAD) || { log "guards: the gate can't name its toolchain and flags: no receipt"; exit 1; }
   py benches/fast/release_gate.py guards --run --log "$OUT/guards/test.log" --identity "$identity" \
-    --json "$OUT/guards.json" | tee -a "$OUT/gate.log"
+    --attempt "$attempt" --json "$OUT/guards.json" | tee -a "$OUT/gate.log"
   code=${PIPESTATUS[0]}
   { [ "$code" -le 1 ] && [ -f "$OUT/guards.json" ]; } || { log "guards: no result (the checker exited $code)"; exit "$(( code > 1 ? code : 1 ))"; }
   ;;

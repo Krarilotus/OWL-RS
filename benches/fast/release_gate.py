@@ -29,6 +29,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import statistics
 import subprocess
 import sys
@@ -1179,9 +1180,9 @@ class Outcome(NamedTuple):
 class CheckReceipt(NamedTuple):
     """What a check ran: the checkout's commit and tree (its tracked files unchanged: `dirty`), the
     build identity (scripts/lib/gate-key.sh gate_identity: toolchain, flags, tools), the host and
-    fleet job, and every unit it launched. `verdict` joins a check only through it
-    (release_verdict()); its inputs' pins are the tree's (fetch-w3c-tests.sh, release-gate.sh's
-    all.rdf), which the fetch verifies."""
+    fleet job, its step's attempt (attempt_record()), and every unit it launched. `verdict` joins a
+    check only through it (release_verdict()); its inputs' pins are the tree's (fetch-w3c-tests.sh,
+    release-gate.sh's all.rdf), which the fetch verifies."""
     kind: str
     commit: str
     tree: str
@@ -1189,6 +1190,7 @@ class CheckReceipt(NamedTuple):
     identity: str
     host: str
     job: str
+    attempt: str
     outcomes: tuple[Outcome, ...]
 
     def as_json(self) -> dict:
@@ -1202,7 +1204,7 @@ class CheckReceipt(NamedTuple):
             r = cls(**{**data, "outcomes": tuple(Outcome(**o) for o in data["outcomes"])})
         except (TypeError, KeyError):
             return None
-        typed = (all(isinstance(getattr(r, k), str) for k in ("kind", "commit", "tree", "identity", "host", "job"))
+        typed = (all(isinstance(getattr(r, k), str) for k in ("kind", "commit", "tree", "identity", "host", "job", "attempt"))
                  and type(r.dirty) is bool
                  and all(type(o.exit) is int and type(o.summary) is bool and isinstance(o.unit, str)
                          and isinstance(o.log_sha256, str) for o in r.outcomes))
@@ -1244,14 +1246,69 @@ def outcome_errors(outcomes: tuple[Outcome, ...], units: list[str]) -> list[str]
     return errors
 
 
-def checkout_receipt(kind: str, identity: str, outcomes: list[Outcome]) -> CheckReceipt:
-    """The receipt of what ran in this directory's checkout (release-gate.sh's checked code checkout)."""
+def checkout_receipt(kind: str, identity: str, attempt: str, outcomes: list[Outcome]) -> CheckReceipt:
+    """The receipt of what ran in this directory's checkout (release-gate.sh's checked code checkout)
+    as ATTEMPT."""
     def git(*args: str) -> str:
         done = subprocess.run(["git", *args], capture_output=True, text=True, timeout=60)
         return done.stdout.strip() if done.returncode == 0 else ""
     return CheckReceipt(kind, git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}"),
                         bool(git("status", "--porcelain", "--untracked-files=no")), identity,
-                        os.environ.get("FLEET_HOST") or platform.node(), os.environ.get("FLEET_JOB", ""), tuple(outcomes))
+                        os.environ.get("FLEET_HOST") or platform.node(), os.environ.get("FLEET_JOB", ""), attempt,
+                        tuple(outcomes))
+
+
+# A check's step writes its attempt record first (release-gate.sh w3c, guards; `release_gate.py
+# attempt`), before it touches an earlier result: a file of its own beside the result,
+# KIND.attempt.SEQUENCE-ID.json (SEQUENCE one above the highest there, ID fresh and random), created
+# new, never replaced or removed: no reader holding an older record or result can stop it. Its
+# result and receipt carry the id; `verdict` takes a result only of the newest record's id, so an
+# earlier result the step couldn't remove is refused (the orchestrator's design, fix check r2, 9 Nov
+# 2026, 13:01 and 13:17). The run directory is per job: old records stay.
+ATTEMPT_NAME = re.compile(r"(w3c|guards)\.attempt\.(\d{9})-([0-9a-f]{32})\.json")
+
+
+def attempt_records(where: Path, kind: str) -> list[tuple[int, str, Path]]:
+    """KIND's attempt records in WHERE: (sequence, id, path), oldest first."""
+    found = []
+    for path in where.glob(f"{kind}.attempt.*.json"):
+        if (m := ATTEMPT_NAME.fullmatch(path.name)) and m[1] == kind:
+            found.append((int(m[2]), m[3], path))
+    return sorted(found)
+
+
+def attempt_record(kind: str, where: Path) -> str:
+    """A new attempt of KIND's step in this directory's checkout, recorded in WHERE under a name of
+    its own (created new: an existing name is never written over); its id."""
+    tree = git_line(".", "rev-parse", "HEAD^{tree}")
+    if not tree:
+        raise SystemExit(f"attempt: no checkout here to name the tree of: no attempt of {kind}")
+    attempt = secrets.token_hex(16)
+    sequence = 1 + max((s for s, _, _ in attempt_records(where, kind)), default=0)
+    with open(where / f"{kind}.attempt.{sequence:09d}-{attempt}.json", "x", encoding="utf-8") as out:
+        out.write(json.dumps({"kind": kind, "attempt": attempt, "tree": tree}))
+        out.flush()
+        os.fsync(out.fileno())
+    return attempt
+
+
+def newest_attempt(where: Path, kind: str) -> tuple[dict | None, str | None]:
+    """KIND's newest attempt record in WHERE, by sequence, and what's wrong with it: (None, None) when
+    there is none; a record whose content isn't its name's, or two of the newest sequence, is no record."""
+    records = attempt_records(where, kind)
+    if not records:
+        return None, None
+    sequence, attempt, path = records[-1]
+    if sum(1 for s, _, _ in records if s == sequence) > 1:
+        return None, f"two attempt records of sequence {sequence}"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        return None, f"its newest attempt record {path.name} can't be read ({error})"
+    if not (isinstance(record, dict) and record.get("kind") == kind and record.get("attempt") == attempt
+            and isinstance(record.get("tree"), str) and record["tree"]):
+        return None, f"its newest attempt record {path.name} isn't one"
+    return record, None
 
 
 # The checks' exits: 0 passed and 1 not passed, each with its own published result (the steps keep
@@ -1266,7 +1323,7 @@ def publish(path: Path, data: dict) -> None:
     os.replace(part, path)
 
 
-def run_w3c(logs: Path, kits: list[Kit], identity: str) -> CheckReceipt:
+def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckReceipt:
     """Every declared kit, in order, through this checkout's scripts/cargo-guarded.sh; each kit's log
     and table its own, an earlier attempt's removed first."""
     outcomes = []
@@ -1279,7 +1336,7 @@ def run_w3c(logs: Path, kits: list[Kit], identity: str) -> CheckReceipt:
                                 "--test", kit.test, "--", "--nocapture"], logs / f"{kit.test}.log", env)
         print(f"w3c {kit.name}: exit {o.exit}{'' if o.summary else ', no passing summary'}", file=sys.stderr)
         outcomes.append(o)
-    return checkout_receipt("w3c", identity, outcomes)
+    return checkout_receipt("w3c", identity, attempt, outcomes)
 
 
 # --- the host each pass met --------------------------------------------------------------------
@@ -2800,15 +2857,40 @@ def guards_result_errors(result: dict, receipt: CheckReceipt, contract: Contract
 RESULT_ERRORS = {"w3c": w3c_result_errors, "guards": guards_result_errors}
 
 
-def evidence_errors(timed: list[dict], checks: dict[str, dict], candidate: Candidate,
-                    contract: Contract) -> list[str]:
+def attempt_errors(kind: str, result: dict | None, newest: tuple[dict | None, str | None],
+                   candidate: Candidate) -> list[str]:
+    """A check's result against its step's newest attempt record (newest_attempt()): one there, of the
+    candidate's tree, and the result (and its receipt) that attempt's."""
+    record, wrong = newest
+    if wrong:
+        return [f"{kind}: {wrong}"]
+    if record is None:
+        return [f"{kind}: no attempt record ({kind}.attempt.*.json beside its result): no step stands for it"]
+    if result is None:
+        return [f"{kind}: no result for its latest attempt {record['attempt']}"]
+    errors = []
+    carried = {result.get("attempt"), (result.get("receipt") or {}).get("attempt")}
+    if carried != {record["attempt"]}:
+        errors.append(f"{kind}: stale result from an earlier attempt (it carries "
+                      f"{', '.join(sorted(map(str, carried)))}; the latest attempt is {record['attempt']})")
+    if record["tree"] != candidate.tree:
+        errors.append(f"{kind}: its latest attempt ran tree {record['tree']}, not the candidate's {candidate.tree}")
+    return errors
+
+
+def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate: Candidate,
+                    contract: Contract, attempts: dict[str, tuple[dict | None, str | None]]) -> list[str]:
     """What isn't evidence of the candidate's tree: a timed part that timed another tree, a check
     without a receipt (one from before receipts, or not the gate's), with a receipt of another tree,
-    of a checkout with changes, or whose commit isn't of the tree it names; and a check that isn't
+    of a checkout with changes, or whose commit isn't of the tree it names; a check that isn't its
+    step's latest attempt (ATTEMPTS: each kind's record, attempt_errors()); and a check that isn't
     the run the candidate's CONTRACT requires (its own `passed` decides nothing). A tree, not a
     commit: the same tree under a merge commit is the same candidate
     (rule.owl-rs-results-keyed-by-tree)."""
     errors = [f"the candidate's contract: {e}" for e in contract.errors]
+    for kind, result in checks.items():
+        errors += attempt_errors(kind, result, attempts.get(kind, (None, None)), candidate)
+    checks = {kind: result for kind, result in checks.items() if result is not None}
     for report in timed:
         rev = str((report.get("candidate") or {}).get("revision") or "")
         tree = candidate.tree_of(rev) if rev else None
@@ -2839,12 +2921,14 @@ def evidence_errors(timed: list[dict], checks: dict[str, dict], candidate: Candi
     return errors
 
 
-def release_verdict(timed: list[dict], w3c: dict, guards: dict, candidate: Candidate,
-                    policy: Policy, contract: Contract) -> tuple[bool, str]:
-    """`verdict`: the parts bound to the candidate and held to its tree's contract (evidence_errors()),
-    under its tree's policy."""
-    passed, text = verdict(timed, w3c, guards, policy,
-                           evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract))
+def release_verdict(timed: list[dict], w3c: dict | None, guards: dict | None, candidate: Candidate,
+                    policy: Policy, contract: Contract,
+                    attempts: dict[str, tuple[dict | None, str | None]]) -> tuple[bool, str]:
+    """`verdict`: the parts bound to the candidate, each check to its step's latest attempt (ATTEMPTS)
+    and to its tree's contract (evidence_errors()), under its tree's policy. A check without a result
+    (None) is no pass."""
+    evidence = evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract, attempts)
+    passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence)
     head, rest = text.split("\n", 1)
     return passed, f"{head}\n\nCandidate: {candidate.commit} (tree {candidate.tree})\n{rest}"
 
@@ -2909,6 +2993,7 @@ def main() -> int:
     s.add_argument("--run", action="store_true", help="launch every declared kit in this checkout first, each "
                                                       "outcome recorded in LOGS/receipt.json")
     s.add_argument("--identity", help="with --run: the build identity (scripts/lib/gate-key.sh gate_identity)")
+    s.add_argument("--attempt", help="with --run: its step's attempt (release_gate.py attempt), in result and receipt")
     s.add_argument("--json", type=Path)
     s = sub.add_parser("guards", help="the §0 guards, run (release-gate.sh guards)")
     s.add_argument("--names", type=Path, help="one guard per line; default: performance.md §0's")
@@ -2916,7 +3001,11 @@ def main() -> int:
     s.add_argument("--log", type=Path)
     s.add_argument("--run", action="store_true", help="run the guards' tests in this checkout first, into --log")
     s.add_argument("--identity", help="with --run: the build identity (scripts/lib/gate-key.sh gate_identity)")
+    s.add_argument("--attempt", help="with --run: its step's attempt (release_gate.py attempt), in result and receipt")
     s.add_argument("--json", type=Path)
+    s = sub.add_parser("attempt", help="a new attempt of a check's step, recorded beside its result; prints its id")
+    s.add_argument("kind", choices=("w3c", "guards"))
+    s.add_argument("where", type=Path, help="the step's results directory (KIND.attempt.SEQUENCE-ID.json)")
     s = sub.add_parser("jobs", help="the fleet jobs of a whole gate, as TOML files")
     s.add_argument("candidate", help="the head to gate (a revision of --checkout)")
     s.add_argument("--harness", help="the revision whose fast suite, generator and gate run (default: the candidate)")
@@ -3043,6 +3132,10 @@ def main() -> int:
                 print(f"{args.command}: the earlier result {earlier} can't be removed ({error}): no run",
                       file=sys.stderr)
                 return CANT_INVALIDATE
+    if args.command == "attempt":
+        args.where.mkdir(parents=True, exist_ok=True)
+        print(attempt_record(args.kind, args.where))
+        return 0
     if args.command == "w3c":
         expected, kits, bad = load_w3c_expected(args.expected.read_text(encoding="utf-8"))
         if bad:
@@ -3050,11 +3143,11 @@ def main() -> int:
         if args.list_kits:
             print("\n".join(kit.name for kit in kits))
             return 0
-        if args.logs is None or (args.run and not args.identity):
-            p.error("w3c: LOGDIR, and with --run its --identity")
+        if args.logs is None or (args.run and not (args.identity and args.attempt)):
+            p.error("w3c: LOGDIR, and with --run its --identity and --attempt")
         recorded = args.logs / "receipt.json"
         if args.run:
-            receipt = run_w3c(args.logs, kits, args.identity)
+            receipt = run_w3c(args.logs, kits, args.identity, args.attempt)
             publish(recorded, receipt.as_json())
         else:
             receipt = CheckReceipt.of(json.loads(recorded.read_text(encoding="utf-8"))) if recorded.is_file() else None
@@ -3066,7 +3159,7 @@ def main() -> int:
                    if o.unit in logs_of and (not logs_of[o.unit].is_file()
                                              or hashlib.sha256(logs_of[o.unit].read_bytes()).hexdigest() != o.log_sha256)]
         out = {"counts": counts, "expected": expected, "errors": errors, "passed": not errors,
-               **({"receipt": receipt.as_json()} if receipt else {})}
+               **({"attempt": receipt.attempt, "receipt": receipt.as_json()} if receipt else {})}
         print(json.dumps(out, indent=1))
         if args.json:
             publish(args.json, out)
@@ -3077,18 +3170,18 @@ def main() -> int:
         if args.list_names:
             print("\n".join(names))
             return 0
-        if args.log is None or (args.run and not args.identity):
-            p.error("guards: --log, and with --run its --identity")
+        if args.log is None or (args.run and not (args.identity and args.attempt)):
+            p.error("guards: --log, and with --run its --identity and --attempt")
         receipt = None
         if args.run:
-            receipt = checkout_receipt("guards", args.identity, [run_unit("guards", [
+            receipt = checkout_receipt("guards", args.identity, args.attempt, [run_unit("guards", [
                 "bash", "scripts/cargo-guarded.sh", "test", "--release", "--locked", "--workspace", "--no-fail-fast",
                 "--lib", "--bins", "--tests", "--", *names], args.log)])
         errors, results = guards_check(names, args.log.read_text(encoding="utf-8", errors="replace")
                                        if args.log.is_file() else "")
         errors = outcome_errors(receipt.outcomes if receipt else (), ["guards"]) + errors
         out = {"guards": len(names), "results": results, "errors": errors, "passed": not errors,
-               **({"receipt": receipt.as_json()} if receipt else {})}
+               **({"attempt": receipt.attempt, "receipt": receipt.as_json()} if receipt else {})}
         print("\n".join(errors) or f"all {len(names)} guards ran and passed")
         if args.json:
             publish(args.json, out)
@@ -3196,10 +3289,16 @@ def main() -> int:
                           lambda rev: git_line(args.checkout, "rev-parse", "--verify", "--quiet", f"{rev}^{{tree}}"))
     # What the candidate's tree requires of its checks: its kits, suites and guards.
     contract = load_contract(*(git_line(args.checkout, "show", f"{commit}:{rel}") for rel in CONTRACT_FILES))
-    parts = [json.loads(path.read_text(encoding="utf-8")) for path in [*args.timed, args.w3c, args.guards]]
-    if not all(isinstance(part, dict) for part in parts):
+    timed = [json.loads(path.read_text(encoding="utf-8")) for path in args.timed]
+    # Each check's result (None: there is none, as when its producer never published) and its step's
+    # newest attempt record beside it (attempt_errors()).
+    checks, attempts = {}, {}
+    for kind, path in (("w3c", args.w3c), ("guards", args.guards)):
+        checks[kind] = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        attempts[kind] = newest_attempt(path.parent, kind)
+    if not all(isinstance(part, dict) for part in [*timed, *(c for c in checks.values() if c is not None)]):
         p.error("verdict: every part is a JSON object (release-gate.json, w3c.json, guards.json)")
-    passed, text = release_verdict(parts[:-2], parts[-2], parts[-1], candidate, policy, contract)
+    passed, text = release_verdict(timed, checks["w3c"], checks["guards"], candidate, policy, contract, attempts)
     print(text)
     if args.out:
         args.out.write_text(text, encoding="utf-8")
