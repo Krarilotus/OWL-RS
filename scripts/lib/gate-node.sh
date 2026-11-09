@@ -31,29 +31,56 @@ gate_node() {
   suite_python_entry "$cache/node-$version-${sha:0:12}" gate_node_is gate_node_unpack "$version" "$platform" "$sha"
 }
 
-# PLATFORM VERSION SHA256: the provenance record of an entry unpacked from that archive.
+# PLATFORM VERSION SHA256: the archive part of an entry's provenance record.
 gate_node_provenance() {
   local ext=tar.gz
   [ "$1" != win-x64 ] || ext=zip
   printf 'sha256 %s node-v%s-%s.%s\n' "$3" "$2" "$1" "$ext"
 }
 
-# DIR VERSION PLATFORM SHA256: DIR's directory of node, npm and npx, if DIR records the archive of
-# SHA256 it was unpacked from (review r1 F2: a version string alone isn't the build), its node reports
-# VERSION, and its own node, npm and npx are files that run: one that doesn't would leave PATH to the
-# host's, and on Windows the host's npm and npx run the host's node (sol-loop r1 S2, review r1 F1).
+# DIR: DIR's payload, every regular file by its sha256 and every symlink by its target, in a fixed
+# order; the entry's own metadata (.provenance, .manifest, .last-used) left out.
+gate_node_manifest() {
+  (cd "$1" && {
+    find . -type l ! -name '.*' -printf 'link %p -> %l\n' | LC_ALL=C sort
+    find . -type f ! -path ./.provenance ! -path ./.manifest ! -path ./.last-used -print0 | LC_ALL=C sort -z \
+      | xargs -0 -r sha256sum -b
+  })
+}
+
+# DIR PLATFORM VERSION SHA256: the record binding DIR's payload to the verified archive it was unpacked
+# from (review r2 F2): its manifest, and the provenance line naming the archive and the manifest's sha256.
+gate_node_seal() {
+  gate_node_manifest "$1" > "$1/.manifest" || return 1
+  printf '%s manifest %s\n' "$(gate_node_provenance "$2" "$3" "$4")" "$(sha256sum -b < "$1/.manifest" | cut -c1-64)" \
+    > "$1/.provenance"
+}
+
+# PATH: its Git Bash (cygpath -u) form on Windows, so that `C:/x` and `/c/x` compare equal.
+gate_node_canon() { cygpath -u "$1" 2> /dev/null || printf '%s\n' "$1"; }
+
+# DIR VERSION PLATFORM SHA256: DIR's directory of node, npm and npx, if DIR is still the payload of the
+# verified archive of SHA256 (its provenance names that archive and its manifest; the payload as it is
+# now matches that manifest: review r1/r2 F2), and node, npm and npx, looked up as the console step
+# looks them up (bare names, DIR's bin first on PATH), are DIR's own and run, node reporting VERSION:
+# else the host's would run, and on Windows the host's npm and npx run the host's node (review r1/r2 F1).
 gate_node_is() {
-  local bin=$1/bin found tool
+  local bin=$1/bin found tool on
   [ "$3" != win-x64 ] || bin=$1
-  [ "$(tr -d '\r' < "$1/.provenance" 2> /dev/null)" = "$(gate_node_provenance "$3" "$2" "$4")" ] \
-    || { echo "$1 records no archive of sha256 $4" >&2; return 1; }
-  [ -x "$bin/node" ] || [ -x "$bin/node.exe" ] || return 1
-  found=$("$bin/node" --version 2> /dev/null | tr -d '\r')
-  [ "$found" = "v$2" ] || { echo "$bin/node reports ${found:-nothing}, not the pinned v$2" >&2; return 1; }
-  for tool in npm npx; do
-    [ -f "$bin/$tool" ] && PATH="$bin:$PATH" "$bin/$tool" --version > /dev/null 2>&1 \
-      || { echo "$bin has no $tool of its own that runs" >&2; return 1; }
+  on=$(gate_node_canon "$bin")  # PATH's form: a `C:` in PATH splits at its colon
+  [ -f "$1/.manifest" ] && [ "$(tr -d '\r' < "$1/.provenance" 2> /dev/null)" = \
+    "$(gate_node_provenance "$3" "$2" "$4") manifest $(sha256sum -b < "$1/.manifest" | cut -c1-64)" ] \
+    || { echo "$1 records no payload of the archive of sha256 $4" >&2; return 1; }
+  [ "$(gate_node_manifest "$1")" = "$(cat "$1/.manifest")" ] \
+    || { echo "$1's payload isn't the one unpacked from its archive" >&2; return 1; }
+  for tool in node npm npx; do
+    found=$(PATH="$on:$PATH"; hash -r; command -v "$tool") \
+      && [ "$(gate_node_canon "${found%.exe}")" = "$on/$tool" ] \
+      && (PATH="$on:$PATH"; hash -r; "$tool" --version > /dev/null 2>&1) \
+      || { echo "$bin: $tool, as the console step finds it, isn't the entry's own or doesn't run" >&2; return 1; }
   done
+  found=$(PATH="$on:$PATH"; hash -r; node --version 2> /dev/null | tr -d '\r')
+  [ "$found" = "v$2" ] || { echo "$bin/node reports ${found:-nothing}, not the pinned v$2" >&2; return 1; }
   echo "$bin"
 }
 
@@ -76,7 +103,7 @@ gate_node_unpack() {
   # The archive's one top directory, its contents moved up into PART.
   [ -d "$part/$name" ] || { echo "$archive has no $name/" >&2; return 1; }
   find "$part/$name" -mindepth 1 -maxdepth 1 -exec mv -t "$part" -- {} + && rmdir -- "$part/$name" || return 1
-  # The record of the verified archive, in the part: published with the whole entry when it is moved
-  # into place (suite_python_entry), never on an entry made otherwise.
-  gate_node_provenance "$platform" "$version" "$sha" > "$part/.provenance"
+  # The record of the verified archive and of the payload unpacked from it, in the part: published with
+  # the whole entry when it is moved into place (suite_python_entry), never on an entry made otherwise.
+  gate_node_seal "$part" "$platform" "$version" "$sha"
 }
