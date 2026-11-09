@@ -187,7 +187,7 @@ impl AlignedSolutions {
     pub fn reserve_appends(&mut self, rows: usize) -> Result<(), QueryEvaluationError> {
         let table = &mut self.lower.table;
         let old = table.memory_bytes();
-        let more = rows.saturating_mul(table.width()).saturating_mul(8);
+        let more = rows.saturating_mul(table.row_bytes());
         self.held.charge(old.saturating_add(more))?;
         table.reserve_exact(rows);
         self.held.release(old);
