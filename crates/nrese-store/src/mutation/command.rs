@@ -135,21 +135,24 @@ impl MutationCommand {
                 update(tx, request)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
+            // A payload's parsed statements are charged to the request's envelope until
+            // they are written ([`crate::rdf_io::StagedQuads`]).
             Self::Statements(request) => {
-                apply_statements(tx, request, requester, &mut update)?;
+                apply_statements(tx, request, requester, &context.memory, &mut update)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Tell(request) => {
-                apply_graph_write(tx, &request.as_graph_write())?;
+                apply_graph_write(tx, &request.as_graph_write(), &context.memory)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
-            Self::GraphWrite(request) => {
-                apply_graph_write(tx, request).map(MutationCommitReport::GraphWrite)
-            }
+            Self::GraphWrite(request) => apply_graph_write(tx, request, &context.memory)
+                .map(MutationCommitReport::GraphWrite),
             Self::GraphDelete(target) => {
                 apply_graph_delete(tx, target).map(MutationCommitReport::GraphDelete)
             }
-            Self::Restore(request) => apply_restore(tx, request).map(MutationCommitReport::Restore),
+            Self::Restore(request) => {
+                apply_restore(tx, request, &context.memory).map(MutationCommitReport::Restore)
+            }
             Self::Delta(planner) => {
                 planner.plan(tx, requester, context)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })

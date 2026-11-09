@@ -1328,9 +1328,15 @@ impl StoreService {
         tx.charge_pending_to(std::sync::Arc::new(memory.part()))?;
         let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
-        crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
-            crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
-        })?;
+        crate::statements::apply_statements(
+            &mut tx,
+            pending,
+            &requester,
+            memory,
+            &mut |tx, request| {
+                crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
+            },
+        )?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx)?,
             None => tx.pending_snapshot(),
