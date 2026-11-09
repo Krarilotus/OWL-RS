@@ -587,3 +587,28 @@ fn a_private_lookup_holds_one_key_for_both_probes() {
         );
     }
 }
+
+/// Sol-loop e1 S1: a probe of a key already made allocates nothing on a plain dictionary, so
+/// interning a shared term through the overlay charges its key and not the compressed base's
+/// probe bound.
+///
+/// - Input: a plain dictionary holding an IRI whose key is 1,026 bytes, and the two other terms
+///   of a quad; an overlay at its length with an 8 KiB budget; the IRI interned through it
+///   alone, then as that quad's object.
+/// - Expected: its shared id both times, not a refusal. The parent charged 4,104 bytes for the
+///   single intern: a lookup's own key and the overlay's copy.
+#[test]
+fn a_shared_long_term_is_interned_on_a_plain_base_within_its_key() {
+    let dictionary = Arc::new(Dictionary::default());
+    let long = iri(&"x".repeat(1_016));
+    let shared = dictionary.intern(long.as_ref().into());
+    let (s, p) = (iri("s"), iri("p"));
+    dictionary.intern(s.as_ref().into());
+    dictionary.intern(p.as_ref().into());
+    let start = dictionary.len();
+    let overlay = Overlay::over(Arc::clone(&dictionary), start, Arc::new(Budget::new(8_192)));
+    assert_eq!(overlay.intern(long.as_ref().into()), Ok(shared));
+    let quad = Quad::new(s, p, long, GraphName::DefaultGraph);
+    let encoded = overlay.intern_quad(quad.as_ref());
+    assert_eq!(encoded.map(|quad| quad.object), Ok(shared));
+}

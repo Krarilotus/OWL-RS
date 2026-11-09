@@ -500,3 +500,74 @@ fn a_pending_scan_outlives_its_pattern() {
         "write"
     );
 }
+
+/// The shared kind through `PendingWrite` charges as its own charged writes do: since #219,
+/// engine-v2's update path calls `Transaction::try_insert` and `try_remove`, and a generic one
+/// calls the trait (V2's lead, 9 Nov).
+///
+/// - Input: a write transaction whose pending changes are charged to an empty budget; through
+///   the trait, an insert of a new statement, then the removal of the committed one.
+/// - Expected: each refused for memory, as the inherent charged calls refuse, and nothing
+///   pending.
+#[test]
+fn a_write_transaction_through_the_trait_charges_its_pending_growth() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.charge_pending_to(Arc::new(Budget::new(0))).unwrap();
+    let inserted = PendingWrite::try_insert(&mut tx, quad("b", "two").as_ref());
+    assert!(
+        matches!(inserted, Err(crate::EngineError::MemoryLimit(_))),
+        "{inserted:?}"
+    );
+    let removed = PendingWrite::remove(&mut tx, quad("a", "one").as_ref());
+    assert!(
+        matches!(removed, Err(crate::EngineError::MemoryLimit(_))),
+        "{removed:?}"
+    );
+    assert_eq!(tx.pending(), (0, 0));
+}
+
+/// The shared kind's pending snapshots through `PendingView` are charged as its own
+/// `pending_snapshot_within` charges them (DUR-6): the same shape as the writes'.
+///
+/// - Input: a write transaction with one pending insert; its pending snapshot asked for through
+///   the trait, against an empty budget.
+/// - Expected: refused for memory, as `Transaction::pending_snapshot_within` refuses it.
+#[test]
+fn a_write_transactions_pending_snapshot_through_the_trait_is_charged() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(quad("b", "two").as_ref());
+    let empty = Arc::new(Budget::new(0));
+    let snapshot = PendingView::pending_snapshot_within(&tx, &empty);
+    assert!(
+        matches!(snapshot, Err(crate::EngineError::MemoryLimit(_))),
+        "{:?}",
+        snapshot.map(|_| ())
+    );
+}
+
+/// Every private write is charged, its pending changes as its terms are (§1.1: "every write is
+/// fallible"; the budget attached at its opening pays for the changes since D16-039).
+///
+/// - Input: a private transaction over the committed `ex:a ex:p "one"` with an empty budget;
+///   through `PendingWrite`, the removal of that statement, then the removal of every statement
+///   in the default graph.
+/// - Expected: each refused for memory, and nothing pending.
+#[test]
+fn a_private_transactions_pending_growth_is_charged_to_its_budget() {
+    let engine = engine();
+    let mut tx = engine.speculative(Arc::new(Budget::new(0)));
+    let removed = PendingWrite::remove(&mut tx, quad("a", "one").as_ref());
+    assert!(
+        matches!(removed, Err(crate::EngineError::MemoryLimit(_))),
+        "{removed:?}"
+    );
+    let every = crate::QuadPattern::in_graph(crate::TermId::DEFAULT_GRAPH);
+    let matched = PendingWrite::remove_matching(&mut tx, &every);
+    assert!(
+        matches!(matched, Err(crate::EngineError::MemoryLimit(_))),
+        "{matched:?}"
+    );
+    assert_eq!(tx.pending(), (0, 0));
+}
