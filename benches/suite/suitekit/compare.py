@@ -21,9 +21,9 @@ order, so that nothing lost hides behind a time:
     suite.py compare BASE NEW [--min-ms 2] [--threshold 0.10] [--systems S] [--include-restricted]
     fast.py compare BASE.json NEW.json [--min-ms 2] [--allow-host-change]
 
-Runs of different hosts, or of one host under different configurations (benches/hosts.toml
-`config`, or a different CPU governor read by the runs), are not compared: compare exits 2
-unless --allow-host-change, and then flags every verdict as no evidence of a code change.
+Across different hosts/configurations/governors, correctness and deterministic work still
+compare; host-dependent measures are withheld. Exit 1 for failures, otherwise 2 for refused
+measures. --allow-host-change retains flagged measurements as no evidence of a code change.
 Of two fast-suite reports, a case whose two sides didn't load the same frozen input files, byte
 for byte (each record's `inputs`), or don't say which, gets no time, throughput, memory or work
 verdict: it is listed as a different or unknown input, no evidence of a code change (7 Nov 2026:
@@ -330,7 +330,8 @@ def kind_of(entry: dict) -> str:
 
 
 def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, out: Out,
-                  untimed: dict[str, str] | None = None, unmeasured: dict[str, str] | None = None) -> list[float]:
+                  untimed: dict[str, str] | None = None, unmeasured: dict[str, str] | None = None,
+                  host_refused: bool = False) -> list[float]:
     """Fast-suite cases (or a perf-lab report as one), case by case; the spreads seen. A case in
     `untimed` (case: why) is compared in everything but its time and its spread; one in `unmeasured`
     (its two sides loaded other or unknown input bytes: input_check()) in its answers, status and
@@ -381,9 +382,10 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                 # Its status is a finding about the new run whatever the input; its metric and peak only
                 # over the same input bytes (review r1 of pkg/compare-input-status, R1-W1).
                 worse = "ok" in sb and sn != {"ok"}
-                measures = (f"metric and peak not compared: {unmeasured[case]}" if case in unmeasured
+                why = unmeasured.get(case) or ("host change" if host_refused else None)
+                measures = (f"metric and peak not compared: {why}" if why
                             else f"metric {mb} -> {mn}, peak {pb} -> {pn} MiB")
-                worse |= case not in unmeasured and bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
+                worse |= not why and bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
                 out.add("Answers and completeness",
                         f"{'':<28}past its limit ({len(b['frontiers'])} and {len(n['frontiers'])} runs, medians): "
                         f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, {measures}"
@@ -393,6 +395,11 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
             out.add("Time", f"{case:<26} not measured against its baseline: {unmeasured[case]}")
             continue
         work, notes = counter_changes(b["counters"], n["counters"])
+        if host_refused:
+            out.add("Time", f"{case:<26} host-dependent measures not compared" + (", MORE WORK" if work else ""), work)
+            for note in notes:
+                out.add("Time", f"{'':<28}{note}")
+            continue
         if case in untimed:
             # Its time has no baseline in these units: no ratio, and no spread of it for the memory
             # threshold below; everything else is compared as for any case.
@@ -721,8 +728,6 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
         raise ValueError("--min-ms must be finite and nonnegative")
     refused = host_check([identity(base_report.get("machine"), base_report.get("started"))],
                          [identity(new_report.get("machine"), new_report.get("started"))], allow_host_change)
-    if refused:
-        return refused
     other_input = input_check(base_report, new_report)
     if other_input:
         print("## Inputs\n")
@@ -743,7 +748,7 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
             print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
                   "rests on the 10 % floor alone (run --reps 2 or more)")
     out = Out()
-    spreads = compare_cases(pooled(base_report), pooled(new_report), min_ms, out, untimed, other_input)
+    spreads = compare_cases(pooled(base_report), pooled(new_report), min_ms, out, untimed, other_input, bool(refused))
     out.print({"Time": f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'spread':>7}  verdict"})
     if spreads:
         print(f"spread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
@@ -752,6 +757,8 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
           "QPS is higher-is-better, judged per client width without a millisecond floor")
     if out.regressions:
         return 1
+    if refused:
+        return refused
     if no_input:
         print("REFUSED: no case loaded the same input on both sides")
         return 2
@@ -844,7 +851,8 @@ def eligible(item: Item, name: str, pair: Pair) -> bool:
 
 def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: float, min_ms: float, out: Out,
                   kinds: tuple[dict, dict] = ({}, {}),
-                  answers: tuple[TimingVerdicts, TimingVerdicts] | None = None) -> dict[str, int]:
+                  answers: tuple[TimingVerdicts, TimingVerdicts] | None = None,
+                  measures: bool = True) -> dict[str, int]:
     """Suite pairs, pair by pair, with summary.py's estimator; the query verdicts' totals."""
     answers = answers or (TimingVerdicts(), TimingVerdicts())
     totals = {"slower": 0, "faster": 0, "=": 0, "not comparable": 0}
@@ -870,6 +878,8 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                     f"- {title}: **statement counts differ:** {sorted(b.counts)} -> {sorted(n.counts)}", True)
         # Steps: times under Time, peaks under Memory with their kind, the store under Disk.
         for metric in sorted(set(b.steps) & set(n.steps)):
+            if not measures:
+                continue
             sb, sn = estimate(b.steps[metric]), estimate(n.steps[metric])
             if not (sb and sn and sb[0] > 0):
                 continue
@@ -917,6 +927,9 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                 if name in n.disputed:
                     out.add("Answers and completeness",
                             f"- {title}: {name}{label}: answers differ between systems in the new run (disputed)")
+                if not measures:
+                    totals["not comparable"] += 1
+                    continue
                 if not (eligible(ib, name, b) and eligible(inn, name, n)):
                     totals["not comparable"] += 1
                     continue
@@ -981,16 +994,15 @@ def main(argv: list[str]) -> int:
     systems = set(args.systems.split(",")) if args.systems else None
     base_files, new_files = files(args.base), files(args.new)
     refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
-    if refused:
-        return refused
     # The input rule of compare_reports() (input_difference()), over the /data files the runs read:
     # another release of a dataset is no evidence of a code change (the orchestrator, 7 Nov 2026).
     (base_sha, base_bytes), (new_sha, new_bytes) = suite_inputs(base_files), suite_inputs(new_files)
+    other_input = None
     if base_sha != {} or new_sha != {}:
         if why := input_difference(base_sha, new_sha, base_bytes, new_bytes):
+            other_input = why
             print(f"## Inputs\n\n- {why}\n\nREFUSED: the runs didn't read the same input: no time or memory "
                   "verdict would be evidence of a code change")
-            return 2
     base = collect(base_files, systems, args.include_restricted)
     new = collect(new_files, systems, args.include_restricted)
     print(f"# {args.new} against {args.base}\n")
@@ -998,9 +1010,11 @@ def main(argv: list[str]) -> int:
           "only complete, correct, undisputed queries enter the speed verdict\n")
     out = Out()
     totals = compare_pairs(base, new, args.threshold, args.min_ms, out,
-                           (memory_kinds(base_files), memory_kinds(new_files)), (verdicts(base_files), verdicts(new_files)))
+                           (memory_kinds(base_files), memory_kinds(new_files)), (verdicts(base_files), verdicts(new_files)),
+                           measures=not (refused or other_input))
     out.print()
-    print(f"**Queries:** {totals['slower']} slower, {totals['faster']} faster, {totals['=']} within noise, "
-          f"{totals['not comparable']} not comparable (incomplete, wrong, disputed or without timings).")
+    if not (refused or other_input):
+        print(f"**Queries:** {totals['slower']} slower, {totals['faster']} faster, {totals['=']} within noise, "
+              f"{totals['not comparable']} not comparable (incomplete, wrong, disputed or without timings).")
     print(f"**{out.regressions} regression(s)** (lost work, changed answers, worse beyond noise).")
-    return 1 if out.regressions else 0
+    return 1 if out.regressions else 2 if refused or other_input else 0
