@@ -391,37 +391,27 @@ impl Classes {
                 if a == b {
                     continue;
                 }
-                // A union moves the smaller side's members: a step that can't be split
-                // (`nrese_exec::classes::Classes::union`), counted whole before it is made
-                // (REAS-3a sol-loop r1 S1, review r1 R1). A pair already in one class (one
-                // member list) moves nothing and counts one unit (sol-loop r2 S6: an inferred
-                // star over an asserted chain).
+                // A union moves the smaller side's members, each counted before it moves, a
+                // chunk at a time (REAS-3a sol-loop r1 S1, fix check r1 R1); a pair already in
+                // one class moves none (sol-loop r2 S6). A stopped union leaves the kernel half
+                // made: dropped with this build.
                 if M::COUNTED {
-                    let (class_a, class_b) = (union.class_of(a), union.class_of(b));
-                    let moved = match (class_a, class_b) {
-                        (Some(x), Some(y)) if std::ptr::eq(x, y) => 1,
-                        _ => {
-                            let size = |class: Option<&[u64]>| class.map_or(1, <[u64]>::len);
-                            size(class_a).min(size(class_b)) as u64
-                        }
-                    };
-                    if !credit.take_many(meter, moved) {
-                        return None;
-                    }
+                    union.union_asking(a, b, |n| credit.take_many(meter, n))?;
+                } else {
+                    union.union(a, b);
                 }
-                union.union(a, b);
             }
         }
         if meter.stopped() {
             return None;
         }
-        // Finishing the classes (REAS-3a review r1 R1): each identity copied out of the union
-        // kernel, and each checked for a literal and indexed, is a unit counted before it is
-        // handled, a chunk of at most `POLL_UNITS` at a time, so a stop is seen within a run
-        // of identities however large a class is. A class's sort is the one step here that
-        // can't be split: counted whole (its identities) before it runs, in place. The maps
-        // are made at their final size before the first insert, counted as the identities
-        // they will hold, so no insert grows them.
+        // Finishing the classes (REAS-3a review r1 R1, fix check r1 R1): each identity copied
+        // out of the union kernel, sorted, checked for a literal and indexed is counted before
+        // it is handled, a chunk of at most `POLL_UNITS` units at a time, so a stop is seen
+        // within a run of work however large a class is (a counted sort: `sort_counted`). The
+        // maps are made at their final size before the first insert, counted as the identities
+        // they will hold, so no insert grows them (their initialisation is held for the owner:
+        // fix check r1 F2).
         let chunk = nrese_exec::POLL_UNITS as usize;
         let mut copies: Vec<Vec<u64>> = Vec::with_capacity(union.classes().size_hint().0);
         let mut identities_in_all = 0;
@@ -450,16 +440,11 @@ impl Classes {
             literals: false,
         };
         for mut identities in copies {
-            if !credit.take_many(meter, identities.len() as u64) {
+            if !M::COUNTED {
+                identities.sort_unstable();
+            } else if !sort_counted(&mut identities, |n| credit.take_many(meter, n)) {
                 return None;
             }
-            #[cfg(not(any(test, all(feature = "witness", debug_assertions))))]
-            identities.sort_unstable();
-            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-            identities.sort_unstable_by(|a, b| {
-                crate::witness::add(crate::witness::Site::SortWork, 1);
-                a.cmp(b)
-            });
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
             classes.literals |= is_literal(TermId::from_raw(representative));
@@ -703,6 +688,68 @@ pub(crate) trait Metering: Copy {
         plan: &crate::quad::AccessPlan,
     ) -> Option<u64>;
 }
+
+/// Sorts `ids` (distinct identities), `take(n)` called before each `n` units of its work, `n`
+/// at most `POLL_UNITS` (REAS-3a fix check r1 R1): runs of [`SORT_RUN`] ids each sorted alone,
+/// counted as `len · (⌊log2 len⌋ + 1)` comparisons before it, then merged pairwise into a
+/// second list, each id a merge moves a unit, counted a chunk at a time. False once `take`
+/// answers false: `ids` is then in no particular order.
+fn sort_counted(ids: &mut Vec<u64>, mut take: impl FnMut(u64) -> bool) -> bool {
+    let comparisons = |len: usize| (len * (usize::BITS - len.leading_zeros()) as usize) as u64;
+    for run in ids.chunks_mut(SORT_RUN) {
+        if !take(comparisons(run.len())) {
+            return false;
+        }
+        #[cfg(not(any(test, all(feature = "witness", debug_assertions))))]
+        run.sort_unstable();
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        run.sort_unstable_by(|a, b| {
+            crate::witness::add(crate::witness::Site::SortWork, 1);
+            a.cmp(b)
+        });
+    }
+    let len = ids.len();
+    if len <= SORT_RUN {
+        return true;
+    }
+    let chunk = nrese_exec::POLL_UNITS as usize;
+    let mut from = std::mem::take(ids);
+    let mut into: Vec<u64> = Vec::with_capacity(len);
+    let mut width = SORT_RUN;
+    while width < len {
+        into.clear();
+        for lo in (0..len).step_by(2 * width) {
+            let (mid, hi) = ((lo + width).min(len), (lo + 2 * width).min(len));
+            let (mut i, mut j) = (lo, mid);
+            while i < mid || j < hi {
+                let part = chunk.min(mid - i + hi - j);
+                if !take(part as u64) {
+                    *ids = from;
+                    return false;
+                }
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::SortWork, part as u64);
+                for _ in 0..part {
+                    if j == hi || (i < mid && from[i] < from[j]) {
+                        into.push(from[i]);
+                        i += 1;
+                    } else {
+                        into.push(from[j]);
+                        j += 1;
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut from, &mut into);
+        width *= 2;
+    }
+    *ids = from;
+    true
+}
+
+/// The ids [`sort_counted`] sorts alone before merging: their sort is at most about
+/// `SORT_RUN · log2 SORT_RUN` comparisons, a fraction of `POLL_UNITS`.
+const SORT_RUN: usize = 256;
 
 /// A meter's count taken a unit at a time and asked for a run at a time: one call of the
 /// visitor per run of at most `POLL_UNITS` units, a decrement per unit (REAS-2's r8 form:
@@ -1208,6 +1255,45 @@ mod tests {
         assert_eq!(expanded.len(), 3 + 1);
         assert!(expanded.iter().all(|q| q.subject.raw() == 30));
         assert_eq!(classes.multiplicity(&quad(10, 5, 20), &pattern), Some(3));
+    }
+
+    /// Spec (`sort_counted`): it sorts distinct ids as `sort_unstable` does, asking before at
+    /// most `POLL_UNITS` units at a time, and a false answer ends it with false. Lengths around
+    /// its run size and past several merge passes, the ids a permutation of `0..len`.
+    #[test]
+    fn a_counted_sort_sorts_and_stops_when_told() {
+        for len in [
+            0,
+            1,
+            2,
+            SORT_RUN - 1,
+            SORT_RUN,
+            SORT_RUN + 1,
+            5 * SORT_RUN + 17,
+            20_000,
+        ] {
+            let ids: Vec<u64> = (0..len as u64).map(|i| (i * 7919) % len as u64).collect();
+            let mut counted = ids.clone();
+            let largest = std::cell::Cell::new(0);
+            assert!(sort_counted(&mut counted, |n| {
+                largest.set(largest.get().max(n));
+                true
+            }));
+            let mut plain = ids.clone();
+            plain.sort_unstable();
+            assert_eq!(counted, plain, "{len} ids");
+            assert!(
+                largest.get() <= u64::from(nrese_exec::POLL_UNITS),
+                "{len} ids"
+            );
+        }
+        let mut ids: Vec<u64> = (0..20_000).rev().collect();
+        let asked = std::cell::Cell::new(0);
+        assert!(!sort_counted(&mut ids, |_| {
+            asked.set(asked.get() + 1);
+            asked.get() < 10
+        }));
+        assert_eq!(asked.get(), 10, "no ask after the false one");
     }
 
     /// One class of 2^22 identities in all three places stands for 2^66 quads, more than a

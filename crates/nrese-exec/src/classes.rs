@@ -140,16 +140,28 @@ impl Classes {
 
     /// Merges the classes of `a` and `b`; returns the representative that lost its place
     /// (the larger of the two smallest ids), or `None` if they were one class.
-    ///
-    /// One union is a step that can't be split: it moves the smaller side's members into the
-    /// larger side's list (O(smaller side) work, the larger list grown to hold them, the
-    /// smaller one freed), and asks no stop. A caller that counts its work for a stop counts a
-    /// union whole before it starts (the engine's counted reads, `nrese_engine::visit`).
     pub fn union(&mut self, a: u64, b: u64) -> Option<u64> {
+        self.union_asking(a, b, |_| true)
+            .expect("a union never told to stop finishes")
+    }
+
+    /// [`Self::union`], `ask(n)` called before each `n` members it moves, `n` at most
+    /// [`crate::POLL_UNITS`], so a caller that counts its work for a stop sees it within a run
+    /// of members however large the classes are (the engine's counted reads,
+    /// `nrese_engine::visit`; REAS-3a fix check r1 R1). `None` once `ask` answers false: the
+    /// union is then half made and these classes are no use, so a caller that stops drops
+    /// them. (Growing the larger side's list and the maps, allocator work, is held for the
+    /// owner with the engine's map initialisation: fix check r1 F2.)
+    pub fn union_asking(
+        &mut self,
+        a: u64,
+        b: u64,
+        mut ask: impl FnMut(u64) -> bool,
+    ) -> Option<Option<u64>> {
         let (ra, rb) = (self.root_or_new(a), self.root_or_new(b));
         if ra == rb {
             self.drop_if_single(ra);
-            return None;
+            return Some(None);
         }
         let (keep, gone) = match self.roots[&ra].1.len() >= self.roots[&rb].1.len() {
             true => (ra, rb),
@@ -158,12 +170,18 @@ impl Classes {
         let (gone_min, moved) = self.roots.remove(&gone).expect("a root");
         self.parent.insert(gone, keep);
         let (keep_min, members) = self.roots.get_mut(&keep).expect("a root");
-        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-        witness::add(moved.len() as u64);
-        members.extend(moved);
+        members.reserve(moved.len());
+        for part in moved.chunks(crate::POLL_UNITS as usize) {
+            if !ask(part.len() as u64) {
+                return None;
+            }
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            witness::add(part.len() as u64);
+            members.extend_from_slice(part);
+        }
         let lost = gone_min.max(*keep_min);
         *keep_min = gone_min.min(*keep_min);
-        Some(lost)
+        Some(Some(lost))
     }
 
     /// Merges the classes of each pair; returns the representatives that lost their place.
