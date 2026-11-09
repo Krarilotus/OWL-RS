@@ -39,6 +39,7 @@ ZERO = "0" * 40
 COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
+          "scripts/lib/gate-publish.sh", "rust-toolchain.toml",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "scripts/lib/suite-python.sh", *isolation.NS_SH, "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
@@ -60,6 +61,7 @@ esac
 """
 # A stand-in for rustc: the toolchain a gate's identity names.
 RUSTC = """#!/bin/sh
+[ "${1#+}" != "$1" ] && shift
 [ "$1" = -vV ] && printf 'rustc 1.98.1\\nbinary: rustc\\ncommit-hash: abcdef1234567890\\nrelease: 1.98.1\\n'
 exit 0
 """
@@ -151,7 +153,7 @@ class Repo(unittest.TestCase):
         listed = "".join(f"{f}\n" for f in files).encode()  # bytes: the list check.sh hashes has bare LFs
         list_hash = subprocess.run(["git", "hash-object", "--stdin"], input=listed, capture_output=True, cwd=self.repo,
                                    env=self.env, check=True).stdout.decode().strip()
-        identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity"], cwd=self.repo,
+        identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
                                   capture_output=True, text=True, env=self.env).stdout.strip()
         record = {
             "tier": tier, "part": "rest", "tree": tree, "list_hash": list_hash, "identity": identity,
@@ -182,6 +184,38 @@ class Repo(unittest.TestCase):
 
 class PushGate(Repo):
     """The hook and check.sh's push tier, end to end with the stand-in fleet."""
+
+    def test_identity_uses_the_requested_commits_inputs(self):
+        # Spec: IB0622-25e2: the identity of a pushed commit equals its own checkout's,
+        # even when the pusher has different tools, requirements, compiler and flag code.
+        compiler = self.fake / "bin/rustc"
+        compiler.write_text('#!/bin/sh\ncase "$1" in\n+1.98.1) v=1.98.1;;\n'
+                            '+1.99.0) v=1.99.0;;\n*) v=WRONG;;\nesac\n'
+                            'printf "release: %s\\ncommit-hash: abcdef1234567890\\n" "$v"\n', newline="\n")
+        compiler.chmod(0o755)
+
+        def identity(rev):
+            done = subprocess.run([BASH, "-c", '. scripts/lib/gate-key.sh && gate_identity "$1"', "-", rev],
+                                  cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return done.stdout.strip()
+
+        previous = identity("HEAD")
+        for path, text in (("scripts/lib/gate-tools.txt", "# changed tools\n"),
+                           ("benches/suite/requirements.txt", "# changed requirements\n"),
+                           ("rust-toolchain.toml", '[toolchain]\nchannel = "1.99.0"\n'),
+                           ("scripts/lib/target-cpu.sh", 'export_target_cpu_rustflags() { export RUSTFLAGS="-C opt-level=1"; }\n')):
+            with self.subTest(path=path):
+                original = (self.repo / path).read_text()
+                tip = self.commit(path, text if path.endswith((".toml", ".sh")) else original + text)
+                own = identity("HEAD")
+                self.git(self.repo, "checkout", "-q", "--detach", f"{tip}^")
+                self.assertEqual(identity(tip), own, f"SPEC identity reads {path} from the pushed commit")
+                self.assertNotEqual(own, previous, f"SPEC identity distinguishes changed {path}")
+                if path.endswith(".toml"):
+                    self.assertIn("rustc-1.99.0-", own)
+                self.git(self.repo, "checkout", "-q", "--detach", tip)
+                previous = own
 
     def test_fake_submit_refuses_a_job_it_cannot_copy(self):
         # Spec: D16-150: the fleet fake cannot acknowledge a submission it lost.
@@ -484,7 +518,7 @@ esac
     def test_no_gate_under_flags_its_identity_doesnt_name(self):
         """Sol, review-remote-gates-r1-20261020 (ENCODED_RUSTFLAGS): two encoded cfgs gave one identity."""
         for flags in ("--cfg\x1fvariant_a", ""):
-            done = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity"], cwd=self.repo,
+            done = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
                                   capture_output=True, text=True, env={**self.env, "CARGO_ENCODED_RUSTFLAGS": flags})
             self.assertNotEqual(done.returncode, 0, f"SPEC encoded-flags: {done.stdout}")
             self.assertIn("CARGO_ENCODED_RUSTFLAGS", done.stderr)
@@ -867,7 +901,7 @@ class WindowsCheck(Repo):
         whichever Python its host had: the commit is checked again."""
         tip = self.commit("a.txt", "a changed\n")
         old = subprocess.run([BASH, "-c", '. scripts/lib/gate-key.sh && gate_key windows "inputs-$(windows_inputs "$1")"'
-                              ' "$(git hash-object --stdin < /dev/null)" "$(gate_identity)"', "-", tip],
+                              ' "$(git hash-object --stdin < /dev/null)" "$(gate_identity HEAD)"', "-", tip],
                              cwd=self.repo, capture_output=True, text=True, env=self.env, check=True).stdout.strip()
         common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
         (common / "nrese-gate-passed").write_text(f"{old} | {tip} fleet:gate-0@office-pc cpu=znver3\n", newline="\n")
