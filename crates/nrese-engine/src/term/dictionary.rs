@@ -714,6 +714,31 @@ impl Dictionary {
         Self::find_key(&self.inner.read_recursive(), key, hash, kind, limit)
     }
 
+    /// [`Self::lookup_key_bounded`], what its probe allocates charged first through `charge`:
+    /// nothing where the base's keys are plain (the key is probed as it is), and where they are
+    /// compressed, [`key_lookup_bytes`]'s bound for a key of its length (the compressor's
+    /// output and the stored key it is copied into). The bound and the probe read one state of
+    /// the dictionary, under one read guard: a checkpoint can't publish a compressed base
+    /// between them (sol-loop e1 S1: a compressed base's bound charged on a plain one refused
+    /// interns the parent made).
+    pub(crate) fn lookup_key_charged<E>(
+        &self,
+        key: &[u8],
+        hash: u64,
+        kind: TermKind,
+        limit: u64,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        // Recursive: callers may hold a read lock already (`with_views`).
+        let inner = self.inner.read_recursive();
+        let compressed = inner.base.as_ref().is_some_and(|base| base.codec.is_some());
+        charge(match compressed {
+            true => key_lookup_bytes(key.len(), true),
+            false => 0,
+        })?;
+        Ok(Self::find_key(&inner, key, hash, kind, limit))
+    }
+
     /// `key`'s entry in `inner`, if it is below `limit`, as a `kind` id.
     fn find_key(
         inner: &Inner,
@@ -1427,7 +1452,9 @@ impl Dictionary {
         let decoded = Decoded::default();
         let view = |id: TermId| {
             (id.kind().is_dictionary() && id.payload() < len).then(|| {
-                view_key(match inner.key(id.payload()) {
+                // Inlined here alone: a caller's loop over many views keeps the decode in
+                // line (package 2b's B17 count); every other caller gets `view_key`'s.
+                decode_view(match inner.key(id.payload()) {
                     Key::Borrowed(key) => key,
                     Key::Owned(key) => decoded.keep(key),
                 })
@@ -2099,6 +2126,13 @@ impl<'a> TermView<'a> {
 }
 
 pub(super) fn view_key(key: &[u8]) -> TermView<'_> {
+    decode_view(key)
+}
+
+/// [`view_key`]'s body, always inlined: for [`Dictionary::with_views`]'s lookup, whose callers
+/// loop over many views.
+#[inline(always)]
+fn decode_view(key: &[u8]) -> TermView<'_> {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default();
     match key[0] {

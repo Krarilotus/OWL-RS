@@ -418,3 +418,41 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     assert!(!prepared.proves_consistency);
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
+
+/// REAS-2 fix check r1 (R2-F3, U1). Spec (design note, rule 2: a stop is an error the
+/// consumer has to handle, never an answer): U1's change for a commit ends at its stop. U1
+/// built over an existential axiom and one member, then a change deleting 16 × `POLL_UNITS`
+/// facts U1 doesn't hold, the stop firing at its first ask after the first of their view
+/// lookups: the change gives up, and no more than one lookup is made after the stop fired.
+/// Read as "not in the view", a stopped lookup kept every deleted fact after it, and the
+/// keep looked each one up.
+#[test]
+fn a_change_s_deleted_facts_are_looked_up_until_its_stop() {
+    use crate::witness::{self, Site};
+    let n = 16 * u64::from(nrese_exec::POLL_UNITS);
+    let store = pooled(&members(1));
+    let tx = store.engine().transaction();
+    source::intern_vocabulary(&tx);
+    let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
+    let normalised = nrese_owl::normalise(&ontology);
+    let upper = Upper::build(
+        &ontology,
+        &normalised,
+        tx.base(),
+        &|t| Some(tx.intern(t)),
+        nrese_reasoner::eval::NEVER,
+        store.dl().bounds.kept(),
+    )
+    .unwrap();
+    // Ids no term has: facts in neither U1's program nor the view.
+    let deleted: Vec<Triple> = (0..n).map(|i| [1 << 40 | i, 1 << 41, 1 << 42]).collect();
+    let first = witness::FirstWork::new(Site::InView);
+    let stop = || first.ask();
+    let change = upper.change(tx.base(), &[], &deleted, &stop);
+    let after = first.after();
+    assert!(
+        after <= 1,
+        "{after} view lookups after the stop fired, of {n}: at most the one that saw it"
+    );
+    assert!(change.is_err(), "a stopped change gives up");
+}

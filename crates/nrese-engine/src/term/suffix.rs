@@ -68,6 +68,11 @@ pub(crate) struct Suffix {
     len: u64,
 }
 
+/// The entries the open lists and the table first make room for: a few, so a handful of
+/// terms (a request's own, in a private vocabulary) grow each once, not at every push
+/// (`ChargedVec::reserve` doubles from the capacity it has; dictionary lifecycle V1, count 1).
+const FIRST_ROOM: usize = 8;
+
 /// What a `HashTable<(u64, u64)>` with room for `capacity` entries allocates: hashbrown's
 /// buckets for it (`capacity_to_buckets`: 4 below 4, 8 below 8, else the power of two at or
 /// past `capacity · 8/7`), each a 16-byte slot and a control byte, plus one control group (at
@@ -116,7 +121,9 @@ impl Suffix {
         if self.table.len() < self.table.capacity() {
             return Ok(());
         }
-        let target = (2 * self.table.capacity()).max(self.table.len() + 1);
+        let target = (2 * self.table.capacity())
+            .max(self.table.len() + 1)
+            .max(FIRST_ROOM);
         let held = self.table_bytes.bytes();
         self.table_bytes.charge(table_cost(target))?;
         self.table
@@ -140,10 +147,14 @@ impl Suffix {
     pub(crate) fn push(&mut self, key: &[u8], hash: u64) -> Result<u64, BudgetExceeded> {
         let cost = key_cost(key.len());
         self.open_bytes.charge(cost)?;
+        let room = match self.open.is_empty() {
+            true => FIRST_ROOM,
+            false => 1,
+        };
         if let Err(refused) = self
             .open
-            .reserve(1)
-            .and_then(|()| self.open_hashes.reserve(1))
+            .reserve(room)
+            .and_then(|()| self.open_hashes.reserve(room))
             .and_then(|()| self.table_room())
         {
             self.open_bytes.release(cost);

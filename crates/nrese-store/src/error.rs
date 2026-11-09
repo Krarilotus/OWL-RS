@@ -36,8 +36,8 @@ pub enum StoreError {
     Configuration(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    /// An engine error other than a memory refusal, which converts to the memory limit's
-    /// error (`From<EngineError>`).
+    /// An engine error other than a refusal for memory, which is the request's memory error
+    /// (`From<EngineError>`).
     #[error("storage engine error: {0}")]
     Engine(#[source] EngineError),
     #[error("SPARQL syntax error: {0}")]
@@ -132,14 +132,15 @@ impl From<nrese_exec::BudgetExceeded> for StoreError {
     }
 }
 
-/// An engine's memory refusal (a private transaction's budget: dictionary lifecycle V1) is
-/// the request's memory limit, as a [`nrese_exec::BudgetExceeded`]'s; any other error is
-/// the engine's.
+/// The engine refusing for memory is the request's memory error, as a query's or an update's
+/// is, so every transport answers it alike ([`StoreError::is_memory_limit`]): the pending
+/// changes' growth past the request's envelope (D16-039), and a private transaction's own
+/// terms past its budget (dictionary lifecycle V1). Any other engine error is the store's.
 impl From<EngineError> for StoreError {
     fn from(error: EngineError) -> Self {
         match error {
             EngineError::MemoryLimit(exceeded) => exceeded.into(),
-            other => Self::Engine(other),
+            error => Self::Engine(error),
         }
     }
 }

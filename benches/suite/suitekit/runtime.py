@@ -317,6 +317,11 @@ def tree_rss_mib(pid: int) -> int | None:
     return total // 1048576 if total else None
 
 
+# The runtimes a suite run can name (`suite.py run --runtime`, a receipt's protocol `runtime`): the
+# `kind` of each class below. suite.py coverage judges a receipt under the one it names.
+KINDS = ("docker", "apptainer", "rootfs", "process")
+
+
 class Runtime:
     """The interface; `DockerRuntime`, `ApptainerRuntime` and `ProcessRuntime` implement it."""
 

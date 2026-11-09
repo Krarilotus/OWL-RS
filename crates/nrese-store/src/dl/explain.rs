@@ -163,8 +163,27 @@ pub(crate) fn justify(
     budget: &Budget,
     deadline: Deadline,
 ) -> Result<Option<Justification>, String> {
-    let (background, candidates): (Vec<usize>, Vec<usize>) = (0..ontology.axioms.len())
-        .partition(|&i| matches!(ontology.axioms[i], Axiom::Declaration(..)));
+    let candidates = (0..ontology.axioms.len())
+        .filter(|&i| !matches!(ontology.axioms[i], Axiom::Declaration(..)))
+        .collect();
+    justify_among(ontology, goal, fresh, budget, deadline, candidates)
+}
+
+/// [`justify`] trying `candidates` (each axiom but the declarations, once) in their order:
+/// which minimal set it finds depends on that order and on nothing else (QuickXplain over
+/// tests whose answers are the ontology's), so a caller that orders them by a key of its own
+/// decides which one, whatever the ontology's order.
+pub(crate) fn justify_among(
+    ontology: &Ontology,
+    goal: &Goal,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+    candidates: Vec<usize>,
+) -> Result<Option<Justification>, String> {
+    let background: Vec<usize> = (0..ontology.axioms.len())
+        .filter(|&i| matches!(ontology.axioms[i], Axiom::Declaration(..)))
+        .collect();
     let mut search = Search {
         ontology,
         goal,
