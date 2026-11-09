@@ -92,27 +92,29 @@ fn a_commit_records_its_violations_within_the_request_budget() {
     assert!(detail.contains("at least"), "{detail}");
 }
 
-/// The most the requests' shared memory held for `command` on a store whose rules are
-/// `rules`, with memory to spare: what a commit that lists nothing needs itself. Its pending
-/// changes draw on the same memory as its report (D16-039), so a pool smaller than this
-/// refuses the commit before any report.
-fn own_peak(rules: &str, command: MutationCommand) -> usize {
-    let pipeline = pipeline_of(POOL, rules);
+/// The most the requests' shared memory held for `command` with no consistency check at all
+/// (reasoning off), with memory to spare: what the commit itself needs, nothing of a check or
+/// its report (sol-loop r2 T1). Its pending changes draw on the same memory as the report
+/// (D16-039), so a pool smaller than this refuses the commit before any check.
+fn own_peak(command: MutationCommand) -> usize {
+    let mut config = StoreConfig::in_memory();
+    config.total_query_memory_bytes = POOL;
+    let store = StoreService::new(config).expect("store");
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Disabled);
+    let pipeline = MutationPipeline::new(Arc::new(store), Arc::new(ReasonerService::new(reasoner)));
     pipeline
         .apply(command, &Requester::all(), &MutationTicket::new())
-        .expect("a commit that lists nothing is accepted");
+        .expect("a commit without a check is accepted");
     pipeline.store().query_memory().expect("a pool").1
 }
 
 /// A pool without room for the list's first entry: nothing is listed, and the commit is
 /// rejected all the same, as at least one violation and without an explanation. The pool is
-/// what the same commit needs where nothing fires (its third atom has no facts), so the
-/// commit itself fits and the list has no room of its own.
+/// what the commit needs without any check, so the commit itself fits and neither the check
+/// nor its list has room of its own.
 #[test]
 fn a_commit_is_rejected_when_not_one_violation_can_be_listed() {
-    let never =
-        "@prefix : <http://example.com/> .\n{ ?a :p ?x . ?b :q ?y . ?c :none ?z } => false .\n";
-    let pipeline = pipeline_within(own_peak(never, facts(1)));
+    let pipeline = pipeline_within(own_peak(facts(1)));
     let result = pipeline.apply(facts(1), &Requester::all(), &MutationTicket::new());
     let Err(MutationError::Rejected(reject)) = result else {
         panic!("expected a rejection, got {result:?}");
@@ -121,10 +123,10 @@ fn a_commit_is_rejected_when_not_one_violation_can_be_listed() {
     assert!(reject.explanation.is_none());
 }
 
-/// A pool with no room beyond what the commit itself needs (as above), and a rule whose
-/// atoms both have facts that never join (sol-loop r1 S1): nothing fires, so nothing is
-/// listed and the consistent commit is accepted; a budget without room for a list that
-/// stays empty is no inconsistency.
+/// A pool with no room beyond what the commit needs without any check (as above), and a
+/// rule whose atoms both have facts that never join (sol-loop r1 S1): nothing fires, so
+/// nothing is charged and the consistent commit is accepted; a budget without room for a list
+/// that stays empty is no inconsistency.
 #[test]
 fn a_consistent_commit_is_accepted_whatever_room_the_list_has() {
     let rules = "@prefix : <http://example.com/> .\n{ ?s :p ?x . ?s :q ?y } => false .\n";
@@ -133,7 +135,7 @@ fn a_consistent_commit_is_accepted_whatever_room_the_list_has() {
             "INSERT DATA {{ <{EX}a> <{EX}p> <{EX}x> . <{EX}b> <{EX}q> <{EX}y> . }}"
         )))
     };
-    let pipeline = pipeline_of(own_peak(rules, command()), rules);
+    let pipeline = pipeline_of(own_peak(command()), rules);
     let result = pipeline.apply(command(), &Requester::all(), &MutationTicket::new());
     assert!(result.is_ok(), "a consistent commit: {result:?}");
 }
