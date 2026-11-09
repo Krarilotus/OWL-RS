@@ -268,8 +268,9 @@ struct Cached {
     access: Option<GraphAccess>,
     /// The exact snapshot view it was read from, including pending changes and masks.
     key: SnapshotIdentity,
-    /// The compiling snapshot's [`Snapshot::shared_bound`]: every id the entry holds is
-    /// below it.
+    /// The [`Snapshot::shared_bound`] of the snapshot its TBox was last compiled on: in a
+    /// store's entry, every dictionary id the TBox holds is below it (a private version's
+    /// own entry may also hold its overlay's own ids, at or past it).
     bound: u64,
     /// The schema without its memberships, in every graph ([`read_core`]): what a new
     /// snapshot's must equal for the entry to stand. Equality is linear in its size, as
@@ -683,6 +684,7 @@ impl QlRewriting {
             c.equality,
         ));
         c.tbox = Arc::clone(&tbox);
+        c.bound = snapshot.shared_bound();
         tbox
     }
 }
