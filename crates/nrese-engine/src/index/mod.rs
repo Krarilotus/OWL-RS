@@ -312,10 +312,11 @@ impl IndexVersion {
                 false => Ok(false),
             };
         };
-        let has_tombstones = self
-            .runs
-            .iter()
-            .any(|run| !run.permutation(adapted.permutation).tombstones.is_empty());
+        let has_tombstones = self.runs.iter().any(|run| {
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            !run.permutation(adapted.permutation).tombstones.is_empty()
+        });
         if adapted.exclude_default_graph || has_tombstones {
             let count = self.count_plan_visiting(plan, visit);
             return count.map(|count| count > 0).ok_or(Stopped);

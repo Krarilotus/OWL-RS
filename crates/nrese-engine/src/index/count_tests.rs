@@ -52,3 +52,50 @@ fn a_held_count_reads_its_tombstones_within_a_run_of_its_visitor() {
         "a visit of {largest} units: at most {interval} at once"
     );
 }
+
+/// REAS-3a, sol-loop r1 S2. Spec (`crate::visit`: a unit is each run a read searches or
+/// probes, counted before it is looked at): a counted existence probe looks at its runs within
+/// its visitor's interval. Three intervals of runs, one statement each, none with tombstones
+/// and none matching the probe (so it reads every run): between two asks of the visitor (and
+/// after the last) it looks at no more than two intervals of runs. Reading every run's
+/// tombstones before the first ask, it looked at all of them unseen.
+#[test]
+fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
+    let interval = u64::from(nrese_exec::POLL_UNITS);
+    let n = 3 * interval;
+    let (p, o) = (term(1), term(2));
+    let runs: Vec<_> = (0..n)
+        .map(|i| {
+            let quad = EncodedQuad::new(term(10 + i), p, o, TermId::DEFAULT_GRAPH);
+            std::sync::Arc::new(Run::from_delta(Layout::DefaultGraph, &[quad], &[]))
+        })
+        .collect();
+    let version = IndexVersion {
+        layout: Layout::DefaultGraph,
+        runs: runs.into(),
+        len: n,
+    };
+    let plan = AccessPlan::for_pattern(&QuadPattern {
+        subject: Some(term(5)),
+        predicate: Some(p),
+        ..QuadPattern::all()
+    });
+    let last = std::cell::Cell::new(witness::get(Site::RunProbes));
+    let largest = std::cell::Cell::new(0);
+    let gap = || {
+        let now = witness::get(Site::RunProbes);
+        largest.set(largest.get().max(now - last.replace(now)));
+    };
+    let found = version.any_plan_counted(&plan, &|_| {
+        gap();
+        true
+    });
+    gap();
+    assert_eq!(found, Ok(false), "no run holds the probed statement");
+    let largest = largest.get();
+    assert!(
+        largest <= 2 * interval,
+        "{largest} runs looked at between two asks of the visitor: at most {}",
+        2 * interval
+    );
+}
