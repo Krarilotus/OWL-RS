@@ -75,7 +75,21 @@ const SENT_CONSTANT: &str = "urn:nrese:substituted-blank-node:";
 /// nothing ([`unmatchable`]). Unchanged, and nothing renamed, when the pattern holds no
 /// made name.
 pub fn printable(pattern: GraphPattern) -> (GraphPattern, Sent) {
-    printable_names(pattern)
+    printable_avoiding(pattern, [])
+}
+
+/// Also reserves variables outside the pattern, such as CONSTRUCT template variables.
+pub fn printable_avoiding(
+    pattern: GraphPattern,
+    reserved: impl IntoIterator<Item = Variable>,
+) -> (GraphPattern, Sent) {
+    printable_names(
+        pattern,
+        reserved
+            .into_iter()
+            .map(|v| v.as_str().to_owned())
+            .collect(),
+    )
 }
 
 /// Prints resolved ground triple values as RDF1.2 terms (or TRIPLE expressions).
@@ -125,14 +139,13 @@ pub fn printable_with_values(
             }
         }
     }
-    printable_names(pattern)
+    printable_names(pattern, HashSet::new())
 }
 
-fn printable_names(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
+fn printable_names(mut pattern: GraphPattern, mut taken: HashSet<String>) -> (GraphPattern, Sent) {
     // First what the pattern names, then the renames: a new name is clear of every one.
     let mut made: HashSet<Variable> = HashSet::new();
     let mut constants = false;
-    let mut taken: HashSet<String> = HashSet::new();
     walk_mut(NodeMut::Pattern(&mut pattern), &mut |slot| match slot {
         SlotMut::Variable(v) if is_variable(v) => {
             made.insert(v.clone());
