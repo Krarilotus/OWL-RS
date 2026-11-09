@@ -466,16 +466,7 @@ impl Quarantine {
             // log made by a call whose sync then failed is in place but not known durable, and
             // the next call must not take it for so (fix check r1, R2-F1).
             nrese_engine::place::create_dir_all(dir)?;
-            // A log that is a link to a file elsewhere: its target's names are durable before
-            // the append (DUR-5, fix check r2 on DUR-4, R2-F1); a failure refuses the
-            // resolution before anything is written. No entry yet: the append makes a file in
-            // `dir`, named by its sync below.
             let path = dir.join(RESOLUTIONS);
-            match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-                Ok(_) => nrese_engine::place::name_existing_file(&path)?,
-            }
             let mut log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -483,6 +474,11 @@ impl Quarantine {
             let line = serde_json::to_string(&resolution).expect("a resolution serialises");
             log.write_all(format!("{line}\n").as_bytes())?;
             log.sync_data()?;
+            // A log that is a link to a file elsewhere: its target's names are durable before
+            // the resolution is acknowledged (DUR-5, fix check r2 on DUR-4, R2-F1). After the
+            // append, which makes a target not there yet (sol-loop r1, S2); a failure refuses
+            // the resolution, written but not known durable, as a failed sync below does.
+            nrese_engine::place::name_existing_file(&path)?;
             #[cfg(test)]
             if tests::FAIL_LOG_DIR_SYNC.get() {
                 return Err(std::io::Error::other(

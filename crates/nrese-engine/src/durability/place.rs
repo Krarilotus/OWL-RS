@@ -485,11 +485,11 @@ pub fn name_existing_file(path: &Path) -> std::io::Result<()> {
 /// The directories, each with its key (its canonical path: a link was followed), holding the
 /// entries the existing file `path` is reached through beyond its own directory's (DUR-5, fix
 /// check r2 on DUR-4, R2-F1): none for a regular file. For a file that is a link, its target
-/// resolved as a directory link's is (relative to the link's directory; on Windows normalised
-/// first, [`as_walked`]): the holders of every level of the target's directory, links in its
-/// chain included ([`resolve`]), and that directory, which holds the target's entry; for a
-/// chain of file links, each one's alike. Refused: a dangling link (`NotFound`), more than
-/// [`MAX_LINKS`] file links (a loop), a target that isn't a file.
+/// resolved as a directory link's is (relative to the link's directory as reached; on Windows
+/// normalised then, [`as_walked`]): the holders of every level of the target's directory,
+/// links in its chain included ([`resolve`]), and that directory, which holds the target's
+/// entry; for a chain of file links, each one's alike. Refused: a dangling link (`NotFound`),
+/// more than [`MAX_LINKS`] file links (a loop), a target that isn't a file.
 pub(crate) fn file_holders(path: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
     use std::io::{Error, ErrorKind};
     let mut holders = Vec::new();
@@ -524,7 +524,11 @@ pub(crate) fn file_holders(path: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf
             )));
         }
         let target = fs::read_link(&current)?;
-        let joined = current.parent().unwrap_or(Path::new("")).join(&target);
+        // A relative target is taken from the link's directory as reached, not as spelled:
+        // Windows joins it to the path reparsed so far and only then takes `..` lexically
+        // (sol-loop r1 on DUR-5, S1); Unix walks it from there physically.
+        let from = resolve(current.parent().unwrap_or(Path::new("")))?;
+        let joined = from.reached.join(&target);
         #[cfg(windows)]
         let joined = as_walked(&joined);
         let Some(name) = joined.file_name().map(std::ffi::OsStr::to_os_string) else {
