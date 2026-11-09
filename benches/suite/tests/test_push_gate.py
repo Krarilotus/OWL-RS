@@ -173,6 +173,13 @@ class Repo(unittest.TestCase):
 class PushGate(Repo):
     """The hook and check.sh's push tier, end to end with the stand-in fleet."""
 
+    def test_fake_submit_refuses_a_job_it_cannot_copy(self):
+        # Spec: D16-150: the fleet fake cannot acknowledge a submission it lost.
+        done = subprocess.run([BASH, str(self.fake / "fleet"), "submit", "missing.toml"],
+                              cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(done.returncode, 0, f"SPEC faithful fake: {done.stdout}{done.stderr}")
+        self.assertEqual(done.stdout, "", "SPEC faithful fake: no success id for a lost job")
+
     def test_deletions_alone_need_no_gate(self):
         """A push that only deletes refs has no tree to gate: the hook lets it through and asks
         nothing of the fleet (I9: the remote deletion of a plan branch was refused on 25 Oct)."""
