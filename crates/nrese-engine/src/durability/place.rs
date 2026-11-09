@@ -113,24 +113,69 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The directories [`create_dir_all`] syncs for the levels of `dir` it finds, outermost first:
-/// the directory holding each entry the resolution of `dir` reads ([`resolve`]: through links,
-/// the link's own entry and its target's chain). A store's open that finds its root defers
-/// these syncs to the first durable write that relies on them (`Wal::settle_names`,
-/// deferred-sync design note of 8 Nov).
-pub(crate) fn holders(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    Ok(resolve(dir)?.holders)
+/// A store's root as its open resolved it ([`resolve`]): the directories [`create_dir_all`]
+/// syncs for the levels it finds, the directory holding each entry the resolution reads
+/// (through links, the link's own entry and its target's chain). A store's open that finds its
+/// root defers these syncs to the first durable write that relies on them (`Wal::settle_names`,
+/// deferred-sync design note of 8 Nov). Kept so that a directory inside the root is resolved
+/// from where the root's resolution ended ([`Self::beyond`]): the root's chain is walked once,
+/// and each holder canonicalised once (timing of DUR-4, 9 Nov).
+pub(crate) struct Named(Resolution);
+
+impl Named {
+    /// Resolves the existing directory `dir`.
+    pub(crate) fn resolve(dir: &Path) -> std::io::Result<Self> {
+        Ok(Self(resolve(dir)?))
+    }
+
+    /// The holders, each with its canonical path, outermost first.
+    pub(crate) fn holders(&self) -> impl Iterator<Item = (PathBuf, PathBuf)> + '_ {
+        self.0
+            .holders
+            .iter()
+            .cloned()
+            .zip(self.0.keys.iter().cloned())
+    }
+
+    /// The holders, with their canonical paths, that the resolution of `name`, an existing
+    /// directory in this one, reads past this one's: this directory (the holder of `name`'s
+    /// entry) and, if `name` is a link, its target's chain (package review r1, R1-L1).
+    pub(crate) fn beyond(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
+        let base = self.0.holders.len();
+        let path = self.0.reached.join(name);
+        let resolution = walk(
+            self.0.clone(),
+            [(Step::Name(name.to_owned()), false)].into(),
+            &path,
+        )?;
+        if !resolution.missing.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} is not a directory", path.display()),
+            ));
+        }
+        let Resolution { holders, keys, .. } = resolution;
+        Ok(holders.into_iter().zip(keys).skip(base).collect())
+    }
 }
 
 /// Where the resolution of a path leads ([`resolve`]).
+#[derive(Clone, Default)]
 struct Resolution {
     /// The directories holding each entry the resolution read, physical (no link in them),
     /// outermost first, each once.
     holders: Vec<PathBuf>,
+    /// Each holder's canonical path, by which they are deduplicated.
+    keys: Vec<PathBuf>,
     /// The physical directory the path's existing part leads to (empty: `.`).
     reached: PathBuf,
     /// The path's names past `reached` that aren't there, in order.
     missing: Vec<std::ffi::OsString>,
+    /// The links followed so far.
+    links: usize,
 }
 
 /// Links one resolution follows at most, as Linux's `ELOOP`.
@@ -174,14 +219,28 @@ fn steps(path: &Path, from_link: bool) -> Vec<(Step, bool)> {
 /// an entry that isn't a directory, a `..` past a missing name. Holders are deduplicated by
 /// their canonical path (a junction's target is spelled `\\?\…`).
 fn resolve(path: &Path) -> std::io::Result<Resolution> {
-    use std::collections::VecDeque;
+    walk(
+        Resolution::default(),
+        steps(&as_walked(path), false).into(),
+        path,
+    )
+}
+
+/// [`resolve`]'s walk: `queue`'s steps from where `resolution` stands (`path` names the walk in
+/// errors).
+fn walk(
+    resolution: Resolution,
+    mut queue: std::collections::VecDeque<(Step, bool)>,
+    path: &Path,
+) -> std::io::Result<Resolution> {
     use std::io::{Error, ErrorKind};
-    let mut holders = Vec::new();
-    let mut seen: Vec<PathBuf> = Vec::new();
-    let mut current = PathBuf::new();
-    let mut missing = Vec::new();
-    let mut links = 0;
-    let mut queue: VecDeque<(Step, bool)> = steps(&as_walked(path), false).into();
+    let Resolution {
+        mut holders,
+        mut keys,
+        reached: mut current,
+        mut missing,
+        mut links,
+    } = resolution;
     while let Some((step, from_link)) = queue.pop_front() {
         if !missing.is_empty() {
             match step {
@@ -229,13 +288,13 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
                         if target.is_relative() {
                             current = PathBuf::new();
                         }
-                        hold(&mut holders, &mut seen, holder);
+                        hold(&mut holders, &mut keys, holder);
                         for step in steps(&target, true).into_iter().rev() {
                             queue.push_front(step);
                         }
                     }
                     Ok(meta) if meta.is_dir() => {
-                        hold(&mut holders, &mut seen, holder);
+                        hold(&mut holders, &mut keys, holder);
                         current = entry;
                     }
                     Ok(_) => {
@@ -258,8 +317,10 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
     }
     Ok(Resolution {
         holders,
+        keys,
         reached: current,
         missing,
+        links,
     })
 }
 
@@ -384,6 +445,7 @@ fn name_levels(dir: &Path, made: &mut Vec<PathBuf>) -> std::io::Result<()> {
         holders,
         reached,
         missing,
+        ..
     } = resolve(dir)?;
     // Found levels aren't made again (an ancestor may be one this process can't write); a
     // holder of one this process may not open for the sync was provisioned (the exception).
