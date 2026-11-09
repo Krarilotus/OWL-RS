@@ -142,7 +142,7 @@ fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
             "INSERT { <urn:x> <urn:p> ?u } WHERE { BIND(STRUUID() AS ?u) }",
         ))
     };
-    assert!(sessions.add(&id, None, vec![fresh()]));
+    assert!(sessions.add(&id, None, vec![fresh()]).unwrap());
     let pending = |session: Option<&str>| StatementsRequest {
         ops: sessions.pending(&id, None).unwrap(),
         session: session.map(str::to_owned),
@@ -171,7 +171,7 @@ fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
     assert_eq!(after_commit.len(), 2, "{after_commit:?}");
     assert!(!after_commit.contains(&first[0]));
     // More operations: replayed too.
-    assert!(sessions.add(&id, None, vec![fresh()]));
+    assert!(sessions.add(&id, None, vec![fresh()]).unwrap());
     let longer = pending(Some(&id));
     assert_eq!(
         objects(&store, &ReadContext::all().on(Some(&longer))).len(),

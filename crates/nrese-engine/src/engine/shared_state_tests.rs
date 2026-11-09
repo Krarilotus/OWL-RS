@@ -64,15 +64,33 @@ fn inferred(snapshot: &Snapshot) -> Vec<EncodedQuad> {
         .collect()
 }
 
+/// Whether `snapshot` grants a token. Every row of the matrix also checks 3.0c's item 1
+/// (`notes/2026-11-09-dict3-0c-own-state-design.md` §3): `admission()` is `Own` exactly where
+/// `shared_state()` is `None`, and either capability gives back the snapshot itself.
 fn token(snapshot: &Snapshot) -> bool {
-    snapshot.shared_state().is_some()
+    let shared = snapshot.shared_state();
+    match snapshot.admission() {
+        super::Admission::Shared(state) => {
+            assert!(
+                std::ptr::eq(state.snapshot(), snapshot),
+                "shared, of itself"
+            );
+            assert!(shared.is_some(), "admission Shared, shared_state None");
+        }
+        super::Admission::Own(own) => {
+            assert!(std::ptr::eq(own.snapshot(), snapshot), "own, of itself");
+            assert!(shared.is_none(), "admission Own, shared_state Some");
+        }
+    }
+    shared.is_some()
 }
 
 /// Review §5 item 1, 3.0's share: pending state of both kinds grants no token, with no private
 /// id involved.
 ///
-/// - Input: a published snapshot; writer pending snapshots (`pending_snapshot` and `pending_over`)
-///   after inserting and deleting statements made only of existing ids, with no change, and after
+/// - Input: a published snapshot; writer pending snapshots (`pending_snapshot` and `pending_over`,
+///   and DUR-6a's charged `_within` forms of both, once changed) after inserting and deleting
+///   statements made only of existing ids, with no change, and after
 ///   inserting then deleting the same statement; `Engine::speculative()`'s; a private
 ///   transaction's, from both builders.
 /// - Expected: the published one grants a token whose snapshot is itself; none of the others
@@ -98,6 +116,14 @@ fn pending_states_of_both_kinds_grant_no_token() {
     assert!(
         !token(&changed.pending_over(&view, &[])),
         "writer, over a view"
+    );
+    assert!(
+        !token(&changed.pending_snapshot_within(&budget()).unwrap()),
+        "writer, charged"
+    );
+    assert!(
+        !token(&changed.pending_over_within(&view, &[], &budget()).unwrap()),
+        "writer, charged, over a view"
     );
     drop(changed);
 
@@ -130,6 +156,16 @@ fn pending_states_of_both_kinds_grant_no_token() {
         !token(&private.pending_over(&view, &[]).unwrap()),
         "private, over"
     );
+}
+
+/// `source` with `added` as statements its DL bounds derived (3.0b): the constructor's own
+/// test, beside its one caller.
+#[allow(clippy::disallowed_methods)]
+fn derived(source: &Snapshot, added: EncodedQuad) -> Snapshot {
+    let triple = EncodedTriple::new(added.subject, added.predicate, added.object);
+    source
+        .with_inferred_derived_within(&[triple], &budget())
+        .unwrap()
 }
 
 /// Review §5 item 2 and F2: views keep or clear eligibility by the design note's matrix, and
@@ -179,6 +215,13 @@ fn views_keep_or_clear_eligibility_by_the_matrix() {
                     .with_inferred_mask(&mask, &budget())
                     .unwrap()
                     .unwrap(),
+            ),
+            // 3.0b: the DL bounds' derivation keeps its source's publication, the upper
+            // bound's read with its equality too.
+            ("derived within", derived(source, added)),
+            (
+                "derived, with equality",
+                derived(source, added).with_equality(predicate),
             ),
             ("equality", source.with_equality(predicate)),
             ("stored", source.stored()),

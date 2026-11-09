@@ -29,6 +29,9 @@ from statistics import median, quantiles
 ADJUDICATIONS = Path(__file__).resolve().parent.parent / "adjudications.tsv"
 
 FAILED = ("failed", "timeout")
+# Every outcome Pair.outcome() gives (a test reads them off its source): what a receipt's
+# `outcome.outcome` may say; suite.py coverage refuses any other as unrecognised.
+OUTCOMES = ("ok", "partial", "wrong", "disputed", "failed", "timeout", "skipped", "restricted")
 
 
 def number(text) -> float | None:

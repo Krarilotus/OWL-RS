@@ -25,6 +25,8 @@ pub mod cpu;
 mod durability;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "fault-points")]
+pub mod fault_points;
 mod index;
 mod mapped;
 pub mod memory;
@@ -37,11 +39,12 @@ pub mod witness;
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
 pub use engine::{
-    Applied, AssertedIdentity, BulkLoad, BulkMode, CommitSummary, Content, CorpusTuning, Count,
-    CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats,
+    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitSummary, Content, CorpusTuning,
+    Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats,
     EqualityClasses, HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch,
-    LogExpectation, PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation, SearchRefused,
-    Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
+    LogExpectation, OwnState, PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation,
+    SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope,
+    Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

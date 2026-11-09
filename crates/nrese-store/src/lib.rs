@@ -122,7 +122,7 @@ pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
     ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
 };
-pub use statements::{RdfPayload, StatementOp, StatementPattern, StatementsRequest};
+pub use statements::{RdfPayload, StatementOp, StatementOps, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;
 pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};

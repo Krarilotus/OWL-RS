@@ -261,18 +261,49 @@ impl Quarantine {
             }
             let resolutions = dir.join(RESOLUTIONS);
             if resolutions.exists() {
-                for line in BufReader::new(File::open(&resolutions)?).lines() {
-                    let line = line?;
-                    match serde_json::from_str::<Resolution>(&line) {
+                let mut log = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&resolutions)?;
+                let mut reader = BufReader::new(&log);
+                let mut framed = 0;
+                let mut line = Vec::new();
+                while reader.read_until(b'\n', &mut line)? != 0 {
+                    let terminated = line.last() == Some(&b'\n');
+                    match serde_json::from_slice::<Resolution>(&line) {
                         Ok(resolution) => {
                             state.resolutions.insert(resolution.id.clone(), resolution);
+                            if !terminated {
+                                // A complete record needs its delimiter before the next append.
+                                drop(reader);
+                                log.seek(SeekFrom::End(0))?;
+                                log.write_all(b"\n")?;
+                                log.sync_data()?;
+                                break;
+                            }
                         }
-                        // A record torn by a crash: its resolution didn't happen.
-                        Err(_) if !line.is_empty() => {
-                            tracing::warn!(record = %line, "skipped an unreadable quarantine resolution");
+                        Err(_) if !terminated => {
+                            // Recovery must remove the torn tail, or the next record would
+                            // join it and an acknowledged resolution would disappear on reopen.
+                            tracing::warn!(bytes = line.len(), record = %String::from_utf8_lossy(&line), "truncating a torn quarantine resolution");
+                            drop(reader);
+                            log.set_len(framed)?;
+                            log.sync_data()?;
+                            break;
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            // Keep the existing error policy for framed records, including
+                            // invalid UTF-8; only the unfinished tail is repaired above.
+                            let text = std::str::from_utf8(&line).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?;
+                            if !text.trim_end_matches(['\r', '\n']).is_empty() {
+                                tracing::warn!(record = %text, "skipped an unreadable quarantine resolution");
+                            }
+                        }
                     }
+                    framed += line.len() as u64;
+                    line.clear();
                 }
             }
         }
@@ -466,13 +497,19 @@ impl Quarantine {
             // log made by a call whose sync then failed is in place but not known durable, and
             // the next call must not take it for so (fix check r1, R2-F1).
             nrese_engine::place::create_dir_all(dir)?;
+            let path = dir.join(RESOLUTIONS);
             let mut log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(dir.join(RESOLUTIONS))?;
+                .open(&path)?;
             let line = serde_json::to_string(&resolution).expect("a resolution serialises");
             log.write_all(format!("{line}\n").as_bytes())?;
             log.sync_data()?;
+            // A log that is a link to a file elsewhere: its target's names are durable before
+            // the resolution is acknowledged (DUR-5, fix check r2 on DUR-4, R2-F1). After the
+            // append, which makes a target not there yet (sol-loop r1, S2); a failure refuses
+            // the resolution, written but not known durable, as a failed sync below does.
+            nrese_engine::place::name_existing_file(&path)?;
             #[cfg(test)]
             if tests::FAIL_LOG_DIR_SYNC.get() {
                 return Err(std::io::Error::other(
@@ -982,6 +1019,155 @@ mod tests {
         if store.quarantine().open_count() != 0 {
             wrong.push(format!(
                 "after a reopen {} are open, not 0",
+                store.quarantine().open_count()
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A resolution appended through a log that is a link to a file elsewhere is acknowledged
+    /// only once the names its target's resolution reads are durable (DUR-5, fix check r2 on
+    /// DUR-4, R2-F1). The first discard makes the log; the store closed, the log moved to
+    /// `data/new-parent/` and linked back, the store reopened. With the sync of `data/new-parent`
+    /// (a target ancestor) failing with a non-permission error, a discard is refused. Once the
+    /// sync works it is acknowledged, and after a reopen nothing is open. Windows runs it on a
+    /// file symlink where the host may make one, else "not run". Before the fix the discard was
+    /// acknowledged with `data/new-parent` never synced: a power loss could leave the link
+    /// dangling, and the acknowledged resolutions with it.
+    #[test]
+    fn a_discard_through_a_linked_log_waits_for_its_targets_names() {
+        use nrese_engine::fault_points::fail_dir_sync_of;
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let file = dir.path().join("bad.nt");
+        fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> .\n\
+             <http://example.com/b> \"no predicate\" .\n",
+        )
+        .unwrap();
+        let ids: Vec<String> = {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            store
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .unwrap();
+            let ids: Vec<String> = store
+                .quarantine()
+                .list(&QuarantineFilter::default())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.statement.id)
+                .collect();
+            assert_eq!(ids.len(), 2);
+            assert!(matches!(store.quarantine().discard(&ids[..1], None), Ok(1)));
+            ids
+        };
+        let log = store_dir.join(DIR).join(RESOLUTIONS);
+        let parent = dir.path().join("data").join("new-parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::rename(&log, parent.join(RESOLUTIONS)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(parent.join(RESOLUTIONS), &log).unwrap();
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_file(parent.join(RESOLUTIONS), &log) {
+            Ok(()) => {}
+            // ERROR_PRIVILEGE_NOT_HELD
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("not run (no privilege to make a file symlink on this host)");
+                return;
+            }
+            Err(error) => panic!("symlink {}: {error}", log.display()),
+        }
+        let mut wrong = Vec::new();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        fail_dir_sync_of(Some((&parent, std::io::ErrorKind::Other)));
+        let discarded = store.quarantine().discard(&ids[1..], None);
+        fail_dir_sync_of(None);
+        if discarded.is_ok() {
+            wrong.push("acknowledged though a target ancestor's sync failed".to_owned());
+        }
+        let discarded = store.quarantine().discard(&ids[1..], None);
+        if !matches!(discarded, Ok(1)) {
+            wrong.push(format!("once the sync works: {discarded:?}"));
+        }
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.quarantine().open_count() != 0 {
+            wrong.push(format!(
+                "after a reopen {} are open, not 0",
+                store.quarantine().open_count()
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The first resolution through a log that is a link to a file not made yet (sol-loop r1 on
+    /// DUR-5, S2): the append makes the target, as it did before naming linked logs, and the
+    /// resolution is acknowledged and kept after a reopen. Windows runs it on a file symlink
+    /// where the host may make one, else "not run". Before the fix the naming ahead of the
+    /// append found no target and refused every resolution.
+    #[test]
+    fn a_first_discard_through_a_log_link_makes_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let file = dir.path().join("bad.nt");
+        fs::write(
+            &file,
+            "<http://example.com/a> <http://example.com/p> .\n\
+             <http://example.com/b> \"no predicate\" .\n",
+        )
+        .unwrap();
+        let ids: Vec<String> = {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+            store
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .unwrap();
+            store
+                .quarantine()
+                .list(&QuarantineFilter::default())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.statement.id)
+                .collect()
+        };
+        assert_eq!(ids.len(), 2);
+        let log = store_dir.join(DIR).join(RESOLUTIONS);
+        assert!(!log.exists(), "no resolution yet, no log");
+        let parent = dir.path().join("data").join("new-parent");
+        fs::create_dir_all(&parent).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(parent.join(RESOLUTIONS), &log).unwrap();
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_file(parent.join(RESOLUTIONS), &log) {
+            Ok(()) => {}
+            // ERROR_PRIVILEGE_NOT_HELD
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("not run (no privilege to make a file symlink on this host)");
+                return;
+            }
+            Err(error) => panic!("symlink {}: {error}", log.display()),
+        }
+        let mut wrong = Vec::new();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let discarded = store.quarantine().discard(&ids[..1], None);
+        if !matches!(discarded, Ok(1)) {
+            wrong.push(format!("the first discard: {discarded:?}"));
+        }
+        drop(store);
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.quarantine().open_count() != 1 {
+            wrong.push(format!(
+                "after a reopen {} are open, not 1",
                 store.quarantine().open_count()
             ));
         }

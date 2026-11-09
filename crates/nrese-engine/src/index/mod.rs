@@ -36,6 +36,7 @@ use std::borrow::Cow;
 use keys::PackedKeys;
 use merge::SignedMerge;
 use nrese_exec::{BudgetExceeded, ChargedVec, Reservation};
+pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
@@ -218,17 +219,99 @@ impl IndexVersion {
         self.layout
     }
 
-    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
-    /// stack that receives a quad in a named graph turns into a quad stack first
-    /// ([`with_quads_layout`](Self::with_quads_layout)).
-    pub(crate) fn with_delta(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Self {
+    /// The layout `self` takes with the delta `inserts` and `deletes`: the quad layout once a
+    /// quad of them is in a named graph.
+    fn layout_with(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Layout {
         let named = |quads: &[EncodedQuad]| Layout::holding(quads) == Layout::Quads;
-        let base = match self.layout == Layout::DefaultGraph && (named(inserts) || named(deletes)) {
-            true => self.with_quads_layout(),
-            false => self.clone(),
+        match self.layout == Layout::DefaultGraph && (named(inserts) || named(deletes)) {
+            true => Layout::Quads,
+            false => self.layout,
+        }
+    }
+
+    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
+    /// stack that receives a quad in a named graph turns into a quad stack first, its runs
+    /// converted for this version alone: never installed as their shared forms (which would
+    /// then go uncounted). For stacks no reader shares a conversion of: an inferred stack
+    /// (its statements are in the default graph), a test's. An asserted stack a pending
+    /// version reads goes through [`Self::with_delta_in`], which shares and counts it (DUR-6).
+    pub(crate) fn with_delta(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Self {
+        let base = match self.layout_with(inserts, deletes) == self.layout {
+            true => self.clone(),
+            false => self.with_quads_layout_alone(),
         };
         let run = Run::from_delta(base.layout, inserts, deletes);
         base.with_run(run)
+    }
+
+    /// The same quads in the quad layout, made for this version alone: its runs are its own,
+    /// counted as the index's own runs (`Engine::stats`), never installed as shared forms.
+    /// For a version that replaces its source for good (a recovery's replay, a bulk load's
+    /// publication), where nothing else would share the form.
+    pub(crate) fn with_quads_layout_alone(&self) -> Self {
+        if self.layout == Layout::Quads {
+            return self.clone();
+        }
+        Self {
+            layout: Layout::Quads,
+            runs: self
+                .runs
+                .iter()
+                .map(|run| Arc::new(run.with_quads_layout()))
+                .collect(),
+            len: self.len,
+        }
+    }
+
+    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
+    /// stack that receives a quad in a named graph reads its runs in the quad layout, each
+    /// run's form shared and counted in `forms` ([`Self::with_quads_layout`], DUR-6).
+    pub(crate) fn with_delta_in(
+        &self,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        forms: &Forms,
+    ) -> Self {
+        let base = match self.layout_with(inserts, deletes) == self.layout {
+            true => self.clone(),
+            false => self.with_quads_layout(forms),
+        };
+        let run = Run::from_delta(base.layout, inserts, deletes);
+        base.with_run(run)
+    }
+
+    /// [`Self::with_delta_in`] charged to `budget` (DUR-6): the delta's run built with
+    /// [`Run::from_delta_within_parallel`], and the list of runs made once (with the base's
+    /// runs in the quad layout, shared and counted in `forms`, where the delta needs it, not
+    /// charged: they are the store's). The new version and the reservation of what its run
+    /// keeps; the list ([`Self::runs_bytes`] of one more) and the run's box are the caller's
+    /// to charge first.
+    pub(crate) fn with_change_within(
+        &self,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        forms: &Forms,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<(Self, Reservation), BudgetExceeded> {
+        let layout = self.layout_with(inserts, deletes);
+        let (run, held) = Run::from_delta_within_parallel(layout, inserts, deletes, budget)?;
+        let converting = layout != self.layout;
+        let extra = (run.entries() > 0).then(|| Arc::new(run));
+        let net = extra.as_ref().map_or(0, |run| run.net());
+        let runs: Arc<[Arc<Run>]> = self
+            .runs
+            .iter()
+            .map(|run| match converting {
+                true => run.quads_layout_shared(forms),
+                false => Arc::clone(run),
+            })
+            .chain(extra)
+            .collect();
+        let len = self
+            .len
+            .checked_add_signed(net)
+            .expect("exact delta can't make the quad count negative");
+        Ok((Self { layout, runs, len }, held))
     }
 
     /// [`Self::with_delta`] for default-graph `inserts` (which fit either layout, so no stack
@@ -247,9 +330,11 @@ impl IndexVersion {
 
     /// The same quads in the quad layout: each run's graph-first permutations are its
     /// graph-last ones with the graph moved to the front (all its quads are in the default
-    /// graph, so both sort alike). O(n) for n entries, once per store: at its first quad in
-    /// a named graph.
-    pub(crate) fn with_quads_layout(&self) -> Self {
+    /// graph, so both sort alike). O(n) for n entries, once per run while any holder keeps
+    /// its form: each run's form is shared and counted in `forms` from when it is made until
+    /// its last holder drops it ([`Run::quads_layout_shared`], DUR-6), so pending versions,
+    /// and the commit that publishes one, share it.
+    pub(crate) fn with_quads_layout(&self, forms: &Forms) -> Self {
         if self.layout == Layout::Quads {
             return self.clone();
         }
@@ -258,7 +343,7 @@ impl IndexVersion {
             runs: self
                 .runs
                 .iter()
-                .map(|run| Arc::new(run.with_quads_layout()))
+                .map(|run| run.quads_layout_shared(forms))
                 .collect(),
             len: self.len,
         }
