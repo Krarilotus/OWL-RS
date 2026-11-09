@@ -188,15 +188,13 @@ impl Durable {
         // an open does costs it a journal commit and a device flush (timing of 8 Nov,
         // deferred-sync design note). A root made: every level now, as a new store pays once.
         let found = root.is_dir();
-        let named = match found {
+        let mut named = match found {
             true => Some(place::Named::resolve(root)?),
             false => {
                 place::create_dir_all(root)?;
                 None
             }
         };
-        let mut holders: Vec<(PathBuf, PathBuf)> =
-            named.iter().flat_map(place::Named::holders).collect();
         // Whether the open changes the store on disk: then what it changed, and the names
         // with it, are synced before it returns, as before.
         let mut changed = !found;
@@ -272,11 +270,11 @@ impl Durable {
         // Resolved from where the root's resolution ended (one walk of their common chain).
         let mut internal = |dir: &Path| -> EngineResult<bool> {
             let made = place::create_store_dir(dir)?;
-            if !made && let Some(named) = &named {
+            if !made && let Some(named) = &mut named {
                 let name = dir
                     .file_name()
                     .expect("a store's internal directory has a name");
-                holders.extend(named.beyond(name)?);
+                named.beyond(name)?;
             }
             Ok(made)
         };
@@ -487,7 +485,25 @@ impl Durable {
         for path in &replayed {
             place::sync_file(path)?;
         }
-        let mut pending = wal::PendingNames::new(holders, [wal_dir.clone(), root.to_path_buf()]);
+        // The store's own directories keyed as the holders are (one directory, one key); a
+        // made root has no holders to meet.
+        let (holders, own) = match named {
+            Some(named) => {
+                let own = vec![
+                    (wal_dir.clone(), named.key(wal_dir.file_name())),
+                    (root.to_path_buf(), named.key(None)),
+                ];
+                (named.into_holders(), own)
+            }
+            None => (
+                Vec::new(),
+                vec![
+                    (wal_dir.clone(), wal_dir.clone()),
+                    (root.to_path_buf(), root.to_path_buf()),
+                ],
+            ),
+        };
+        let mut pending = wal::PendingNames::new(holders, own);
         if changed {
             pending.settle()?;
         }

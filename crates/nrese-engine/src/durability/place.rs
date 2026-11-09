@@ -119,46 +119,65 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
 /// root defers these syncs to the first durable write that relies on them (`Wal::settle_names`,
 /// deferred-sync design note of 8 Nov). Kept so that a directory inside the root is resolved
 /// from where the root's resolution ended ([`Self::beyond`]): the root's chain is walked once,
-/// and each holder canonicalised once (timing of DUR-4, 9 Nov).
-pub(crate) struct Named(Resolution);
+/// and a holder canonicalised only where its spelling may not name it uniquely
+/// ([`Resolution::exact`]; timing of DUR-4, 9 Nov).
+pub(crate) struct Named {
+    /// The root's resolution and those of the directories resolved in it since, together.
+    resolution: Resolution,
+    /// The physical directory the root's resolution reached.
+    root: PathBuf,
+    /// The links the root's resolution followed: each directory's resolution in it starts
+    /// from these, as a path through the root would.
+    root_links: usize,
+}
 
 impl Named {
     /// Resolves the existing directory `dir`.
     pub(crate) fn resolve(dir: &Path) -> std::io::Result<Self> {
-        Ok(Self(resolve(dir)?))
+        let resolution = resolve(dir)?;
+        Ok(Self {
+            root: resolution.reached.clone(),
+            root_links: resolution.links,
+            resolution,
+        })
     }
 
-    /// The holders, each with its canonical path, outermost first.
-    pub(crate) fn holders(&self) -> impl Iterator<Item = (PathBuf, PathBuf)> + '_ {
-        self.0
-            .holders
-            .iter()
-            .cloned()
-            .zip(self.0.keys.iter().cloned())
-    }
-
-    /// The holders, with their canonical paths, that the resolution of `name`, an existing
-    /// directory in this one, reads past this one's: this directory (the holder of `name`'s
-    /// entry) and, if `name` is a link, its target's chain (package review r1, R1-L1).
-    pub(crate) fn beyond(
-        &self,
-        name: &std::ffi::OsStr,
-    ) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
-        let base = self.0.holders.len();
-        let path = self.0.reached.join(name);
-        let resolution = walk(
-            self.0.clone(),
-            [(Step::Name(name.to_owned()), false)].into(),
-            &path,
-        )?;
+    /// Adds the holders that the resolution of `name`, an existing directory in the root, reads
+    /// past the root's: the root (the holder of `name`'s entry) and, if `name` is a link, its
+    /// target's chain (package review r1, R1-L1).
+    pub(crate) fn beyond(&mut self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        let path = self.root.join(name);
+        let start = Resolution {
+            reached: self.root.clone(),
+            missing: Vec::new(),
+            links: self.root_links,
+            ..self.resolution.clone()
+        };
+        let resolution = walk(start, [(Step::Name(name.to_owned()), false)].into(), &path)?;
         if !resolution.missing.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("{} is not a directory", path.display()),
             ));
         }
-        let Resolution { holders, keys, .. } = resolution;
-        Ok(holders.into_iter().zip(keys).skip(base).collect())
+        self.resolution = resolution;
+        Ok(())
+    }
+
+    /// The key of the root (`name` none) or of the directory `name` in it, as the holders'
+    /// keys are made: one directory has one key among them.
+    pub(crate) fn key(&self, name: Option<&std::ffi::OsStr>) -> PathBuf {
+        let path = match name {
+            Some(name) => self.root.join(name),
+            None => spelled(&self.root),
+        };
+        key(self.resolution.exact, &path)
+    }
+
+    /// The holders, each with its key, outermost first.
+    pub(crate) fn into_holders(self) -> Vec<(PathBuf, PathBuf)> {
+        let Resolution { holders, keys, .. } = self.resolution;
+        holders.into_iter().zip(keys).collect()
     }
 }
 
@@ -168,8 +187,14 @@ struct Resolution {
     /// The directories holding each entry the resolution read, physical (no link in them),
     /// outermost first, each once.
     holders: Vec<PathBuf>,
-    /// Each holder's canonical path, by which they are deduplicated.
+    /// Each holder's key, by which they are deduplicated ([`Self::exact`]).
     keys: Vec<PathBuf>,
+    /// Whether the keys are canonical paths: since the walk followed a link (a link's target
+    /// may be spelled otherwise, `\\?\…` for a junction, and lead back to a directory already
+    /// held) or stepped above a relative start (`..` from `.`). Until then each holder's own
+    /// spelling is its key: the walk only went down from its start, so no two spellings in it
+    /// name one directory, and no holder is canonicalised (timing of DUR-4, 9 Nov).
+    exact: bool,
     /// The physical directory the path's existing part leads to (empty: `.`).
     reached: PathBuf,
     /// The path's names past `reached` that aren't there, in order.
@@ -217,7 +242,8 @@ fn steps(path: &Path, from_link: bool) -> Vec<(Step, bool)> {
 /// `..` steps to the physical parent on Unix; Windows takes `..` lexically first ([`as_walked`]).
 /// Refused: a link whose target isn't there (dangling), more than [`MAX_LINKS`] links (a loop),
 /// an entry that isn't a directory, a `..` past a missing name. Holders are deduplicated by
-/// their canonical path (a junction's target is spelled `\\?\…`).
+/// their keys: their spellings, or their canonical paths once the walk followed a link (a
+/// junction's target is spelled `\\?\…`) or stepped above a relative start ([`Resolution::exact`]).
 fn resolve(path: &Path) -> std::io::Result<Resolution> {
     walk(
         Resolution::default(),
@@ -237,6 +263,7 @@ fn walk(
     let Resolution {
         mut holders,
         mut keys,
+        mut exact,
         reached: mut current,
         mut missing,
         mut links,
@@ -261,12 +288,14 @@ fn walk(
         }
         match step {
             Step::Start(start) => current = start,
-            Step::Parent => step_up(&mut current),
+            Step::Parent => {
+                step_up(&mut current);
+                if let Some(std::path::Component::ParentDir) = current.components().next_back() {
+                    make_exact(&mut holders, &mut keys, &mut exact);
+                }
+            }
             Step::Name(name) => {
-                let holder = match current.as_os_str().is_empty() {
-                    true => PathBuf::from("."),
-                    false => current.clone(),
-                };
+                let holder = spelled(&current);
                 let entry = current.join(&name);
                 match fs::symlink_metadata(&entry) {
                     Ok(meta) if meta.file_type().is_symlink() => {
@@ -288,13 +317,14 @@ fn walk(
                         if target.is_relative() {
                             current = PathBuf::new();
                         }
-                        hold(&mut holders, &mut keys, holder);
+                        make_exact(&mut holders, &mut keys, &mut exact);
+                        hold(&mut holders, &mut keys, exact, holder);
                         for step in steps(&target, true).into_iter().rev() {
                             queue.push_front(step);
                         }
                     }
                     Ok(meta) if meta.is_dir() => {
-                        hold(&mut holders, &mut keys, holder);
+                        hold(&mut holders, &mut keys, exact, holder);
                         current = entry;
                     }
                     Ok(_) => {
@@ -318,6 +348,7 @@ fn walk(
     Ok(Resolution {
         holders,
         keys,
+        exact,
         reached: current,
         missing,
         links,
@@ -370,12 +401,42 @@ fn step_up(path: &mut PathBuf) {
     }
 }
 
+/// A walked directory as a path: `.` for the empty start.
+fn spelled(walked: &Path) -> PathBuf {
+    match walked.as_os_str().is_empty() {
+        true => PathBuf::from("."),
+        false => walked.to_path_buf(),
+    }
+}
+
+/// `dir`'s key in a resolution ([`Resolution::exact`]): its canonical path if `exact`, else
+/// its spelling.
+fn key(exact: bool, dir: &Path) -> PathBuf {
+    match exact {
+        true => dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+        false => dir.to_path_buf(),
+    }
+}
+
 /// Adds `holder` to `holders` unless it's there already under some spelling.
-fn hold(holders: &mut Vec<PathBuf>, seen: &mut Vec<PathBuf>, holder: PathBuf) {
-    let key = holder.canonicalize().unwrap_or_else(|_| holder.clone());
+fn hold(holders: &mut Vec<PathBuf>, seen: &mut Vec<PathBuf>, exact: bool, holder: PathBuf) {
+    let key = key(exact, &holder);
     if !seen.contains(&key) {
         seen.push(key);
         holders.push(holder);
+    }
+}
+
+/// Turns a resolution's keys canonical, once: the holders so far re-keyed (and deduplicated
+/// again) by their canonical paths.
+fn make_exact(holders: &mut Vec<PathBuf>, keys: &mut Vec<PathBuf>, exact: &mut bool) {
+    if *exact {
+        return;
+    }
+    *exact = true;
+    keys.clear();
+    for holder in std::mem::take(holders) {
+        hold(holders, keys, true, holder);
     }
 }
 
