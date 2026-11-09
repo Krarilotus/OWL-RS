@@ -7,6 +7,7 @@ use nrese_exec::measure::{alone, measure, measure_within};
 use nrese_exec::{Envelope, SharedBudget};
 use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql_syntax::SparqlParser;
+use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 fn node(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{local}"))
@@ -282,4 +283,389 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
             "{operator}: {one} uncharged bytes, more than the plan's bookkeeping"
         );
     }
+}
+
+/// Guard (PR #84's timing, notes/2026-11-02-zero-width-budget.md ZW-10): one solution without
+/// bindings counts nothing, so making and consuming it, as an empty group does once per row
+/// of a substituted EXISTS, never draws on the query's budget: its peak stays where it was.
+/// Two such rows count one id, charged where they are made and released where they are
+/// consumed.
+#[test]
+fn a_solution_without_bindings_draws_nothing_from_the_budget() {
+    let engine = store([]);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    // What the evaluation holds from its start (its reads' state); nothing charged and
+    // released before, so a charge now would raise the peak.
+    let held = ctx.budget.used();
+    assert_eq!(ctx.budget.peak(), held, "a fresh evaluation");
+    for _ in 0..3 {
+        let unit = ctx.unit().ok().expect("one solution");
+        ctx.consumed(unit);
+    }
+    assert_eq!((ctx.budget.used(), ctx.budget.peak()), (held, held));
+    let two = ctx
+        .produced(Solutions {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..], &[][..]]),
+            ordered: false,
+        })
+        .ok()
+        .expect("room");
+    assert_eq!(ctx.budget.used(), held + 8);
+    ctx.consumed(two);
+    assert_eq!(ctx.budget.used(), held);
+}
+
+/// Spec (notes/2026-11-02-exec-memory-stack.md EMS-2): what a table is charged is what its
+/// consumer releases. One solution without bindings counts nothing, so an operator that gives
+/// such a row a column, in place or in a table it makes of it, charges that column, or
+/// consuming its answer releases another holder's charge: a projection's UNDEF column, a
+/// union's widening, GRAPH ?g's column, a BIND's column, LATERAL's put-in column, and
+/// SERVICE ?e's endpoint column (that one on any width: sol-loop r1 S1). Each pattern is
+/// evaluated with another holder's charge on the query's budget; after its answer is
+/// consumed the budget holds at least that much again. Every term the cases name is
+/// stored, so no computed term's kept charge covers a release (sol-loop r2 S2).
+#[test]
+fn a_column_given_to_a_row_without_columns_is_charged() {
+    use crate::{ServiceCall, ServiceClient, ServiceResults, Services};
+    use nrese_sparql_syntax::Query;
+
+    /// An endpoint whose every answer is five rows of one variable, a stored term.
+    struct Five;
+    impl ServiceClient for Five {
+        fn select(
+            &self,
+            _endpoint: &str,
+            _query: &str,
+            _call: ServiceCall<'_>,
+        ) -> Result<ServiceResults, QueryEvaluationError> {
+            let x = Term::from(node("a"));
+            Ok(ServiceResults {
+                variables: vec![Variable::new_unchecked("x")],
+                rows: vec![vec![Some(x)]; 5],
+            })
+        }
+    }
+
+    let engine =
+        store((0..3).map(|g| ("a".to_owned(), "r", "b".to_owned(), ["g0", "g1", "g2"][g])));
+    let snapshot = engine.snapshot();
+    let options = QueryOptions {
+        services: Some(Services(Arc::new(Five))),
+        ..QueryOptions::default()
+    };
+    let cases = [
+        ("a projection's UNDEF column", "SELECT ?u WHERE { }"),
+        (
+            "a union's widening",
+            "SELECT * WHERE { { } UNION { VALUES ?u { <urn:a> } } }",
+        ),
+        ("GRAPH ?g's column", "SELECT * WHERE { GRAPH ?g { } }"),
+        ("a BIND's column", "SELECT * WHERE { BIND(<urn:a> AS ?u) }"),
+        (
+            "LATERAL's put-in column",
+            "SELECT * WHERE { VALUES ?s { <urn:a> <urn:b> } LATERAL { FILTER(?s = ?s) } }",
+        ),
+        (
+            "SERVICE ?e's endpoint column",
+            "SELECT * WHERE { VALUES ?e { <urn:b> } SERVICE ?e { ?a ?b ?x } }",
+        ),
+    ];
+    // Every case's verdict, not only the first failing one's.
+    let mut failures = Vec::new();
+    for (case, text) in cases {
+        let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+            panic!("{case}: a SELECT")
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let mut other = Reservation::new(&*ctx.budget);
+        other.charge(1 << 20).unwrap();
+        let before = ctx.budget.used();
+        match ctx.eval(&pattern) {
+            Ok(answer) if answer.table.is_empty() => {
+                failures.push(format!("{case}: no rows, nothing tested"));
+            }
+            Ok(answer) => ctx.consumed(answer),
+            Err(_) => failures.push(format!("{case}: refused")),
+        }
+        let after = ctx.budget.used();
+        if after < before {
+            failures.push(format!(
+                "{case}: consuming the answer released {} bytes of another holder's charge",
+                before - after
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// Spec (sol-loop r3 S2; the budget types' owner, 3 Nov): under a 4 KiB envelope no grant
+/// holds spare, so CONSTRUCT's two grants (the copies it keeps to emit a triple once, and
+/// the triples) charge exactly and answer its one triple, never refused for spare.
+#[test]
+fn construct_under_a_small_envelope_is_never_refused_for_spare() {
+    let engine = store([]);
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("CONSTRUCT { <urn:s> <urn:p> <urn:o> } WHERE { }")
+        .unwrap();
+    let mut options = QueryOptions::default();
+    options.resources.memory = Envelope::new(Some(4 << 10), None);
+    let answer = crate::evaluate_query(&snapshot, &query, &options);
+    assert!(answer.is_ok(), "refused: {:?}", answer.err());
+    assert!(!options.resources.memory.refused());
+}
+
+/// A store of default-graph statements `urn:s urn:p urn:o`, without background maintenance.
+fn default_store(statements: impl IntoIterator<Item = (String, String, String)>) -> Engine {
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
+    let mut tx = engine.transaction();
+    for (s, p, o) in statements {
+        let quad = Quad::new(node(&s), node(&p), node(&o), GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// A path's end: `?name` a variable, else the IRI `urn:name`.
+fn end(text: &str) -> TermPattern {
+    match text.strip_prefix('?') {
+        Some(name) => TermPattern::Variable(Variable::new_unchecked(name)),
+        None => TermPattern::NamedNode(node(text)),
+    }
+}
+
+fn link(p: &str) -> PropertyPathExpression {
+    PropertyPathExpression::NamedNode(node(p))
+}
+
+/// A path pattern: its subject, path and object ([`end`]).
+type PathTerms<'a> = (&'a str, &'a PropertyPathExpression, &'a str);
+
+/// A path pattern that owns its path, for a case to return.
+type PathCase = (&'static str, PropertyPathExpression, &'static str);
+
+/// `subject path object` over `engine`'s default graph under a request limit of `limit`
+/// bytes (`None`: unlimited): its rows or the refusal, and the most it held beyond its charge
+/// at any moment ([`measure_within`]: a charge released while its memory lives counts there).
+fn path_held(
+    engine: &Engine,
+    (subject, path, object): PathTerms<'_>,
+    limit: Option<usize>,
+) -> (Result<usize, String>, usize) {
+    let snapshot = engine.snapshot();
+    let mut options = QueryOptions::default();
+    options.resources.memory = Envelope::new(limit, None);
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (subject, object) = (end(subject), end(object));
+    measure_within(&options.resources.memory, || {
+        ctx.path(&subject, path, &object)
+            .map(|solutions| solutions.table.len())
+            .map_err(|error| format!("{:?}", QueryEvaluationError::from(error)))
+    })
+}
+
+/// Guard (the executor memory stack's package fix check r3, EMS-R3-C1, and its related
+/// sites): a path's buffers hold no more than they are charged at any moment, so a query
+/// sharing the server's budget can never take the room of memory that still lives. Each
+/// case runs at `rows` and at `more` rows, and the most it held beyond its charge may not
+/// grow by a byte a row it adds: what grows with the rows is charged throughout (what doesn't
+/// is the plan's bookkeeping, the same at both sizes). `case` makes the store for a size and
+/// names the path pattern, `limit` the request's limit at that size.
+fn holds_nothing_uncharged_per_row(
+    name: &str,
+    (rows, more): (usize, usize),
+    case: impl Fn(usize) -> (Engine, PathCase),
+    limit: impl Fn(usize) -> Option<usize>,
+    answer: impl Fn(Result<usize, String>, usize) -> Result<(), String>,
+) -> Result<(), String> {
+    let held = |n: usize| {
+        let (engine, (subject, path, object)) = case(n);
+        let (rows, excess) = path_held(&engine, (subject, &path, object), limit(n));
+        answer(rows, n).map_err(|wrong| format!("{name} at {n} rows: {wrong}"))?;
+        Ok::<_, String>(excess)
+    };
+    let (few, many) = (held(rows)?, held(more)?);
+    eprintln!("{name}: {few} bytes beyond its charge at {rows} rows, {many} at {more}");
+    match many.saturating_sub(few) < more - rows {
+        true => Ok(()),
+        false => Err(format!(
+            "{name}: held {few} bytes beyond its charge at {rows} rows, {many} at {more}"
+        )),
+    }
+}
+
+/// The answer must be `n` rows.
+fn rows_of(rows: Result<usize, String>, n: usize) -> Result<(), String> {
+    match rows {
+        Ok(rows) if rows == n => Ok(()),
+        other => Err(format!("answered {other:?}, not {n} rows")),
+    }
+}
+
+/// Spec (EMS-R3-C1 and the sites the package fix check r3 named beside it): every row-sized
+/// buffer of a path is charged while it lives, through the move into its table and through a
+/// refusal. Cases, each at two sizes:
+/// - `<h> (p|missing) ?y` over 2^k + 1 statements (T1): the union's vector has room for 2^(k+1)
+///   ends; moved into its column, its whole capacity stays charged (it was released down to
+///   its length, then charged again, at 6449d5cd).
+/// - `?x (p|missing) ?y` (T2): the pairs' columns are made beside the pairs, whose charge
+///   goes only once they are freed.
+/// - T2 under a limit of its answer's two columns alone, n ids each (T3), which the pairs
+///   and their columns can't fit together: refused, wherever the refusal comes (the union's
+///   growth or a column), and every buffer freed before its charge is released.
+/// - `<h> p/q ?y` (T4, a sequence from a node), `?x p/q ?y` (T5, every pair), `?x p/(q/r) ?y`
+///   (T6, a step that isn't a link), `<h> p/q <b>` (T7, both ends bound: the ways counted): a
+///   step's input is freed before its charge goes.
+#[test]
+fn a_paths_buffers_are_charged_while_they_live() {
+    if !alone() {
+        return;
+    }
+    let either = || PropertyPathExpression::Alternative(vec![link("p"), link("missing")]);
+    let fanned =
+        |n: usize| default_store((0..n).map(|i| ("h".to_owned(), "p".to_owned(), format!("n{i}"))));
+    let unlimited = |_| None;
+    let refused = |rows: Result<usize, String>, _| match rows {
+        Err(refusal) if refusal.contains("MemoryLimit") => Ok(()),
+        other => Err(format!("answered {other:?}, not refused")),
+    };
+    // A sequence `p/q` whose middle nodes are `m<i>`: from `h` (T4), or from `x<i>` (T5).
+    let chain = |n: usize, shared_start: bool| {
+        default_store((0..n).flat_map(|i| {
+            let start = match shared_start {
+                true => "h".to_owned(),
+                false => format!("x{i}"),
+            };
+            [
+                (start, "p".to_owned(), format!("m{i}")),
+                (format!("m{i}"), "q".to_owned(), format!("y{i}")),
+            ]
+        }))
+    };
+    let sequence = |steps: Vec<PropertyPathExpression>| PropertyPathExpression::Sequence(steps);
+    let (wide, narrow) = ((32_769, 65_537), (4_097, 8_193));
+    let failures: Vec<String> = [
+        holds_nothing_uncharged_per_row(
+            "T1 <h> (p|missing) ?y",
+            wide,
+            |n| (fanned(n), ("h", either(), "?y")),
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T2 ?x (p|missing) ?y",
+            wide,
+            |n| (fanned(n), ("?x", either(), "?y")),
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T3 ?x (p|missing) ?y refused under its columns' bytes",
+            wide,
+            |n| (fanned(n), ("?x", either(), "?y")),
+            |n: usize| Some(2 * n * 8),
+            refused,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T4 <h> p/q ?y",
+            narrow,
+            |n| {
+                (
+                    chain(n, true),
+                    ("h", sequence(vec![link("p"), link("q")]), "?y"),
+                )
+            },
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T5 ?x p/q ?y",
+            narrow,
+            |n| {
+                (
+                    chain(n, false),
+                    ("?x", sequence(vec![link("p"), link("q")]), "?y"),
+                )
+            },
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T6 ?x p/(q/r) ?y",
+            narrow,
+            |n| {
+                let engine = default_store(
+                    std::iter::once(("a".to_owned(), "p".to_owned(), "m".to_owned())).chain(
+                        (0..n).flat_map(|i| {
+                            [
+                                ("m".to_owned(), "q".to_owned(), format!("x{i}")),
+                                (format!("x{i}"), "r".to_owned(), format!("y{i}")),
+                            ]
+                        }),
+                    ),
+                );
+                let inner = sequence(vec![link("q"), link("r")]);
+                (engine, ("?x", sequence(vec![link("p"), inner]), "?y"))
+            },
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T7 <h> p/q <b>",
+            narrow,
+            |n| {
+                let engine = default_store((0..n).flat_map(|i| {
+                    [
+                        ("h".to_owned(), "p".to_owned(), format!("m{i}")),
+                        (format!("m{i}"), "q".to_owned(), "b".to_owned()),
+                    ]
+                }));
+                (engine, ("h", sequence(vec![link("p"), link("q")]), "b"))
+            },
+            unlimited,
+            rows_of,
+        ),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Spec (sol-loop r1 S1 of the executor memory stack's second lead): a path with both ends
+/// bound answers as many solutions as it connects the ends ways, a table without columns of
+/// that many rows, charged before its rows are made. Over `a p a`, 64 steps of `(p|p)`
+/// connect `a` to `a` 2^64 ways, saturated to `usize::MAX`: refused at once, within its
+/// deadline. Made row by row and charged afterwards, they ran for good.
+#[test]
+fn a_both_bound_paths_rows_are_charged_before_they_are_made() {
+    let (answered, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let engine = default_store([("a".to_owned(), "p".to_owned(), "a".to_owned())]);
+        let snapshot = engine.snapshot();
+        let options = QueryOptions::default();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let step = PropertyPathExpression::Alternative(vec![link("p"), link("p")]);
+        let path = PropertyPathExpression::Sequence(vec![step; 64]);
+        let solutions = ctx
+            .path(&end("a"), &path, &end("a"))
+            .map(|solutions| solutions.table.len())
+            .map_err(|error| format!("{:?}", QueryEvaluationError::from(error)));
+        let _ = answered.send(solutions);
+    });
+    let solutions = answer
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("answered within 30 s");
+    assert!(
+        matches!(&solutions, Err(refusal) if refusal.contains("MemoryLimit")),
+        "{solutions:?}"
+    );
 }

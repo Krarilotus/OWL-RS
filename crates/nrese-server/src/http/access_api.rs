@@ -14,7 +14,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use nrese_store::access::{
     AccessState, Change, ChangeRecord, DefaultGraphRight, Fallback, Inferred, Level, Principal,
-    RoleRule,
+    RoleRule, SettingsPatch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -283,23 +283,18 @@ pub async fn settings_put(
     bytes: Bytes,
 ) -> Result<Response, ApiError> {
     let request: SettingsBody = body(&bytes)?;
-    let mut settings = state.access().state().settings.clone();
-    if let Some(enforced) = request.enforced {
-        settings.enforced = enforced;
-    }
-    if let Some(fallback) = request.fallback {
-        settings.fallback = fallback;
-    }
-    if let Some(inferred) = request.inferred {
-        settings.inferred = inferred;
-    }
-    if let Some(create) = request.users_create_workspaces {
-        settings.users_create_workspaces = create;
-    }
+    // The fields given only: the others are those the change applies to (C-1001).
+    let patch = SettingsPatch {
+        enforced: request.enforced,
+        fallback: request.fallback,
+        inferred: request.inferred,
+        users_create_workspaces: request.users_create_workspaces,
+        ..SettingsPatch::default()
+    };
     let response = change(
         &state,
         &authenticated,
-        Change::Settings(settings),
+        Change::Settings(patch),
         request.reason,
     )
     .await?;
