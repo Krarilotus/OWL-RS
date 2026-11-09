@@ -387,10 +387,12 @@ impl<'e> PrivateTransaction<'e> {
 
     /// Retracts every asserted quad matching `pattern`; the number removed. What the
     /// retractions grow is charged as [`Self::try_insert_encoded`]'s; refused part way, the
-    /// retractions made before the refusal stay, so the refusal counts as a change.
+    /// retractions made before the refusal stay, so the refusal counts as a change where it
+    /// moved the asserted counts (one refused before its first retraction changed nothing).
     pub fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
+        let before = self.pending.asserted().counts();
         let removed = self.pending.try_remove_matching(pattern).inspect_err(|_| {
-            self.note(true);
+            self.note(self.pending.asserted().counts() != before);
         })?;
         self.note(removed > 0);
         Ok(removed)
