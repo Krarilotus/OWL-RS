@@ -98,8 +98,11 @@ pub async fn repository_get(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let repository = state.for_repository(&id)?;
-    // One observation: its settings and the reasoning in effect from the same change.
-    let (settings, reasoning) = repository.observe_repository();
+    // One observation: its settings and the reasoning in effect from the same change; a
+    // repository removed meanwhile is gone.
+    let (settings, reasoning) = repository
+        .observe_repository()
+        .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
     let settings = Some(settings)
         .filter(|settings| *settings != crate::repository_config::RepositorySettings::default());
     Ok(Json(RepositoryView {

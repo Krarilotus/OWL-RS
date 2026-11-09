@@ -246,6 +246,67 @@ fn a_repository_switches_the_ql_rewriting() {
     ));
 }
 
+/// A change from `owl2-dl` (whose bounds give the existentials, so no QL rewriting runs
+/// under it) to `owl2-rl` with the QL rewriting on answers through the existential at once:
+/// whether the setting changes with the reasoning or was on already. Specified: as
+/// [`a_repository_switches_the_ql_rewriting`]'s `on`; with it `off`, no bob (the control:
+/// the answer comes from the rewriting, not from stored inferences). A guard: the catalogue
+/// slice applies the QL setting before the new write path switches the bounds off (its
+/// sol-loop r1, S1, thought that lost the rewriting; this passes on that head too).
+#[test]
+fn a_change_from_owl2_dl_to_owl2_rl_keeps_the_ql_rewriting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = open(dir.path());
+    let settings = |reasoning: &str, ql: Option<&str>| RepositorySettings {
+        reasoning: Some(reasoning.to_owned()),
+        ql_rewriting: ql.map(str::to_owned),
+        ..RepositorySettings::default()
+    };
+    let mut wrong = Vec::new();
+    for (id, under_dl, after, bob) in [
+        ("with", None, "on", true),
+        ("already", Some("on"), "on", true),
+        ("control", None, "off", false),
+    ] {
+        catalog
+            .create(id, settings("owl2-dl", under_dl))
+            .expect("created");
+        let store = catalog
+            .get(id)
+            .expect("created")
+            .pipeline
+            .read()
+            .store()
+            .clone();
+        store
+            .execute_update_str(
+                "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                 INSERT DATA {
+                    <urn:Employee> rdfs:subClassOf [ a owl:Restriction ;
+                        owl:onProperty <urn:worksFor> ; owl:someValuesFrom owl:Thing ] .
+                    <urn:bob> a <urn:Employee> .
+                 }",
+            )
+            .expect("written");
+        catalog
+            .change(id, settings("owl2-rl", Some(after)))
+            .expect("changed");
+        let result = store
+            .execute_query_str("SELECT ?x WHERE { ?x <urn:worksFor> ?y }")
+            .expect("answered");
+        let answer = String::from_utf8(result.payload).expect("utf-8");
+        if answer.contains("urn:bob") != bob {
+            let ruleset = store.reasoning_state().map(|state| state.ruleset);
+            wrong.push(format!(
+                "{id}: bob {}expected, ruleset {ruleset:?}, answer {answer}",
+                if bob { "" } else { "not " }
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A change of reasoning whose inferences can't be recomputed (here: the process's memory
 /// limit) leaves the old reasoning in effect, its write path open, and the old settings.
 #[test]

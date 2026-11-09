@@ -306,14 +306,14 @@ impl AppState {
 
     /// The repository's settings and the reasoning mode in effect, as the catalogue
     /// published them together ([`crate::repositories::Repository::observe`]): never a
-    /// change's new settings beside its old reasoning, or the reverse.
+    /// change's new settings beside its old reasoning, or the reverse. `None` once it is
+    /// removed (or can't serve).
     pub fn observe_repository(
         &self,
-    ) -> (crate::repository_config::RepositorySettings, &'static str) {
-        match self.repositories.observe(self.repository_id()) {
-            Some((settings, pipeline)) => (settings, pipeline.reasoner().mode_name()),
-            None => (Default::default(), self.reasoner_mode_name()),
-        }
+    ) -> Option<(crate::repository_config::RepositorySettings, &'static str)> {
+        self.repositories
+            .observe(self.repository_id())
+            .map(|(settings, pipeline)| (settings, pipeline.reasoner().mode_name()))
     }
 
     /// Changes this state's repository's settings to what `edit` makes of those current
