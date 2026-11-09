@@ -80,6 +80,13 @@ pub(crate) trait Account {
     /// once the read's visitor has stopped. (An equality class build's account also takes its
     /// own chunks, up to `POLL_UNITS`, whole: `engine::equality`'s `OnMeter`.)
     fn take(&mut self, n: u64) -> bool;
+
+    /// [`Self::take`] of a cost worked out only where it is counted: a plain read skips the
+    /// arithmetic (the F1 ablation, `p2-reas3-abl2`).
+    #[inline(always)]
+    fn take_cost(&mut self, cost: impl FnOnce() -> u64) -> bool {
+        !Self::COUNTED || self.take(cost())
+    }
 }
 
 /// The plain reads' account: counts nothing, never stops.

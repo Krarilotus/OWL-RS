@@ -1,7 +1,7 @@
 //! REAS-2 fix check r1 (R2-F1, held counts): a count tells its visitor about a run's
 //! tombstone words as it reads them, so a caller's stop ends the read within a run of words.
 
-use super::merge::SignedMerge;
+use super::merge::{LINEAR_UP_TO, SignedMerge};
 use super::run::Run;
 use super::{IndexVersion, Layout, Visitor};
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
@@ -32,7 +32,9 @@ impl Account for Allow {
 /// each, so taking K from the first decodes a block. The first step is stopped at each of its
 /// portions in turn. It answers `Stopped`. After that, a step on an account that never stops
 /// answers `Stopped` again and the plain iterator answers the end, and neither does any work.
-/// Not stopped, the first step yields K with sign +1.
+/// Not stopped, the first step yields K with sign +1. So for both selectors: the three ranges
+/// alone are selected linearly, and with `LINEAR_UP_TO` more ranges of one later key each,
+/// by the heap.
 #[test]
 fn a_stopped_merge_step_stays_stopped() {
     let (p, o) = (term(1), term(2));
@@ -43,18 +45,26 @@ fn a_stopped_merge_step_stays_stopped() {
             .chain((from..from + 255).map(quad))
             .collect()
     };
-    let runs = [
+    let mut runs = vec![
         Run::from_delta(Layout::DefaultGraph, &with(100), &[]),
         Run::from_delta(Layout::DefaultGraph, &[], &[k]),
         Run::from_delta(Layout::DefaultGraph, &with(400), &[]),
     ];
+    // The selection, then an advance for each of K's occurrences.
+    stops_after_any_portion(&runs, Permutation::Spog.to_key(&k), 1 + 3);
+    let later = (0..LINEAR_UP_TO as u64).map(|i| quad(1_000 + i));
+    runs.extend(later.map(|q| Run::from_delta(Layout::DefaultGraph, &[q], &[])));
+    // An advance and the heap's repair for each of K's occurrences.
+    stops_after_any_portion(&runs, Permutation::Spog.to_key(&k), 2 * 3);
+}
+
+fn stops_after_any_portion(runs: &[Run], key: crate::quad::Key, portions: usize) {
     let parts = || {
         runs.iter().map(|run| {
             let perm = run.permutation(Permutation::Spog);
             (perm, 0, perm.keys.len())
         })
     };
-    let key = Permutation::Spog.to_key(&k);
     let mut stops = 0;
     for allowed in 0.. {
         let mut merge = SignedMerge::new(parts());
@@ -80,7 +90,12 @@ fn a_stopped_merge_step_stays_stopped() {
             }
         }
     }
-    assert_eq!(stops, 6, "two portions for each of K's three occurrences");
+    assert_eq!(
+        stops,
+        portions,
+        "the first step's portions, over {} ranges",
+        runs.len()
+    );
 }
 
 /// The work a read's producers count: the runs it searches or probes, the comparisons its
