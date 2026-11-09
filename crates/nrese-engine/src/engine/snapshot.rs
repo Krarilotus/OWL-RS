@@ -1045,6 +1045,49 @@ impl Snapshot {
 
     /// A snapshot of `version` over this one's vocabulary and statistics: a transaction's
     /// pending state, never published, whatever this one is.
+    /// A pending version over this snapshot's (DUR-6): its asserted stack with the `asserted`
+    /// inserts and deletes and its inferred stack with the `inferred` ones, each as one more
+    /// run (the asserted base read in the quad layout where they need it, its runs' forms
+    /// shared and counted in `forms`, the store's index memory, not charged here), in the
+    /// version `make` builds of the two. What it makes is charged to `budget` before it is
+    /// made and held by the result until its last holder lets it go: its version, its runs,
+    /// their lists, the charge's own box and parts. A refusal leaves nothing made.
+    pub(super) fn pending_within(
+        &self,
+        asserted: [&[EncodedQuad]; 2],
+        inferred: [&[EncodedQuad]; 2],
+        forms: &crate::index::Forms,
+        budget: &Arc<nrese_exec::Budget>,
+        make: impl FnOnce(crate::index::IndexVersion, crate::index::IndexVersion) -> Version,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        use std::mem::size_of;
+        let version = &self.version;
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(
+            boxed(size_of::<Version>())
+                + version.asserted.runs_bytes(1)
+                + version.inferred.runs_bytes(1)
+                + 2 * boxed(size_of::<crate::index::run::Run>())
+                + Held::overhead(self.held.count()),
+        )?;
+        let (asserted, asserted_held) =
+            version
+                .asserted
+                .with_change_within(asserted[0], asserted[1], forms, budget)?;
+        let (inferred, inferred_held) =
+            version
+                .inferred
+                .with_change_within(inferred[0], inferred[1], forms, budget)?;
+        let held = nrese_exec::Reservation::adopt(
+            Arc::clone(budget),
+            held.transfer() + asserted_held.transfer() + inferred_held.transfer(),
+        );
+        let held = Held::new(self.held.with(0), held);
+        let mut snapshot = self.with_version(make(asserted, inferred));
+        snapshot.held = held;
+        Ok(snapshot)
+    }
+
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         let version = Arc::new(version);
         let canonical_data = self.canonical_view(&version);

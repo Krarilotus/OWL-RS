@@ -9,6 +9,8 @@
 //! is the *sum* of its entries across runs (+1 insert, -1 tombstone) and is either 0 or 1,
 //! independent of run order. Merges of any adjacent runs just add the signs.
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use super::Layout;
@@ -131,6 +133,31 @@ impl PermutationRun {
     }
 }
 
+/// The heap bytes of the quad-layout forms of default-graph runs alive in one engine
+/// ([`Run::quads_layout_shared`], DUR-6): counted in its index memory from when a form is
+/// made until it is freed, published by a commit or not.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Forms(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Forms {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A form's bytes in its engine's [`Forms`], given back when the form is freed.
+#[derive(Debug)]
+struct Accounted {
+    bytes: u64,
+    forms: Forms,
+}
+
+impl Drop for Accounted {
+    fn drop(&mut self) {
+        (self.forms.0).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Invariant: exactly the permutations of `layout` are populated; the others are empty.
 #[derive(Debug, Default)]
 pub(crate) struct Run {
@@ -138,6 +165,11 @@ pub(crate) struct Run {
     perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
+    /// This run's quad-layout form while a holder keeps it (a default-graph run's, made by
+    /// [`Self::quads_layout_shared`]): one form, shared by every holder.
+    quads_form: parking_lot::Mutex<std::sync::Weak<Run>>,
+    /// On a quad-layout form: its bytes in its engine's [`Forms`] while it lives.
+    account: Option<Accounted>,
 }
 
 impl Run {
@@ -254,6 +286,8 @@ impl Run {
             perms,
             inserts,
             deletes,
+            quads_form: Default::default(),
+            account: None,
         }
     }
 
@@ -310,12 +344,42 @@ impl Run {
         for (permutation, run) in built {
             perms[permutation as usize] = run;
         }
-        Self {
-            layout: Layout::Quads,
-            perms,
-            inserts: self.inserts,
-            deletes: self.deletes,
+        Self::from_permutations(Layout::Quads, perms)
+    }
+
+    /// This run in the quad layout ([`Self::with_quads_layout`]), made once and shared by
+    /// every holder while any keeps it (DUR-6): N pending versions over one base hold one form
+    /// of each of its runs, not N. A run of the quad layout is itself. Made without the slot's
+    /// lock (the build is parallel on the caller's pool; no lock is held across pool work);
+    /// two made at once both count in `forms` while they live, and the second to install
+    /// takes the first's and frees its own. Counted in `forms` from when it is made until it
+    /// is freed.
+    pub(crate) fn quads_layout_shared(self: &Arc<Self>, forms: &Forms) -> Arc<Self> {
+        if self.layout == Layout::Quads {
+            return Arc::clone(self);
         }
+        if let Some(form) = self.quads_form.lock().upgrade() {
+            return form;
+        }
+        let mut form = self.with_quads_layout();
+        let bytes = form.memory_bytes();
+        (forms.0).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        form.account = Some(Accounted {
+            bytes,
+            forms: forms.clone(),
+        });
+        let form = Arc::new(form);
+        let mut slot = self.quads_form.lock();
+        if let Some(installed) = slot.upgrade() {
+            return installed;
+        }
+        *slot = Arc::downgrade(&form);
+        form
+    }
+
+    /// Whether this run is a shared quad-layout form, counted in its engine's [`Forms`].
+    pub(crate) fn is_form(&self) -> bool {
+        self.account.is_some()
     }
 
     /// Net contribution to the visible quad count.
