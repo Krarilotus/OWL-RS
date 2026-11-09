@@ -839,11 +839,13 @@ def fmt(x) -> str:
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          catalog: list[dict] | None = None, elsewhere: dict | None = None,
-         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None) -> dict:
+         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
+         baseline_candidate: bool = False) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
-    at the candidate's commit. `floor`: the host's A-A' noise floor (read_floor())."""
+    at the candidate's commit. `floor`: the host's A-A' noise floor (read_floor()).
+    `baseline_candidate`: an A-A' control's candidate is a baseline, with its own optimizer route."""
     not_run, elsewhere = dict(not_run or {}), dict(elsewhere or {})
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
@@ -890,17 +892,18 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
               for c in (catalog or [])}
     for case in planned:
         cand = evidence(by_side[candidate], case)
-        if state(cand) == "failed":
+        cand_state = state(cand, off_route_ok=baseline_candidate)
+        if cand_state == "failed":
             why = cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
             summary["candidate_failures"][case] = f"statuses {', '.join(map(str, cand['status']))}; " + "; ".join(why)
-        elif state(cand) == "known":
+        elif cand_state == "known":
             summary["known_issues"][case] = ", ".join(sorted(set(cand["status"])))
         elif any(x != "ok" for x in cand["expected"]):
             summary["fixed"][case] = ", ".join(sorted(set(cand["expected"]) - {"ok"}))
-        if cand["unchecked"] and state(cand) != "failed":
+        if cand["unchecked"] and cand_state != "failed":
             summary["candidate_failures"][case] = f"{cand['unchecked']} checks unchecked on the candidate"
         for side in baselines:
-            if state(cand) == "failed" or side in aliases:
+            if cand_state == "failed" or side in aliases:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
                                ((floor or {}).get("cases") or {}).get(case))
