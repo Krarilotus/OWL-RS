@@ -29,6 +29,9 @@ ROOT = Path(__file__).resolve().parents[3]
 GATE = ROOT / "benches/fast/release_gate.py"
 gate_module = fixtures.gate_module
 POLICY = "benches/release-tradeoffs.toml"
+# What the candidate's tree requires of its checks (release_gate.py load_contract): this tree's, in
+# every candidate a test makes.
+CONTRACT = ("benches/fast/w3c-expected.toml", "docs/design/performance.md")
 IDENTITY = "rustc-1.98.1-0123456789ab flags=-C_target-cpu=native tools=abcdef012345"
 QUOTE = 'quote = "accept it for v1.5"\nsource = "OWL-RS master thread, 9 Nov 2026 10:11"\n'
 
@@ -39,7 +42,8 @@ def git(repo: Path, *args: str) -> str:
 
 
 class Repository:
-    """A repository of the test's own: commits whose trees differ only by their policy file."""
+    """A repository of the test's own: commits whose trees differ only by their policy file, each
+    holding this tree's contract (CONTRACT)."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -47,7 +51,8 @@ class Repository:
         git(path, "init", "-q")
 
     def commit(self, policy: str = "", message: str = "a candidate", files: dict[str, str] | None = None) -> str:
-        for rel, text in {POLICY: policy, **(files or {})}.items():
+        contract = {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in CONTRACT}
+        for rel, text in {**contract, POLICY: policy, **(files or {})}.items():
             (self.path / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.path / rel).write_text(text, encoding="utf-8", newline="\n")
         git(self.path, "add", "-A")
@@ -62,18 +67,33 @@ class Repository:
         return git(self.path, "commit-tree", self.tree(rev), "-p", rev, "-m", "the same tree")
 
 
+def contract():
+    """This tree's contract: the declared kits and suites, and the §0 guards."""
+    suites, kits, bad = gate_module.load_w3c_expected((ROOT / CONTRACT[0]).read_text(encoding="utf-8"))
+    assert not bad, bad
+    return suites, kits, gate_module.guard_names((ROOT / CONTRACT[1]).read_text(encoding="utf-8"))
+
+
 def receipt(kind: str, commit: str, tree: str, **changes) -> dict:
-    """A check's receipt as release_gate.py w3c/guards --run write it."""
+    """A check's receipt as release_gate.py w3c/guards --run write it: every unit the contract
+    requires launched once and run whole."""
+    units = [kit.name for kit in contract()[1]] if kind == "w3c" else ["guards"]
     return {"kind": kind, "commit": commit, "tree": tree, "dirty": False, "identity": IDENTITY,
             "host": "office-pc", "job": "rg-cand-checks",
-            "outcomes": [{"unit": "nrese-sparql:w3c_sparql11" if kind == "w3c" else "guards", "exit": 0,
-                          "log_sha256": "0" * 64, "summary": True}], **changes}
+            "outcomes": [{"unit": unit, "exit": 0, "log_sha256": "0" * 64, "summary": True} for unit in units],
+            **changes}
 
 
 def checks(commit: str, tree: str) -> tuple[dict, dict]:
-    """Passed W3C and guard results, each with its receipt for COMMIT at TREE."""
-    return ({"counts": {}, "expected": {}, "errors": [], "passed": True, "receipt": receipt("w3c", commit, tree)},
-            {"guards": 81, "results": {}, "errors": [], "passed": True, "receipt": receipt("guards", commit, tree)})
+    """Passed W3C and guard results as the contract requires them (every kit, every suite's counts,
+    every guard ok), each with its receipt for COMMIT at TREE."""
+    suites, _, guards = contract()
+    counts = {suite: {**want, "failed": 0} for suite, want in suites.items()}
+    counts["test results"] = {"passed": len(suites), "failed": 0}
+    return ({"counts": counts, "expected": suites, "errors": [], "passed": True,
+             "receipt": receipt("w3c", commit, tree)},
+            {"guards": len(guards), "results": {name: ["ok"] for name in guards}, "errors": [], "passed": True,
+             "receipt": receipt("guards", commit, tree)})
 
 
 def rounds(candidate: str, records_of=None) -> list[dict]:
@@ -151,6 +171,70 @@ class CandidateJoin(Scratch):
         done = verdict(self.repo.path, a, rounds(a), *checks(b, self.repo.tree(a)))
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn(f"{b[:12]} isn't of tree", done.stdout)
+
+
+class EvidenceContract(Scratch):
+    """Package review r1 R1: a check binds as the run the candidate's tree requires (its kits, suites
+    and guards), never by its own `passed`; the receipt proves that run."""
+
+    def refused(self, name: str, w3c: dict, guards: dict, *named: str) -> None:
+        a = self.repo.commit()
+        for part in (w3c, guards):
+            part["receipt"].update(commit=a, tree=self.repo.tree(a))
+        done = verdict(self.repo.path, a, rounds(a), w3c, guards)
+        self.assertEqual(done.returncode, 1, f"SPEC {name}: refused\n{done.stdout}{done.stderr}")
+        for text in named:
+            self.assertIn(text, done.stdout, name)
+
+    def test_a_receipt_of_a_failed_or_unproven_run_is_refused_whatever_passed_says(self):
+        # Spec: review r1 R1, probes failed-kit, missing-summary, missing-hash, truthy-failed-result, and a
+        # unit launched twice: each result claims passed; each fails the candidate's contract, named.
+        kit = contract()[1][0].name
+        for name, change, text in (("failed-kit", {"exit": 101}, f"{kit}: exited 101"),
+                                   ("missing-summary", {"summary": False}, f"{kit}: exited 0 without passing"),
+                                   ("missing-hash", {"log_sha256": ""}, f"{kit}: no SHA-256 of its log")):
+            with self.subTest(name):
+                w3c, guards = checks("c", "t")
+                w3c["receipt"]["outcomes"][0].update(change)
+                self.refused(name, w3c, guards, text)
+        with self.subTest("truthy-failed-result"):
+            w3c, guards = checks("c", "t")
+            w3c.update(passed="false", errors=["the W3C run failed"])
+            self.refused("truthy-failed-result", w3c, guards, "w3c: its result doesn't say passed")
+        with self.subTest("a unit launched twice"):
+            w3c, guards = checks("c", "t")
+            w3c["receipt"]["outcomes"].append(dict(w3c["receipt"]["outcomes"][0]))
+            self.refused("a unit launched twice", w3c, guards, f"{kit}: launched 2 times")
+
+    def test_a_partial_run_is_refused_its_missing_kits_suites_and_guards_named(self):
+        # Spec: review r1 R1, probe partial-kits-zero-guards: one of the seven kits, no guard ran.
+        w3c, guards = checks("c", "t")
+        w3c["receipt"]["outcomes"] = w3c["receipt"]["outcomes"][:1]
+        del w3c["counts"]["OWL 2 RL"]
+        guards.update(guards=0, results={})
+        missing_kit = contract()[1][-1].name
+        self.refused("partial-kits-zero-guards", w3c, guards, f"{missing_kit}: no launch recorded",
+                     "OWL 2 RL: no counts", f"{contract()[2][0]}: no test of that name ran")
+
+    def test_the_producer_s_partial_expectations_never_pass_the_candidate(self):
+        # Spec: review r1 R1, probe generated-partial-w3c-final-verdict: `w3c --run` with an expectations
+        # file declaring one kit writes a passing result and receipt at the candidate's own tree; the join
+        # holds it to the candidate tree's seven kits.
+        stub = "#!/usr/bin/env bash\necho 'test result: ok. 1 passed; 0 failed; 0 ignored'\n"
+        a = self.repo.commit(files={"scripts/cargo-guarded.sh": stub})
+        partial = self.tmp / "partial.toml"
+        partial.write_text('[kit."nrese-owl:w3c_owl2"]\nsuites = []\n', encoding="utf-8")
+        result = self.tmp / "w3c.json"
+        made = subprocess.run([sys.executable, str(GATE), "w3c", str(self.tmp / "logs"), "--expected", str(partial),
+                               "--run", "--identity", IDENTITY, "--json", str(result)], cwd=self.repo.path,
+                              capture_output=True, text=True, timeout=120,
+                              env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        w3c = json.loads(result.read_text(encoding="utf-8"))
+        self.assertEqual(w3c["receipt"]["tree"], self.repo.tree(a))
+        done = verdict(self.repo.path, a, rounds(a), w3c, checks(a, self.repo.tree(a))[1])
+        self.assertEqual(done.returncode, 1, f"SPEC one kit of seven\n{done.stdout}")
+        self.assertIn("nrese-sparql:w3c_sparql11: no launch recorded", done.stdout)
 
 
 class CheckDirectory(Scratch):
@@ -346,6 +430,40 @@ class GuardRun(Scratch):
         self.assertIn("exited 101", " ".join(result["errors"]))
         self.assertEqual([(o["unit"], o["exit"]) for o in result["receipt"]["outcomes"]], [("guards", 101)])
 
+    def test_a_launch_that_fails_leaves_no_earlier_result(self):
+        # Spec: review r1 R2, probes guards-launch-error and stale-guard-after-launch-error: a passed
+        # guards.json from an earlier run, then a run that fails before it launches (its setup raises: the
+        # guards' names can't be read): no result stands afterwards, never the earlier one.
+        out = self.tmp / "guards.json"
+        out.write_text(json.dumps(checks("c", "t")[1]), encoding="utf-8")
+        done = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--names", str(self.tmp / "no-names"),
+                               "--log", str(self.tmp / "test.log"), "--identity", IDENTITY, "--json", str(out)],
+                              cwd=self.tmp, capture_output=True, text=True, timeout=120,
+                              env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(out.exists(), f"SPEC the earlier passed result is gone\n{done.stdout}{done.stderr}")
+
+    def test_the_guards_step_fails_when_its_checker_publishes_nothing(self):
+        # Spec: review r1 R2, probe exact-guards-shell-boundary: release-gate.sh's guards step, its checker
+        # failing before it publishes, an earlier passed guards.json in its results: the step fails and no
+        # earlier result stands.
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        body = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8").split("\nguards)\n", 1)[1].split("\n  ;;", 1)[0]
+        script = self.tmp / "guards-step.sh"
+        script.write_text('set -uo pipefail\nOUT="$1"\nGATE="$1"\nlog() { echo "$*"; }\n'
+                          'gate_identity() { echo identity; }\n'
+                          'py() { echo "the checker failed before publishing" >&2; return 1; }\n' + body + "\n",
+                          encoding="utf-8", newline="\n")
+        out = self.tmp / "out"
+        out.mkdir()
+        (out / "guards.json").write_text(json.dumps(checks("c", "t")[1]), encoding="utf-8")
+        done = subprocess.run([bash, script.as_posix(), out.as_posix()], capture_output=True, text=True, timeout=60,
+                              env=isolation.inherit("NRESE_", "FLEET_"))
+        self.assertNotEqual(done.returncode, 0, f"SPEC the step fails\n{done.stdout}{done.stderr}")
+        self.assertFalse((out / "guards.json").exists(), "SPEC no earlier result stands")
+
 
 def wrong_everywhere(side, n):
     return [fixtures.record(status="wrong", expected="wrong")]
@@ -432,19 +550,24 @@ class Tradeoffs(Scratch):
     candidate's tree). Moved from test_release_gate.py: the verdict reads its policy from the
     candidate commit, no longer from what each timed report embedded."""
 
-    def rounds(self, candidate: str) -> list[dict]:
-        def records_of(side, n):
-            cand = side == "cand"
-            return [fixtures.record(samples={"q01": [10.0, 10.1, 9.9],
-                                             "q06": [v * (fixtures.worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
-                    fixtures.record(case="kernel-intersect",
-                                    samples={"triangles": [v * (fixtures.worse(0.36, n) if cand else 1)
-                                                           for v in [140.0, 140.5]]})]
+    def rounds(self, candidate: str, losses: tuple[float, float] = (1.08, 1.08)) -> list[dict]:
+        """Two rounds, round k's q06 LOSSES[k] times the baselines', the paying win in both."""
+        def records_of(loss):
+            def records(side, n):
+                cand = side == "cand"
+                return [fixtures.record(samples={"q01": [10.0, 10.1, 9.9],
+                                                 "q06": [v * (fixtures.worse(loss, n) if cand else 1)
+                                                         for v in [4.8, 4.85, 4.8]]}),
+                        fixtures.record(case="kernel-intersect",
+                                        samples={"triangles": [v * (fixtures.worse(0.36, n) if cand else 1)
+                                                               for v in [140.0, 140.5]]})]
+            return records
         # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
         # 0.0083), and which runs a side got in the block's order decided it.
         out = []
         for k in (0, 1):
-            summary = fixtures.run_gate(fixtures.passes(records_of, blocks=3), context={**fixtures.CONTEXT, "round": k})
+            summary = fixtures.run_gate(fixtures.passes(records_of(losses[k]), blocks=3),
+                                        context={**fixtures.CONTEXT, "round": k})
             summary["candidate"]["revision"] = candidate
             out.append(summary)
         return out
@@ -463,9 +586,26 @@ class Tradeoffs(Scratch):
             lines.append(f"{key} = {value}")
         return "\n".join(lines) + "\n"
 
-    def verdict(self, policy: str = "") -> subprocess.CompletedProcess:
+    def verdict(self, policy: str = "", losses: tuple[float, float] = (1.08, 1.08)) -> subprocess.CompletedProcess:
         a = self.repo.commit(policy=policy)
-        return verdict(self.repo.path, a, self.rounds(a), *checks(a, self.repo.tree(a)))
+        return verdict(self.repo.path, a, self.rounds(a, losses), *checks(a, self.repo.tree(a)))
+
+    def test_a_trade_off_covers_a_loss_only_within_its_bound_in_every_round(self):
+        # Spec: review r1 R3, probe real-reports-tradeoff-8-percent-then-50-percent: an approval bounded
+        # at 1.12 with its win shown in both rounds; round 1's loss 8 %, round 2's 50 %: anything beyond
+        # the bound blocks (PROTOCOL.md §5), whichever round shows it.
+        done = self.verdict(self.entry(), losses=(1.08, 1.50))
+        self.assertEqual(done.returncode, 1, f"SPEC a 50 % loss beyond a 1.12 bound\n{done.stdout}")
+        self.assertIn("**confirmed loss**: lab-olympics against", done.stdout)
+
+    def test_a_policy_file_of_another_shape_is_refused_never_read_as_none(self):
+        # Spec: review r1 (malformed input): `tradeoff = 1` raised TypeError; a [tradeoff] or [exception]
+        # table read as no entries. Each is an error naming its table, never an exception or an empty policy.
+        for text in ("tradeoff = 1", '[tradeoff]\ncase = "x"\n', '[exception]\ncase = "x"\n', "exception = [1]"):
+            with self.subTest(text):
+                policy = gate_module.load_policy(text)
+                self.assertEqual((policy.tradeoffs, policy.exceptions), ([], []))
+                self.assertTrue(any("an array of tables" in e for e in policy.errors), policy.errors)
 
     def test_a_confirmed_loss_blocks_unless_an_approved_trade_off_with_its_win_covers_it(self):
         self.assertEqual(self.verdict().returncode, 1)
