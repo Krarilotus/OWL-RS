@@ -169,6 +169,9 @@ impl<'e> Transaction<'e> {
                 dictionary_len: self.engine.shared.dictionary.len(),
                 equality,
                 canonical: Default::default(),
+                // Empty, as every new version's: what this pending version's readers keep
+                // (its memo's hits share it, as they share the version).
+                own: Default::default(),
             },
         )?;
         // Recorded once nothing can be refused any more (a refusal records nothing).
@@ -243,6 +246,8 @@ impl<'e> Transaction<'e> {
                 dictionary_len: self.engine.shared.dictionary.len(),
                 equality,
                 canonical: Default::default(),
+                // Empty, as every new version's: what this pending version's readers keep.
+                own: Default::default(),
             },
         )?;
         if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
@@ -310,6 +315,7 @@ impl<'e> Transaction<'e> {
                 false => std::sync::Arc::clone(&base.equality),
             },
             canonical: Default::default(),
+            own: Default::default(),
         };
         self.pending.base().with_version(version)
     }
@@ -357,6 +363,7 @@ impl<'e> Transaction<'e> {
                 false => std::sync::Arc::clone(&seen.equality),
             },
             canonical: Default::default(),
+            own: Default::default(),
         };
         view.with_version(version)
     }
@@ -729,6 +736,7 @@ impl Inner {
                     false => std::sync::Arc::clone(&current.equality),
                 },
                 canonical: Default::default(),
+                own: Default::default(),
             }
         };
         let wal_bytes = match &shared.durable {
