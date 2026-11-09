@@ -904,6 +904,18 @@ impl Catalog {
             .collect()
     }
 
+    /// The statements of a repository's configuration `payload` in `format`, kept for the
+    /// passes that read it: charged to an envelope within the catalog's query memory, as a
+    /// request's are, before they are copied (fresh blank nodes).
+    pub fn parse_configuration(
+        &self,
+        format: crate::GraphResultFormat,
+        payload: &[u8],
+    ) -> crate::StoreResult<crate::ChargedQuads> {
+        let memory = nrese_exec::Envelope::new(None, self.runtime.query_memory());
+        crate::parse_payload(format, None, payload, &memory)
+    }
+
     /// Creates repository `id`, empty, with `settings`: its id reserved, `repositories/` synced
     /// (so that no earlier removal's tombstone can come back over it), its settings written,
     /// then its store opened. A failed start removes what was made.

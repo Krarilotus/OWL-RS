@@ -255,7 +255,7 @@ fn every_write_is_checked_against_its_requesters_scope() {
             target: GraphTarget::NamedGraph(graph.to_owned()),
             format: GraphResultFormat::NTriples,
             base_iri: None,
-            payload: b"<urn:n> <urn:p> \"4\" .".to_vec(),
+            payload: b"<urn:n> <urn:p> \"4\" .".to_vec().into(),
             replace: true,
         })
     };
@@ -297,7 +297,8 @@ fn every_write_is_checked_against_its_requesters_scope() {
             format: GraphResultFormat::NTriples,
             base_iri: None,
             payload: b"<urn:c> <urn:p> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
-                .to_vec(),
+                .to_vec()
+                .into(),
             replace: false,
         })
     };
@@ -540,7 +541,7 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         let prepared = prepare(pipeline, scope);
         let add = StatementOp::Add {
             data: nrese_store::RdfPayload {
-                payload: b"<urn:pending> <urn:p> \"2\" .".to_vec(),
+                payload: b"<urn:pending> <urn:p> \"2\" .".to_vec().into(),
                 format: GraphResultFormat::NTriples,
                 base_iri: None,
             },

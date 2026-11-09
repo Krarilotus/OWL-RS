@@ -1160,6 +1160,7 @@ name = "nrese-store"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "bytes",
  "getrandom 0.4.2",
  "hashbrown 0.16.1",
  "nrese-dl",
