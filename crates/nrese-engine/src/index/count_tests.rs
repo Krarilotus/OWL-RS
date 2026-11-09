@@ -386,3 +386,87 @@ fn a_counted_scan_reads_its_cursors_within_its_visitor_s_interval() {
         interval
     );
 }
+
+/// An account granted runs of `run` units (or a portion, where that is more) that never
+/// stops: the most work done after a grant past what the grant allowed.
+struct Runs {
+    run: u64,
+    left: u64,
+    granted: u64,
+    since: u64,
+    over: u64,
+}
+
+impl Runs {
+    fn new(run: u64) -> Self {
+        Self {
+            run,
+            left: 0,
+            granted: 0,
+            since: read_work(),
+            over: 0,
+        }
+    }
+
+    /// Ends the last grant; its excess counts too.
+    fn over(mut self) -> u64 {
+        self.grant(0);
+        self.over
+    }
+
+    fn grant(&mut self, n: u64) {
+        let done = read_work() - self.since;
+        self.over = self.over.max(done.saturating_sub(self.granted));
+        (self.granted, self.since) = (self.run.max(n), read_work());
+        self.left = self.granted;
+    }
+}
+
+impl Account for Runs {
+    fn take(&mut self, n: u64) -> bool {
+        if self.left < n {
+            self.grant(n);
+        }
+        self.left -= n;
+        true
+    }
+}
+
+/// REAS-3a fix check r3 H1. Spec (`crate::visit`: after a yes at most the units it allowed
+/// follow; `Ledger`: each portion's work is done before the next portion is taken): a merge
+/// does no work after a grant that it counted before it. Two to six runs of 600 statements
+/// each, their subjects alternating, merged with an account granted runs of 1 to 64 units:
+/// by the linear selector (2 and 3 runs) and the heap (4 and 6). The linear selector counted
+/// all its inputs' tests at once and tested the inputs after an advance's grant; the heap
+/// counted an advance, then took the repair's portion, and advanced after the repair's grant.
+#[test]
+fn a_merge_does_no_work_after_a_grant_that_it_counted_before() {
+    let (p, o) = (term(1), term(2));
+    for k in [2, 3, 4, 6] {
+        let runs: Vec<_> = (0..k)
+            .map(|r| {
+                let quads: Vec<_> = (0..600)
+                    .map(|i| EncodedQuad::new(term(10 + k * i + r), p, o, TermId::DEFAULT_GRAPH))
+                    .collect();
+                Run::from_delta(Layout::DefaultGraph, &quads, &[])
+            })
+            .collect();
+        for run in 1..=64 {
+            let mut merge = SignedMerge::new(runs.iter().map(|delta| {
+                let perm = delta.permutation(Permutation::Spog);
+                (perm, 0, perm.keys.len())
+            }));
+            let mut account = Runs::new(run);
+            let mut keys = 0u64;
+            while merge.step(&mut account).expect("never stopped").is_some() {
+                keys += 1;
+            }
+            assert_eq!(keys, 600 * k, "every statement of {k} runs");
+            assert_eq!(
+                account.over(),
+                0,
+                "{k} runs, grants of {run}: work past a grant"
+            );
+        }
+    }
+}
