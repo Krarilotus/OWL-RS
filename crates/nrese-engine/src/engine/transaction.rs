@@ -9,7 +9,7 @@ use parking_lot::MutexGuard;
 
 mod pending;
 
-use self::pending::{Pending, SnapshotChanges};
+pub(super) use self::pending::{Pending, SnapshotChanges};
 use super::{Inner, ReadModel, Snapshot, Version};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
