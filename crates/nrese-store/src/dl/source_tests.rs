@@ -1,11 +1,67 @@
 //! Dictionary lifecycle V1's store guards for the DL source helpers
-//! (`notes/2026-11-09-dict-v1-speculative-private-design.md` §4, items 6 and 7).
+//! (`notes/2026-11-09-dict-v1-speculative-private-design.md` §4, items 5, 6 and 7).
 
 use std::sync::Arc;
 
 use nrese_exec::Budget;
 
+use crate::dl::bounds::upper_facts;
 use crate::{StoreConfig, StoreError, StoreService};
+
+/// Item 5: the U1 a cold read keeps holds valid names until the next commit. Its red is the
+/// mutant that gives U1's names a private vocabulary (design note §4, item 5's record): the
+/// window is between the cold read and the next commit, and terms appended there (an aborted
+/// writer's stay in the dictionary) take the next ids.
+///
+/// - Input: a store with an existential axiom written without the gates (no commit interned
+///   U1's names); a cold read that keeps U1; a writer that interns two new terms and is dropped
+///   (no commit); then the kept U1 and U1 afresh, at the same revision.
+/// - Expected: the revision unchanged; the kept U1 equals U1 afresh, and neither names the
+///   aborted writer's terms or an undecoded `#id`.
+#[test]
+fn the_kept_cold_upper_bound_survives_an_aborted_writers_terms() {
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    store
+        .update_str_ungated(
+            "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA { :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ;
+                 owl:someValuesFrom :B ] . :a a :A . }",
+        )
+        .unwrap();
+    let cold = upper_facts(&store, false).expect("the cold read keeps U1");
+    let revision = store.current_revision();
+    let mut aborted = store.engine().transaction();
+    for name in ["urn:test:aborted1", "urn:test:aborted2"] {
+        let node = nrese_rdf::NamedNode::new_unchecked(name);
+        aborted.insert(
+            nrese_rdf::Quad::new(
+                node.clone(),
+                node.clone(),
+                node,
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    drop(aborted);
+    assert_eq!(store.current_revision(), revision, "no commit");
+    let kept = upper_facts(&store, false).expect("the kept U1");
+    let afresh = upper_facts(&store, true).expect("U1 afresh");
+    let wrong: Vec<&String> = cold
+        .iter()
+        .chain(&kept)
+        .chain(&afresh)
+        .flatten()
+        .filter(|t| t.starts_with('#') || t.contains("aborted"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "undecoded or the aborted writer's: {wrong:?}"
+    );
+    assert_eq!(kept, cold, "the kept U1, read again");
+    assert_eq!(kept, afresh, "the kept U1 is U1 afresh");
+}
 
 /// Item 6: the bounded-prefix precondition, checked where a DL request opens its private
 /// transaction.

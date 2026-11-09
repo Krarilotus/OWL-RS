@@ -201,13 +201,20 @@ fn an_explanation_refused_for_memory_is_the_memory_limit() {
         }
         match answer {
             Ok(true) => high = mid,
-            Ok(false) => failed.push(format!("{mid} bytes: an unverified or no explanation")),
+            // Neither bound moves on these: recorded, and the search ends.
+            Ok(false) => {
+                failed.push(format!("{mid} bytes: an unverified or no explanation"));
+                break;
+            }
             Err(error) if error.is_memory_limit() => {
                 refused_at.push(mid);
                 low = mid;
             }
             Err(nrese_store::StoreError::Incomplete(_)) => low = mid,
-            Err(error) => failed.push(format!("{mid} bytes: {error}")),
+            Err(error) => {
+                failed.push(format!("{mid} bytes: {error}"));
+                break;
+            }
         }
     }
     assert!(
@@ -269,7 +276,33 @@ fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     out.into_iter().collect()
 }
 
-/// Item 5 (a guard; its red is the mutant that gives U1's names a private vocabulary).
+/// Caller 10's report decodes U1's names (a guard, DICT2 04:03): they are shared ids appended
+/// past the published snapshot's length, with no commit since.
+///
+/// - Input: the schema of the guard below, loaded past the pipeline (no commit interned U1's
+///   names); the upper-facts report evaluated afresh, cold.
+/// - Expected: U1's own names among its facts, and every term decoded: none is `#id`, the
+///   report's text for an id its decoding vocabulary lacks.
+#[test]
+fn a_cold_upper_facts_report_decodes_every_name() {
+    let dl = super::pipeline();
+    let turtle = format!(
+        "@prefix : <{EX}> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . {SCHEMA}"
+    );
+    crate::support::load_past_the_pipeline(dl.store(), &turtle);
+    let facts = dl.store().dl_upper_facts(true).expect("U1 afresh");
+    let terms: Vec<&String> = facts.iter().flatten().collect();
+    assert!(
+        terms.iter().any(|t| t.starts_with("<urn:nrese:u1:")),
+        "U1's own names: {facts:?}"
+    );
+    let undecoded: Vec<&&String> = terms.iter().filter(|t| t.starts_with('#')).collect();
+    assert!(undecoded.is_empty(), "undecoded: {undecoded:?}");
+}
+
+/// Item 5's commit path (a guard of the delta from shared names; the window before the first
+/// commit is `dl::source::tests::the_kept_cold_upper_bound_survives_an_aborted_writers_terms`).
 ///
 /// - Input: a schema U1 approximates with Skolem constants, loaded past the pipeline (no
 ///   commit interned U1's names); a cold DL read, which builds U1 afresh and keeps it; then
