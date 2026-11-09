@@ -6,11 +6,12 @@
 //! A cache is never needed for an answer, so it gives way to what the query must hold:
 //! - It keeps a term only where, kept, it would hold no more than the room it leaves free
 //!   (sol-loop r1 S2), so what the query must hold later finds at least as much room as the
-//!   cache takes. A term that doesn't fit so is decoded again as it is needed.
-//! - At each term it is offered, where it holds more than the room left (what the query holds
-//!   grew since), it lets go of everything it keeps and starts afresh (sol-loop r2 S2).
-//!   Residual: a required charge made while only cached terms are read, with no term decoded
-//!   in between, still meets the cache as it was; it holds at most what it left free when it
+//!   cache takes.
+//! - A term offered that doesn't fit so means what the query holds has outgrown the cache's
+//!   share: the cache lets go of everything it keeps and starts afresh, and that term is
+//!   decoded again as it is needed (sol-loop r2, r3 S2).
+//! - Residual: a required charge made while only cached terms are read, with no term decoded
+//!   in between, still meets the cache as it was, holding at most what it left free when it
 //!   last kept a term.
 //! - Where the budget refuses an entry anyway, the cache lets go of everything it keeps, with
 //!   its charge, and keeps nothing more for the rest of its life.
@@ -81,21 +82,20 @@ impl DecodeCache {
         let text = term.as_ref().map_or(0, Term::heap_bytes);
         let held = kept.terms.charged() + kept.text.bytes();
         let remaining = kept.budget.remaining();
-        // What the query must hold grew since the cache last kept a term: where the cache now
-        // holds more than the room left, it lets everything go, so that room is the query's
-        // again (sol-loop r2 S2), and starts afresh.
-        if held > remaining {
-            let (budget, workers) = (Arc::clone(&kept.budget), kept.workers);
-            // The old terms and their charge go before anything new is charged.
-            self.kept = None;
-            self.kept = Some(Kept::new(&budget, workers));
-            return;
-        }
         // Kept, the cache would hold `held + text` and leave `remaining - text` free.
         let fits = held
             .checked_add(text.saturating_mul(2))
             .is_some_and(|needed| needed <= remaining);
         if !fits {
+            // What the query must hold has outgrown the cache's share: it lets everything go,
+            // so the room is the query's again (sol-loop r2/r3 S2), keeps this term uncached,
+            // and starts afresh.
+            if held > 0 {
+                let (budget, workers) = (Arc::clone(&kept.budget), kept.workers);
+                // The old terms and their charge go before anything new is charged.
+                self.kept = None;
+                self.kept = Some(Kept::new(&budget, workers));
+            }
             return;
         }
         if kept.text.take(text).is_err() {
@@ -152,15 +152,21 @@ mod tests {
         let limit = 64 << 10;
         let budget = Arc::new(Budget::new(limit));
         let mut cache = DecodeCache::new(&budget, 1 << 10, 1);
+        let mut most = 0;
         for i in 0..100 {
             cache.keep(i as u64, &literal(i, 4096));
+            let kept = cache.kept.as_ref().expect("it gives way, it isn't refused");
+            let held = kept.terms.charged() + kept.text.bytes();
+            assert!(
+                held <= limit / 2,
+                "after term {i} it holds {held} bytes of {limit}"
+            );
+            most = most.max(held);
         }
-        assert!(cache.keeps(), "it gave way rather than being refused");
-        assert!(cache.get(0).is_some(), "the first terms are kept");
-        assert!(cache.get(99).is_none(), "the last don't fit so");
-        let kept = cache.kept.as_ref().expect("keeps");
-        let held = kept.terms.charged() + kept.text.bytes();
-        assert!(held <= limit / 2, "it holds {held} bytes of {limit}");
+        assert!(
+            most >= 4 * 4096,
+            "it keeps terms while there is room: at most {most} bytes"
+        );
         drop(cache);
         assert_eq!(budget.used(), 0, "dropped, nothing stays charged");
     }
