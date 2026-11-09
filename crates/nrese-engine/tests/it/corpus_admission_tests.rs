@@ -380,6 +380,19 @@ fn nearest(snapshot: &Snapshot, query: &nrese_engine::VectorQuery) -> (Vec<(Stri
     (hits, report.space)
 }
 
+/// An IRI search's matches decoded (the IRI, its relevance), every graph.
+fn named(snapshot: &Snapshot, text: &str) -> Vec<(String, f64)> {
+    snapshot
+        .iri_search_in(MODEL, &TextScope::EVERY, &query(text), None)
+        .unwrap()
+        .iter()
+        .map(|m| match snapshot.decode(TermId::from_raw(m.id)) {
+            Some(nrese_rdf::Term::NamedNode(n)) => (n.as_str().to_owned(), m.relevance),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
 /// Attack items 2, 3 and 7 (the design note's list), guards: a writer's pending state's
 /// derived views (as stored, canonical, restricted) and a pending state searched after its
 /// transaction was dropped and another commit published keep nothing, and answer text,
@@ -444,13 +457,9 @@ fn pending_views_and_abandoned_pending_states_keep_nothing() {
             if got != want {
                 failed.push(format!("{context}: text {got:?} != {want:?}"));
             }
-            let iris = |s: &Snapshot| {
-                s.iri_search_in(MODEL, &TextScope::EVERY, &query("n"), None)
-                    .unwrap()
-                    .len()
-            };
-            if iris(view) != iris(&truth) {
-                failed.push(format!("{context}: IRIs"));
+            let (got, want) = (named(view, "n"), named(&truth, "n"));
+            if got != want {
+                failed.push(format!("{context}: IRIs {got:?} != {want:?}"));
             }
             let (got, want) = (nearest(view, &near), nearest(&truth, &near));
             if got != want {
@@ -480,6 +489,12 @@ fn pending_views_and_abandoned_pending_states_keep_nothing() {
         if got != want {
             failed.push(format!(
                 "abandoned, base first {base_first}: {got:?} != {want:?}"
+            ));
+        }
+        let (got, want) = (named(&pending, "n"), named(&truth, "n"));
+        if got != want {
+            failed.push(format!(
+                "abandoned IRIs, base first {base_first}: {got:?} != {want:?}"
             ));
         }
         if nearest(&pending, &near) != nearest(&truth, &near) {
