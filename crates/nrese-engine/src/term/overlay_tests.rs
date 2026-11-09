@@ -454,6 +454,12 @@ fn an_overlay_and_its_views_hold_only_what_they_charged() {
 
 /// B16. An overlay's intern reads the dictionary with recursive read guards and takes only its
 /// own leaf lock: it returns while a reader holds the dictionary and a writer is queued behind it.
+///
+/// - Input: a reader holding the dictionary's views; a writer's intern, seen queued behind it
+///   (a plain read of the entries then fails: review P2A-F2, 8 Nov, no sleep); then an
+///   overlay's intern of a new term.
+/// - Expected: the overlay's intern returns before the reader lets go, within [`DEADLINE`],
+///   with the overlay's first own id, which its view decodes to that term.
 #[test]
 fn an_overlay_intern_returns_behind_a_queued_writer() {
     let budget = unlimited();
@@ -484,8 +490,7 @@ fn an_overlay_intern_returns_behind_a_queued_writer() {
         let dictionary = Arc::clone(&dictionary);
         std::thread::spawn(move || dictionary.intern(literal("queued").as_ref()))
     };
-    // The writer queues for the write lock behind the reader.
-    std::thread::sleep(Duration::from_millis(50));
+    let queued = until(DEADLINE, || dictionary.writer_waiting());
     let (sent, answer) = std::sync::mpsc::channel();
     let interning = {
         let overlay = Arc::clone(&overlay);
@@ -494,15 +499,40 @@ fn an_overlay_intern_returns_behind_a_queued_writer() {
             let _ = sent.send(id);
         })
     };
-    let id = answer.recv_timeout(Duration::from_secs(10));
+    let id = if queued {
+        answer.recv_timeout(DEADLINE)
+    } else {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    };
     done.store(true, Ordering::Release);
     reader.join().unwrap();
     writer.join().unwrap();
     interning.join().unwrap();
+    assert!(queued, "the writer queued behind the reader");
     let id = id
         .expect("the overlay's intern returned behind a queued writer")
         .unwrap();
     assert_eq!(id.payload(), 4, "the overlay's first own id");
+    assert_eq!(
+        overlay.freeze().unwrap().decode(id),
+        Some(literal("behind the writer")),
+        "the returned id is the term's"
+    );
+}
+
+/// How long a call that should return may take: far above any run.
+const DEADLINE: Duration = Duration::from_secs(10);
+
+/// Waits until `state` holds or `limit` passes; whether it held.
+fn until(limit: Duration, state: impl Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while !state() {
+        if start.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
 }
 
 fn view_end(view: &Vocabulary) -> u64 {
