@@ -263,6 +263,37 @@ fn guard_charged_updates_do_what_they_say() {
     assert_eq!(committed(&engine).0, 0, "everything is dropped");
 }
 
+/// A `WHERE` after an earlier operation of the request reads a snapshot of the pending state,
+/// which holds the `N` pending statements again: it is charged to the request's envelope (DUR-6's
+/// charged builder), and refused as the request's memory error where it doesn't fit. Its second
+/// operation matches nothing, so the snapshot is all it holds.
+#[test]
+fn a_where_clauses_pending_snapshot_is_charged_to_the_request() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let data: String = (0..N)
+        .map(|i| format!("<ex:s{i}> <ex:p> \"{i}\" . "))
+        .collect();
+    let insert = format!("INSERT DATA {{ GRAPH <ex:c> {{ {data} }} }}");
+    let both =
+        format!("{insert} ; DELETE {{ ?s ?p ?o }} WHERE {{ GRAPH <ex:c> {{ ?s <ex:none> ?o }} }}");
+    // Each alone, with memory to spare: what the first holds at its peak, and whether the
+    // second holds more.
+    let peak = |text: &str| {
+        let envelope = Envelope::new(None, None);
+        let mut tx = charged(&engine, &envelope);
+        apply_update(&mut tx, &update(text), &within(&envelope)).unwrap();
+        envelope.peak()
+    };
+    let (first, request) = (peak(&insert), peak(&both));
+    assert!(
+        request >= first + N * size_of::<EncodedQuad>(),
+        "the snapshot of {N} pending statements is charged: peak {request} bytes, \
+         {first} for the first operation alone"
+    );
+    // The first operation's peak fits; the snapshot doesn't.
+    assert_refused(&engine, &both, first);
+}
+
 /// `INSERT DATA` of `N` new statements needs room for `N` pending inserts: an envelope of `N`
 /// encoded quads' bytes can't hold it. The update text is parsed before it is applied, outside
 /// the envelope, as the store does.
