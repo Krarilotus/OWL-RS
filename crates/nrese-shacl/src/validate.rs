@@ -871,7 +871,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 } else {
                     literal.datatype().as_str()
                 };
-                actual == datatype && well_formed(datatype, literal.value())
+                actual == datatype && well_formed(datatype, literal.value(), literal.language())
             }
             _ => false,
         }
