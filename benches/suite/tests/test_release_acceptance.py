@@ -12,6 +12,7 @@ final join pass a candidate it must refuse, each reproduced on engine-v2 3a4e0a2
 from __future__ import annotations
 
 import contextlib
+import copy
 import ctypes
 import hashlib
 import json
@@ -35,6 +36,7 @@ POLICY = "benches/release-tradeoffs.toml"
 # every candidate a test makes.
 CONTRACT = ("benches/fast/w3c-expected.toml", "docs/design/performance.md")
 IDENTITY = "rustc-1.98.1-0123456789ab flags=-C_target-cpu=native tools=abcdef012345"
+ATTEMPT = "a" * 32  # a check's attempt (release_gate.py attempt), in its result, receipt and attempt record
 QUOTE = 'quote = "accept it for v1.5"\nsource = "OWL-RS master thread, 9 Nov 2026 10:11"\n'
 
 
@@ -80,8 +82,11 @@ def receipt(kind: str, commit: str, tree: str, **changes) -> dict:
     """A check's receipt as release_gate.py w3c/guards --run write it: every unit the contract
     requires launched once and run whole."""
     units = [kit.name for kit in contract()[1]] if kind == "w3c" else ["guards"]
+    # The attempt where the receipt type holds one: on the code before attempts (the red of fix check r2)
+    # the join then reads its own receipts, and shows what it accepts, not a receipt it can't read.
+    attempt = {"attempt": ATTEMPT} if "attempt" in gate_module.CheckReceipt._fields else {}
     return {"kind": kind, "commit": commit, "tree": tree, "dirty": False, "identity": IDENTITY,
-            "host": "office-pc", "job": "rg-cand-checks",
+            "host": "office-pc", "job": "rg-cand-checks", **attempt,
             "outcomes": [{"unit": unit, "exit": 0, "log_sha256": "0" * 64, "summary": True} for unit in units],
             **changes}
 
@@ -92,10 +97,23 @@ def checks(commit: str, tree: str) -> tuple[dict, dict]:
     suites, _, guards = contract()
     counts = {suite: {**want, "failed": 0} for suite, want in suites.items()}
     counts["test results"] = {"passed": len(suites), "failed": 0}
-    return ({"counts": counts, "expected": suites, "errors": [], "passed": True,
+    return ({"counts": counts, "expected": suites, "errors": [], "passed": True, "attempt": ATTEMPT,
              "receipt": receipt("w3c", commit, tree)},
             {"guards": len(guards), "results": {name: ["ok"] for name in guards}, "errors": [], "passed": True,
-             "receipt": receipt("guards", commit, tree)})
+             "attempt": ATTEMPT, "receipt": receipt("guards", commit, tree)})
+
+
+def with_attempt(result: dict, attempt: str) -> dict:
+    """RESULT as attempt ATTEMPT's: its own field, and its receipt's where it holds one (receipt())."""
+    result["attempt"] = attempt
+    if "attempt" in result["receipt"]:
+        result["receipt"]["attempt"] = attempt
+    return result
+
+
+def attempt_record(kind: str, attempt: str, tree: str) -> dict:
+    """KIND's attempt record as `release_gate.py attempt` writes it (KIND.attempt.json beside its result)."""
+    return {"kind": kind, "attempt": attempt, "tree": tree}
 
 
 def rounds(candidate: str, records_of=None) -> list[dict]:
@@ -109,21 +127,38 @@ def rounds(candidate: str, records_of=None) -> list[dict]:
     return out
 
 
-def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: dict) -> subprocess.CompletedProcess:
-    """`release_gate.py verdict` on these parts, CANDIDATE resolved in REPO."""
+def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: dict,
+            attempts: dict | None = None) -> subprocess.CompletedProcess:
+    """`release_gate.py verdict` on these parts, CANDIDATE resolved in REPO; each check's attempt record
+    beside its result: the one its result names (ATTEMPTS: others, or None for none)."""
     tmp = Path(tempfile.mkdtemp(prefix="acceptance-", dir=isolation.SCRATCH))
-    files = []
-    for i, part in enumerate([*timed, w3c, guards]):
-        files.append(tmp / f"part-{i}.json")
-        files[-1].write_text(json.dumps(part), encoding="utf-8")
-    args = [a for f in files[:-2] for a in ("--timed", str(f))]
+    tree = git(repo, "rev-parse", f"{candidate}^{{tree}}")
+    for kind, result in (("w3c", w3c), ("guards", guards)):
+        record = (attempts or {}).get(kind, attempt_record(kind, str(result.get("attempt")), tree))
+        if record is not None:
+            (tmp / f"{kind}.attempt.json").write_text(json.dumps(record), encoding="utf-8")
     try:
-        return subprocess.run([sys.executable, str(GATE), "verdict", "--checkout", str(repo), "--candidate", candidate,
-                               *args, "--w3c", str(files[-2]), "--guards", str(files[-1])],
-                              capture_output=True, text=True, timeout=120,
-                              env=isolation.inherit("NRESE_", "FLEET_", PYTHONIOENCODING="utf-8"))
+        return verdict_on(repo, candidate, tmp, timed, w3c, guards)
     finally:
         shutil.rmtree(tmp, True)
+
+
+def verdict_on(repo: Path, candidate: str, where: Path, timed: list[dict], w3c: dict | Path,
+               guards: dict | Path) -> subprocess.CompletedProcess:
+    """`release_gate.py verdict` with the timed parts and each check written into WHERE (a check given as a
+    path: that file, where its attempt record lies beside it)."""
+    files = []
+    for i, part in enumerate([*timed, w3c, guards]):
+        if isinstance(part, Path):
+            files.append(part)
+            continue
+        files.append(where / ("w3c.json" if i == len(timed) else "guards.json" if i > len(timed) else f"part-{i}.json"))
+        files[-1].write_text(json.dumps(part), encoding="utf-8")
+    args = [a for f in files[:-2] for a in ("--timed", str(f))]
+    return subprocess.run([sys.executable, str(GATE), "verdict", "--checkout", str(repo), "--candidate", candidate,
+                           *args, "--w3c", str(files[-2]), "--guards", str(files[-1])],
+                          capture_output=True, text=True, timeout=120,
+                          env=isolation.inherit("NRESE_", "FLEET_", PYTHONIOENCODING="utf-8"))
 
 
 class Scratch(unittest.TestCase):
@@ -228,7 +263,8 @@ class EvidenceContract(Scratch):
         partial.write_text('[kit."nrese-owl:w3c_owl2"]\nsuites = []\n', encoding="utf-8")
         result = self.tmp / "w3c.json"
         made = subprocess.run([sys.executable, str(GATE), "w3c", str(self.tmp / "logs"), "--expected", str(partial),
-                               "--run", "--identity", IDENTITY, "--json", str(result)], cwd=self.repo.path,
+                               "--run", "--identity", IDENTITY, "--attempt", ATTEMPT, "--json", str(result)],
+                              cwd=self.repo.path,
                               capture_output=True, text=True, timeout=120,
                               env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
         self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
@@ -338,7 +374,7 @@ class KitOutcomes(Scratch):
     def run_kits(self, behaviour: dict[str, str]) -> tuple[subprocess.CompletedProcess, dict]:
         checkout = self.cargo_guarded(behaviour)
         logs = self.tmp / "out-w3c"
-        done = self.w3c(logs, "--run", "--identity", IDENTITY, cwd=checkout)
+        done = self.w3c(logs, "--run", "--identity", IDENTITY, "--attempt", ATTEMPT, cwd=checkout)
         result = json.loads((self.tmp / "w3c.json").read_text(encoding="utf-8")) if (self.tmp / "w3c.json").exists() else {}
         return done, result
 
@@ -424,7 +460,8 @@ class GuardRun(Scratch):
         (self.tmp / "names").write_text("first_guard_name_here\n", encoding="utf-8")
         out = self.tmp / "guards.json"
         done = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--names", str(self.tmp / "names"),
-                               "--log", str(self.tmp / "test.log"), "--identity", IDENTITY, "--json", str(out)],
+                               "--log", str(self.tmp / "test.log"), "--identity", IDENTITY, "--attempt", ATTEMPT,
+                               "--json", str(out)],
                               cwd=checkout, capture_output=True, text=True, timeout=120,
                               env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
         self.assertEqual(done.returncode, 1, f"SPEC a guard ok under a run that exited 101\n{done.stdout}{done.stderr}")
@@ -439,7 +476,8 @@ class GuardRun(Scratch):
         out = self.tmp / "guards.json"
         out.write_text(json.dumps(checks("c", "t")[1]), encoding="utf-8")
         done = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--names", str(self.tmp / "no-names"),
-                               "--log", str(self.tmp / "test.log"), "--identity", IDENTITY, "--json", str(out)],
+                               "--log", str(self.tmp / "test.log"), "--identity", IDENTITY, "--attempt", ATTEMPT,
+                               "--json", str(out)],
                               cwd=self.tmp, capture_output=True, text=True, timeout=120,
                               env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
         self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -465,6 +503,71 @@ class GuardRun(Scratch):
                               env=isolation.inherit("NRESE_", "FLEET_"))
         self.assertNotEqual(done.returncode, 0, f"SPEC the step fails\n{done.stdout}{done.stderr}")
         self.assertFalse((out / "guards.json").exists(), "SPEC no earlier result stands")
+
+
+class AttemptRecords(Scratch):
+    """Fix check r2, R2 (the orchestrator's design of 13:01): each check step writes a fresh attempt record
+    first (KIND.attempt.json: a random id and the tree); its result and receipt carry that id; the verdict
+    takes a result only beside a record of the same id."""
+
+    def attempt(self, kind: str, where: Path) -> str:
+        done = subprocess.run([sys.executable, str(GATE), "attempt", kind, str(where)], cwd=self.repo.path,
+                              capture_output=True, text=True, timeout=60,
+                              env=isolation.inherit("NRESE_", "FLEET_", PYTHONIOENCODING="utf-8"))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return done.stdout.strip()
+
+    def test_a_normal_run_passes_with_its_own_attempt(self):
+        # Spec: a guards run end to end (attempt record, then the real producer through a cargo stand-in
+        # that runs every §0 guard ok), a W3C result of its own attempt: the verdict passes; each record
+        # names a fresh id and the candidate's tree.
+        names = contract()[2]
+        stub = "#!/usr/bin/env bash\n" + "".join(f"echo 'test a::{n} ... ok'\n" for n in names) + \
+               "echo 'test result: ok. 1 passed; 0 failed; 0 ignored'\n"
+        a = self.repo.commit(files={"scripts/cargo-guarded.sh": stub})
+        out = self.tmp / "out"
+        out.mkdir()
+        attempts = {kind: self.attempt(kind, out) for kind in ("w3c", "guards")}
+        self.assertNotEqual(attempts["w3c"], attempts["guards"])
+        for kind in attempts:
+            record = json.loads((out / f"{kind}.attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(record, attempt_record(kind, attempts[kind], self.repo.tree(a)))
+        made = subprocess.run([sys.executable, str(GATE), "guards", "--run", "--log", str(out / "test.log"),
+                               "--identity", IDENTITY, "--attempt", attempts["guards"], "--json", str(out / "guards.json")],
+                              cwd=self.repo.path, capture_output=True, text=True, timeout=120,
+                              env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        guards = json.loads((out / "guards.json").read_text(encoding="utf-8"))
+        self.assertEqual((guards["attempt"], guards["receipt"]["attempt"]), (attempts["guards"],) * 2)
+        w3c = checks(a, self.repo.tree(a))[0]
+        with_attempt(w3c, attempts["w3c"])
+        (out / "w3c.json").write_text(json.dumps(w3c), encoding="utf-8")
+        done = verdict_on(self.repo.path, a, self.tmp, rounds(a), out / "w3c.json", out / "guards.json")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_a_result_of_another_attempt_or_none_is_refused(self):
+        # Spec: the orchestrator's design, items 3 and 5: a result beside a newer attempt record (its
+        # producer never published), beside no record, or an attempt record with no result: each refused
+        # with its named reason.
+        a = self.repo.commit()
+        tree = self.repo.tree(a)
+        w3c, guards = checks(a, tree)
+        for name, attempts, text in (
+                ("a newer attempt", {"guards": attempt_record("guards", "b" * 32, tree)},
+                 "guards: stale result from an earlier attempt"),
+                ("no attempt record", {"w3c": None}, "w3c: no attempt record")):
+            with self.subTest(name):
+                done = verdict(self.repo.path, a, rounds(a), copy.deepcopy(w3c), copy.deepcopy(guards), attempts)
+                self.assertEqual(done.returncode, 1, f"SPEC {name}\n{done.stdout}")
+                self.assertIn(text, done.stdout)
+        with self.subTest("an attempt record without its result"):
+            where = self.tmp / "no-result"
+            where.mkdir()
+            (where / "guards.attempt.json").write_text(json.dumps(attempt_record("guards", "c" * 32, tree)),
+                                                       encoding="utf-8")
+            done = verdict_on(self.repo.path, a, where, rounds(a), w3c, where / "guards.json")
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertIn("guards: no result for its latest attempt", done.stdout)
 
 
 @contextlib.contextmanager
@@ -504,13 +607,21 @@ class ResultInvalidation(Scratch):
         if bash is None:
             self.skipTest("needs bash")
         body = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8").split(f"\n{name})\n", 1)[1].split("\n  ;;", 1)[0]
+        # The step's checkout: a commit of its own (an attempt record names its tree).
         cwd = self.tmp / "cwd"
-        (cwd / "scripts").mkdir(parents=True, exist_ok=True)
-        (cwd / "scripts/fetch-w3c-tests.sh").write_text("exit 0\n", encoding="utf-8", newline="\n")
+        if not (cwd / ".git").exists():
+            (cwd / "scripts").mkdir(parents=True, exist_ok=True)
+            (cwd / "scripts/fetch-w3c-tests.sh").write_text("exit 0\n", encoding="utf-8", newline="\n")
+            git(self.tmp, "init", "-q", str(cwd))
+            git(cwd, "add", "-A")
+            git(cwd, "commit", "-q", "-m", "the step's checkout")
         script = self.tmp / f"{name}-step.sh"
+        # py: the step's summary line (-c) prints nothing; its attempt record is the real checker's; its
+        # check is PY's.
         script.write_text('set -uo pipefail\nOUT="$1"\nGATE="$1"\nlog() { echo "$*"; }\n'
                           'gate_identity() { echo identity; }\nsha256sum() { cat > /dev/null; }\n'
-                          f'py() {{ [ "$1" != -c ] || return 0; "$REALPY" "$REALGATE" {py}; }}\n' + body + "\n",
+                          'py() { [ "$1" != -c ] || return 0; [ "${2:-}" != attempt ] || { "$REALPY" "$REALGATE" "${@:2}"; return; }; '
+                          f'"$REALPY" "$REALGATE" {py}; }}\n' + body + "\n",
                           encoding="utf-8", newline="\n")
         return subprocess.run([bash, script.as_posix(), self.out.as_posix()], cwd=cwd, capture_output=True, text=True,
                               timeout=120, env=isolation.inherit("NRESE_", "FLEET_", "CARGO_",
@@ -535,13 +646,41 @@ class ResultInvalidation(Scratch):
                 self.assertNotEqual(done.returncode, 0, f"SPEC {name}: an earlier result held\n{done.stdout}{done.stderr}")
                 self.assertIn(f"{name}: the earlier result", done.stdout + done.stderr)
 
+    def test_a_locked_earlier_result_is_refused_by_the_verdict_after_its_step_fails(self):
+        # Spec: fix check r2, R2 (IB1254-0ebf; the orchestrator's design of 13:01): an earlier complete
+        # passing result of this very candidate, held by a reader without delete sharing; its step fails
+        # before anything runs; the actual verdict CLI on what the results directory then holds refuses
+        # it: a stale result from an earlier attempt. Today it passes, exit 0.
+        a = self.repo.commit()
+        tree = self.repo.tree(a)
+        earlier = "0" * 32
+        for name, py in (("guards", 'guards --run --identity identity --attempt x --names "$OUT/no-names" '
+                                    '--log "$OUT/guards/test.log" --json "$OUT/guards.json"'),
+                         ("w3c", 'w3c "$OUT/w3c" --expected "$OUT/no-expected" --run --identity identity '
+                                 '--attempt x --json "$OUT/w3c.json"')):
+            with self.subTest(name):
+                w3c, guards = checks(a, tree)
+                for kind, result in (("w3c", w3c), ("guards", guards)):
+                    if kind == name:
+                        with_attempt(result, earlier)
+                    (self.out / f"{kind}.json").write_text(json.dumps(result), encoding="utf-8")
+                    (self.out / f"{kind}.attempt.json").write_text(
+                        json.dumps(attempt_record(kind, result["attempt"], tree)), encoding="utf-8")
+                with undeletable(self.out / f"{name}.json"):
+                    done = self.step(name, py)
+                self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                judged = verdict_on(self.repo.path, a, self.tmp, rounds(a), self.out / "w3c.json",
+                                    self.out / "guards.json")
+                self.assertEqual(judged.returncode, 1, f"SPEC {name}: the earlier result refused\n{judged.stdout}")
+                self.assertIn(f"{name}: stale result from an earlier attempt", judged.stdout)
+
     def test_the_checker_s_failed_removal_is_a_crash_not_a_judged_result(self):
         # Spec: fix check r1: the checker exits 0 (passed) or 1 (not passed) only with its own published
         # result; an earlier result it can't remove exits 3.
-        for name, args in (("guards", ["guards", "--run", "--identity", IDENTITY, "--names", "no-names",
-                                       "--log", "test.log", "--json", "guards.json"]),
+        for name, args in (("guards", ["guards", "--run", "--identity", IDENTITY, "--attempt", ATTEMPT,
+                                       "--names", "no-names", "--log", "test.log", "--json", "guards.json"]),
                            ("w3c", ["w3c", "logs", "--expected", "no-expected", "--run", "--identity", IDENTITY,
-                                    "--json", "w3c.json"])):
+                                    "--attempt", ATTEMPT, "--json", "w3c.json"])):
             with self.subTest(name):
                 earlier = self.tmp / f"{name}.json"
                 earlier.write_text("{}", encoding="utf-8")
