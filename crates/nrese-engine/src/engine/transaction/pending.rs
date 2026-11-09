@@ -298,6 +298,8 @@ impl Pending {
         &mut self,
         quad: EncodedQuad,
     ) -> EngineResult<bool> {
+        // A write, refused or not: the kept pending snapshot goes (DUR-6).
+        self.changed();
         let Some(charge) = &mut self.charge else {
             return Ok(self.insert_asserted(quad));
         };
@@ -314,6 +316,7 @@ impl Pending {
         &mut self,
         quad: EncodedQuad,
     ) -> EngineResult<bool> {
+        self.changed();
         let Some(charge) = &mut self.charge else {
             return Ok(self.remove_asserted(quad));
         };
@@ -335,6 +338,7 @@ impl Pending {
         &mut self,
         pattern: &QuadPattern,
     ) -> EngineResult<u64> {
+        self.changed();
         let Self {
             base,
             asserted,
@@ -916,6 +920,28 @@ mod tests {
         }
         covers(&pending);
         assert_eq!(pending.asserted.counts(), (3000, 2000));
+    }
+
+    /// The charged changes are writes: a pending snapshot kept before one (DUR-6's memo) is not
+    /// what the transaction gives after it, which shows the change.
+    #[test]
+    fn a_charged_change_lets_the_kept_snapshot_go() {
+        let (engine, base) = committed(10);
+        let budget = Arc::new(Budget::unlimited());
+        let mut tx = engine.transaction();
+        tx.charge_pending_to(Arc::clone(&budget)).unwrap();
+        let seen = |tx: &crate::Transaction<'_>| {
+            tx.pending_snapshot_within(&budget)
+                .unwrap()
+                .len_in(ReadModel::Asserted)
+        };
+        assert_eq!(seen(&tx), 10);
+        assert!(tx.try_remove_encoded(base[0]).unwrap());
+        assert_eq!(seen(&tx), 9, "after a charged removal");
+        assert_eq!(tx.remove_matching(&QuadPattern::all()).unwrap(), 9);
+        assert_eq!(seen(&tx), 0, "after a removal of what matches");
+        assert!(tx.try_insert_encoded(base[0]).unwrap());
+        assert_eq!(seen(&tx), 1, "after a charged insert");
     }
 
     /// A refused charged insert interns nothing: its room is charged before its terms are.

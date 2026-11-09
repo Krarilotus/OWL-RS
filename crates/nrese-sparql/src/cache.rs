@@ -111,7 +111,9 @@ pub fn term_heap(term: &Term) -> usize {
         Term::Literal(l) => {
             l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
         }
-        Term::Triple(t) => 3 * std::mem::size_of::<Term>() + t.to_string().len(),
+        // Its box and what that holds, counted without writing the term out (D16-039: a
+        // nested term's text written out only to be sized was itself an uncharged copy).
+        Term::Triple(_) => term.heap_bytes(),
     }
 }
 

@@ -17,6 +17,7 @@ mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
 mod canonical;
+mod decode_cache;
 mod equality;
 mod equijoin;
 mod estimate;
@@ -1298,7 +1299,8 @@ struct Context<'a> {
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
-    decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// Stored terms decoded once, charged to `budget` while kept ([`decode_cache`]).
+    decoded: RefCell<decode_cache::DecodeCache>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
     decodes: AtomicU64,
@@ -1535,7 +1537,12 @@ impl<'a> Context<'a> {
             aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
-            decoded: RefCell::default(),
+            // One thread fills it, with no sibling grant: the whole spare.
+            decoded: RefCell::new(decode_cache::DecodeCache::new(
+                &budget,
+                DECODE_CACHE_ENTRIES,
+                1,
+            )),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
@@ -1791,15 +1798,14 @@ impl<'a> Context<'a> {
             return self.computed.borrow().get(index as usize).cloned();
         }
         let mut decoded = self.decoded.borrow_mut();
-        if let Some(term) = decoded.get(&id) {
+        if let Some(term) = decoded.get(id) {
             return term.clone();
         }
         self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
-        if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
-        }
+        // Bounded: a scan over millions of distinct labels must not keep them all; and charged
+        // while kept (D16-039).
+        decoded.keep(id, &term);
         term
     }
 
@@ -4551,14 +4557,14 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let snapshot: &Snapshot = &self.snapshot;
-        let decodes = &self.decodes;
+        let (decodes, budget) = (&self.decodes, &self.budget);
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes);
+                let decoder = Decoder::new(snapshot, computed, decodes, budget);
                 let range =
                     i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
                 Some(mask.rows(range, &|id| decoder.term(id)))
@@ -4709,7 +4715,7 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
-        let decodes = &self.decodes;
+        let (decodes, budget) = (&self.decodes, &self.budget);
         // A part's aggregates and their charge; `Err(None)` once cancelled.
         type Part = Result<(Vec<Vec<Agg>>, usize), Option<BudgetExceeded>>;
         let parts: Vec<Part> = bounds
@@ -4718,7 +4724,7 @@ impl<'a> Context<'a> {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return Err(None);
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes);
+                let decoder = Decoder::new(snapshot, computed, decodes, budget);
                 let term = |id: u64| decoder.term(id);
                 let kept = aggregate::Kept::new(shared);
                 let aggregator = Aggregator {
@@ -5513,11 +5519,11 @@ impl<'a> Context<'a> {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
                 let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
-                let decodes = &self.decodes;
+                let (decodes, budget) = (&self.decodes, &self.budget);
                 missing
                     .par_chunks(PARALLEL_EXPRESSION_ROWS)
                     .flat_map_iter(|part| {
-                        let decoder = Decoder::new(snapshot, computed, decodes);
+                        let decoder = Decoder::new(snapshot, computed, decodes, budget);
                         let term = |id: u64| decoder.term(id);
                         let aggregator = Aggregator {
                             evaluator,
@@ -5767,37 +5773,45 @@ const PARALLEL_EXPRESSION_ROWS: usize = 1 << 13;
 const DECODER_CACHE_ENTRIES: usize = 1 << 12;
 
 /// Term decoding for one task of a parallel operator: the snapshot, the query's computed
-/// terms (read-only meanwhile), and a small cache of its own.
+/// terms (read-only meanwhile), and a small cache of its own, charged to the query's budget
+/// while kept ([`decode_cache`]).
 struct Decoder<'a> {
     snapshot: &'a Snapshot,
     computed: &'a [Term],
-    cache: RefCell<HashMap<u64, Option<Term>>>,
+    cache: RefCell<decode_cache::DecodeCache>,
     /// The query's count of decoded terms ([`Context::decodes`]).
     decodes: &'a AtomicU64,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(snapshot: &'a Snapshot, computed: &'a [Term], decodes: &'a AtomicU64) -> Self {
+    fn new(
+        snapshot: &'a Snapshot,
+        computed: &'a [Term],
+        decodes: &'a AtomicU64,
+        budget: &Arc<Budget>,
+    ) -> Self {
         Self {
             snapshot,
             computed,
-            cache: RefCell::default(),
+            // As many fill theirs at once as the pool has threads.
+            cache: RefCell::new(decode_cache::DecodeCache::new(
+                budget,
+                DECODER_CACHE_ENTRIES,
+                rayon::current_num_threads(),
+            )),
             decodes,
         }
     }
 
     fn term(&self, id: u64) -> Option<Term> {
-        if let Some(term) = self.cache.borrow().get(&id) {
+        if let Some(term) = self.cache.borrow().get(id) {
             return term.clone();
         }
         if id != UNDEF && computed_index(id).is_none() {
             self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let term = decode(self.snapshot, self.computed, id);
-        let mut cache = self.cache.borrow_mut();
-        if cache.len() < DECODER_CACHE_ENTRIES {
-            cache.insert(id, term.clone());
-        }
+        self.cache.borrow_mut().keep(id, &term);
         term
     }
 }
