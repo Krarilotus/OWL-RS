@@ -233,8 +233,38 @@ pub(crate) fn introduced(
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
         return Ok(None);
     };
-    let before = tx.base();
-    let after = tx.pending_snapshot();
+    let changed = || {
+        tx.inserted()
+            .chain(tx.deleted())
+            .chain(
+                tx.inferred_inserted()
+                    .chain(tx.inferred_deleted())
+                    .map(nrese_engine::EncodedTriple::in_default_graph),
+            )
+            .collect()
+    };
+    introduced_in(
+        tx,
+        tx.base(),
+        &tx.pending_snapshot(),
+        shapes_id,
+        changed,
+        |_| true,
+        resources,
+    )
+}
+
+/// [`introduced`] over the views `before` and `after` of the commit in `tx`, with the
+/// `changed` quads of the views; `None` also for shapes `validated` refuses.
+fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
+    tx: &Transaction<'_>,
+    before: &A,
+    after: &B,
+    shapes_id: TermId,
+    changed: impl FnOnce() -> Vec<EncodedQuad>,
+    validated: impl Fn(&Shapes) -> bool,
+    resources: &Resources,
+) -> StoreResult<Option<ValidationReport>> {
     let data = Selection::of(GraphSelector::Any).excluding(shapes_id);
     let shapes_selection = Selection::asserted(GraphSelector::Exact(shapes_id));
     let shapes_changed = tx
@@ -242,13 +272,16 @@ pub(crate) fn introduced(
         .chain(tx.deleted())
         .any(|quad| quad.graph == shapes_id);
     if shapes_changed {
-        let shapes_after = compile(&after, shapes_selection).map_err(shapes_error)?;
+        let shapes_after = compile(after, shapes_selection).map_err(shapes_error)?;
         // Shapes that didn't compile before had no results.
         let shapes_before = compile(before, shapes_selection).ok();
+        if !validated(&shapes_after) || shapes_before.as_ref().is_some_and(|s| !validated(s)) {
+            return Ok(None);
+        }
         let report = validate_shapes_change(
             before,
             shapes_before.as_ref(),
-            &after,
+            after,
             &shapes_after,
             data,
             resources,
@@ -257,21 +290,67 @@ pub(crate) fn introduced(
     }
     let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
     // A shapes graph with only `sh:entailment` still makes every validation fail.
-    if shapes.is_vacuous() {
+    if shapes.is_vacuous() || !validated(&shapes) {
         return Ok(None);
     }
-    let changed: Vec<EncodedQuad> = tx
-        .inserted()
-        .chain(tx.deleted())
-        .chain(
-            tx.inferred_inserted()
-                .chain(tx.inferred_deleted())
-                .map(nrese_engine::EncodedTriple::in_default_graph),
-        )
-        .collect();
     Ok(Some(validate_changes(
-        before, &after, &shapes, data, &changed, resources,
+        before,
+        after,
+        &shapes,
+        data,
+        &changed(),
+        resources,
     )?))
+}
+
+/// The SHACL reason a restricted committer's view shows: the results the commit introduces
+/// in the statements asserted in graphs it may read, against the shapes of the shapes
+/// graph, if it may read that ([`crate::mutation::evidence::Readable`]). `None` if there
+/// are none, that isn't known within `resources`, or the shapes use SHACL-SPARQL, whose
+/// queries the view can't confine (D16-065).
+pub(crate) fn view_reason(
+    view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    shapes_graph: &str,
+    rejects: impl Fn(&nrese_shacl::ValidationResult) -> bool,
+    resources: &Resources,
+) -> Option<crate::mutation::evidence::Draft> {
+    let tx = view.tx();
+    let shapes_id = tx.lookup(graph_iri(shapes_graph).ok()?.as_ref().into())?;
+    if !view.graph(shapes_id) {
+        return None;
+    }
+    let after = tx.pending_snapshot();
+    let (before, after) = (view.readable(tx.base())?, view.readable(&after)?);
+    let changed = || {
+        tx.inserted()
+            .chain(tx.deleted())
+            .filter(|quad| view.graph(quad.graph))
+            .collect()
+    };
+    let report = introduced_in(
+        tx,
+        &before,
+        &after,
+        shapes_id,
+        changed,
+        |shapes| !shapes.uses_sparql(),
+        resources,
+    )
+    .ok()??;
+    let rejecting: Vec<_> = report.results.iter().filter(|r| rejects(r)).collect();
+    let first = rejecting.first()?;
+    let reason = format!(
+        "the commit introduces {} SHACL result(s) the gate rejects; first: focus node {}, {}",
+        rejecting.len(),
+        first.focus_node,
+        first.component
+    );
+    Some(crate::mutation::evidence::shown(
+        reason,
+        first.component.as_str(),
+        first.focus_node.to_string(),
+        Vec::new(),
+    ))
 }
 
 impl StoreService {
