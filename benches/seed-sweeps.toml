@@ -51,7 +51,10 @@ crate = "nrese-reasoner"
 lib = true
 filters = ["representatives_expand_to_the_replicated_closure", "every_maintenance_plan_keeps_the_stack_equal_to_recomputation", "delta_equals_rematerialisation_under_random_changes",
            "closed_families_skip_their_own_output_exactly", "in_place_drivers_visit_what_a_scan_visits",
-           "list_rules_follow_list_edits_under_the_delta_executor"]
+           "list_rules_follow_list_edits_under_the_delta_executor", "every_profile_batch_equals_naive",
+           "equality_gives_lists_several_member_sequences", "hidden_unnamed_classes_leave_the_rest_of_the_closure",
+           "guarded_maintenance_equals_rematerialisation_over_representatives", "delta_equality_equals_rematerialisation",
+           "materialisation_stops_when_asked", "batch_equals_naive_on_random_ontologies"]
 
 [[target]]
 crate = "nrese-server"
