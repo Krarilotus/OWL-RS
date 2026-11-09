@@ -216,3 +216,61 @@ fn system_vocabulary_is_appended_to_the_shared_dictionary() {
 fn terms(engine: &Engine) -> u64 {
     engine.stats().dictionary.terms
 }
+
+/// `PendingView::quads_for_pattern_in`'s scan returned through a signature that captures the
+/// transaction's borrow only, as `ReadView::quads_for_pattern_in` does (V2's generic `ReadView`
+/// delegates to it). Doesn't compile (E0700) if the trait's iterator captures the pattern's
+/// borrow too.
+fn scan_of<'a, T: PendingView>(
+    tx: &'a T,
+    pattern: &crate::QuadPattern,
+) -> impl Iterator<Item = crate::EncodedQuad> + use<'a, T> {
+    tx.quads_for_pattern_in(ReadModel::Asserted, pattern)
+}
+
+/// [`scan_of`] read after its pattern is dropped.
+fn asserted_after_the_pattern<T: PendingView>(tx: &T) -> Vec<crate::EncodedQuad> {
+    let scan = {
+        let pattern = crate::QuadPattern::all();
+        scan_of(tx, &pattern)
+    };
+    scan.collect()
+}
+
+/// The trait's scan, a pending change included, through both transaction kinds.
+///
+/// - Input: the engine of `ex:a ex:p "one"`; a write transaction and a private one, each
+///   asserting `ex:b ex:p "two"`; each scanned through the trait after its pattern is dropped.
+/// - Expected: both statements from each, decoded through its own transaction.
+#[test]
+fn a_pending_scan_outlives_its_pattern() {
+    let engine = engine();
+    let expected = {
+        let mut both = vec![quad("a", "one"), quad("b", "two")];
+        both.sort_by_key(ToString::to_string);
+        both
+    };
+    let decoded = |quads: Vec<crate::EncodedQuad>,
+                   decode: &dyn Fn(crate::EncodedQuad) -> Option<Quad>| {
+        let mut out: Vec<Quad> = quads.into_iter().map(|q| decode(q).unwrap()).collect();
+        out.sort_by_key(ToString::to_string);
+        out
+    };
+    let mut private = engine.speculative(Arc::new(Budget::unlimited()));
+    assert!(private.try_insert(quad("b", "two").as_ref()).unwrap());
+    let scanned = asserted_after_the_pattern(&private);
+    assert_eq!(
+        decoded(scanned, &|q| private.decode_quad(q)),
+        expected,
+        "private"
+    );
+    drop(private);
+    let mut writer = engine.transaction();
+    assert!(writer.insert(quad("b", "two").as_ref()));
+    let scanned = asserted_after_the_pattern(&writer);
+    assert_eq!(
+        decoded(scanned, &|q| writer.decode_quad(q)),
+        expected,
+        "write"
+    );
+}
