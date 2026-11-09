@@ -823,7 +823,12 @@ fn store_answer(store: &StoreService, query: &str) -> (Vec<Vec<usize>>, Complete
     (rows, completeness)
 }
 
-fn store(turtle: &str, dir: &std::path::Path, ruleset: Ruleset, ql: bool) -> StoreService {
+pub(crate) fn store(
+    turtle: &str,
+    dir: &std::path::Path,
+    ruleset: Ruleset,
+    ql: bool,
+) -> StoreService {
     let file = dir.join("case.ttl");
     std::fs::write(&file, turtle).unwrap();
     let store = StoreService::new(StoreConfig {

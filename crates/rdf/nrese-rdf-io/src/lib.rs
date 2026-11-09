@@ -23,6 +23,17 @@ mod serializer;
 mod text;
 mod turtle;
 
+// The split tests' documents and comparison, shared with the integration tests (`tests/it`),
+// which name this crate `nrese_rdf_io`: the crate's test of each cut alone reads them too.
+#[cfg(test)]
+extern crate self as nrese_rdf_io;
+#[cfg(test)]
+#[path = "../tests/it/oracle.rs"]
+mod oracle;
+#[cfg(test)]
+#[path = "../tests/it/recovery_inputs.rs"]
+mod recovery_inputs;
+
 pub use error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 pub use format::RdfFormat;
 pub use ntriples::parse_term;

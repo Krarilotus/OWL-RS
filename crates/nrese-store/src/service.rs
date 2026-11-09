@@ -230,12 +230,19 @@ impl StoreService {
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
+        // So does what client transactions keep between requests.
+        let sessions = crate::sessions::Sessions::within(
+            std::sync::Arc::new(
+                nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+            ),
+            crate::sessions::SESSION_IDLE,
+        );
         let service = Self {
             process_memory,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
-            sessions: std::sync::Arc::default(),
+            sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),
@@ -457,12 +464,14 @@ impl StoreService {
             return Ok(());
         }
         if let Some(path) = self.marker_path() {
-            match std::fs::remove_file(&path) {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            match crate::metadata::remove(&path) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    // The file may still be there: the next invalidation tries again (the
-                    // review of 3 October 2026, A4).
+                    // The file may still be there, or its removal not durable: the next
+                    // invalidation tries again (the review of 3 October 2026, A4).
                     self.marker.store(true, Ordering::Release);
                     return Err(crate::error::StoreError::Io(error));
                 }
@@ -478,11 +487,15 @@ impl StoreService {
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, text).map_err(crate::error::StoreError::Io)?;
-        std::fs::rename(&temporary, &path).map_err(crate::error::StoreError::Io)?;
+        // "A marker may be in place", before anything is written (fix check r1, R2-F2): a
+        // publication that fails after its rename leaves the marker under its name, and the
+        // next invalidation must remove it, or refuse, not skip it.
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
+        // Synced and durably named, the store's path included (DUR-3; fix check DEFER-F1): read
+        // at open, a marker lost or short after a power loss would misstate what the inferred
+        // stack is exact for.
+        crate::metadata::write(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -724,6 +737,11 @@ impl StoreService {
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        } else if let Some(state) = self.reasoning_state() {
+            // Off: the rewriting the closure and the setting call for, whatever came first
+            // (a change from `owl2-dl` to `owl2-rl` sets its QL rewriting before its write
+            // path, which switches the bounds off, exists).
+            self.note_ql(&state);
         }
     }
 
@@ -1011,16 +1029,29 @@ impl StoreService {
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
     }
 
-    /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
-    /// without reasoning, or for asserted statements only): sound, and complete only for
-    /// what the ruleset derives, never certain answers under OWL 2 DL. Known before the
-    /// query runs.
+    /// The status of answers that don't go through the DL bounds; known before the query
+    /// runs. `None` only where no reasoning path can leave answers out: asserted statements
+    /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
+    /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
+    /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
+    /// rules' closure without the bounds ([`Self::dl_mode`]): sound only, never complete
+    /// (SYN-72 slice 2 r1 F1).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        if self.dl.active() || prepared.read_model() == ReadModel::Asserted {
+        if prepared.read_model() == ReadModel::Asserted {
             return None;
+        }
+        if self.dl.active() {
+            let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+            status.incomplete(
+                "dl",
+                "a read of the inferred statements alone: the rules' closure, without the DL \
+                 bounds; certain answers under OWL 2 DL may be missing"
+                    .to_owned(),
+            );
+            return Some(status);
         }
         let ruleset = self
             .materialised
@@ -1292,6 +1323,9 @@ impl StoreService {
         // read as the reader may; what they change is checked at the commit (the view is
         // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
+        // What the operations' transfers reserve of the pending changes is the reading
+        // query's too.
+        tx.charge_pending_to(std::sync::Arc::new(memory.part()))?;
         let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
@@ -2113,6 +2147,75 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::StoreService;
+    use crate::StoreConfig;
+    // The reasoning marker is written as the store's metadata: its directory sync, after the
+    // rename, fails through metadata's fault (`metadata::tests::FAIL_DIR_SYNC`).
+    use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
+
+    /// A reasoning marker whose publication failed after its rename is still cleared by the
+    /// next clear of the inferences (DUR-3 fix check r1, R2-F2). A rematerialisation under RDFS
+    /// of `a a C . C subClassOf D` publishes its inferences, renames its marker into place, and
+    /// the marker's directory sync then fails: `InferencesNotRecorded`. The inferences are
+    /// cleared; the store must no longer claim them current, then or after a reopen, and a later
+    /// RDFS rematerialisation derives `a a D`. Before the fix the marker stayed while the store
+    /// took it for gone, so the clear left it: after it, the store claimed RDFS current with no
+    /// inferences (a wrong `NotEntailed` for `a a D`).
+    #[test]
+    fn a_marker_whose_placement_failed_is_still_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.nt");
+        std::fs::write(
+            &data,
+            "<http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.com/C> .\n<http://example.com/C> \
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> .\n",
+        )
+        .unwrap();
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        // A bulk load invalidates the reasoning: the store takes no marker to be in place.
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![data],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .unwrap();
+        let program = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs)
+            .materialised_program()
+            .expect("RDFS reasons");
+        FAIL_MARKER_SYNC.set(true);
+        let refused = store.rematerialise(&program);
+        FAIL_MARKER_SYNC.set(false);
+        assert!(
+            matches!(refused, Err(crate::StoreError::InferencesNotRecorded(_))),
+            "{refused:?}"
+        );
+        store.clear_inferred().unwrap();
+        let mut wrong = Vec::new();
+        if store.reasoning_state().is_some() {
+            wrong.push("after the clear, the inferences are claimed current");
+        }
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        if store.reasoning_state().is_some() {
+            wrong.push("after a reopen, the inferences are claimed current");
+        }
+        store.rematerialise(&program).unwrap();
+        let answer = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        if !String::from_utf8_lossy(&answer.payload).contains("true") {
+            wrong.push("a later RDFS rematerialisation doesn't derive a a D");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
 
 #[cfg(test)]

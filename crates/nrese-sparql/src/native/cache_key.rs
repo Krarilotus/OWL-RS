@@ -66,7 +66,7 @@ impl Encoder {
     }
 
     fn iri(&mut self, iri: &str) -> Encoded {
-        if iri.starts_with(super::substitute::ALIAS) {
+        if nrese_sparql_syntax::internal::is_constant(iri) {
             return Err(Uncacheable);
         }
         self.tag(b'<');
@@ -82,9 +82,9 @@ impl Encoder {
     fn term(&mut self, term: &TermPattern) -> Encoded {
         match term {
             TermPattern::NamedNode(n) => self.iri(n.as_str())?,
-            // A blank node of a pattern is a variable the executor names `_bnode_…`.
+            // A blank node of a pattern is the variable the executor makes for it.
             TermPattern::BlankNode(b) => {
-                self.var(&Variable::new_unchecked(format!("_bnode_{}", b.as_str())));
+                self.var(&nrese_sparql_syntax::internal::blank_variable(b));
             }
             TermPattern::Literal(l) => self.display(b'"', l),
             TermPattern::Triple(t) => {
@@ -414,10 +414,20 @@ mod tests {
             "SELECT ?r { BIND(BNODE() AS ?r) }",
             "SELECT * { ?s ?p ?o FILTER EXISTS { ?s ?p ?x FILTER(?x < RAND()) } }",
             "SELECT * { SERVICE <http://example.com/sparql> { ?s ?p ?o } }",
-            "SELECT * { ?s ?p <urn:nrese:substituted-blank-node:b1> }",
         ] {
             assert!(key(query).is_none(), "{query}");
         }
         assert!(key("SELECT * { ?s ?p \"RAND()\" }").is_some());
+        // A constant put in for a blank node means this query's node: no key. An IRI that
+        // spells the namespace such constants were once written in is an IRI like another.
+        let put_in = GraphPattern::Bgp {
+            patterns: vec![TriplePattern {
+                subject: Variable::new_unchecked("s").into(),
+                predicate: nrese_rdf::NamedNode::new_unchecked("http://e/p").into(),
+                object: nrese_sparql_syntax::internal::blank_constant("b1").into(),
+            }],
+        };
+        assert!(Encoder::default().pattern(&put_in).is_err());
+        assert!(key("SELECT * { ?s ?p <urn:nrese:substituted-blank-node:b1> }").is_some());
     }
 }

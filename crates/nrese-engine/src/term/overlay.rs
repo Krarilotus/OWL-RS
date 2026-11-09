@@ -416,19 +416,22 @@ impl OverlayView {
         self.own_key(id).map(|key| f(view_key(key)))
     }
 
-    /// Calls `f` with a lookup of entry views, the dictionary's below `start` under one of its
-    /// read guards, its own from the frozen entries (no lock).
-    pub(crate) fn with_views<R>(
-        &self,
-        f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
-    ) -> R {
-        self.dictionary().with_views(self.start(), |shared| {
-            let both = |id: TermId| match self.is_own(id) {
-                true => self.own_key(id).map(view_key),
-                false => shared(id),
-            };
-            f(&both)
-        })
+    /// Own entry `id`'s view, from the frozen entries (no lock); `None` for an id below
+    /// `start`, which the dictionary answers (`Vocabulary::with_views` asks it under one of
+    /// its read guards).
+    #[inline]
+    pub(crate) fn own_view(&self, id: TermId) -> Option<Option<TermView<'_>>> {
+        self.is_own(id).then(|| self.own_entry_view(id))
+    }
+
+    /// Out of line, so a caller's loop over [`Vocabulary::with_views`] inlines one key decode
+    /// (the dictionary's), not two; with two, the decode itself moved out of the loop on the
+    /// shared path too (package 2b's B17 count).
+    ///
+    /// [`Vocabulary::with_views`]: super::resolve::Vocabulary::with_views
+    #[inline(never)]
+    fn own_entry_view(&self, id: TermId) -> Option<TermView<'_>> {
+        self.own_key(id).map(view_key)
     }
 
     pub(crate) fn decode_quad(&self, quad: crate::EncodedQuad) -> Option<nrese_rdf::Quad> {
