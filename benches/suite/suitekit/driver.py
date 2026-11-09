@@ -37,7 +37,7 @@ from pathlib import Path
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
 from . import hosts, ns
 from .answers import Recorder, capped_post
-from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
+from .runtime import (KINDS, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from . import receipts
 from .datasets import Store
@@ -76,7 +76,7 @@ def arguments(argv: list[str]) -> argparse.Namespace:
                    help="the shuffle seed; repetition r uses seed*1000+r, the same for every system")
     p.add_argument("--timeout-s", type=int, default=3600, help="per load (default 3600)")
     p.add_argument("--query-timeout-s", type=int, default=300, help="per query run (default 300)")
-    p.add_argument("--runtime", choices=["docker", "apptainer", "rootfs", "process"], default="docker")
+    p.add_argument("--runtime", choices=list(KINDS), default="docker")
     p.add_argument("--rootfs-dir", help="rootfs: the images unpacked for bubblewrap (benches/sparql/images.sh export)")
     p.add_argument("--sif-dir", help="Apptainer: the directory of the SIF images")
     p.add_argument("--data", help="the datasets: a directory, or volume:NAME with Docker (default volume:nrese-bench-data)")
@@ -400,7 +400,7 @@ class Suite:
     def build_nrese_in(self, nrese, ctx, tree: Path, log: Path) -> bool:
         if tree != Path(nrese.source(ctx)):
             self.built[nrese.key]["inputs"] = build_inputs(tree, "nrese")
-        if self.args.runtime == "docker":
+        if container_build("nrese", self.args.runtime):
             # Its own build volume, labelled, removed with the run; the Cargo registry is the
             # host's shared cache, never removed by a run.
             if nrese.target_volume not in self.made_volumes and \
@@ -410,10 +410,9 @@ class Suite:
             # Built in the pinned Rust image, as the scorecards do: the binary runs in it.
             # Half the cores, like scripts/cargo-guarded.sh: the machine stays usable.
             cpus = str(max(1, (os.cpu_count() or 2) // 2))
-            # Code for this machine's CPU, where the containers run (NRESE_TARGET_CPU, as
-            # scripts/lib/target-cpu.sh reads it; `portable` for none).
-            cpu = os.environ.get("NRESE_TARGET_CPU", "native")
-            rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
+            # Code for the CPU build_settings names (NRESE_TARGET_CPU; native unset), where the
+            # containers run: docker_rustflags, the flags suite.py coverage expects of a default build.
+            rustflags = docker_rustflags(build_settings(os.environ)["target_cpu"])
             # In the run's pinned id of its Rust image, as every container (ns.pin_images), never
             # its tag looked up again; a dry run's echo names the tag.
             tag = nrese.rust_image(ctx)
@@ -1093,14 +1092,12 @@ class Suite:
             rows = [receipts.csv_row(r) for r in self.written
                     if (r.workload, r.tier, r.system) == (plan.workload, plan.tier, key)]
             pair = summarise(rows).get((plan.workload, plan.tier, key))
-            compiled = isinstance(system, Nrese) or plan.kind == "cycle"
             scripted = set() if child else {tag for tag, _, _ in system.script_builds(ctx)}
             mine = receipts.unknown(f"a {plan.kind} plan's: its child's, not recorded here")
             out[cell] = {
                 **attempts[cell], "complete": True, "commit": receipts.unknown(moved) if moved else commit,
                 "dirty": entry["git"].get("dirty"),
-                "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
-                                            + (receipts.BUILD_PATHS if compiled or child else ())),
+                "code": receipts.object_ids(self.root, commit, receipt_code_paths(self.root, commit, system, plan)),
                 "images": mine if child else {
                     i: {"id": pins[i], "source": self.image_source(i, pins[i], i in scripted)} if pins.get(i) else
                        {"id": receipts.unknown("not in the run's pin map"),
@@ -1119,11 +1116,12 @@ class Suite:
     def build_receipt(self, system) -> dict:
         """What the cell's compiled programs were: built in this run from a checkout (its state when
         the build started), or unknown (--skip-build: whatever binary was there)."""
-        out = {"harness": receipts.unknown("--skip-build: the harness that was there") if self.args.skip_build
-               else self.built.get("harness") or receipts.unknown("not built in this run")}
-        if isinstance(system, Nrese):
-            out["nrese"] = (receipts.unknown("--skip-build: the binary that was there") if self.args.skip_build
-                            else self.built.get(system.key) or receipts.unknown("not built in this run"))
+        out = {}
+        for program in expected_programs(system):
+            what = "the harness" if program == "harness" else "the binary"
+            out[program] = (receipts.unknown(f"--skip-build: {what} that was there") if self.args.skip_build
+                            else self.built.get("harness" if program == "harness" else system.key)
+                            or receipts.unknown("not built in this run"))
         return out
 
     def data_receipt(self, plan, key: str) -> dict:
@@ -1521,6 +1519,32 @@ def checkout_moved(root: Path, start: dict) -> str:
     if start.get("dirty") == 0 and now.get("dirty") != 0:
         return f"checkout changed during the run: clean at its start, {now.get('dirty')} changed paths now"
     return ""
+
+
+def docker_rustflags(cpu: str) -> str:
+    """The RUSTFLAGS a Docker NRESE build compiles with for `cpu` (build_settings' target_cpu;
+    `portable` or empty: none)."""
+    return "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
+
+
+def container_build(program: str, runtime: str) -> bool:
+    """Whether `program` ("nrese", "harness") is built in a container under `runtime`: NRESE in
+    Docker, in its pinned Rust image; the harness always on the host."""
+    return program == "nrese" and runtime == "docker"
+
+
+def expected_programs(system) -> tuple[str, ...]:
+    """The programs a cell of `system` runs that the suite builds, the keys of its receipt's
+    `build`: the timing harness, and NRESE's server for an NRESE system."""
+    return ("harness", "nrese") if isinstance(system, Nrese) else ("harness",)
+
+
+def receipt_code_paths(root: Path, commit: str, system, plan) -> tuple[str, ...]:
+    """The repository paths a cell's receipt `code` names at `commit`: receipts.code_paths, and
+    BUILD_PATHS where the cell runs a compiled program (an NRESE server, or the harness: a cycle
+    plan's queries, or a kit or driver plan's child)."""
+    compiled = isinstance(system, Nrese) or plan.kind in ("cycle", "kit", "driver")
+    return receipts.code_paths(root, commit) + (receipts.BUILD_PATHS if compiled else ())
 
 
 def build_settings(env: Mapping[str, str]) -> dict[str, str]:

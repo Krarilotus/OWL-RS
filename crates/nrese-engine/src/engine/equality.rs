@@ -556,11 +556,7 @@ impl Classes {
 
 /// Whether `id` is a literal: any kind but IRIs, blank nodes and triple terms.
 fn is_literal(id: TermId) -> bool {
-    use crate::term::TermKind;
-    !matches!(
-        id.kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::Triple | TermKind::DefaultGraph
-    )
+    id.kind().is_literal()
 }
 
 enum Values<'a> {

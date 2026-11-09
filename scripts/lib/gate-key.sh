@@ -11,7 +11,7 @@
 #   inputs;
 # - file list: the hash of the files the tier was selected from (the pushed range's; none for
 #   `windows`, which runs everything);
-# - the toolchain rustc -vV reports (the tree's rust-toolchain.toml picks it; a host with
+# - the toolchain rustc +<the commit's channel> -vV reports (a host with
 #   another install or an override doesn't match), and the flags rustc gets
 #   (scripts/cargo-guarded.sh --print-rustflags: `-C target-cpu=native` means each machine's own
 #   CPU, recorded with the pass, not keyed);
@@ -28,9 +28,10 @@
 # written by scripts/check.sh only.
 
 # rustc-<release>-<commit> flags=<rustflags> tools=<id>, for the toolchain, flags and tools a
-# build here uses.
-gate_identity() {
-  local root info release commit flags tools
+# build of COMMIT uses, independently of the caller's checkout.
+gate_identity() (
+  local rev=${1:?gate_identity COMMIT} root channel info release commit flags tools
+  set -o pipefail
   # Cargo takes CARGO_ENCODED_RUSTFLAGS over RUSTFLAGS, and the identity (and what a fleet gate is
   # sent) names RUSTFLAGS only: a gate under it would stand for flags it never ran with (Sol,
   # review-remote-gates-r1-20261020). Refused, before any pass is looked up or run.
@@ -38,15 +39,21 @@ gate_identity() {
     echo "the gate doesn't run under CARGO_ENCODED_RUSTFLAGS (it overrides RUSTFLAGS): unset it, set RUSTFLAGS" >&2
     return 1
   fi
-  root=$(git rev-parse --show-toplevel)
-  info=$(cd "$root" && rustc -vV 2> /dev/null | tr -d '\r') || return 1
+  root=$(git rev-parse --show-toplevel) || return 1
+  channel=$(git show "$rev:rust-toolchain.toml" | tr -d '\r' | sed -n 's/^channel *= *"\(.*\)"/\1/p') || return 1
+  [ -n "$channel" ] || return 1
+  # Explicit selection ignores checkout/directory overrides; a missing channel fails without
+  # rustup installing it implicitly (the job owns toolchain installation and its deadline).
+  info=$(RUSTUP_AUTO_INSTALL=0 rustc "+$channel" -vV 2> /dev/null | tr -d '\r') || return 1
   release=$(printf '%s\n' "$info" | sed -n 's/^release: //p')
   commit=$(printf '%s\n' "$info" | sed -n 's/^commit-hash: //p')
   [ -n "$release" ] && [ -n "$commit" ] || return 1
-  flags=$(bash "$root/scripts/cargo-guarded.sh" --print-rustflags | tr -d '\r' | tr ' ' _)
-  tools=$(cat "$root/scripts/lib/gate-tools.txt" "$root/benches/suite/requirements.txt" | tr -d '\r' | git hash-object --stdin)
+  flags=$( . "$root/scripts/lib/gate-publish.sh"; effective_rustflags "$rev") || return 1
+  flags=$(printf '%s' "$flags" | tr -d '\r' | tr ' ' _)
+  tools=$({ git show "$rev:scripts/lib/gate-tools.txt" && git show "$rev:benches/suite/requirements.txt"; } \
+    | tr -d '\r' | git hash-object --stdin) || return 1
   printf 'rustc-%s-%s flags=%s tools=%s\n' "$release" "${commit:0:12}" "$flags" "${tools:0:12}"
-}
+)
 
 # The CPU `native` resolves to here (recorded with a pass).
 gate_cpu() {

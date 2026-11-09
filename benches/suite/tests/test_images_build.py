@@ -30,6 +30,7 @@ class Labels(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d).resolve() / "repo"
             isolation.checkout(root, "benches/sparql/images.sh", "scripts/lib/ns.sh", "benches/suite/suitekit/lock.py",
+                               "benches/suite/suitekit/dockerfile.py",
                                "benches/competitors/millenniumdb/Dockerfile", "benches/competitors/gcare/Dockerfile")
             context = "benches/competitors/" + args[0]
             if dockerfile is not None:
@@ -101,6 +102,7 @@ class Labels(unittest.TestCase):
             "absent": ("FROM a\nRUN x\n", ()),
             "empty": ("FROM a\nARG MDB_COMMIT=\nRUN x\n", ()),
             "two values": (first + "FROM b\nARG MDB_COMMIT=2222222222222222222222222222222222222222\n", ()),
+            "a value and an empty one": (first + "FROM b\nARG MDB_COMMIT=\n", ()),
             "absent, a commit given": ("FROM a\nRUN x\n", ("0123456789abcdef0123456789abcdef01234567",)),
         }
         for case, (dockerfile, given) in cases.items():
@@ -109,8 +111,26 @@ class Labels(unittest.TestCase):
                 self.assertIsNone(build)
                 self.assertIn("MDB_COMMIT", stderr)
         twice = first + "FROM b\nARG MDB_COMMIT=1111111111111111111111111111111111111111\n"  # twice, one value
-        build, _, _ = self.build("millenniumdb", dockerfile=twice)
-        self.assertIn("--label owlrs.source-commit=1111111111111111111111111111111111111111", build)
+        crlf = twice.replace("\n", "\r\n")  # a Dockerfile checked out with CRLF: the same one value
+        for case, dockerfile in (("twice", twice), ("crlf", crlf)):
+            with self.subTest(case):
+                build, _, _ = self.build("millenniumdb", dockerfile=dockerfile)
+                self.assertIn("--label owlrs.source-commit=1111111111111111111111111111111111111111 ", build)
+                self.assertIn("-t nrese-bench/millenniumdb:1111111 ", build)
+
+    def test_the_declared_commit_is_one_reader_s_for_images_sh_and_coverage(self):
+        """Design check r6 N1: images.sh's declared() is suitekit/dockerfile.py's, the reader suite.py
+        coverage judges an image's source commit against; its exact value, written here by hand."""
+        sys.path.insert(0, str(ROOT / "benches/suite"))
+        from suitekit.dockerfile import declared_source_commit
+        self.assertIn('ns_python "$NS_SUITE/suitekit/dockerfile.py"', (ROOT / "benches/sparql/images.sh").read_text())
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "Dockerfile"
+            path.write_bytes(b"FROM a\r\nARG MDB_COMMIT=ecbf6dde5a5864f088eee3b0836ad6adba1d623b\r\n"
+                             b"ARGS MDB_COMMIT=x\nARG MDB_COMMIT_2=y\n")
+            self.assertEqual(declared_source_commit(path, "MDB_COMMIT"), "ecbf6dde5a5864f088eee3b0836ad6adba1d623b")
+            with self.assertRaises(ValueError):
+                declared_source_commit(Path(d) / "missing", "MDB_COMMIT")
 
 
 if __name__ == "__main__":

@@ -257,7 +257,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `…/repositories/{id}/query`, `/update`, `/sparql` | SPARQL Protocol, as `/dataset/query`, `/dataset/update`, `/dataset` |
 | `…/repositories/{id}/data` | Graph Store Protocol (`?graph=` or `?default`), as `/dataset/data` |
 | `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification`, `/realisation` | as their `/dataset/…` counterparts |
-| `…/repositories/{id}/info`, `/summary`, `/reasoning`, `/service-description` | readiness and statistics, reasoning diagnostics, the service description |
+| `…/repositories/{id}/info`, `/summary`, `/reasoning`, `/service-description` | readiness and statistics (whole-dataset readers or administrators), operator summary, reasoning diagnostics, the service description |
 | `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore. The backup streams every asserted statement; `x-nrese-source-revision` and `x-nrese-quad-count` lead it, and its SHA-256 closes it as the comment `# nrese-sha256 <hex>` (over every byte before it) and follows it as the trailer `x-nrese-checksum-sha256` (announced in `Trailer`; HTTP/1.1 clients send `TE: trailers`). A restore checks that comment where present (`checksum_verified` in its answer) and refuses a mismatch with 400 before changing anything; a dump without one restores unchecked. A restore's body is at most the server's body limit: about 3 × `budgets.upload_size` + 64 KiB (about 384 MiB by default), held whole while it is parsed; larger answer 413. Store-sized backups restore offline: `nrese-server load --replace` for an export, `nrese-server restore DIR` for an image ([server-setup.md](server-setup.md) §5.4) |
 | `POST …/repositories/{id}/image` | An image backup into `backups/` of the data directory (administrators) |
 | `GET …/repositories/{id}/namespaces`, `PUT`/`DELETE …/namespaces/{prefix}` | The repository's prefixes (JSON object; the IRI as the `PUT` body); RDF4J's `/namespaces` reads the same |
@@ -329,10 +329,10 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 
 | URL | What |
 |---|---|
-| `/healthz`, `/readyz` | Liveness; readiness with revision, reasoning mode and consistency; under `owl2-dl` also `dl`: the consistency under OWL 2 DL as last checked (`consistent`, `inconsistent`, `unknown` with its `reason`), the `engine` that decided and the `revision` checked; `degraded` lists the repositories that can't serve (`"nrese: unavailable"`), while the server stays ready (200) for the others |
+| `/healthz`, `/readyz` | Public liveness; public readiness with only `status`: `ready` (200), `starting` or `quarantined` (503). Readiness never includes dataset diagnostics, even with credentials |
 | `/version` | Build, enabled surfaces, reasoning semantics |
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
-| `/dataset/info` | Statement and graph counts |
+| `/dataset/info` | Alias of `/api/v1/repositories/nrese/info`: detailed readiness, revision, statement and graph counts, consistency and violation counts; under `owl2-dl`, `dl` includes consistency, reason, engine and checked revision. Only whole-dataset readers or administrators (403 for restricted readers). `degraded` lists unavailable repositories while readiness stays 200 for the others |
 | `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. `limit` (default 10, at most 1000), `infer=false` for asserted statements only. The indexes are built at the first use |
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
 | `/metrics` | Prometheus metrics (below) |
@@ -344,6 +344,8 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `GET /api/v1/health` | Readiness and the state of every part (store, reasoning, access, jobs) |
 | `GET /api/v1/diagnostics` | How the server runs: memory, caches, the query budget, requests |
 | `GET /api/v1/ai/status`, `POST /api/v1/ai/query-suggestions` | AI query suggestions, where configured |
+
+Monitoring that needs figures or DL diagnostics should authenticate to `/api/v1/repositories/{id}/info` as a whole-dataset reader or administrator. With access enforcement off, the existing unrestricted access view preserves detailed `/info` responses, including for an unconfigured single-user server without credentials. `/readyz` remains status-only.
 
 **Routes of the earlier release** answer as before until the next release, with `Deprecation: @1790985600` (RFC 9745: since 3 October 2026) and `Link: <successor>; rel="successor-version"`:
 

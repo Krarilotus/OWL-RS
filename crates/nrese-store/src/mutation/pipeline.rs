@@ -4,7 +4,8 @@ use nrese_reasoner::ReasonerService;
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
-use super::error::{MutationError, MutationReject};
+use super::error::MutationError;
+use super::evidence;
 use super::record::ReasoningRunRecord;
 use super::ticket::MutationTicket;
 use crate::config::{GateSeverity, ShaclGate};
@@ -256,64 +257,63 @@ impl MutationPipeline {
                 materialisation.diagnostics_total,
                 "the commit leaves an ontology axiom unusable",
             );
+            // What a committer that may read only some graphs is told, whichever gate
+            // rejects ([`evidence`]): its view's reasons; the OWL 2 DL one on the DL gate's
+            // budget where the gate didn't run.
+            let resources = context.resources();
+            let dl_own_budget = |view: &evidence::EvidenceView<'_, '_>| {
+                crate::dl::gate::view_reason_on_its_budget(
+                    self.store.dl().active(),
+                    &self.store.config().dl,
+                    view,
+                    &stop,
+                    &envelope,
+                )
+            };
             if !violations.consistent() {
-                // The committer sees the premises asserted in graphs it may read; the
-                // others are withheld, and counted (graph access: nothing from a graph a
-                // reader can't read reaches it).
-                let readable = |fact: nrese_reasoner::ir::Triple| match &requester.read {
-                    crate::ReadScope::Graphs(access) => {
-                        crate::support::asserted(&tx, access, fact)
-                            == crate::support::Asserted::InReach
-                    }
-                    _ => true,
-                };
-                let restricted = matches!(requester.read, crate::ReadScope::Graphs(_));
                 // A list that stopped at its budget before its first entry has none to
-                // explain; the change is rejected all the same.
+                // explain; the change is rejected all the same. The operator's record
+                // holds the whole first violation, whoever committed.
                 let explanation = violations.first().map(|violation| {
-                    crate::reasoning::explain_violation(
-                        program,
-                        &violation,
-                        &tx,
-                        restricted
-                            .then_some(&readable as &dyn Fn(nrese_reasoner::ir::Triple) -> bool),
-                    )
+                    crate::reasoning::explain_violation(program, &violation, &tx, None)
                 });
                 let attribution = explanation.as_ref().and_then(|explanation| {
                     attribute_reject_delta(explanation, &MutationDeltaPreview::of(&tx))
                 });
-                let count = match violations.complete() {
-                    true => violations.at_least().to_string(),
-                    false => format!("at least {}", violations.at_least()),
-                };
-                let mut detail = match &explanation {
-                    Some(explanation) => format!(
-                        "mutation violates {count} consistency check(s); first: {}",
-                        explanation.summary
-                    ),
-                    None => format!("mutation violates {count} consistency check(s)"),
-                };
-                if !violations.complete() {
-                    detail.push_str(
-                        " (the list of violations stopped at the request's memory budget)",
-                    );
-                }
-                if let Some((s, p, o)) = attribution
-                    .as_ref()
-                    .and_then(super::attribution::RejectAttribution::likely_commit_trigger)
-                {
-                    detail.push_str(&format!(" Likely commit-local trigger: <{s}> <{p}> <{o}>."));
-                }
                 self.record_run(ReasoningRunRecord::from_report(
                     &materialisation,
                     explanation.clone(),
                     attribution.clone(),
                 ));
-                return Err(MutationError::Rejected(Box::new(MutationReject {
-                    detail,
-                    explanation,
-                    attribution,
-                })));
+                let full = || {
+                    let count = match violations.complete() {
+                        true => violations.at_least().to_string(),
+                        false => format!("at least {}", violations.at_least()),
+                    };
+                    let mut detail = match &explanation {
+                        Some(explanation) => format!(
+                            "mutation violates {count} consistency check(s); first: {}",
+                            explanation.summary
+                        ),
+                        None => format!("mutation violates {count} consistency check(s)"),
+                    };
+                    if !violations.complete() {
+                        detail.push_str(
+                            " (the list of violations stopped at the request's memory budget)",
+                        );
+                    }
+                    detail.push_str(&evidence::trigger(attribution.as_ref()));
+                    evidence::Draft {
+                        detail,
+                        explanation,
+                        attribution,
+                    }
+                };
+                let view = evidence::EvidenceView::new(&requester.read, &tx);
+                let reject = view.reject(full, |view| {
+                    self.view_reason(view, &dl_own_budget, &resources)
+                });
+                return Err(MutationError::Rejected(Box::new(reject)));
             }
             self.record_run(ReasoningRunRecord::from_report(
                 &materialisation,
@@ -321,35 +321,40 @@ impl MutationPipeline {
                 None,
             ));
             // The owl2-dl mode: the state the commit leaves, under OWL 2 DL.
-            let dl = self.store.dl().active().then(|| {
+            let mut dl = self.store.dl().active().then(|| {
                 let mut bounds = crate::dl::bounds::prepare(&self.store, &tx, &stop);
                 let gate = crate::dl::gate::check_commit(
                     &self.store,
                     &tx,
                     &stop,
                     &mut bounds,
-                    &requester.read,
+                    &evidence::EvidenceView::new(&requester.read, &tx),
+                    &|view, dl_gate_budget| self.view_reason(view, dl_gate_budget, &resources),
                     &envelope,
                 );
                 (gate, bounds)
             });
-            if let Some((gate, _)) = &dl
-                && let Some(detail) = &gate.reject
+            if let Some((gate, _)) = &mut dl
+                && let Some(reject) = gate.reject.take()
             {
-                return Err(MutationError::Rejected(Box::new(MutationReject {
-                    detail: detail.clone(),
-                    explanation: Some(nrese_reasoner::RejectExplanation {
-                        summary: detail.clone(),
-                        violated_constraint: "owl2-dl-consistency".to_owned(),
-                        focus_resource: String::new(),
-                        evidence: gate.evidence.clone(),
-                    }),
-                    attribution: None,
-                })));
+                return Err(MutationError::Rejected(Box::new(reject)));
             }
-            crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
-                .map_err(store_error)?;
-            self.shacl_gate(&tx, &context.resources(), store_error)?;
+            crate::shacl::check_shapes(
+                &tx,
+                &self.store.config().shapes_graph,
+                &evidence::EvidenceView::new(&requester.read, &tx),
+            )
+            .map_err(store_error)?;
+            // The view's OWL 2 DL reason is looked for even where the whole data is
+            // consistent: the RDF mapping isn't monotone (an annotation property declared in
+            // another graph changes what the view's statements say).
+            self.shacl_gate(
+                &tx,
+                &resources,
+                store_error,
+                &evidence::EvidenceView::new(&requester.read, &tx),
+                &|view| self.view_reason(view, &dl_own_budget, &resources),
+            )?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -402,8 +407,21 @@ impl MutationPipeline {
 
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
-        crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph).map_err(store_error)?;
-        self.shacl_gate(&tx, &context.resources(), store_error)?;
+        crate::shacl::check_shapes(
+            &tx,
+            &self.store.config().shapes_graph,
+            &evidence::EvidenceView::new(&requester.read, &tx),
+        )
+        .map_err(store_error)?;
+        // No OWL 2 reasoning: no OWL 2 reason to look for.
+        let resources = context.resources();
+        self.shacl_gate(
+            &tx,
+            &resources,
+            store_error,
+            &evidence::EvidenceView::new(&requester.read, &tx),
+            &|view| self.view_reason(view, &|_| None, &resources),
+        )?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
@@ -419,11 +437,15 @@ impl MutationPipeline {
     /// `resources` (its cancellation and envelope). A validation they stop fails the write
     /// as `stopped` maps it, under every policy: it is no verdict on the data, so neither a
     /// rejection nor a warning to commit past.
+    ///
+    /// A restricted committer is told what `restricted` tells of its view ([`evidence`]).
     fn shacl_gate(
         &self,
         tx: &nrese_engine::Transaction<'_>,
         resources: &nrese_sparql::Resources,
         stopped: impl FnOnce(StoreError) -> MutationError,
+        view: &evidence::EvidenceView<'_, '_>,
+        restricted: &dyn Fn(&evidence::EvidenceView<'_, '_>) -> evidence::Draft,
     ) -> Result<(), MutationError> {
         let gate = self.store.config().shacl_gate;
         if gate == ShaclGate::Off {
@@ -433,7 +455,11 @@ impl MutationPipeline {
             match crate::shacl::introduced(tx, &self.store.config().shapes_graph, resources) {
                 Ok(report) => report,
                 Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
-                Err(error) => return Err(MutationError::Gate(error.to_string())),
+                // The stored shapes' problems, as the committer may be told them.
+                Err(error) => {
+                    let error = view.shapes_error(&self.store.config().shapes_graph, error);
+                    return Err(MutationError::Gate(error.to_string()));
+                }
             };
         let Some(report) = report else {
             return Ok(());
@@ -441,11 +467,6 @@ impl MutationPipeline {
         if report.results.is_empty() && report.failures.is_empty() {
             return Ok(());
         }
-        let severity = |iri: &str| match iri {
-            "http://www.w3.org/ns/shacl#Info" => GateSeverity::Info,
-            "http://www.w3.org/ns/shacl#Warning" => GateSeverity::Warning,
-            _ => GateSeverity::Violation,
-        };
         let first = report.results.first().map_or_else(String::new, |result| {
             format!(
                 "; first: focus node {}, {}",
@@ -465,11 +486,13 @@ impl MutationPipeline {
                         .iter()
                         .any(|result| severity(result.severity.as_str()) >= least) =>
             {
-                Err(MutationError::Rejected(Box::new(MutationReject {
+                let full = || evidence::Draft {
                     detail,
                     explanation: None,
                     attribution: None,
-                })))
+                };
+                let reject = view.reject(full, restricted);
+                Err(MutationError::Rejected(Box::new(reject)))
             }
             _ => {
                 tracing::warn!("{detail} (SHACL gate: not rejected)");
@@ -478,9 +501,50 @@ impl MutationPipeline {
         }
     }
 
+    /// What a committer that may read only some graphs is told of a rejection, whichever
+    /// gate rejected ([`evidence`]): the first reason its own view shows, in the gates'
+    /// order. `dl`: the view's OWL 2 DL reason (`None` without the DL gate). Its OWL 2 RL
+    /// reason isn't looked for yet: that needs a bounded, charged ground program of its view
+    /// (Q07 S1b), so it is told the DL or SHACL reason its view shows, or none.
+    fn view_reason(
+        &self,
+        view: &evidence::EvidenceView<'_, '_>,
+        dl: &dyn Fn(&evidence::EvidenceView<'_, '_>) -> Option<evidence::Draft>,
+        resources: &nrese_sparql::Resources,
+    ) -> evidence::Draft {
+        dl(view).unwrap_or_else(|| self.view_reason_after_dl(view, resources))
+    }
+
+    /// What a restricted committer is told after the OWL 2 DL reason ([`evidence`]): the
+    /// SHACL reason its view shows, where the gate rejects on one, else that its view shows
+    /// none.
+    fn view_reason_after_dl(
+        &self,
+        view: &evidence::EvidenceView<'_, '_>,
+        resources: &nrese_sparql::Resources,
+    ) -> evidence::Draft {
+        let ShaclGate::Enforce(least) = self.store.config().shacl_gate else {
+            return evidence::nothing_shown();
+        };
+        let rejects =
+            |result: &nrese_shacl::ValidationResult| severity(result.severity.as_str()) >= least;
+        crate::shacl::view_reason(view, &self.store.config().shapes_graph, rejects, resources)
+            .unwrap_or_else(evidence::nothing_shown)
+    }
+
     fn record_run(&self, run: ReasoningRunRecord) {
         if let Ok(mut slot) = self.last_reasoning_run.write() {
             *slot = Some(run);
         }
+    }
+}
+
+/// A SHACL result's severity, as the gate's policy ranks it (a shape's own severity IRI
+/// ranks as a violation).
+fn severity(iri: &str) -> GateSeverity {
+    match iri {
+        "http://www.w3.org/ns/shacl#Info" => GateSeverity::Info,
+        "http://www.w3.org/ns/shacl#Warning" => GateSeverity::Warning,
+        _ => GateSeverity::Violation,
     }
 }
