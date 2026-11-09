@@ -264,6 +264,8 @@ fn no_public_method_commits_outside_the_pipeline() {
         // ... and the U1 a cold read keeps, before any commit (dictionary lifecycle V1, item 5).
         "nrese-store/src/dl/source_tests.rs",
         "nrese-store/src/query_executor_tests.rs",
+        // An access state from before ids, as an upgraded store holds it (SYN-64).
+        "nrese-store/src/access/tests/identity.rs",
     ];
     let mut commits = 0;
     for (name, text) in &files {

@@ -22,7 +22,12 @@ pub enum Admission<'s> {
 }
 
 /// The capability of an unpublished snapshot to keep derived state in its own version, one
-/// value per type, released when the version's last holder drops it. Every view of one
+/// value per type. The version holds each value until the version's last holder drops it;
+/// a value is released then only if nothing else holds it too. An `Arc<T>` a caller kept
+/// from [`get`](Self::get) or [`get_or_insert_with`](Self::get_or_insert_with) keeps the
+/// value (and its charges) alive past the version, and a value that holds its own version
+/// (a snapshot of it, directly or through what it keeps) is a cycle that is never released:
+/// a value keys by identity and never stores a [`Snapshot`] of its version. Every view of one
 /// version reaches the same value (`with_equality`, `stored`, the canonical views,
 /// `reading_within`), so a value keys what it holds by full
 /// [`SnapshotIdentity`](crate::SnapshotIdentity). The slots' lock is a leaf: held only to
@@ -67,7 +72,8 @@ impl<'s> OwnState<'s> {
         &self.snapshot.version.own
     }
 
-    /// The version's value of type `T`, if one was stored.
+    /// The version's value of type `T`, if one was stored. The `Arc` returned keeps the value
+    /// alive while it is held, past the version's last holder too ([`OwnState`]).
     pub fn get<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
         self.slots().get()
     }
@@ -76,6 +82,8 @@ impl<'s> OwnState<'s> {
     /// the slots' lock, so it may read the snapshot and its other slots; where two calls make
     /// one together, the first value stored is kept and returned to both, and the other is
     /// dropped. A value that may be refused is a container made empty, refusing inside it.
+    /// `make` must not capture a [`Snapshot`] of this version into the value: the value would
+    /// then hold its own version, and neither would be released ([`OwnState`]).
     pub fn get_or_insert_with<T: Send + Sync + 'static>(&self, make: impl FnOnce() -> T) -> Arc<T> {
         if let Some(value) = self.get() {
             return value;
@@ -88,7 +96,8 @@ impl<'s> OwnState<'s> {
 
 /// A version's own values, one per type ([`OwnState`]). Empty at every construction, and
 /// never copied to another version: an installed version is made as a value
-/// (`Versions::install`), so no snapshot can have filled it.
+/// (`Versions::install`), so no snapshot can have filled it. Dropped with the version;
+/// a value outlives it only through an `Arc` held elsewhere ([`OwnState`]).
 #[derive(Default)]
 pub(crate) struct OwnSlots(Mutex<Vec<(TypeId, Arc<dyn Any + Send + Sync>)>>);
 

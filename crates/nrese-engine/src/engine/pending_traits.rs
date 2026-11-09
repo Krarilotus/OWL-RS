@@ -6,8 +6,9 @@
 //!
 //! - **Sealed:** only this crate's two transaction kinds implement them.
 //! - **Every write can be refused** ([`crate::EngineError::MemoryLimit`]): a private
-//!   transaction's terms and changes are charged to its budget. A write transaction's never are
-//!   refused today, and answers `Ok` of what its inherent method answers.
+//!   transaction's terms and changes are charged to its budget. A write transaction answers
+//!   what its inherent method answers: `Ok` of it where that method can't be refused, and its
+//!   own result where it can (`remove_matching`, its pending growth charged since D16-039).
 //! - **A pending snapshot is made only against a budget:** there is no budget-free builder
 //!   here.
 //! - **Generic bounds, never `dyn`:** the iterator returns are `impl Iterator`, and every call
@@ -235,7 +236,7 @@ impl PendingWrite for Transaction<'_> {
 
     #[inline]
     fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
-        Ok(Transaction::remove_matching(self, pattern))
+        Transaction::remove_matching(self, pattern)
     }
 
     #[inline]

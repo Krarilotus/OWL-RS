@@ -51,6 +51,7 @@ use nrese_engine::{
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF};
 use nrese_rdf::{Literal, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, Function};
+use nrese_sparql_syntax::internal::blank_variable;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use rayon::prelude::*;
 
@@ -1616,7 +1617,7 @@ impl Context<'_> {
                 None => Side::Free(v.clone()),
             },
             TermPattern::BlankNode(b) => {
-                let v = Variable::new_unchecked(format!("_bnode_{}", b.as_str()));
+                let v = blank_variable(b);
                 match solutions.column(&v) {
                     Some(c) => Side::Bound(c),
                     None => Side::Free(v),
@@ -1649,7 +1650,7 @@ impl Context<'_> {
         // the columns, at most two wider than the rows joined.
         let named = |term: &TermPattern| match term {
             TermPattern::Variable(v) => size_of::<Variable>() + v.as_str().len(),
-            TermPattern::BlankNode(b) => size_of::<Variable>() + "_bnode_".len() + b.as_str().len(),
+            TermPattern::BlankNode(b) => size_of::<Variable>() + blank_variable(b).as_str().len(),
             _ => 0,
         };
         let most = solutions.vars.len() + 2;
@@ -1734,11 +1735,18 @@ impl Context<'_> {
         drop((s, o, line));
         self.consumed(solutions);
         self.check()?;
-        let table = match joined {
-            // No column: only the count of rows, which holds no memory.
-            0 => IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-            _ => charged_table(columns.into_iter()),
-        };
+        if joined == 0 {
+            // No column: only the count of rows, charged as rows without columns are
+            // ([`IdTable::memory_bytes`]); whoever consumes it releases that.
+            drop(columns);
+            drop(working);
+            return self.produced(Solutions {
+                vars,
+                table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                ordered: false,
+            });
+        }
+        let table = charged_table(columns.into_iter());
         drop(working);
         Ok(Solutions {
             vars,
@@ -1862,6 +1870,49 @@ mod tests {
     /// shape or R-tree entry. Over one graph the literals are as unscoped and a scope that
     /// shows the graph checks nothing; over several, a placement's graph is its run's, one
     /// run per graph and kind, and features within one graph cross nothing.
+    /// Spec (sol-loop r1 S2 of `pkg/zero-width-budget`): a relation with both sides
+    /// constant makes rows without columns, which count one id each
+    /// ([`IdTable::memory_bytes`]); its result is charged as every table is, so consuming
+    /// it leaves the query's other charges in place. 1,000 rows, each matching.
+    #[test]
+    fn rows_without_columns_of_a_relation_are_charged() {
+        let snapshot = snapshot_with(&[GraphName::DefaultGraph], |_| {
+            ("asWKT", "wktLiteral", "POINT(0 0)".to_owned())
+        });
+        let options = QueryOptions::default();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let g0 = TermPattern::NamedNode(node("urn:g0".to_owned()));
+        let relation = TriplePattern {
+            subject: g0.clone(),
+            predicate: NamedNodePattern::NamedNode(node(format!("{GEO}sfEquals"))),
+            object: g0,
+        };
+        // Another table of the query, live throughout.
+        let other = 1 << 20;
+        ctx.budget.charge(other).unwrap();
+        let rows = 1_000;
+        let input = ctx
+            .produced(Solutions {
+                vars: Vec::new(),
+                table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                ordered: false,
+            })
+            .ok()
+            .expect("room");
+        let joined = ctx
+            .spatial_join(input, &relation)
+            .ok()
+            .expect("the relation's rows");
+        assert_eq!(joined.table.len(), rows);
+        ctx.consumed(joined);
+        assert!(
+            ctx.budget.used() >= other,
+            "consuming the relation's rows released {} bytes of another table's charge",
+            other - ctx.budget.used()
+        );
+        ctx.budget.release(other);
+    }
+
     #[test]
     fn graphs_are_runs_not_marks() {
         let named = GraphName::NamedNode(NamedNode::new_unchecked("urn:graph"));
