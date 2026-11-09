@@ -369,14 +369,14 @@ impl OverlayView {
         self.dictionary().terms(Some(self)).decode(id)
     }
 
+    /// As [`Dictionary::decode_charged`]: `charge` called with no lock held, each call an
+    /// increment.
     pub(crate) fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        self.dictionary()
-            .terms(Some(self))
-            .decode_charged(id, charge)
+        self.dictionary().decode_charged_in(Some(self), id, charge)
     }
 
     pub(crate) fn decode_bound(&self, id: TermId) -> Option<usize> {

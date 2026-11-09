@@ -1023,7 +1023,6 @@ dependencies = [
  "memmap2",
  "nrese-exec",
  "nrese-rdf",
- "nrese-rdf-io",
  "nrese-vector",
  "parking_lot",
  "rayon",

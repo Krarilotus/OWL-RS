@@ -584,11 +584,21 @@ fn decoded(
     if id.kind() != TermKind::TypedLiteral {
         return Ok(None);
     }
+    // The decoder's charge comes in increments (more than one where a checkpoint came
+    // between its bound and its decode): their sum is the decoding's.
     let mut decoding = 0;
-    let term = snapshot.decode_charged(id, |bytes| {
-        decoding = bytes;
-        held.charge(bytes)
-    })?;
+    let decoded = snapshot.decode_charged(id, |bytes| {
+        held.charge(bytes)?;
+        decoding += bytes;
+        Ok::<(), BudgetExceeded>(())
+    });
+    let term = match decoded {
+        Ok(term) => term,
+        Err(refused) => {
+            held.release(decoding);
+            return Err(refused);
+        }
+    };
     let Some(Term::Literal(literal)) = &term else {
         held.release(decoding);
         return Ok(None);
