@@ -269,6 +269,46 @@ fn a_report_holds_its_computed_terms_once() {
     assert!(bytes < 6 << 20, "held {bytes} bytes");
 }
 
+/// An `rdf:XMLLiteral` nested 200,000 elements deep is well-balanced XML: `sh:datatype
+/// rdf:XMLLiteral` classifies it (no result) and the same with one end tag missing (one
+/// result), on the validation's ordinary threads. Run alone, in a process of its own: a
+/// classifier that recursed per element would overflow its stack, which ends the process
+/// and fails this test.
+#[test]
+fn a_deeply_nested_xml_literal_is_classified() {
+    if !measure::alone() {
+        return;
+    }
+    let depth = 200_000;
+    for (row, closed, results) in [("balanced", depth, 0), ("an end tag missing", depth - 1, 1)] {
+        let xml = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(closed));
+        let turtle = format!(
+            "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+             ex:a ex:v \"{xml}\"^^rdf:XMLLiteral .
+             ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+               sh:property [ sh:path ex:v ; sh:datatype rdf:XMLLiteral ] ."
+        );
+        let snapshot = load(&turtle);
+        let graph = snapshot
+            .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+            .expect("the shapes graph");
+        let shapes =
+            compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+        // The data is the same graph as the shapes.
+        let data = Selection::of(GraphSelector::Exact(graph));
+        let report = nrese_shacl::validate(
+            &snapshot,
+            &shapes,
+            data,
+            &nrese_sparql::Resources::default(),
+        )
+        .expect("nothing stops it");
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(report.results.len(), results, "{row}");
+    }
+}
+
 /// Doubling the values of each parameter at most doubles what compiling the shapes holds at
 /// once (it adds as many statements); built once per combination, it would hold eight times
 /// as much.

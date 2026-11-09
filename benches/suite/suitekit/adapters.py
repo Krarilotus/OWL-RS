@@ -47,6 +47,22 @@ from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, slic
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
+class DeclaredRuntime:
+    """A runtime that says only its kind and that it runs nothing: what an adapter's declarations
+    (images, builds, script_builds, rust_image) may ask of one. Anything else is an AttributeError."""
+    __slots__ = ("kind",)
+    dry = True
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+
+def declared_context(root: Path, kind: str) -> "Context":
+    """The context an adapter declares its images and builds in for runtime `kind`: `root`, no
+    settings (the defaults), never the environment (suite.py coverage: a receipt's own runtime)."""
+    return Context(DeclaredRuntime(kind), root, root, root, Mount("-", "/data"), [], 0, {}, "declared")
+
+
 def images_for(adapter, root: Path) -> list[str]:
     """The images an adapter's containers run, the pulled (`images`) and the built here (`builds`),
     as `suite.py images` asks: the pin set of the tools that pin them at their start
@@ -404,8 +420,10 @@ class Nrese(Adapter):
         return str(target / "release" / ("nrese-server.exe" if os.name == "nt" else "nrese-server"))
 
     def target_dir(self, ctx: Context) -> Path:
-        """The host build's output directory."""
-        return Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        """The host build's output directory; a relative CARGO_TARGET_DIR is the repository's (the
+        build runs in an export, removed after it: P1e sol-loop r1 S1)."""
+        target = Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        return target if target.is_absolute() else ctx.root / target
 
     def spec(self, ctx: Context, name: str, store: str, command: list[str], env: dict) -> Spec:
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}

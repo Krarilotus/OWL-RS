@@ -22,6 +22,8 @@ pub(crate) mod checkpoint;
 pub(crate) mod codec;
 #[cfg(test)]
 pub(crate) mod fault;
+#[cfg(test)]
+mod link_tests;
 mod lock;
 pub mod place;
 pub(crate) mod tail;
@@ -186,11 +188,11 @@ impl Durable {
         // an open does costs it a journal commit and a device flush (timing of 8 Nov,
         // deferred-sync design note). A root made: every level now, as a new store pays once.
         let found = root.is_dir();
-        let holders: Vec<PathBuf> = match found {
-            true => place::holders(root),
+        let mut named = match found {
+            true => Some(place::Named::resolve(root)?),
             false => {
                 place::create_dir_all(root)?;
-                Vec::new()
+                None
             }
         };
         // Whether the open changes the store on disk: then what it changed, and the names
@@ -262,11 +264,24 @@ impl Durable {
 
         let wal_dir = wal::wal_dir(root);
         // Named in the root: the root's sync after replay (or before the first durable write)
-        // names them.
-        changed |= place::create_store_dir(&wal_dir)?;
+        // names them. One found may itself be a link to a directory elsewhere (review r1,
+        // R1-L1): the names its resolution reads (the link's holder, its target's chain) join
+        // the holders, under the same found-level rule, as the store's records live there.
+        // Resolved from where the root's resolution ended (one walk of their common chain).
+        let mut internal = |dir: &Path| -> EngineResult<bool> {
+            let made = place::create_store_dir(dir)?;
+            if !made && let Some(named) = &mut named {
+                let name = dir
+                    .file_name()
+                    .expect("a store's internal directory has a name");
+                named.beyond(name)?;
+            }
+            Ok(made)
+        };
+        changed |= internal(&wal_dir)?;
         let archive = config.wal_archive.then(|| wal::archive_dir(root));
         if let Some(archive) = &archive {
-            changed |= place::create_store_dir(archive)?;
+            changed |= internal(archive)?;
         }
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
@@ -470,7 +485,25 @@ impl Durable {
         for path in &replayed {
             place::sync_file(path)?;
         }
-        let mut pending = wal::PendingNames::new(holders, [wal_dir.clone(), root.to_path_buf()]);
+        // The store's own directories keyed as the holders are (one directory, one key); a
+        // made root has no holders to meet.
+        let (holders, own) = match named {
+            Some(named) => {
+                let own = vec![
+                    (wal_dir.clone(), named.key(wal_dir.file_name())),
+                    (root.to_path_buf(), named.key(None)),
+                ];
+                (named.into_holders(), own)
+            }
+            None => (
+                Vec::new(),
+                vec![
+                    (wal_dir.clone(), wal_dir.clone()),
+                    (root.to_path_buf(), root.to_path_buf()),
+                ],
+            ),
+        };
+        let mut pending = wal::PendingNames::new(holders, own);
         if changed {
             pending.settle()?;
         }
@@ -529,7 +562,7 @@ fn replay(
         dictionary.restore_key(record.dictionary_start + offset as u64, key)?;
     }
     let asserted = match record.names_a_graph() {
-        true => version.asserted.with_quads_layout(),
+        true => version.asserted.with_quads_layout_alone(),
         false => version.asserted.clone(),
     };
     let runs = record.runs(asserted.layout());

@@ -399,12 +399,15 @@ impl Context<'_> {
     /// it.
     fn found(&self, search: &Search) -> NativeResult<Vec<nrese_engine::TextMatch>> {
         Ok(match self.search_in()? {
-            SearchIn::Global => self.snapshot.text_search(&search.query),
+            SearchIn::Global => self
+                .snapshot
+                .text_search(&search.query)
+                .map_err(crate::QueryEvaluationError::from)?,
             SearchIn::Reader(None) => Vec::new(),
             SearchIn::Reader(Some((_charge, scope))) => self
                 .snapshot
                 .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
-                .map_err(crate::QueryEvaluationError::MemoryLimit)?,
+                .map_err(crate::QueryEvaluationError::from)?,
         })
     }
 

@@ -64,9 +64,12 @@ the fixed text.
   quarantine, not its data) and is removed.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`
   `readmitted` with the commit's revision, or `discarded`; when; the repairs; the text
-  admitted where it isn't the quarantined one; a note). A record torn by a crash is
-  skipped: that resolution didn't happen (a re-admission's commit did, so the statement is
-  listed open again although its data is in: re-admitting it again adds nothing).
+  admitted where it isn't the quarantined one; a note). On open, an incomplete final
+  record is logged and truncated; a complete last record missing its newline gets a
+  synced delimiter before any append. Earlier complete records are kept. A re-admission's
+  RDF commit may have landed before its resolution record, leaving the statement listed
+  open although its data is in. Commit/journal atomicity and retry duplication, including
+  fresh blank nodes, are separate durability work.
 
 Both survive restarts; checkpoints and the WAL don't touch them. Image backups and
 restores carry the engine's files only, as for the namespaces: a restored store starts
