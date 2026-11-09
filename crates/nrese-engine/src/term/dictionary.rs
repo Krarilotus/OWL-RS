@@ -714,6 +714,31 @@ impl Dictionary {
         Self::find_key(&self.inner.read_recursive(), key, hash, kind, limit)
     }
 
+    /// [`Self::lookup_key_bounded`], what its probe allocates charged first through `charge`:
+    /// nothing where the base's keys are plain (the key is probed as it is), and where they are
+    /// compressed, [`key_lookup_bytes`]'s bound for a key of its length (the compressor's
+    /// output and the stored key it is copied into). The bound and the probe read one state of
+    /// the dictionary, under one read guard: a checkpoint can't publish a compressed base
+    /// between them (sol-loop e1 S1: a compressed base's bound charged on a plain one refused
+    /// interns the parent made).
+    pub(crate) fn lookup_key_charged<E>(
+        &self,
+        key: &[u8],
+        hash: u64,
+        kind: TermKind,
+        limit: u64,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        // Recursive: callers may hold a read lock already (`with_views`).
+        let inner = self.inner.read_recursive();
+        let compressed = inner.base.as_ref().is_some_and(|base| base.codec.is_some());
+        charge(match compressed {
+            true => key_lookup_bytes(key.len(), true),
+            false => 0,
+        })?;
+        Ok(Self::find_key(&inner, key, hash, kind, limit))
+    }
+
     /// `key`'s entry in `inner`, if it is below `limit`, as a `kind` id.
     fn find_key(
         inner: &Inner,

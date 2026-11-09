@@ -125,24 +125,28 @@ impl Overlay {
         if let TermRef::Triple(_) = term {
             return self.intern_with(term, &mut KeyBuffer::new(&self.budget));
         }
-        // One term: one charge for the probe and its key, which is freed before the charge is
-        // released (declared after it); no buffer is kept across terms.
+        // One term: its key charged first, and freed before the charge is released (declared
+        // after it); no buffer is kept across terms.
         let len = encoded_len(term);
-        let mut scratch = Reservation::new(&*self.budget);
-        scratch.charge(probe_bytes(len) + len)?;
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(len)?;
         let mut key = Vec::with_capacity(len);
         let kind = encode_key(term, &mut key);
         self.probe_or_own(&key, kind)
     }
 
     /// `key`'s id: the dictionary's below `start`, else this overlay's own, added if absent.
-    /// Encoded and hashed once for both.
+    /// Encoded and hashed once for both. The dictionary's probe is charged as the base it reads
+    /// needs ([`Dictionary::lookup_key_charged`]: nothing on a plain one), decided under the
+    /// probe's own guard, so a rebase between bound and probe can't escape it.
     fn probe_or_own(&self, key: &[u8], kind: TermKind) -> Result<TermId, BudgetExceeded> {
         let hash = key_hash(key);
-        if let Some(id) = self
+        let mut scratch = Reservation::new(&*self.budget);
+        let shared = self
             .dictionary
-            .lookup_key_bounded(key, hash, kind, self.start)
-        {
+            .lookup_key_charged(key, hash, kind, self.start, |bytes| scratch.charge(bytes))?;
+        drop(scratch);
+        if let Some(id) = shared {
             return Ok(id);
         }
         self.own(key, hash, kind)
@@ -180,12 +184,9 @@ impl Overlay {
             triple_key(ids, bytes);
             return self.own(bytes, key_hash(bytes), TermKind::Triple);
         }
-        // The probe of a key already made allocates no key of its own; its bound stays the
-        // larger of the two bases' (a compressed base's probe compresses the key).
-        let len = encoded_len(term);
-        let mut scratch = Reservation::new(&*self.budget);
-        scratch.charge(probe_bytes(len))?;
-        let bytes = key.room(len)?;
+        // The key made in the buffer (its growth charged there); the probe of a key already made
+        // charged as the base it reads needs ([`Self::probe_or_own`]).
+        let bytes = key.room(encoded_len(term))?;
         let kind = encode_key(term, bytes);
         self.probe_or_own(bytes, kind)
     }
