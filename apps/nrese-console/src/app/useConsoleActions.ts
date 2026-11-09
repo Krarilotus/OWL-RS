@@ -1,3 +1,5 @@
+import { useRef } from "react";
+
 import type { AppStrings } from "../i18n/types";
 import {
   deleteGraph,
@@ -31,13 +33,42 @@ type SuggestionState = {
 };
 
 export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs) {
+  // The output shows the newest action's result (SYN-72): each action takes the next
+  // number when it starts and writes only while no later one has started. Suggestion
+  // lists and the assistant's busy mark go by the newest suggestion alone.
+  const outputSequence = useRef(0);
+  const suggestionSequence = useRef(0);
+
   async function applyAction(
     title: string,
     operation: Promise<ResponseEnvelope>,
     setOutput: Setter<OutputState>,
     refresh = false,
   ) {
-    const response = await operation;
+    const ticket = ++outputSequence.current;
+    const newest = () => ticket === outputSequence.current;
+    let response: ResponseEnvelope;
+    try {
+      response = await operation;
+    } catch (error) {
+      if (newest()) {
+        setOutput({
+          title,
+          status: "error",
+          body: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return;
+    } finally {
+      // A finished change refreshes the runtime view whether its answer is shown or not.
+      if (refresh) {
+        void runtimeRefs.refetchRuntime();
+        void runtimeRefs.refetchCapabilities();
+      }
+    }
+    if (!newest()) {
+      return;
+    }
     const body = response.problem
       ? describeProblem(response.problem)
       : response.body || strings.noOutput;
@@ -56,13 +87,10 @@ export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs)
         body,
       });
     }
-    if (refresh) {
-      void runtimeRefs.refetchRuntime();
-      void runtimeRefs.refetchCapabilities();
-    }
   }
 
   async function handleSuggest(state: SuggestionState) {
+    const outputTicket = ++outputSequence.current;
     if (!state.aiEnabled) {
       state.setOutput({
         title: strings.assistantTitle,
@@ -72,6 +100,13 @@ export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs)
       return;
     }
 
+    const ticket = ++suggestionSequence.current;
+    const newestSuggestion = () => ticket === suggestionSequence.current;
+    const showOutput = (output: OutputState) => {
+      if (newestSuggestion() && outputTicket === outputSequence.current) {
+        state.setOutput(output);
+      }
+    };
     state.setBusy(true);
     try {
       const response = await getQuerySuggestions({
@@ -79,20 +114,24 @@ export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs)
         locale: state.locale,
         current_query: state.currentQuery,
       });
-      state.setSuggestions(response.suggestions);
-      state.setOutput({
+      if (newestSuggestion()) {
+        state.setSuggestions(response.suggestions);
+      }
+      showOutput({
         title: `${strings.assistantTitle} (${response.provider})`,
         status: "success",
         body: JSON.stringify(response, null, 2),
       });
     } catch (error) {
-      state.setOutput({
+      showOutput({
         title: strings.assistantTitle,
         status: "error",
         body: error instanceof Error ? error.message : strings.aiUnavailable,
       });
     } finally {
-      state.setBusy(false);
+      if (newestSuggestion()) {
+        state.setBusy(false);
+      }
     }
   }
 

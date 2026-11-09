@@ -42,7 +42,7 @@ use super::{
 pub(super) fn supported_expression(expression: &Expression, outer: &[Variable]) -> bool {
     let mut patterns = Vec::new();
     let plain = split(expression, &mut patterns, &mut |n| {
-        Variable::new_unchecked(format!("exists {n}"))
+        nrese_sparql_syntax::internal::variable("exists", n)
     });
     let _ = outer;
     expr::supported(&plain) && patterns.iter().all(|(_, pattern)| supported(pattern))
@@ -348,15 +348,18 @@ fn split(
 }
 
 impl Context<'_> {
-    /// A variable no query can name, for a column the executor adds for itself.
-    fn synthetic(&self, what: &str) -> Variable {
+    /// A variable no query can name, for a column the executor adds for itself (`what`, one
+    /// word: [`nrese_sparql_syntax::internal::variable`]).
+    pub(super) fn synthetic(&self, what: &str) -> Variable {
         let n = self.synthetic.get();
         self.synthetic.set(n + 1);
-        Variable::new_unchecked(format!("{what} {n}"))
+        nrese_sparql_syntax::internal::variable(what, n)
     }
 
-    /// `solutions` with a boolean column for each `EXISTS` in `expression`, and the
-    /// expression reading those columns instead; the columns are the last `count`.
+    /// `solutions` (charged) with a boolean column for each `EXISTS` in `expression`, and
+    /// the expression reading those columns instead; the columns are the last `count`,
+    /// each charged before it is made, however many the expression holds
+    /// ([`Self::drop_added`] releases them).
     pub(super) fn with_exists(
         &self,
         mut solutions: Solutions,
@@ -364,14 +367,17 @@ impl Context<'_> {
     ) -> NativeResult<(Solutions, Expression, usize)> {
         let mut patterns = Vec::new();
         let plain = split(expression, &mut patterns, &mut |_| self.synthetic("exists"));
-        let yes = self.id(&Term::from(Literal::from(true)));
-        let no = self.id(&Term::from(Literal::from(false)));
+        let yes = self.id(&Term::from(Literal::from(true)))?;
+        let no = self.id(&Term::from(Literal::from(false)))?;
         for (variable, pattern) in &patterns {
             let mask = self.exists_mask(&solutions, pattern)?;
-            let mut columns = std::mem::take(&mut solutions.table).into_columns();
-            columns.push(mask.iter().map(|&m| if m { yes } else { no }).collect());
-            solutions.table = IdTable::from_columns(columns);
-            solutions.vars.push(variable.clone());
+            let growth = mask.len().saturating_mul(8);
+            solutions = self.reshaped(solutions, growth, |mut solutions| {
+                let column = mask.iter().map(|&m| if m { yes } else { no }).collect();
+                solutions.table.push_column(column);
+                solutions.vars.push(variable.clone());
+                solutions
+            })?;
         }
         Ok((solutions, plain, patterns.len()))
     }
@@ -523,7 +529,10 @@ impl Context<'_> {
                 }
                 if let Some(term) = self.term(id) {
                     if let Term::BlankNode(b) = &term {
-                        self.register_alias(super::substitute::alias(b.as_str()).as_str(), id);
+                        self.register_alias(
+                            nrese_sparql_syntax::internal::blank_constant(b.as_str()).as_str(),
+                            id,
+                        );
                     }
                     terms.insert(variable.clone(), term);
                 }
@@ -601,7 +610,7 @@ impl Context<'_> {
             });
             key_of_row.push(id);
         }
-        let key_variable = self.synthetic("exists key");
+        let key_variable = self.synthetic("exists-key");
         let mut vars: Vec<Variable> = keys.iter().map(|&c| solutions.vars[c].clone()).collect();
         vars.push(key_variable.clone());
         let distinct = self.produced(Solutions {
@@ -633,12 +642,14 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let ordered = left.ordered;
         let rows = left.table.len();
-        let row_variable = self.synthetic("left row");
-        let mut numbered = left;
-        let mut columns = std::mem::take(&mut numbered.table).into_columns();
-        columns.push((0..rows as u64).collect());
-        numbered.table = IdTable::from_columns(columns);
-        numbered.vars.push(row_variable.clone());
+        let row_variable = self.synthetic("left-row");
+        // The row numbers' column, charged before it is made: `numbered` is consumed as
+        // the charged table it is.
+        let numbered = self.reshaped(left, rows.saturating_mul(8), |mut numbered| {
+            numbered.table.push_column((0..rows as u64).collect());
+            numbered.vars.push(row_variable.clone());
+            numbered
+        })?;
         let (lk, rk) = shared_columns(&numbered, &right);
         let vars = super::joined_vars(&numbered, &right, &rk);
         let max_rows = self.row_limit(vars.len());

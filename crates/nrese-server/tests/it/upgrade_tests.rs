@@ -57,7 +57,7 @@ const QUERY: Duration = Duration::from_secs(300);
 
 /// The configuration `make.sh` gave main, over `data`, on port 0: the server binds a free
 /// port and says which.
-fn configure(dir: &Path, data: &Path) -> std::io::Result<PathBuf> {
+pub(super) fn configure(dir: &Path, data: &Path) -> std::io::Result<PathBuf> {
     let data = data.display().to_string().replace('\\', "/");
     let file = dir.join("config.toml");
     std::fs::write(
@@ -188,8 +188,9 @@ impl Drop for Process {
     }
 }
 
-/// This build's server, stopped (by its own handle) when dropped.
-struct Server {
+/// This build's server, stopped (by its own handle) when dropped. Also the restart tests'
+/// ([`super::restart_tests`]).
+pub(super) struct Server {
     process: Process,
     url: String,
     http: reqwest::Client,
@@ -198,7 +199,7 @@ struct Server {
 impl Server {
     /// Starts the server with `config` and waits for the address it reports once it
     /// serves, then for it to answer ready there.
-    async fn start(config: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(super) async fn start(config: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let mut process = Process::spawn(
             Command::new(env!("CARGO_BIN_EXE_nrese-server"))
                 .arg("--config")
@@ -249,7 +250,7 @@ impl Server {
         .into()
     }
 
-    async fn get(&self, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    pub(super) async fn get(&self, path: &str) -> Result<String, Box<dyn std::error::Error>> {
         let response = self
             .http
             .get(format!("{}{path}", self.url))
@@ -269,7 +270,7 @@ impl Server {
     }
 
     /// A query's TSV results: the header, then the rows sorted.
-    async fn query(
+    pub(super) async fn query(
         &self,
         repo: &str,
         query: &str,
@@ -294,7 +295,38 @@ impl Server {
         Ok(sorted(&text))
     }
 
-    async fn update(&self, repo: &str, update: &str) -> Result<(), Box<dyn std::error::Error>> {
+    /// `PUT`s or `PATCH`es (`method`) the JSON `body` to `path`: fails unless it succeeds.
+    pub(super) async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let response = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.url))
+            .bearer_auth(TOKEN)
+            .header("Content-Type", "application/json")
+            .body(body.to_owned())
+            .send()
+            .await
+            .map_err(|error| self.failed(&format!("{method} {path}: {error}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| self.failed(&format!("{method} {path}: {error}")))?;
+        if !status.is_success() {
+            return Err(self.failed(&format!("{method} {path}: {status} {text}")));
+        }
+        Ok(text)
+    }
+
+    pub(super) async fn update(
+        &self,
+        repo: &str,
+        update: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let response = self
             .http
             .post(format!("{}/api/v1/repositories/{repo}/update", self.url))
@@ -428,7 +460,7 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
     let server = Server::start(&config).await?;
 
     // The data, with the WAL tail main never checkpointed.
-    let ready: serde_json::Value = serde_json::from_str(&server.get("/readyz").await?)?;
+    let ready: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
     let main_ready: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         fixture().join("expected/readyz.json"),
     )?)?;
@@ -518,7 +550,7 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
             .await?,
         ["?v", "\"v2\""]
     );
-    let ready: serde_json::Value = serde_json::from_str(&server.get("/readyz").await?)?;
+    let ready: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
     assert_eq!(
         ready["quad_count"],
         main_ready["quad_count"].as_u64().unwrap() + 1

@@ -150,6 +150,165 @@ fn a_refused_select_validation_holds_less_than_its_solutions() {
     assert!(bytes < 8 << 20, "held {bytes} bytes");
 }
 
+/// SYN-56 review r1 F1: comparing a change of the shapes copies nothing that a shape's
+/// results share. 2048 subjects of ex:p each lack ex:required, against a property shape with
+/// 1024 messages: copied into each earlier result's comparison key, the messages' ids alone
+/// would take 2048 × 1024 × 8 bytes = 16 MiB (decoded into each result, far more). An
+/// annotation added to the shape changes no result, and the comparison holds at most a
+/// quarter of those copies.
+#[test]
+fn a_shapes_change_holds_less_than_its_results_messages() {
+    if !measure::alone() {
+        return;
+    }
+    let data: String = (0..2048)
+        .map(|i| format!("ex:s{i} ex:p ex:o .\n"))
+        .collect();
+    let messages: Vec<String> = (0..1024).map(|i| format!("\"m{i}\"")).collect();
+    let shapes = format!(
+        "ex:S a sh:PropertyShape ; sh:targetSubjectsOf ex:p ; sh:path ex:required ;
+           sh:minCount 1 ; sh:message {} .",
+        messages.join(" , ")
+    );
+    let prefixes = "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .";
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    let insert = |tx: &mut nrese_engine::Transaction<'_>, turtle: &str, graph: GraphNameRef<'_>| {
+        for quad in RdfParser::from_format(RdfFormat::Turtle)
+            .for_slice(format!("{prefixes}{turtle}").as_bytes())
+        {
+            let quad = quad.expect("turtle");
+            tx.insert(QuadRef::new(
+                &quad.subject,
+                &quad.predicate,
+                &quad.object,
+                graph,
+            ));
+        }
+    };
+    let shapes_graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES));
+    let mut tx = engine.transaction();
+    insert(&mut tx, &data, GraphNameRef::DefaultGraph);
+    insert(&mut tx, &shapes, shapes_graph);
+    tx.commit().expect("commit");
+    let before = engine.snapshot();
+    let graph = before
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let selection = Selection::asserted(GraphSelector::Exact(graph));
+    let shapes_before = compile(&before, selection).expect("shapes");
+    let mut tx = engine.transaction();
+    insert(&mut tx, "ex:S rdfs:comment \"annotated\" .", shapes_graph);
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, selection).expect("shapes");
+    let data = Selection::of(GraphSelector::Exact(nrese_engine::TermId::DEFAULT_GRAPH));
+    let resources = nrese_sparql::Resources::default();
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate_shapes_change(
+            &before,
+            Some(&shapes_before),
+            &after,
+            &shapes_after,
+            data,
+            &resources,
+        )
+        .map(|report| report.results.len())
+    });
+    eprintln!("a shapes change of 2048 results held at most {bytes} bytes: {outcome:?}");
+    assert!(matches!(outcome, Ok(0)), "{outcome:?}");
+    assert!(bytes < 4 << 20, "held {bytes} bytes");
+}
+
+/// SYN-56 B: a report holds the terms a query computed once. 64 solutions each bind ?value to
+/// a computed 64 KiB literal (one stored literal and a suffix: no statement holds it), so the
+/// report's values are 4 MiB of text. Decoding moves each value from its result into the
+/// report: the validation holds at most 6 MiB, where a copy beside the results' would hold
+/// more than 8 MiB.
+#[test]
+fn a_report_holds_its_computed_terms_once() {
+    if !measure::alone() {
+        return;
+    }
+    let rows: Vec<String> = (0..64).map(|i| format!("ex:s{i} ex:q ex:o{i} .")).collect();
+    let turtle = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:a ex:big \"{}\" . {}
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select \"\"\"
+           SELECT $this (CONCAT(?big, \"!\") AS ?value) WHERE {{
+             $this <http://example.com/big> ?big .
+             ?x <http://example.com/q> ?o }}\"\"\" ] .",
+        "x".repeat(64 << 10),
+        rows.join(" ")
+    );
+    let snapshot = load(&turtle);
+    let graph = snapshot
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // The data is the same graph as the shapes.
+    let data = Selection::of(GraphSelector::Exact(graph));
+    let resources = nrese_sparql::Resources::default();
+    // Once outside the measurement: what reading builds lazily is the snapshot's.
+    drop(nrese_shacl::validate(&snapshot, &shapes, data, &resources).expect("affordable"));
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate(&snapshot, &shapes, data, &resources).map(|report| {
+            let long = report
+                .results
+                .iter()
+                .filter(|result| {
+                    matches!(&result.value, Some(nrese_rdf::Term::Literal(value))
+                        if value.value().len() == (64 << 10) + 1)
+                })
+                .count();
+            (report.results.len(), long)
+        })
+    });
+    eprintln!("a report of 64 computed 64 KiB values held at most {bytes} bytes: {outcome:?}");
+    assert!(matches!(outcome, Ok((64, 64))), "{outcome:?}");
+    assert!(bytes < 6 << 20, "held {bytes} bytes");
+}
+
+/// An `rdf:XMLLiteral` nested 200,000 elements deep is well-balanced XML: `sh:datatype
+/// rdf:XMLLiteral` classifies it (no result) and the same with one end tag missing (one
+/// result), on the validation's ordinary threads. Run alone, in a process of its own: a
+/// classifier that recursed per element would overflow its stack, which ends the process
+/// and fails this test.
+#[test]
+fn a_deeply_nested_xml_literal_is_classified() {
+    if !measure::alone() {
+        return;
+    }
+    let depth = 200_000;
+    for (row, closed, results) in [("balanced", depth, 0), ("an end tag missing", depth - 1, 1)] {
+        let xml = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(closed));
+        let turtle = format!(
+            "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+             ex:a ex:v \"{xml}\"^^rdf:XMLLiteral .
+             ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+               sh:property [ sh:path ex:v ; sh:datatype rdf:XMLLiteral ] ."
+        );
+        let snapshot = load(&turtle);
+        let graph = snapshot
+            .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+            .expect("the shapes graph");
+        let shapes =
+            compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+        // The data is the same graph as the shapes.
+        let data = Selection::of(GraphSelector::Exact(graph));
+        let report = nrese_shacl::validate(
+            &snapshot,
+            &shapes,
+            data,
+            &nrese_sparql::Resources::default(),
+        )
+        .expect("nothing stops it");
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(report.results.len(), results, "{row}");
+    }
+}
+
 /// Doubling the values of each parameter at most doubles what compiling the shapes holds at
 /// once (it adds as many statements); built once per combination, it would hold eight times
 /// as much.
