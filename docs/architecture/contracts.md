@@ -84,6 +84,11 @@ DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not 
 one index → inner → order → derived bookkeeping, never two locks of one level. Rayon workers use fallible slot admission rather than waiting;
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
 
+**A version's own slots** (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
+value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
+the snapshot and its other slots. The engine takes it under none of its own locks: an installed version is a value no snapshot held
+(`Versions::install`), so nothing drains it.
+
 **The `owl2-dl` bounds (U1):** `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145` (P2-C6b). Its `state` and `view` mutexes guard
 serial work only: taking what a read or a commit needs, a revision check, publishing, applying a computed change. The engine's writer slot and
 the mutation pipeline's ground cache (`crates/nrese-store/src/mutation/pipeline.rs:227`) come before the mutation-side `state`, which `install`

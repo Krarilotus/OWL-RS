@@ -64,8 +64,25 @@ fn inferred(snapshot: &Snapshot) -> Vec<EncodedQuad> {
         .collect()
 }
 
+/// Whether `snapshot` grants a token. Every row of the matrix also checks 3.0c's item 1
+/// (`notes/2026-11-09-dict3-0c-own-state-design.md` §3): `admission()` is `Own` exactly where
+/// `shared_state()` is `None`, and either capability gives back the snapshot itself.
 fn token(snapshot: &Snapshot) -> bool {
-    snapshot.shared_state().is_some()
+    let shared = snapshot.shared_state();
+    match snapshot.admission() {
+        super::Admission::Shared(state) => {
+            assert!(
+                std::ptr::eq(state.snapshot(), snapshot),
+                "shared, of itself"
+            );
+            assert!(shared.is_some(), "admission Shared, shared_state None");
+        }
+        super::Admission::Own(own) => {
+            assert!(std::ptr::eq(own.snapshot(), snapshot), "own, of itself");
+            assert!(shared.is_none(), "admission Own, shared_state Some");
+        }
+    }
+    shared.is_some()
 }
 
 /// Review §5 item 1, 3.0's share: pending state of both kinds grants no token, with no private
