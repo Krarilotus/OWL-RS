@@ -7,6 +7,10 @@ its data (204), then gone (404, and the catalog back to the default repository a
 [vars]
 repo = "verify-lifecycle"
 ex = "http://example.com/verify/"
+data = """
+<http://example.com/verify/Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/verify/Animal> .
+<http://example.com/verify/tom> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/verify/Cat> .
+"""
 
 [[step]]
 name = "the catalog holds the default repository alone"
@@ -73,17 +77,14 @@ name = "load a class hierarchy and an instance into the session"
 method = "POST"
 path = "/api/v1/repositories/${repo}/sessions/${session}/data"
 headers = { Content-Type = "text/turtle" }
-body = """
-  <${ex}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <${ex}Animal> .
-  <${ex}tom> a <${ex}Cat> .
-"""
+body = "${data}"
 [step.expect]
 status = 204
 
 [[step]]
-name = "query and reason over the uncommitted load"
+name = "query the asserted load inside its session (reasoning waits for commit)"
 path = "/api/v1/repositories/${repo}/sessions/${session}/query"
-params = { query = "ASK { <http://example.com/verify/tom> a <http://example.com/verify/Animal> }" }
+params = { query = "ASK { <http://example.com/verify/tom> a <http://example.com/verify/Cat> }" }
 headers = { Accept = "application/sparql-results+json" }
 [step.expect]
 status = 200
@@ -122,6 +123,25 @@ method = "DELETE"
 path = "/api/v1/repositories/${repo}/sessions/${other}"
 [step.expect]
 status = 204
+
+[[step]]
+name = "read the draft-check contract for pre-commit validation"
+path = "/api/v1/draft-check/capabilities"
+[step.expect]
+status = 200
+json = { "$.protocol" = "dmw-store-check/1" }
+[step.capture]
+build = { json = "$.build_id" }
+semantics = { json = "$.semantics[0]" }
+
+[[step]]
+name = "the same RDF is logically consistent before commit"
+method = "POST"
+path = "/api/v1/draft-check"
+json = { protocol = "dmw-store-check/1", operation = "reasoning", request_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", scope = { project_id = "verify-lifecycle", owner_id = "verify" }, build_id = "${build}", semantics_id = "${semantics}", profile = "owl2-rl", input_hashes = {}, limits = { max_seconds = 5, max_results = 10, max_triples = 100 }, inputs = { data = "${data}" } }
+[step.expect]
+status = 200
+json = { "$.terminal_status" = "completed", "$.complete" = true, "$.logical_consistent" = true, "$.unsupported" = [] }
 
 [[step]]
 name = "commit the load and its reasoning"
