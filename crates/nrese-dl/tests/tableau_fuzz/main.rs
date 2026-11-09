@@ -428,6 +428,20 @@ fn a_backtrack_never_restores_a_point_older_than_a_retraction() {
     assert_eq!(tally.inconsistent, 1, "{tally:?}");
 }
 
+/// Guard (dynamic backtracking): seed 700160, case 144 is inconsistent (t0 is empty, so
+/// t2 is everything and every element needs a t3-successor, which must be t5 or t6; t3 is
+/// irreflexive and ¬t3(t6, t5) leaves t6 none). A choice retracted and re-decided on top
+/// keeps its disjunction's old place behind the scan; once it ran out of alternatives and
+/// a retraction below took the clash on, nothing reopened that disjunction, and the search
+/// found a model without it. A frame leaving the stack undecided now reopens its
+/// disjunction. It failed the phase-4 seed sweep as "dynamic-backtracking changes the
+/// answer" (D16-058).
+#[test]
+fn a_disjunction_left_undecided_by_a_retraction_is_reopened() {
+    let tally = campaign(700160, 145, Some(144), &|_| true);
+    assert_eq!(tally.inconsistent, 1, "{tally:?}");
+}
+
 /// The number module's family (docs/design/owl2-dl.md#number-reasoning-layers):
 /// `(n, m, n·m)` is consistent by a validated compressed model, with no tableau node; that
 /// model, expanded to an explicit interpretation, is a model by the semantics' own check
