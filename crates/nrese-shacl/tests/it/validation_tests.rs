@@ -1077,3 +1077,175 @@ fn a_shapes_change_compares_results_without_the_state_before_s_diagnostics() {
     .map(|report| (report.results.len(), report.failures.len()));
     assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
 }
+
+/// SHACL over a private transaction (`Engine::speculative_over`), as a payload's shapes and a
+/// session's validation run once speculative work is private (dictionary lifecycle V2, A3
+/// and A5): SPARQL constraints with a nested `NOT EXISTS` are evaluated once per focus node
+/// on one private view, in parallel (`validate` needs `Sync`). One projects the stored
+/// value; the other a computed one, which the report must take without interning it. How a
+/// computed value is reported is SYN-56 Part B's subject (#137), not this test's: it counts
+/// that shape's results only.
+///
+/// - Input: committed shapes with both constraints on `ex:C`; a private transaction
+///   asserting 20 members of `ex:C`, each with a value only the transaction has.
+/// - Expected: 40 results: `ex:Stored`'s 20 name each member's own private value (decoded
+///   in the transaction's vocabulary); `ex:Computed` has 20. A second validation leaves the
+///   transaction's charge where the first left it; the dictionary holds as many terms as
+///   before, and none of the private values.
+#[test]
+fn sparql_constraints_validate_a_private_transaction() {
+    let store = engine(
+        "",
+        r#"ex:Stored sh:targetClass ex:C ; sh:sparql [ sh:select
+            "SELECT $this ?value WHERE { $this <http://example.com/q> ?value FILTER NOT EXISTS { ?value <http://example.com/ok> true } }" ] .
+        ex:Computed sh:targetClass ex:C ; sh:sparql [ sh:select
+            "SELECT $this (CONCAT(STR(?v), ' computed') AS ?value) WHERE { $this <http://example.com/q> ?v FILTER NOT EXISTS { ?v <http://example.com/ok> true } }" ] ."#,
+    );
+    let snapshot = store.snapshot();
+    let terms = store.stats().dictionary.terms;
+    let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    let mut tx = store
+        .speculative_over(&snapshot, std::sync::Arc::clone(&budget))
+        .expect("private");
+    let members: String = (0..20)
+        .map(|n| format!("ex:n{n} a ex:C ; ex:q \"private {n}\" .\n"))
+        .collect();
+    for quad in RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(format!("{PREFIXES}{members}").as_bytes())
+    {
+        let quad = quad.expect("turtle");
+        tx.try_insert(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            GraphNameRef::DefaultGraph,
+        ))
+        .expect("room");
+    }
+    let reads = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    let view = nrese_sparql::PendingRead::new(&tx, &reads);
+    let shapes = compile(&view, shapes_selection(&snapshot)).expect("shapes");
+    let report = validate(&view, &shapes, DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let values = |shape: &str| -> Vec<Option<String>> {
+        let mut values: Vec<Option<String>> = report
+            .results
+            .iter()
+            .filter(|result| result.source_shape.to_string() == ex(shape))
+            .map(|result| result.value.as_ref().map(ToString::to_string))
+            .collect();
+        values.sort();
+        values
+    };
+    let mut stored: Vec<Option<String>> =
+        (0..20).map(|n| Some(format!("\"private {n}\""))).collect();
+    stored.sort();
+    assert_eq!(values("Stored"), stored);
+    assert_eq!(values("Computed").len(), 20);
+    drop(report);
+    let settled = budget.used();
+    assert_eq!(validate(&view, &shapes, DEFAULT).results.len(), 40);
+    assert_eq!(
+        budget.used(),
+        settled,
+        "no charge left behind per validation"
+    );
+    drop(tx);
+    assert_eq!(
+        store.stats().dictionary.terms,
+        terms,
+        "no term entered the dictionary"
+    );
+    let private = nrese_rdf::Literal::new_simple_literal("private 3");
+    assert_eq!(store.snapshot().lookup(TermRef::from(&private)), None);
+}
+
+/// Parallel SHACL-SPARQL over a large private transaction finishes (V2 review r1, R1-C1):
+/// every focus node's check asks the one view for its evaluation snapshot, the first on a
+/// cold memo builds it, and a pending state of 16,384 or more changes is built in parallel
+/// (`index/run.rs`'s parallel build threshold). No reader may wait on a lock held across that
+/// Rayon work, or a worker that steals a queued check while waiting for its build blocks on
+/// the lock it holds.
+///
+/// - Input: committed shapes with a SPARQL constraint on `ex:C`; per round, a fresh private
+///   transaction (a cold memo) with 16,384 filler statements and 512 members of `ex:C`, each
+///   with a value of its own; validation in a 4-thread pool (more than one task of 32 nodes
+///   each, so checks run concurrently), 8 rounds.
+/// - Expected: each round reports its 512 results within the deadline. The deadline is a
+///   hang guard, not a bound on the work: the job's log records each round's time.
+#[test]
+fn parallel_sparql_validation_of_a_large_private_transaction_finishes() {
+    const ROUNDS: usize = 8;
+    const MEMBERS: usize = 512;
+    const FILLER: usize = 16 * 1024;
+    let deadline = std::time::Duration::from_secs(300);
+    let (done, outcome) = std::sync::mpsc::channel();
+    // Not scoped: a deadlocked validation must not keep the test from failing.
+    std::thread::spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let store = engine(
+            "",
+            r#"ex:S sh:targetClass ex:C ; sh:sparql [ sh:select
+            "SELECT $this ?value WHERE { $this <http://example.com/q> ?value FILTER NOT EXISTS { ?value <http://example.com/ok> true } }" ] ."#,
+        );
+        let snapshot = store.snapshot();
+        let iri = |local: String| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        let (rdf_type, class, q, filler) = (
+            NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            iri("C".to_owned()),
+            iri("q".to_owned()),
+            iri("filler".to_owned()),
+        );
+        for round in 0..ROUNDS {
+            let started = std::time::Instant::now();
+            let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+            let mut tx = store.speculative_over(&snapshot, budget).expect("private");
+            let mut insert =
+                |subject: &NamedNode, predicate: &NamedNode, object: nrese_rdf::Term| {
+                    tx.try_insert(QuadRef::new(
+                        subject,
+                        predicate,
+                        &object,
+                        GraphNameRef::DefaultGraph,
+                    ))
+                    .expect("room");
+                };
+            for n in 0..FILLER {
+                let value = nrese_rdf::Literal::new_simple_literal(format!("filler {n}"));
+                insert(&iri(format!("f{n}")), &filler, value.into());
+            }
+            for n in 0..MEMBERS {
+                let member = iri(format!("m{n}"));
+                insert(&member, &rdf_type, class.clone().into());
+                let value = nrese_rdf::Literal::new_simple_literal(format!("member {n}"));
+                insert(&member, &q, value.into());
+            }
+            let reads = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+            let view = nrese_sparql::PendingRead::new(&tx, &reads);
+            let shapes = compile(&view, shapes_selection(&snapshot)).expect("shapes");
+            let results = pool
+                .install(|| validate(&view, &shapes, DEFAULT))
+                .results
+                .len();
+            eprintln!(
+                "round {round}: {results} results in {:?}",
+                started.elapsed()
+            );
+            if done.send(results).is_err() {
+                return;
+            }
+        }
+    });
+    for round in 0..ROUNDS {
+        match outcome.recv_timeout(deadline) {
+            Ok(results) => assert_eq!(results, MEMBERS, "round {round}"),
+            Err(_) => panic!(
+                "round {round}: validation didn't finish within {deadline:?}: a reader waits on \
+                 the private snapshot memo while its builder needs the pool (R1-C1)"
+            ),
+        }
+    }
+}
