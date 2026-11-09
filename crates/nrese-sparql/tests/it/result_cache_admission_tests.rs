@@ -509,3 +509,55 @@ fn a_pin_on_unpublished_state_fails_and_leaves_the_pins_as_they_were() {
     );
     assert_eq!(cache.pins(), pins, "the published pin stays");
 }
+
+/// Sol-loop round 1, S1: canonical answers read a view of the snapshot with an identity of
+/// its own; their bytes are never another reading's.
+///
+/// - Input: `Alias owl:sameAs Rep` inferred, the store reading equality classes, and
+///   `Rep p o`; `?x p o` with early expansion, answered canonically (`Rep` alone) and expanded
+///   (`Rep` and `Alias`), through one cache, canonical first and expanded first, twice each.
+/// - Expected: every answer's bytes are its own reading's, as written without a cache, and
+///   the two readings' differ.
+#[test]
+fn canonical_and_expanded_answers_keep_their_own_bytes_in_both_orders() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(ex("Rep").as_ref().into());
+    let alias = tx.intern(ex("Alias").as_ref().into());
+    let same_as = nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let same_as = tx.intern(same_as.as_ref().into());
+    tx.insert(quad("Rep", "p", "o").as_ref());
+    tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let snapshot = engine.snapshot();
+    let text = format!("SELECT ?x WHERE {{ ?x <{EX}p> <{EX}o> }}");
+    let reading = |canonical: bool, cache: Option<&Arc<ResultCache>>| QueryOptions {
+        equality_early_expansion: true,
+        equality_canonical: canonical,
+        result_cache: cache.map(Arc::clone),
+        ..QueryOptions::default()
+    };
+    let (canonical, expanded) = (
+        tsv(&snapshot, &text, &reading(true, None)),
+        tsv(&snapshot, &text, &reading(false, None)),
+    );
+    assert_ne!(canonical, expanded, "the expansion answers Alias too");
+    for canonical_first in [true, false] {
+        let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+        let order = match canonical_first {
+            true => [(true, &canonical), (false, &expanded)],
+            false => [(false, &expanded), (true, &canonical)],
+        };
+        for _ in 0..2 {
+            for (mode, expected) in order {
+                assert_eq!(
+                    &tsv_through_the_cache(&snapshot, &text, &reading(mode, Some(&cache))),
+                    expected,
+                    "canonical first: {canonical_first}, canonical: {mode}"
+                );
+            }
+        }
+        assert!(cache.stats().hits > 0, "{:?}", cache.stats());
+    }
+}
