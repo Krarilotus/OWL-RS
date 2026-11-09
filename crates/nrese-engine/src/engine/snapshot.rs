@@ -1991,9 +1991,10 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
-    /// [`Self::lookup`], what it allocates charged first through `charge`
-    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
-    /// dictionary, which a checkpoint may otherwise change between them).
+    /// [`Self::lookup`], what it allocates charged first through `charge`, which is called
+    /// with no lock of the dictionary held ([`Dictionary::lookup_charged`]: at the larger of
+    /// a plain and a compressed base's bounds, since a checkpoint may change the base before
+    /// the lookup).
     pub fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
@@ -2050,14 +2051,19 @@ impl Snapshot {
         self.vocabulary.decode(id)
     }
 
-    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
-    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
-    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
-    /// snapshot doesn't know.
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, for every
+    /// kind of term: inline, the dictionary's, a private snapshot's own, and a triple term
+    /// with its components. `Ok(None)` for an id that isn't a term this snapshot knows.
+    ///
+    /// `charge` is called with no lock of the dictionary held, once, or again where a
+    /// checkpoint's rebase came between the bound and the decode
+    /// ([`Dictionary::decode_charged`]): each call charges an increment, and what the decode
+    /// holds is covered by their sum. A refusal ends it, nothing decoded; what was charged
+    /// before stays the caller's to release.
     pub fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
         self.vocabulary
             .decode_charged(id, self.version.dictionary_len, charge)
@@ -2065,8 +2071,8 @@ impl Snapshot {
 
     /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
     /// as stored now: a checkpoint may store the term compressed after, so a charge for a
-    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
-    /// ids this snapshot doesn't know.
+    /// decode goes through [`Self::decode_charged`]. `None` for ids this snapshot doesn't
+    /// know.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
         self.vocabulary
             .decode_bound(id, self.version.dictionary_len)
