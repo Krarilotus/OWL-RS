@@ -1492,8 +1492,10 @@ impl Snapshot {
     }
 
     /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
-    /// a time ([`Self::scan_columns_in`]); `None` where that can't answer.
-    pub fn scan_range_columns_in(
+    /// a time and charged to `budget` before they are ([`Self::scan_columns_in`]); `None`
+    /// where that can't answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_range_columns_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
@@ -1501,9 +1503,12 @@ impl Snapshot {
         low: TermId,
         high: TermId,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
-        let plan = self.range_plan(model, pattern, permutation, low, high)?;
-        self.columns_of_stacks(model, &plan, permutation, components)
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
+        let Some(plan) = self.range_plan(model, pattern, permutation, low, high) else {
+            return Ok(None);
+        };
+        self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
     /// Whether a statement read in `model` has a triple term (RDF 1.2): triple terms are
@@ -1576,26 +1581,34 @@ impl Snapshot {
     ///
     /// This answers `GROUP BY ?x` with `COUNT(*)` over one triple pattern without reading its
     /// matches: a walk over the groups of each run (see `IndexVersion::group_counts`).
-    pub fn group_counts_in(
+    ///
+    /// The groups are charged to `budget` as they are found, one charge a growth, before
+    /// they are allocated, and the result holds exactly their charge: a walk over many
+    /// groups can't outgrow its budget (D16-039 F7). Refused, nothing is held.
+    pub fn group_counts_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
-    ) -> Option<Vec<(TermId, u64)>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
-        let (plan, bound) = self.group_plan(model, &pattern, permutation)?;
-        let mut counts = Vec::new();
+        let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
+            return Ok(None);
+        };
+        let mut counts = nrese_exec::ChargedVec::new(budget);
         let mut sources = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
                 let before = counts.len();
                 self.data(model)
                     .stack(stack)
-                    .group_counts(&plan, bound, &mut counts);
+                    .group_counts(&plan, bound, &mut counts, budget)?;
                 sources += usize::from(counts.len() > before);
             }
         }
-        // One run of one stack yields each value once, in order; otherwise merge.
+        let (mut counts, mut held) = counts.into_parts();
+        // One run of one stack yields each value once, in order; otherwise merge (in place).
         if sources > 1 || !counts.is_sorted_by(|a, b| a.0 < b.0) {
             counts.sort_unstable_by_key(|&(value, _)| value);
             counts.dedup_by(|later, kept| {
@@ -1606,13 +1619,17 @@ impl Snapshot {
                 same
             });
         }
-        Some(
-            counts
-                .into_iter()
-                .filter(|&(_, count)| count > 0)
-                .map(|(value, count)| (TermId::from_raw(value), count as u64))
-                .collect(),
-        )
+        // In place: the pairs keep their layout, so the collection reuses their buffer.
+        let counts: Vec<(TermId, u64)> = counts
+            .into_iter()
+            .filter(|&(_, count)| count > 0)
+            .map(|(value, count)| (TermId::from_raw(value), count as u64))
+            .collect();
+        if let Err(refused) = held.resize(counts.capacity() * size_of::<(TermId, u64)>()) {
+            drop(counts);
+            return Err(refused);
+        }
+        Ok(Some(GroupCounts { counts, held }))
     }
 
     /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
@@ -1733,29 +1750,37 @@ impl Snapshot {
     /// time instead of a quad at a time. `None` where that can't answer: the matches lie
     /// in several runs or a run with deletions, which must be merged quad by quad, or in
     /// both stacks with columns that can't order them ([`Self::columns_of_stacks`]); or
-    /// the plan needs a post-filter.
-    pub fn scan_columns_in(
+    /// the plan needs a post-filter. Decided before anything is charged.
+    ///
+    /// The columns are charged to `budget` before they are decoded (each stack's rows are
+    /// known from its index first), and the result holds exactly their charge: a query's
+    /// scan can't decode past its budget (D16-039 F1, F2). Refused, nothing is decoded
+    /// beyond what was charged, and the budget is as it was.
+    pub fn scan_columns_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
-            return None;
+            return Ok(None);
         }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let Some(plan) = AccessPlan::in_permutation(pattern, permutation) else {
+            return Ok(None);
+        };
         if plan.exclude_default_graph {
-            return None;
+            return Ok(None);
         }
         if Stack::ALL.into_iter().any(|stack| {
             model.includes(stack) && !self.data(model).stack(stack).layout().supports(permutation)
         }) {
-            return None;
+            return Ok(None);
         }
-        self.columns_of_stacks(model, &plan, permutation, components)
+        self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
     /// The columns `components` of the quads matching `plan` in each stack of `model`, each
@@ -1764,14 +1789,20 @@ impl Snapshot {
     /// statements of one pattern, as reasoning gives them. `None` where a stack can't be
     /// decoded so (several runs, deletions), or where both have matches and the columns
     /// can't order them: rows compare on the columns alone, so every column the plan lets
-    /// vary must be among them up to the last of them in `permutation`'s order.
-    fn columns_of_stacks(
+    /// vary must be among them up to the last of them in `permutation`'s order. Every
+    /// "can't" is decided before anything is charged.
+    ///
+    /// Charged to `budget` before anything is decoded: each stack's part (its rows are
+    /// its index range's), and where both have matches their merge too, which exists
+    /// beside them until they are freed. Then the charge of exactly the result's columns.
+    fn columns_of_stacks<'b>(
         &self,
         model: ReadModel,
         plan: &AccessPlan,
         permutation: Permutation,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
         let matching = Stack::ALL
             .map(|stack| model.includes(stack) && self.data(model).stack(stack).any_plan(plan));
         let order = permutation.order();
@@ -1782,36 +1813,63 @@ impl Snapshot {
                 .all(|position| plan.low[position] == plan.high[position] || projected(position))
         });
         if matching.iter().all(|&matches| matches) && !ordered {
-            return None;
+            return Ok(None);
         }
-        let mut parts: Vec<Vec<Vec<u64>>> = Vec::new();
+        let mut scans = Vec::with_capacity(Stack::ALL.len());
         for (stack, matches) in Stack::ALL.into_iter().zip(matching) {
             if !matches {
                 continue;
             }
-            let index = self.data(model).stack(stack);
-            let mut out = vec![Vec::new(); components.len()];
-            if !index.scan_columns(plan, components, &mut out) {
-                return None;
+            match self.data(model).stack(stack).column_scan(plan, components) {
+                Some(scan) => scans.push(scan),
+                None => return Ok(None),
             }
-            parts.push(out);
         }
-        match parts.len() {
-            0 => Some(vec![Vec::new(); components.len()]),
-            1 => parts.pop(),
+        let width = components.len();
+        let bytes = |rows: usize| rows.saturating_mul(width).saturating_mul(size_of::<u64>());
+        let rows: usize = scans
+            .iter()
+            .map(crate::index::ColumnScan::rows)
+            .fold(0, usize::saturating_add);
+        let merged = if scans.len() > 1 { bytes(rows) } else { 0 };
+        let mut held = nrese_exec::Reservation::new(budget);
+        held.charge(bytes(rows).saturating_add(merged))?;
+        // Declared after `held`: freed before their charge is released.
+        let mut parts: Vec<Vec<Vec<u64>>> = scans
+            .iter()
+            .map(|scan| {
+                let mut out = vec![Vec::new(); width];
+                scan.decode(&mut out);
+                out
+            })
+            .collect();
+        let columns = match parts.len() {
+            0 => vec![Vec::new(); width],
+            1 => parts.pop().expect("one part"),
             _ => {
                 let right = parts.pop().expect("two parts");
                 let left = parts.pop().expect("two parts");
-                Some(merge_columns(left, right, permutation, components))
+                merge_columns(left, right, permutation, components)
             }
-        }
+        };
+        held.resize(columns_bytes(&columns))?;
+        Ok(Some(ScanColumns { columns, held }))
     }
 
     /// The number of distinct terms used as subject or object in `graphs` (one graph, or
     /// every graph) in `model`: what zero-length property paths start from. Exact; kept
     /// for this version once computed. The two walks (subjects, objects) run in parallel.
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
-    pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
+    ///
+    /// The two walks' lists are charged to `budget` as they grow, before they are allocated
+    /// (D16-039 F4): the reader that counts first holds them while it counts, and the count
+    /// is kept, not the lists. Refused, nothing is kept and nothing is held.
+    pub fn node_count_in(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        budget: &nrese_exec::Budget,
+    ) -> Result<Option<u64>, nrese_exec::BudgetExceeded> {
         let pattern = self
             .read_pattern(
                 model,
@@ -1825,9 +1883,12 @@ impl Snapshot {
         if self.expanding(model, &pattern).is_some()
             || (self.canonical_data.is_some() && model != ReadModel::Asserted)
         {
-            return None;
+            return Ok(None);
         }
-        self.statistics
+        // A refusal is the caller's error, never a count kept for the version.
+        let refused = std::sync::Mutex::new(None);
+        let count = self
+            .statistics
             .node_count(&self.version, model, graphs, || {
                 let (pattern, by_subject, by_object) = match graphs {
                     GraphSelector::Exact(graph) => (
@@ -1837,9 +1898,21 @@ impl Snapshot {
                     ),
                     _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
                 };
-                let distinct = |permutation| -> Option<Vec<TermId>> {
-                    let counts = self.group_counts_in(model, &pattern, permutation)?;
-                    Some(counts.into_iter().map(|(id, _)| id).collect())
+                // The groups as the walk charged them, read in place: no list copied out.
+                let distinct = |permutation| match self.group_counts_in(
+                    model,
+                    &pattern,
+                    permutation,
+                    budget,
+                ) {
+                    Ok(groups) => groups,
+                    Err(error) => {
+                        refused
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get_or_insert(error);
+                        None
+                    }
                 };
                 let (subjects, objects) =
                     rayon::join(|| distinct(by_subject), || distinct(by_object));
@@ -1847,7 +1920,7 @@ impl Snapshot {
                 // |S ∪ O| by a merge of the two sorted lists.
                 let (mut i, mut j, mut both) = (0, 0, 0u64);
                 while i < subjects.len() && j < objects.len() {
-                    match subjects[i].cmp(&objects[j]) {
+                    match subjects[i].0.cmp(&objects[j].0) {
                         std::cmp::Ordering::Less => i += 1,
                         std::cmp::Ordering::Greater => j += 1,
                         std::cmp::Ordering::Equal => {
@@ -1858,7 +1931,11 @@ impl Snapshot {
                     }
                 }
                 Some(subjects.len() as u64 + objects.len() as u64 - both)
-            })
+            });
+        match refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
     }
 
     /// The number of distinct values of the first unbound component of `pattern` in
@@ -2289,6 +2366,75 @@ where
             (None, _) => self.right.next(),
         }
     }
+}
+
+/// The columns of a scan ([`Snapshot::scan_columns_in`]) and the charge of exactly their
+/// capacity, together: neither is dropped or handed on without the other. Dropped, the
+/// columns are freed, then their charge released; [`Self::into_parts`] hands both to a
+/// table that counts them, never released and charged again.
+#[derive(Debug)]
+pub struct ScanColumns<'b> {
+    /// Before `held`: fields drop in order, the columns first.
+    columns: Vec<Vec<u64>>,
+    held: nrese_exec::Reservation<&'b nrese_exec::Budget>,
+}
+
+impl<'b> ScanColumns<'b> {
+    pub fn columns(&self) -> &[Vec<u64>] {
+        &self.columns
+    }
+
+    /// The columns, and the charge of their capacity, for a holder that keeps it until
+    /// they are freed or hands it on with them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Vec<u64>>,
+        nrese_exec::Reservation<&'b nrese_exec::Budget>,
+    ) {
+        let Self { columns, held } = self;
+        (columns, held)
+    }
+}
+
+/// The groups of a walk ([`Snapshot::group_counts_in`]), each value with its number of
+/// matching quads in id order, and the charge of exactly their capacity, together. Dropped,
+/// the groups are freed, then their charge released.
+#[derive(Debug)]
+pub struct GroupCounts<'b> {
+    /// Before `held`: fields drop in order, the groups first.
+    counts: Vec<(TermId, u64)>,
+    held: nrese_exec::Reservation<&'b nrese_exec::Budget>,
+}
+
+impl std::ops::Deref for GroupCounts<'_> {
+    type Target = [(TermId, u64)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.counts
+    }
+}
+
+impl<'b> GroupCounts<'b> {
+    /// The groups, and the charge of their capacity, for a holder that keeps it until they
+    /// are freed or hands it on with them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(TermId, u64)>,
+        nrese_exec::Reservation<&'b nrese_exec::Budget>,
+    ) {
+        let Self { counts, held } = self;
+        (counts, held)
+    }
+}
+
+/// The bytes `columns` hold, by capacity: what a table of them counts.
+fn columns_bytes(columns: &[Vec<u64>]) -> usize {
+    columns
+        .iter()
+        .map(|column| column.capacity() * size_of::<u64>())
+        .sum()
 }
 
 /// Two column sets (`components` of quads), each sorted in `permutation`'s order, merged

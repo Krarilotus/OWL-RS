@@ -645,11 +645,12 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
             .justify_statement(Ruleset::Owl2Rl, scope, statement, mode)
             .map(|_| ())
     };
-    // Two stores each that differ only in how many statements the secret graph holds.
-    let store = |hidden: usize, public: &str| {
+    // Two stores each that differ only in how many statements the secret graph holds, with
+    // `memory` bytes of query memory.
+    let store_with = |memory: usize, hidden: usize, public: &str| {
         let mut config = in_memory_store_config();
         config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
-        config.total_query_memory_bytes = 64 << 10;
+        config.total_query_memory_bytes = memory;
         let pipeline = MutationPipeline::new(
             Arc::new(StoreService::new(config).unwrap()),
             Arc::new(nrese_reasoner::ReasonerService::new(
@@ -667,6 +668,7 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
             .unwrap();
         pipeline
     };
+    let store = |hidden: usize, public: &str| store_with(64 << 10, hidden, public);
     // Scanned: a query of `?s <urn:p> ?o` in every graph reads the secret graph's.
     let scans = [100_000, 200_000].map(|hidden| store(hidden, "<urn:visible> <urn:p> 1"));
     // Viewed: the rules derive `?s <urn:q> ?o` from each with the public graph's
@@ -714,9 +716,11 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     let mut told = Vec::new();
     for &entry in EntryPoint::ALL {
         let (bys, read): (&[By], Entry<'_>) = match entry {
-            EntryPoint::Run => (&[By::Scan], &run),
-            EntryPoint::RunPending => (&[By::Scan], &pending_run),
-            EntryPoint::Explain => (&[By::Scan], &explain),
+            // A view row each as well: a scan's refusal no longer tells the hidden size to
+            // anyone (D16-039), so only a view's still would, if this entry point told it.
+            EntryPoint::Run => (&[By::Scan, By::View], &run),
+            EntryPoint::RunPending => (&[By::Scan, By::View], &pending_run),
+            EntryPoint::Explain => (&[By::Scan, By::View], &explain),
             EntryPoint::Plan => (&[By::View], &plan),
             EntryPoint::UpdateWhere => (&[By::Scan, By::View], &update_where),
             EntryPoint::GraphRead => (&[By::View], &graph_read),
@@ -752,14 +756,31 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
                 told.push(format!("{entry:?} by {by:?}: {small:?} against {large:?}"));
             }
             if matches!(by, By::Scan) {
-                let [small, large] = refused(&ReadScope::All);
-                assert_ne!(
-                    small.to_string(),
-                    large.to_string(),
-                    "{entry:?}: every graph"
-                );
+                // A reader of every graph is refused there too, with the server's limit.
+                refused(&ReadScope::All);
             }
         }
     }
     assert!(told.is_empty(), "told the hidden sizes: {told:#?}");
+    // The channel is live: a reader of every graph tells two such stores apart, so that the
+    // rows above telling a restricted requester nothing mean something. A scan's columns are
+    // charged before they grow, so they are refused at their first growth past the limit, with
+    // the same amounts whatever the secret graph holds (D16-039: before, the whole table was
+    // charged at once, and the amounts asked for told its size). An answer from one store
+    // against a refusal from the other still tells it, under a limit between what the two
+    // scans need: 20,000 secret rows of three ids fit 4 MiB, 400,000 (9.6 MB) don't.
+    let between = 4 << 20;
+    let [fits, outgrows] =
+        [20_000, 400_000].map(|hidden| store_with(between, hidden, "<urn:visible> <urn:p> 1"));
+    assert_eq!(
+        run(&fits, &ReadScope::All).map_err(|e| e.to_string()),
+        Ok(()),
+        "every graph: the smaller store answers"
+    );
+    let refusal = run(&outgrows, &ReadScope::All).expect_err("every graph: the larger is refused");
+    assert_eq!(
+        kind_and_limit(&refusal),
+        Some((true, between)),
+        "every graph: the larger is refused by the server's limit: {refusal}"
+    );
 }

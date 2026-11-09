@@ -429,6 +429,9 @@ pub(crate) struct PathEvaluator<'a> {
     /// workers, none under an envelope's 1 KiB floor), so evaluators in parallel workers
     /// (EXISTS) hold one cap between them.
     pool: Pool,
+    /// The query's budget, for what the engine charges the evaluation directly: the group
+    /// walks behind the graph's nodes ([`Snapshot::node_count_in`], D16-039 F4).
+    budget: Arc<Budget>,
     /// The first charge the budget refused: it stops the evaluator as a cancellation does,
     /// and the entry points report it ([`Self::answer`]).
     refused: Cell<Option<BudgetExceeded>>,
@@ -451,6 +454,7 @@ impl<'a> PathEvaluator<'a> {
             cancellation,
             closures: Cell::new(0),
             pool: Pool::new(Arc::clone(budget)),
+            budget: Arc::clone(budget),
             refused: Cell::new(None),
         }
     }
@@ -718,10 +722,17 @@ impl PathEvaluator<'_> {
             PathGraph::Merged(None) => Some(GraphSelector::Any),
             PathGraph::Merged(Some(_)) => None,
         };
-        if let Some(count) =
-            graphs.and_then(|graphs| self.snapshot.node_count_in(self.model, graphs))
-        {
-            return count;
+        match graphs.map(|graphs| {
+            self.snapshot
+                .node_count_in(self.model, graphs, &self.budget)
+        }) {
+            Some(Ok(Some(count))) => return count,
+            // Refused: the evaluator stops, and its entry point reports it.
+            Some(Err(refused)) => {
+                self.refuse(refused);
+                return 0;
+            }
+            Some(Ok(None)) | None => {}
         }
         let (subjects, objects) = self.subjects_and_objects();
         let mut count = 0;
@@ -756,11 +767,21 @@ impl PathEvaluator<'_> {
                 Permutation::Gosp,
             ),
         };
+        // The walks charged to the query's budget as they grow; the lists made of them, and
+        // `read`'s, are the evaluator's own (uncharged, its follow-up: D16-039's notes).
         let distinct = |permutation| -> Option<Vec<u64>> {
-            let counts = self
-                .snapshot
-                .group_counts_in(self.model, &pattern, permutation)?;
-            Some(counts.into_iter().map(|(id, _)| id.raw()).collect())
+            let counts =
+                match self
+                    .snapshot
+                    .group_counts_in(self.model, &pattern, permutation, &self.budget)
+                {
+                    Ok(counts) => counts?,
+                    Err(refused) => {
+                        self.refuse(refused);
+                        return Some(Vec::new());
+                    }
+                };
+            Some(counts.iter().map(|&(id, _)| id.raw()).collect())
         };
         match (distinct(by_subject), distinct(by_object)) {
             (Some(subjects), Some(objects)) => (subjects, objects),
@@ -792,7 +813,9 @@ impl PathEvaluator<'_> {
             .iter()
             .map(|&(_, reached, on_cycle)| reached - u64::from(on_cycle))
             .sum();
-        Ok(Some(self.node_count() + beyond))
+        // A node count the budget refused stops the evaluator: an error, never a count.
+        let nodes = self.node_count();
+        self.answer(Some(nodes + beyond))
     }
 
     /// How many nodes the closure `path` (`p+` or `p*`) reaches from `node` (`forward`) or

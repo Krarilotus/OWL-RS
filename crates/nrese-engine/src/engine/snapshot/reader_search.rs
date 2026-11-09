@@ -754,17 +754,22 @@ impl Snapshot {
         if !supported {
             return None;
         }
-        let mut counts = Vec::new();
+        // Uncharged here, as before: no reader's budget reaches this walk (the snapshot read
+        // owner's follow-up, D16-039 F7).
+        let unlimited = nrese_exec::Budget::unlimited();
+        let mut counts = nrese_exec::ChargedVec::new(&unlimited);
         let mut sources = 0;
         for stack in crate::engine::Stack::ALL {
             if model.includes(stack) {
                 let before = counts.len();
                 self.data(model)
                     .stack(stack)
-                    .group_counts(plan, bound, &mut counts);
+                    .group_counts(plan, bound, &mut counts, &unlimited)
+                    .expect("an unlimited budget");
                 sources += usize::from(counts.len() > before);
             }
         }
+        let (mut counts, _held) = counts.into_parts();
         // One run of one stack yields each value once, in order; otherwise merge.
         if sources > 1 || !counts.is_sorted_by(|a, b| a.0 < b.0) {
             counts.sort_unstable_by_key(|&(value, _)| value);
