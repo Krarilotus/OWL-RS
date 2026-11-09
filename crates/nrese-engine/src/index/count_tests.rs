@@ -1,16 +1,86 @@
 //! REAS-2 fix check r1 (R2-F1, held counts): a count tells its visitor about a run's
 //! tombstone words as it reads them, so a caller's stop ends the read within a run of words.
 
+use super::merge::SignedMerge;
 use super::run::Run;
 use super::{IndexVersion, Layout, Visitor};
-use crate::quad::{AccessPlan, EncodedQuad, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
+use crate::visit::{Account, Free, Stopped};
 use crate::witness::{self, Site};
 use std::cell::Cell;
 use std::sync::Arc;
 
 fn term(n: u64) -> TermId {
     TermId::new(TermKind::Iri, n + 1)
+}
+
+/// An account that allows its first `0` portions and refuses every one after.
+struct Allow(u32);
+
+impl Account for Allow {
+    fn take(&mut self, _: u64) -> bool {
+        let allowed = self.0 > 0;
+        self.0 = self.0.saturating_sub(1);
+        allowed
+    }
+}
+
+/// REAS-3a fix check r1 F1 (design attacks D6 and r2 E3). Spec (`SignedMerge::step`): a merge
+/// step its account stops leaves the merge stopped. Three ranges hold one key K: it is
+/// inserted, deleted, then inserted again, and the first and last ranges hold 255 more keys
+/// each, so taking K from the first decodes a block. The first step is stopped at each of its
+/// portions in turn. It answers `Stopped`. After that, a step on an account that never stops
+/// answers `Stopped` again and the plain iterator answers the end, and neither does any work.
+/// Not stopped, the first step yields K with sign +1.
+#[test]
+fn a_stopped_merge_step_stays_stopped() {
+    let (p, o) = (term(1), term(2));
+    let quad = |s| EncodedQuad::new(term(s), p, o, TermId::DEFAULT_GRAPH);
+    let k = quad(10);
+    let with = |from: u64| -> Vec<_> {
+        std::iter::once(k)
+            .chain((from..from + 255).map(quad))
+            .collect()
+    };
+    let runs = [
+        Run::from_delta(Layout::DefaultGraph, &with(100), &[]),
+        Run::from_delta(Layout::DefaultGraph, &[], &[k]),
+        Run::from_delta(Layout::DefaultGraph, &with(400), &[]),
+    ];
+    let parts = || {
+        runs.iter().map(|run| {
+            let perm = run.permutation(Permutation::Spog);
+            (perm, 0, perm.keys.len())
+        })
+    };
+    let key = Permutation::Spog.to_key(&k);
+    let mut stops = 0;
+    for allowed in 0.. {
+        let mut merge = SignedMerge::new(parts());
+        match merge.step(&mut Allow(allowed)) {
+            Ok(first) => {
+                assert_eq!(first, Some((key, 1)), "K, inserted last, comes first");
+                break;
+            }
+            Err(Stopped) => {
+                stops += 1;
+                let before = witness::get(Site::MergeWork);
+                assert_eq!(merge.step(&mut Free), Err(Stopped), "stopped at {allowed}");
+                assert_eq!(
+                    merge.next(),
+                    None,
+                    "stopped at {allowed}: the plain read ends"
+                );
+                assert_eq!(
+                    witness::get(Site::MergeWork),
+                    before,
+                    "stopped at {allowed}: no work after the stop"
+                );
+            }
+        }
+    }
+    assert_eq!(stops, 6, "two portions for each of K's three occurrences");
 }
 
 /// The work a read's producers count: the runs it searches or probes, the comparisons its

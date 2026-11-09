@@ -29,6 +29,7 @@ use rayon::prelude::*;
 
 use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
+use crate::visit::Account;
 
 /// How index blocks are encoded when they are built (`store.index_encoding`). Reading
 /// takes either, so a store can switch: blocks built after the switch take the new one.
@@ -76,6 +77,9 @@ fn current_encoding() -> IndexEncoding {
 
 /// Keys per block.
 pub(crate) const BLOCK: usize = 128;
+
+/// The most probes a binary search inside one block makes.
+const BLOCK_PROBES: u64 = (usize::BITS - BLOCK.leading_zeros()) as u64;
 
 /// A search's key comparison, `outcome`, counted where it is made in a build with the work
 /// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
@@ -989,6 +993,41 @@ impl PackedKeys {
     pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
         let start = self.bound_in(0, self.len, low, false);
         (start, self.end_from(start, high))
+    }
+
+    /// [`Self::range`], each of its two searches counted on `account` before it is made:
+    /// `None` once the account has stopped (REAS-3a fix check r1 F1, design attack r2 E2: a
+    /// search finding nothing is counted too).
+    pub(crate) fn range_counted(
+        &self,
+        low: &Key,
+        high: &Key,
+        account: &mut impl Account,
+    ) -> Option<(usize, usize)> {
+        let start = self.bound_counted(low, account)?;
+        if start == self.len {
+            // `end_from` compares nothing here.
+            return Some((start, start));
+        }
+        account
+            .take(3 * self.levels() + BLOCK_PROBES)
+            .then(|| (start, self.end_from(start, high)))
+    }
+
+    /// The lower bound of `key` over all the keys, counted on `account` before it is searched
+    /// (the run it reads counted with it): `None` once the account has stopped.
+    pub(crate) fn bound_counted(&self, key: &Key, account: &mut impl Account) -> Option<usize> {
+        account
+            .take(self.levels() + BLOCK_PROBES + 1)
+            .then(|| self.bound_in(0, self.len, key, false))
+    }
+
+    /// The most comparisons a search over the blocks' first keys makes, one per level of a
+    /// binary search over them plus its last: a bound search makes one such search and at most
+    /// [`BLOCK_PROBES`] probes inside a block, the range end three (its gallop, the search
+    /// between the gallop's last probes and its bound's) and the probes. At most 65.
+    fn levels(&self) -> u64 {
+        u64::from(usize::BITS - self.firsts.len().leading_zeros()) + 1
     }
 
     /// [`Self::range`] for a `low` not below the key at `from - 1`: a finger search from

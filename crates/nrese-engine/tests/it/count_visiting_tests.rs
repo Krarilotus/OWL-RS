@@ -262,13 +262,26 @@ fn counted_reads_answer_as_the_uncounted_ones() {
 /// it moves): a counted read's cold equality class build counts in proportion to its input.
 /// An asserted chain of `n` identities (`s_i sameAs s_i+1`, one class) and materialisation's
 /// inferred star over it (`s_i sameAs s_0`, each pair already in that class, which a union
-/// leaves as it is): a count's visitor is told of at most a small multiple of `n` units, plus
-/// the class sort's `n · log2 n` comparisons (counted since fix check r1 R1). Charging a union
-/// by the smaller side's size whatever it does, each star statement counted the whole class:
-/// about `n` squared.
+/// leaves as it is): doubling `n` at most triples the units a count's visitor is told of. A
+/// linear count doubles, and the class sort's `n log n` a little more; charging a union by the
+/// smaller side's size whatever it does, each star statement counted the whole class, about
+/// `n` squared: four times as many (fix check r1: the ratio, not a multiple of `n` that each
+/// charging change would retune).
 #[test]
 fn a_counted_class_build_counts_in_proportion_to_its_statements() {
-    let n = 2 * nrese_exec::POLL_UNITS as usize;
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let (small, large) = (class_build_units(interval), class_build_units(2 * interval));
+    assert!(
+        large <= 3 * small,
+        "{large} units counted for {} identities, {small} for {interval}: at most three times",
+        2 * interval
+    );
+}
+
+/// The units a counted count of `? p ?` tells its visitor of on a fresh engine whose
+/// equality class of `n` identities ([`a_counted_class_build_counts_in_proportion_to_its_statements`])
+/// is built cold, checking the count's answer.
+fn class_build_units(n: usize) -> u64 {
     let engine = Engine::new(EngineConfig {
         background_maintenance: false,
         ..EngineConfig::default()
@@ -318,10 +331,5 @@ fn a_counted_class_build_counts_in_proportion_to_its_statements() {
         Ok(Count::Exact(n as u64)),
         "the statement's copy for each identity"
     );
-    let sort = n as u64 * u64::from(usize::BITS - n.leading_zeros());
-    let (units, bound) = (units.get(), 16 * n as u64 + sort);
-    assert!(
-        units <= bound,
-        "{units} units counted for {n} identities: at most {bound}"
-    );
+    units.get()
 }
