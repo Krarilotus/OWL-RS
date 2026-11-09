@@ -2353,6 +2353,8 @@ impl Supports {
         let mut updated = None;
         if let Some((earlier, touched)) = earlier {
             let in_closure = |fact: Triple, poll: &Poller<'_>| {
+                #[cfg(test)]
+                crate::witness::add(crate::witness::Site::FallbackProbe, 1);
                 !poll.tick()
                     && (axioms.binary_search(&fact).is_ok()
                         || snapshot

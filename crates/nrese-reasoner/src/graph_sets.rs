@@ -1038,6 +1038,8 @@ fn support_sets_run(
             .map_init(
                 || Poller::new(&fired),
                 |poll, w| {
+                    #[cfg(test)]
+                    crate::witness::add(crate::witness::Site::HeadGroup, 1);
                     let poll = poll.as_ref()?;
                     let group = &found[w[0]..w[1]];
                     let fact = group[0].0;
@@ -1350,6 +1352,8 @@ pub fn rederived<S: Source + Sync + ?Sized>(
         .map_init(
             || Poller::new(&fired),
             |poll, fact| {
+                #[cfg(test)]
+                crate::witness::add(crate::witness::Site::OneStepCandidate, 1);
                 let poll = poll.as_ref()?;
                 derived_otherwise(source, program, axioms, fact, poll).then_some(fact)
             },
@@ -2404,6 +2408,8 @@ fn merge(
     poll: &Poller<'_>,
     annotations: &mut usize,
 ) -> bool {
+    #[cfg(test)]
+    crate::witness::add(crate::witness::Site::Merge, 1);
     let current = sets.entry(fact).or_default();
     // At its final capacity ([`merge_found`] charges it so).
     let mut all = Vec::with_capacity(current.sets.len() + from.sets.len());

@@ -11,6 +11,7 @@ use super::rulesets::Ruleset;
 use super::vocabulary::LocalVocabulary;
 
 mod attempted;
+mod boundaries;
 mod sources;
 mod stops;
 mod support_refusal;

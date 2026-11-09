@@ -521,3 +521,78 @@ fn a_restricted_view_s_changes_are_counted_as_they_are_read() {
          than {interval} plus one run of {run} between two of them"
     );
 }
+
+/// REAS-2 fix check r2 (R3-F3, SW109). Spec (design note, rule 2: a stop is an error the
+/// consumer has to handle, never an answer): the re-derived facts of a snapshot, brought to it
+/// from the earlier ones through the commit's touched facts (`compute_rederived`'s fallback),
+/// end once the reading query is cancelled while their closure is asked about. The earlier
+/// re-derived facts computed, then one commit of 4 × `POLL_UNITS` memberships of `C`, then the
+/// next snapshot's, the query cancelled at the first touched fact asked about: no more than
+/// `POLL_UNITS` touched facts asked about (the poller sees the cancellation at its next ask),
+/// and the read fails as cancelled. A stopped ask read as "not in the closure", and every later
+/// touched fact was asked about and kept as removed. A run without cancellation, after it,
+/// asks about every touched fact: the fallback is the path taken.
+#[test]
+fn a_cached_rederived_fallback_ends_at_its_cancellation() {
+    use crate::witness::{self, Site};
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let n = 4 * interval;
+    let store = past_the_cap();
+    let reasoner = nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::for_mode(
+        nrese_reasoner::ReasoningMode::for_ruleset(nrese_reasoner::rulesets::Ruleset::Owl2Rl),
+    ));
+    let pipeline = crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner));
+    let supports = store.supports();
+    let compilation = Compilation {
+        hide_unnamed_classes: false,
+        by_representatives: false,
+        compact: false,
+        cap: 16,
+    };
+    let unlimited = || Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: None,
+    };
+    let before = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&before).unwrap();
+    supports
+        .compute_rederived(&before, &generation, compilation, &unlimited())
+        .unwrap();
+    let members: String = (0..n).map(|i| format!("<{EX}x{i}> a <{EX}C> . ")).collect();
+    pipeline
+        .execute_update(&crate::SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ {members} }}"
+        )))
+        .unwrap();
+    let after = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&after).unwrap();
+    let token = nrese_sparql::CancellationToken::new();
+    let cancelled = Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: Some(token.clone()),
+    };
+    let start = witness::get(Site::FallbackProbe);
+    witness::on_first(Site::FallbackProbe, Box::new(move || token.cancel()));
+    let stopped = supports.compute_rederived(&after, &generation, compilation, &cancelled);
+    let asked = witness::get(Site::FallbackProbe) - start;
+    let whole = {
+        let start = witness::get(Site::FallbackProbe);
+        supports
+            .compute_rederived(&after, &generation, compilation, &unlimited())
+            .unwrap();
+        witness::get(Site::FallbackProbe) - start
+    };
+    assert!(
+        whole >= n as u64,
+        "{whole} touched facts asked about uncancelled: the fallback wasn't taken"
+    );
+    assert!(
+        asked <= interval as u64 + 1,
+        "{asked} touched facts asked about once cancelled at the first, of {whole}: more than \
+         {interval} plus the one that saw it"
+    );
+    assert!(
+        matches!(stopped, Err(Unavailable::Cancelled)),
+        "a cancelled read fails as cancelled"
+    );
+}

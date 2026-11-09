@@ -191,6 +191,8 @@ pub fn same_as_partners<S: Source + ?Sized>(
     term: u64,
     poll: &super::eval::Poller<'_>,
 ) -> Result<Vec<u64>, super::eval::Stopped> {
+    #[cfg(test)]
+    crate::witness::add(crate::witness::Site::PartnerRead, 1);
     // `Err` where its poller stopped the read, never a part of the class (fix check r1, B9).
     let mut out = Vec::new();
     if let Some(same_as) = same_as {
