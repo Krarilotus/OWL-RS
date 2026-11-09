@@ -15,6 +15,13 @@
 //!
 //! Everything works on ids through a [`ir::Vocabulary`] that interns the rules' constants.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold
+/// (`graph_sets`' premise product guard measures against its budget).
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
+
 pub mod batch;
 pub mod capability;
 pub mod classify;
@@ -42,6 +49,8 @@ mod tests;
 pub mod unnamed;
 mod violations;
 pub mod vocabulary;
+#[cfg(test)]
+mod witness;
 
 pub use capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature, ReasonerRunStatus};
 pub use config::{ConfigError, ReasonerConfig, ReasoningMode};

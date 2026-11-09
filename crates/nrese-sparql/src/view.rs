@@ -83,11 +83,12 @@ pub(crate) fn changed(tx: &impl PendingView) -> bool {
     tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0)
 }
 
-/// A transaction's refusal as the evaluation's: its memory as any other memory refusal.
+/// A transaction's refusal as the evaluation's: its memory as any other memory refusal (past
+/// the request's envelope), anything else unexpected (as the update's refused writes are).
 pub(crate) fn engine_refusal(error: EngineError) -> QueryEvaluationError {
     match error {
         EngineError::MemoryLimit(exceeded) => QueryEvaluationError::MemoryLimit(exceeded),
-        error => QueryEvaluationError::Dataset(Box::new(error)),
+        error => QueryEvaluationError::Unexpected(error.to_string()),
     }
 }
 

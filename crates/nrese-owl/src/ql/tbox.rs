@@ -36,6 +36,14 @@ pub struct Closure {
     pub lists: bool,
 }
 
+impl Closure {
+    /// Whether it applies equality between individuals (`eq-*`): `owl2-rl`'s rules do, as
+    /// they have the list rules; `owl2-ql`'s have neither.
+    pub fn equality(self) -> bool {
+        self.lists
+    }
+}
+
 /// A generating axiom `left ⊑ ∃role.filler` (`filler` `None`: `owl:Thing`, or a data
 /// value), with the type of the anonymous element it makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +116,22 @@ struct Builder {
     /// Generating axioms: (left, role, filler, data).
     generating: Vec<(u32, Role, Option<u32>, bool)>,
     fresh: HashMap<ExprId, u32>,
+    /// The conclusions, or parts of them, the TBox doesn't read, per axiom, each with its
+    /// polarity (`false`: the expression's complement is concluded). They are:
+    /// - a right side `superclass` reads as nothing;
+    /// - the right side of a left side read only in part ([`Self::subclass`]);
+    /// - a disjoint union's parts, as the class's covering;
+    /// - every part of a disjointness, negated (fix check r1, F3: `A ⊑ ¬≤0 S.D`).
+    ///
+    /// This is the ledger the hazards classify, so what the TBox leaves out is never
+    /// re-derived there.
+    unread: std::collections::BTreeSet<(ExprId, bool)>,
+    /// The axioms (their indices in the ontology) the TBox reads only in part or not at all.
+    /// One it reads whole the rewriting answers, so the closure's profile doesn't bound it
+    /// (I24c). Ascending and without repeats: axioms are read in order ([`Self::mark_partial`]).
+    partial: Vec<usize>,
+    /// The axiom being read.
+    current: usize,
 }
 
 impl Tbox {
@@ -120,14 +144,47 @@ impl Tbox {
         };
         b.tbox.thing = thing;
         b.basic(Basic::Thing);
-        for axiom in &ontology.axioms {
+        for (i, axiom) in ontology.axioms.iter().enumerate() {
+            b.current = i;
             b.axiom(ontology, axiom);
         }
+        let unread = std::mem::take(&mut b.unread);
+        let partial = std::mem::take(&mut b.partial);
         let mut tbox = b.finish();
+        let read = super::hazards::Read {
+            unread: &unread,
+            partial: &partial,
+            rl: closure.lists,
+        };
         tbox.hazards =
-            super::hazards::hazards(ontology, &tbox.types, &|id| tbox.basics[id as usize]);
+            super::hazards::hazards(ontology, &tbox.types, &read, &|id| tbox.basics[id as usize]);
+        // An axiom the mapping drops supports no claim: any term may miss its conclusions
+        // (I24c-2). An existing global hazard's reason is the more specific.
+        if tbox.hazards.global.is_none() {
+            use crate::diagnostics::Diagnostic;
+            tbox.hazards.global = ontology.diagnostics.iter().find_map(|d| match *d {
+                Diagnostic::Malformed { node, .. } | Diagnostic::Unsupported { node, .. } => {
+                    Some(Hazard::Dropped(node))
+                }
+                Diagnostic::BrokenList { head } => Some(Hazard::Dropped(head)),
+                _ => None,
+            });
+        }
         tbox.rewritable = tbox.rewritable_terms();
         tbox
+    }
+
+    /// The source holds an equality of individuals (`owl:sameAs`) that isn't among the
+    /// axioms compiled. The store's reader reads only whether one exists, in any graph, so no
+    /// name of it reaches a reader who can't read it, and no sampled statement can be lost
+    /// to the mapping (I24c-2 review r1, F1, F3). Where `closure` applies no equality
+    /// (owl2-ql), any fact may follow: the hazard is global, [`Hazard::Equating`], unless one
+    /// already is.
+    pub fn with_equality(mut self, closure: Closure) -> Self {
+        if !closure.equality() && self.hazards.global.is_none() {
+            self.hazards.global = Some(Hazard::Equating);
+        }
+        self
     }
 
     /// Why answers to `cq` through anonymous individuals may be missing
@@ -455,6 +512,13 @@ fn reach(edges: &[Vec<u32>], start: impl IntoIterator<Item = u32>) -> Vec<u32> {
 }
 
 impl Builder {
+    /// Records that the axiom being read is read only in part or not at all.
+    fn mark_partial(&mut self) {
+        if self.partial.last() != Some(&self.current) {
+            self.partial.push(self.current);
+        }
+    }
+
     fn basic(&mut self, basic: Basic) -> u32 {
         if let Some(&id) = self.tbox.ids.get(&basic) {
             return id;
@@ -498,11 +562,19 @@ impl Builder {
             Axiom::DisjointUnion(class, parts) => {
                 let class = self.basic(Basic::Class(*class));
                 for &part in parts {
-                    for (left, _) in self.lefts(o, part) {
+                    // A part the TBox reads only in part concludes the class only: nothing to
+                    // record.
+                    for (left, _) in self.lefts(o, part, &mut true) {
                         self.include(left, class, false);
                     }
+                    // The direction from the class to the union isn't read (review r1, F2):
+                    // the union's existentials are each part's.
+                    self.unread.insert((part, true));
                 }
+                self.mark_partial();
+                self.disjoint(parts);
             }
+            Axiom::DisjointClasses(classes) => self.disjoint(classes),
             Axiom::SubObjectPropertyOf(chain, sup) if chain.len() == 1 => {
                 self.role(chain[0], *sup, true);
             }
@@ -552,26 +624,48 @@ impl Builder {
                 let left = self.basic(Basic::Exists(ObjProp::Named(*property)));
                 self.superclass(o, left, *class, true);
             }
-            _ => {}
+            // Not read: what the closure's profile says of it decides (I24c).
+            _ => {
+                self.mark_partial();
+            }
         }
     }
 
     /// A role inclusion; `base` if the materialisation applies it (`prp-spo1`,
     /// `prp-inv1/2`, `prp-symp`, `prp-eqp1/2`): every one, through an inverse expression
     /// too, since its facts are generalised triples (`x [owl:inverseOf p] y`).
+    /// Disjoint class expressions: each part's members are in every other part's
+    /// complement, which the TBox doesn't read (fix check r1, F3). So with two parts or
+    /// more, each part is recorded negated.
+    fn disjoint(&mut self, parts: &[ExprId]) {
+        if parts.len() >= 2 {
+            self.unread.extend(parts.iter().map(|&p| (p, false)));
+            self.mark_partial();
+        }
+    }
+
     fn role(&mut self, sub: Role, sup: Role, base: bool) {
         self.roles.push((sub, sup, base));
     }
 
     fn subclass(&mut self, o: &Ontology, sub: ExprId, sup: ExprId) {
-        for (left, base) in self.lefts(o, sub) {
+        let mut whole = true;
+        for (left, base) in self.lefts(o, sub, &mut whole) {
             self.superclass(o, left, sup, base);
+        }
+        // Individuals in the part of `sub` that isn't read are in `sup` unread (review r1,
+        // F1: `A ⊓ B ⊑ ∃S.D`).
+        if !whole {
+            self.unread.insert((sup, true));
+            self.mark_partial();
         }
     }
 
     /// The basic concepts a subclass expression is read as, each with whether the
     /// materialisation applies an inclusion from it (`cax-sco`, `cls-svf2`, `cls-uni`).
-    fn lefts(&mut self, o: &Ontology, expr: ExprId) -> Vec<(u32, bool)> {
+    /// `whole` is cleared where some part of it isn't read: no basic concept, or a union's
+    /// branch without one.
+    fn lefts(&mut self, o: &Ontology, expr: ExprId, whole: &mut bool) -> Vec<(u32, bool)> {
         match o.class(expr) {
             ClassExpr::Class(a) => vec![(self.basic(Basic::Class(*a)), true)],
             ClassExpr::Thing => vec![(self.basic(Basic::Thing), false)],
@@ -597,11 +691,14 @@ impl Builder {
                 parts
                     .clone()
                     .into_iter()
-                    .flat_map(|part| self.lefts(o, part))
+                    .flat_map(|part| self.lefts(o, part, whole))
                     .map(|(left, base)| (left, base && lists))
                     .collect()
             }
-            _ => Vec::new(),
+            _ => {
+                *whole = false;
+                Vec::new()
+            }
         }
     }
 
@@ -630,7 +727,10 @@ impl Builder {
             {
                 self.generates_data(left, *property);
             }
-            _ => {}
+            _ => {
+                self.unread.insert((expr, true));
+                self.mark_partial();
+            }
         }
     }
 

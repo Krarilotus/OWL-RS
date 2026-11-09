@@ -51,10 +51,10 @@ use nrese_engine::{
 };
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
-use nrese_reasoner::eval::{Seg, Source};
+use nrese_reasoner::eval::{Poller, Probe, Seg, Stopped as ReadStopped, Visit, Visits};
 use nrese_reasoner::graph_sets::{
-    Annotation, Change, GraphSet, Limits, Stopped, closure_within, initial_sets, rederived,
-    rederived_candidates, support_sets, update_support_sets,
+    Annotation, Change, GraphSet, Graphs, InGraphs, Limits, Previous, Sets, Stopped,
+    closure_within, rederived, rederived_candidates, support_sets, update_support_sets,
 };
 use nrese_reasoner::ir::Triple;
 use nrese_sparql::{CancellationToken, GraphAccess, PendingRead, ReadView};
@@ -181,14 +181,18 @@ impl Work {
     /// Fails once the reading query is cancelled: what polls it stops there, before it
     /// charges or keeps more.
     fn go_on(&self) -> Result<(), Unavailable> {
-        match self
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+        match self.cancelled() {
             true => Err(Unavailable::Cancelled),
             false => Ok(()),
         }
+    }
+
+    /// Whether the reading query is cancelled (an atomic load): the stop of the pollers its
+    /// store loops count on (REAS-2, sweep M14, M15).
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
     }
 }
 
@@ -246,6 +250,7 @@ impl Following {
             Stopped::ProcessMemory => Unavailable::ProcessMemory,
             Stopped::MemoryUnreadable => Unavailable::MemoryUnreadable,
             Stopped::Cancelled => Unavailable::Cancelled,
+            Stopped::Refused(exceeded) => Unavailable::Memory(exceeded),
             // The watch refused: the budget, or else the cancellation.
             Stopped::Memory { .. } => self
                 .refused
@@ -437,6 +442,51 @@ impl Closure {
     }
 }
 
+/// Where `snapshot` asserts facts, its graphs numbered by `graphs` (`index`, sorted by graph,
+/// the other way): read from the snapshot as asked, no list made.
+struct InSnapshot<'s> {
+    snapshot: &'s Snapshot,
+    graphs: &'s [TermId],
+    index: &'s [(TermId, u32)],
+}
+
+/// Store reads the update calls back: the call counted before its lookup, then each quad
+/// read, on the reading task's poller (REAS-2, sweep M14; sol-loop r2 S5).
+impl Graphs for InSnapshot<'_> {
+    fn each(
+        &self,
+        fact: Triple,
+        poll: &Poller<'_>,
+        graph: &mut dyn FnMut(u32),
+    ) -> Result<(), ReadStopped> {
+        if poll.tick() {
+            return Err(ReadStopped);
+        }
+        for quad in self
+            .snapshot
+            .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
+        {
+            if poll.tick() {
+                return Err(ReadStopped);
+            }
+            graph(graph_index(self.index, quad.graph));
+        }
+        Ok(())
+    }
+
+    fn holds(&self, fact: Triple, graph: u32, poll: &Poller<'_>) -> Result<bool, ReadStopped> {
+        if poll.tick() {
+            return Err(ReadStopped);
+        }
+        Ok(self.graphs.get(graph as usize).is_some_and(|&id| {
+            self.snapshot.exists_in(
+                ReadModel::Asserted,
+                &pattern(fact, GraphSelector::Exact(id)),
+            )
+        }))
+    }
+}
+
 impl SupportSets {
     /// The sets of `snapshot`'s facts under `program`, at most `cap` per fact, kept on
     /// `kept`; what computing them reads and builds charged to `working`.
@@ -453,9 +503,10 @@ impl SupportSets {
         axioms.extend_from_slice(program.axioms())?;
         axioms.sort_unstable();
         let closure = Closure::of(snapshot, &graphs, &axioms, working)?;
-        let graphs_of = |fact: Triple| -> Vec<u32> {
-            closure.graphs_of(fact).iter().map(|&(_, g)| g).collect()
-        };
+        // Read where the closure keeps them, no list per fact (fix check r2, C1.b residual);
+        // each lookup counted before it is made, then its entries, on the reading task's
+        // poller ([`InGraphs`]'s `Graphs`; sol-loop r1 S4, r2 S5).
+        let graphs_of = InGraphs(&closure.asserted);
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
         let by_fact = support_sets(
@@ -467,6 +518,7 @@ impl SupportSets {
             Limits {
                 watch: &|bytes| following.watch(bytes),
                 stop: &|| following.cancelled(),
+                scratch: &working.budget,
             },
         )
         .map_err(|stopped| following.failure(stopped))?;
@@ -614,23 +666,31 @@ impl SupportSets {
         }
         let graphs = graphs_in_order(snapshot, &self.graphs, kept, working)?;
         let index = index_of(&graphs, working)?;
-        let graphs_of = |fact: Triple| -> Vec<u32> {
-            let mut found: Vec<u32> = snapshot
-                .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
-                .map(|quad| graph_index(&index, quad.graph))
-                .collect();
-            found.sort_unstable();
-            found.dedup();
-            found
+        // Store reads the update calls back, counted on the reading task's poller
+        // ([`InSnapshot`]'s `Graphs`).
+        let graphs_of = InSnapshot {
+            snapshot,
+            graphs: &graphs,
+            index: &index,
         };
-        let in_closure = |fact: Triple| {
-            snapshot.exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any))
-                || self.axioms.binary_search(&fact).is_ok()
+        let in_closure = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+            if poll.tick() {
+                return Err(ReadStopped);
+            }
+            Ok(
+                snapshot.exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any))
+                    || self.axioms.binary_search(&fact).is_ok(),
+            )
         };
+        let following = Following::new(working);
+        let cancelled = || following.cancelled();
+        // The touched facts' probes, on the query's cancellation; the first that finds it
+        // stopped ends the update (fix check r1, rule 2).
+        let prep = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
         let mut removed: Kept<Triple> =
             ChargedVec::with_capacity(Arc::clone(working), touched.len())?;
         for &fact in touched {
-            if !in_closure(fact) {
+            if !in_closure(fact, &prep).map_err(|ReadStopped| Unavailable::Cancelled)? {
                 removed.push(fact)?;
             }
         }
@@ -638,19 +698,19 @@ impl SupportSets {
             snapshot,
             removed: &removed,
         };
-        let previous = |fact: Triple| -> Annotation {
-            match self.record(fact) {
+        // Lent from the pool for the whole update, not copied (fix check r2, C1.b residual):
+        // `self` outlives it, and the pool is shared and never changed. A fact recorded as
+        // its own sets keeps none; the update makes them, charged, its graphs read on the
+        // reading task's poller ([`Previous::Own`]). The record itself is an in-memory
+        // lookup the reading derivation counted.
+        let previous = |fact: Triple, _: &Poller<'_>| {
+            Ok(match self.record(fact) {
                 // The record keeps one mark: the second taken to be as wide.
-                Record::Kept(entries, truncated) => Annotation {
-                    sets: entries
-                        .iter()
-                        .map(|&(_, id)| self.sets.sets[id as usize].clone())
-                        .collect(),
-                    truncated,
-                    beyond_own: truncated,
-                },
-                Record::Own => self.initial(fact, graphs_of(fact), cap),
-            }
+                Record::Kept(entries, truncated) => {
+                    Previous::Sets(Sets::pooled(entries, &self.sets.sets, truncated))
+                }
+                Record::Own => Previous::Own,
+            })
         };
         let change = Change {
             source: &source,
@@ -659,10 +719,10 @@ impl SupportSets {
             previous: &previous,
             limit: self.base.len() / 4 + 10_000,
         };
-        let following = Following::new(working);
         let limits = Limits {
             watch: &|bytes| following.watch(bytes),
             stop: &|| following.cancelled(),
+            scratch: &working.budget,
         };
         let recomputed =
             match update_support_sets(&change, &ground, &self.axioms, &graphs_of, cap, limits) {
@@ -675,18 +735,22 @@ impl SupportSets {
         // `snapshot` holds them (one read at a time, its working memory reserved).
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
+        // Each quad and graph probe counted on the query's cancellation (sweep M14): stopped,
+        // the answers mean nothing, and the loop below ends `Cancelled`.
         let starts = |fact: Triple, found: &Annotation| -> (bool, bool) {
             let [s, p, o] = fact.map(TermId::from_raw);
             let holds = snapshot
                 .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
+                .take_while(|_| !prep.tick())
                 .count();
             if found.is_empty() {
                 return (true, holds > 0);
             }
             let own = |graph: u32| {
-                graphs.get(graph as usize).is_some_and(|&graph| {
-                    snapshot.contains_in(ReadModel::Asserted, &EncodedQuad::new(s, p, o, graph))
-                })
+                !prep.tick()
+                    && graphs.get(graph as usize).is_some_and(|&graph| {
+                        snapshot.contains_in(ReadModel::Asserted, &EncodedQuad::new(s, p, o, graph))
+                    })
             };
             let own_sets = starts_with(
                 found,
@@ -703,6 +767,9 @@ impl SupportSets {
             ChargedVec::with_capacity(Arc::clone(working), recomputed.len() + removed.len())?;
         for (&fact, found) in &recomputed {
             fresh.push((fact, starts(fact, found)))?;
+            if prep.stopped() {
+                return Err(Unavailable::Cancelled);
+            }
         }
         for &fact in removed.iter() {
             if !recomputed.contains_key(&fact) {
@@ -891,12 +958,6 @@ impl SupportSets {
         Ok(())
     }
 
-    /// The sets `fact` starts with, from its graphs.
-    fn initial(&self, fact: Triple, graphs: Vec<u32>, cap: usize) -> Annotation {
-        let axiom = self.axioms.binary_search(&fact).is_ok();
-        initial_sets(if axiom { Vec::new() } else { graphs }, axiom, cap)
-    }
-
     /// What `fact`'s sets are recorded as.
     fn record(&self, fact: Triple) -> Record<'_> {
         let overlaid = in_order(&self.overlay.entries, fact);
@@ -951,13 +1012,14 @@ impl SupportSets {
 
     /// The facts that may join a reader's view though the stack holds no copy of them:
     /// those of `elsewhere` (and of the ruleset's axioms) asserted only in graphs the
-    /// reader with `access` may not read, sorted. Its scans' working memory on `working`.
+    /// reader with `access` may not read, sorted. Its scans' working memory on `working`;
+    /// each candidate's read counted on a poller of the query's cancellation (sweep M15).
     fn asserted_elsewhere(
         &self,
         snapshot: &Snapshot,
         access: &GraphAccess,
-        working: &Arc<Budget>,
-    ) -> Result<Kept<Triple>, BudgetExceeded> {
+        working: &Work,
+    ) -> Result<Kept<Triple>, Unavailable> {
         let overlaid = |fact: &Triple| !in_order(&self.overlay.entries, *fact).is_empty();
         let bound = self.elsewhere.len() + self.overlay.elsewhere.len() + self.axioms.len();
         let mut found: Kept<Triple> = ChargedVec::with_capacity(Arc::clone(working), bound)?;
@@ -969,9 +1031,13 @@ impl SupportSets {
             .filter(|fact| !overlaid(fact))
             .chain(self.overlay.elsewhere.iter())
             .chain(self.axioms.iter());
+        let cancelled = || working.cancelled();
+        let poll = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
         for &fact in candidates {
-            if asserted(snapshot, access, fact) == Asserted::OutOfReach {
-                found.push(fact)?;
+            match asserted_counted(snapshot, access, fact, &poll) {
+                None => return Err(Unavailable::Cancelled),
+                Some(Asserted::OutOfReach) => found.push(fact)?,
+                Some(_) => {}
             }
         }
         drop(scanning);
@@ -1082,8 +1148,9 @@ impl SupportSets {
         earlier: &SupportSets,
         before: &Snapshot,
         access: &GraphAccess,
-        working: &Arc<Budget>,
-    ) -> Result<Option<Changes>, BudgetExceeded> {
+        working: &Work,
+        stop: nrese_reasoner::eval::Stop<'_>,
+    ) -> Result<Option<Changes>, Unavailable> {
         let Some((from, changed)) = self.since.as_ref() else {
             return Ok(None);
         };
@@ -1098,13 +1165,32 @@ impl SupportSets {
         // graph the reader reads both times, it is no extra of either view.
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
-        let extra = |fact: Triple| {
-            (earlier.decide(fact, &visible_before) != Decision::Hidden
-                || self.decide(fact, &visible_now) != Decision::Hidden)
-                && (asserted(before, access, fact) == Asserted::OutOfReach
-                    || asserted(snapshot, access, fact) == Asserted::OutOfReach)
+        // Each changed fact counted before it is decided, and its reads, on `stop` (the
+        // query's cancellation; sweep M15, review r1 F4): a fact both versions hide is
+        // decided with no store read, and still counts.
+        let poll = Poller::new(stop).ok_or(Unavailable::Cancelled)?;
+        // A probe its poller stopped ends the changes (fix check r1, rule 2: it read as "not
+        // out of reach").
+        let out_of_reach = |view: &Snapshot, fact: Triple| -> Result<bool, Unavailable> {
+            let asserted = asserted_counted(view, access, fact, &poll);
+            Ok(asserted.ok_or(Unavailable::Cancelled)? == Asserted::OutOfReach)
         };
-        if changed.iter().any(|&fact| extra(fact)) {
+        let extra = |fact: Triple| -> Result<bool, Unavailable> {
+            Ok((earlier.decide(fact, &visible_before) != Decision::Hidden
+                || self.decide(fact, &visible_now) != Decision::Hidden)
+                && (out_of_reach(before, fact)? || out_of_reach(snapshot, fact)?))
+        };
+        let mut any_extra = false;
+        for &fact in poll.counted(changed.iter()) {
+            if extra(fact)? {
+                any_extra = true;
+                break;
+            }
+        }
+        if poll.stopped() {
+            return Err(Unavailable::Cancelled);
+        }
+        if any_extra {
             return Ok(None);
         }
         drop(scanning);
@@ -1115,6 +1201,10 @@ impl SupportSets {
             show: ChargedVec::new(Arc::clone(working)),
         };
         for &fact in changed.iter() {
+            // The fact's four store probes, counted before they are made (review r1 F4).
+            if poll.attempt(4) {
+                return Err(Unavailable::Cancelled);
+            }
             let [s, p, o] = fact.map(TermId::from_raw);
             let quad = EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
             let decided = |sets: &SupportSets, visible: &[bool], present: bool| match present {
@@ -1148,6 +1238,9 @@ impl SupportSets {
                 (true, false) => changes.show.push(quad)?,
                 _ => {}
             }
+        }
+        if poll.stopped() {
+            return Err(Unavailable::Cancelled);
         }
         Ok(Some(changes))
     }
@@ -1291,15 +1384,35 @@ pub(crate) enum Asserted {
 /// Where `fact` is asserted in `view` (a snapshot, or a transaction with its pending
 /// changes), for a reader with `access`: the one test of whether a reader may know a
 /// statement is asserted, for its views, its pending reads and what it is told.
+///
+/// One fact's answer, run to its end (an explanation's reader, a commit's report); loops
+/// over many facts use [`asserted_counted`].
 pub(crate) fn asserted(view: &impl ReadView, access: &GraphAccess, fact: Triple) -> Asserted {
+    asserted_counted(view, access, fact, &Poller::never()).expect("never stops")
+}
+
+/// [`asserted`], counting the call and each asserting quad it reads on `poll`; `None` once
+/// that has stopped (REAS-2, sweep M15: a loop over facts, each read scanning its copies).
+fn asserted_counted(
+    view: &impl ReadView,
+    access: &GraphAccess,
+    fact: Triple,
+    poll: &Poller<'_>,
+) -> Option<Asserted> {
+    if poll.tick() {
+        return None;
+    }
     let mut found = Asserted::Nowhere;
     for quad in view.quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)) {
+        if poll.tick() {
+            return None;
+        }
         if access.allows_id(view, quad.graph) {
-            return Asserted::InReach;
+            return Some(Asserted::InReach);
         }
         found = Asserted::OutOfReach;
     }
-    found
+    Some(found)
 }
 
 /// `known` followed by the named graphs of `snapshot` it lacks, in IRI order, kept on
@@ -1344,40 +1457,62 @@ struct After<'a> {
     removed: &'a [Triple],
 }
 
-impl After<'_> {
-    fn removed_matching(&self, bound: [Option<u64>; 3]) -> impl Iterator<Item = Triple> + '_ {
-        self.removed.iter().copied().filter(move |fact| {
-            bound
-                .iter()
-                .zip(fact)
-                .all(|(bound, term)| bound.is_none_or(|b| b == *term))
-        })
-    }
+/// Whether `fact` has `bound`'s terms where it binds them.
+fn matches(bound: [Option<u64>; 3], fact: &Triple) -> bool {
+    bound
+        .iter()
+        .zip(fact)
+        .all(|(bound, term)| bound.is_none_or(|b| b == *term))
 }
 
-impl Source for After<'_> {
-    fn scan(&self, bound: [Option<u64>; 3], _: Seg, f: &mut dyn FnMut(Triple)) {
+/// Reads count as `Source` says: each quad a scan visits is a position, and so is each
+/// removed fact it looks at, the ones that don't match skipped; an estimate counts the
+/// removed facts it looks at (REAS-2, sweep M13).
+impl Visits for After<'_> {
+    fn visit(&self, bound: [Option<u64>; 3], _: Seg, visit: &mut Visit<'_, '_>) {
         for quad in self
             .snapshot
             .quads_for_pattern_in(ReadModel::Materialised, &bound_pattern(bound))
         {
-            f(triple(quad));
+            if !visit.fact(triple(quad)) {
+                return;
+            }
         }
-        self.removed_matching(bound).for_each(f);
+        for &fact in self.removed {
+            let going = match matches(bound, &fact) {
+                true => visit.fact(fact),
+                false => visit.skip(),
+            };
+            if !going {
+                return;
+            }
+        }
     }
 
-    fn estimate(&self, bound: [Option<u64>; 3], _: Seg) -> usize {
+    /// Each removed fact counted as it is read (review r1 F1).
+    fn size(
+        &self,
+        bound: [Option<u64>; 3],
+        _: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, ReadStopped> {
+        let removed = probe
+            .counted(self.removed)
+            .filter(|fact| matches(bound, fact))
+            .count();
+        // A count its stop cut short is `Err` (fix check r1, B9).
+        probe.ended()?;
         let stored = self
             .snapshot
             .estimate_in(ReadModel::Materialised, &bound_pattern(bound));
-        usize::try_from(stored).unwrap_or(usize::MAX) + self.removed_matching(bound).count()
+        Ok(usize::try_from(stored).unwrap_or(usize::MAX) + removed)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.removed.binary_search(&fact).is_ok()
+    fn holds(&self, fact: Triple, _: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+        Ok(self.removed.binary_search(&fact).is_ok()
             || self
                 .snapshot
-                .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any))
+                .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any)))
     }
 }
 
@@ -2113,16 +2248,23 @@ impl Supports {
         snapshot: &Snapshot,
         access: &GraphAccess,
         found: &Rederived,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Snapshot, Unavailable> {
         let started = std::time::Instant::now();
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
         let mut show: Kept<EncodedQuad> = ChargedVec::new(Arc::clone(working));
+        // Each fact's read counted on the query's cancellation (sweep M15).
+        let cancelled = || working.cancelled();
+        let poll = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
         for &fact in found.facts.iter() {
-            if asserted(snapshot, access, fact) == Asserted::OutOfReach {
-                let [s, p, o] = fact.map(TermId::from_raw);
-                show.push(EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH))?;
+            match asserted_counted(snapshot, access, fact, &poll) {
+                None => return Err(Unavailable::Cancelled),
+                Some(Asserted::OutOfReach) => {
+                    let [s, p, o] = fact.map(TermId::from_raw);
+                    show.push(EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH))?;
+                }
+                Some(_) => {}
             }
         }
         drop(scanning);
@@ -2173,14 +2315,22 @@ impl Supports {
         let limits = Limits {
             watch: &watch,
             stop: &stop,
+            scratch: &working.budget,
         };
         let closure = After {
             snapshot,
             removed: &[],
         };
-        let asserted = |fact: Triple| {
-            snapshot.exists_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
+        // A store probe, one unit on the reading task's poller (REAS-2, sweep M16); `Err` once
+        // that has stopped (fix check r1, rule 2).
+        let asserted = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+            if poll.tick() {
+                return Err(ReadStopped);
+            }
+            Ok(snapshot.exists_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)))
         };
+        // The candidates' own probes below, on the query's cancellation.
+        let prep = Poller::new(&stop).ok_or(Unavailable::Cancelled)?;
         // Past this many facts, a candidate's cone is no cheaper than the whole closure.
         let limit = usize::try_from(snapshot.len_in(ReadModel::Materialised)).unwrap_or(usize::MAX)
             / 4
@@ -2201,7 +2351,9 @@ impl Supports {
                 let graphs = graphs_in_order(snapshot, &[TermId::DEFAULT_GRAPH], working, working)?;
                 let whole = Closure::of(snapshot, &graphs, &axioms, working)?;
                 for &fact in &undecided {
-                    let without = |other: Triple| other != fact && asserted(other);
+                    let without = |other: Triple, poll: &Poller<'_>| {
+                        Ok(other != fact && asserted(other, poll)?)
+                    };
                     let held = closure_within(&whole.facts, &ground, &axioms, &without, limits)
                         .map_err(|stopped| following.failure(stopped))?;
                     if held.contains_key(&fact) {
@@ -2229,15 +2381,23 @@ impl Supports {
         };
         let mut updated = None;
         if let Some((earlier, touched)) = earlier {
-            let in_closure = |fact: Triple| {
-                axioms.binary_search(&fact).is_ok()
+            // A store probe, one unit on the query's poller; `Err` once that has stopped, which
+            // ends the loop (fix check r2, R3-F3: "not in the closure" kept every later
+            // touched fact as removed).
+            let in_closure = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+                #[cfg(test)]
+                crate::witness::add(crate::witness::Site::FallbackProbe, 1);
+                if poll.tick() {
+                    return Err(ReadStopped);
+                }
+                Ok(axioms.binary_search(&fact).is_ok()
                     || snapshot
-                        .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any))
+                        .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any)))
             };
             let mut removed: Kept<Triple> =
                 ChargedVec::with_capacity(Arc::clone(working), touched.len())?;
             for &fact in touched.iter() {
-                if !in_closure(fact) {
+                if !in_closure(fact, &prep).map_err(|ReadStopped| Unavailable::Cancelled)? {
                     removed.push(fact)?;
                 }
             }
@@ -2251,7 +2411,7 @@ impl Supports {
                 let mut reachable: Kept<Triple> =
                     ChargedVec::with_capacity(Arc::clone(working), candidates.len())?;
                 for &fact in &candidates {
-                    if asserted(fact) {
+                    if asserted(fact, &prep).map_err(|ReadStopped| Unavailable::Cancelled)? {
                         reachable.push(fact)?;
                     }
                 }
@@ -2383,9 +2543,16 @@ impl Supports {
                 .flatten()
         };
         let mut form = None;
+        let cancelled = || working.cancelled();
         if let Some(reader) = earlier
-            && let Some(changes) =
-                sets.changes_since(snapshot, &reader.sets, &reader.snapshot, access, working)?
+            && let Some(changes) = sets.changes_since(
+                snapshot,
+                &reader.sets,
+                &reader.snapshot,
+                access,
+                working,
+                &cancelled,
+            )?
         {
             form = match &reader.form {
                 Form::Mask(mask) => {
@@ -2490,17 +2657,28 @@ impl Supports {
         for &graph in graphs.iter() {
             readable.push(access.allows_id(snapshot, graph))?;
         }
-        let reads = |fact: Triple| {
-            closure
-                .graphs_of(fact)
-                .iter()
-                .any(|&(_, g)| readable[g as usize])
+        // A lookup in the closure's list, counted before it is made, then each graph entry
+        // as it is read: on the reading task's poller (sol-loop r1 S4, r2 S5, review r1 F1).
+        // `Err` where its poller stopped it before a readable graph was found (fix check r1,
+        // rule 2: it read as not readable).
+        let reads = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
+            if poll.tick() {
+                return Err(ReadStopped);
+            }
+            let found = poll
+                .counted(closure.graphs_of(fact))
+                .any(|&(_, g)| readable[g as usize]);
+            if !found {
+                poll.ended()?;
+            }
+            Ok(found)
         };
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
         let limits = Limits {
             watch: &|bytes| following.watch(bytes),
             stop: &|| following.cancelled(),
+            scratch: &working.budget,
         };
         let held = closure_within(&closure.facts, &ground, &axioms, &reads, limits)
             .map_err(|stopped| following.failure(stopped))?;

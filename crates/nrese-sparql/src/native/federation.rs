@@ -124,6 +124,19 @@ impl Context<'_> {
             return Ok((self.vector_service(inner, bound)?, None));
         }
         let variable = match name {
+            // A blank node or literal put in for the endpoint ([`super::substitute`]) is no
+            // IRI: as a variable endpoint without one, never called.
+            NamedNodePattern::NamedNode(endpoint)
+                if nrese_sparql_syntax::internal::is_constant(endpoint.as_str()) =>
+            {
+                if silent {
+                    return Ok((self.unit()?, None));
+                }
+                return Err(QueryEvaluationError::Service(
+                    "SERVICE: an endpoint must be an IRI".into(),
+                )
+                .into());
+            }
             NamedNodePattern::NamedNode(endpoint) => {
                 let found = self.call_silently(endpoint.as_str(), inner, bound, silent)?;
                 return Ok((found, None));
@@ -132,12 +145,12 @@ impl Context<'_> {
         };
         // Joined to no solutions: none names an endpoint, and the join has none.
         if bound.is_some_and(|b| b.table.is_empty()) {
-            return Ok((Solutions::unit(), None));
+            return Ok((self.unit()?, None));
         }
         // The endpoints are the values the joined solutions have for the variable.
         let unbound = || -> NativeResult<Solutions> {
             if silent {
-                Ok(Solutions::unit())
+                self.unit()
             } else {
                 Err(QueryEvaluationError::Service(
                     format!("SERVICE {variable}: the variable has no value").into(),
@@ -183,23 +196,18 @@ impl Context<'_> {
                 ordered: false,
             };
             let found = self.call_silently(endpoint.as_str(), inner, Some(&subset), silent)?;
-            // The endpoint's rows carry the endpoint, so they join to the rows that named it.
+            // The endpoint's rows carry the endpoint, so they join to the rows that named it:
+            // its column, charged before it is made.
             let found = if found.vars.contains(variable) {
                 found
             } else {
-                let mut vars = found.vars.clone();
-                vars.push(variable.clone());
-                let mut table = IdTable::new(vars.len());
-                let mut line = vec![id; vars.len()];
-                for row in 0..found.table.len() {
-                    line[..found.vars.len()].copy_from_slice(&found.table.row(row));
-                    table.push_row(&line);
-                }
-                Solutions {
-                    vars,
-                    table,
-                    ordered: false,
-                }
+                let rows = found.table.len();
+                self.reshaped(found, rows.saturating_mul(8), |mut found| {
+                    found.table.push_column(vec![id; rows]);
+                    found.vars.push(variable.clone());
+                    found.ordered = false;
+                    found
+                })?
             };
             all = Some(match all {
                 Some(all) => self.union(all, found)?,
@@ -241,9 +249,7 @@ impl Context<'_> {
         silent: bool,
     ) -> NativeResult<Solutions> {
         match self.call_service(endpoint, inner, bound) {
-            Err(NativeError::Evaluation(QueryEvaluationError::Service(_))) if silent => {
-                Ok(Solutions::unit())
-            }
+            Err(NativeError::Evaluation(QueryEvaluationError::Service(_))) if silent => self.unit(),
             other => other,
         }
     }
@@ -280,6 +286,9 @@ impl Context<'_> {
         let mut all: Option<Solutions> = None;
         for pattern in patterns {
             self.check()?;
+            // No made name goes out as it is (`internal`): renamed apart from the pattern's,
+            // and read back from the answer.
+            let (pattern, sent) = nrese_sparql_syntax::internal::printable(pattern);
             // Under the query's BASE: an `IRI()` the endpoint evaluates resolves as here.
             let query = Query::Select {
                 dataset: None,
@@ -301,16 +310,21 @@ impl Context<'_> {
             // The endpoint's terms, its blank nodes its own, as canonical answers name them.
             let scope = Scope::new();
             let table = match &self.canonical {
-                None => import(&results, |term| self.id(&scope.of(term))),
+                None => import(&results, |term| self.id(&scope.of(term)))?,
                 Some(names) => import(&results, |term| {
                     let term = scope.of(term);
-                    names
-                        .id(&term)
-                        .unwrap_or_else(|| self.id(&names.term(term.into_owned())))
-                }),
+                    match names.id(&term) {
+                        Some(id) => Ok(id),
+                        None => self.id(&names.term(term.into_owned())),
+                    }
+                })?,
             };
             let solutions = self.produced(Solutions {
-                vars: results.variables,
+                vars: results
+                    .variables
+                    .into_iter()
+                    .map(|v| sent.local(v))
+                    .collect(),
                 table,
                 ordered: false,
             })?;
@@ -319,21 +333,24 @@ impl Context<'_> {
                 None => solutions,
             });
         }
-        Ok(all.unwrap_or_else(Solutions::unit))
+        all.map_or_else(|| self.unit(), Ok)
     }
 }
 
 /// The endpoint's rows as an id table, each term's id by `id`.
-fn import(results: &crate::ServiceResults, id: impl Fn(&Term) -> u64) -> IdTable {
+fn import(
+    results: &crate::ServiceResults,
+    id: impl Fn(&Term) -> NativeResult<u64>,
+) -> NativeResult<IdTable> {
     let mut table = IdTable::new(results.variables.len());
     let mut row = vec![UNDEF; results.variables.len()];
     for values in &results.rows {
         for (slot, value) in row.iter_mut().zip(values) {
-            *slot = value.as_ref().map_or(UNDEF, &id);
+            *slot = value.as_ref().map_or(Ok(UNDEF), &id)?;
         }
         table.push_row(&row);
     }
-    table
+    Ok(table)
 }
 
 /// The blank nodes of one endpoint answer, named apart from every other answer's and the

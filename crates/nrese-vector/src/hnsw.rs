@@ -743,13 +743,19 @@ mod growth_tests {
     /// of the rest answers as one graph does.
     #[test]
     fn graphs_round_trip_grow_and_cover_a_prefix() {
+        // Fix insertion order as well as the level seed: parallel insertion can change
+        // the graph's links and recall. Keep both extends on this test-local worker.
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
         let all = random_vectors(6_000, 8, 11);
         let mut prefix = Vectors::new(8);
         for p in 0..4_000u32 {
             prefix.push(all.id(p), all.get(p));
         }
         let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
-        graph.extend(&prefix);
+        one.install(|| graph.extend(&prefix));
         let query = all.get(5_000).to_vec();
         let read = Hnsw::from_parts(graph.to_parts()).expect("sound parts");
         assert_eq!(
@@ -781,20 +787,16 @@ mod growth_tests {
             .unwrap()
             .to_vec();
         assert_eq!(merged[0].id, all.id(5_000));
-        // The graph's part is approximate (and its parallel build not deterministic): at
-        // least 4 of the exact 5 nearest, the exact tail's own hit first.
-        let truth: Vec<u64> = exact(&all, &query, 5, Metric::L2, &|_| true, &Budget::unlimited())
+        // This deterministic graph plus the exact tail finds all five exact nearest
+        // neighbours, in order and with the same distances.
+        let truth = exact(&all, &query, 5, Metric::L2, &|_| true, &Budget::unlimited())
             .unwrap()
-            .to_vec()[..5]
-            .iter()
-            .map(|hit| hit.id)
-            .collect();
-        let found = merged.iter().filter(|hit| truth.contains(&hit.id)).count();
-        assert!(found >= 4, "{merged:?} against {truth:?}");
+            .to_vec();
+        assert_eq!(merged, truth);
         // A copy extended to every vector finds it through the graph; the original
         // still covers the prefix.
         let mut grown = graph.duplicate();
-        grown.extend(&all);
+        one.install(|| grown.extend(&all));
         assert_eq!(grown.len(), 6_000);
         assert_eq!(graph.len(), 4_000);
         assert_eq!(

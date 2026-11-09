@@ -59,9 +59,9 @@ QUERIES=$ROOT/benches/competitors/queries/${DATASET%%-[0-9]*}
 # Both workspaces build into one directory (.cargo/config.toml).
 HARNESS=${HARNESS:-$ROOT/target/release/nrese-bench-harness}
 FILE=/data/$DATASET.nt
-GRAPHDB_IMAGE=${GRAPHDB_IMAGE:-ontotext/graphdb:11.5.1}
-QLEVER_IMAGE=${QLEVER_IMAGE:-adfreiburg/qlever:latest}
-OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.11}
+GRAPHDB_IMAGE=${GRAPHDB_IMAGE:-ontotext/graphdb:11.5.2}
+QLEVER_IMAGE=${QLEVER_IMAGE:-adfreiburg/qlever:commit-0998359ab0}
+OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.13}
 VIRTUOSO_IMAGE=${VIRTUOSO_IMAGE:-openlink/virtuoso-opensource-7:7.2.17}
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
 # The Rust image follows rust-toolchain.toml, so benchmarks build with the pinned compiler.

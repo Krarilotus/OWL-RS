@@ -10,6 +10,8 @@
 //! are decided: elements, attributes, text, references, CDATA sections, and namespace
 //! declarations (rendered where visibly used, as exclusive canonicalisation does).
 
+use std::collections::HashMap;
+
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -41,11 +43,12 @@ pub fn classify(text: &str) -> Result<String, NotCanonical> {
         s: text.as_bytes(),
         at: 0,
         out: String::new(),
-        scopes: Vec::new(),
-        rendered: Vec::new(),
+        open: Vec::new(),
+        bound: HashMap::new(),
+        rendered: HashMap::new(),
         undecided: false,
     };
-    if p.content(None).is_none() || p.at != p.s.len() {
+    if p.content().is_none() || p.at != p.s.len() {
         return Err(NotCanonical::Malformed);
     }
     if p.undecided {
@@ -54,14 +57,26 @@ pub fn classify(text: &str) -> Result<String, NotCanonical> {
     Ok(p.out)
 }
 
+/// An open element: its name, and the prefixes it binds and renders (each pushed on
+/// [`Parser::bound`] and [`Parser::rendered`], popped when it closes).
+struct Open {
+    name: String,
+    declared: Vec<String>,
+    rendered: Vec<String>,
+}
+
+/// The parser keeps its open elements on the heap ([`Parser::open`]), not on the call
+/// stack: nesting depth costs memory linear in the input, never stack.
 struct Parser<'a> {
     s: &'a [u8],
     at: usize,
     out: String,
-    /// Per open element: its namespace declarations (prefix, IRI).
-    scopes: Vec<Vec<(String, String)>>,
-    /// Per open element: the declarations its canonical form renders.
-    rendered: Vec<Vec<(String, String)>>,
+    /// The open elements, innermost last.
+    open: Vec<Open>,
+    /// Per prefix: the IRIs the open elements bind it to, innermost last.
+    bound: HashMap<String, Vec<String>>,
+    /// Per prefix: the IRIs the open elements' canonical forms render for it, innermost last.
+    rendered: HashMap<String, Vec<String>>,
     /// A comment or processing instruction was read: well-formed so far, but not decided.
     undecided: bool,
 }
@@ -178,21 +193,22 @@ impl Parser<'_> {
         }
     }
 
-    /// Content up to the end tag of `element` (or the end of the input).
-    fn content(&mut self, element: Option<&str>) -> Option<()> {
+    /// The whole fragment: content, each end tag closing the innermost open element, every
+    /// element closed at the end of the input. One loop, whatever the nesting.
+    fn content(&mut self) -> Option<()> {
         loop {
             match self.peek() {
-                None => return element.is_none().then_some(()),
+                None => return self.open.is_empty().then_some(()),
                 Some(b'<') if self.starts("</") => {
-                    let name = element?;
+                    let open = self.open.pop()?;
                     self.at += 2;
                     let end = self.name()?;
                     self.space();
-                    if end != name || self.peek() != Some(b'>') {
+                    if end != open.name || self.peek() != Some(b'>') {
                         return None;
                     }
                     self.at += 1;
-                    return Some(());
+                    self.close(open);
                 }
                 Some(b'<') if self.starts("<![CDATA[") => {
                     self.at += 9;
@@ -287,6 +303,10 @@ impl Parser<'_> {
                     || prefix == "xmlns"
                     || value == XMLNS_NAMESPACE
                     || (!prefix.is_empty() && value.is_empty())
+                    // Check every normalized declaration, including unused ones, before
+                    // storing it. URI references may be relative (Namespaces §§2.2–3);
+                    // validate without resolving or changing their string identity.
+                    || iri_string::types::UriReferenceStr::new(&value).is_err()
                 {
                     return None;
                 }
@@ -310,7 +330,11 @@ impl Parser<'_> {
         // Exclusive canonicalisation renders a declaration on each element that visibly
         // uses its prefix (in its name or an attribute's), unless an output ancestor
         // already rendered the same; declarations nothing uses are left out.
-        self.scopes.push(declarations);
+        let mut declared = Vec::with_capacity(declarations.len());
+        for (prefix, iri) in declarations {
+            self.bound.entry(prefix.clone()).or_default().push(iri);
+            declared.push(prefix);
+        }
         let prefix_of = |qname: &str| qname.split_once(':').map_or("", |(p, _)| p).to_owned();
         let mut used = vec![prefix_of(&name)];
         for (a, _) in &attributes {
@@ -365,7 +389,11 @@ impl Parser<'_> {
             self.escape_attribute(iri);
             self.out.push('"');
         }
-        self.rendered.push(rendered);
+        let mut rendered_prefixes = Vec::with_capacity(rendered.len());
+        for (prefix, iri) in rendered {
+            self.rendered.entry(prefix.clone()).or_default().push(iri);
+            rendered_prefixes.push(prefix);
+        }
         for (_, _, a, v) in &keyed {
             self.out.push(' ');
             self.out.push_str(a);
@@ -374,25 +402,40 @@ impl Parser<'_> {
             self.out.push('"');
         }
         self.out.push('>');
-        if !empty {
-            self.content(Some(&name))?;
+        let open = Open {
+            name,
+            declared,
+            rendered: rendered_prefixes,
+        };
+        // Its content is read by the loop that read this tag ([`Parser::content`]).
+        if empty {
+            self.close(open);
+        } else {
+            self.open.push(open);
         }
-        self.out.push_str("</");
-        self.out.push_str(&name);
-        self.out.push('>');
-        self.scopes.pop();
-        self.rendered.pop();
         Some(())
+    }
+
+    /// Ends `open`: its end tag, and its bindings and rendered declarations go out of scope.
+    fn close(&mut self, open: Open) {
+        self.out.push_str("</");
+        self.out.push_str(&open.name);
+        self.out.push('>');
+        for prefix in open.declared {
+            if let Some(iris) = self.bound.get_mut(&prefix) {
+                iris.pop();
+            }
+        }
+        for prefix in open.rendered {
+            if let Some(iris) = self.rendered.get_mut(&prefix) {
+                iris.pop();
+            }
+        }
     }
 
     /// The value the nearest output ancestor rendered for `prefix`.
     fn rendered_value(&self, prefix: &str) -> Option<String> {
-        self.rendered
-            .iter()
-            .rev()
-            .flat_map(|s| s.iter())
-            .find(|(p, _)| p == prefix)
-            .map(|(_, iri)| iri.clone())
+        self.rendered.get(prefix)?.last().cloned()
     }
 
     /// The namespace IRI `prefix` is bound to; `xml`'s binding needs no declaration.
@@ -400,12 +443,7 @@ impl Parser<'_> {
         if prefix == "xml" {
             return Some(XML_NAMESPACE.to_owned());
         }
-        self.scopes
-            .iter()
-            .rev()
-            .flat_map(|s| s.iter())
-            .find(|(p, _)| p == prefix)
-            .map(|(_, iri)| iri.clone())
+        self.bound.get(prefix)?.last().cloned()
     }
 
     fn escape_attribute(&mut self, v: &str) {
@@ -427,9 +465,136 @@ impl Parser<'_> {
 mod tests {
     use super::{NotCanonical, classify};
 
+    /// Spec: Namespaces in XML 1.0 §§2.1, 3 and RFC 3986 §4.1 require a URI
+    /// reference in every declaration, including unused ones. RDF 1.1 XMLLiteral
+    /// requires namespace-conforming content; comments/PIs cannot hide malformedness.
+    #[test]
+    fn namespace_names_are_checked_before_use_or_comments() {
+        use crate::owl::{Datatype, LiteralError, Value};
+
+        let mut wrong = Vec::new();
+        for uri in [
+            " ",
+            "urn:x y",
+            "&#x20;",
+            "\t",
+            "&#x9;",
+            "%",
+            "%2",
+            "%GG",
+            "http://[bad]/",
+            "http://x:bad/",
+            "1:relative",
+            "urn:x[",
+            "urn:x#x#y",
+            "urn:é",
+            "urn:x&#x7F;",
+        ] {
+            for fragment in [
+                format!("<a xmlns:p='{uri}'/>"),
+                format!("<a xmlns:p='{uri}'><p:b/></a>"),
+                format!("<a xmlns:p='{uri}' p:b='x'/>"),
+                format!("<a xmlns='{uri}'/>"),
+            ] {
+                for text in [
+                    fragment.clone(),
+                    format!("<!--c-->{fragment}"),
+                    format!("{fragment}<!--c-->"),
+                    format!("<?pi x?>{fragment}"),
+                    format!("<outer><!--c-->{fragment}</outer>"),
+                ] {
+                    let classified = classify(&text);
+                    let parsed = Value::parse(&text, Datatype::XmlLiteral, None);
+                    if classified != Err(NotCanonical::Malformed)
+                        || !matches!(parsed, Err(LiteralError::IllTyped(_)))
+                    {
+                        wrong.push(format!("{text:?}: {classified:?}, {parsed:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Spec: Namespaces §§2.2–2.3, 3, 6.2 permit relative references, compare
+    /// normalized strings verbatim, and constrain empty/default/reserved bindings.
+    /// Guards: valid comments stay Undecided; these controls hold on the base too.
+    #[test]
+    fn namespace_reference_and_reserved_binding_controls() {
+        let valid = [
+            (
+                "<a xmlns:p='../ns'><p:b/></a>",
+                "<a><p:b xmlns:p=\"../ns\"></p:b></a>",
+            ),
+            ("<a xmlns='?q#f'/>", "<a xmlns=\"?q#f\"></a>"),
+            ("<a xmlns='//host/ns'/>", "<a xmlns=\"//host/ns\"></a>"),
+            ("<a xmlns='urn:x%20y'/>", "<a xmlns=\"urn:x%20y\"></a>"),
+            ("<a xmlns='urn:x&#x2F;y'/>", "<a xmlns=\"urn:x/y\"></a>"),
+            (
+                "<a xmlns='urn:x?y&amp;z'/>",
+                "<a xmlns=\"urn:x?y&amp;z\"></a>",
+            ),
+            (
+                "<a xmlns='urn:x'><b xmlns=''/></a>",
+                "<a xmlns=\"urn:x\"><b xmlns=\"\"></b></a>",
+            ),
+            ("<a xmlns=''/>", "<a></a>"),
+            ("<a xmlns:p='#f'/>", "<a></a>"),
+            ("<a xml:lang='en'/>", "<a xml:lang=\"en\"></a>"),
+            (
+                "<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+                "<a></a>",
+            ),
+            ("<a xmlns:xmlfoo='urn:x'/>", "<a></a>"),
+        ];
+        for (text, expected) in valid {
+            assert_eq!(classify(text).as_deref(), Ok(expected), "{text}");
+            for text in [format!("<!--c-->{text}"), format!("{text}<!--c-->")] {
+                assert_eq!(classify(&text), Err(NotCanonical::Undecided), "{text}");
+            }
+        }
+        for text in [
+            "<a xmlns:p=''/>",
+            "<a xmlns:xml='urn:x'/>",
+            "<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns:xmlns='urn:x'/>",
+            "<a xmlns:p='http://www.w3.org/2000/xmlns/'/>",
+            "<a xmlns='http://www.w3.org/2000/xmlns/'/>",
+        ] {
+            for text in [text.to_owned(), format!("<!--c-->{text}")] {
+                assert_eq!(classify(&text), Err(NotCanonical::Malformed), "{text}");
+            }
+        }
+    }
+
     /// The canonical form where there is one (malformed and undecided alike: `None`).
     fn canonical(text: &str) -> Option<String> {
         classify(text).ok()
+    }
+
+    /// Nesting depth costs no stack: 100,000 nested elements classify on a thread with a
+    /// 256 KiB stack, as their own canonical form, and with one end tag missing as malformed.
+    /// (A classifier that recursed per element overflows that stack and aborts the test
+    /// binary.)
+    #[test]
+    fn deep_nesting_takes_no_stack() {
+        let depth = 100_000;
+        let balanced = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        let unclosed = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth - 1));
+        let (a, b) = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                (
+                    classify(&balanced).map(|form| form == balanced),
+                    classify(&unclosed),
+                )
+            })
+            .expect("thread")
+            .join()
+            .expect("no panic");
+        assert_eq!(a, Ok(true));
+        assert_eq!(b, Err(NotCanonical::Malformed));
     }
 
     /// RDF 1.1 Concepts (`rdf:XMLLiteral`: well-balanced, self-contained XML content), XML
