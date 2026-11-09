@@ -11,7 +11,7 @@ use crate::engine::ReadModel;
 use crate::engine::corpora::{CorpusRef, CorpusStore, Found, KindRef, TextCorpusStats};
 use crate::engine::equality::Classes as EqualityClasses;
 use crate::quad::{AccessPlan, GraphSelector, Permutation, QuadPattern};
-use crate::term::text::{Bits, Corpus};
+use crate::term::text::{Bits, Corpus, word_length};
 use crate::term::{TermId, TermKind};
 
 /// The graphs whose statements make the corpus of a reader-scoped search
@@ -95,6 +95,42 @@ impl Documents {
     }
 }
 
+/// The text an own term (an overlay entry: `id`, `key`) is a document of `documents` by: a
+/// literal's value, an IRI's local name ([`crate::term::text::local_name_text`]); `None` for
+/// a term of another kind, and for vectors (whose corpus counts each member once).
+fn own_text(documents: Documents, id: TermId, key: &[u8]) -> Option<String> {
+    use crate::term::TermView;
+    if !documents.holds(id.kind()) {
+        return None;
+    }
+    match (documents, crate::term::dictionary::view_key(key)) {
+        (Documents::Literals, TermView::String(value) | TermView::LangString { value, .. }) => {
+            Some(value.to_owned())
+        }
+        (Documents::Subjects, TermView::Iri(iri)) => crate::term::text::local_name_text(iri),
+        _ => None,
+    }
+}
+
+/// A private snapshot's own documents' lengths, by overlay entry from `start`
+/// ([`Snapshot::own_lengths`]).
+struct OwnLengths {
+    start: u64,
+    lengths: nrese_exec::ChargedVec<u16>,
+}
+
+impl OwnLengths {
+    /// Words of `document`: the shared `index`'s below `start`, its own text's past it (0:
+    /// not a document).
+    #[inline]
+    fn length(&self, index: &crate::term::text::TextIndex, document: u64) -> u16 {
+        match document.checked_sub(self.start) {
+            None => index.length_of(document),
+            Some(own) => self.lengths.get(own as usize).copied().unwrap_or(0),
+        }
+    }
+}
+
 /// Words of the bits each slice of a walk over `words` covers ([`Snapshot::mark_values`]):
 /// four slices a thread of the pool, at most `most`
 /// ([`crate::CorpusTuning::walk_slice_words`]; a slice holds its group counts, 16 bytes a
@@ -170,8 +206,9 @@ impl Snapshot {
     /// building the corpus takes is charged to `budget` while the search holds it (the
     /// request's; `None`: unbounded); a kept corpus is the engine's. A budget that has no
     /// room returns its refusal, as does a read the reader's budget refused
-    /// ([`Self::read_refused`]): what it read may be incomplete. Refused for a private
-    /// snapshot, before anything is built ([`super::SearchRefused::Private`]).
+    /// ([`Self::read_refused`]): what it read may be incomplete. A private snapshot searches
+    /// what it can see the same way, its own literals among them (V3; the lifecycle
+    /// contract's §7), and leaves the store of corpora as it found it.
     pub fn text_search_in(
         &self,
         model: ReadModel,
@@ -179,13 +216,35 @@ impl Snapshot {
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
     ) -> Result<Vec<crate::TextMatch>, super::SearchRefused> {
-        self.searchable()?;
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Literals, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut matches = self.underlying().text_search_in(query, Some(&corpus));
+        let mut matches = self.search_corpus(Documents::Literals, query, &corpus, &request)?;
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
         Ok(matches)
+    }
+
+    /// The literals or IRI names (`documents`) of `corpus` matching `query`: through the
+    /// shared index, and for a private snapshot through the index of its own documents too,
+    /// built for this search on `request` ([`crate::term::text::Private`]).
+    fn search_corpus(
+        &self,
+        documents: Documents,
+        query: &crate::TextQuery,
+        corpus: &Corpus,
+        request: &Arc<nrese_exec::Budget>,
+    ) -> Result<Vec<crate::TextMatch>, nrese_exec::BudgetExceeded> {
+        let iris = documents == Documents::Subjects;
+        let Some(view) = self.own_view() else {
+            return Ok(match iris {
+                false => self.underlying().text_search_in(query, Some(corpus)),
+                true => self.underlying().iri_search_in(query, Some(corpus)),
+            });
+        };
+        let own = self.own_documents(view, documents, corpus, query.stem.as_deref(), request)?;
+        Ok(self
+            .underlying()
+            .private_search(iris, query, corpus, view.start(), &own))
     }
 
     /// The IRIs that are subjects of statements this snapshot shows in `scope`'s graphs
@@ -194,7 +253,7 @@ impl Snapshot {
     /// canonically, a class is its representative, named by every identity: each
     /// identity's local name is a document while the representative is a subject, and a
     /// match is answered as the representative, each once, at its best identity's
-    /// relevance. Refused for a private snapshot.
+    /// relevance. A private snapshot searches its own IRIs too, as [`Self::text_search_in`].
     pub fn iri_search_in(
         &self,
         model: ReadModel,
@@ -202,11 +261,10 @@ impl Snapshot {
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
     ) -> Result<Vec<crate::TextMatch>, super::SearchRefused> {
-        self.searchable()?;
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Subjects, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut found = self.underlying().iri_search_in(query, Some(&corpus));
+        let mut found = self.search_corpus(Documents::Subjects, query, &corpus, &request)?;
         found.retain(|m| TermId::from_raw(m.id).payload() < known);
         if let Some((classes, true)) = self.corpus_classes(Documents::Subjects, model) {
             // Best first: the first of each class is its best identity's.
@@ -226,7 +284,7 @@ impl Snapshot {
     /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
     /// changes the answer or the report. Building the corpus, the scan and the hits are
     /// charged to `budget` before they are allocated, as [`Snapshot::vector_search`]'s are.
-    /// Refused for a private snapshot.
+    /// A private snapshot searches its own vectors too ([`Self::private_vector_search`]).
     pub fn vector_search_in<'b>(
         &self,
         model: ReadModel,
@@ -235,7 +293,9 @@ impl Snapshot {
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b Arc<nrese_exec::Budget>,
     ) -> Result<super::VectorHits<'b>, super::SearchRefused> {
-        self.searchable()?;
+        if let Some(view) = self.own_view() {
+            return self.private_vector_search(view, model, scope, query, accept, budget);
+        }
         // The space first: no vector of the query's dimension, nothing found and nothing
         // reported, before a corpus is admitted (attack list item 7; sol-loop r1 S3).
         let Some(input) = self.underlying().vector_input(query) else {
@@ -269,6 +329,91 @@ impl Snapshot {
         Ok((found?, report))
     }
 
+    /// [`Self::vector_search_in`] of a private snapshot (V3; the lifecycle contract's §7):
+    /// the shared vectors of its corpus below the overlay's `start`, compared exactly as a
+    /// reader's are ([`crate::term::vectors::search_eligible`]), and its own (the overlay's
+    /// vector literals of the query's dimension in its corpus) by an exact scan of their own,
+    /// each `eligible` before `accept`; the two lists merged by distance, then id
+    /// ([`nrese_vector::merge`]), the shared hits offered first: where `k` cuts a group of
+    /// equal distances, the shared ones of it stay (`merge` keeps the first it is offered).
+    /// The report's space and scan are exactly both sides' eligible vectors, which a caller
+    /// widens `k` by. Own vectors never enter the shared index or its graph.
+    fn private_vector_search<'b>(
+        &self,
+        view: &crate::term::overlay::OverlayView,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+        budget: &'b Arc<nrese_exec::Budget>,
+    ) -> Result<super::VectorHits<'b>, super::SearchRefused> {
+        use crate::term::TermView;
+        let input = self.underlying().vector_input(query);
+        let corpus = self.text_corpus(Documents::Vectors, model, scope, budget)?;
+        let start = view.start();
+        // The own vectors of the dimension among the corpus's members: parsed, charged first.
+        let dimension = query.vector.len();
+        let mut own = nrese_vector::Vectors::new(dimension);
+        let mut charge = nrese_exec::Reservation::new(Arc::clone(budget));
+        for (id, key) in view.own_entries() {
+            if id.kind() != TermKind::TypedLiteral || !corpus.contains(id.payload()) {
+                continue;
+            }
+            let TermView::Typed { value, datatype } = crate::term::dictionary::view_key(key) else {
+                continue;
+            };
+            if datatype != nrese_vector::DATATYPE {
+                continue;
+            }
+            let Ok(vector) = nrese_vector::parse(value) else {
+                continue;
+            };
+            if vector.len() == dimension {
+                charge.charge(dimension * 4 + 16)?;
+                own.push(id.raw(), &vector);
+            }
+        }
+        if input.is_none() && own.is_empty() {
+            let none = crate::VectorSearchReport {
+                space: 0,
+                graph: false,
+                scanned: 0,
+            };
+            return Ok((nrese_exec::ChargedVec::new(&**budget), none));
+        }
+        let shared = |raw: u64| {
+            let id = TermId::from_raw(raw);
+            id.payload() < start && corpus.contains(id.payload())
+        };
+        let accept = |raw: u64| accept(TermId::from_raw(raw));
+        let (shared_hits, shared_report) =
+            crate::term::vectors::search_eligible(input, query, &shared, &accept, budget)?;
+        let own_hits =
+            nrese_vector::exact(&own, &query.vector, query.k, query.metric, &accept, budget)?;
+        let hits = nrese_vector::merge(
+            shared_hits.iter().chain(own_hits.iter()).copied(),
+            query.k,
+            budget,
+        )?;
+        drop((shared_hits, own_hits));
+        let report = crate::VectorSearchReport {
+            space: shared_report.space + own.len(),
+            graph: false,
+            scanned: shared_report.scanned + own.len(),
+        };
+        let len = hits.len();
+        let (hits, held) = hits.into_parts();
+        let found = nrese_exec::ChargedVec::collect(
+            &**budget,
+            len,
+            hits.into_iter()
+                .map(|hit| (TermId::from_raw(hit.id), hit.distance)),
+        );
+        drop(held);
+        drop(charge);
+        Ok((found?, report))
+    }
+
     /// The corpora this snapshot's engine keeps, and how many were built by a walk or
     /// derived from an ancestor's ([`super::super::corpora`]); all zero, `started` false,
     /// where no reader-scoped search ran on the engine.
@@ -283,7 +428,8 @@ impl Snapshot {
     /// The members of the corpus of [`Self::text_search_in`] for `model` and `scope` (with
     /// `iris`, of [`Self::iri_search_in`]'s), dictionary entries ascending, with their
     /// number and words, as a search finds them (kept, derived or walked): for checks
-    /// against the statements this snapshot's scans show. Refused for a private snapshot.
+    /// against the statements this snapshot's scans show (a private snapshot's own ones
+    /// among them, past its overlay's start).
     #[doc(hidden)]
     pub fn text_corpus_members(
         &self,
@@ -291,7 +437,6 @@ impl Snapshot {
         scope: &TextScope,
         iris: bool,
     ) -> Result<(Vec<u64>, u64, u64), super::SearchRefused> {
-        self.searchable()?;
         let documents = match iris {
             false => Documents::Literals,
             true => Documents::Subjects,
@@ -304,14 +449,13 @@ impl Snapshot {
 
     /// The members of [`Self::vector_search_in`]'s corpus for `model` and `scope`: the
     /// typed literals that are objects of statements this snapshot shows there (the scan
-    /// reads the vectors among them). Refused for a private snapshot.
+    /// reads the vectors among them), a private snapshot's own ones among them.
     #[doc(hidden)]
     pub fn vector_corpus_members(
         &self,
         model: ReadModel,
         scope: &TextScope,
     ) -> Result<Vec<u64>, super::SearchRefused> {
-        self.searchable()?;
         Ok(self
             .text_corpus(Documents::Vectors, model, scope, &request_budget(None))
             .expect("no budget to exceed")
@@ -404,7 +548,7 @@ impl Snapshot {
         let found = match (store, &admitted) {
             (Some(store), Some(admitted)) => store.find(admitted, kind, request)?,
             (Some(store), None) => Found::Build {
-                from: store.derive_unadmitted(&self.version, kind, request),
+                from: store.derive_unadmitted(&self.version, kind, self.is_private(), request),
                 keep: false,
             },
             (None, _) => Found::Build {
@@ -492,12 +636,18 @@ impl Snapshot {
                     }
                 }
                 built_by(true);
-                match vectors {
+                let own = self.own_lengths(documents, request)?;
+                match (vectors, own) {
                     // Every typed literal is a member (of one word): the scan reads the
                     // vectors among them.
-                    true => Bits::derived(&base, &changes, span, request, |_| 1)?,
-                    false => self.underlying().with_text_index(iris, |index| {
+                    (true, _) => Bits::derived(&base, &changes, span, request, |_| 1)?,
+                    (false, None) => self.underlying().with_text_index(iris, |index| {
                         index.derive(&base, &changes, span, request)
+                    })?,
+                    (false, Some(own)) => self.underlying().with_text_index(iris, |index| {
+                        Bits::derived(&base, &changes, span, request, |document| {
+                            own.length(index, document)
+                        })
                     })?,
                 }
             }
@@ -587,15 +737,69 @@ impl Snapshot {
                 }
             }
         }
-        Ok(match documents {
-            Documents::Vectors => Bits::counted(bits, |_| 1),
-            Documents::Literals => self
+        let own = self.own_lengths(documents, budget)?;
+        Ok(match (documents, own) {
+            (Documents::Vectors, _) => Bits::counted(bits, |_| 1),
+            (Documents::Literals | Documents::Subjects, None) => self
                 .underlying()
-                .with_text_index(false, |index| index.corpus(bits)),
-            Documents::Subjects => self
+                .with_text_index(documents == Documents::Subjects, |index| index.corpus(bits)),
+            (Documents::Literals | Documents::Subjects, Some(own)) => self
                 .underlying()
-                .with_text_index(true, |index| index.corpus(bits)),
+                .with_text_index(documents == Documents::Subjects, |index| {
+                    Bits::counted(bits, |document| own.length(index, document))
+                }),
         })
+    }
+
+    /// A private snapshot's own documents' lengths for a corpus of `documents`, by overlay
+    /// entry from its `start` (V3): each own term's words as the shared index would count
+    /// them ([`crate::term::text::word_length`]; 0 for a term of another kind), charged to
+    /// `budget`. `None` for a published snapshot, whose documents the shared index counts.
+    fn own_lengths(
+        &self,
+        documents: Documents,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Option<OwnLengths>, nrese_exec::BudgetExceeded> {
+        let Some(view) = self.own_view() else {
+            return Ok(None);
+        };
+        let start = view.start();
+        let count = (view.end() - start) as usize;
+        let lengths = nrese_exec::ChargedVec::collect(
+            Arc::clone(budget),
+            count,
+            view.own_entries()
+                .map(|(id, key)| own_text(documents, id, key).map_or(0, |t| word_length(&t))),
+        )?;
+        Ok(Some(OwnLengths { start, lengths }))
+    }
+
+    /// The overlay view of a private snapshot (its own terms); `None` for a published one.
+    fn own_view(&self) -> Option<&crate::term::overlay::OverlayView> {
+        match &self.vocabulary {
+            crate::term::resolve::Vocabulary::Private(view) => Some(view),
+            crate::term::resolve::Vocabulary::Shared(_) => None,
+        }
+    }
+
+    /// The own documents of `corpus` (a private snapshot's, of `documents`: literals or IRI
+    /// names), indexed for one search with stems for `language`, charged to `budget` (V3).
+    fn own_documents(
+        &self,
+        view: &crate::term::overlay::OverlayView,
+        documents: Documents,
+        corpus: &Corpus,
+        language: Option<&str>,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<crate::term::text::Local, nrese_exec::BudgetExceeded> {
+        let own = view
+            .own_entries()
+            .filter(|(id, _)| corpus.contains(id.payload()))
+            .filter_map(|(id, key)| {
+                let text = own_text(documents, id, key)?;
+                (word_length(&text) > 0).then_some((id.payload(), id.kind(), text))
+            });
+        crate::term::text::Local::build(own, language, budget)
     }
 
     /// Extends the index of `documents` (the vectors, for vector literals) over the

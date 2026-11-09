@@ -298,6 +298,23 @@ impl OverlayView {
         self.overlay.start + self.frozen.len()
     }
 
+    /// Its own entries (ids `start..end`, none of the dictionary's), in id order, each with
+    /// its key: what a private search indexes its own documents from (V3; DICT2 9 Nov
+    /// 04:02).
+    pub(crate) fn own_entries(&self) -> impl Iterator<Item = (TermId, &[u8])> + '_ {
+        self.frozen.entries().map(|(payload, key)| {
+            let kind = match view_key(key) {
+                TermView::Iri(_) => TermKind::Iri,
+                TermView::BlankNode(_) => TermKind::BlankNode,
+                TermView::String(_) => TermKind::String,
+                TermView::LangString { .. } => TermKind::LangString,
+                TermView::Typed { .. } => TermKind::TypedLiteral,
+                TermView::Triple => TermKind::Triple,
+            };
+            (TermId::new(kind, payload), key)
+        })
+    }
+
     /// Test support: its own entries' count.
     #[cfg(test)]
     pub(crate) fn len(&self) -> u64 {

@@ -30,7 +30,9 @@ use std::collections::{BTreeMap, HashMap};
 use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
+mod private;
 mod scope;
+pub(crate) use private::{Local, Private};
 pub(crate) use scope::Bits;
 pub use scope::Corpus;
 
@@ -78,7 +80,7 @@ pub fn stemmer(language: &str) -> Option<Stemmer> {
 
 /// How a query word matches indexed words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Match {
+pub(crate) enum Match {
     Exact,
     Prefix,
     /// Within this many edits.
@@ -234,6 +236,23 @@ pub(crate) trait Scope {
     fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]>;
 }
 
+impl<T: Scope> Scope for &T {
+    #[inline(always)]
+    fn documents(&self) -> u64 {
+        (**self).documents()
+    }
+
+    #[inline(always)]
+    fn total_words(&self) -> u64 {
+        (**self).total_words()
+    }
+
+    #[inline(always)]
+    fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]> {
+        (**self).postings(list)
+    }
+}
+
 /// Every document of an index: its own statistics, its postings as they are.
 pub(crate) struct Whole<'a>(pub(crate) &'a TextIndex);
 
@@ -305,6 +324,12 @@ fn tokens(text: &str) -> (HashMap<String, u16>, u16) {
         length = length.saturating_add(1);
     }
     (counts, length)
+}
+
+/// How many words a document holding `text` has, as [`TextIndex::add`] counts them (0: it
+/// is not a document).
+pub(crate) fn word_length(text: &str) -> u16 {
+    words(text).fold(0u16, |length, _| length.saturating_add(1))
 }
 
 /// The version of [`TextIndex::write`]'s layout.
@@ -591,22 +616,119 @@ impl TextIndex {
         text_of: &dyn Fn(u64) -> Option<String>,
         scope: &S,
     ) -> Vec<TextMatch> {
-        let documents = scope.documents() as f64;
+        search_with(
+            query,
+            text_of,
+            &Indexed::new(self, scope, query.stem.as_deref()),
+        )
+    }
+}
+
+/// Where a search reads its documents' statistics, a word's postings among them and a
+/// document's length from ([`search_with`]): one index and a scope of it ([`Indexed`]), or
+/// a private snapshot's shared index below its own terms and the index of its own documents
+/// ([`Private`]; the lifecycle contract's §7, one search body over one document domain).
+pub(crate) trait Source {
+    fn documents(&self) -> u64;
+    fn total_words(&self) -> u64;
+    /// The postings of `word` among the source's documents: of the words it starts as a
+    /// prefix, within the edits of a fuzzy match, with its stem where stemming, else its
+    /// own; merged by document, ascending.
+    fn postings(&self, word: &str, matching: Match) -> Cow<'_, [(u64, u16)]>;
+    /// The documents with `word` (its stem where stemming), of the whole of each index the
+    /// source reads: what an exclusion takes out of the matches.
+    fn excluding(&self, word: &str) -> Vec<u64>;
+    /// Words of `document` (1 where unknown).
+    fn length(&self, document: u64) -> f64;
+    /// The stemmer, where the query stems and its stems are prepared.
+    fn stemmer(&self) -> Option<&Stemmer>;
+}
+
+/// An index and a scope of it, with the query's stems where prepared: the global search
+/// ([`Whole`]) and a reader's ([`Corpus`]).
+pub(crate) struct Indexed<'a, S> {
+    index: &'a TextIndex,
+    scope: S,
+    stems: Option<(Stemmer, &'a Stems)>,
+}
+
+impl<'a, S: Scope> Indexed<'a, S> {
+    /// Stemming in `language` where it has a stemmer and `index` has its stems prepared.
+    pub(crate) fn new(index: &'a TextIndex, scope: S, language: Option<&str>) -> Self {
+        let stems = language
+            .and_then(|language| Some((stemmer(language)?, index.stems.get(&stem_key(language))?)));
+        Self {
+            index,
+            scope,
+            stems,
+        }
+    }
+
+    fn stems(&self) -> Option<(&Stemmer, &Stems)> {
+        self.stems
+            .as_ref()
+            .map(|(stemmer, stems)| (stemmer, *stems))
+    }
+}
+
+impl<S: Scope> Source for Indexed<'_, S> {
+    #[inline]
+    fn documents(&self) -> u64 {
+        self.scope.documents()
+    }
+
+    #[inline]
+    fn total_words(&self) -> u64 {
+        self.scope.total_words()
+    }
+
+    #[inline]
+    fn postings(&self, word: &str, matching: Match) -> Cow<'_, [(u64, u16)]> {
+        self.scope
+            .postings(self.index.postings_of(word, matching, self.stems()))
+    }
+
+    fn excluding(&self, word: &str) -> Vec<u64> {
+        self.index
+            .postings_of(word, Match::Exact, self.stems())
+            .iter()
+            .map(|&(id, _)| id)
+            .collect()
+    }
+
+    #[inline]
+    fn length(&self, document: u64) -> f64 {
+        self.index.length(document)
+    }
+
+    #[inline]
+    fn stemmer(&self) -> Option<&Stemmer> {
+        self.stems.as_ref().map(|(stemmer, _)| stemmer)
+    }
+}
+
+/// The literals or IRI names of `source` matching `query`, best first (ties by id), scored
+/// by BM25 with `source`'s statistics alone: its document count and mean length, each
+/// word's frequency among its documents, the best match among them. `text_of` gives a
+/// document's text, to check phrases. One body for every source, monomorphised per source,
+/// so the global search does the work it did before scopes existed.
+pub(crate) fn search_with<R: Source>(
+    query: &TextQuery,
+    text_of: &dyn Fn(u64) -> Option<String>,
+    source: &R,
+) -> Vec<TextMatch> {
+    {
+        let documents = source.documents() as f64;
         if documents == 0.0 {
             return Vec::new();
         }
-        let average = scope.total_words() as f64 / documents;
+        let average = source.total_words() as f64 / documents;
         let (k1, b) = (1.2, 0.75);
-        // Stemming, where the language has a stemmer and its stems are prepared.
-        let stemming = query
-            .stem
-            .as_deref()
-            .and_then(|language| Some((stemmer(language)?, self.stems.get(&stem_key(language))?)));
-        let stems = stemming.as_ref().map(|(stemmer, stems)| (stemmer, *stems));
         // Words compared in phrases: their stems when stemming.
+        let stemmer = source.stemmer();
         let normal = |word: &str| -> String {
-            match &stemming {
-                Some((stemmer, _)) => stemmer.stem(word).into_owned(),
+            match stemmer {
+                Some(stemmer) => stemmer.stem(word).into_owned(),
                 None => word.to_owned(),
             }
         };
@@ -653,7 +775,7 @@ impl TextIndex {
             let frequency = list.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in list {
-                let length = self.length(id);
+                let length = source.length(id);
                 let tf = f64::from(count);
                 *out.entry(id).or_default() +=
                     idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
@@ -662,7 +784,7 @@ impl TextIndex {
         for phrase in &phrases {
             let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
                 .iter()
-                .map(|word| scope.postings(self.postings_of(word, Match::Exact, stems)))
+                .map(|word| source.postings(word, Match::Exact))
                 .collect();
             if lists.iter().any(|list| list.is_empty()) {
                 continue;
@@ -695,11 +817,11 @@ impl TextIndex {
             }
         }
         for (word, matching) in &terms {
-            let found = scope.postings(self.postings_of(word, *matching, stems));
+            let found = source.postings(word, *matching);
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in found.iter() {
-                let length = self.length(id);
+                let length = source.length(id);
                 let tf = f64::from(count);
                 let score = idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
                 let entry = scores.entry(id).or_default();
@@ -714,12 +836,7 @@ impl TextIndex {
         };
         let excluded: std::collections::HashSet<u64> = excluded
             .iter()
-            .flat_map(|word| {
-                self.postings_of(word, Match::Exact, stems)
-                    .iter()
-                    .map(|&(id, _)| id)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|word| source.excluding(word))
             .collect();
         let mut matches: Vec<TextMatch> = scores
             .into_iter()
