@@ -365,8 +365,9 @@ impl<'a> SignedMerge<'a> {
 
     /// Cursor `i`'s sign, its advance counted first as one portion with `more` units done
     /// with it (a heap's repair), then whether it has another key. An exhausted cursor's
-    /// buffer is freed. [`Stopped`] where the account refuses.
-    #[inline]
+    /// buffer is freed. [`Stopped`] where the account refuses. Always inlined: as a call it
+    /// cost a plain load 0.56 % of its instructions (`p2-reas3-abl6`).
+    #[inline(always)]
     fn take_from(
         &mut self,
         i: usize,
