@@ -119,6 +119,9 @@ impl<'e> Transaction<'e> {
         budget: &std::sync::Arc<nrese_exec::Budget>,
     ) -> EngineResult<Snapshot> {
         let generation = self.pending.generation();
+        // Read before the memo's lock, which then holds no other lock's wait: a term interned
+        // after this read leaves the kept snapshot as current as the read it answers.
+        let dictionary_len = self.engine.shared.dictionary.len();
         // Kept only while nothing it shows changed: no write (the generation), no term interned
         // since (its vocabulary ends at the dictionary's length then: sol-loop r1, S2), the
         // same budget. Not current: taken out under the same guard (another reader may have
@@ -129,7 +132,7 @@ impl<'e> Transaction<'e> {
             let mut memo = self.pending.memo().lock();
             if let Some(kept) = memo.as_ref()
                 && kept.generation == generation
-                && kept.snapshot.version().dictionary_len == self.engine.shared.dictionary.len()
+                && kept.snapshot.version().dictionary_len == dictionary_len
                 && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
             {
                 return Ok(kept.snapshot.clone());
@@ -195,11 +198,14 @@ impl<'e> Transaction<'e> {
             inferred_deletes,
         ));
         drop(scratch);
-        *self.pending.memo().lock() = Some(pending::Memo {
+        // Installed in place of what another reader kept meanwhile, which is let go after the
+        // lock (its drop may free a snapshot and release its charge).
+        let displaced = self.pending.memo().lock().replace(pending::Memo {
             generation,
             budget: std::sync::Arc::downgrade(budget),
             snapshot: snapshot.clone(),
         });
+        drop(displaced);
         Ok(snapshot)
     }
 
