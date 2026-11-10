@@ -3,10 +3,12 @@
 //! held at the level's first revision: snapshot acquisition, commits of a declared delta, reads
 //! of the current data (the first after the commits apart from warm repeats), private reads in
 //! a client transaction (`sessions` and `run_query_pending`, the HTTP transaction's calls) and
-//! their rollback, and the live bytes the views retain (what dropping them frees, the store's
-//! background maintenance settled first). The staggered level holds one view before each of its
-//! commits, each replacing a large delta, and gives each commit's time and the live bytes each
-//! view frees as it goes, oldest first.
+//! their rollback, and the live bytes dropping the views frees on this thread (counted at the
+//! allocator for this thread alone, the store's background maintenance settled first; memory
+//! another thread still holds isn't counted, so a lower bound of what the views retain). The
+//! staggered level holds one view before each of its commits, each replacing a large delta,
+//! and gives each commit's time and the live bytes each view's drop frees, oldest first: what
+//! one frees depends on the views still held beside it.
 //!
 //! Every timed answer is kept and checked after the timed windows against rows the declared
 //! deltas specify, never against another answer: each current read's, each private read's and
@@ -261,7 +263,7 @@ pub fn measure(
         all_ok &= ok;
         let revision = snapshot.revision();
         drop(snapshot);
-        // What the views retain: the live bytes dropping them frees, everything else kept.
+        // What the views retain: the live bytes dropping them frees on this thread.
         store.settle();
         let retained = crate::bytes_freed_by(|| drop(views));
         let (a50, a99, amax) = percentiles(&mut acquire);
@@ -366,7 +368,7 @@ fn staggered_views(
         format!(
             "{{\"views\": {count}, \"replaced_rows\": {rows}, \"revisions\": [{}], \"commit_ms\": [{}], \
              \"commit_p50_ms\": {p50:.3}, \"commit_max_ms\": {max:.3}, \"freed_live_bytes\": [{}], \
-             \"retained_live_bytes\": {}, \"retained_per_view_bytes\": {}, \"answers_ok\": {ok}}}",
+             \"retained_live_bytes\": {}, \"answers_ok\": {ok}}}",
             revisions.join(", "),
             commit_ms.join(", "),
             freed
@@ -375,7 +377,6 @@ fn staggered_views(
                 .collect::<Vec<_>>()
                 .join(", "),
             bytes(total),
-            bytes(total.map(|t| t / count.max(1) as i64)),
         ),
         ok,
     ))

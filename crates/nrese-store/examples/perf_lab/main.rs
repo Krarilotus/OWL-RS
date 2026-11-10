@@ -107,6 +107,7 @@ mod support;
 mod support_family;
 mod views;
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -145,6 +146,13 @@ static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK_LIVE: AtomicI64 = AtomicI64::new(0);
 static LIVE_PEAK_RUN: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    /// The live bytes this thread's own allocations and frees changed while `bytes_freed_by`
+    /// measures on it (`None` otherwise). Constant and without a destructor: the allocator
+    /// reads it without allocating, even while the thread ends.
+    static HERE: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
 /// mimalloc, counting allocations when asked (one relaxed load when not).
 #[cfg(not(any(system_alloc, alloc_profile)))]
 struct Counting;
@@ -165,6 +173,11 @@ impl Counting {
             let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
             PEAK_LIVE.fetch_max(now, Ordering::Relaxed);
             LIVE_PEAK_RUN.fetch_max(now, Ordering::Relaxed);
+            let _ = HERE.try_with(|here| {
+                if let Some(bytes) = here.get() {
+                    here.set(Some(bytes + delta));
+                }
+            });
         }
     }
 }
@@ -218,21 +231,63 @@ fn allocations() -> (u64, u64) {
     )
 }
 
-/// The live requested bytes `f` frees (negative: allocates more than it frees), counted over
-/// its span alone, whether or not `--count-allocations` counts the rest; every thread's
-/// allocations in the span count, so a caller settles background work first. `None` under
-/// another allocator (`system_alloc`, `alloc_profile`): nothing is counted there.
+/// The live requested bytes `f` frees on the calling thread (negative: allocates more than it
+/// frees), counted at the allocator for this thread's own allocations and frees while `f`
+/// runs: other threads' count nothing, whatever they do meanwhile. What `f` lets go of that
+/// another thread still holds, and frees later there, isn't counted: a lower bound of what
+/// `f` releases. One measurement at a time in the process (counting is switched on for it).
+/// `None` under another allocator (`system_alloc`, `alloc_profile`): nothing is counted there.
 pub(crate) fn bytes_freed_by(f: impl FnOnce()) -> Option<i64> {
     if cfg!(any(system_alloc, alloc_profile)) {
         f();
         return None;
     }
     let counting = COUNT_ALLOCATIONS.swap(true, Ordering::SeqCst);
-    let before = LIVE.load(Ordering::SeqCst);
+    HERE.set(Some(0));
     f();
-    let freed = before - LIVE.load(Ordering::SeqCst);
+    let changed = HERE.replace(None).unwrap_or(0);
     COUNT_ALLOCATIONS.store(counting, Ordering::SeqCst);
-    Some(freed)
+    Some(-changed)
+}
+
+/// `bytes_freed_by`'s scope: exactly the calling thread's frees, never another thread's.
+#[cfg(all(test, not(any(system_alloc, alloc_profile))))]
+mod freed_tests {
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// One measurement at a time: `bytes_freed_by` switches counting for the process.
+    static ONE: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_drop_counts_exactly_the_bytes_it_frees() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let block = vec![7u8; 1 << 20];
+        assert_eq!(super::bytes_freed_by(|| drop(block)), Some(1 << 20));
+    }
+
+    #[test]
+    fn another_thread_s_allocations_and_frees_during_the_span_count_nothing() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let (go, done) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let (other_go, other_done) = (Arc::clone(&go), Arc::clone(&done));
+        let other = std::thread::spawn(move || {
+            let earlier = vec![1u8; 1 << 20];
+            other_go.wait();
+            // Within the span: a free of an earlier allocation, and an allocation kept past it.
+            drop(earlier);
+            let kept = vec![2u8; 3 << 20];
+            other_done.wait();
+            kept
+        });
+        let mine = vec![3u8; 4096];
+        let freed = super::bytes_freed_by(|| {
+            go.wait();
+            done.wait();
+            drop(mine);
+        });
+        drop(other.join().expect("the other thread"));
+        assert_eq!(freed, Some(4096));
+    }
 }
 
 /// The memory a phase used: its peak (Linux: the resident set's, in a window started with

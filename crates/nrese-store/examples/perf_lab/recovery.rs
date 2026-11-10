@@ -14,7 +14,8 @@
 //!
 //! Checked after the timed windows, against contents made without any store: the fixture as
 //! parsed and the commits as generated. The source holds them all, the restored store those up
-//! to the chosen revision (and is at it), the follower all of them.
+//! to the chosen revision (and is at it), the follower all of them, and so does the timed image
+//! of the latest, restored apart and opened.
 //!
 //! What runs: the stores with the store's defaults (background maintenance on, durable sync per
 //! commit; a follower publishes each record as one such commit); `restore_until` itself runs
@@ -181,7 +182,8 @@ pub fn measure(
     let primary = StoreService::new(config.clone())?;
     let primary_open_ms = at.elapsed().as_secs_f64() * 1e3;
     let at = Instant::now();
-    let made = primary.backup_image(&root.path().join("image"))?;
+    let made_dir = root.path().join("image");
+    let made = primary.backup_image(&made_dir)?;
     let image_ms = at.elapsed().as_secs_f64() * 1e3;
     let follower_dir = root.path().join("follower");
     nrese_store::restore_image(&image, &follower_dir)?;
@@ -229,7 +231,17 @@ pub fn measure(
         && excluded_rows.is_empty();
     let follower_ok = follower.current_revision() == latest
         && digest(contents(&follower.read_snapshot(None)?)?) == all;
-    let ok = primary_ok && restored_ok && follower_ok;
+    // The timed image: restored apart and opened, at the latest revision with all of them.
+    let checked_dir = root.path().join("image-checked");
+    nrese_store::restore_image(&made_dir, &checked_dir)?;
+    let checked = StoreService::new(StoreConfig {
+        wal_archive: false,
+        ..on(checked_dir)
+    })?;
+    let image_ok = made.revision == latest
+        && checked.current_revision() == latest
+        && digest(contents(&checked.read_snapshot(None)?)?) == all;
+    let ok = primary_ok && restored_ok && follower_ok && image_ok;
     let (feed_ms, apply_ms) = (
         caught.feed.as_secs_f64() * 1e3,
         caught.apply.as_secs_f64() * 1e3,
@@ -246,7 +258,7 @@ pub fn measure(
          \"first_query_ms\": {first_query_ms:.3}, \"primary_open_ms\": {primary_open_ms:.3}, \
          \"image_ms\": {image_ms:.3}, \"image_bytes\": {}, \"feed_ms\": {feed_ms:.3}, \"apply_ms\": {apply_ms:.3}, \
          \"records\": {}, \"frames_bytes\": {}, \"catch_up_memory\": {catch_up_memory}, \
-         \"catch_up_conditions\": \"in process, no network; batches up to {BATCH_BYTES} bytes; store defaults: durable sync per commit, background maintenance on, not settled in the timed window\",          \"primary_ok\": {primary_ok}, \"restored_ok\": {restored_ok}, \"follower_ok\": {follower_ok}, \"answers_ok\": {ok}}}",
+         \"catch_up_conditions\": \"in process, no network; batches up to {BATCH_BYTES} bytes; store defaults: durable sync per commit, background maintenance on, not settled in the timed window\", \"primary_ok\": {primary_ok}, \"restored_ok\": {restored_ok}, \"follower_ok\": {follower_ok}, \"image_ok\": {image_ok}, \"answers_ok\": {ok}}}",
         statements,
         bytes_in(std::slice::from_ref(&image)),
         made.bytes,

@@ -2470,7 +2470,7 @@ home_turf = "virtuoso"
 [[case]]
 name = "snapshot-private-cost"
 area = "concurrency"
-what = "a 1 M-statement store on disk, 0, 1 and 8 views held at one revision: snapshot acquisition, 50 commits of a 100-statement delta, reads of the current data (first after the commits, then warm), private reads in a transaction and their rollback, and the live bytes the views retain; then 8 views held at staggered revisions, one before each of 8 commits replacing 100,000 statements: each commit's time and the live bytes each view retains. Commits as SPARQL UPDATE with durable sync and the engine's default background maintenance (settled before each retention reading); every answer checked against its declared delta"
+what = "a 1 M-statement store on disk, 0, 1 and 8 views held at one revision: snapshot acquisition, 50 commits of a 100-statement delta, reads of the current data (first after the commits, then warm), private reads in a transaction and their rollback, and the live bytes dropping the views frees on the dropping thread (other threads' allocations and frees excluded; a lower bound of what they retain); then 8 views held at staggered revisions, one before each of 8 commits replacing 100,000 statements: each commit's time and the live bytes each view's drop frees, oldest first (shared retention: it depends on the views still held). Commits as SPARQL UPDATE with durable sync and the engine's default background maintenance (settled before each retention reading); every answer checked against its declared delta"
 levels = ["focused"]
 semantics = "none"
 data = "social people=40000"
@@ -2488,7 +2488,7 @@ est_min = 1
 [[case]]
 name = "recovery-catchup-cost"
 area = "service"
-what = "a 1 M-statement store's image and 100 commits x 100 statements of retained log: restore to the 50th commit, open, first correct query; an image of the latest; a follower's feed/apply catch-up in process, fed in batches of up to 8 MiB, with the store's defaults (durable sync per commit, background maintenance on, not settled in the timed window); no network or Kafka lag. Contents checked against the fixture as parsed plus the generated commits"
+what = "a 1 M-statement store's image and 100 commits x 100 statements of retained log: restore to the 50th commit, open, first correct query; an image of the latest (restored apart and checked after timing); a follower's feed/apply catch-up in process, fed in batches of up to 8 MiB, with the store's defaults (durable sync per commit, background maintenance on, not settled in the timed window); no network or Kafka lag. Contents checked against the fixture as parsed plus the generated commits"
 levels = ["focused"]
 semantics = "none"
 data = "social people=40000"
