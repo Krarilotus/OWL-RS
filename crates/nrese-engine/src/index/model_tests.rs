@@ -393,13 +393,17 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
 }
 
 /// The group walk of `rows` quads of one predicate, the `i`-th with subject `subject(i)`, by
-/// subject under a budget of `limit` bytes: its answer (each subject's count) or refusal, and
-/// what the budget still holds once the walk's groups are dropped.
+/// subject under a budget of `limit` bytes: its answer (each subject's count) or refusal, what
+/// the budget still holds once the walk's groups are dropped, and whether it recorded a refusal.
 fn walk_by_subject(
     rows: u64,
     subject: impl Fn(u64) -> u64,
     limit: usize,
-) -> (Result<Vec<(u64, i64)>, nrese_exec::BudgetExceeded>, usize) {
+) -> (
+    Result<Vec<(u64, i64)>, nrese_exec::BudgetExceeded>,
+    usize,
+    bool,
+) {
     let quads: Vec<EncodedQuad> = (0..rows)
         .map(|i| EncodedQuad::new(term(subject(i)), term(1), term(10_000 + i), graph(0)))
         .collect();
@@ -418,7 +422,7 @@ fn walk_by_subject(
             .group_counts(&plan, 1, &mut counts, &budget)
             .map(|()| counts.to_vec())
     };
-    (answer, budget.used())
+    (answer, budget.used(), budget.refused())
 }
 
 /// A walk that fits its budget is answered, however its parts start: two parallel parts of
@@ -428,7 +432,7 @@ fn walk_by_subject(
 #[test]
 fn a_walk_in_parts_that_fits_its_budget_is_answered() {
     let rows = 2 * super::GROUP_PART as u64;
-    let (answer, _) = walk_by_subject(rows, |_| 1000, 32 << 10);
+    let (answer, ..) = walk_by_subject(rows, |_| 1000, 32 << 10);
     let counts = answer.expect("one group fits 32 KiB");
     assert_eq!(counts, [(term(1000).raw(), rows as i64)]);
 }
@@ -444,7 +448,7 @@ fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
         true => 1000,
         false => 2000 + (i - part) * 513 / part,
     };
-    let (answer, _) = walk_by_subject(2 * part, subject, 32 << 10);
+    let (answer, ..) = walk_by_subject(2 * part, subject, 32 << 10);
     let counts = answer.expect("514 groups and their parts fit 32 KiB");
     let mut expected = std::collections::BTreeMap::new();
     for i in 0..2 * part {
@@ -460,15 +464,36 @@ fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
 fn a_walk_releases_every_charge_answered_or_refused() {
     let part = super::GROUP_PART as u64;
     // Groups of two quads: 65,536 of them, about 1 MiB, past 64 KiB and within 8 MiB.
-    let (answered, held) = walk_by_subject(2 * part, |i| 1000 + i / 2, 8 << 20);
+    let (answered, held, _) = walk_by_subject(2 * part, |i| 1000 + i / 2, 8 << 20);
     assert_eq!(
         answered.ok().map(|counts| counts.len()),
         Some(part as usize)
     );
     assert_eq!(held, 0, "an answered walk's charges");
-    let (refused, held) = walk_by_subject(2 * part, |i| 1000 + i / 2, 64 << 10);
+    let (refused, held, _) = walk_by_subject(2 * part, |i| 1000 + i / 2, 64 << 10);
     assert!(refused.is_err(), "65,536 groups need more than 64 KiB");
     assert_eq!(held, 0, "a refused walk's charges");
+}
+
+/// A walk is refused only where the serial walk would be (package fix check r3). Two parts of
+/// 16,385 disjoint groups each, under 1.5 MiB: grown in parallel, each holds capacity 32,768
+/// (1 MiB together) and the merge's 32,770 groups need 32 bytes more than is left; the serial
+/// walk, one buffer doubling to 65,536 beside its 32,768, peaks at exactly 1.5 MiB and fits.
+/// Answered with every count, no refusal recorded, nothing held once dropped.
+#[test]
+fn a_walk_the_serial_walk_fits_is_answered() {
+    let part = super::GROUP_PART as u64;
+    let subject = |i: u64| 1000 + i * 16_385 / part;
+    let (answer, held, refused) = walk_by_subject(2 * part, subject, 1_572_864);
+    let counts = answer.expect("the serial walk fits 1.5 MiB");
+    let mut expected = std::collections::BTreeMap::new();
+    for i in 0..2 * part {
+        *expected.entry(term(subject(i)).raw()).or_insert(0i64) += 1;
+    }
+    assert_eq!(counts.len(), 32_770);
+    assert_eq!(counts, expected.into_iter().collect::<Vec<_>>());
+    assert!(!refused, "no refusal recorded on the budget");
+    assert_eq!(held, 0);
 }
 
 /// Every layout keeps the permutation each pattern shape's access plan reads, the pattern's
