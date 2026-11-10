@@ -433,7 +433,7 @@ class DockerRuntime(Runtime):
         self.containers: dict[str, Server] = {}
 
     def args(self, spec: Spec, detached: bool) -> list[str]:
-        args = [ns.executable(), "run", *ns.name_args(spec.name, ROOT, OWNER), "--init"]
+        args = [ns.executable(), *ns.run_args(ROOT, OWNER, spec.name, spec.memory), "--init"]
         # A measurement's own container: the quiet slot's watcher pauses the others.
         if os.environ.get("NRESE_QUIET_TOKEN"):
             args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
@@ -448,8 +448,6 @@ class DockerRuntime(Runtime):
             args += ["-p", f"{self.port}:{spec.port}"]
         if spec.user:
             args += ["-u", spec.user]
-        if spec.memory:
-            args += ["--memory", spec.memory, "--memory-swap", spec.memory]
         # Every system on the same CPUs when a run asks for it (DOCKER_CPUS, e.g. "8").
         if os.environ.get("DOCKER_CPUS"):
             args += ["--cpus", os.environ["DOCKER_CPUS"]]
@@ -498,10 +496,11 @@ class DockerRuntime(Runtime):
     def run(self, spec, log, timeout_s):
         if spec.name in self.containers or spec.name in self.names("container"):
             raise FileExistsError(spec.name)
+        argv = self.args(spec, detached=True)  # one refused (its memory, its image) is never owned or removed
         server = self.containers[spec.name] = Server(spec, spec.name, log)
         started = time.monotonic()
         try:
-            subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
+            subprocess.run(argv, check=True, capture_output=True)
             sampler = server.sampler = self.sample(spec.name)
             timed_out = False
             try:
@@ -520,8 +519,9 @@ class DockerRuntime(Runtime):
     def start(self, spec, log):
         if spec.name in self.containers or spec.name in self.names("container"):
             raise FileExistsError(spec.name)
+        argv = self.args(spec, detached=True)
         server = self.containers[spec.name] = Server(spec, spec.name, log)
-        subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
+        subprocess.run(argv, check=True, capture_output=True)
         server.sampler = self.sample(spec.name)
         return server
 
@@ -559,7 +559,12 @@ class DockerRuntime(Runtime):
         return name
 
     def store_bytes(self, source):
-        out = run_quiet(["docker", "run", "--rm", "-v", f"{source}:/v:ro", "alpine", "du", "-sb", "/v"], 600)
+        # Between a load and a serve, never beside a container of its own: a declared fleet job's
+        # watcher matches one live container to each declaration (fleet Spec 9).
+        if self.containers:
+            raise RuntimeError(f"the store's size is read with no container running: {', '.join(self.containers)} runs")
+        out = run_quiet([ns.executable(), *ns.run_args(ROOT, OWNER), "--rm", "-v", f"{source}:/v:ro", "alpine",
+                         "du", "-sb", "/v"], 600)
         try:
             return int(out.stdout.split()[0])
         except (IndexError, ValueError):
