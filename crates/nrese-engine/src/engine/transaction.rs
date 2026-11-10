@@ -372,11 +372,11 @@ impl<'e> Transaction<'e> {
         view.with_version(version)
     }
 
-    /// Whether the next version must compute its equality classes anew. While expansion
-    /// is disabled no predicate is known: do not inherit a cell an older reader may fill.
+    /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
+    /// equality classes: then the next version computes its classes anew.
     fn changes_equality(&self) -> bool {
         let Some(same_as) = *self.engine.shared.equality.read() else {
-            return true;
+            return false;
         };
         self.pending.touches_predicate(same_as)
     }
@@ -795,7 +795,10 @@ impl Inner {
                 // (a primary's log may step back) bounds what came before too.
                 committed_micros: crate::durability::later(current.committed_micros, committed),
                 dictionary_len,
-                equality: match changes_equality {
+                // While expansion is disabled no predicate is tracked. A published
+                // version must not inherit a cell an older snapshot may still fill.
+                // Pending views instead keep their base's frozen equality mode.
+                equality: match changes_equality || shared.equality.read().is_none() {
                     true => Default::default(),
                     false => std::sync::Arc::clone(&current.equality),
                 },
