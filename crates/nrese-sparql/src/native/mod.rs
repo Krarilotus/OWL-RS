@@ -17,6 +17,7 @@ mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
 mod canonical;
+mod decode_cache;
 mod equality;
 #[cfg(test)]
 mod equality_tests;
@@ -50,8 +51,11 @@ pub(crate) use pushdown::per_solution;
 mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod optimise_tests;
 pub(crate) mod ql;
 mod ranges;
+mod scan_columns;
 mod search;
 mod sets;
 mod sideways;
@@ -85,14 +89,15 @@ use nrese_exec::join::{
     left_join, outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF, computed_id, computed_index,
-    group::group_rows,
+    Budget, BudgetExceeded, ChargedMap, ChargedVec, Grant, IdTable, Reservation, UNDEF,
+    computed_id, computed_index,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
+use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::Integer;
 use numeric::Numeric;
@@ -109,9 +114,7 @@ const PARALLEL_RANKS: usize = 4096;
 use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
-use aggregate::{
-    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer, integer_agg,
-};
+use aggregate::{Agg, Aggregator, Number, counts_rows, finish_total, integer, integer_agg};
 pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
 use value::Value;
@@ -221,40 +224,43 @@ fn run(
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pre_bound = options
-        .pre_bound
-        .as_ref()
-        .map(|values| match &ctx.canonical {
-            Some(names) => Cow::Owned(names.values(values)),
-            None => Cow::Borrowed(&**values),
-        });
-    let pattern = match &pre_bound {
-        Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
-            for term in values.values() {
-                if let Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values { terms: values }.top(&pattern)
-        }
-        None => pattern,
-    };
     let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
     ctx.check()?;
     let outcome = match form {
         Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
         Form::Describe => Outcome::Graph(ctx.describe(&solutions)?),
-        Form::Construct(template) => Outcome::Graph(
-            construct(snapshot, ctx.computed.take(), solutions, &template, || {
-                ctx.check()
-            })
-            .collect::<NativeResult<_>>()?,
-        ),
+        Form::Construct(template) => {
+            // A triple per solution and template triple, however many the template has:
+            // each charged as it is made, before it is kept.
+            let mut triples = Vec::new();
+            let computed = ctx.computed.take();
+            let made = construct(
+                snapshot,
+                &ctx.budget,
+                computed,
+                solutions,
+                &template,
+                || ctx.check(),
+            );
+            // One at a time through a grant (no budget call within its spare); the triples
+            // keep their charge with the outcome. One thread, beside `construct`'s own grant:
+            // half the spare each.
+            let mut grant = Grant::with_workers(&*ctx.budget, 2);
+            for triple in made {
+                let triple = triple?;
+                grant
+                    .take(triple_bytes(&triple))
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                triples.push(triple);
+            }
+            grant.transfer();
+            Outcome::Graph(triples)
+        }
         Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
     };
+    // The computed terms go with the outcome: their charge goes with what it holds.
+    let kept = Reservation::new(Arc::clone(&ctx.budget));
+    ctx.kept.replace(kept).transfer();
     Ok((
         outcome,
         Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used()),
@@ -304,9 +310,15 @@ pub(crate) fn explain(
         Form::Select | Form::Ask => solutions.table.len(),
         Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
-            construct(snapshot, ctx.computed.take(), solutions, &template, || {
-                ctx.check()
-            })
+            let computed = ctx.computed.take();
+            construct(
+                snapshot,
+                &ctx.budget,
+                computed,
+                solutions,
+                &template,
+                || ctx.check(),
+            )
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
         }
     };
@@ -428,8 +440,43 @@ pub(crate) fn write_results(
     )
 }
 
-/// The quads an update removes and adds, in that order.
-pub(crate) type QuadChanges = (Vec<nrese_rdf::Quad>, Vec<nrese_rdf::Quad>);
+/// The quads an update removes and adds, in that order, decoded, and charged to the request's
+/// envelope while they live (D16-039): their room ([`ChargedVec`]) before it grows, and their
+/// terms' text ([`Grant`], [`nrese_rdf::Term::heap_bytes`]) before each quad is kept, as
+/// CONSTRUCT and DESCRIBE charge theirs. Dropped, the quads are freed and then their charge.
+pub(crate) struct QuadChanges {
+    pub(crate) deletes: ChargedVec<nrese_rdf::Quad>,
+    pub(crate) inserts: ChargedVec<nrese_rdf::Quad>,
+    /// After the quads: fields drop in order, the terms freed before their charge goes.
+    terms: Grant,
+}
+
+impl QuadChanges {
+    /// No changes yet, charged to `budget`. One thread fills them, with no sibling grant: the
+    /// whole spare.
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            deletes: ChargedVec::new(Arc::clone(budget)),
+            inserts: ChargedVec::new(Arc::clone(budget)),
+            terms: Grant::with_workers(Arc::clone(budget), 1),
+        }
+    }
+
+    /// Keeps `quad` among the deletes, or the inserts, its terms charged first.
+    fn keep(&mut self, quad: nrese_rdf::Quad, delete: bool) -> Result<(), BudgetExceeded> {
+        self.terms.take(
+            quad.subject.heap_bytes()
+                + quad.predicate.heap_bytes()
+                + quad.object.heap_bytes()
+                + quad.graph_name.heap_bytes(),
+        )?;
+        if delete {
+            self.deletes.push(quad)
+        } else {
+            self.inserts.push(quad)
+        }
+    }
+}
 
 /// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated on
 /// `snapshot`. `using`
@@ -461,10 +508,14 @@ pub(crate) fn delete_insert(
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
     let solutions = ctx.eval(&pattern)?;
-    let computed = ctx.computed.into_inner();
+    let mut changes = QuadChanges::new(&ctx.budget);
+    let memory = QueryEvaluationError::MemoryLimit;
+    let computed = std::mem::take(&mut *ctx.computed.borrow_mut());
     let table = &solutions.table;
-    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     for row in 0..table.len() {
+        if row % 256 == 0 {
+            ctx.check()?;
+        }
         let value = |v: &Variable| -> Option<Term> {
             decode(snapshot, &computed, table.get(row, solutions.column(v)?))
         };
@@ -481,13 +532,12 @@ pub(crate) fn delete_insert(
             },
         };
         let graph = |g: &GraphNamePattern| match g {
-            GraphNamePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                Some(nrese_rdf::GraphName::DefaultGraph)
-            }
-            GraphNamePattern::NamedNode(n) => Some(nrese_rdf::GraphName::from(n.clone())),
+            GraphNamePattern::NamedNode(n) => Some(crate::compat::graph_named(n).into_owned()),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
+            // A value bound to the graph slot names a store graph as a constant does
+            // (review r1, S2-F2), whatever bound it: VALUES, BIND, SERVICE or GRAPH ?g.
             GraphNamePattern::Variable(v) => match value(v)? {
-                Term::NamedNode(n) => Some(n.into()),
+                Term::NamedNode(n) => Some(crate::compat::graph_named(&n).into_owned()),
                 Term::BlankNode(b) => Some(b.into()),
                 Term::Literal(_) | Term::Triple(_) => None,
             },
@@ -502,7 +552,9 @@ pub(crate) fn delete_insert(
                     graph(&quad.graph_name)?,
                 ))
             })();
-            deletes.extend(filled);
+            if let Some(quad) = filled {
+                changes.keep(quad, true).map_err(memory)?;
+            }
         }
         let mut fresh: HashMap<String, nrese_rdf::BlankNode> = HashMap::new();
         let mut term = |t: &TermPattern| fill_template(t, &value, &mut fresh);
@@ -516,10 +568,13 @@ pub(crate) fn delete_insert(
             let (Some(p), Some(g)) = (predicate(&quad.predicate), graph(&quad.graph_name)) else {
                 continue;
             };
-            inserts.push(nrese_rdf::Quad::new(s, p, o, g));
+            changes
+                .keep(nrese_rdf::Quad::new(s, p, o, g), false)
+                .map_err(memory)?;
         }
     }
-    Ok((deletes, inserts))
+    ctx.check()?;
+    Ok(changes)
 }
 
 /// What a query returns.
@@ -542,7 +597,10 @@ type NativePattern<'q> = (
 );
 
 /// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
-/// query form, and the rewrites that changed it.
+/// query form, and the rewrites that changed it: the one preparation every delivery of the
+/// answer reads (results, typed results, the direct writer, EXPLAIN and its plan), so a
+/// request option holds in all of them. Pre-bound variables are put in last
+/// ([`substitute::Values::top`]), their blank nodes registered on `ctx`.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
@@ -578,6 +636,27 @@ fn native_pattern<'q>(
         }
         _ => pattern,
     };
+    let pre_bound = options
+        .pre_bound
+        .as_ref()
+        .map(|values| match &ctx.canonical {
+            Some(names) => Cow::Owned(names.values(values)),
+            None => Cow::Borrowed(&**values),
+        });
+    let pattern = match &pre_bound {
+        Some(values) => {
+            // A blank node is put in as a made constant that stands for the node.
+            for term in values.values() {
+                if let Term::BlankNode(b) = term
+                    && let Some(id) = ctx.snapshot.lookup(term.as_ref())
+                {
+                    ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
+                }
+            }
+            substitute::Values::new(ctx, values)?.top(&pattern)
+        }
+        None => pattern,
+    };
     Ok((pattern, form, rewrites, ql_report))
 }
 
@@ -590,11 +669,18 @@ fn native_pattern<'q>(
 ///   before the join ([`crate::plan::Plan::eager_aggregation`]).
 /// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
 ///   variables ([`pushdown`]).
+///
+/// A pass runs only where its input has a node it can change (each pass's `changes_at`,
+/// asked of the input as the passes before left it): elsewhere it would return its input,
+/// and building, lowering and comparing its plan was most of a microsecond query's
+/// preparation (entities COUNT: 1 µs on main, 3–4 µs with the passes, 10 Nov 2026). One
+/// search answers all three, again only after a pass changed the pattern.
 fn optimise(
-    pattern: GraphPattern,
+    mut pattern: GraphPattern,
     fired: &mut Vec<&'static str>,
     ctx: &Context<'_>,
 ) -> GraphPattern {
+    use nrese_sparql_syntax::visit::Node;
     let pays = |side: &crate::plan::Plan, keys: &[Variable]| ctx.pre_aggregation_pays(side, keys);
     let eager = |pattern: &GraphPattern| crate::plan::eager_aggregation_where(pattern, &pays);
     type Pass<'p> = &'p dyn Fn(&GraphPattern) -> GraphPattern;
@@ -605,13 +691,46 @@ fn optimise(
             pushdown::push_filters(pattern.clone())
         }),
     ];
-    passes.into_iter().fold(pattern, |pattern, (name, pass)| {
+    // Whether a pattern with this node in it is one the pass can change, in the passes' order.
+    let changes_at: [fn(&GraphPattern) -> bool; 3] = [
+        crate::plan::rewrite_changes_at,
+        crate::plan::eager_aggregation_changes_at,
+        pushdown::changes_at,
+    ];
+    let shapes = |pattern: &GraphPattern| {
+        let mut found = [false; 3];
+        pattern.find(&mut |node| {
+            if let Node::Pattern(p) = node {
+                for (found, changes_at) in found.iter_mut().zip(changes_at) {
+                    *found = *found || changes_at(p);
+                }
+            }
+            found.iter().all(|&found| found)
+        });
+        found
+    };
+    let mut found = shapes(&pattern);
+    for (i, (name, pass)) in passes.into_iter().enumerate() {
+        if !found[i] {
+            debug_assert!(pass(&pattern) == pattern, "{name} changes {pattern}");
+            continue;
+        }
+        #[cfg(test)]
+        PASSES_RUN.set(PASSES_RUN.get() + 1);
         let rewritten = pass(&pattern);
         if rewritten != pattern {
             fired.push(name);
+            pattern = rewritten;
+            found = shapes(&pattern);
         }
-        rewritten
-    })
+    }
+    pattern
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rewrite passes [`optimise`] ran on this thread.
+    static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.
@@ -681,6 +800,7 @@ enum TemplateTerm {
 /// nodes are emitted once (the memory of emitted triples is bounded).
 fn construct<'a>(
     snapshot: &'a Snapshot,
+    budget: &'a Budget,
     computed: Vec<Term>,
     solutions: Solutions,
     template: &[TriplePattern],
@@ -705,25 +825,36 @@ fn construct<'a>(
     let fresh_count = labels.len();
     let table = solutions.table;
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
-    let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
-    let mut row = 0;
+    // The copies `emitted` keeps, each charged before it is kept, one at a time through a
+    // grant: one thread, beside the caller's grant for the triples (half the spare each).
+    let mut held = Grant::with_workers(budget, 2);
+    // A triple at a time, however many the template has: the next is the template's
+    // `index`-th triple of row `row`, with the row's fresh blank nodes.
+    let (mut row, mut index) = (0, 0);
+    let mut fresh: Vec<nrese_rdf::BlankNode> = Vec::new();
     std::iter::from_fn(move || {
         loop {
-            if let Some(triple) = buffer.pop() {
-                return Some(Ok(triple));
-            }
             if row >= table.len() {
                 return None;
             }
             // One check per row, and one per 256 entries of a wide template; an error
             // ends the iteration.
-            if let Err(error) = check() {
+            if index % 256 == 0
+                && let Err(error) = check()
+            {
                 row = table.len();
                 return Some(Err(error));
             }
-            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
-                .map(|_| nrese_rdf::BlankNode::default())
-                .collect();
+            if index == 0 {
+                fresh = (0..fresh_count)
+                    .map(|_| nrese_rdf::BlankNode::default())
+                    .collect();
+            }
+            let Some([s, p, o]) = resolved.get(index) else {
+                (row, index) = (row + 1, 0);
+                continue;
+            };
+            index += 1;
             fn template_value(
                 term: &TemplateTerm,
                 column: &dyn Fn(usize) -> Option<Term>,
@@ -752,40 +883,57 @@ fn construct<'a>(
             let current = row;
             let column = |c: usize| decode(snapshot, &computed, table.get(current, c));
             let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
-            for (index, [s, p, o]) in resolved.iter().enumerate() {
-                if index % 256 == 255
-                    && let Err(error) = check()
-                {
-                    buffer.clear();
+            let subject = match value(s) {
+                Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
+                _ => continue,
+            };
+            let Some(Term::NamedNode(predicate)) = value(p) else {
+                continue;
+            };
+            let Some(object) = value(o) else {
+                continue;
+            };
+            let triple = nrese_rdf::Triple::new(subject, predicate, object);
+            if !triple.subject.is_blank_node() && !triple.object.is_blank_node() {
+                // The copy kept to emit it once, charged first (its slot counted twice:
+                // the set doubles).
+                let copy = triple_heap(&triple)
+                    .saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>());
+                if let Err(refused) = held.take(copy) {
                     row = table.len();
-                    return Some(Err(error));
+                    return Some(Err(QueryEvaluationError::MemoryLimit(refused).into()));
                 }
-                let subject = match value(s) {
-                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
-                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
-                    _ => continue,
-                };
-                let Some(Term::NamedNode(predicate)) = value(p) else {
+                if !emitted.insert(triple.clone()) {
+                    held.give_back(copy);
                     continue;
-                };
-                let Some(object) = value(o) else {
-                    continue;
-                };
-                let triple = nrese_rdf::Triple::new(subject, predicate, object);
-                let new = triple.subject.is_blank_node()
-                    || triple.object.is_blank_node()
-                    || emitted.insert(triple.clone());
-                if new {
-                    buffer.push(triple);
-                    if emitted.len() > 1024 * 1024 {
-                        emitted.clear();
-                    }
+                }
+                if emitted.len() > 1024 * 1024 {
+                    emitted = HashSet::new();
+                    held.trim();
                 }
             }
-            buffer.reverse();
-            row += 1;
+            return Some(Ok(triple));
         }
     })
+}
+
+/// The bytes of a triple's terms' strings.
+fn triple_heap(triple: &nrese_rdf::Triple) -> usize {
+    let subject = match &triple.subject {
+        nrese_rdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        nrese_rdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    };
+    subject
+        .saturating_add(triple.predicate.as_str().len())
+        .saturating_add(crate::cache::term_heap(&triple.object))
+}
+
+/// What a constructed triple holds once kept ([`run`]): its strings, and its slot with the
+/// list's room for it counted at its most (a list doubles). The copy [`construct`] keeps to
+/// emit repeated triples once is charged there.
+fn triple_bytes(triple: &nrese_rdf::Triple) -> usize {
+    triple_heap(triple).saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>())
 }
 
 fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
@@ -1184,14 +1332,6 @@ impl Solutions {
     fn column(&self, variable: &Variable) -> Option<usize> {
         self.vars.iter().position(|v| v == variable)
     }
-
-    fn unit() -> Self {
-        Self {
-            vars: Vec::new(),
-            table: IdTable::from_rows(0, [&[][..]]),
-            ordered: false,
-        }
-    }
 }
 
 struct Context<'a> {
@@ -1205,7 +1345,8 @@ struct Context<'a> {
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
-    decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// Stored terms decoded once, charged to `budget` while kept ([`decode_cache`]).
+    decoded: RefCell<decode_cache::DecodeCache>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
     decodes: AtomicU64,
@@ -1216,6 +1357,10 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
+    /// What the context keeps to the query's end, charged to `budget`: its computed terms
+    /// ([`Self::id`]) and remembered numbers ([`Self::numeric_pass`]). A retry that releases
+    /// what a failed attempt held ([`Self::group`]) leaves it.
+    kept: RefCell<Reservation>,
     /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
     /// index) draws from it ([`spatial`]).
     memory: nrese_exec::Envelope,
@@ -1312,6 +1457,12 @@ impl Charged for Solutions {
 impl Charged for Vec<Solutions> {
     fn charged(&self) -> usize {
         self.iter().map(Charged::charged).sum()
+    }
+}
+
+impl<A: Charged, B: Charged> Charged for (A, B) {
+    fn charged(&self) -> usize {
+        self.0.charged() + self.1.charged()
     }
 }
 
@@ -1435,10 +1586,16 @@ impl<'a> Context<'a> {
             aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
-            decoded: RefCell::default(),
+            // One thread fills it, with no sibling grant: the whole spare.
+            decoded: RefCell::new(decode_cache::DecodeCache::new(
+                &budget,
+                DECODE_CACHE_ENTRIES,
+                1,
+            )),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
+            kept: RefCell::new(Reservation::new(Arc::clone(&budget))),
             budget,
             memory: options.resources.memory.clone(),
             trace: None,
@@ -1468,8 +1625,8 @@ impl<'a> Context<'a> {
         ctx
     }
 
-    /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
-    /// blank node.
+    /// The id of a constant of a pattern: a made constant ([`substitute`]) stands for the
+    /// term registered for it, every IRI for itself.
     /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
     /// ([`Snapshot::lookup_charged`]).
     fn lookup_const_charged(
@@ -1478,7 +1635,7 @@ impl<'a> Context<'a> {
         held: &mut Reservation<&nrese_exec::Budget>,
     ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return Ok(self.lookup_const(term));
         }
@@ -1488,7 +1645,7 @@ impl<'a> Context<'a> {
 
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return self
                 .aliases
@@ -1541,12 +1698,27 @@ impl<'a> Context<'a> {
             .map_or(Ok(()), CancellationToken::check)?)
     }
 
-    /// Charges a produced table against the query's memory budget.
+    /// One solution without bindings (an empty group's), made as every table is
+    /// ([`Self::produced`]): it counts nothing ([`IdTable::memory_bytes`]), so neither making
+    /// it nor consuming it touches the budget.
+    fn unit(&self) -> NativeResult<Solutions> {
+        self.produced(Solutions {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..]]),
+            ordered: false,
+        })
+    }
+
+    /// Charges a produced table against the query's memory budget. A table that counts
+    /// nothing is charged nothing: no call up the budget's levels for it.
     fn produced(&self, solutions: Solutions) -> NativeResult<Solutions> {
         self.check()?;
-        self.budget
-            .charge(solutions.table.memory_bytes())
-            .map_err(QueryEvaluationError::MemoryLimit)?;
+        let bytes = solutions.table.memory_bytes();
+        if bytes > 0 {
+            self.budget
+                .charge(bytes)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+        }
         Ok(solutions)
     }
 
@@ -1604,11 +1776,13 @@ impl<'a> Context<'a> {
     }
 
     /// Frees a table charged to the query's budget, then releases its charge: the budget
-    /// never shows less than the tables hold.
+    /// never shows less than the tables hold. A table that counts nothing releases nothing.
     fn consumed(&self, solutions: Solutions) {
         let bytes = solutions.table.memory_bytes();
         drop(solutions);
-        self.budget.release(bytes);
+        if bytes > 0 {
+            self.budget.release(bytes);
+        }
     }
 
     /// A table that `reshape` makes of charged ones, which it takes (filtering in place,
@@ -1636,6 +1810,36 @@ impl<'a> Context<'a> {
         Ok(solutions)
     }
 
+    /// A table `make` makes of nothing charged: `bytes`, the most it allocates for the
+    /// table, charged first; then the charge of exactly the table's bytes, which it keeps.
+    fn made(
+        &self,
+        bytes: usize,
+        make: impl FnOnce() -> NativeResult<Solutions>,
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(bytes)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        // Declared after `held`: dropped before it.
+        let solutions = make()?;
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
+    }
+
+    /// `solutions` (charged) without its last `count` columns ([`Self::with_exists`]'),
+    /// their charge released.
+    fn drop_added(&self, solutions: Solutions, count: usize) -> NativeResult<Solutions> {
+        if count == 0 {
+            return Ok(solutions);
+        }
+        self.reshaped(solutions, 0, |solutions| {
+            drop_last_columns(solutions, count)
+        })
+    }
+
     fn term(&self, id: u64) -> Option<Term> {
         if id == UNDEF {
             return None;
@@ -1644,33 +1848,38 @@ impl<'a> Context<'a> {
             return self.computed.borrow().get(index as usize).cloned();
         }
         let mut decoded = self.decoded.borrow_mut();
-        if let Some(term) = decoded.get(&id) {
+        if let Some(term) = decoded.get(id) {
             return term.clone();
         }
         self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
-        if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
-        }
+        // Bounded: a scan over millions of distinct labels must not keep them all; and charged
+        // while kept (D16-039).
+        decoded.keep(id, &term);
         term
     }
 
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
-    /// one for equal terms.
-    fn id(&self, term: &Term) -> u64 {
+    /// one for equal terms. A term new to the query is charged before it is kept
+    /// ([`computed_bytes`]), however many the query's text makes per row; the charge stays
+    /// with what the query holds to its end (its result keeps the computed terms).
+    fn id(&self, term: &Term) -> NativeResult<u64> {
         if let Some(id) = self.lookup_const(term.as_ref()) {
-            return id.raw();
+            return Ok(id.raw());
         }
         let mut ids = self.computed_ids.borrow_mut();
         if let Some(&id) = ids.get(term) {
-            return id;
+            return Ok(id);
         }
+        self.kept
+            .borrow_mut()
+            .charge(computed_bytes(term))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let mut computed = self.computed.borrow_mut();
         let id = computed_id(computed.len() as u64);
         computed.push(term.clone());
         ids.insert(term.clone(), id);
-        id
+        Ok(id)
     }
 
     fn binding<'s>(
@@ -1728,7 +1937,7 @@ impl<'a> Context<'a> {
         match pattern {
             GraphPattern::Project { inner, variables } => {
                 let solutions = self.eval_limited(inner, limit)?;
-                Ok(self.project(solutions, variables))
+                self.project(solutions, variables)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1791,28 +2000,29 @@ impl<'a> Context<'a> {
         // expressions by the generic evaluator.
         let on_ids = fast::compile_term(&plain, &self.snapshot)
             .filter(|term| matches!(term, fast::IdTerm::Part(..) | fast::IdTerm::Triple(_)));
-        let values: Vec<u64> = (0..solutions.table.len())
-            .map(|row| {
-                if let Some(term) = &on_ids {
-                    let value = |v: &Variable| {
-                        solutions
-                            .column(v)
-                            .map_or(UNDEF, |c| solutions.table.get(row, c))
-                    };
-                    match term.value(&value, &self.snapshot) {
-                        fast::Id::Stored(id) => return id.raw(),
-                        fast::Id::Error => return UNDEF,
-                        fast::Id::Absent | fast::Id::Unknown => {}
-                    }
+        let value = |row: usize| -> NativeResult<u64> {
+            if let Some(term) = &on_ids {
+                let value = |v: &Variable| {
+                    solutions
+                        .column(v)
+                        .map_or(UNDEF, |c| solutions.table.get(row, c))
+                };
+                match term.value(&value, &self.snapshot) {
+                    fast::Id::Stored(id) => return Ok(id.raw()),
+                    fast::Id::Error => return Ok(UNDEF),
+                    fast::Id::Absent | fast::Id::Unknown => {}
                 }
-                self.evaluator
-                    .in_solution(row as u64, || {
-                        self.evaluator.eval(&plain, &self.binding(&solutions, row))
-                    })
-                    .map_or(UNDEF, |term| self.id(&term))
-            })
-            .collect();
-        let mut solutions = drop_last_columns(solutions, added);
+            }
+            let term = self.evaluator.in_solution(row as u64, || {
+                self.evaluator.eval(&plain, &self.binding(&solutions, row))
+            });
+            term.map_or(Ok(UNDEF), |term| self.id(&term))
+        };
+        let mut values = Vec::with_capacity(solutions.table.len());
+        for row in 0..solutions.table.len() {
+            values.push(value(row)?);
+        }
+        let mut solutions = self.drop_added(solutions, added)?;
         let mut columns = std::mem::take(&mut solutions.table).into_columns();
         columns.push(values);
         solutions.vars.push(variable.clone());
@@ -1977,7 +2187,7 @@ impl<'a> Context<'a> {
                         None => rows,
                     });
                 }
-                Ok(united.unwrap_or_else(Solutions::unit))
+                united.map_or_else(|| self.unit(), Ok)
             }
             GraphPattern::Extend { inner, bindings } => {
                 let mut solutions = self.eval(inner)?;
@@ -2014,14 +2224,15 @@ impl<'a> Context<'a> {
                 bindings,
             } => {
                 let mut table = IdTable::new(variables.len());
+                let mut row = Vec::with_capacity(variables.len());
                 for binding in bindings {
-                    let row: Vec<u64> = binding
-                        .iter()
-                        .map(|term| match term {
-                            Some(term) => self.id(&Term::from(term.clone())),
+                    row.clear();
+                    for term in binding {
+                        row.push(match term {
+                            Some(term) => self.id(&Term::from(term.clone()))?,
                             None => UNDEF,
-                        })
-                        .collect();
+                        });
+                    }
                     table.push_row(&row);
                 }
                 self.produced(Solutions {
@@ -2036,7 +2247,7 @@ impl<'a> Context<'a> {
             }
             GraphPattern::Project { inner, variables } => {
                 let solutions = self.eval(inner)?;
-                Ok(self.project(solutions, variables))
+                self.project(solutions, variables)
             }
             GraphPattern::Distinct { inner } => {
                 // SELECT DISTINCT … ORDER BY projected variables: deduplicate first, then sort
@@ -2065,7 +2276,7 @@ impl<'a> Context<'a> {
                         }
                         _ => self.eval(sorted)?,
                     };
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.dedup_preserving_order();
                     return self.order_by(solutions, expression, None);
                 }
@@ -2079,7 +2290,7 @@ impl<'a> Context<'a> {
                     && !self.as_written
                 {
                     let solutions = self.eval_set(projected, variables)?;
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.dedup_preserving_order();
                     return Ok(solutions);
                 }
@@ -2125,7 +2336,7 @@ impl<'a> Context<'a> {
                     let solutions = self.eval(sorted)?;
                     let solutions =
                         self.order_by(solutions, expression, length.map(|l| start + l))?;
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.slice(*start, *length);
                     return Ok(solutions);
                 }
@@ -2171,16 +2382,16 @@ impl<'a> Context<'a> {
             // Jena's name for the default graph (`compat`): the store's default graph, where
             // it is in reach; for a reader who may not read it, absent as an unreadable named
             // graph is (below).
-            NamedNodePattern::NamedNode(n)
-                if crate::compat::names_default_graph(n.as_str()) && self.store_default =>
-            {
-                return self.in_graph(GraphScope::Default, inner);
-            }
             NamedNodePattern::NamedNode(n) => {
-                let id = (!crate::compat::names_default_graph(n.as_str()))
-                    .then(|| self.lookup_const(n.as_ref().into()))
-                    .flatten()
-                    .filter(|&id| self.is_named_graph(id));
+                let id = match crate::compat::graph_named(n) {
+                    nrese_rdf::GraphNameRef::DefaultGraph if self.store_default => {
+                        return self.in_graph(GraphScope::Default, inner);
+                    }
+                    nrese_rdf::GraphNameRef::DefaultGraph => None,
+                    _ => self
+                        .lookup_const(n.as_ref().into())
+                        .filter(|&id| self.is_named_graph(id)),
+                };
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
                     // No such graph in the dataset: no solutions, whatever the pattern
@@ -2223,7 +2434,15 @@ impl<'a> Context<'a> {
         for graph in graphs {
             self.check()?;
             let solutions = self.in_graph(GraphScope::Named(graph), inner)?;
-            let solutions = bind_graph(solutions, variable, RowGraphs::One(graph.raw()));
+            // The graph's column, where the pattern doesn't bind the variable, charged
+            // before it is made; the charge then follows the table's bytes (`reshaped`).
+            let growth = match solutions.column(variable) {
+                Some(_) => 0,
+                None => solutions.table.len().saturating_mul(8),
+            };
+            let solutions = self.reshaped(solutions, growth, |solutions| {
+                bind_graph(solutions, variable, RowGraphs::One(graph.raw()))
+            })?;
             all = Some(match all {
                 Some(all) => self.union(all, solutions)?,
                 None => solutions,
@@ -2251,17 +2470,15 @@ impl<'a> Context<'a> {
 
     /// An end of a path: a variable (blank nodes are variables here), or a constant's id
     /// (computed if the store doesn't know it; such an id has no edges).
-    fn path_end(&self, term: &TermPattern) -> Result<Variable, u64> {
-        match term {
+    fn path_end(&self, term: &TermPattern) -> NativeResult<Result<Variable, u64>> {
+        Ok(match term {
             TermPattern::Variable(v) => Ok(v.clone()),
-            TermPattern::BlankNode(b) => {
-                Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-            }
-            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
-            TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
+            TermPattern::BlankNode(b) => Ok(internal::blank_variable(b)),
+            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())?),
+            TermPattern::Literal(l) => Err(self.id(&l.clone().into())?),
             // A triple term at a path's end matches nothing a path reaches.
             TermPattern::Triple(_) => Err(UNDEF),
-        }
+        })
     }
 
     /// The path evaluator for the active graph. There is none while `GRAPH ?g` is evaluated
@@ -2276,14 +2493,13 @@ impl<'a> Context<'a> {
             // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
-        Ok(paths::PathEvaluator {
-            snapshot: &self.snapshot,
-            model: self.model,
+        Ok(paths::PathEvaluator::new(
+            &self.snapshot,
+            self.model,
             graph,
-            fixed: None,
-            cancellation: self.cancellation.as_ref(),
-            closures: Cell::new(0),
-        })
+            self.cancellation.as_ref(),
+            &self.budget,
+        ))
     }
 
     /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
@@ -2302,7 +2518,7 @@ impl<'a> Context<'a> {
         if self.as_written {
             return self.filtered_path(path, None, start);
         }
-        let (Ok(s), Ok(o)) = (self.path_end(path.subject), self.path_end(path.object)) else {
+        let (Ok(s), Ok(o)) = (self.path_end(path.subject)?, self.path_end(path.object)?) else {
             // A constant end already bounds the path.
             return self.filtered_path(path, None, start);
         };
@@ -2321,21 +2537,99 @@ impl<'a> Context<'a> {
         } else {
             return self.filtered_path(path, None, start);
         };
+        let pairs = pairs.map_err(QueryEvaluationError::MemoryLimit)?;
         let estimate = || self.path_estimate(path, Some(from));
         self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
-        let (vars, table) = if s == o {
-            let same = pairs.into_iter().filter(|(a, b)| a == b).map(|(a, _)| a);
-            (vec![s], IdTable::from_columns(vec![same.collect()]))
-        } else {
-            let (starts, ends): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
-            (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+        let reached = self.path_pairs(evaluator.pool(), pairs, s, o)?;
+        self.filtered_path(path, Some((reached, from)), start)
+    }
+
+    /// The table of a path's ends (or starts), a row per copy of its bag: a bag of copies moves
+    /// into the column with its charge; a counted one's copies are charged to `pool` before
+    /// they are made, beside it.
+    fn path_column<'e>(
+        &self,
+        pool: &'e nrese_exec::Pool,
+        variable: Variable,
+        ends: paths::Bag<'e, u64>,
+    ) -> NativeResult<Solutions> {
+        let column = ends
+            .into_copies(pool)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        self.path_table(vec![variable], vec![column])
+    }
+
+    /// The table of a path's `(s, o)` pairs (one column if `s` and `o` are one variable,
+    /// of the pairs that start where they end): a row per copy (a sequence of alternatives
+    /// counts a pair once per way through), every column charged to `pool` before it is made,
+    /// beside the pairs, which are freed once the columns are made ([`Self::path_table`]).
+    fn path_pairs(
+        &self,
+        pool: &nrese_exec::Pool,
+        pairs: paths::Bag<'_, (u64, u64)>,
+        s: Variable,
+        o: Variable,
+    ) -> NativeResult<Solutions> {
+        let refused = QueryEvaluationError::MemoryLimit;
+        // A column of `rows` ids, the copies of each pair's `end` (of the pairs `keep` takes).
+        let column = |rows: usize, keep: fn(&(u64, u64)) -> bool, end: fn((u64, u64)) -> u64| {
+            let mut column = paths::Buf::with_capacity_in(pool, rows).map_err(refused)?;
+            let filled = column.fill(rows, |room| {
+                for (pair, copies) in pairs.counted().filter(|(pair, _)| keep(pair)) {
+                    room.extend(std::iter::repeat_n(end(pair), copies));
+                }
+            });
+            filled.map_err(refused)?;
+            Ok::<_, NativeError>(column)
         };
-        let reached = self.produced(Solutions {
+        let (vars, columns) = if s == o {
+            let same = |(a, b): &(u64, u64)| a == b;
+            let rows = pairs
+                .counted()
+                .filter(|(pair, _)| same(pair))
+                .fold(0usize, |n, (_, copies)| n.saturating_add(copies));
+            (vec![s], vec![column(rows, same, |(a, _)| a)?])
+        } else {
+            let (rows, all) = (pairs.len(), |_: &(u64, u64)| true);
+            let starts = column(rows, all, |(a, _)| a)?;
+            (vec![s, o], vec![starts, column(rows, all, |(_, b)| b)?])
+        };
+        drop(pairs);
+        self.path_table(vars, columns)
+    }
+
+    /// A path's table of `columns`, each charged to the path's pool since before it was
+    /// made: their charge is handed to the table whole ([`nrese_exec::Share::transfer`]),
+    /// never released and charged again, exactly the table's bytes (the executor memory
+    /// stack's package fix check r3, EMS-R3-C1: a column's capacity released down to its
+    /// length while it lived). Cancelled or refused before, the columns are dropped: freed,
+    /// then released.
+    fn path_table(
+        &self,
+        vars: Vec<Variable>,
+        columns: Vec<paths::Buf<'_, u64>>,
+    ) -> NativeResult<Solutions> {
+        self.check()?;
+        let mut bytes = 0usize;
+        let columns = columns
+            .into_iter()
+            .map(|column| {
+                let (column, held) = column.into_parts();
+                bytes += held.transfer();
+                column
+            })
+            .collect();
+        let table = IdTable::from_columns(columns);
+        debug_assert_eq!(
+            table.memory_bytes(),
+            bytes,
+            "a path table's charge is its bytes"
+        );
+        Ok(Solutions {
             vars,
             table,
             ordered: false,
-        })?;
-        self.filtered_path(path, Some((reached, from)), start)
+        })
     }
 
     /// The path's solutions (`reached`, from that many bound values, or all of them),
@@ -2395,33 +2689,45 @@ impl<'a> Context<'a> {
     ) -> NativeResult<Solutions> {
         let start = Instant::now();
         let resolved = paths::Path::resolve(path, &self.snapshot);
-        let end = |term: &TermPattern| self.path_end(term);
+        let ends = (self.path_end(subject)?, self.path_end(object)?);
         let mut evaluator = self.path_evaluator()?;
-        evaluator.fixed = end(subject).err().or_else(|| end(object).err());
-        let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
-        let (vars, table) = match (end(subject), end(object)) {
+        let constant = |end: &Result<Variable, u64>| end.as_ref().err().copied();
+        evaluator.fixed = constant(&ends.0).or_else(|| constant(&ends.1));
+        let refused = QueryEvaluationError::MemoryLimit;
+        let pool = evaluator.pool();
+        let solutions = match ends {
+            // As many solutions without bindings as the path connects the two ways: a table
+            // without columns, which holds no buffer, charged its rows ([`Self::produced`]).
+            // As many solutions without bindings as the path connects the two ways: a table
+            // without columns, which holds no buffer but counts its rows, charged before they
+            // are made (sol-loop r1 S1 of the executor memory stack's second lead: 64 `(p|p)`
+            // steps over `a p a` count `usize::MAX` ways, made one by one before the charge).
             (Err(start), Err(finish)) => {
-                let rows = evaluator.multiplicity(&resolved, start, finish);
-                (
-                    Vec::new(),
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-                )
+                let rows = evaluator
+                    .solutions(&resolved, start, finish)
+                    .map_err(refused)?;
+                self.check()?;
+                let bytes = IdTable::new(0).bytes_for_rows(rows);
+                if bytes > 0 {
+                    self.budget.charge(bytes).map_err(refused)?;
+                }
+                Solutions {
+                    vars: Vec::new(),
+                    table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                    ordered: false,
+                }
             }
-            (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))),
-            (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))),
-            (Ok(s), Ok(o)) if s == o => {
-                let same: Vec<u64> = evaluator
-                    .open(&resolved)
-                    .into_iter()
-                    .filter(|(a, b)| a == b)
-                    .map(|(a, _)| a)
-                    .collect();
-                (vec![s], column(same))
+            (Err(start), Ok(o)) => {
+                let ends = evaluator.ends(&resolved, start).map_err(refused)?;
+                self.path_column(pool, o, ends)?
+            }
+            (Ok(s), Err(finish)) => {
+                let starts = evaluator.starts(&resolved, finish).map_err(refused)?;
+                self.path_column(pool, s, starts)?
             }
             (Ok(s), Ok(o)) => {
-                let (starts, ends): (Vec<u64>, Vec<u64>) =
-                    evaluator.open(&resolved).into_iter().unzip();
-                (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+                let pairs = evaluator.pairs(&resolved).map_err(refused)?;
+                self.path_pairs(pool, pairs, s, o)?
             }
         };
         let estimate = || {
@@ -2433,12 +2739,9 @@ impl<'a> Context<'a> {
             };
             Some(self.path_size(&pattern).round() as u64)
         };
-        self.note_closures(&evaluator, path, estimate, table.len(), start);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let rows = solutions.table.len();
+        self.note_closures(&evaluator, path, estimate, rows, start);
+        Ok(solutions)
     }
 
     // --- basic graph patterns ------------------------------------------------------------
@@ -2456,7 +2759,7 @@ impl<'a> Context<'a> {
         // GeoSPARQL relations between features (`spatial`): those with a constant side
         // start the joins, the others follow them.
         if let Some((first, later, rest)) = self.spatial_split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for triple in &first {
                 result = self.spatial_join(result, triple)?;
             }
@@ -2475,7 +2778,7 @@ impl<'a> Context<'a> {
         }
         // Full-text searches start the joins (`search`).
         if let Some((searches, rest)) = search::split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for search in &searches {
                 let start = Instant::now();
                 let found = self.search(search)?;
@@ -2512,7 +2815,7 @@ impl<'a> Context<'a> {
             }
         }
         if scans.is_empty() {
-            return Ok(Solutions::unit());
+            return self.unit();
         }
         // A string test on a large pattern's object: the terms that pass, from the
         // dictionary first (`strings`), as a hint.
@@ -2853,13 +3156,13 @@ impl<'a> Context<'a> {
         let tables = parts
             .into_iter()
             .map(|part| {
-                if part.vars == vars {
+                Ok(if part.vars == vars {
                     part.table
                 } else {
-                    self.project(part, &vars).table
-                }
+                    self.project(part, &vars)?.table
+                })
             })
-            .collect();
+            .collect::<NativeResult<_>>()?;
         Ok(Solutions {
             table: IdTable::concat(vars.len(), tables),
             vars,
@@ -3243,6 +3546,10 @@ impl<'a> Context<'a> {
                 Some((v.clone(), position))
             })
             .collect();
+        // The lists' charge, while they live: the columns decoded for them are charged before
+        // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
+        let mut held = Reservation::new(&*self.budget);
+        // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
         for i in 0..scans.len() {
             // Pairs of patterns: cancelled, the rest is left out, and the orderer that
@@ -3268,18 +3575,26 @@ impl<'a> Context<'a> {
                         let pattern = scans[k].quad_pattern();
                         // A column at a time where the index allows (a few ns a value;
                         // a quad at a time took 50: LUBM-10 q11 0.06 → 0.18 ms).
-                        lists[k] = self
-                            .snapshot
-                            .scan_columns_in(self.model, &pattern, permutation, &[*position])
-                            .and_then(|mut columns| columns.pop())
-                            .or_else(|| {
-                                let quads = self.snapshot.scan_sorted_in(
-                                    self.model,
-                                    &pattern,
-                                    permutation,
-                                )?;
-                                Some(quads.map(|q| q.components()[*position]).collect())
-                            });
+                        let decoded = self.snapshot.scan_columns_in(
+                            self.model,
+                            &pattern,
+                            permutation,
+                            &[*position],
+                            &self.budget,
+                        );
+                        lists[k] = match decoded {
+                            Ok(Some(columns)) => {
+                                let (mut columns, charge) = columns.into_parts();
+                                held.absorb(charge);
+                                columns.pop()
+                            }
+                            Ok(None) => self
+                                .snapshot
+                                .scan_sorted_in(self.model, &pattern, permutation)
+                                .map(|quads| quads.map(|q| q.components()[*position]).collect()),
+                            // Refused: no overlap known for it; the plan goes without.
+                            Err(_) => None,
+                        };
                     }
                 }
                 let (Some(x), Some(y)) = (&lists[i], &lists[j]) else {
@@ -3569,25 +3884,36 @@ impl<'a> Context<'a> {
         graph_tests::checkpoint();
         self.check()?;
         let (predicate, object) = (
-            Variable::new_unchecked("described predicate"),
-            Variable::new_unchecked("described object"),
+            internal::variable("described", "predicate"),
+            internal::variable("described", "object"),
         );
         let Some(graph) = self.graph_slot() else {
             return Ok(Vec::new());
         };
         let table = &solutions.table;
-        let mut described: HashSet<u64> = HashSet::new();
-        let mut todo = Vec::new();
-        let mut out = Vec::new();
+        let mut described = ChargedMap::new(&*self.budget);
+        let mut todo = ChargedVec::new(&*self.budget);
+        // The decoded payloads stay charged with the output, just as CONSTRUCT's do.
+        // One thread, with no sibling payload grant: the whole spare.
+        // Declared before `out` so the triples are freed before their payload charge.
+        let mut kept = Grant::with_workers(&*self.budget, 1);
+        let mut out = ChargedVec::new(&*self.budget);
         for row in 0..table.len() {
             self.check()?;
             for column in 0..table.width() {
                 let id = table.get(row, column);
-                if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
-                    todo.push(id);
+                if id != UNDEF
+                    && computed_index(id).is_none()
+                    && described
+                        .get_or_insert_with(id, || ())
+                        .map_err(QueryEvaluationError::MemoryLimit)?
+                        .1
+                {
+                    todo.push(id).map_err(QueryEvaluationError::MemoryLimit)?;
                 }
             }
-            while let Some(node) = todo.pop() {
+            while let Some(node) = todo.last().copied() {
+                todo.truncate(todo.len() - 1);
                 self.check()?;
                 let Some(subject) = self
                     .term(node)
@@ -3619,15 +3945,27 @@ impl<'a> Context<'a> {
                     ) else {
                         continue;
                     };
-                    if o.is_blank_node() && described.insert(o_id) {
-                        todo.push(o_id);
+                    if o.is_blank_node()
+                        && described
+                            .get_or_insert_with(o_id, || ())
+                            .map_err(QueryEvaluationError::MemoryLimit)?
+                            .1
+                    {
+                        todo.push(o_id).map_err(QueryEvaluationError::MemoryLimit)?;
                     }
-                    out.push(nrese_rdf::Triple::new(subject.clone(), p, o));
+                    let triple = nrese_rdf::Triple::new(subject.clone(), p, o);
+                    kept.take(triple_heap(&triple))
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
+                    out.push(triple)
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
                 }
                 self.consumed(statements);
             }
         }
         self.check()?;
+        let (out, capacity) = out.into_parts();
+        capacity.transfer();
+        kept.transfer();
         Ok(out)
     }
 
@@ -3647,9 +3985,7 @@ impl<'a> Context<'a> {
         let slot = |term: &TermPattern| -> Option<Slot> {
             Some(match term {
                 TermPattern::Variable(v) => Slot::Var(v.clone()),
-                TermPattern::BlankNode(b) => {
-                    Slot::Var(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-                }
+                TermPattern::BlankNode(b) => Slot::Var(internal::blank_variable(b)),
                 TermPattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
                 TermPattern::Literal(l) => Slot::Const(self.lookup_const(l.as_ref().into())?),
                 TermPattern::Triple(t) => {
@@ -3686,24 +4022,39 @@ impl<'a> Context<'a> {
         // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
         if !merged && !scan.repeats_variable() {
             let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
-            if let Some(columns) =
-                self.snapshot
-                    .scan_columns_in(self.model, &pattern, permutation, &components)
+            // Charged before they are decoded ([`Snapshot::scan_columns_in`]): the table
+            // takes over their charge.
+            if let Some(columns) = self
+                .snapshot
+                .scan_columns_in(self.model, &pattern, permutation, &components, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             {
-                let table = if vars.is_empty() {
+                let sorted = sorted_columns(scan, permutation, &vars);
+                if vars.is_empty() {
                     let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
-                } else {
-                    IdTable::from_columns(columns)
-                };
-                return self.produced(Solutions {
-                    vars: vars.clone(),
-                    table: table.assume_sorted_by(sorted_columns(scan, permutation, &vars)),
-                    ordered: false,
-                });
+                    let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+                    return self.produced(Solutions {
+                        vars: vars.clone(),
+                        table: table.assume_sorted_by(sorted),
+                        ordered: false,
+                    });
+                }
+                let (columns, held) = columns.into_parts();
+                return self.holding(
+                    held,
+                    Solutions {
+                        vars: vars.clone(),
+                        table: IdTable::from_columns(columns).assume_sorted_by(sorted),
+                        ordered: false,
+                    },
+                );
             }
         }
-        let mut table = IdTable::new(vars.len());
+        if vars.is_empty() {
+            return self.scan_without_columns(scan, permutation);
+        }
+        // Rows known only as they are read: each column charged before it grows.
+        let mut columns = scan_columns::Columns::new(&self.budget, vars.len());
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
@@ -3737,14 +4088,80 @@ impl<'a> Context<'a> {
                 }
                 *slot = value;
             }
-            table.push_row(&row);
+            columns
+                .push_row(&row)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
         }
+        let (table, held) = columns
+            .into_table()
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table,
+                ordered: false,
+            },
+        )
+    }
+
+    /// [`Self::scan`] of a pattern without variables, matched quad by quad: its rows hold
+    /// nothing until something makes a column of them, charged as such
+    /// ([`IdTable::memory_bytes`]) once they are counted.
+    fn scan_without_columns(
+        &self,
+        scan: &ScanPattern,
+        permutation: Permutation,
+    ) -> NativeResult<Solutions> {
+        let pattern = scan.quad_pattern();
+        let merged = scan.merged();
+        let mut table = IdTable::new(0);
+        let quads = self
+            .snapshot
+            .scan_sorted_in(self.model, &pattern, permutation)
+            .expect("permutation_for returns a usable permutation");
+        let mut previous: Option<[u64; 3]> = None;
+        for (n, quad) in quads.enumerate() {
+            if n % (1 << 16) == 0 {
+                self.check()?;
+            }
+            if merged {
+                if let Some(graphs) = &self.merge_set
+                    && !graphs.contains(&quad.graph)
+                {
+                    continue;
+                }
+                // Graph-last order: the copies of a statement follow each other.
+                let components = quad.components();
+                let statement = [components[0], components[1], components[2]];
+                if previous == Some(statement) {
+                    continue;
+                }
+                previous = Some(statement);
+            }
+            table.push_row(&[]);
+        }
         self.produced(Solutions {
-            vars,
+            vars: Vec::new(),
             table,
             ordered: false,
         })
+    }
+
+    /// `solutions`, whose table `held` holds the charge of (exactly its bytes, once
+    /// resized): the charge handed on with them, never released and charged again. A
+    /// cancelled query fails here, as at [`Self::produced`].
+    fn holding(
+        &self,
+        mut held: Reservation<&Budget>,
+        solutions: Solutions,
+    ) -> NativeResult<Solutions> {
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
     }
 
     /// Scans `scan` over `ranges` of its object (the first free component of
@@ -3782,21 +4199,27 @@ impl<'a> Context<'a> {
                 solutions
             });
         }
-        // Each range a block and a column at a time where the index can, else quad by quad.
-        let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
+        // Each range a block and a column at a time where the index can, else quad by quad;
+        // what each range decodes and the table it goes into charged before they grow.
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut out = scan_columns::Columns::new(&self.budget, vars.len());
+        let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
             self.check()?;
-            if let Some(decoded) = self.snapshot.scan_range_columns_in(
-                self.model,
-                &pattern,
-                permutation,
-                low,
-                high,
-                &columns,
-            ) {
-                for (column, values) in out.iter_mut().zip(decoded) {
-                    column.extend(values);
-                }
+            if let Some(decoded) = self
+                .snapshot
+                .scan_range_columns_in(
+                    self.model,
+                    &pattern,
+                    permutation,
+                    low,
+                    high,
+                    &columns,
+                    &self.budget,
+                )
+                .map_err(memory)?
+            {
+                out.extend(decoded.columns()).map_err(memory)?;
                 continue;
             }
             let Some(quads) =
@@ -3810,21 +4233,25 @@ impl<'a> Context<'a> {
                     self.check()?;
                 }
                 let components = quad.components();
-                for (column, &c) in out.iter_mut().zip(&columns) {
-                    column.push(components[c]);
+                for (slot, &c) in row.iter_mut().zip(&columns) {
+                    *slot = components[c];
                 }
+                out.push_row(&row).map_err(memory)?;
             }
         }
         let object = vars
             .iter()
             .position(|v| scan.slots[2].is_var(v))
             .expect("ranged object");
-        let table = IdTable::from_columns(out).assume_sorted_by(vec![object]);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let (table, held) = out.into_table().map_err(memory)?;
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table: table.assume_sorted_by(vec![object]),
+                ordered: false,
+            },
+        )
     }
 
     /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the
@@ -4054,6 +4481,10 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// The rows of both sides over the variables of either: a variable a side lacks is
+    /// UNDEF in its rows. Every column of the result is made, for the rows of both sides,
+    /// while they are held: charged before it is made, however many variables a side
+    /// lacks.
     fn union(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
         let mut vars = left.vars.clone();
         for v in &right.vars {
@@ -4061,28 +4492,30 @@ impl<'a> Context<'a> {
                 vars.push(v.clone());
             }
         }
-        let widen = |s: &Solutions| {
+        let rows = left.table.len() + right.table.len();
+        let growth = rows.saturating_mul(8).saturating_mul(vars.len());
+        self.reshaped((left, right), growth, |(left, right)| {
             // No variables on either side: rows without columns, as many as there are.
-            if vars.is_empty() {
-                return IdTable::from_rows(0, std::iter::repeat_n(&[][..], s.table.len()));
+            let table = if vars.is_empty() {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
+            } else {
+                let column = |v: &Variable| {
+                    let mut column = Vec::with_capacity(rows);
+                    for side in [&left, &right] {
+                        match side.column(v) {
+                            Some(c) => column.extend_from_slice(side.table.column(c)),
+                            None => column.resize(column.len() + side.table.len(), UNDEF),
+                        }
+                    }
+                    column
+                };
+                IdTable::from_columns(vars.iter().map(column).collect())
+            };
+            Solutions {
+                vars,
+                table,
+                ordered: false,
             }
-            let columns: Vec<Vec<u64>> = vars
-                .iter()
-                .map(|v| match s.column(v) {
-                    Some(c) => s.table.column(c).to_vec(),
-                    None => vec![UNDEF; s.table.len()],
-                })
-                .collect();
-            IdTable::from_columns(columns)
-        };
-        let mut table = widen(&left);
-        table.append(&widen(&right));
-        self.consumed(left);
-        self.consumed(right);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
         })
     }
 
@@ -4130,7 +4563,7 @@ impl<'a> Context<'a> {
                 ordered: false,
             };
             return Ok(Some(match projection {
-                Some(variables) => self.project(solutions, variables),
+                Some(variables) => self.project(solutions, variables)?,
                 None => solutions,
             }));
         };
@@ -4230,28 +4663,16 @@ impl<'a> Context<'a> {
             table: out,
             ordered: false,
         };
-        let Some(variables) = projection else {
-            out_held.transfer();
-            return Ok(Some(solutions));
-        };
-        // The projection's new columns are charged as the rows were, before they are made:
-        // a bound variable's column moves, every other projected one is made (an unbound
-        // variable's, a column projected again). The result keeps its charge.
-        let moved = solutions
-            .vars
-            .iter()
-            .filter(|v| variables.contains(v))
-            .count();
-        let made = variables.len() - moved;
+        // The result keeps the charge of exactly its bytes; a projection charges the columns
+        // it makes before making them (`project`).
         out_held
-            .charge(solutions.table.len().saturating_mul(8 * made))
-            .map_err(memory)?;
-        let projected = self.project(solutions, variables);
-        out_held
-            .resize(projected.table.memory_bytes())
+            .resize(solutions.table.memory_bytes())
             .map_err(memory)?;
         out_held.transfer();
-        Ok(Some(projected))
+        Ok(Some(match projection {
+            Some(variables) => self.project(solutions, variables)?,
+            None => solutions,
+        }))
     }
 
     /// Which rows pass `expression`: the compiled id-level predicate where it decides
@@ -4285,14 +4706,14 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let snapshot: &Snapshot = &self.snapshot;
-        let decodes = &self.decodes;
+        let (decodes, budget) = (&self.decodes, &self.budget);
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes);
+                let decoder = Decoder::new(snapshot, computed, decodes, budget);
                 let range =
                     i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
                 Some(mask.rows(range, &|id| decoder.term(id)))
@@ -4326,7 +4747,7 @@ impl<'a> Context<'a> {
                 let (mut solutions, plain, added) = self.with_exists(solutions, expression)?;
                 let mask = self.filter_mask(&solutions, &plain)?;
                 solutions.table.retain_mask(&mask);
-                Ok(drop_last_columns(solutions, added))
+                self.drop_added(solutions, added)
             }
             _ => {
                 let mask = self.filter_mask(&solutions, expression)?;
@@ -4338,25 +4759,39 @@ impl<'a> Context<'a> {
 
     // --- modifiers -----------------------------------------------------------------------
 
-    /// The columns of `variables`: bound ones move, an unbound one is UNDEF.
-    fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
-        let mut table = solutions.table;
-        let mut undef = None;
-        let mut columns = Vec::with_capacity(variables.len());
-        for variable in variables {
-            columns.push(match solutions.vars.iter().position(|v| v == variable) {
-                Some(column) => column,
-                None => *undef.get_or_insert_with(|| {
-                    table.push_column(vec![UNDEF; table.len()]);
-                    table.width() - 1
-                }),
-            });
-        }
-        Solutions {
-            vars: variables.to_vec(),
-            table: table.project(&columns),
-            ordered: solutions.ordered,
-        }
+    /// The columns of `variables` of a charged table: a bound variable's column moves,
+    /// every other one is made (an unbound variable's UNDEF, a column projected again),
+    /// charged before it is made, however many the query names. The result keeps the
+    /// charge, of exactly its bytes.
+    fn project(&self, solutions: Solutions, variables: &[Variable]) -> NativeResult<Solutions> {
+        // The input's columns that move: the first named by each variable, each once.
+        let mut moved: Vec<usize> = variables
+            .iter()
+            .filter_map(|variable| solutions.vars.iter().position(|v| v == variable))
+            .collect();
+        moved.sort_unstable();
+        moved.dedup();
+        let made = variables.len() - moved.len();
+        let growth = solutions.table.len().saturating_mul(8).saturating_mul(made);
+        self.reshaped(solutions, growth, |solutions| {
+            let mut table = solutions.table;
+            let mut undef = None;
+            let mut columns = Vec::with_capacity(variables.len());
+            for variable in variables {
+                columns.push(match solutions.vars.iter().position(|v| v == variable) {
+                    Some(column) => column,
+                    None => *undef.get_or_insert_with(|| {
+                        table.push_column(vec![UNDEF; table.len()]);
+                        table.width() - 1
+                    }),
+                });
+            }
+            Solutions {
+                vars: variables.to_vec(),
+                table: table.project(&columns),
+                ordered: solutions.ordered,
+            }
+        })
     }
 
     /// Sorts by the ORDER BY keys. With `limit`, only the first `limit` rows are guaranteed to
@@ -4366,31 +4801,51 @@ impl<'a> Context<'a> {
     /// each distinct id is decoded once, the distinct terms are sorted, and every row gets its
     /// term's rank: equal-ordering terms (1 and 1.0) share a rank.
     /// Every aggregate of every group (`members` lists each group's rows), in parallel
-    /// chunks of groups for large inputs.
+    /// chunks of groups for large inputs. The terms the aggregation keeps are charged as
+    /// they are made ([`aggregate::Kept`]); with the results comes their charge (bytes the
+    /// caller releases once it let them go).
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
         members: &[Vec<usize>],
         aggregates: &[(Variable, AggregateExpression)],
-    ) -> NativeResult<Vec<Vec<Agg>>> {
-        let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
-            aggregates
-                .iter()
-                .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
-                .collect()
+    ) -> NativeResult<(Vec<Vec<Agg>>, usize)> {
+        let shared: &Arc<Budget> = &self.budget;
+        let budget: &Budget = shared;
+        // The aggregates of `groups`, with their results' charge; the refusal that ended
+        // them, if one did.
+        let aggregate = |aggregator: &Aggregator<'_>,
+                         kept: &aggregate::Kept,
+                         groups: &[Vec<usize>]|
+         -> Result<Vec<Vec<Agg>>, BudgetExceeded> {
+            let mut out = Vec::with_capacity(groups.len());
+            for rows in groups {
+                out.push(
+                    aggregates
+                        .iter()
+                        .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
+                        .collect(),
+                );
+                if let Some(refused) = kept.refused() {
+                    return Err(refused);
+                }
+            }
+            Ok(out)
         };
         if solutions.table.len() < 2 * PARALLEL_EXPRESSION_ROWS || members.len() < 2 {
             let term = |id: u64| self.term(id);
+            let kept = aggregate::Kept::new(&self.budget);
             let aggregator = Aggregator {
                 evaluator: &self.evaluator,
                 term: &term,
                 memo: RefCell::default(),
                 numbers: RefCell::default(),
+                kept: Some(&kept),
             };
-            return Ok(members
-                .iter()
-                .map(|rows| per_group(&aggregator, rows))
-                .collect());
+            let out = aggregate(&aggregator, &kept, members)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+            drop(aggregator);
+            return Ok((out, kept.results()));
         }
         // Chunks of groups holding about PARALLEL_EXPRESSION_ROWS rows each.
         let mut bounds = vec![0];
@@ -4410,36 +4865,58 @@ impl<'a> Context<'a> {
         let token = self.cancellation.as_ref();
         let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
         let decodes = &self.decodes;
-        let parts: Vec<Option<Vec<Vec<Agg>>>> = bounds
+        // A part's aggregates and their charge; `Err(None)` once cancelled.
+        type Part = Result<(Vec<Vec<Agg>>, usize), Option<BudgetExceeded>>;
+        let parts: Vec<Part> = bounds
             .par_windows(2)
             .map(|window| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
-                    return None;
+                    return Err(None);
                 }
-                let decoder = Decoder::new(snapshot, computed, decodes);
+                let decoder = Decoder::new(snapshot, computed, decodes, shared);
                 let term = |id: u64| decoder.term(id);
+                let kept = aggregate::Kept::new(shared);
                 let aggregator = Aggregator {
                     evaluator,
                     term: &term,
                     memo: RefCell::default(),
                     numbers: RefCell::default(),
+                    kept: Some(&kept),
                 };
-                Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
-                        .collect(),
-                )
+                let part = aggregate(&aggregator, &kept, &members[window[0]..window[1]]);
+                drop(aggregator);
+                let charged = kept.results();
+                match part {
+                    Ok(part) => Ok((part, charged)),
+                    Err(refused) => {
+                        budget.release(charged);
+                        Err(Some(refused))
+                    }
+                }
             })
             .collect();
-        let mut out = Vec::with_capacity(members.len());
+        let (mut out, mut charged) = (Vec::with_capacity(members.len()), 0usize);
+        let mut stop = None;
         for part in parts {
-            let Some(part) = part else {
-                return Err(QueryEvaluationError::Cancelled.into());
-            };
-            out.extend(part);
+            match part {
+                Ok((part, bytes)) => {
+                    out.extend(part);
+                    charged = charged.saturating_add(bytes);
+                }
+                Err(why) => stop = Some(stop.flatten().or(why)),
+            }
         }
-        Ok(out)
+        if let Some(why) = stop {
+            // Let go of what the other parts made, then of their charge.
+            drop(out);
+            budget.release(charged);
+            return Err(match why {
+                Some(refused) => QueryEvaluationError::MemoryLimit(refused),
+                None => QueryEvaluationError::Cancelled,
+            }
+            .into());
+        }
+        Ok((out, charged))
     }
 
     /// Ranks of `column`'s values in SPARQL's order. With `top = (k, descending)` only the
@@ -4560,48 +5037,88 @@ impl<'a> Context<'a> {
             .collect()
     }
 
-    /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`. A key
-    /// that is a variable sorts by rank ([`Self::order_ranks`]: inline integers by id, so
-    /// no term is decoded); others are evaluated per row.
-    fn sort_keys(
-        &self,
+    /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`, each
+    /// key's charged to `held` before it is made (a term's strings as it is made), however
+    /// many keys the query names. A key that is a variable sorts by rank
+    /// ([`Self::order_ranks`]: inline integers by id, so no term is decoded); others are
+    /// evaluated per row.
+    fn sort_keys<'b>(
+        &'b self,
         solutions: &Solutions,
         keys: &[OrderExpression],
         rows: &[usize],
         limit: Option<usize>,
-    ) -> Vec<SortKey> {
-        keys.iter()
-            .enumerate()
-            .map(|(i, key)| {
-                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
-                if let Expression::Variable(v) = e
-                    && let Some(column) = solutions.column(v)
-                {
-                    let column = solutions.table.column(column);
-                    let values: Vec<u64> = rows.iter().map(|&row| column[row]).collect();
-                    // With a limit, the first key needs only its first values told apart
-                    // when it is the only key (later keys break its ties).
-                    let descending = matches!(key, OrderExpression::Desc(_));
-                    let top = limit
-                        .filter(|_| i == 0 && keys.len() == 1)
-                        .map(|k| (k, descending));
-                    return SortKey::Ids(self.order_ranks(&values, top));
+        held: &mut Reservation<&'b Budget>,
+    ) -> NativeResult<Vec<SortKey>> {
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut sort_keys = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+            if let Expression::Variable(v) = e
+                && let Some(column) = solutions.column(v)
+            {
+                held.charge(rows.len().saturating_mul(8)).map_err(memory)?;
+                let column = solutions.table.column(column);
+                let values: Vec<u64> = rows.iter().map(|&row| column[row]).collect();
+                // With a limit, the first key needs only its first values told apart
+                // when it is the only key (later keys break its ties).
+                let descending = matches!(key, OrderExpression::Desc(_));
+                let top = limit
+                    .filter(|_| i == 0 && keys.len() == 1)
+                    .map(|k| (k, descending));
+                sort_keys.push(SortKey::Ids(self.order_ranks(&values, top)));
+                continue;
+            }
+            let slot = std::mem::size_of::<Option<Term>>();
+            held.charge(rows.len().saturating_mul(slot))
+                .map_err(memory)?;
+            let mut terms = Vec::with_capacity(rows.len());
+            // A term at a time through a grant (no budget call within its spare), its charge
+            // then held with the keys'. One thread.
+            let mut strings = Grant::with_workers(&*self.budget, 1);
+            for &row in rows {
+                let term = self.evaluator.eval(e, &self.binding(solutions, row));
+                if let Some(term) = &term {
+                    strings
+                        .take(crate::cache::term_heap(term))
+                        .map_err(memory)?;
                 }
-                SortKey::Terms(
-                    rows.iter()
-                        .map(|&row| self.evaluator.eval(e, &self.binding(solutions, row)))
-                        .collect(),
-                )
-            })
-            .collect()
+                terms.push(term);
+            }
+            held.absorb(strings.into_reservation());
+            sort_keys.push(SortKey::Terms(terms));
+        }
+        Ok(sort_keys)
     }
 
+    /// `solutions` (charged) in the order of `keys`; what that holds per key, and the
+    /// reordered table, charged before they are made. Keys that order nothing are left out,
+    /// however many the query names: a variable no row binds (unbound in every row, all rows
+    /// tie, §15.1), and an expression an earlier key has (it only meets that key's ties,
+    /// which it ties too), unless drawn per row (`RAND()`).
     fn order_by(
         &self,
-        mut solutions: Solutions,
+        solutions: Solutions,
         keys: &[OrderExpression],
         limit: Option<usize>,
     ) -> NativeResult<Solutions> {
+        fn expression(key: &OrderExpression) -> &Expression {
+            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+            e
+        }
+        let mut deciding: Vec<OrderExpression> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let e = expression(key);
+            let unbound = matches!(e, Expression::Variable(v) if solutions.column(v).is_none());
+            let repeated = !pushdown::per_solution(e)
+                && deciding.iter().any(|earlier| expression(earlier) == e);
+            if !unbound && !repeated {
+                deciding.push(key.clone());
+            }
+        }
+        let keys = &deciding[..];
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut held = Reservation::new(&*self.budget);
         let n = solutions.table.len();
         // The order of positions `a` and `b` by `values` of `keys` (no tie-break).
         let by_keys = |keys: &[OrderExpression], values: &[SortKey], a: usize, b: usize| {
@@ -4624,20 +5141,28 @@ impl<'a> Context<'a> {
         // can be among the first k (those up to the k-th row's value, ties included); the
         // other keys are computed for those only. Olympics q4 ranked 28 k athletes' IRIs
         // to break ties among the top 10 medal counts.
+        // The rows' positions and their order: a word a row each.
+        held.charge(n.saturating_mul(16)).map_err(memory)?;
         let mut rows: Vec<usize> = (0..n).collect();
         if let Some(k) = limit
             && k > 0
             && k < n
             && keys.len() > 1
         {
-            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k));
+            let before = held.bytes();
+            held.charge(n.saturating_mul(8)).map_err(memory)?;
+            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k), &mut held)?;
             let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
             let mut positions = rows.clone();
             positions.select_nth_unstable_by(k - 1, cmp);
             let pivot = positions[k - 1];
             rows.retain(|row| cmp(row, &pivot).is_le());
+            drop(positions);
+            drop(first);
+            // The first key and the positions are gone: so is their charge.
+            held.resize(before).map_err(memory)?;
         }
-        let key_values = self.sort_keys(&solutions, keys, &rows, limit);
+        let key_values = self.sort_keys(&solutions, keys, &rows, limit, &mut held)?;
         let compare = |a: &usize, b: &usize| {
             by_keys(keys, &key_values, *a, *b).then_with(|| rows[*a].cmp(&rows[*b]))
         };
@@ -4651,20 +5176,30 @@ impl<'a> Context<'a> {
             _ => order.sort_unstable_by(compare),
         }
         let order: Vec<usize> = order.into_iter().map(|position| rows[position]).collect();
-        let columns: Vec<Vec<u64>> = solutions
-            .table
-            .columns()
-            .iter()
-            .map(|column| order.iter().map(|&row| column[row]).collect())
-            .collect();
+        drop(key_values);
+        drop(rows);
+        // Only the order is left of the scratch, and charged.
+        held.resize(order.capacity().saturating_mul(8))
+            .map_err(memory)?;
+        // The rows in that order: a table made of the charged one.
         let width = solutions.table.width();
-        solutions.table = if width == 0 {
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], order.len()))
-        } else {
-            IdTable::from_columns(columns)
-        };
-        solutions.ordered = true;
-        Ok(solutions)
+        let growth = order.len().saturating_mul(8).saturating_mul(width.max(1));
+        let mut sorted = self.reshaped(solutions, growth, |mut solutions| {
+            let columns: Vec<Vec<u64>> = solutions
+                .table
+                .columns()
+                .iter()
+                .map(|column| order.iter().map(|&row| column[row]).collect())
+                .collect();
+            solutions.table = if width == 0 {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], order.len()))
+            } else {
+                IdTable::from_columns(columns)
+            };
+            solutions
+        })?;
+        sorted.ordered = true;
+        Ok(sorted)
     }
 
     // --- aggregation ---------------------------------------------------------------------
@@ -4689,10 +5224,18 @@ impl<'a> Context<'a> {
             return self.group_streamed(plan, variables, aggregates);
         }
         let before = self.budget.used();
+        let kept = self.kept.borrow().bytes();
         match self.group_direct(inner, variables, aggregates, having) {
             Err(error) if streamable.is_some() && stream::is_memory_limit(&error) => {
-                self.budget
-                    .release(self.budget.used().saturating_sub(before));
+                // What the attempt held, not what the context keeps of it (its computed
+                // terms and numbers stay, and stay charged).
+                let grown = self.kept.borrow().bytes().saturating_sub(kept);
+                self.budget.release(
+                    self.budget
+                        .used()
+                        .saturating_sub(before)
+                        .saturating_sub(grown),
+                );
                 let plan = streamable.as_ref().expect("checked");
                 self.group_streamed(plan, variables, aggregates)
             }
@@ -4725,8 +5268,8 @@ impl<'a> Context<'a> {
                 None => 0,
             };
             let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            table.push_row(&[self.id(&integer(count))?]);
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4741,8 +5284,8 @@ impl<'a> Context<'a> {
             && let Some(count) = self.cyclic_count(patterns)?
         {
             let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            table.push_row(&[self.id(&integer(count))?]);
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4759,19 +5302,20 @@ impl<'a> Context<'a> {
                 path,
                 object,
             } = inner
-            && let (Ok(start), Ok(end)) = (self.path_end(subject), self.path_end(object))
+            && let (Ok(start), Ok(end)) = (self.path_end(subject)?, self.path_end(object)?)
             && start != end
             && let Some(count) = self
                 .path_evaluator()?
                 .count_open(&paths::Path::resolve(path, &self.snapshot))
+                .map_err(QueryEvaluationError::MemoryLimit)?
         {
             if self.trace.is_some() {
                 let detail = format!("COUNT of {path} from the closure's size per component");
                 self.note("closure", detail, Some(1), 1, begun);
             }
             let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            table.push_row(&[self.id(&integer(count))?]);
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4794,10 +5338,12 @@ impl<'a> Context<'a> {
         {
             let permutation = scan.permutation_for(Some(key));
             let start = std::time::Instant::now();
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
             if scan.first_free(permutation) == Some(component)
-                && let Some(groups) =
-                    self.snapshot
-                        .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+                && let Some(groups) = self
+                    .snapshot
+                    .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                    .map_err(QueryEvaluationError::MemoryLimit)?
             {
                 if self.trace.is_some() {
                     let detail = format!("{key} of {triple}");
@@ -4805,29 +5351,28 @@ impl<'a> Context<'a> {
                     let estimate = Some(self.distinct(&scan, key, count));
                     self.note("group count", detail, estimate, groups.len(), start);
                 }
-                let mut columns = vec![
-                    groups
-                        .iter()
-                        .map(|(value, _)| value.raw())
-                        .collect::<Vec<_>>(),
-                ];
-                let counts: Vec<u64> = groups
-                    .iter()
-                    .map(|&(_, n)| match TermId::inline_integer(n as i64) {
-                        Some(id) => id.raw(),
-                        None => self.id(&integer(n)),
-                    })
-                    .collect();
+                // The key's column and the counts' for each aggregate, however many the
+                // query names, charged before they are made.
                 let mut vars = vec![key.clone()];
-                for (target, _) in aggregates {
-                    columns.push(counts.clone());
-                    vars.push(target.clone());
-                }
-                let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
-                return self.produced(Solutions {
-                    vars,
-                    table,
-                    ordered: false,
+                vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+                let bytes = groups.len().saturating_mul(8).saturating_mul(vars.len());
+                return self.made(bytes, || {
+                    let mut columns = Vec::with_capacity(vars.len());
+                    columns.push(groups.iter().map(|(value, _)| value.raw()).collect());
+                    let mut counts = Vec::with_capacity(groups.len());
+                    for &(_, n) in groups.iter() {
+                        counts.push(match TermId::inline_integer(n as i64) {
+                            Some(id) => id.raw(),
+                            None => self.id(&integer(n))?,
+                        });
+                    }
+                    columns.resize(vars.len(), counts);
+                    let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
+                    Ok(Solutions {
+                        vars,
+                        table,
+                        ordered: false,
+                    })
                 });
             }
         }
@@ -4905,19 +5450,32 @@ impl<'a> Context<'a> {
         // Rows of the keyed side per chunk, so that a chunk's product has about
         // CROSS_CHUNK_ROWS rows.
         let per_chunk = (self.cross_chunk_rows / other.table.len().max(1)).max(1);
-        // A key in scope but never bound has no column: unbound in every row, it splits no
-        // group.
-        let key_columns: Vec<usize> = variables.iter().filter_map(|v| keyed.column(v)).collect();
+        // The keys' columns, each once: a key named again orders and splits nothing more,
+        // and one in scope but never bound has no column (unbound in every row, it splits
+        // no group).
+        let (key_columns, _) = aggregate::bound_keys(&keyed, variables);
+        let memory = QueryEvaluationError::MemoryLimit;
+        // The keyed rows' order and the sort's buffer: a word a row each, charged before
+        // they are made. Declared before `order`: dropped after it.
+        let mut scratch = Reservation::new(&*self.budget);
+        scratch
+            .charge(keyed.table.len().saturating_mul(16))
+            .map_err(memory)?;
         let mut order: Vec<usize> = (0..keyed.table.len()).collect();
         if keyed.table.len() > per_chunk {
-            let key_of = |row: usize| -> Vec<u64> {
+            // Stable: rows of a key keep their order, as the groups' members do.
+            order.sort_by(|&a, &b| {
                 key_columns
                     .iter()
-                    .map(|&c| keyed.table.get(row, c))
-                    .collect()
-            };
-            order.sort_by_cached_key(|&row| key_of(row));
+                    .map(|&c| keyed.table.get(a, c).cmp(&keyed.table.get(b, c)))
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
+        // The buffer is gone; the order is left, charged until the chunks are made.
+        scratch
+            .resize(order.capacity().saturating_mul(8))
+            .map_err(memory)?;
         let same_key = |a: usize, b: usize| {
             key_columns
                 .iter()
@@ -4959,6 +5517,8 @@ impl<'a> Context<'a> {
             parts.push(self.group_solutions(crossed, variables, aggregates)?);
             start = end;
         }
+        drop(order);
+        drop(scratch);
         self.consumed(keyed);
         self.consumed(other);
         let Some(first) = parts.first() else {
@@ -4987,13 +5547,17 @@ impl<'a> Context<'a> {
     /// are read in order instead of per group. `None` otherwise (and where a value isn't a
     /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
     /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
+    /// Once it applies, and before it allocates, it calls `reserve` with what the pass
+    /// holds at most ([`aggregate::pass_bytes`]); the numbers it remembers are charged to
+    /// the query before they are found, and released as they are let go. A refusal ends it.
     fn numeric_pass(
         &self,
         solutions: &Solutions,
         group_of: &[u32],
         groups: usize,
         aggregates: &[(Variable, AggregateExpression)],
-    ) -> Option<Vec<Vec<Agg>>> {
+        reserve: &mut dyn FnMut(usize) -> Result<(), BudgetExceeded>,
+    ) -> Result<Option<Vec<Vec<Agg>>>, BudgetExceeded> {
         enum Plan<'e> {
             Rows,
             Bound(usize),
@@ -5012,7 +5576,10 @@ impl<'a> Context<'a> {
                     name: AggregateFunction::Count,
                     expr: Expression::Variable(variable),
                     distinct: false,
-                } => Plan::Bound(solutions.column(variable)?),
+                } => match solutions.column(variable) {
+                    Some(column) => Plan::Bound(column),
+                    None => return Ok(None),
+                },
                 AggregateExpression::FunctionCall {
                     name: name @ (AggregateFunction::Sum | AggregateFunction::Avg),
                     expr,
@@ -5025,7 +5592,7 @@ impl<'a> Context<'a> {
                     columns.sort_unstable();
                     columns.dedup();
                     let [column] = columns[..] else {
-                        return None;
+                        return Ok(None);
                     };
                     totals += 1;
                     Plan::Total {
@@ -5034,12 +5601,12 @@ impl<'a> Context<'a> {
                         average: *name == AggregateFunction::Avg,
                     }
                 }
-                _ => return None,
+                _ => return Ok(None),
             });
         }
         // Only worth it where a total is computed; counts alone take the other paths.
         if totals == 0 {
-            return None;
+            return Ok(None);
         }
         #[derive(Clone, Copy)]
         struct State {
@@ -5047,6 +5614,8 @@ impl<'a> Context<'a> {
             total: Option<Numeric>,
             error: bool,
         }
+        const { assert!(std::mem::size_of::<State>() <= aggregate::STATE_BYTES) };
+        reserve(aggregate::pass_bytes(groups, plans.len()))?;
         let width = plans.len();
         let table = &solutions.table;
         // Every id's number, found once per query: the chunks of a cross product
@@ -5069,6 +5638,11 @@ impl<'a> Context<'a> {
                 }
             }
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
+            // Each number found is kept: charged before (`number_bytes`), however many
+            // expressions the query sums.
+            self.kept
+                .borrow_mut()
+                .charge(missing.len().saturating_mul(number_bytes()))?;
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
@@ -5086,6 +5660,7 @@ impl<'a> Context<'a> {
                     term: &term,
                     memo: RefCell::default(),
                     numbers: RefCell::default(),
+                    kept: None,
                 };
                 missing
                     .iter()
@@ -5095,17 +5670,18 @@ impl<'a> Context<'a> {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
                 let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
-                let decodes = &self.decodes;
+                let (decodes, budget) = (&self.decodes, &self.budget);
                 missing
                     .par_chunks(PARALLEL_EXPRESSION_ROWS)
                     .flat_map_iter(|part| {
-                        let decoder = Decoder::new(snapshot, computed, decodes);
+                        let decoder = Decoder::new(snapshot, computed, decodes, budget);
                         let term = |id: u64| decoder.term(id);
                         let aggregator = Aggregator {
                             evaluator,
                             term: &term,
                             memo: RefCell::default(),
                             numbers: RefCell::default(),
+                            kept: None,
                         };
                         part.iter()
                             .map(|&(id, row)| (id, number(&aggregator, row)))
@@ -5172,27 +5748,46 @@ impl<'a> Context<'a> {
         // Parts of the groups on every core where there are many rows: each part reads the
         // rows in order, so every group adds its values in the order the general path does.
         let parts = rayon::current_num_threads().min(groups).max(1);
-        let states: Vec<State> = if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
-            pass(0..groups)?
-        } else {
-            let done: Vec<Option<Vec<State>>> = (0..parts)
-                .into_par_iter()
-                .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
-                .collect();
-            let mut states = Vec::with_capacity(groups * width);
-            for part in done {
-                states.extend(part?);
-            }
-            states
+        let states: Option<Vec<State>> =
+            if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
+                pass(0..groups)
+            } else {
+                let done: Vec<Option<Vec<State>>> = (0..parts)
+                    .into_par_iter()
+                    .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
+                    .collect();
+                let mut states = Vec::with_capacity(groups * width);
+                let mut numbers_only = true;
+                for part in done {
+                    match part {
+                        Some(part) => states.extend(part),
+                        None => {
+                            numbers_only = false;
+                            break;
+                        }
+                    }
+                }
+                numbers_only.then_some(states)
+            };
+        let Some(states) = states else {
+            return Ok(None);
         };
         // Kept for the next chunk only while small: a GROUP BY over many distinct values
         // would hold all their numbers to the end of the query.
         drop(known);
         drop(numbers);
-        self.numbers
+        let mut let_go = 0usize;
+        self.numbers.borrow_mut().retain(|_, known| {
+            let keep = known.len() <= NUMBER_MEMO_ENTRIES;
+            if !keep {
+                let_go = let_go.saturating_add(known.len());
+            }
+            keep
+        });
+        self.kept
             .borrow_mut()
-            .retain(|_, known| known.len() <= NUMBER_MEMO_ENTRIES);
-        Some(
+            .release(let_go.saturating_mul(number_bytes()));
+        Ok(Some(
             (0..groups)
                 .map(|group| {
                     plans
@@ -5210,77 +5805,43 @@ impl<'a> Context<'a> {
                         .collect()
                 })
                 .collect(),
-        )
+        ))
     }
 
-    /// GROUP BY over evaluated `solutions`.
+    /// GROUP BY over evaluated `solutions` (charged). The groups' table, a column per key
+    /// and per aggregate however many the query names, is charged before it is made, beside
+    /// the rows it is made of.
     fn group_solutions(
         &self,
         solutions: Solutions,
         variables: &[Variable],
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Solutions> {
-        let key_table = if variables.is_empty() {
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
-        } else {
-            let key_columns: Vec<Vec<u64>> = variables
-                .iter()
-                .map(|v| match solutions.column(v) {
-                    Some(c) => solutions.table.column(c).to_vec(),
-                    None => vec![UNDEF; solutions.table.len()],
-                })
-                .collect();
-            let key_table = IdTable::from_columns(key_columns);
-            let sorted_on: Vec<usize> = variables
-                .iter()
-                .map_while(|v| solutions.column(v))
-                .collect();
-            if sorted_on.len() == variables.len() && solutions.table.is_sorted_on(&sorted_on) {
-                key_table.assume_sorted_by((0..variables.len()).collect())
-            } else {
-                key_table
-            }
-        };
-        let keys: Vec<usize> = (0..variables.len()).collect();
-        let groups = group_rows(&key_table, &keys).map_err(QueryEvaluationError::from)?;
-        // Without GROUP BY, an empty input still yields one (empty) group.
+        let (groups, positions) = aggregate::groups_of(&solutions, variables)?;
         let group_count = groups.len();
-        let one_pass = aggregate_in_one_pass(&solutions, &groups.group_of, group_count, aggregates)
-            .or_else(|| self.numeric_pass(&solutions, &groups.group_of, group_count, aggregates));
-        let values = match one_pass {
-            Some(values) => values,
-            None => {
-                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                for (row, &group) in groups.group_of.iter().enumerate() {
-                    members[group as usize].push(row);
-                }
-                self.aggregate_groups(&solutions, &members, aggregates)?
-            }
-        };
-        let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
-        for (index, (target, _)) in aggregates.iter().enumerate() {
-            let column: Vec<u64> = values
-                .iter()
-                .map(|group| match &group[index] {
-                    Agg::Id(id) => *id,
-                    Agg::Term(term) => self.id(term),
-                })
-                .collect();
-            columns.push(column);
-            vars.push(target.clone());
-        }
-        let table = if columns.is_empty() {
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], group_count))
-        } else {
-            IdTable::from_columns(columns)
-        };
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        let bytes = group_count
+            .saturating_mul(8)
+            .saturating_mul(vars.len().max(1));
+        let grouped = self.made(bytes, || {
+            let mut columns = aggregate::key_columns(&groups, &positions, None);
+            let values =
+                self.aggregate_columns(&solutions, &groups.group_of, group_count, aggregates)?;
+            columns.extend(values);
+            let table = if columns.is_empty() {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], group_count))
+            } else {
+                IdTable::from_columns(columns)
+            };
+            Ok(Solutions {
+                vars,
+                table,
+                ordered: false,
+            })
+        });
         self.consumed(solutions);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        grouped
     }
 }
 
@@ -5363,37 +5924,45 @@ const PARALLEL_EXPRESSION_ROWS: usize = 1 << 13;
 const DECODER_CACHE_ENTRIES: usize = 1 << 12;
 
 /// Term decoding for one task of a parallel operator: the snapshot, the query's computed
-/// terms (read-only meanwhile), and a small cache of its own.
+/// terms (read-only meanwhile), and a small cache of its own, charged to the query's budget
+/// while kept ([`decode_cache`]).
 struct Decoder<'a> {
     snapshot: &'a Snapshot,
     computed: &'a [Term],
-    cache: RefCell<HashMap<u64, Option<Term>>>,
+    cache: RefCell<decode_cache::DecodeCache>,
     /// The query's count of decoded terms ([`Context::decodes`]).
     decodes: &'a AtomicU64,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(snapshot: &'a Snapshot, computed: &'a [Term], decodes: &'a AtomicU64) -> Self {
+    fn new(
+        snapshot: &'a Snapshot,
+        computed: &'a [Term],
+        decodes: &'a AtomicU64,
+        budget: &Arc<Budget>,
+    ) -> Self {
         Self {
             snapshot,
             computed,
-            cache: RefCell::default(),
+            // As many fill theirs at once as the pool has threads.
+            cache: RefCell::new(decode_cache::DecodeCache::new(
+                budget,
+                DECODER_CACHE_ENTRIES,
+                rayon::current_num_threads(),
+            )),
             decodes,
         }
     }
 
     fn term(&self, id: u64) -> Option<Term> {
-        if let Some(term) = self.cache.borrow().get(&id) {
+        if let Some(term) = self.cache.borrow().get(id) {
             return term.clone();
         }
         if id != UNDEF && computed_index(id).is_none() {
             self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let term = decode(self.snapshot, self.computed, id);
-        let mut cache = self.cache.borrow_mut();
-        if cache.len() < DECODER_CACHE_ENTRIES {
-            cache.insert(id, term.clone());
-        }
+        self.cache.borrow_mut().keep(id, &term);
         term
     }
 }
@@ -5564,8 +6133,7 @@ impl<'b> Probe<'_, 'b> {
                 }
             }
             if out.len() + found > room {
-                reserve_rows(&mut out, &mut held, found, usize::MAX).map_err(ProbeStop::Memory)?;
-                room = out.memory_bytes() / (8 * self.width).max(1);
+                room = grown_room(&mut out, &mut held, found).map_err(ProbeStop::Memory)?;
             }
             for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
@@ -5687,6 +6255,27 @@ fn joined_vars(left: &Solutions, right: &Solutions, right_keys: &[usize]) -> Vec
 }
 
 /// `solutions` without its last `count` columns.
+/// What a computed term holds once [`Context::id`] keeps it: a copy in the list and one as
+/// the map's key (their strings, [`crate::cache::term_heap`]), with each container's room
+/// for it counted at its most, twice the slot (a vector doubles; a map doubles at
+/// seven-eighths full, with a control byte and the id per entry).
+fn computed_bytes(term: &Term) -> usize {
+    let slot = std::mem::size_of::<Term>();
+    let entry = slot + std::mem::size_of::<u64>() + 1;
+    let heap = crate::cache::term_heap(term);
+    (2 * slot)
+        .saturating_add(2 * entry * 8 / 7 + 2)
+        .saturating_add(heap.saturating_mul(2))
+}
+
+/// What a number [`Context::numeric_pass`] remembers holds in its map: the id and the
+/// number, a control byte, the map's room for it counted at its most (it doubles at
+/// seven-eighths full).
+fn number_bytes() -> usize {
+    let entry = std::mem::size_of::<(u64, Number)>() + 1;
+    2 * entry * 8 / 7 + 2
+}
+
 fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
     if count == 0 {
         return solutions;
@@ -5788,15 +6377,17 @@ fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
     rows: usize,
     most: usize,
 ) -> Result<(), BudgetExceeded> {
-    let row_bytes = 8 * table.width();
+    // What room for so many rows counts is the table's to say: without columns, its rows
+    // after the first ([`IdTable::bytes_for_rows`]).
     let needed = table.len().saturating_add(rows);
-    if row_bytes == 0 || needed.saturating_mul(row_bytes) <= table.memory_bytes() {
+    let room = table.len() + table.spare_rows();
+    if needed <= room {
         return Ok(());
     }
-    let doubled = (table.memory_bytes() / row_bytes * 2).min(most).max(needed);
+    let doubled = room.saturating_mul(2).min(most).max(needed);
     let mut grow = |capacity: usize| -> Result<(), BudgetExceeded> {
         let old = held.bytes();
-        held.charge(capacity.saturating_mul(row_bytes))?;
+        held.charge(table.bytes_for_rows(capacity))?;
         table.reserve_exact(capacity - table.len());
         held.release(old);
         // An allocator may hand out more than asked: held too.
@@ -5807,6 +6398,20 @@ fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
         Ok(())
     };
     grow(doubled).or_else(|_| grow(needed))
+}
+
+/// [`reserve_rows`] for `rows` more rows, then the rows `table` has room for: the index
+/// join probe's rare growth, kept out of its loop over rows (PR #84's timing: with it inlined
+/// there, the probe took more cycles at the same instruction count).
+#[cold]
+#[inline(never)]
+fn grown_room<B: std::ops::Deref<Target = Budget>>(
+    table: &mut IdTable,
+    held: &mut Reservation<B>,
+    rows: usize,
+) -> Result<usize, BudgetExceeded> {
+    reserve_rows(table, held, rows, usize::MAX)?;
+    Ok(table.len() + table.spare_rows())
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
@@ -5888,9 +6493,7 @@ fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
     let term = |t: &TermPattern| match t {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(internal::blank_variable(b)),
         _ => None,
     };
     let predicate = match &triple.predicate {

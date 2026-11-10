@@ -44,6 +44,11 @@ const CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks in flight between producer and client (at most ~0.5 MiB per request).
 const CHANNEL_CHUNKS: usize = 8;
 
+/// Maximum live chunk payload: the queue, a pending send, the producer's replacement
+/// buffer and the frame currently held by the consumer. Independent of result size;
+/// allocation metadata and other per-request state are outside this payload bound.
+pub const MAX_BUFFERED_OUTPUT_BYTES: usize = (CHANNEL_CHUNKS + 3) * CHUNK_BYTES;
+
 type Message = Frame<Bytes>;
 
 /// How the producer ended: `None` while it runs (or if it panicked), its result after.

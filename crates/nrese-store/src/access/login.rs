@@ -278,8 +278,8 @@ pub(super) struct Logins {
     verified: Mutex<HashMap<[u8; 32], (String, String)>>,
     /// Failed attempts ([`Throttle`]).
     failures: Mutex<Throttle>,
-    /// Session tokens: the user and when the session ends.
-    sessions: Mutex<HashMap<String, (String, Instant)>>,
+    /// Session tokens and their sessions. Lock order: this, then the access state.
+    sessions: Mutex<HashMap<String, Session>>,
     /// Every Argon2 run's turn.
     argon2: Argon2Gate,
     /// What a password is checked with, in its turn: [`verify_password`].
@@ -300,6 +300,31 @@ impl Default for Verifier {
 /// A session token's prefix, which tells it from other bearer tokens.
 pub const SESSION_PREFIX: &str = "nrese-session.";
 
+/// An open session: its user, the credential it was opened with (the user's PHC string
+/// its password was verified against) and when it ends.
+struct Session {
+    user: String,
+    credential: String,
+    until: Instant,
+}
+
+/// Whether `credential` is still `user`'s local login in `state`. A session is valid only
+/// for the credential it was verified against (SYN-63): a new password is a new PHC
+/// string (a fresh random salt), so it ends every session of the old one, as removing the
+/// user or its login does.
+fn current(state: &AccessState, user: &str, credential: &str) -> bool {
+    state
+        .users
+        .get(user)
+        .and_then(|record| record.password_hash.as_deref())
+        == Some(credential)
+}
+
+/// The refusal of a wrong user name or password.
+fn refused() -> AccessError {
+    AccessError::Forbidden("wrong user name or password".to_owned())
+}
+
 impl Logins {
     pub(super) fn new(limits: LoginLimits) -> Self {
         let mut secret = [0u8; 32];
@@ -316,7 +341,7 @@ impl Logins {
 
     /// [`Self::new`], checking passwords with `verify` instead of [`verify_password`].
     #[cfg(test)]
-    fn verifying_with(limits: LoginLimits, verify: fn(&str, &str) -> bool) -> Self {
+    pub(super) fn verifying_with(limits: LoginLimits, verify: fn(&str, &str) -> bool) -> Self {
         Self {
             verify: Verifier(verify),
             ..Self::new(limits)
@@ -332,7 +357,22 @@ impl Logins {
         password: &str,
         client: Option<IpAddr>,
     ) -> Result<Principal, AccessError> {
-        let refused = || AccessError::Forbidden("wrong user name or password".to_owned());
+        self.verify(state, user, password, client)?;
+        Ok(Principal {
+            user: Some(user.to_owned()),
+            ..Principal::default()
+        })
+    }
+
+    /// [`Self::login`]'s check: the credential `password` was verified against, `user`'s
+    /// PHC string in `state`.
+    pub(super) fn verify(
+        &self,
+        state: &AccessState,
+        user: &str,
+        password: &str,
+        client: Option<IpAddr>,
+    ) -> Result<String, AccessError> {
         let pair = (user.to_owned(), client);
         {
             let mut failures = self.failures.lock().expect("failures");
@@ -372,13 +412,10 @@ impl Logins {
             if verified.len() >= self.limits.remembered {
                 verified.clear();
             }
-            verified.insert(key, (user.to_owned(), hash));
+            verified.insert(key, (user.to_owned(), hash.clone()));
         }
         self.failures.lock().expect("failures").pairs.clear(&pair);
-        Ok(Principal {
-            user: Some(user.to_owned()),
-            ..Principal::default()
-        })
+        Ok(hash)
     }
 
     /// `work`, an Argon2 run, in its turn ([`Argon2Gate`]).
@@ -398,8 +435,19 @@ impl Logins {
         (failures.pairs.len(), failures.addresses.len())
     }
 
-    /// Opens a session for `user` for `lifetime`; its token.
-    pub(super) fn open(&self, user: &str, lifetime: Duration) -> Result<String, AccessError> {
+    /// Opens a session for `user` for `lifetime`, with the `credential` its password was
+    /// verified against: its token. Refused as a wrong password if `credential` is no
+    /// longer the user's in the state `now` returns, read under the sessions lock: a change
+    /// of the credential publishes its state before it closes the user's sessions under
+    /// that lock ([`Self::close_all`]), so a session opened in between is closed, and one
+    /// opened later is refused. No session of an old credential is ever kept.
+    pub(super) fn open(
+        &self,
+        user: &str,
+        credential: String,
+        lifetime: Duration,
+        now: impl FnOnce() -> std::sync::Arc<AccessState>,
+    ) -> Result<String, AccessError> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)
             .map_err(|error| AccessError::Store(format!("no randomness: {error}")))?;
@@ -408,18 +456,28 @@ impl Logins {
             bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
         let mut sessions = self.sessions.lock().expect("sessions");
-        sessions.retain(|_, (_, until)| *until > Instant::now());
-        sessions.insert(token.clone(), (user.to_owned(), Instant::now() + lifetime));
+        if !current(&now(), user, &credential) {
+            return Err(refused());
+        }
+        sessions.retain(|_, session| session.until > Instant::now());
+        let session = Session {
+            user: user.to_owned(),
+            credential,
+            until: Instant::now() + lifetime,
+        };
+        sessions.insert(token.clone(), session);
         Ok(token)
     }
 
-    /// The user of session `token`, while it lasts.
-    pub(super) fn session(&self, token: &str) -> Option<String> {
+    /// The user of session `token`, while it lasts and the credential it was opened with
+    /// is still the user's in `state`.
+    pub(super) fn session(&self, token: &str, state: &AccessState) -> Option<String> {
         let sessions = self.sessions.lock().expect("sessions");
         sessions
             .get(token)
-            .filter(|(_, until)| *until > Instant::now())
-            .map(|(user, _)| user.clone())
+            .filter(|session| session.until > Instant::now())
+            .filter(|session| current(state, &session.user, &session.credential))
+            .map(|session| session.user.clone())
     }
 
     /// Closes session `token`; whether it was open.
@@ -431,12 +489,13 @@ impl Logins {
             .is_some()
     }
 
-    /// Closes every session of `user` (its password or record changed).
+    /// Closes every session of `user` (its password or record changed), once the state
+    /// with that change is published ([`Self::open`] relies on that order).
     pub(super) fn close_all(&self, user: &str) {
         self.sessions
             .lock()
             .expect("sessions")
-            .retain(|_, (owner, _)| owner != user);
+            .retain(|_, session| session.user != user);
     }
 }
 

@@ -44,7 +44,7 @@
 //!   report, for the fast suite's route checks; a query with one row also records its
 //!   first value there (`value`), the answer of a count.
 //!   `--faults` prints, per query, the first execution's time and page faults beside the
-//!   later runs' median faults (the first execution after opening a mapped store, P6),
+//!   later executions' mean faults (the first execution after opening a mapped store, P6),
 //!   and the working set after opening; the report gets `first_faults` and `faults`.
 //!   `--read-graphs IRI,...` runs every query as a reader restricted to those named graphs
 //!   (graph-level access control: not the default graph, not the inferred statements), the
@@ -281,6 +281,9 @@ struct Args {
     split_turtle: Option<(usize, PathBuf)>,
     replication: Option<String>,
     replication_probe: bool,
+    upload: Option<PathBuf>,
+    upload_format: Option<nrese_store::GraphResultFormat>,
+    upload_as: modes::UploadRoute,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
     read_graphs: Vec<String>,
@@ -331,6 +334,9 @@ fn parse_args() -> Result<Args, String> {
         split_turtle: None,
         replication: None,
         replication_probe: false,
+        upload: None,
+        upload_format: None,
+        upload_as: modes::UploadRoute::GraphStore,
         classify: false,
         prepare_vector_graph: None,
         read_graphs: Vec::new(),
@@ -432,6 +438,26 @@ fn parse_args() -> Result<Args, String> {
                 "swap-one" => args.replication_probe = true,
                 other => return Err(format!("--replication-probe swap-one, not {other}")),
             },
+            "--upload" => args.upload = Some(value()?.into()),
+            "--upload-format" => {
+                args.upload_format = Some(match value()?.as_str() {
+                    "ntriples" => nrese_store::GraphResultFormat::NTriples,
+                    "turtle" => nrese_store::GraphResultFormat::Turtle,
+                    other => return Err(format!("--upload-format ntriples|turtle, not {other}")),
+                })
+            }
+            "--upload-as" => {
+                args.upload_as = match value()?.as_str() {
+                    "graph-store" => modes::UploadRoute::GraphStore,
+                    "statements" => modes::UploadRoute::Statements,
+                    "delete" => modes::UploadRoute::Delete,
+                    other => {
+                        return Err(format!(
+                            "--upload-as graph-store|statements|delete, not {other}"
+                        ));
+                    }
+                }
+            }
             "--classify" => args.classify = true,
             "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--support-sets" => {
@@ -503,9 +529,9 @@ struct Measured {
     /// The query's first execution in this process (the warm-up, or the first measured run).
     first: Option<Duration>,
     error: Option<String>,
-    /// Page faults of the first execution, and of each later one (sorted).
+    /// Page faults of the first execution, and the later executions' mean.
     first_faults: Option<u64>,
-    faults: Vec<u64>,
+    faults: Option<u64>,
 }
 
 /// Runs the query `executions` times back to back under one timeout: the rows of an execution
@@ -588,7 +614,7 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
                 first: None,
                 error: Some(e.to_string()),
                 first_faults: None,
-                faults: Vec::new(),
+                faults: None,
             };
         }
     };
@@ -598,18 +624,22 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
         first: None,
         error: None,
         first_faults: None,
-        faults: Vec::new(),
+        faults: None,
     };
+    // Page faults are read before the first execution, after it, and after the last sample,
+    // never between two later samples: a read there (a /proc file on Linux) left the next
+    // execution colder than another perf lab's that reads none, which a microsecond query's
+    // time shows (entities q03, one execution a sample: IPC 2.17, batched 2.76; 10 Nov 2026).
+    let start = nrese_exec::memory::page_faults();
+    let mut after_first = None;
+    let mut later_executions = 0u64;
     for i in 0..args.warmup + args.runs {
-        let faults = nrese_exec::memory::page_faults();
         let executions = if i >= args.warmup { batch } else { 1 };
         match run_once(store, &prepared, args.timeout, executions) {
             Ok((rows, elapsed)) => {
-                if let (Ok(before), Ok(after)) = (faults, nrese_exec::memory::page_faults()) {
-                    match measured.first_faults {
-                        None => measured.first_faults = Some(after - before),
-                        Some(_) => measured.faults.push(after - before),
-                    }
+                match i {
+                    0 => after_first = Some(nrese_exec::memory::page_faults()),
+                    _ => later_executions += executions as u64,
                 }
                 measured.rows = rows;
                 measured.first.get_or_insert(elapsed);
@@ -623,8 +653,16 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
             }
         }
     }
+    if let (Ok(start), Some(Ok(first)), Ok(end)) =
+        (start, after_first, nrese_exec::memory::page_faults())
+    {
+        measured.first_faults = Some(first.saturating_sub(start));
+        measured.faults = Some(match later_executions {
+            0 => 0,
+            n => (end.saturating_sub(first) as f64 / n as f64).round() as u64,
+        });
+    }
     measured.times.sort();
-    measured.faults.sort();
     measured
 }
 
@@ -1124,6 +1162,16 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             .push(("kernel", modes::kernel(kernel, args.runs)?));
         return Ok(());
     }
+    if let Some(file) = &args.upload {
+        let format = args
+            .upload_format
+            .unwrap_or(nrese_store::GraphResultFormat::NTriples);
+        report.sections.push((
+            "upload",
+            modes::upload(&config, file, format, args.upload_as, args.runs)?,
+        ));
+        return Ok(());
+    }
     if let Some(file) = &args.parse_turtle {
         report
             .sections
@@ -1576,13 +1624,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             extra.push_str(&format!(",\n      \"first_ms\": {:.3}", ms(first)));
         }
         if let Some(first) = m.first_faults {
-            let later = m.faults.get(m.faults.len() / 2).copied().unwrap_or(0);
+            let later = m.faults.unwrap_or(0);
             extra.push_str(&format!(
                 ",\n      \"first_faults\": {first},\n      \"faults\": {later}"
             ));
             if args.faults {
                 println!(
-                    "    first {:.2} ms, {first} page faults; later runs {later} faults (median)",
+                    "    first {:.2} ms, {first} page faults; later runs {later} faults (mean)",
                     m.first.map_or(0.0, ms)
                 );
             }

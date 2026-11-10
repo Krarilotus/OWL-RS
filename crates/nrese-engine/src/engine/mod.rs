@@ -31,6 +31,8 @@ mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(test)]
+mod own_state_tests;
 mod private;
 mod replication;
 #[cfg(test)]
@@ -39,6 +41,7 @@ mod snapshot;
 pub(crate) mod spill;
 mod statistics;
 mod transaction;
+mod writer;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,10 +65,12 @@ pub use equality::Classes as EqualityClasses;
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
-    SharedState, Snapshot, SnapshotIdentity, TextScope,
+    Admission, Count, CountedSnapshot, GroupCounts, HeavyGroups, InferredMask, InferredSubset,
+    OwnState, ProbeCursor, ScanColumns, SearchRefused, Seek, SharedState, Snapshot,
+    SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
+pub use writer::{CommitNote, Finished, NoteError, WriterHeld};
 
 /// `slot` (the writer or checkpoint slot, `name`d), taken if free; otherwise waited for off
 /// the Rayon pool, and refused on a pool thread ([`EngineError::SlotBusy`]). Its holder runs
@@ -136,7 +141,10 @@ pub struct EngineStats {
     pub inferred: u64,
     /// Runs of both stacks.
     pub runs: usize,
-    /// Index memory of both stacks on the heap.
+    /// Index memory of both stacks on the heap: the latest version's own runs, and every
+    /// quad-layout form of a default-graph run alive (shared by pending versions over a base
+    /// that hasn't the quad layout yet, published or not), each once (DUR-6). Array payload,
+    /// not run boxes; older versions held by snapshots aren't counted.
     pub index_bytes: u64,
     /// Index data of both stacks used in place from a mapped checkpoint.
     pub index_mapped_bytes: u64,
@@ -246,6 +254,9 @@ pub(crate) struct Version {
     pub(crate) asserted_content: AssertedIdentity,
     /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
     pub(crate) canonical: equality::CanonicalCache,
+    /// What readers of its unpublished snapshots keep ([`OwnState`]): empty at every
+    /// construction, never copied.
+    pub(crate) own: snapshot::OwnSlots,
 }
 
 /// The identity of a snapshot's asserted statements ([`Snapshot::asserted_identity`]
@@ -304,6 +315,7 @@ impl Version {
             content: Content::fresh(),
             asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -334,6 +346,7 @@ impl Version {
             content: self.content,
             asserted_content: self.asserted_content,
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -350,6 +363,7 @@ impl Version {
             asserted_content: self.asserted_content,
             // A canonical view of the old runs would hold them: made afresh.
             canonical: Default::default(),
+            own: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -390,8 +404,10 @@ impl Versions {
     /// Replaces the current version with a prebuilt one. The caller must hold the writer slot,
     /// so that no statement changed since `version` was built from the latest content (a merge
     /// or a mapped checkpoint published meanwhile changed runs only, and is replaced), and the
-    /// compaction slot, so that none is published while it is replaced.
-    fn install(&self, version: Arc<Version>) {
+    /// compaction slot, so that none is published while it is replaced. A value, never an
+    /// `Arc`: no snapshot can have held it, so its own slots ([`OwnState`]) are empty.
+    fn install(&self, version: Version) {
+        let version = Arc::new(version);
         *self.current.write() = version;
     }
 
@@ -485,10 +501,14 @@ impl Versions {
     /// stack's runs until the caller publishes. Converted without the slot, on the caller's
     /// pool, and kept only where the stack's runs are still the ones converted (a merge or a
     /// mapped checkpoint may have replaced them meanwhile: converted afresh).
-    fn converted_asserted(&self) -> (MutexGuard<'_, ()>, IndexVersion) {
+    fn converted_asserted(
+        &self,
+        forms: &crate::index::Forms,
+    ) -> (MutexGuard<'_, ()>, IndexVersion) {
         loop {
             let base = self.load();
-            let converted = base.asserted.with_quads_layout();
+            // The runs' shared forms: a pending version's, if one holds it still (DUR-6).
+            let converted = base.asserted.with_quads_layout(forms);
             let slot = self.compaction_slot.lock();
             let now = self.load();
             let (was, is) = (base.asserted.runs(), now.asserted.runs());
@@ -536,6 +556,10 @@ struct Shared {
     /// while it holds commits of unknown time: the clock stays known through them (review r1,
     /// R1-F2). Recovered from the checkpoint and the log; changed by writers only.
     clock: AtomicU64,
+    /// The quad-layout forms of default-graph runs alive, shared by the pending versions (and
+    /// a commit) that read a base in the quad layout: their bytes, counted in the index memory
+    /// ([`Engine::stats`]) while any holder keeps one (DUR-6).
+    forms: crate::index::Forms,
 }
 
 impl Shared {
@@ -580,6 +604,9 @@ impl Shared {
                     self.dictionary.save_derived();
                     return Ok(snapshot.revision());
                 }
+                // The names a reopen left pending, before anything is written (deferred-sync
+                // design note of 8 Nov): a failure leaves the log as it was.
+                wal.settle_names()?;
                 wal.rotate(snapshot.revision() + 1)?;
                 (snapshot, clock)
             };
@@ -638,6 +665,7 @@ impl Shared {
                     // A checkpoint mapped: the same statements.
                     asserted_content: current.asserted_content,
                     canonical: Default::default(),
+                    own: Default::default(),
                 }
             });
         }
@@ -993,6 +1021,7 @@ impl Engine {
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             admission: config.admission,
             clock: AtomicU64::new(clock),
+            forms: Default::default(),
         });
         let worker = config
             .background_maintenance
@@ -1212,7 +1241,14 @@ impl Engine {
             quads: version.asserted.len(),
             inferred: version.inferred.len(),
             runs: version.runs().count(),
-            index_bytes: version.runs().map(|run| run.memory_bytes()).sum(),
+            // The latest version's own runs, and every shared quad-layout form alive, published
+            // or not, once (DUR-6).
+            index_bytes: version
+                .runs()
+                .filter(|run| !run.is_form())
+                .map(|run| run.memory_bytes())
+                .sum::<u64>()
+                + self.inner.shared.forms.bytes(),
             index_mapped_bytes: version.runs().map(|run| run.mapped_bytes()).sum(),
             dictionary: self.inner.shared.dictionary.stats(),
             wal_bytes_since_checkpoint: self

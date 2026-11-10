@@ -38,6 +38,7 @@ spec = importlib.util.spec_from_file_location("release_gate", ROOT / "benches/fa
 gate_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate_module)
 import fast  # noqa: E402
+import isolation  # noqa: E402
 from suitekit import gatestats  # noqa: E402
 
 def LOCAL_TABLES(checkout, harness):  # noqa: N802
@@ -59,8 +60,8 @@ def commit_all(repo: Path) -> str:
 LUBM_MAKER = "bash benches/reasoning/prepare-lubm.sh"
 
 
-MAKER_SCRIPTS = ("scripts/lib/ns.sh", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
-                 "benches/sparql/prepare.sh")
+MAKER_SCRIPTS = (*isolation.NS_SH, "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+                 "benches/sparql/prepare.sh")  # ns.sh with its lock (isolation.NS_SH)
 
 
 def harness_commit(repo: Path, lubm_size: tuple | None = (4, 8), lubm_made_by: str | None = None,
@@ -1542,7 +1543,11 @@ class Parts(unittest.TestCase):
                 "  QueryEvaluation: 239 / 0 / 0 (0)\n  total: 505 / 0 / 0 (0)\n")
             (logs / "tableau-w3c.tsv").write_text("a\tConsistencyTest\tAL\tpass\t0\n" * 410 +
                                                   "b\tInconsistencyTest\tAL\tdisputed\t0\n")
-            counts = gate_module.w3c_counts(logs)
+            # Each suite's counts from its own kit's log or table (the gate's declared kits).
+            _, kits, bad = gate_module.load_w3c_expected(
+                (ROOT / "benches/fast/w3c-expected.toml").read_text(encoding="utf-8"))
+            self.assertEqual(bad, [])
+            counts = gate_module.kit_counts(logs, kits)
             expected = {"OWL 2 RL": {"passed": 86, "skipped": 3}, "SHACL Core": {"passed": 98},
                         "SPARQL 1.1": {"passed": 505}, "OWL 2 DL": {"passed": 410, "disputed": 1},
                         "SHACL-SPARQL": {"passed": 22}}
@@ -2054,48 +2059,8 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
             self.assertIn("## Against main", text)
 
 
-class Tradeoffs(unittest.TestCase):
-    """Only an owner-approved trade-off accepts a loss (benches/release-tradeoffs.toml)."""
-
-    def rounds(self, tradeoffs=()):
-        def records_of(side, n):
-            cand = side == "cand"
-            return [record(samples={"q01": [10.0, 10.1, 9.9],
-                                    "q06": [v * (worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
-                    record(case="kernel-intersect",
-                           samples={"triangles": [v * (worse(0.36, n) if cand else 1) for v in [140.0, 140.5]]})]
-        # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
-        # 0.0083), and which runs a side got in the block's order decided it.
-        return [run_gate(passes(records_of, blocks=3), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
-                for k in (0, 1)]
-
-    def entry(self, **changes):
-        return {"case": "lab-olympics", "dimension": "time/q06", "max_ratio": 1.12, "approved": "2026-10-20",
-                "by": "the owner", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
-                "pays_with": {"case": "kernel-intersect", "dimension": "time/triangles"}, **changes}
-
-    def verdict(self, *entries):
-        return gate_module.verdict(self.rounds(entries), {"passed": True, "errors": []},
-                                   {"passed": True, "errors": [], "guards": 81})
-
-    def test_a_confirmed_loss_blocks_unless_an_approved_trade_off_with_its_win_covers_it(self):
-        self.assertFalse(self.verdict()[0])
-        passed, text = self.verdict(self.entry())
-        self.assertTrue(passed, text)
-        self.assertIn("accepted trade-off", text)
-        for entry in (self.entry(max_ratio=1.05), self.entry(pays_with={"case": "lab-olympics", "dimension": "time/q01"}),
-                      self.entry(dimension="time/q01")):
-            self.assertFalse(self.verdict(entry)[0], entry)
-
-    def test_the_list_starts_empty_and_a_malformed_entry_is_refused(self):
-        entries, errors = gate_module.load_tradeoffs(ROOT / "benches/release-tradeoffs.toml")
-        self.assertEqual((entries, errors), ([], []))
-        with tempfile.TemporaryDirectory() as tmp:
-            bad = Path(tmp) / "t.toml"
-            bad.write_text('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n', encoding="utf-8")
-            entries, errors = gate_module.load_tradeoffs(bad)
-            self.assertEqual(entries, [])
-            self.assertIn("missing approved, by, pays_with, reason", errors[0])
+# The owner-approved trade-offs' tests: test_release_acceptance.py's Tradeoffs (the verdict reads
+# them at the candidate's tree).
 
 
 @patch.object(gate_module, "harness_tables", LOCAL_TABLES, create=True)  # fake harnesses: this tree's metadata
@@ -3047,9 +3012,24 @@ printf '%s\\n' "$out"; exit $code
 
     def test_a_job_that_builds_a_side_takes_its_measurement_commit_as_an_input(self):
         commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
-        inputs = gate_module.measurement_inputs(self.repo, [self.side, self.later, self.side],
-                                                {self.side: commit})
+        inputs = gate_module.measurement_inputs(self.repo, self.later, [self.side, self.later, self.side],
+                                                {self.side: commit})  # `later` doesn't reach `commit`
         self.assertEqual(inputs, [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}])
+
+    def test_a_job_takes_no_measurement_commit_its_checkout_already_reaches(self):
+        """Master, 10 Nov (IB0343-654a): the fleet stages a job's checkout with its history and takes one git
+        input (F150), so a measurement commit the checkout reaches is no input of its own; one it doesn't
+        reach still is. Both checkouts hold the side itself, so neither takes it as an input."""
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        holding = self.commit({"README.md": "holds it\n"}, "a checkout that reaches it", commit)
+        kept = [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}]
+        with patch.object(gate_module, "measurement_sides", return_value={self.side: commit}):
+            self.assertEqual(gate_module.side_inputs(self.repo, holding, [self.side]), [])
+            self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
+            # Review r1 R1: a replace ref here that gives `later` the commit as a parent reaches it
+            # only in this repository, not in the history a job's checkout is staged with.
+            self.git("replace", "--graft", self.later, self.side, commit)
+            self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
 
     def test_main_and_v1_5_are_measured_at_their_commits(self):
         table = gate_module.tomllib.loads(gate_module.MEASUREMENT_SIDES.read_text(encoding="utf-8"))["side"]

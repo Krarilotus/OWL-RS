@@ -14,8 +14,20 @@ use hashbrown::HashMap;
 use nrese_owl::ProofGraph;
 
 use super::delta::{Base, Rules};
-use super::eval::{GroundProgram, Seg, Source};
+use super::eval::{GroundProgram, Poller, Probe, Seg, Stopped, Visit, Visits};
 use super::ir::Triple;
+
+/// What an explanation's reads count on: nothing stops one, it runs to its end (bounded by
+/// its budget), as the program's enumerations it reads do ([`GroundProgram::unpolled`]).
+/// A read on [`to_its_end`]'s poller, which never stops: its answer (fix check r1 triage,
+/// NEVER rows).
+fn known<T>(read: Result<T, Stopped>) -> T {
+    read.expect("an explanation reads to its end")
+}
+
+fn to_its_end() -> Poller<'static> {
+    Poller::never()
+}
 
 /// One step of an [`Explanation`]: a fact, how it holds, and its premises (indexes of
 /// steps).
@@ -46,7 +58,7 @@ pub fn explain<B: Base + ?Sized>(
     fact: Triple,
     budget: usize,
 ) -> Option<Explanation> {
-    if !base.contains(fact) {
+    if !known(base.contains(fact, &to_its_end())) {
         return None;
     }
     let program = super::delta::program(base, rules);
@@ -61,11 +73,12 @@ pub fn explain_with<B: Base + ?Sized>(
     budget: usize,
 ) -> Option<Explanation> {
     let source = Whole(base);
+    let poll = to_its_end();
     // Backwards: the derivations of every inferred fact reachable from `fact`.
     let mut derivations: HashMap<Triple, Vec<(String, Vec<Triple>)>> = HashMap::new();
     let mut queue = vec![fact];
     while let Some(next) = queue.pop() {
-        if derivations.contains_key(&next) || base.is_asserted(next) {
+        if derivations.contains_key(&next) || known(base.is_asserted(next, &poll)) {
             continue;
         }
         if derivations.len() >= budget {
@@ -93,7 +106,7 @@ pub fn explain_with<B: Base + ?Sized>(
     let size = |fact: Triple, proved: &HashMap<Triple, Proved>| -> Option<usize> {
         match proved.get(&fact) {
             Some(entry) => Some(entry.size),
-            None => base.is_asserted(fact).then_some(1),
+            None => known(base.is_asserted(fact, &poll)).then_some(1),
         }
     };
     let mut pending: Vec<Triple> = derivations.keys().copied().collect();
@@ -132,7 +145,7 @@ pub fn explain_with<B: Base + ?Sized>(
         pending.retain(|next| !round.iter().any(|(fact, _)| fact == next));
         proved.extend(round);
     }
-    if !proved.contains_key(&fact) && !base.is_asserted(fact) {
+    if !proved.contains_key(&fact) && !known(base.is_asserted(fact, &poll)) {
         return None;
     }
     // The proof of `fact`, each fact once.
@@ -190,7 +203,8 @@ pub fn proof_graph<B: Base + ?Sized>(
     fact: Triple,
     budget: usize,
 ) -> Option<ProofGraph<Triple, Triple>> {
-    if !base.contains(fact) {
+    let poll = to_its_end();
+    if !known(base.contains(fact, &poll)) {
         return None;
     }
     let source = Whole(base);
@@ -205,7 +219,7 @@ pub fn proof_graph<B: Base + ?Sized>(
             graph.complete = false;
             break;
         }
-        if base.is_asserted(next) {
+        if known(base.is_asserted(next, &poll)) {
             graph.add("asserted", &[], &[next], next);
         }
         let mut found = program
@@ -242,7 +256,7 @@ pub fn valid_step<B: Base + ?Sized>(
     if inference.rule == "asserted" {
         return inference.premises.is_empty()
             && inference.axioms == [inference.conclusion]
-            && base.is_asserted(inference.conclusion);
+            && known(base.is_asserted(inference.conclusion, &to_its_end()));
     }
     let same = |body: &[Triple]| {
         let mut body = body.to_vec();
@@ -272,25 +286,35 @@ struct Proved {
     derivation: Option<(String, Vec<Triple>)>,
 }
 
-/// A [`Base`] as a [`Source`] whose every fact is old.
+/// A [`Base`] as a [`Source`] whose every fact is old; reads count on the base's.
 struct Whole<'a, B: ?Sized>(&'a B);
 
-impl<B: Base + ?Sized> Source for Whole<'_, B> {
-    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+impl<B: Base + ?Sized> Visits for Whole<'_, B> {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
         if seg.plain() != Seg::Delta {
-            self.0.scan(pattern, f);
+            // The base's scan counts each position it visits on this visit's poller; stopped,
+            // the read around this visit answers `Stopped` (the poller is latched).
+            let scanned = self
+                .0
+                .scan(pattern, visit.poller(), &mut |fact| visit.counted(fact));
+            debug_assert!(scanned.is_ok() || visit.stopped());
         }
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         match seg.plain() {
-            Seg::Delta => 0,
-            _ => self.0.estimate(pattern),
+            Seg::Delta => Ok(0),
+            _ => self.0.estimate(pattern, probe.poller()),
         }
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.0.contains(fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        self.0.contains(fact, probe.poller())
     }
 }
 
