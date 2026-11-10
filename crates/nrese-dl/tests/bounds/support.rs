@@ -41,9 +41,13 @@ impl Table {
         self.id(NamedNode::new_unchecked(iri).into())
     }
 
-    /// Reads `iri` as the term `id` from now on (a text's name for a term it can't spell).
-    pub fn alias(&mut self, iri: &str, id: u64) {
-        self.ids.insert(NamedNode::new_unchecked(iri).into(), id);
+    /// IRIs for U1's own terms, which have none, in a text written with this table's terms
+    /// (`Program::to_n3`): one per term.
+    pub fn own_iris(&self, program: &Program) -> HashMap<u64, String> {
+        (0..self.terms.len() as u64)
+            .filter(|&t| program.is_internal(t))
+            .map(|t| (t, format!("urn:nrese:bounds-eval:own:{t}")))
+            .collect()
     }
 
     /// The N-Triples form of a term.
