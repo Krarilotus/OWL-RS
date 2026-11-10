@@ -148,8 +148,6 @@ impl Layout {
 /// Keys per part of a group walk over a large range, walked in parallel: a multiple of
 /// the block size.
 pub(crate) const GROUP_PART: usize = 1 << 16;
-/// The groups a part of a parallel group walk has room for from the start (16 KiB).
-const PART_FIRST: usize = 1 << 10;
 
 /// [`IndexVersion::group_counts`]'s walk past its capacity, out of its hot loop: `group`
 /// pushed after a growth charged first, or dropped where the walk was refused (that
@@ -733,20 +731,12 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
-            // Each part starts at room for its first group and, where that fits, for up to
-            // PART_FIRST (at most its keys): one budget call where its doublings from a few
-            // groups made about ten, all parts' calls on one budget at once (D16-039's NOT
-            // EXISTS: 300 K cycles a run in `Budget::take`). The room past the first group is
-            // optional, never refused (sol-loop S2-1), and the parts' together at most half
-            // the room the walk starts with: what a part asks ahead and doesn't fill is held
-            // until the merge, and the merge's own room, at most the parts' groups, must stay
-            // (package review r1, SC-R1-01). Read once, before the parts start.
-            let ahead = budget.remaining() / (2 * (cuts.len() - 1) * size_of::<(u64, i64)>());
+            // Each part grows as its groups come, by doubling: no room asked ahead, so none
+            // left unfilled is held across the merge's required room (package fix check r2).
             let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
                     let mut part = ChargedVec::new(budget);
-                    part.reserve_hint(1, (cut[1] - cut[0]).min(PART_FIRST).min(ahead))?;
                     walk(cut[0], cut[1], &mut part)?;
                     Ok(part)
                 })
