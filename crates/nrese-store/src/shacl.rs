@@ -16,7 +16,7 @@ use nrese_sparql::{CancellationToken, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
+use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
 use crate::service::StoreService;
 
 /// Where a request's shapes stay while it runs (never committed): this graph, or the first
@@ -424,7 +424,8 @@ impl StoreService {
             } => {
                 // The shapes go into a graph of a private transaction, never committed: their
                 // terms are its own, charged to the request's envelope, and none enters the
-                // dictionary (dictionary lifecycle V1); stored terms keep their ids in it. It
+                // dictionary (dictionary lifecycle V1); stored terms keep their ids in it. Each
+                // is inserted as it is read, its terms and pending growth charged first. It
                 // takes no writer slot, so commits go on meanwhile. The graph holds no stored
                 // statement (SYN-58). One budget for the request, so its pending snapshot is
                 // made once for every check (`pending_snapshot_within`'s memo).
@@ -437,16 +438,17 @@ impl StoreService {
                 };
                 let graph = request_shapes_graph(tx.base(), validated.as_ref());
                 let scratch = graph.as_ref();
-                let quads = parse_graph(
+                each_graph_quad(
                     *format,
                     base_iri.as_deref(),
                     payload.as_slice(),
                     GraphName::NamedNode(scratch.into_owned()),
                     BlankNodes::Fresh,
+                    |quad| {
+                        tx.try_insert(quad)?;
+                        Ok(())
+                    },
                 )?;
-                for quad in &quads {
-                    tx.try_insert(quad.as_ref())?;
-                }
                 let (report, shapes, applicable) = validate_view(
                     &nrese_sparql::PendingRead::new(&tx, &reads),
                     tx.lookup(scratch.into()),

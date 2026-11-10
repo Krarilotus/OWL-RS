@@ -77,6 +77,12 @@ fn results_announce_rdf12_when_they_may_use_it() {
         let document = text(&graph);
         assert!(document.starts_with("VERSION \"1.2\"\n"), "{document}");
         // What was written reads back.
-        nrese_store::parse_payload(format, None, &graph.payload).expect("parses");
+        nrese_store::parse_payload(
+            format,
+            None,
+            &graph.payload,
+            &nrese_exec::Envelope::unlimited(),
+        )
+        .expect("parses");
     }
 }

@@ -807,7 +807,8 @@ fn a_cancelled_pending_read_fails_and_keeps_no_view() {
     let pending = StatementsRequest::new(vec![StatementOp::Add {
         data: RdfPayload {
             payload: format!("<{EX}z> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}C> .")
-                .into_bytes(),
+                .into_bytes()
+                .into(),
             format: GraphResultFormat::NTriples,
             base_iri: None,
         },

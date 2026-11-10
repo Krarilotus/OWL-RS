@@ -602,8 +602,13 @@ impl Builder {
             Axiom::ObjectCharacteristic(Characteristic::Symmetric, property) => {
                 self.role(*property, property.inverse(), true);
             }
+            // Read for anonymous individuals. Named ones' loops are QL's closure's
+            // (`prp-refl-*`), not RL's: under RL its profile decides (DL44).
             Axiom::ObjectCharacteristic(Characteristic::Reflexive, property) => {
                 self.tbox.reflexive.insert(property.named());
+                if self.lists {
+                    self.mark_partial();
+                }
             }
             Axiom::SubDataPropertyOf(a, b) => {
                 self.tbox.data.extend([*a, *b]);
