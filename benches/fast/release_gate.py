@@ -1859,16 +1859,22 @@ def measurement_ref(repo: str, ref: str, commit: str, remote: str | None,
     return rev
 
 
-def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
-    """The measurement commits of these sides as a job's git inputs: a job's checkout holds only
-    its own revision's history, and release-gate.sh build needs them in it."""
+def measurement_inputs(checkout: str, rev: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
+    """The measurement commits of these sides that a job's checkout of `rev` doesn't reach, as its
+    git inputs: the checkout holds only `rev`'s history, and release-gate.sh build needs them in it.
+    One that `rev` reaches is staged with it already (and the fleet takes one git input, F150)."""
     import subprocess
     sides = measurement_sides() if sides is None else sides
     inputs = []
-    for rev in dict.fromkeys(revs):
-        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{rev}^{{commit}}"],
+    for side in dict.fromkeys(revs):
+        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{side}^{{commit}}"],
                               capture_output=True, text=True, timeout=60).stdout.strip()
-        if full in sides:
+        if full not in sides:
+            continue
+        # As stored: a replace ref or graft here would reach it only in this repository.
+        reached = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", sides[full], rev],
+                                 capture_output=True, text=True, timeout=60, env={**os.environ, **STORED_OBJECTS})
+        if reached.returncode != 0:  # not reached, or not known here: kept, for the build to find or report
             inputs.append({"name": f"measure-{full[:8]}", "source": {"git": checkout, "rev": sides[full]}})
     return inputs
 
@@ -1896,7 +1902,7 @@ def side_inputs(checkout: str, rev: str, revs: list[str]) -> list[dict]:
     commits (measurement_inputs()), and each side that `rev`'s history doesn't hold, so that its
     build finds it (Sol r1 S4, 2 Nov 2026: a base off the change's history was built unstaged)."""
     import subprocess
-    inputs = measurement_inputs(checkout, revs)
+    inputs = measurement_inputs(checkout, rev, revs)
     for side in dict.fromkeys(revs):
         held = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", side, rev],
                               capture_output=True, text=True, timeout=60)
