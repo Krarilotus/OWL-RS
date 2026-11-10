@@ -392,6 +392,32 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
     assert_eq!(totals, expected);
 }
 
+/// A walk that fits its budget is answered, however its parts start: two parallel parts of
+/// one group each, whose merge appends that one group, need a few hundred bytes, and under
+/// 32 KiB they are answered with the group's whole count. The room a part asks for ahead is
+/// optional (D16-039, package review r1 SC-R1-01): none of it may refuse the merge.
+#[test]
+fn a_walk_in_parts_that_fits_its_budget_is_answered() {
+    let rows = 2 * super::GROUP_PART as u64;
+    let quads: Vec<EncodedQuad> = (0..rows)
+        .map(|i| EncodedQuad::new(term(1000), term(1), term(10_000 + i), graph(0)))
+        .collect();
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(term(1)),
+        object: None,
+        graph: GraphSelector::Any,
+    };
+    let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    let budget = nrese_exec::Budget::new(32 << 10);
+    let mut counts = ChargedVec::new(&budget);
+    version
+        .group_counts(&plan, 1, &mut counts, &budget)
+        .expect("one group fits 32 KiB");
+    assert_eq!(&counts[..], &[(term(1000).raw(), rows as i64)]);
+}
+
 /// Every layout keeps the permutation each pattern shape's access plan reads, the pattern's
 /// bound components a prefix of it: an equality expansion merges its matches in that order
 /// as it reads them, collecting none (`Snapshot::expanded`).
