@@ -65,8 +65,9 @@ pub use equality::Classes as EqualityClasses;
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Admission, Count, CountedSnapshot, HeavyGroups, InferredMask, InferredSubset, OwnState,
-    ProbeCursor, SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextScope,
+    Admission, Count, CountedSnapshot, GroupCounts, HeavyGroups, InferredMask, InferredSubset,
+    OwnState, ProbeCursor, ScanColumns, SearchRefused, Seek, SharedState, Snapshot,
+    SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 pub use writer::{CommitNote, Finished, NoteError, WriterHeld};
