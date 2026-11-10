@@ -795,7 +795,10 @@ impl Inner {
                 // (a primary's log may step back) bounds what came before too.
                 committed_micros: crate::durability::later(current.committed_micros, committed),
                 dictionary_len,
-                equality: match changes_equality {
+                // While expansion is disabled no predicate is tracked. A published
+                // version must not inherit a cell an older snapshot may still fill.
+                // Pending views instead keep their base's frozen equality mode.
+                equality: match changes_equality || shared.equality.read().is_none() {
                     true => Default::default(),
                     false => std::sync::Arc::clone(&current.equality),
                 },

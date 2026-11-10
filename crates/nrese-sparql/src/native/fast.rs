@@ -306,7 +306,11 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
         Expression::Bound(v) => Fast::Bound(v.clone()),
         Expression::Equal(a, b) | Expression::SameTerm(a, b) => {
             let iri = |x: &Expression| match x {
-                Expression::NamedNode(n) => Some(n.clone()),
+                Expression::NamedNode(n)
+                    if !nrese_sparql_syntax::internal::is_constant(n.as_str()) =>
+                {
+                    Some(n.clone())
+                }
                 _ => None,
             };
             let same_iri = match (variable(a), iri(b), variable(b), iri(a)) {

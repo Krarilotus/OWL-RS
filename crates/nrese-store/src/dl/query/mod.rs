@@ -266,6 +266,16 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
 /// onto it by both entry points ([`plan_status`], [`answer`]): each only lowers what the
 /// status asserts, so no earlier return can claim more than they allow.
 fn certify(completeness: &mut Completeness, analysis: &Analysis) {
+    if let Some(op) = analysis.not_monotone
+        && !completeness.complete
+    {
+        completeness.unsound(
+            "dl",
+            format!(
+                "the query uses {op} over an uncertified lower bound: answers may not be certain"
+            ),
+        );
+    }
     if let Some((why, sound)) = reflexive_same_as(analysis) {
         if sound {
             completeness.incomplete("dl", why);
