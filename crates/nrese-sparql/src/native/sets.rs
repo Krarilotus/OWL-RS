@@ -41,7 +41,7 @@
 //! results (`GROUP_CONCAT`, `SAMPLE`, the first of equal `MIN`/`MAX`) come out as they do
 //! from the full join.
 
-use nrese_exec::{IdTable, UNDEF, group::group_rows};
+use nrese_exec::{IdTable, Reservation, UNDEF};
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
@@ -49,9 +49,10 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::term::TriplePattern;
 
 use super::{
-    Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
-    pushdown, triple_variables,
+    Context, NativeResult, Solutions, as_path, bound_variables, expression_variables, pushdown,
+    triple_variables,
 };
+use crate::QueryEvaluationError;
 
 /// The variables each aggregate reads, if none of the aggregates counts duplicate rows.
 pub(super) fn insensitive_arguments(
@@ -110,7 +111,7 @@ pub(super) fn shares(a: &[Variable], b: &[Variable]) -> bool {
 /// The group a row belongs to, as a column next to the row's values. No variable of a
 /// query can have this name.
 fn group_column() -> Variable {
-    Variable::new_unchecked("group of the row")
+    nrese_sparql_syntax::internal::variable("group", "of the row")
 }
 
 impl Context<'_> {
@@ -202,7 +203,10 @@ impl Context<'_> {
                         }
                     });
                 }
-                joined.unwrap_or_else(Solutions::unit)
+                match joined {
+                    Some(joined) => joined,
+                    None => self.unit()?,
+                }
             }
             GraphPattern::LeftJoin {
                 left,
@@ -317,9 +321,11 @@ impl Context<'_> {
                 continue;
             }
             let start = std::time::Instant::now();
-            let Some(groups) =
-                self.snapshot
-                    .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
+            let Some(groups) = self
+                .snapshot
+                .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             else {
                 continue;
             };
@@ -330,13 +336,16 @@ impl Context<'_> {
                 self.note("group walk", detail, estimate, groups.len(), start);
             }
             // The column at once: a row at a time cost as much as the walk (DBpedia q13,
-            // 363 k subjects).
-            let table =
-                IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
-            let values = self.produced(Solutions {
-                vars: vec![(*kept).clone()],
-                table: table.assume_sorted_by(vec![0]),
-                ordered: false,
+            // 363 k subjects). Charged before it is made: one id a group.
+            let column_bytes = groups.len().saturating_mul(size_of::<u64>());
+            let values = self.made(column_bytes, || {
+                let table =
+                    IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
+                Ok(Solutions {
+                    vars: vec![(*kept).clone()],
+                    table: table.assume_sorted_by(vec![0]),
+                    ordered: false,
+                })
             })?;
             let rest: Vec<TriplePattern> = patterns
                 .iter()
@@ -472,16 +481,7 @@ impl Context<'_> {
         }
 
         // The groups, from the core.
-        let key_columns: Vec<Vec<u64>> = variables
-            .iter()
-            .map(|v| match core.column(v) {
-                Some(column) => core.table.column(column).to_vec(),
-                None => vec![UNDEF; core.table.len()],
-            })
-            .collect();
-        let key_table = IdTable::from_columns(key_columns);
-        let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>())
-            .map_err(crate::QueryEvaluationError::from)?;
+        let (groups, positions) = super::aggregate::groups_of(&core, variables)?;
         let group_count = groups.len();
         let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
             let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
@@ -491,26 +491,20 @@ impl Context<'_> {
             members
         };
         // Aggregates in the caller's order; each column is filled by the part that
-        // computes it.
+        // computes it, charged before (to `held`), however many the query names.
+        let mut held = Reservation::new(&*self.budget);
+        // Declared after `held`: dropped before it.
         let mut values: Vec<Option<Vec<u64>>> = vec![None; aggregates.len()];
         let compute = |solutions: &Solutions,
                        members: &[Vec<usize>],
                        selected: &[usize],
+                       held: &mut Reservation<&nrese_exec::Budget>,
                        values: &mut Vec<Option<Vec<u64>>>|
          -> NativeResult<()> {
-            let chosen: Vec<(Variable, AggregateExpression)> =
-                selected.iter().map(|&a| aggregates[a].clone()).collect();
-            let computed = self.aggregate_groups(solutions, members, &chosen)?;
-            for (position, &a) in selected.iter().enumerate() {
-                values[a] = Some(
-                    computed
-                        .iter()
-                        .map(|group| match &group[position] {
-                            Agg::Id(id) => *id,
-                            Agg::Term(term) => self.id(term),
-                        })
-                        .collect(),
-                );
+            for &a in selected {
+                held.charge(group_count.saturating_mul(8))
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                values[a] = Some(self.aggregate_column(solutions, members, &aggregates[a])?);
             }
             Ok(())
         };
@@ -519,7 +513,7 @@ impl Context<'_> {
             .collect();
         let members = members_of(&mut groups.group_of.iter().map(|&g| g as usize));
         let start = std::time::Instant::now();
-        compute(&core, &members, &core_aggregates, &mut values)?;
+        compute(&core, &members, &core_aggregates, &mut held, &mut values)?;
         if self.trace.is_some() {
             let detail = format!("{} aggregate(s) of the core", core_aggregates.len());
             // At most a group per row of the core (`estimate`'s rule for GROUP BY).
@@ -531,17 +525,21 @@ impl Context<'_> {
         let mut keep = vec![true; group_count];
         if let Some(having) = having {
             let mut vars = variables.to_vec();
-            let mut columns = groups.keys.clone().into_columns();
-            for &a in &core_aggregates {
-                vars.push(aggregates[a].0.clone());
-                columns.push(values[a].clone().unwrap_or_default());
-            }
-            if !columns.is_empty() {
-                let known = Solutions {
-                    vars,
-                    table: IdTable::from_columns(columns),
-                    ordered: false,
-                };
+            vars.extend(core_aggregates.iter().map(|&a| aggregates[a].0.clone()));
+            if !vars.is_empty() {
+                // What HAVING reads, a column per key and core aggregate, charged first.
+                let bytes = group_count.saturating_mul(8).saturating_mul(vars.len());
+                let known = self.made(bytes, || {
+                    let mut columns = super::aggregate::key_columns(&groups, &positions, None);
+                    for &a in &core_aggregates {
+                        columns.push(values[a].clone().unwrap_or_default());
+                    }
+                    Ok(Solutions {
+                        vars,
+                        table: IdTable::from_columns(columns),
+                        ordered: false,
+                    })
+                })?;
                 let mut conjuncts = Vec::new();
                 pushdown::conjuncts_of(having, &mut conjuncts);
                 for conjunct in conjuncts {
@@ -553,6 +551,7 @@ impl Context<'_> {
                             .for_each(|(keep, pass)| *keep &= pass);
                     }
                 }
+                self.consumed(known);
             }
         }
 
@@ -663,7 +662,7 @@ impl Context<'_> {
                 self.note("optional", detail, estimate, joined.table.len(), start);
             }
             let start = std::time::Instant::now();
-            compute(&joined, &members, &selected, &mut values)?;
+            compute(&joined, &members, &selected, &mut held, &mut values)?;
             if self.trace.is_some() {
                 let detail = format!("{} aggregate(s) of the detached OPTIONAL", selected.len());
                 let estimate = Some(kept_groups as u64);
@@ -675,25 +674,28 @@ impl Context<'_> {
         // Detached OPTIONALs without aggregates contribute nothing. The kept groups, with
         // the aggregates in the caller's order.
         let kept: Vec<usize> = (0..group_count).filter(|&g| keep[g]).collect();
-        let mut columns: Vec<Vec<u64>> = groups
-            .keys
-            .columns()
-            .iter()
-            .map(|column| kept.iter().map(|&g| column[g]).collect())
-            .collect();
         let mut vars = variables.to_vec();
-        for (a, (target, _)) in aggregates.iter().enumerate() {
-            let column = values[a].take().unwrap_or_else(|| vec![UNDEF; group_count]);
-            columns.push(kept.iter().map(|&g| column[g]).collect());
-            vars.push(target.clone());
-        }
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        // The kept groups' table, a column per key and aggregate, charged before it is made.
+        let bytes = kept.len().saturating_mul(8).saturating_mul(vars.len());
+        let grouped = self.made(bytes, || {
+            let mut columns = super::aggregate::key_columns(&groups, &positions, Some(&kept));
+            for column in &values {
+                columns.push(match column {
+                    Some(column) => kept.iter().map(|&g| column[g]).collect(),
+                    None => vec![UNDEF; kept.len()],
+                });
+            }
+            Ok(Solutions {
+                vars,
+                table: IdTable::from_columns(columns),
+                ordered: false,
+            })
+        });
+        drop(values);
+        drop(held);
         self.consumed(core);
-        self.produced(Solutions {
-            vars,
-            table: IdTable::from_columns(columns),
-            ordered: false,
-        })
-        .map(Some)
+        grouped.map(Some)
     }
 }
 

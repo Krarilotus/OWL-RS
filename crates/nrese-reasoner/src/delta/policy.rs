@@ -23,6 +23,7 @@
 use hashbrown::HashSet;
 
 use super::Base;
+use crate::eval::{Poller, Stopped};
 use crate::ir::Triple;
 
 /// The plan an update took.
@@ -103,7 +104,10 @@ fn equality_region<B: Base + ?Sized>(
     base: &B,
     same_as: u64,
     equalities: impl Iterator<Item = Triple>,
-) -> Option<(HashSet<u64>, u64, u64)> {
+    poll: &Poller<'_>,
+) -> Result<Option<(HashSet<u64>, u64, u64)>, Stopped> {
+    // Its first stopped read ends the walk (fix check r1, rule 2: a stopped scan read as no
+    // more members kept the queue going).
     let mut terms: HashSet<u64> = HashSet::new();
     let (mut facts, mut dred) = (0u64, 0u64);
     for [a, _, b] in equalities {
@@ -119,13 +123,13 @@ fn equality_region<B: Base + ?Sized>(
                 [Some(x), Some(same_as), None],
                 [None, Some(same_as), Some(x)],
             ] {
-                base.scan(pattern, &mut |t| {
+                base.scan(pattern, poll, &mut |t| {
                     for y in [t[0], t[2]] {
                         if members.insert(y) {
                             queue.push(y);
                         }
                     }
-                });
+                })?;
             }
         }
         // Estimates saturate (a count over expanded equality past `u64` reads as its
@@ -137,7 +141,7 @@ fn equality_region<B: Base + ?Sized>(
                 [None, Some(m), None],
                 [None, None, Some(m)],
             ] {
-                class_facts = class_facts.saturating_add(base.estimate(pattern) as u64);
+                class_facts = class_facts.saturating_add(base.estimate(pattern, poll)? as u64);
             }
         }
         facts = facts.saturating_add(class_facts);
@@ -148,36 +152,38 @@ fn equality_region<B: Base + ?Sized>(
         );
         terms.extend(members);
     }
-    (!terms.is_empty()).then_some((terms, facts, dred))
+    Ok((!terms.is_empty()).then_some((terms, facts, dred)))
 }
 
 /// The decision for an update whose overdeletion meets `equalities` (deleted or about to
-/// be overdeleted), under `policy`.
+/// be overdeleted), under `policy`, reading on `poll`: [`Stopped`] where its reads were
+/// stopped.
 pub(super) fn plan_for_equalities<B: Base + ?Sized>(
     base: &B,
     same_as: u64,
     equalities: impl Iterator<Item = Triple>,
     policy: Policy,
     counts: &mut Counts,
-) -> Decision {
+    poll: &Poller<'_>,
+) -> Result<Decision, Stopped> {
     let mut equalities = equalities.peekable();
     if equalities.peek().is_none() {
-        return Decision::Keep;
+        return Ok(Decision::Keep);
     }
     counts.rebuild_estimate = policy.rebuild.unwrap_or(0);
     let may_rebuild = matches!(policy.force, None | Some(Plan::Rebuild));
     if may_rebuild && policy.split_rebuilds && policy.rebuild.is_some() {
         // Any delta plan ends in the rebuild: no estimate (over the expanded view, the
         // class's walk was 52 of a 500-member split's 115 ms).
-        return Decision::Rebuild;
+        return Ok(Decision::Rebuild);
     }
-    let Some((terms, facts, dred)) = equality_region(base, same_as, equalities) else {
-        return Decision::Keep;
+    let Some((terms, facts, dred)) = equality_region(base, same_as, equalities, poll)? else {
+        return Ok(Decision::Keep);
     };
     let recompute = RECOMPUTE_PER_FACT.saturating_mul(facts);
     counts.dred_estimate = counts.dred_estimate.saturating_add(dred);
     counts.recompute_estimate = counts.recompute_estimate.saturating_add(recompute);
-    match policy.force {
+    Ok(match policy.force {
         Some(Plan::Dred) => Decision::Keep,
         Some(Plan::Recompute) => Decision::Recompute(terms),
         None | Some(Plan::Rebuild) => {
@@ -191,5 +197,5 @@ pub(super) fn plan_for_equalities<B: Base + ?Sized>(
                 Decision::Keep
             }
         }
-    }
+    })
 }

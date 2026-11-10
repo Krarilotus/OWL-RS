@@ -16,7 +16,10 @@ mod rewrite;
 #[cfg(test)]
 mod tests;
 
-pub use rewrite::{eager_aggregation, eager_aggregation_where, rewrite};
+pub use rewrite::{
+    eager_aggregation, eager_aggregation_changes_at, eager_aggregation_where, rewrite,
+    rewrite_changes_at,
+};
 
 #[cfg(test)]
 thread_local! { pub(crate) static LOWERED_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

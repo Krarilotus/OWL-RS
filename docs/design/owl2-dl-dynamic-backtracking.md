@@ -174,6 +174,27 @@ Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
   for the rest of the run (`restarts` in the telemetry). Checkpoints also keep the
   retraction queues, which a backtrack restores as they were. Without the fallback (the
   rollback backend, step 3) no restart would be needed.
+- **A frame that leaves the stack undecided reopens its disjunction.** That covers an
+  exhausted frame popped by a backtrack, a dependent frame retracted with its culprit, and
+  an exhausted culprit. A re-decided frame keeps its disjunction's old place in the pending
+  list, behind the scan position it saved, so neither the scan nor the retraction's window
+  (which binds touched nodes) is sure to find it again. On fuzz seed 700160, case 144, a
+  re-decided frame was popped exhausted, the retraction below it reopened other
+  disjunctions, and the search found a model without that one (D16-058). Each frame records
+  the pending disjunction it decides, and `check_retraction` checks at a model's end that
+  no live pending disjunction is left undecided.
+- **A re-decided frame takes its whole state from the checkpoint,** the retraction queues
+  included, by struct update: only the decision (alternatives, premise, failures, the next
+  alternative) comes from its first opening. With the queues of its first opening, a
+  truncation to it lost the disjunctions its own retraction had reopened (fuzz seed
+  710126, case 7, found by the model-end check).
+- **The reopening window reaches down to the lowest disjunction ever taken from the
+  reopen list.** A disjunction a killed fact satisfied was looked at after the fact's level
+  opened: by the scan, at or after that level's saved cursor, or taken from `reopen`, at
+  any index below it. A reopened disjunction passed over as satisfied by a newer choice
+  sat below that choice's window, and retracting the choice left it undecided: a wrong
+  answer (review D16-058 r1, a hand-made case). `Engine::reopened_low` is the run's lowest
+  reopened index, and a retraction's window starts at the smaller of the two.
 
 **Measured** (662 to 664, lab profile):
 - Truncating backjumps fall to 0 and rebuilt levels to 0. Branch points fall from millions

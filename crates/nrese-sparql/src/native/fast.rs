@@ -178,8 +178,8 @@ pub(crate) fn same_term(a: Id, b: Id, snapshot: &Snapshot) -> Tri {
 pub(crate) fn compile_term(expr: &Expression, snapshot: &Snapshot) -> Option<IdTerm> {
     Some(match expr {
         Expression::Variable(v) => IdTerm::Var(v.clone()),
-        // An alias stands for a blank node of the query (`substitute`): the context knows it.
-        Expression::NamedNode(n) if n.as_str().starts_with(super::substitute::ALIAS) => {
+        // A made constant stands for a term put in (`substitute`): the context knows it.
+        Expression::NamedNode(n) if nrese_sparql_syntax::internal::is_constant(n.as_str()) => {
             return None;
         }
         Expression::NamedNode(n) => IdTerm::Const(
@@ -391,13 +391,13 @@ impl Fast {
             Err(undecided) => undecided,
         };
         let language = |id: TermId, test: &dyn Fn(&str) -> bool| match id.kind() {
-            TermKind::Iri | TermKind::BlankNode => Tri::Error,
             TermKind::LangString => match view(id) {
                 Some(TermView::LangString { language, .. }) => Tri::of(test(language)),
                 _ => Tri::Unknown,
             },
             // Any other literal has the empty language tag.
-            _ => Tri::of(test("")),
+            kind if kind.is_literal() => Tri::of(test("")),
+            _ => Tri::Error,
         };
         match self {
             Self::And(a, b) => match (a.eval(value, view, snapshot), b.eval(value, view, snapshot))
@@ -423,12 +423,7 @@ impl Fast {
             Self::Bound(v) => Tri::of(value(v) != UNDEF),
             Self::IsIri(v) => on_kind(v, &|k| k == TermKind::Iri),
             Self::IsBlank(v) => on_kind(v, &|k| k == TermKind::BlankNode),
-            Self::IsLiteral(v) => on_kind(v, &|k| {
-                !matches!(
-                    k,
-                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-                )
-            }),
+            Self::IsLiteral(v) => on_kind(v, &TermKind::is_literal),
             Self::SameIri(v, iri) => match stored(v) {
                 Ok(id) => Tri::of(Some(id.raw()) == *iri),
                 Err(undecided) => undecided,

@@ -173,6 +173,36 @@ impl Default for Settings {
     }
 }
 
+/// A change of some settings: the fields given; the others stay as they are when the
+/// change applies (not as a requester read them: two changes at once keep each other).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsPatch {
+    pub enforced: Option<bool>,
+    pub fallback: Option<Fallback>,
+    pub inferred: Option<Inferred>,
+    pub users_create_workspaces: Option<bool>,
+    pub min_password_length: Option<u32>,
+    pub session_hours: Option<u32>,
+}
+
+impl SettingsPatch {
+    /// `settings` with this patch's fields.
+    fn applied_to(&self, settings: &Settings) -> Settings {
+        Settings {
+            enforced: self.enforced.unwrap_or(settings.enforced),
+            fallback: self.fallback.unwrap_or(settings.fallback),
+            inferred: self.inferred.unwrap_or(settings.inferred),
+            users_create_workspaces: self
+                .users_create_workspaces
+                .unwrap_or(settings.users_create_workspaces),
+            min_password_length: self
+                .min_password_length
+                .unwrap_or(settings.min_password_length),
+            session_hours: self.session_hours.unwrap_or(settings.session_hours),
+        }
+    }
+}
+
 /// A user the state records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct User {
@@ -181,11 +211,25 @@ pub struct User {
     pub roles: BTreeSet<String>,
     /// The PHC string of its local login's password, if it has one.
     pub password_hash: Option<String>,
+    /// The change that created this record; `None` for one from before ids, a continuing
+    /// identity. A record isn't evidence of a person by its password (package review R1-D1):
+    /// this tells a new record from a continuing one.
+    pub created: Option<u64>,
+    /// The change that created this record, if a new person could be starting then: it was
+    /// created with a local login, or its name had one before (the access history). Its
+    /// personal space's prefix carries it ([`AccessState::prefix`]); nothing later changes
+    /// it. `None` for a user from before ids, or a name its credentials give (a token's
+    /// subject), which keeps its space.
+    pub id: Option<u64>,
 }
 
 /// A workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Workspace {
+    /// The change that created it: its prefix carries it, so a workspace removed and
+    /// created again under its name starts empty ([`AccessState::prefix`]). `None` for one
+    /// from before ids, which keeps its prefix.
+    pub id: Option<u64>,
     pub title: Option<String>,
     /// The repository it is in; `None`: every repository.
     pub repository: Option<String>,
@@ -268,7 +312,8 @@ impl AccessView {
 /// A change of the state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Settings(Settings),
+    /// Changes the settings the patch gives, in the state it applies to.
+    Settings(SettingsPatch),
     PutRole(RoleRule),
     RemoveRole(String),
     /// Creates or updates a user; fields left `None` keep their value. `password_hash`:
@@ -333,6 +378,15 @@ impl std::error::Error for AccessError {}
 /// The personal space's workspace name of `user`.
 pub fn personal_space(user: &str) -> String {
     format!("~{user}")
+}
+
+/// What names one incarnation of a space, in its graph prefix and its saved queries'
+/// IRIs: `name`, and `~{id}` after it when it has an id (SYN-64).
+fn space_key(name: &str, id: Option<u64>) -> String {
+    match id {
+        Some(id) => format!("{name}~{id}"),
+        None => name.to_owned(),
+    }
 }
 
 /// Whether `name` can name a user: letters, digits and `. _ @ + | : -`, at most 128.
@@ -437,11 +491,50 @@ impl AccessState {
     }
 
     /// The graph IRI prefix of workspace `name`: `{base}space/{user}/` for a personal
-    /// space, `{base}workspace/{name}/` for the others.
+    /// space, `{base}workspace/{name}/` for the others; with `~{id}` after the name for a
+    /// space with an id ([`Self::space_id`]), so that no two incarnations of a name share
+    /// graphs (SYN-64). Names hold no `~`: the prefixes of incarnations are disjoint.
     pub fn prefix(&self, name: &str) -> String {
+        let (kind, bare) = match name.strip_prefix('~') {
+            Some(user) => ("space", user),
+            None => ("workspace", name),
+        };
+        format!(
+            "{}{kind}/{}/",
+            self.base,
+            space_key(&encode_name(bare), self.space_id(name))
+        )
+    }
+
+    /// The id of space `name`'s current incarnation: its workspace's, or for a personal
+    /// space its user's. `None` for one from before ids, or without a record.
+    pub fn space_id(&self, name: &str) -> Option<u64> {
         match name.strip_prefix('~') {
-            Some(user) => format!("{}space/{}/", self.base, encode_name(user)),
-            None => format!("{}workspace/{}/", self.base, encode_name(name)),
+            Some(user) => self.users.get(user).and_then(|user| user.id),
+            None => self.workspaces.get(name).and_then(|workspace| workspace.id),
+        }
+    }
+
+    /// Names what the change numbered `number` (which made this state from `before`; one
+    /// change creates one record at most) creates: each workspace this state has and `before`
+    /// hadn't gets the id `number`; each user it has and `before` hadn't gets `created`, and
+    /// the id `number` too if a new person can be starting: it is created with a local login,
+    /// or its name is in `local_past` (it had one before: R1-D1). Nothing else ever sets or
+    /// changes an id, so a password added or removed later moves no one's space (R2-L1).
+    fn identify_new(&mut self, before: &AccessState, number: u64, local_past: &BTreeSet<String>) {
+        // A personal space's record (its sharing) takes its user's id.
+        for (name, workspace) in &mut self.workspaces {
+            if !name.starts_with('~') && !before.workspaces.contains_key(name) {
+                workspace.id = Some(number);
+            }
+        }
+        for (name, user) in &mut self.users {
+            if !before.users.contains_key(name) {
+                user.created = Some(number);
+                if user.password_hash.is_some() || local_past.contains(name) {
+                    user.id = Some(number);
+                }
+            }
         }
     }
 
@@ -635,8 +728,9 @@ impl AccessState {
             }
         };
         match change {
-            Change::Settings(settings) => {
+            Change::Settings(patch) => {
                 only_admins("change the access settings")?;
+                let settings = patch.applied_to(&self.settings);
                 if settings.session_hours == 0 {
                     return Err(AccessError::Invalid(
                         "sessions must last an hour at least".to_owned(),

@@ -370,3 +370,229 @@ fn a_view_stopped_unread_fails_as_memory_unreadable() {
         crate::StoreError::ProcessMemoryLimit { .. }
     ));
 }
+
+/// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): the closure after a
+/// change counts the removed facts its scan passes over (sweep M13), not only those it
+/// delivers. Over three poll intervals of removed facts, none matching, a poller whose stop
+/// has fired polls within the scan and is stopped by it; uncounted, it would never poll.
+#[test]
+fn the_closure_after_a_change_counts_the_removed_facts_it_passes_over() {
+    let n = 3 * u64::from(nrese_exec::POLL_UNITS);
+    let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    let snapshot = store.engine().snapshot();
+    let removed: Vec<Triple> = (0..n).map(|i| [i, 5, i]).collect();
+    let after = After {
+        snapshot: snapshot.counted(),
+        removed: &removed,
+    };
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    let stop = || fired.load(std::sync::atomic::Ordering::Relaxed);
+    let poll = Poller::new(&stop).expect("not stopped yet");
+    fired.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut delivered = 0;
+    let scanned = nrese_reasoner::eval::Source::scan(
+        &after,
+        [None, Some(6), None],
+        Seg::All,
+        &poll,
+        &mut |_| delivered += 1,
+    );
+    assert!(scanned.is_err(), "a scan its poller stopped says so");
+    assert_eq!(delivered, 0, "no removed fact matches");
+    assert!(
+        poll.stopped(),
+        "{n} removed facts passed over without the poller polling"
+    );
+}
+
+/// REAS-2 review r1 F1: the closure after a change estimates its matches (the update's job
+/// planning) by reading the removed facts, each counted as it is read: 8 × `POLL_UNITS` of
+/// them ask the stop at least once every `POLL_UNITS` plus one run (the longest run counted
+/// at once, `POLL_UNITS`). Counted all at once, the whole list was one ask.
+#[test]
+fn the_closure_after_a_change_estimates_within_a_run_of_the_stop() {
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let n = 8 * interval as u64;
+    let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    let snapshot = store.engine().snapshot();
+    let removed: Vec<Triple> = (0..n).map(|i| [i, 5, i]).collect();
+    let after = After {
+        snapshot: snapshot.counted(),
+        removed: &removed,
+    };
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || {
+        asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    };
+    let poll = Poller::new(&stop).expect("never stopped");
+    let estimate =
+        nrese_reasoner::eval::Source::estimate(&after, [None, Some(6), None], Seg::All, &poll)
+            .expect("never stopped");
+    assert_eq!(
+        estimate, 0,
+        "no removed fact matches, the snapshot holds none"
+    );
+    let run = interval;
+    let asks = asks.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        asks >= n as usize / (interval + run),
+        "{asks} asks of the stop for {n} removed facts read: more than {interval} plus one run \
+         of {run} read between two of them"
+    );
+}
+
+/// REAS-2 review r1 F4: a restricted reader's view is brought to a commit from the changed
+/// facts (`SupportSets::changes_since`), each counted before it is decided, and its store
+/// probes too. g16's reader, its sets computed, then a commit of 3,000 memberships of `C` in
+/// a graph it can't read: with their `x a D`, 6,000 changed facts that both versions hide,
+/// under the update's limit (a quarter of the earlier sets plus 10,000 touched facts), so
+/// the sets are updated, not recomputed; each is decided, then probed four times in the
+/// second pass. After the poller is made, the stop is asked at least once every
+/// `POLL_UNITS` plus one run of those decisions and probes. Hidden by both, a fact was
+/// decided with no count, and the second pass's probes had none.
+#[test]
+fn a_restricted_view_s_changes_are_counted_as_they_are_read() {
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let n = 3_000;
+    let store = past_the_cap();
+    // The update's pipeline sets its rules on the store (a new epoch), so it is made first,
+    // under the rules the sets are computed with.
+    let reasoner = nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::for_mode(
+        nrese_reasoner::ReasoningMode::for_ruleset(nrese_reasoner::rulesets::Ruleset::Owl2Rl),
+    ));
+    let pipeline = crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner));
+    let supports = store.supports();
+    let compilation = Compilation {
+        hide_unnamed_classes: false,
+        by_representatives: false,
+        compact: false,
+        cap: 16,
+    };
+    let working = Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: None,
+    };
+    let before = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&before).unwrap();
+    let earlier = supports
+        .compute(&before, &generation, compilation, &working)
+        .unwrap()
+        .unwrap();
+    let members: String = (0..n).map(|i| format!("<{EX}x{i}> a <{EX}C> . ")).collect();
+    pipeline
+        .execute_update(&crate::SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ GRAPH <{EX}hidden> {{ {members} }} }}"
+        )))
+        .unwrap();
+    let after = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&after).unwrap();
+    let sets = supports
+        .compute(&after, &generation, compilation, &working)
+        .unwrap()
+        .unwrap();
+    let changed = sets.since.as_ref().map_or(0, |(_, changed)| changed.len());
+    assert!(
+        changed >= n,
+        "{changed} facts changed: the sets weren't updated"
+    );
+    let access = GraphAccess {
+        graphs: vec![format!("{EX}g16")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    };
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || {
+        asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    };
+    let changes = sets
+        .changes_since(&after, &earlier, &before, &access, &working, &stop)
+        .expect("never stopped");
+    assert!(changes.is_some(), "the view is brought to the commit");
+    // Its poller's creation asks once; then each fact's decision and its four probes.
+    let asked = asks.load(std::sync::atomic::Ordering::Relaxed) - 1;
+    let (work, run) = (5 * changed, interval);
+    assert!(
+        asked >= work / (interval + run),
+        "{asked} asks of the stop for {changed} changed facts ({work} decisions and probes): more \
+         than {interval} plus one run of {run} between two of them"
+    );
+}
+
+/// REAS-2 fix check r2 (R3-F3, SW109). Spec (design note, rule 2: a stop is an error the
+/// consumer has to handle, never an answer): the re-derived facts of a snapshot, brought to it
+/// from the earlier ones through the commit's touched facts (`compute_rederived`'s fallback),
+/// end once the reading query is cancelled while their closure is asked about. The earlier
+/// re-derived facts computed, then one commit of 4 × `POLL_UNITS` memberships of `C`, then the
+/// next snapshot's, the query cancelled at the first touched fact asked about: no more than
+/// `POLL_UNITS` touched facts asked about (the poller sees the cancellation at its next ask),
+/// and the read fails as cancelled. A stopped ask read as "not in the closure", and every later
+/// touched fact was asked about and kept as removed. A run without cancellation, after it,
+/// asks about every touched fact: the fallback is the path taken.
+#[test]
+fn a_cached_rederived_fallback_ends_at_its_cancellation() {
+    use crate::witness::{self, Site};
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let n = 4 * interval;
+    let store = past_the_cap();
+    let reasoner = nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::for_mode(
+        nrese_reasoner::ReasoningMode::for_ruleset(nrese_reasoner::rulesets::Ruleset::Owl2Rl),
+    ));
+    let pipeline = crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner));
+    let supports = store.supports();
+    let compilation = Compilation {
+        hide_unnamed_classes: false,
+        by_representatives: false,
+        compact: false,
+        cap: 16,
+    };
+    let unlimited = || Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: None,
+    };
+    let before = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&before).unwrap();
+    supports
+        .compute_rederived(&before, &generation, compilation, &unlimited())
+        .unwrap();
+    let members: String = (0..n).map(|i| format!("<{EX}x{i}> a <{EX}C> . ")).collect();
+    pipeline
+        .execute_update(&crate::SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ {members} }}"
+        )))
+        .unwrap();
+    let after = store.read_snapshot(None).unwrap();
+    let (_, generation) = supports.cell_for(&after).unwrap();
+    let token = nrese_sparql::CancellationToken::new();
+    let cancelled = Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: Some(token.clone()),
+    };
+    let start = witness::get(Site::FallbackProbe);
+    witness::on_first(Site::FallbackProbe, Box::new(move || token.cancel()));
+    let stopped = supports.compute_rederived(&after, &generation, compilation, &cancelled);
+    let asked = witness::get(Site::FallbackProbe) - start;
+    let whole = {
+        let start = witness::get(Site::FallbackProbe);
+        supports
+            .compute_rederived(&after, &generation, compilation, &unlimited())
+            .unwrap();
+        witness::get(Site::FallbackProbe) - start
+    };
+    assert!(
+        whole >= n as u64,
+        "{whole} touched facts asked about uncancelled: the fallback wasn't taken"
+    );
+    assert!(
+        asked <= interval as u64 + 1,
+        "{asked} touched facts asked about once cancelled at the first, of {whole}: more than \
+         {interval} plus the one that saw it"
+    );
+    assert!(
+        matches!(stopped, Err(Unavailable::Cancelled)),
+        "a cancelled read fails as cancelled"
+    );
+}

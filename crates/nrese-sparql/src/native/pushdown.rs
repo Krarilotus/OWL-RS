@@ -37,6 +37,19 @@ use nrese_sparql_syntax::visit::Node;
 
 use super::expression_variables;
 
+/// Whether [`push_filters`] can change a pattern with this node in it: only a filter or an
+/// OPTIONAL's condition moves; every other node is rebuilt as it was.
+pub(super) fn changes_at(node: &GraphPattern) -> bool {
+    matches!(
+        node,
+        GraphPattern::Filter { .. }
+            | GraphPattern::LeftJoin {
+                expression: Some(_),
+                ..
+            }
+    )
+}
+
 /// `pattern` with its filters pushed down, in every sub-pattern.
 pub(super) fn push_filters(pattern: GraphPattern) -> GraphPattern {
     let boxed = |pattern: Box<GraphPattern>| Box::new(push_filters(*pattern));

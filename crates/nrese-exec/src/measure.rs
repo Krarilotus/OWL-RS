@@ -201,13 +201,15 @@ static STARTING: AtomicBool = AtomicBool::new(false);
 /// Panics unless [`Measured`] is the process's global allocator: without it a measurement
 /// counts nothing, and passes whatever the work holds. Asked anew each time: one byte from
 /// the global allocator, uncounted, which only a [`Measured`] that is the global allocator
-/// sees (a `Measured` of the test's own, called directly, never does).
+/// sees (a `Measured` of the test's own, called directly, never does). The block passes through
+/// `black_box`: the compiler may remove an allocation nothing uses, and in release builds it did,
+/// so the probe saw no byte and refused every measured binary.
 fn require_measured() {
     let before = UNCOUNTED.replace(Some(0));
     let layout = Layout::new::<u8>();
     // SAFETY: a layout of non-zero size; the block, if one was made, is freed with it.
     unsafe {
-        let block = std::alloc::alloc(layout);
+        let block = std::hint::black_box(std::alloc::alloc(layout));
         if !block.is_null() {
             std::alloc::dealloc(block, layout);
         }
@@ -396,7 +398,10 @@ unsafe fn handed_out(base: *mut u8, header: usize, tag: u64) -> *mut u8 {
 
 // SAFETY: every block is `A`'s, with the header added to its layout (same alignment) and
 // handed out past it; the counting touches only atomics and the slots (no allocation).
+// Never inlined: inlined, the header's reads fall outside the block LLVM takes
+// `__rust_alloc` to return, and fat LTO dropped the code around them (UCG#442).
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
+    #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some((outer, header)) = with_header(layout) else {
             return std::ptr::null_mut();
@@ -410,6 +415,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         pointer
     }
 
+    #[inline(never)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let Some((outer, header)) = with_header(layout) else {
             return std::ptr::null_mut();
@@ -423,6 +429,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         pointer
     }
 
+    #[inline(never)]
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         let (outer, header) = with_header(layout).expect("the layout it was allocated with");
         // SAFETY: a block of this allocator, allocated with `layout`.
@@ -432,9 +439,14 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         }
     }
 
+    #[inline(never)]
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let (outer, header) = with_header(layout).expect("the layout it was allocated with");
-        let Some(grown) = size.checked_add(header) else {
+        // The grown block with its header must be a layout too (`A`'s contract), as in `alloc`.
+        let Some((grown, _)) = Layout::from_size_align(size, layout.align())
+            .ok()
+            .and_then(with_header)
+        else {
             return std::ptr::null_mut();
         };
         // SAFETY: a block of this allocator, allocated with `layout`; its header moves with
@@ -443,7 +455,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
             let was = tag_of(pointer);
             let (tag, counted) = block_tag(size);
             let moved = handed_out(
-                self.0.realloc(pointer.sub(header), outer, grown),
+                self.0.realloc(pointer.sub(header), outer, grown.size()),
                 header,
                 tag,
             );
