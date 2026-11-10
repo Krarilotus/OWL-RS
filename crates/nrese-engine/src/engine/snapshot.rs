@@ -1613,8 +1613,10 @@ impl Snapshot {
     }
 
     /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
-    /// a time ([`Self::scan_columns_in`]); `None` where that can't answer.
-    pub fn scan_range_columns_in(
+    /// a time and charged to `budget` before they are ([`Self::scan_columns_in`]); `None`
+    /// where that can't answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_range_columns_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
@@ -1622,9 +1624,12 @@ impl Snapshot {
         low: TermId,
         high: TermId,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
-        let plan = self.range_plan(model, pattern, permutation, low, high)?;
-        self.columns_of_stacks(model, &plan, permutation, components)
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
+        let Some(plan) = self.range_plan(model, pattern, permutation, low, high) else {
+            return Ok(None);
+        };
+        self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
     /// Whether a statement read in `model` has a triple term (RDF 1.2): triple terms are
@@ -1697,26 +1702,61 @@ impl Snapshot {
     ///
     /// This answers `GROUP BY ?x` with `COUNT(*)` over one triple pattern without reading its
     /// matches: a walk over the groups of each run (see `IndexVersion::group_counts`).
-    pub fn group_counts_in(
+    ///
+    /// The groups are charged to `budget` as they are found, one charge a growth, before
+    /// they are allocated, and the result holds exactly their charge: a walk over many
+    /// groups can't outgrow its budget (D16-039 F7). Refused, nothing is held.
+    ///
+    /// The walk's large runs go in parallel parts only where the budget's room, read once,
+    /// covers the whole walk's peak over every included stack; otherwise every run is walked
+    /// serially. Against a budget no one else draws from during the walk, a walk is refused
+    /// only where the fully serial walk would be. A concurrent consumer can take room after
+    /// the check: the walk is then refused, typed, never answered short.
+    pub fn group_counts_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
-    ) -> Option<Vec<(TermId, u64)>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
+        self.group_counts_on(model, pattern, permutation, budget, None)
+    }
+
+    /// [`Self::group_counts_in`] on the path `in_parts` chose for the whole walk, or, where
+    /// `None`, on the path its budget's room allows.
+    fn group_counts_on<'b>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        budget: &'b nrese_exec::Budget,
+        in_parts: Option<bool>,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
-        let (plan, bound) = self.group_plan(model, &pattern, permutation)?;
-        let mut counts = Vec::new();
+        let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
+            return Ok(None);
+        };
+        let in_parts = in_parts.unwrap_or_else(|| {
+            let (keys, parts) = self.group_walk_size(model, &plan, bound);
+            crate::index::walks_in_parts(budget, keys, parts)
+        });
+        let mut counts = nrese_exec::ChargedVec::new(budget);
         let mut sources = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
                 let before = counts.len();
-                self.data(model)
-                    .stack(stack)
-                    .group_counts(&plan, bound, &mut counts);
+                self.data(model).stack(stack).group_counts_on(
+                    &plan,
+                    bound,
+                    &mut counts,
+                    budget,
+                    in_parts,
+                )?;
                 sources += usize::from(counts.len() > before);
             }
         }
-        // One run of one stack yields each value once, in order; otherwise merge.
+        let (mut counts, mut held) = counts.into_parts();
+        // One run of one stack yields each value once, in order; otherwise merge (in place).
         if sources > 1 || !counts.is_sorted_by(|a, b| a.0 < b.0) {
             counts.sort_unstable_by_key(|&(value, _)| value);
             counts.dedup_by(|later, kept| {
@@ -1727,13 +1767,28 @@ impl Snapshot {
                 same
             });
         }
-        Some(
-            counts
-                .into_iter()
-                .filter(|&(_, count)| count > 0)
-                .map(|(value, count)| (TermId::from_raw(value), count as u64))
-                .collect(),
-        )
+        // In place: the pairs keep their layout, so the collection reuses their buffer.
+        let counts: Vec<(TermId, u64)> = counts
+            .into_iter()
+            .filter(|&(_, count)| count > 0)
+            .map(|(value, count)| (TermId::from_raw(value), count as u64))
+            .collect();
+        if let Err(refused) = held.resize(counts.capacity() * size_of::<(TermId, u64)>()) {
+            drop(counts);
+            return Err(refused);
+        }
+        Ok(Some(GroupCounts { counts, held }))
+    }
+
+    /// The keys [`Self::group_counts_in`]'s walk of `plan` reads over every included stack,
+    /// and the parallel parts of its large runs: what bounds its charge
+    /// ([`crate::index::group_walk_peak`]).
+    fn group_walk_size(&self, model: ReadModel, plan: &AccessPlan, bound: usize) -> (usize, usize) {
+        Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| self.data(model).stack(stack).group_walk_size(plan, bound))
+            .fold((0, 0), |(keys, parts), (k, p)| (keys + k, parts + p))
     }
 
     /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
@@ -1854,29 +1909,37 @@ impl Snapshot {
     /// time instead of a quad at a time. `None` where that can't answer: the matches lie
     /// in several runs or a run with deletions, which must be merged quad by quad, or in
     /// both stacks with columns that can't order them ([`Self::columns_of_stacks`]); or
-    /// the plan needs a post-filter.
-    pub fn scan_columns_in(
+    /// the plan needs a post-filter. Decided before anything is charged.
+    ///
+    /// The columns are charged to `budget` before they are decoded (each stack's rows are
+    /// known from its index first), and the result holds exactly their charge: a query's
+    /// scan can't decode past its budget (D16-039 F1, F2). Refused, nothing is decoded
+    /// beyond what was charged, and the budget is as it was.
+    pub fn scan_columns_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
-            return None;
+            return Ok(None);
         }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let Some(plan) = AccessPlan::in_permutation(pattern, permutation) else {
+            return Ok(None);
+        };
         if plan.exclude_default_graph {
-            return None;
+            return Ok(None);
         }
         if Stack::ALL.into_iter().any(|stack| {
             model.includes(stack) && !self.data(model).stack(stack).layout().supports(permutation)
         }) {
-            return None;
+            return Ok(None);
         }
-        self.columns_of_stacks(model, &plan, permutation, components)
+        self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
     /// The columns `components` of the quads matching `plan` in each stack of `model`, each
@@ -1885,14 +1948,20 @@ impl Snapshot {
     /// statements of one pattern, as reasoning gives them. `None` where a stack can't be
     /// decoded so (several runs, deletions), or where both have matches and the columns
     /// can't order them: rows compare on the columns alone, so every column the plan lets
-    /// vary must be among them up to the last of them in `permutation`'s order.
-    fn columns_of_stacks(
+    /// vary must be among them up to the last of them in `permutation`'s order. Every
+    /// "can't" is decided before anything is charged.
+    ///
+    /// Charged to `budget` before anything is decoded: each stack's part (its rows are
+    /// its index range's), and where both have matches their merge too, which exists
+    /// beside them until they are freed. Then the charge of exactly the result's columns.
+    fn columns_of_stacks<'b>(
         &self,
         model: ReadModel,
         plan: &AccessPlan,
         permutation: Permutation,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
         let matching = Stack::ALL
             .map(|stack| model.includes(stack) && self.data(model).stack(stack).any_plan(plan));
         let order = permutation.order();
@@ -1903,36 +1972,65 @@ impl Snapshot {
                 .all(|position| plan.low[position] == plan.high[position] || projected(position))
         });
         if matching.iter().all(|&matches| matches) && !ordered {
-            return None;
+            return Ok(None);
         }
-        let mut parts: Vec<Vec<Vec<u64>>> = Vec::new();
+        let mut scans = Vec::with_capacity(Stack::ALL.len());
         for (stack, matches) in Stack::ALL.into_iter().zip(matching) {
             if !matches {
                 continue;
             }
-            let index = self.data(model).stack(stack);
-            let mut out = vec![Vec::new(); components.len()];
-            if !index.scan_columns(plan, components, &mut out) {
-                return None;
+            match self.data(model).stack(stack).column_scan(plan, components) {
+                Some(scan) => scans.push(scan),
+                None => return Ok(None),
             }
-            parts.push(out);
         }
-        match parts.len() {
-            0 => Some(vec![Vec::new(); components.len()]),
-            1 => parts.pop(),
+        let width = components.len();
+        let bytes = |rows: usize| rows.saturating_mul(width).saturating_mul(size_of::<u64>());
+        let rows: usize = scans
+            .iter()
+            .map(crate::index::ColumnScan::rows)
+            .fold(0, usize::saturating_add);
+        let merged = if scans.len() > 1 { bytes(rows) } else { 0 };
+        let mut held = nrese_exec::Reservation::new(budget);
+        held.charge(bytes(rows).saturating_add(merged))?;
+        // Declared after `held`: freed before their charge is released.
+        let mut parts: Vec<Vec<Vec<u64>>> = scans
+            .iter()
+            .map(|scan| {
+                let mut out = vec![Vec::new(); width];
+                scan.decode(&mut out);
+                out
+            })
+            .collect();
+        let columns = match parts.len() {
+            0 => vec![Vec::new(); width],
+            1 => parts.pop().expect("one part"),
             _ => {
                 let right = parts.pop().expect("two parts");
                 let left = parts.pop().expect("two parts");
-                Some(merge_columns(left, right, permutation, components))
+                merge_columns(left, right, permutation, components)
             }
-        }
+        };
+        held.resize(columns_bytes(&columns))?;
+        Ok(Some(ScanColumns { columns, held }))
     }
 
     /// The number of distinct terms used as subject or object in `graphs` (one graph, or
     /// every graph) in `model`: what zero-length property paths start from. Exact; kept
-    /// for this version once computed. The two walks (subjects, objects) run in parallel.
+    /// for this version once computed. The two walks (subjects, objects) run at once, each in
+    /// parallel parts, where the budget's room covers both their peaks; otherwise both
+    /// serially, one after the other ([`Self::group_counts_in`]).
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
-    pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
+    ///
+    /// The two walks' lists are charged to `budget` as they grow, before they are allocated
+    /// (D16-039 F4): the reader that counts first holds them while it counts, and the count
+    /// is kept, not the lists. Refused, nothing is kept and nothing is held.
+    pub fn node_count_in(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        budget: &nrese_exec::Budget,
+    ) -> Result<Option<u64>, nrese_exec::BudgetExceeded> {
         let pattern = self
             .read_pattern(
                 model,
@@ -1946,9 +2044,12 @@ impl Snapshot {
         if self.expanding(model, &pattern).is_some()
             || (self.canonical_data.is_some() && model != ReadModel::Asserted)
         {
-            return None;
+            return Ok(None);
         }
-        self.statistics
+        // A refusal is the caller's error, never a count kept for the version.
+        let refused = std::sync::Mutex::new(None);
+        let count = self
+            .statistics
             .node_count(&self.version, model, graphs, || {
                 let (pattern, by_subject, by_object) = match graphs {
                     GraphSelector::Exact(graph) => (
@@ -1958,17 +2059,48 @@ impl Snapshot {
                     ),
                     _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
                 };
-                let distinct = |permutation| -> Option<Vec<TermId>> {
-                    let counts = self.group_counts_in(model, &pattern, permutation)?;
-                    Some(counts.into_iter().map(|(id, _)| id).collect())
+                // The groups as the walk charged them, read in place: no list copied out.
+                let distinct = |permutation, in_parts| match self.group_counts_on(
+                    model,
+                    &pattern,
+                    permutation,
+                    budget,
+                    Some(in_parts),
+                ) {
+                    Ok(groups) => groups,
+                    Err(error) => {
+                        refused
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get_or_insert(error);
+                        None
+                    }
                 };
-                let (subjects, objects) =
-                    rayon::join(|| distinct(by_subject), || distinct(by_object));
-                let (subjects, objects) = (subjects?, objects?);
+                // One decision for both walks (package fix checks r3, r4): at once, each in
+                // parts, where the room, read once, covers both whole walks' peaks; otherwise
+                // both serially, one after the other, the reference. Against a budget no one
+                // else draws from meanwhile, a count is refused only where that would be.
+                let peak = |permutation| {
+                    let pattern = self.read_pattern(model, &pattern);
+                    self.group_plan(model, &pattern, permutation)
+                        .map_or(0, |(plan, bound)| {
+                            let (keys, parts) = self.group_walk_size(model, &plan, bound);
+                            crate::index::group_walk_peak(keys, parts)
+                        })
+                };
+                let peaks = peak(by_subject).saturating_add(peak(by_object));
+                let (subjects, objects) = if budget.remaining() >= peaks {
+                    let (subjects, objects) =
+                        rayon::join(|| distinct(by_subject, true), || distinct(by_object, true));
+                    (subjects?, objects?)
+                } else {
+                    let subjects = distinct(by_subject, false)?;
+                    (subjects, distinct(by_object, false)?)
+                };
                 // |S ∪ O| by a merge of the two sorted lists.
                 let (mut i, mut j, mut both) = (0, 0, 0u64);
                 while i < subjects.len() && j < objects.len() {
-                    match subjects[i].cmp(&objects[j]) {
+                    match subjects[i].0.cmp(&objects[j].0) {
                         std::cmp::Ordering::Less => i += 1,
                         std::cmp::Ordering::Greater => j += 1,
                         std::cmp::Ordering::Equal => {
@@ -1979,7 +2111,11 @@ impl Snapshot {
                     }
                 }
                 Some(subjects.len() as u64 + objects.len() as u64 - both)
-            })
+            });
+        match refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
     }
 
     /// The number of distinct values of the first unbound component of `pattern` in
@@ -2437,6 +2573,75 @@ impl std::error::Error for SearchRefused {
     }
 }
 
+/// The columns of a scan ([`Snapshot::scan_columns_in`]) and the charge of exactly their
+/// capacity, together: neither is dropped or handed on without the other. Dropped, the
+/// columns are freed, then their charge released; [`Self::into_parts`] hands both to a
+/// table that counts them, never released and charged again.
+#[derive(Debug)]
+pub struct ScanColumns<'b> {
+    /// Before `held`: fields drop in order, the columns first.
+    columns: Vec<Vec<u64>>,
+    held: nrese_exec::Reservation<&'b nrese_exec::Budget>,
+}
+
+impl<'b> ScanColumns<'b> {
+    pub fn columns(&self) -> &[Vec<u64>] {
+        &self.columns
+    }
+
+    /// The columns, and the charge of their capacity, for a holder that keeps it until
+    /// they are freed or hands it on with them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Vec<u64>>,
+        nrese_exec::Reservation<&'b nrese_exec::Budget>,
+    ) {
+        let Self { columns, held } = self;
+        (columns, held)
+    }
+}
+
+/// The groups of a walk ([`Snapshot::group_counts_in`]), each value with its number of
+/// matching quads in id order, and the charge of exactly their capacity, together. Dropped,
+/// the groups are freed, then their charge released.
+#[derive(Debug)]
+pub struct GroupCounts<'b> {
+    /// Before `held`: fields drop in order, the groups first.
+    counts: Vec<(TermId, u64)>,
+    held: nrese_exec::Reservation<&'b nrese_exec::Budget>,
+}
+
+impl std::ops::Deref for GroupCounts<'_> {
+    type Target = [(TermId, u64)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.counts
+    }
+}
+
+impl<'b> GroupCounts<'b> {
+    /// The groups, and the charge of their capacity, for a holder that keeps it until they
+    /// are freed or hands it on with them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(TermId, u64)>,
+        nrese_exec::Reservation<&'b nrese_exec::Budget>,
+    ) {
+        let Self { counts, held } = self;
+        (counts, held)
+    }
+}
+
+/// The bytes `columns` hold, by capacity: what a table of them counts.
+fn columns_bytes(columns: &[Vec<u64>]) -> usize {
+    columns
+        .iter()
+        .map(|column| column.capacity() * size_of::<u64>())
+        .sum()
+}
+
 /// Two column sets (`components` of quads), each sorted in `permutation`'s order, merged
 /// into one in that order: rows compared on the components by their place in the order.
 fn merge_columns(
@@ -2654,5 +2859,65 @@ mod count_visiting_tests {
              run of {interval}"
         );
         assert_eq!(counted, None, "a count its visitor stopped answers nothing");
+    }
+}
+
+#[cfg(test)]
+mod node_count_tests {
+    use super::*;
+    use nrese_rdf::NamedNode;
+
+    /// A node count is refused only where both walks, serially and one after the other, would
+    /// be (package fix check r4). Two runs of one predicate in the default graph under
+    /// 6,291,584 bytes: the first, 131,072 statements of 65,538 subjects (two parts of 32,769
+    /// disjoint groups) and two objects; the second, 131,075 fresh subjects and one of those
+    /// objects. The subject walk's first run fits its parts' peak; walked in parts, its merge
+    /// leaves the subjects' list where the second run's serial growth is refused by 16 bytes.
+    /// Serially it peaks 128 bytes under the limit, and the objects' two groups fit beside
+    /// its list. Answered, 196,615 nodes, no refusal recorded, nothing held after.
+    #[test]
+    fn a_node_count_the_serial_walks_fit_is_answered() {
+        let part = crate::index::GROUP_PART as u64;
+        let ex = |local: String| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        // The runs kept apart: no window ever merges, and nothing is held inline.
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        // Interned in order, so the ids order the subjects as their numbers do.
+        let (first, second, p, objects) = {
+            let id = |local: String| tx.intern(ex(local).as_ref().into());
+            let first: Vec<TermId> = (0..65_538).map(|j| id(format!("s{j}"))).collect();
+            let second: Vec<TermId> = (0..2 * part + 3).map(|i| id(format!("t{i}"))).collect();
+            (
+                first,
+                second,
+                id("p".into()),
+                [id("o0".into()), id("o1".into())],
+            )
+        };
+        let statement = |s, o| EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
+        for i in 0..2 * part {
+            let subject = first[(i * 32_769 / part) as usize];
+            tx.insert_encoded(statement(subject, objects[(i % 2) as usize]));
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for &subject in &second {
+            tx.insert_encoded(statement(subject, objects[0]));
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let budget = nrese_exec::Budget::new(6_291_584);
+        let count = snapshot.node_count_in(ReadModel::Asserted, GraphSelector::Any, &budget);
+        assert_eq!(count, Ok(Some(196_615)));
+        assert!(!budget.refused(), "no refusal recorded on the budget");
+        assert_eq!(budget.used(), 0);
     }
 }
