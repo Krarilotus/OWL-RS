@@ -1909,8 +1909,9 @@ impl Snapshot {
         // Which reads the walk answers is decided before the list kept: a stored read of
         // this version keeps one under the same key.
         let (plan, bound) = self.group_plan(model, &read, permutation)?;
+        let reader = self.reads.as_ref().map(|reads| Arc::clone(&reads.budget));
         self.statistics
-            .heavy_groups(self.data(model), model, read, permutation, min, |budget| {
+            .heavy_groups(self, model, (read, permutation, min), reader, |budget| {
                 self.heavy_groups_walked(model, &plan, bound, min, budget)
             })
     }
@@ -2117,70 +2118,68 @@ impl Snapshot {
         }
         // A refusal is the caller's error, never a count kept for the version.
         let refused = std::sync::Mutex::new(None);
-        let count = self
-            .statistics
-            .node_count(&self.version, model, graphs, || {
-                let (pattern, by_subject, by_object) = match graphs {
-                    GraphSelector::Exact(graph) => (
-                        QuadPattern::in_graph(graph),
-                        Permutation::Gspo,
-                        Permutation::Gosp,
-                    ),
-                    _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
-                };
-                // The groups as the walk charged them, read in place: no list copied out.
-                let distinct = |permutation, in_parts| match self.group_counts_on(
-                    model,
-                    &pattern,
-                    permutation,
-                    budget,
-                    Some(in_parts),
-                ) {
-                    Ok(groups) => groups,
-                    Err(error) => {
-                        refused
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .get_or_insert(error);
-                        None
-                    }
-                };
-                // One decision for both walks (package fix checks r3, r4): at once, each in
-                // parts, where the room, read once, covers both whole walks' peaks; otherwise
-                // both serially, one after the other, the reference. Against a budget no one
-                // else draws from meanwhile, a count is refused only where that would be.
-                let peak = |permutation| {
-                    let pattern = self.read_pattern(model, &pattern);
-                    self.group_plan(model, &pattern, permutation)
-                        .map_or(0, |(plan, bound)| {
-                            let (keys, parts) = self.group_walk_size(model, &plan, bound);
-                            crate::index::group_walk_peak(keys, parts)
-                        })
-                };
-                let peaks = peak(by_subject).saturating_add(peak(by_object));
-                let (subjects, objects) = if budget.remaining() >= peaks {
-                    let (subjects, objects) =
-                        rayon::join(|| distinct(by_subject, true), || distinct(by_object, true));
-                    (subjects?, objects?)
-                } else {
-                    let subjects = distinct(by_subject, false)?;
-                    (subjects, distinct(by_object, false)?)
-                };
-                // |S ∪ O| by a merge of the two sorted lists.
-                let (mut i, mut j, mut both) = (0, 0, 0u64);
-                while i < subjects.len() && j < objects.len() {
-                    match subjects[i].0.cmp(&objects[j].0) {
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
-                        std::cmp::Ordering::Equal => {
-                            both += 1;
-                            i += 1;
-                            j += 1;
-                        }
+        let count = self.statistics.node_count(self, model, graphs, || {
+            let (pattern, by_subject, by_object) = match graphs {
+                GraphSelector::Exact(graph) => (
+                    QuadPattern::in_graph(graph),
+                    Permutation::Gspo,
+                    Permutation::Gosp,
+                ),
+                _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
+            };
+            // The groups as the walk charged them, read in place: no list copied out.
+            let distinct = |permutation, in_parts| match self.group_counts_on(
+                model,
+                &pattern,
+                permutation,
+                budget,
+                Some(in_parts),
+            ) {
+                Ok(groups) => groups,
+                Err(error) => {
+                    refused
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_or_insert(error);
+                    None
+                }
+            };
+            // One decision for both walks (package fix checks r3, r4): at once, each in
+            // parts, where the room, read once, covers both whole walks' peaks; otherwise
+            // both serially, one after the other, the reference. Against a budget no one
+            // else draws from meanwhile, a count is refused only where that would be.
+            let peak = |permutation| {
+                let pattern = self.read_pattern(model, &pattern);
+                self.group_plan(model, &pattern, permutation)
+                    .map_or(0, |(plan, bound)| {
+                        let (keys, parts) = self.group_walk_size(model, &plan, bound);
+                        crate::index::group_walk_peak(keys, parts)
+                    })
+            };
+            let peaks = peak(by_subject).saturating_add(peak(by_object));
+            let (subjects, objects) = if budget.remaining() >= peaks {
+                let (subjects, objects) =
+                    rayon::join(|| distinct(by_subject, true), || distinct(by_object, true));
+                (subjects?, objects?)
+            } else {
+                let subjects = distinct(by_subject, false)?;
+                (subjects, distinct(by_object, false)?)
+            };
+            // |S ∪ O| by a merge of the two sorted lists.
+            let (mut i, mut j, mut both) = (0, 0, 0u64);
+            while i < subjects.len() && j < objects.len() {
+                match subjects[i].0.cmp(&objects[j].0) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        both += 1;
+                        i += 1;
+                        j += 1;
                     }
                 }
-                Some(subjects.len() as u64 + objects.len() as u64 - both)
-            });
+            }
+            Some(subjects.len() as u64 + objects.len() as u64 - both)
+        });
         match refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
             Some(error) => Err(error),
             None => Ok(count),
