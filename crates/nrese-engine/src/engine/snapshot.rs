@@ -1699,6 +1699,12 @@ impl Snapshot {
     /// The groups are charged to `budget` as they are found, one charge a growth, before
     /// they are allocated, and the result holds exactly their charge: a walk over many
     /// groups can't outgrow its budget (D16-039 F7). Refused, nothing is held.
+    ///
+    /// The walk's large runs go in parallel parts only where the budget's room, read once,
+    /// covers the whole walk's peak over every included stack; otherwise every run is walked
+    /// serially. Against a budget no one else draws from during the walk, a walk is refused
+    /// only where the fully serial walk would be. A concurrent consumer can take room after
+    /// the check: the walk is then refused, typed, never answered short.
     pub fn group_counts_in<'b>(
         &self,
         model: ReadModel,
@@ -1706,18 +1712,39 @@ impl Snapshot {
         permutation: Permutation,
         budget: &'b nrese_exec::Budget,
     ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
+        self.group_counts_on(model, pattern, permutation, budget, None)
+    }
+
+    /// [`Self::group_counts_in`] on the path `in_parts` chose for the whole walk, or, where
+    /// `None`, on the path its budget's room allows.
+    fn group_counts_on<'b>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        budget: &'b nrese_exec::Budget,
+        in_parts: Option<bool>,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
         let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
             return Ok(None);
         };
+        let in_parts = in_parts.unwrap_or_else(|| {
+            let (keys, parts) = self.group_walk_size(model, &plan, bound);
+            crate::index::walks_in_parts(budget, keys, parts)
+        });
         let mut counts = nrese_exec::ChargedVec::new(budget);
         let mut sources = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
                 let before = counts.len();
-                self.data(model)
-                    .stack(stack)
-                    .group_counts(&plan, bound, &mut counts, budget)?;
+                self.data(model).stack(stack).group_counts_on(
+                    &plan,
+                    bound,
+                    &mut counts,
+                    budget,
+                    in_parts,
+                )?;
                 sources += usize::from(counts.len() > before);
             }
         }
@@ -1746,25 +1773,15 @@ impl Snapshot {
         Ok(Some(GroupCounts { counts, held }))
     }
 
-    /// The most bytes [`Self::group_counts_in`] of `pattern` in `permutation` charges to its
-    /// budget, whichever path its walks take ([`crate::index::group_walk_peak`] over every
-    /// included stack's keys): 0 where it can't walk them.
-    fn group_walk_peak(
-        &self,
-        model: ReadModel,
-        pattern: &QuadPattern,
-        permutation: Permutation,
-    ) -> usize {
-        let pattern = self.read_pattern(model, pattern);
-        let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
-            return 0;
-        };
-        let (keys, parts) = Stack::ALL
+    /// The keys [`Self::group_counts_in`]'s walk of `plan` reads over every included stack,
+    /// and the parallel parts of its large runs: what bounds its charge
+    /// ([`crate::index::group_walk_peak`]).
+    fn group_walk_size(&self, model: ReadModel, plan: &AccessPlan, bound: usize) -> (usize, usize) {
+        Stack::ALL
             .into_iter()
             .filter(|&stack| model.includes(stack))
-            .map(|stack| self.data(model).stack(stack).group_walk_size(&plan, bound))
-            .fold((0, 0), |(keys, parts), (k, p)| (keys + k, parts + p));
-        crate::index::group_walk_peak(keys, parts)
+            .map(|stack| self.data(model).stack(stack).group_walk_size(plan, bound))
+            .fold((0, 0), |(keys, parts), (k, p)| (keys + k, parts + p))
     }
 
     /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
@@ -1993,9 +2010,9 @@ impl Snapshot {
 
     /// The number of distinct terms used as subject or object in `graphs` (one graph, or
     /// every graph) in `model`: what zero-length property paths start from. Exact; kept
-    /// for this version once computed. The two walks (subjects, objects) run at once where the
-    /// budget's room covers both their peaks, otherwise one after the other, each in parallel
-    /// parts where its room allows ([`Self::group_counts_in`]).
+    /// for this version once computed. The two walks (subjects, objects) run at once, each in
+    /// parallel parts, where the budget's room covers both their peaks; otherwise both
+    /// serially, one after the other ([`Self::group_counts_in`]).
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
     ///
     /// The two walks' lists are charged to `budget` as they grow, before they are allocated
@@ -2036,11 +2053,12 @@ impl Snapshot {
                     _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
                 };
                 // The groups as the walk charged them, read in place: no list copied out.
-                let distinct = |permutation| match self.group_counts_in(
+                let distinct = |permutation, in_parts| match self.group_counts_on(
                     model,
                     &pattern,
                     permutation,
                     budget,
+                    Some(in_parts),
                 ) {
                     Ok(groups) => groups,
                     Err(error) => {
@@ -2051,20 +2069,26 @@ impl Snapshot {
                         None
                     }
                 };
-                // A count is refused only where the walks one after the other would be
-                // (package fix check r3). At once where the room, read once, covers both
-                // walks' worst peaks, whatever paths they take; otherwise one after the
-                // other, each walk's parts deciding against the room the other's list leaves.
-                let peaks = self
-                    .group_walk_peak(model, &pattern, by_subject)
-                    .saturating_add(self.group_walk_peak(model, &pattern, by_object));
+                // One decision for both walks (package fix checks r3, r4): at once, each in
+                // parts, where the room, read once, covers both whole walks' peaks; otherwise
+                // both serially, one after the other, the reference. Against a budget no one
+                // else draws from meanwhile, a count is refused only where that would be.
+                let peak = |permutation| {
+                    let pattern = self.read_pattern(model, &pattern);
+                    self.group_plan(model, &pattern, permutation)
+                        .map_or(0, |(plan, bound)| {
+                            let (keys, parts) = self.group_walk_size(model, &plan, bound);
+                            crate::index::group_walk_peak(keys, parts)
+                        })
+                };
+                let peaks = peak(by_subject).saturating_add(peak(by_object));
                 let (subjects, objects) = if budget.remaining() >= peaks {
                     let (subjects, objects) =
-                        rayon::join(|| distinct(by_subject), || distinct(by_object));
+                        rayon::join(|| distinct(by_subject, true), || distinct(by_object, true));
                     (subjects?, objects?)
                 } else {
-                    let subjects = distinct(by_subject)?;
-                    (subjects, distinct(by_object)?)
+                    let subjects = distinct(by_subject, false)?;
+                    (subjects, distinct(by_object, false)?)
                 };
                 // |S ∪ O| by a merge of the two sorted lists.
                 let (mut i, mut j, mut both) = (0, 0, 0u64);

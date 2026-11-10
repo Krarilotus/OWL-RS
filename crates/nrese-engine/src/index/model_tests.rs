@@ -546,20 +546,27 @@ fn a_walk_over_runs_the_serial_walk_fits_is_answered() {
     assert_eq!(budget.used(), 0);
 }
 
-/// Under an ample budget the same range is still walked in parallel parts, so the normal case
-/// keeps its speed; under 1.5 MiB (the walk above) it is walked serially.
+/// Under an ample budget the walks above still run in parallel parts, so the normal case
+/// keeps its speed; under their budgets they are walked serially, the whole walk.
 #[test]
 fn a_walk_with_room_for_its_parts_peak_runs_in_parts() {
     let keys = 2 * super::GROUP_PART;
     let ample = nrese_exec::Budget::new(64 << 20);
-    let tight = nrese_exec::Budget::new(1_572_864);
-    let empty = ChargedVec::new(&ample);
-    assert!(super::walks_in_parts(keys, 2, &empty, &ample));
-    let empty = ChargedVec::new(&tight);
-    assert!(!super::walks_in_parts(keys, 2, &empty, &tight));
+    assert!(super::walks_in_parts(&ample, keys, 2));
     assert!(
-        !super::walks_in_parts(keys - 1, 2, &empty, &ample),
-        "a range under two parts is walked serially"
+        super::walks_in_parts(&ample, 2 * keys + 3, 5),
+        "both runs in parts"
+    );
+    let tight = nrese_exec::Budget::new(1_572_864);
+    assert!(!super::walks_in_parts(&tight, keys, 2));
+    let tight = nrese_exec::Budget::new(6_291_584);
+    assert!(
+        !super::walks_in_parts(&tight, 2 * keys + 3, 5),
+        "neither run in parts"
+    );
+    assert!(
+        !super::walks_in_parts(&ample, keys - 1, 0),
+        "a walk without a run of two parts is walked serially"
     );
 }
 

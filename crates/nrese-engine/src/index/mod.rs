@@ -149,49 +149,24 @@ impl Layout {
 /// the block size.
 pub(crate) const GROUP_PART: usize = 1 << 16;
 
-/// Whether [`IndexVersion::group_counts`] walks a range of `keys` keys in `parts` parallel
-/// parts: a range large enough, and a budget whose room covers the parts' worst peak
-/// ([`parallel_peak`]), so the parallel walk can't be refused where the serial one fits.
-fn walks_in_parts(
-    keys: usize,
-    parts: usize,
-    out: &ChargedVec<(u64, i64), &Budget>,
-    budget: &Budget,
-) -> bool {
-    keys >= 2 * GROUP_PART && budget.remaining() >= parallel_peak(keys, parts, out)
-}
-
-/// The most bytes [`IndexVersion::group_counts`] charges beyond what `out` holds when it walks
-/// `keys` keys in `parts` parallel parts, bounded by the keys alone (a group has at least one):
-/// - each part of `k` keys grows by doubling (`Charged::reserve`) to at most `max(2k, 4)`
-///   groups, holding its old capacity, under `k`, beside the new while it grows: `3k + 4`;
-/// - then the merge: the parts at their final capacities (`2k + 4` each) beside `out`'s new
-///   capacity, at most `max(len + keys, 2 · capacity, 4)` groups (its old one is charged
-///   already).
-fn parallel_peak(keys: usize, parts: usize, out: &ChargedVec<(u64, i64), &Budget>) -> usize {
-    let slack = parts.saturating_mul(4);
-    let growing = keys.saturating_mul(3).saturating_add(slack);
-    let merged = (out.len().saturating_add(keys))
-        .max(out.capacity().saturating_mul(2))
-        .max(4);
-    let merging = keys
-        .saturating_mul(2)
-        .saturating_add(slack)
-        .saturating_add(merged);
-    growing.max(merging).saturating_mul(size_of::<(u64, i64)>())
-}
-
-/// The most bytes a group walk over `keys` keys charges, its runs' `parts` parallel parts
-/// included, whichever path each run takes, bounded by the keys alone (a group has at least
-/// one). Its output reaches at most `2·keys + 4` groups and grows only below `keys`, so a
-/// growth holds at most `3·keys + 4`. A run's parts hold at most `3k + 4·parts` while they
-/// grow, beside the output's capacity, and at most `2k + 4·parts` during the merge, beside
-/// the output's growth. With `k ≤ keys`, that's `5·keys + 4·parts + 4` groups at most.
+/// The most bytes a group walk over `keys` keys charges, into an output that starts without
+/// capacity, its runs walked in `parts` parallel parts in all (or serially), bounded by the
+/// keys alone: a group has at least one. Let `S` be the keys walked before a run of `k` keys
+/// in `p` parts. The output then holds at most `2S + 4` groups; the run's parts grow to at
+/// most `2k + 4p` beside it, `3k + 4p` while one reallocates. While the output reallocates,
+/// its old capacity is under `S + k`, its new one at most `2(S + k) + 4`, the finished parts
+/// at most `2k + 4p`. That is `3S + 5k + 4p + 4` groups, at most `5·keys + 4·parts + 4`.
 pub(crate) fn group_walk_peak(keys: usize, parts: usize) -> usize {
     keys.saturating_mul(5)
         .saturating_add(parts.saturating_mul(4))
         .saturating_add(4)
         .saturating_mul(size_of::<(u64, i64)>())
+}
+
+/// Whether a group walk over `keys` keys, `parts` parallel parts in its large runs, runs in
+/// parts: where it has any, and `budget`'s room covers the whole walk's peak.
+pub(crate) fn walks_in_parts(budget: &Budget, keys: usize, parts: usize) -> bool {
+    parts > 0 && budget.remaining() >= group_walk_peak(keys, parts)
 }
 
 /// [`IndexVersion::group_counts`]'s walk past its capacity, out of its hot loop: `group`
@@ -724,12 +699,36 @@ impl IndexVersion {
     /// `out` and each part walked in parallel grow charged to `budget` (`out`'s), one
     /// charge a growth, before they allocate: a reader's walk can't outgrow its budget
     /// (D16-039 F7). Refused, the walk ends with what it charged released.
+    ///
+    /// Its large runs are walked in parallel parts only where the budget's room, read once
+    /// before anything grows, covers the whole walk's peak ([`group_walk_peak`]); otherwise
+    /// every run is walked serially, the reference. So, against a budget no one else draws
+    /// from during the walk, a walk is refused only where the fully serial walk would be. A
+    /// concurrent consumer can take room after the check: the walk is then refused, typed,
+    /// never answered short.
     pub(crate) fn group_counts<'b>(
         &self,
         plan: &AccessPlan,
         position: usize,
         out: &mut ChargedVec<(u64, i64), &'b Budget>,
         budget: &'b Budget,
+    ) -> Result<(), BudgetExceeded> {
+        let (keys, parts) = self.group_walk_size(plan, position);
+        let in_parts = out.capacity() == 0 && walks_in_parts(budget, keys, parts);
+        self.group_counts_on(plan, position, out, budget, in_parts)
+    }
+
+    /// [`Self::group_counts`] on a path chosen for the whole walk: its large runs in parallel
+    /// parts (`in_parts`), or every run serially. The caller's choice keeps the guarantee
+    /// only where it is [`Self::group_counts`]'s: parts only where the room covers the peak
+    /// of every walk that may run beside this one, `out` without capacity at the start.
+    pub(crate) fn group_counts_on<'b>(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        out: &mut ChargedVec<(u64, i64), &'b Budget>,
+        budget: &'b Budget,
+        in_parts: bool,
     ) -> Result<(), BudgetExceeded> {
         let Some(adapted) = self.layout.adapt(plan) else {
             return Ok(());
@@ -766,12 +765,9 @@ impl IndexVersion {
                 });
                 refused.map_or(Ok(()), Err)
             };
-            // A walk is refused only where the serial walk would be (package fix check r3):
-            // the parts hold their doubling's spare across the merge's required room, so they
-            // run only where the budget's room covers their worst peak; else the range is
-            // walked serially, into `out`, the reference. Read once, before anything grows.
-            let parts = end.div_ceil(GROUP_PART) - start / GROUP_PART;
-            if !walks_in_parts(end - start, parts, out, budget) {
+            // The path is the whole walk's (package fix checks r3, r4): a run walked serially
+            // after a merged one would grow from the merge's capacity, not the reference's.
+            if !in_parts || end - start < 2 * GROUP_PART {
                 walk(start, end, out)?;
                 continue;
             }
@@ -781,7 +777,6 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
-            debug_assert_eq!(cuts.len() - 1, parts);
             let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
