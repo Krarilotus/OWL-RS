@@ -14,7 +14,7 @@ mod fuzz;
 mod support;
 mod w3c;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use nrese_dl::bounds::{Answer, AtomicQuery, Bounds, Origin};
 use nrese_rdf_io::RdfFormat;
@@ -272,20 +272,13 @@ fn pagoda_running_example_gives_the_papers_bound() {
 #[test]
 fn the_n3_form_gives_the_same_closure() {
     let mut e = example(KEX);
-    let text = {
-        let table = &e.table;
-        e.program.to_n3(&|t| table.text(t)).expect("no blank nodes")
-    };
-    let n3 = nrese_reasoner::n3::compile("u1", &text, &mut e.table).expect("U1 is valid N3");
-    let mut input = e.input.clone();
-    input.extend(n3.facts);
-    input.sort_unstable();
-    input.dedup();
-    assert_eq!(input, support::upper_input(&e.program, &e.input));
-    let from_n3 = support::upper_copied(&mut e.table, &n3.rules, &input);
-    let rules = support::reasoner_rules(&e.program);
-    let copied = support::upper_copied(&mut e.table, &rules, &input);
-    assert_eq!(from_n3, copied);
+    // U1's own terms have no IRI: written as they are, the text would be no N3.
+    let raw = e.program.to_n3(&|t| e.table.text(t));
+    assert!(
+        matches!(raw, Err(nrese_dl::bounds::RenderError::OwnTerm { .. })),
+        "{raw:?}"
+    );
+    let copied = assert_n3_round_trip(&mut e);
     // support::upper (what the other tests read) gives the same answers.
     let program = &e.program;
     let answers = |facts: &[Triple]| -> Vec<Triple> {
@@ -296,6 +289,85 @@ fn the_n3_form_gives_the_same_closure() {
             .collect()
     };
     assert_eq!(answers(&copied), answers(&e.upper.facts));
+}
+
+/// The export names U1's own terms apart from every input term, whatever IRIs the input
+/// holds: an individual `b` spelled as an earlier export named the Skolem constant of
+/// `A ⊑ ∃r.B` stays apart from that constant, so the text doesn't make `b` a `B`, nor
+/// derive the clash of `B` and `C`.
+#[test]
+fn the_n3_form_names_own_terms_apart_from_the_input() {
+    let text = |b: &str| {
+        format!(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :r a owl:ObjectProperty .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] .
+:B owl:disjointWith :C .
+:a a :A .
+<{b}> a :C .
+"#
+        )
+    };
+    let mut first = example(&text(&format!("{EX}b")));
+    let (a, r) = (ex(&mut first.table, "a"), ex(&mut first.table, "r"));
+    let skolem = first
+        .upper
+        .facts
+        .iter()
+        .find(|f| f[0] == a && f[1] == r && first.program.is_internal(f[2]))
+        .expect("a's r-successor is U1's constant")[2];
+    let alias = first.table.own_iris(&first.program)[&skolem].clone();
+    // The same ontology, b spelled as that name: the terms keep their ids.
+    let mut e = example(&text(&alias));
+    let b = e.table.named(&alias);
+    assert_eq!(b, ex(&mut first.table, "b"));
+    assert!(e.program.is_internal(skolem) && !e.program.is_internal(b));
+    let copied = assert_n3_round_trip(&mut e);
+    let (rdf_type, class_b) = (e.program.names.rdf_type, ex(&mut e.table, "B"));
+    assert!(!copied.contains(&[b, rdf_type, class_b]));
+}
+
+/// U1 through its Notation3 export, named as the bounds example names it
+/// ([`Table::own_iris`]), and read back as a reader of the text would: over the input's
+/// terms, so a name the input holds is that term. Only the export's names the input
+/// doesn't hold are then decoded to U1's terms. The text's facts must be U1's, and its
+/// closure U1's closure by the same engine, which this returns.
+fn assert_n3_round_trip(e: &mut Example) -> Vec<Triple> {
+    let own = e.table.own_iris(&e.program);
+    let text = {
+        let table = &e.table;
+        let term = |t| {
+            own.get(&t)
+                .map_or_else(|| table.text(t), |iri| format!("<{iri}>"))
+        };
+        e.program.to_n3(&term).expect("no blank nodes")
+    };
+    let held = e.table.terms.len() as u64;
+    let n3 = nrese_reasoner::n3::compile("u1", &text, &mut e.table).expect("U1 is valid N3");
+    let names: HashMap<u64, u64> = (own.iter())
+        .map(|(&t, iri)| (e.table.named(iri), t))
+        .filter(|&(read, _)| read >= held)
+        .collect();
+    let decode = |facts: &[Triple]| -> Vec<Triple> {
+        let mut out: Vec<Triple> = (facts.iter())
+            .map(|f| f.map(|x| names.get(&x).copied().unwrap_or(x)))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    };
+    let upper_input = support::upper_input(&e.program, &e.input);
+    let mut input = e.input.clone();
+    input.extend(n3.facts);
+    assert_eq!(decode(&input), upper_input);
+    let from_n3 = support::upper_copied(&mut e.table, &n3.rules, &input);
+    let rules = support::reasoner_rules(&e.program);
+    let copied = support::upper_copied(&mut e.table, &rules, &upper_input);
+    assert_eq!(decode(&from_n3), copied);
+    copied
 }
 
 /// `≥ n` collapsed to two constants keeps every answer and every clash of the full
