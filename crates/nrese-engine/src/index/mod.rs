@@ -35,7 +35,7 @@ use std::borrow::Cow;
 
 use keys::PackedKeys;
 use merge::SignedMerge;
-use nrese_exec::{BudgetExceeded, ChargedVec, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
@@ -148,6 +148,48 @@ impl Layout {
 /// Keys per part of a group walk over a large range, walked in parallel: a multiple of
 /// the block size.
 pub(crate) const GROUP_PART: usize = 1 << 16;
+
+/// The most bytes a group walk over `keys` keys charges, into an output that starts without
+/// capacity, its runs walked in `parts` parallel parts in all (or serially), bounded by the
+/// keys alone: a group has at least one. Let `S` be the keys walked before a run of `k` keys
+/// in `p` parts. The output then holds at most `2S + 4` groups; the run's parts grow to at
+/// most `2k + 4p` beside it, `3k + 4p` while one reallocates. While the output reallocates,
+/// its old capacity is under `S + k`, its new one at most `2(S + k) + 4`, the finished parts
+/// at most `2k + 4p`. That is `3S + 5k + 4p + 4` groups, at most `5·keys + 4·parts + 4`.
+pub(crate) fn group_walk_peak(keys: usize, parts: usize) -> usize {
+    keys.saturating_mul(5)
+        .saturating_add(parts.saturating_mul(4))
+        .saturating_add(4)
+        .saturating_mul(size_of::<(u64, i64)>())
+}
+
+/// Whether a group walk over `keys` keys, `parts` parallel parts in its large runs, runs in
+/// parts: where it has any, and `budget`'s room covers the whole walk's peak.
+pub(crate) fn walks_in_parts(budget: &Budget, keys: usize, parts: usize) -> bool {
+    parts > 0 && budget.remaining() >= group_walk_peak(keys, parts)
+}
+
+/// [`IndexVersion::group_counts`]'s walk past its capacity, out of its hot loop: `group`
+/// pushed after a growth charged first, or dropped where the walk was refused (that
+/// refusal kept, the first one).
+#[cold]
+#[inline(never)]
+fn grow_then_push(
+    out: &mut ChargedVec<(u64, i64), &Budget>,
+    group: (u64, i64),
+    refused: &mut Option<BudgetExceeded>,
+) {
+    if refused.is_some() {
+        return;
+    }
+    match out.reserve(1) {
+        Ok(()) => {
+            let pushed = out.push_within(group);
+            debug_assert!(pushed.is_ok(), "room after a growth");
+        }
+        Err(error) => *refused = Some(error),
+    }
+}
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
 #[derive(Debug, Clone, Default)]
@@ -653,14 +695,43 @@ impl IndexVersion {
     /// run, appended to `out`: sorted by value within a run, a value once per run that has
     /// it. Each run's range is walked group by group ([`PackedKeys::groups`]): no search per
     /// group, so many small groups cost a scan of the column, few large ones a search each.
-    pub(crate) fn group_counts(
+    ///
+    /// `out` and each part walked in parallel grow charged to `budget` (`out`'s), one
+    /// charge a growth, before they allocate: a reader's walk can't outgrow its budget
+    /// (D16-039 F7). Refused, the walk ends with what it charged released.
+    ///
+    /// Its large runs are walked in parallel parts only where the budget's room, read once
+    /// before anything grows, covers the whole walk's peak ([`group_walk_peak`]); otherwise
+    /// every run is walked serially, the reference. So, against a budget no one else draws
+    /// from during the walk, a walk is refused only where the fully serial walk would be. A
+    /// concurrent consumer can take room after the check: the walk is then refused, typed,
+    /// never answered short.
+    pub(crate) fn group_counts<'b>(
         &self,
         plan: &AccessPlan,
         position: usize,
-        out: &mut Vec<(u64, i64)>,
-    ) {
+        out: &mut ChargedVec<(u64, i64), &'b Budget>,
+        budget: &'b Budget,
+    ) -> Result<(), BudgetExceeded> {
+        let (keys, parts) = self.group_walk_size(plan, position);
+        let in_parts = out.capacity() == 0 && walks_in_parts(budget, keys, parts);
+        self.group_counts_on(plan, position, out, budget, in_parts)
+    }
+
+    /// [`Self::group_counts`] on a path chosen for the whole walk: its large runs in parallel
+    /// parts (`in_parts`), or every run serially. The caller's choice keeps the guarantee
+    /// only where it is [`Self::group_counts`]'s: parts only where the room covers the peak
+    /// of every walk that may run beside this one, `out` without capacity at the start.
+    pub(crate) fn group_counts_on<'b>(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        out: &mut ChargedVec<(u64, i64), &'b Budget>,
+        budget: &'b Budget,
+        in_parts: bool,
+    ) -> Result<(), BudgetExceeded> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return;
+            return Ok(());
         };
         debug_assert!(
             !adapted.exclude_default_graph,
@@ -671,21 +742,33 @@ impl IndexVersion {
         let position = if adapted.permutation == plan.permutation {
             position
         } else if position == 0 {
-            out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
-            return;
+            return out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
         } else {
             position - 1
         };
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
-            let walk = |start: usize, end: usize, out: &mut Vec<(u64, i64)>| {
+            // The walk can't stop between groups: a refused group ends what it appends, and
+            // the walk only skips over the rest. A group costs a push within the capacity
+            // charged; only a growth, logarithmically many, calls the budget.
+            let walk = |start: usize,
+                        end: usize,
+                        out: &mut ChargedVec<(u64, i64), &'b Budget>|
+             -> Result<(), BudgetExceeded> {
+                let mut refused = None;
                 perm.keys.groups(start, end, position, |value, i, j| {
-                    out.push((value, (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64));
+                    let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                    if let Err(group) = out.push_within((value, count)) {
+                        grow_then_push(out, group, &mut refused);
+                    }
                 });
+                refused.map_or(Ok(()), Err)
             };
-            if end - start < 2 * GROUP_PART {
-                walk(start, end, out);
+            // The path is the whole walk's (package fix checks r3, r4): a run walked serially
+            // after a merged one would grow from the merge's capacity, not the reference's.
+            if !in_parts || end - start < 2 * GROUP_PART {
+                walk(start, end, out)?;
                 continue;
             }
             // Large ranges in parts on every core, cut at block boundaries; a group that
@@ -694,27 +777,62 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
-            let parts: Vec<Vec<(u64, i64)>> = cuts
+            let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
-                    let mut part = Vec::new();
-                    walk(cut[0], cut[1], &mut part);
-                    part
+                    let mut part = ChargedVec::new(budget);
+                    walk(cut[0], cut[1], &mut part)?;
+                    Ok(part)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, BudgetExceeded>>()?;
+            // The merge's room at once, for exactly the groups it appends: a group spanning
+            // a cut is added to the one before it, not appended (sol-loop S2-2).
+            let mut last = None;
+            let mut appended = 0;
+            for part in &parts {
+                if let (Some(&(value, _)), Some(&(end, _))) = (part.first(), part.last()) {
+                    appended += part.len() - usize::from(last == Some(value));
+                    last = Some(end);
+                }
+            }
+            out.reserve(appended)?;
             let first = out.len();
             for part in parts {
-                let mut groups = part.into_iter();
-                if let Some((value, count)) = groups.next() {
-                    let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
-                    match out.last_mut() {
-                        Some(last) if spans => last.1 += count,
-                        _ => out.push((value, count)),
-                    }
+                let Some((&(value, count), rest)) = part.split_first() else {
+                    continue;
+                };
+                let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
+                match out.last_mut() {
+                    Some(last) if spans => last.1 += count,
+                    _ => out.push((value, count))?,
                 }
-                out.extend(groups);
+                out.extend_from_slice(rest)?;
             }
         }
+        Ok(())
+    }
+
+    /// The keys [`Self::group_counts`] reads for `plan` over this version's runs, and the
+    /// parallel parts of the runs large enough to be walked in parts: what bounds its charge
+    /// ([`group_walk_peak`]).
+    pub(crate) fn group_walk_size(&self, plan: &AccessPlan, position: usize) -> (usize, usize) {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return (0, 0);
+        };
+        if adapted.permutation != plan.permutation && position == 0 {
+            return (1, 0);
+        }
+        self.runs.iter().fold((0, 0), |(keys, parts), run| {
+            let (start, end) = run
+                .permutation(adapted.permutation)
+                .range(&adapted.low, &adapted.high);
+            let run_parts = if end - start >= 2 * GROUP_PART {
+                end.div_ceil(GROUP_PART) - start / GROUP_PART
+            } else {
+                0
+            };
+            (keys + (end - start), parts + run_parts)
+        })
     }
 
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
@@ -741,31 +859,37 @@ impl IndexVersion {
         }
     }
 
-    /// Appends, for each of `components` (quad components: subject 0, predicate 1, object
-    /// 2, graph 3), its values among the quads matching `plan`, in the plan's order, to
-    /// the matching vector of `out`, decoded a block and a column at a time. Answers only
-    /// for a version of at most one run without tombstones (`false`, nothing appended,
-    /// otherwise: then quads must be merged and cancelled one by one).
-    pub(crate) fn scan_columns(
+    /// The scan, a block and a column at a time, of `components` (quad components:
+    /// subject 0, predicate 1, object 2, graph 3) among the quads matching `plan`, in the
+    /// plan's order: its rows are known before anything is decoded, so a caller charges
+    /// them first ([`ColumnScan::rows`], then [`ColumnScan::decode`]). Answers only for a
+    /// version of at most one run without tombstones (`None` otherwise: then quads must be
+    /// merged and cancelled one by one).
+    pub(crate) fn column_scan(
         &self,
         plan: &AccessPlan,
         components: &[usize],
-        out: &mut [Vec<u64>],
-    ) -> bool {
+    ) -> Option<ColumnScan<'_>> {
+        let nothing = ColumnScan {
+            keys: None,
+            start: 0,
+            end: 0,
+            positions: Vec::new(),
+        };
         let Some(adapted) = self.layout.adapt(plan) else {
-            return true; // nothing this layout holds matches
+            return Some(nothing); // nothing this layout holds matches
         };
         if adapted.exclude_default_graph {
-            return false;
+            return None;
         }
         let run = match &*self.runs {
-            [] => return true,
+            [] => return Some(nothing),
             [run] => run,
-            _ => return false,
+            _ => return None,
         };
         let perm = run.permutation(adapted.permutation);
         if !perm.tombstones.is_empty() {
-            return false;
+            return None;
         }
         let order = adapted.permutation.order();
         let positions: Vec<usize> = components
@@ -778,8 +902,12 @@ impl IndexVersion {
             })
             .collect();
         let (start, end) = perm.range(&adapted.low, &adapted.high);
-        perm.keys.decode_columns(start, end, &positions, out);
-        true
+        Some(ColumnScan {
+            keys: Some(&perm.keys),
+            start,
+            end,
+            positions,
+        })
     }
 
     pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
@@ -925,6 +1053,30 @@ impl IndexVersion {
     /// once ([`Self::with_run`], [`Self::with_runs`]).
     pub(crate) fn runs_bytes(&self, extra: usize) -> usize {
         2 * (self.runs.len() + extra) * std::mem::size_of::<Arc<Run>>() + 16
+    }
+}
+
+/// A column scan of one version ([`IndexVersion::column_scan`]): how many rows it decodes,
+/// known before it decodes them.
+pub(crate) struct ColumnScan<'a> {
+    keys: Option<&'a PackedKeys>,
+    start: usize,
+    end: usize,
+    positions: Vec<usize>,
+}
+
+impl ColumnScan<'_> {
+    /// The rows [`Self::decode`] appends to each column.
+    pub(crate) fn rows(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Appends each component's values to the matching vector of `out`, which grows by
+    /// exactly [`Self::rows`]: the capacity a caller charged for them.
+    pub(crate) fn decode(&self, out: &mut [Vec<u64>]) {
+        if let Some(keys) = self.keys {
+            keys.decode_columns(self.start, self.end, &self.positions, out);
+        }
     }
 }
 
