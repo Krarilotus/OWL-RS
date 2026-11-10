@@ -1746,6 +1746,27 @@ impl Snapshot {
         Ok(Some(GroupCounts { counts, held }))
     }
 
+    /// The most bytes [`Self::group_counts_in`] of `pattern` in `permutation` charges to its
+    /// budget, whichever path its walks take ([`crate::index::group_walk_peak`] over every
+    /// included stack's keys): 0 where it can't walk them.
+    fn group_walk_peak(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> usize {
+        let pattern = self.read_pattern(model, pattern);
+        let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
+            return 0;
+        };
+        let (keys, parts) = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| self.data(model).stack(stack).group_walk_size(&plan, bound))
+            .fold((0, 0), |(keys, parts), (k, p)| (keys + k, parts + p));
+        crate::index::group_walk_peak(keys, parts)
+    }
+
     /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
     /// prefix's length: `None` where a walk can't answer it (equality classes expanded, a
     /// bound graph after the prefix, a range excluding the default graph, an included
@@ -1972,7 +1993,9 @@ impl Snapshot {
 
     /// The number of distinct terms used as subject or object in `graphs` (one graph, or
     /// every graph) in `model`: what zero-length property paths start from. Exact; kept
-    /// for this version once computed. The two walks (subjects, objects) run in parallel.
+    /// for this version once computed. The two walks (subjects, objects) run at once where the
+    /// budget's room covers both their peaks, otherwise one after the other, each in parallel
+    /// parts where its room allows ([`Self::group_counts_in`]).
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
     ///
     /// The two walks' lists are charged to `budget` as they grow, before they are allocated
@@ -2028,9 +2051,21 @@ impl Snapshot {
                         None
                     }
                 };
-                let (subjects, objects) =
-                    rayon::join(|| distinct(by_subject), || distinct(by_object));
-                let (subjects, objects) = (subjects?, objects?);
+                // A count is refused only where the walks one after the other would be
+                // (package fix check r3). At once where the room, read once, covers both
+                // walks' worst peaks, whatever paths they take; otherwise one after the
+                // other, each walk's parts deciding against the room the other's list leaves.
+                let peaks = self
+                    .group_walk_peak(model, &pattern, by_subject)
+                    .saturating_add(self.group_walk_peak(model, &pattern, by_object));
+                let (subjects, objects) = if budget.remaining() >= peaks {
+                    let (subjects, objects) =
+                        rayon::join(|| distinct(by_subject), || distinct(by_object));
+                    (subjects?, objects?)
+                } else {
+                    let subjects = distinct(by_subject)?;
+                    (subjects, distinct(by_object)?)
+                };
                 // |S ∪ O| by a merge of the two sorted lists.
                 let (mut i, mut j, mut both) = (0, 0, 0u64);
                 while i < subjects.len() && j < objects.len() {
