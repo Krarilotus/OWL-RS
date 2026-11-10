@@ -2463,6 +2463,48 @@ cap_gb = 6
 systems = []
 home_turf = "virtuoso"
 
+# What holding a view costs, and what restoring and catching up take, on one 1 M-statement store
+# (held-view, private-read, restore and catch-up costs, measured until now as behaviour only):
+# every number with its checked answers, outside the timed windows (perf_lab views.rs, recovery.rs).
+
+[[case]]
+name = "snapshot-private-cost"
+area = "concurrency"
+what = "a 1 M-statement store on disk, 0, 1 and 8 views held: snapshot acquisition, 50 commits of a 100-statement delta, reads (first after the commits, then warm), private reads in a transaction and their rollback, and the resident memory the views retain"
+levels = ["focused"]
+semantics = "none"
+data = "social people=40000"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--held-views", "0,1,8", "--warmup", "0", "--runs", "10"]
+queries = "lookups"
+repeat = 3
+metric = "views.private_read_p50_ms"
+check = { "view_checks.answers_ok" = "true", "view_checks.levels" = 3, "q.name.rows" = 1 }
+route = {}
+cap_gb = 4
+systems = []
+est_min = 10
+
+[[case]]
+name = "recovery-catchup-cost"
+area = "service"
+what = "a 1 M-statement store's image and 100 commits x 100 statements of retained log: restore to the 50th commit, open, first correct query; an image of the latest; a follower's feed/apply catch-up in process (no network or Kafka lag)"
+levels = ["focused"]
+semantics = "none"
+data = "social people=40000"
+setup = ["--store", "{scratch}/primary", "--load", "{data}", "--recovery-prepare", "100:100"]
+args = ["--store", "{scratch}/primary", "--recovery", "100:100"]
+env = { NRESE_WAL_ARCHIVE = "true" }
+queries = ""
+repeat = 5
+page_cache = ["warm", "cold"]
+metric = "recovery.restore_ms"
+check = { "recovery.answers_ok" = "true", "recovery.records" = 100 }
+route = {}
+cap_gb = 4
+systems = []
+est_min = 12
+
 # Background checkpoints overlapping reads and commits (IB0024 fix check F1): a checkpoint
 # runs as a job of the global pool, its file writing on one of its threads. A durable store,
 # 5,000 commits under 8 readers, a checkpoint asked for every 128 KiB of log (a count at
