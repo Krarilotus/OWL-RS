@@ -4,12 +4,16 @@ use std::sync::Arc;
 
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
-use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisibility};
+use super::equality::{
+    Classes as EqualityClasses, Expand, Merged, Metering, OnMeter, Plain, Unmetered,
+    Visibility as CopyVisibility,
+};
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::resolve::Vocabulary;
 use crate::term::{Dictionary, TermId};
+use crate::visit::Account;
 
 /// A pattern's heavy groups as the engine keeps them ([`Snapshot::heavy_groups_in`]): values
 /// with their match counts, in id order, charged for as long as any holder keeps them.
@@ -18,9 +22,16 @@ pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
+mod own_state;
+pub(crate) use own_state::OwnSlots;
+pub use own_state::{Admission, OwnState};
+
 mod reader_search;
-pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
+pub(crate) use reader_search::{CorpusAdmission, Documents};
+
+mod counted;
+pub use counted::CountedSnapshot;
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
@@ -376,7 +387,8 @@ impl std::fmt::Debug for Snapshot {
 
 impl Snapshot {
     /// A snapshot of `version`, not published: no [`SharedState`]. The bulk path's checkpoint
-    /// image is made so, before its version is installed.
+    /// image is made so, of a version that is never installed (one made from it is). Never of
+    /// an installed version: its own slots ([`OwnState`]) would be that version's.
     pub(super) fn new(
         version: Arc<Version>,
         dictionary: Arc<Dictionary>,
@@ -413,12 +425,25 @@ impl Snapshot {
         }
     }
 
+    /// Where what this snapshot derives may be kept (the lifecycle contract's S3): in state
+    /// other operations reach for a published snapshot ([`SharedState`]), in its own
+    /// version's slots for a pending, private, staged or added-to one ([`OwnState`]).
+    pub fn admission(&self) -> Admission<'_> {
+        match self.published {
+            true => Admission::Shared(SharedState { snapshot: self }),
+            false => Admission::Own(OwnState::new(self)),
+        }
+    }
+
     /// The capability to admit into state other operations reach, for a published snapshot
-    /// alone (the lifecycle contract's S3); `None` for a pending, private, staged or
-    /// added-to one, which computes for its request instead. Reading entries made from
-    /// published snapshots needs none.
+    /// alone ([`Self::admission`]'s `Shared`); `None` for a pending, private, staged or
+    /// added-to one, which computes for its request or keeps it in its own version instead.
+    /// Reading entries made from published snapshots needs none.
     pub fn shared_state(&self) -> Option<SharedState<'_>> {
-        self.published.then_some(SharedState { snapshot: self })
+        match self.admission() {
+            Admission::Shared(state) => Some(state),
+            Admission::Own(_) => None,
+        }
     }
 
     /// This snapshot reading the default graph expanded over the `owl:sameAs` classes of
@@ -820,6 +845,7 @@ impl Snapshot {
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {
@@ -867,6 +893,37 @@ impl Snapshot {
             ),
             None => Cow::Borrowed(pattern),
         }
+    }
+
+    /// [`Self::expanding`], a build of the classes counted on `meter`: `Err` where it stopped
+    /// (REAS-3, sweep SW012). A canonical snapshot's alias view is made as `expanding` makes
+    /// it: no counted reader reads canonically (REAS-3 design note, residuals).
+    fn expanding_with<M: super::equality::Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Result<Option<Arc<EqualityClasses>>, crate::visit::Stopped> {
+        let default_graph = match pattern.graph {
+            GraphSelector::Any => true,
+            GraphSelector::AnyNamed => false,
+            GraphSelector::Exact(graph) => graph.is_default_graph(),
+        };
+        if model == ReadModel::Asserted || !default_graph {
+            return Ok(None);
+        }
+        let Some(same_as) = self.equality else {
+            return Ok(None);
+        };
+        let classes = match self.canonical {
+            true => self.version.equality.canonical(&self.version, same_as),
+            false => self
+                .version
+                .equality
+                .classes_with(&self.version, same_as, meter)
+                .ok_or(crate::visit::Stopped)?,
+        };
+        Ok((!classes.is_empty()).then_some(classes))
     }
 
     /// The classes a read of `pattern` in `model` expands: equality is on, some class
@@ -919,11 +976,11 @@ impl Snapshot {
             true => Some(AccessPlan::in_permutation(pattern, permutation)?),
             false => None,
         };
-        let stored = SortedMerge {
-            left: data.asserted.scan_plan(&plan).peekable(),
-            right: data.inferred.scan_plan(&plan).peekable(),
+        let stored = Merged::new(
+            Plain(data.asserted.scan_plan(&plan)),
+            Plain(data.inferred.scan_plan(&plan)),
             permutation,
-        };
+        );
         let expanded = Expand::new(
             stored,
             classes,
@@ -938,11 +995,7 @@ impl Snapshot {
             .into_iter()
             .flat_map(move |plan| data.asserted.scan_plan(&plan))
             .filter(|quad| !quad.graph.is_default_graph());
-        Some(SortedMerge {
-            left: expanded.peekable(),
-            right: named.peekable(),
-            permutation,
-        })
+        Some(Merged::new(Plain(expanded), Plain(named), permutation))
     }
 
     /// The expanded matches of `pattern` in `model`, in the order of its access plan,
@@ -963,29 +1016,37 @@ impl Snapshot {
     /// the stored matches over representatives weighted by how many quads each stands for,
     /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
     /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
-    /// holds (its maximum then; PR #70 fix check 2 F3). `visit(1)` is called before each
-    /// stored position its scans pass, deleted ones included (`QuadScan::next_visiting`;
-    /// REAS-2 fix check r1, R2-F1), and before each copy it expands; `None` as soon as it
-    /// returns false, nothing more read ([`Self::count_in_visiting`]).
-    fn expanded_count(
+    /// holds (its maximum then; PR #70 fix check 2 F3). A counted count ([`Metering`]) counts
+    /// each stored position its scans pass, deleted ones included (REAS-2 fix check r1,
+    /// R2-F1), each copy it expands and each visibility probe; `None` once its meter has
+    /// stopped, nothing more read ([`Self::count_in_visiting`]). [`Self::count_in`]'s is
+    /// unmetered: the plain scans and probes (REAS-3, the master's 01:37 condition (b)).
+    fn expanded_count<M: Metering>(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
         limit: u64,
-        visit: &mut dyn FnMut(u64) -> bool,
+        meter: M,
     ) -> Option<Count> {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
         let mut count: u64 = 0;
+        // One account for the count's scans, copies and visibility probes, so at most
+        // `POLL_UNITS` units of them follow any yes (fix check r2 G1's sibling: a scan's
+        // ledger, the copies' credit and each probe's own allowed one each).
+        let mut account = OnMeter::new(meter);
         for stack in Stack::ALL {
-            let mut scan = data.stack(stack).scan(&normalised);
+            let mut scan = data
+                .stack(stack)
+                .scan_plan_with(&AccessPlan::for_pattern(&normalised), &mut account)
+                .ok()?;
             loop {
                 if count >= limit {
                     return Some(Count::AtLeast(count));
                 }
-                let Some(quad) = scan.next_visiting(visit).ok()? else {
+                let Some(quad) = scan.step_with(&mut account).ok()? else {
                     break;
                 };
                 if !quad.graph.is_default_graph() {
@@ -1005,11 +1066,21 @@ impl Snapshot {
                         let (mut copies, wanted) = (0, limit - count);
                         let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
-                            if !visit(1) {
+                            // Its probe, counting its own work, then the copy, a unit counted
+                            // before it is counted in (fix check r3 H1).
+                            let shown = visibility
+                                .shows_with(&copy, touching, &mut account)
+                                .and_then(|shown| {
+                                    account
+                                        .take(1)
+                                        .then_some(shown)
+                                        .ok_or(crate::visit::Stopped)
+                                });
+                            let Ok(shown) = shown else {
                                 stopped = true;
                                 return std::ops::ControlFlow::Break(());
-                            }
-                            copies += u64::from(visibility.shows(&copy, touching));
+                            };
+                            copies += u64::from(shown);
                             match copies >= wanted {
                                 true => std::ops::ControlFlow::Break(()),
                                 false => std::ops::ControlFlow::Continue(()),
@@ -1033,9 +1104,12 @@ impl Snapshot {
             && normalised != *pattern
             && !self.canonical
         {
-            let mut scan = self.data(model).asserted.scan(pattern);
+            let mut scan = data
+                .asserted
+                .scan_plan_with(&AccessPlan::for_pattern(pattern), &mut account)
+                .ok()?;
             while count < limit {
-                let Some(quad) = scan.next_visiting(visit).ok()? else {
+                let Some(quad) = scan.step_with(&mut account).ok()? else {
                     break;
                 };
                 count += u64::from(!quad.graph.is_default_graph());
@@ -1343,7 +1417,7 @@ impl Snapshot {
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
     /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
-        self.count_in_visiting(model, pattern, &mut |_| true)
+        self.count_with(model, pattern, Unmetered)
             .expect("never stopped")
     }
 
@@ -1360,10 +1434,53 @@ impl Snapshot {
         pattern: &QuadPattern,
         visit: &mut dyn FnMut(u64) -> bool,
     ) -> Option<Count> {
+        // The counted reads share one visitor among their producers ([`crate::visit`]): this
+        // one, called from one place at a time, is shared through a cell, and latched as the
+        // contract has it: once it says stop it is not asked again, and `visit(0)` (whether
+        // it has stopped) is answered here, never passed on.
+        let visit = std::cell::RefCell::new(visit);
+        let stopped = std::cell::Cell::new(false);
+        self.count_visited(model, pattern, &|n| {
+            if stopped.get() {
+                return false;
+            }
+            if n == 0 {
+                return true;
+            }
+            let go = (visit.borrow_mut())(n);
+            stopped.set(!go);
+            go
+        })
+    }
+
+    /// [`Self::count_in_visiting`] on a counted read's visitor ([`crate::visit`]), the
+    /// equality classes it needs built counted too (REAS-3, sweep SW012).
+    pub(crate) fn count_visited(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: crate::visit::Visitor<'_>,
+    ) -> Option<Count> {
+        self.count_with(model, pattern, visit)
+    }
+
+    /// [`Self::count_in`]'s work on `meter`: unmetered, the plain reads; on a visitor,
+    /// counted.
+    fn count_with<M: Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Option<Count> {
+        // Asked once whatever the count does (a layout that holds nothing of it does no
+        // work): a stopped visitor always gets `None`.
+        if meter.stopped() {
+            return None;
+        }
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
-        if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, u64::MAX, visit);
+        if let Some(classes) = self.expanding_with(model, pattern, meter).ok()? {
+            return self.expanded_count(&classes, model, pattern, u64::MAX, meter);
         }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan, both
@@ -1377,29 +1494,26 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            let every = self.held_count(model, &every, visit)?;
-            let default = self.held_count(model, &default, visit)?;
+            let every = self.held_count(model, &every, meter)?;
+            let default = self.held_count(model, &default, meter)?;
             return Some(Count::Exact(every - default));
         }
-        self.held_count(model, pattern, visit).map(Count::Exact)
+        self.held_count(model, pattern, meter).map(Count::Exact)
     }
 
     /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion,
-    /// each run's work visited (`IndexVersion::count_plan_visiting`).
-    fn held_count(
+    /// each run's work counted on `meter` (`IndexVersion::count_plan_visiting`).
+    fn held_count<M: Metering>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
-        visit: &mut dyn FnMut(u64) -> bool,
+        meter: M,
     ) -> Option<u64> {
         let plan = AccessPlan::for_pattern(pattern);
         let mut sum = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
-                sum += self
-                    .data(model)
-                    .stack(stack)
-                    .count_plan_visiting(&plan, visit)?;
+                sum += meter.count_plan(self.data(model).stack(stack), &plan)?;
             }
         }
         Some(sum)
@@ -1412,7 +1526,7 @@ impl Snapshot {
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self
-                .expanded_count(&classes, model, pattern, 1, &mut |_| true)
+                .expanded_count(&classes, model, pattern, 1, Unmetered)
                 .expect("never stopped")
                 .at_least()
                 > 0;
@@ -1458,11 +1572,11 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(Either::Right(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
+        Some(Either::Right(Merged::new(
+            Plain(scan(Stack::Asserted)),
+            Plain(scan(Stack::Inferred)),
             permutation,
-        }))
+        )))
     }
 
     /// Like [`scan_sorted_in`](Self::scan_sorted_in), with the first unbound component of the
@@ -1484,11 +1598,11 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
+        Some(Merged::new(
+            Plain(scan(Stack::Asserted)),
+            Plain(scan(Stack::Inferred)),
             permutation,
-        })
+        ))
     }
 
     /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
@@ -2049,9 +2163,10 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
-    /// [`Self::lookup`], what it allocates charged first through `charge`
-    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
-    /// dictionary, which a checkpoint may otherwise change between them).
+    /// [`Self::lookup`], what it allocates charged first through `charge`, which is called
+    /// with no lock of the dictionary held ([`Dictionary::lookup_charged`]: at the larger of
+    /// a plain and a compressed base's bounds, since a checkpoint may change the base before
+    /// the lookup).
     pub fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
@@ -2108,14 +2223,19 @@ impl Snapshot {
         self.vocabulary.decode(id)
     }
 
-    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
-    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
-    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
-    /// snapshot doesn't know.
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, for every
+    /// kind of term: inline, the dictionary's, a private snapshot's own, and a triple term
+    /// with its components. `Ok(None)` for an id that isn't a term this snapshot knows.
+    ///
+    /// `charge` is called with no lock of the dictionary held, once, or again where a
+    /// checkpoint's rebase came between the bound and the decode
+    /// ([`Dictionary::decode_charged`]): each call charges an increment, and what the decode
+    /// holds is covered by their sum. A refusal ends it, nothing decoded; what was charged
+    /// before stays the caller's to release.
     pub fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
         self.vocabulary
             .decode_charged(id, self.version.dictionary_len, charge)
@@ -2123,8 +2243,8 @@ impl Snapshot {
 
     /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
     /// as stored now: a checkpoint may store the term compressed after, so a charge for a
-    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
-    /// ids this snapshot doesn't know.
+    /// decode goes through [`Self::decode_charged`]. `None` for ids this snapshot doesn't
+    /// know.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
         self.vocabulary
             .decode_bound(id, self.version.dictionary_len)
@@ -2181,24 +2301,18 @@ impl Snapshot {
         self.underlying().stats().arena_bytes
     }
 
-    /// Refused, before any search touches the dictionary, for a private snapshot: the
-    /// shared indexes don't cover its own terms, and building or extending them would change
-    /// state every snapshot shares.
-    fn searchable(&self) -> Result<(), SearchRefused> {
-        match self.is_private() {
-            true => Err(SearchRefused::Private),
-            false => Ok(()),
-        }
-    }
-
     /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check). Refused for a private
-    /// snapshot ([`SearchRefused::Private`]).
+    /// (whether statements still use them is the caller's to check). A private snapshot's
+    /// shared indexes don't cover its own terms, and extending them would change state every
+    /// snapshot shares: it searches what it can see instead, as a reader of every graph in the
+    /// materialised model ([`Self::text_search_in`]; V3, DICT2 9 Nov 04:02 Q2).
     pub fn text_search(
         &self,
         query: &crate::TextQuery,
     ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
-        self.searchable()?;
+        if self.is_private() {
+            return self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None);
+        }
         let known = self.version.dictionary_len;
         let mut matches = self.underlying().text_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
@@ -2209,15 +2323,67 @@ impl Snapshot {
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
     /// (whether statements still use them is the caller's to check, in `accept`). What the
     /// search holds, the hits included, is charged to `budget` before it is allocated: a
-    /// search the budget has no room for is refused, with nothing left charged. Refused for
-    /// a private snapshot too.
+    /// search the budget has no room for is refused, with nothing left charged. A private
+    /// snapshot searches what it can see, as [`Self::text_search`] does
+    /// ([`Self::vector_search_in`]): run within what `budget` has left, held on it meanwhile.
     pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b nrese_exec::Budget,
     ) -> Result<VectorHits<'b>, SearchRefused> {
-        self.searchable()?;
+        if self.is_private() {
+            // A snapshot reading within this very budget (a query's envelope): the reader
+            // path charges it through its own `Arc`, as its reads do (sol-loop r1 B3: a
+            // bridge holding the budget's room would refuse those reads).
+            let reading = self.reads.as_ref().and_then(|reads| reads.0.as_ref());
+            if let Some(reads) = reading.filter(|reads| std::ptr::eq(&*reads.budget, budget)) {
+                let (hits, report) = self.vector_search_in(
+                    ReadModel::Materialised,
+                    &TextScope::EVERY,
+                    query,
+                    accept,
+                    &reads.budget,
+                )?;
+                // Handed over on `budget`: charged there before they are copied.
+                let found =
+                    nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+                drop(hits);
+                return Ok((found?, report));
+            }
+            // Otherwise an `Arc`'d budget of what `budget` has left, that room held on
+            // `budget` until the search is done, then the hits charged there. The snapshot's
+            // reads, where it has any, charge their own budget, not this one. (A reader's
+            // budget beside `budget` under one parent would find the parent's room held:
+            // no caller passes one; SPARQL passes the reader's, the others unbounded ones.)
+            let (inner, held) = match budget.is_bounded() {
+                true => {
+                    let room = budget.remaining();
+                    let mut held = nrese_exec::Reservation::new(budget);
+                    held.charge(room)?;
+                    (nrese_exec::Budget::new(room), Some(held))
+                }
+                false => (nrese_exec::Budget::unlimited(), None),
+            };
+            let inner = Arc::new(inner);
+            let (hits, report) = self.vector_search_in(
+                ReadModel::Materialised,
+                &TextScope::EVERY,
+                query,
+                accept,
+                &inner,
+            )?;
+            // Of the held room, what the copy takes is let go for it, the rest held until the
+            // inner hits are freed (sol-loop r2 B3: no gap where neither is counted).
+            let held = held.map(|mut held| {
+                held.release(hits.len() * std::mem::size_of::<(TermId, f32)>());
+                held
+            });
+            let found = nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+            drop(hits);
+            drop(held);
+            return Ok((found?, report));
+        }
         let (hits, report) =
             self.underlying()
                 .vector_search(query, self.version.dictionary_len, accept, budget)?;
@@ -2236,21 +2402,23 @@ impl Snapshot {
     /// Builds the graph searches like `query` use, covering every vector of its
     /// dimension, before returning: a warm-up (searches build it themselves, a large one
     /// on a thread of its own while they scan exactly). Nothing for a private snapshot,
-    /// which doesn't search: a build is shared state.
+    /// whose searches scan exactly: a build is shared state.
     pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        if self.searchable().is_ok() {
+        if !self.is_private() {
             self.underlying().prepare_vector_graph(query);
         }
     }
 
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check). Refused for a
-    /// private snapshot.
+    /// first (whether statements still use them is the caller's to check). A private
+    /// snapshot searches what it can see, as [`Self::text_search`] does.
     pub fn iri_search(
         &self,
         query: &crate::TextQuery,
     ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
-        self.searchable()?;
+        if self.is_private() {
+            return self.iri_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None);
+        }
         let known = self.version.dictionary_len;
         let mut matches = self.underlying().iri_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
@@ -2308,8 +2476,8 @@ enum ViewOf {
 pub enum SearchRefused {
     /// The search's budget had no room ([`nrese_exec::BudgetExceeded`]).
     Memory(nrese_exec::BudgetExceeded),
-    /// The snapshot is private ([`Snapshot::is_private`]): the shared indexes don't cover
-    /// its own terms, and no search changes them for it.
+    /// Not returned since V3: a private snapshot ([`Snapshot::is_private`]) searches what it
+    /// can see. Kept while callers still match it (`nrese-sparql`'s results).
     Private,
 }
 
@@ -2333,37 +2501,6 @@ impl std::error::Error for SearchRefused {
         match self {
             Self::Memory(exceeded) => Some(exceeded),
             Self::Private => None,
-        }
-    }
-}
-
-/// Two quad streams sorted by one permutation, merged into one sorted stream. The inputs
-/// come from disjoint stacks, so equal keys never occur.
-struct SortedMerge<L: Iterator<Item = EncodedQuad>, R: Iterator<Item = EncodedQuad>> {
-    left: std::iter::Peekable<L>,
-    right: std::iter::Peekable<R>,
-    permutation: Permutation,
-}
-
-impl<L, R> Iterator for SortedMerge<L, R>
-where
-    L: Iterator<Item = EncodedQuad>,
-    R: Iterator<Item = EncodedQuad>,
-{
-    type Item = EncodedQuad;
-
-    #[inline]
-    fn next(&mut self) -> Option<EncodedQuad> {
-        match (self.left.peek(), self.right.peek()) {
-            (Some(l), Some(r)) => {
-                if self.permutation.to_key(l) <= self.permutation.to_key(r) {
-                    self.left.next()
-                } else {
-                    self.right.next()
-                }
-            }
-            (Some(_), None) => self.left.next(),
-            (None, _) => self.right.next(),
         }
     }
 }

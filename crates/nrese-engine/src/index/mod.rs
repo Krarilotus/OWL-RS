@@ -41,6 +41,7 @@ use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::TermId;
+use crate::visit::{Account, Free, Ledger};
 
 pub use compaction::CompactionPolicy;
 pub use keys::{IndexEncoding, set_index_encoding};
@@ -379,7 +380,172 @@ impl IndexVersion {
 
     /// True if `quad` is visible. O(r log n).
     pub(crate) fn contains(&self, quad: &EncodedQuad) -> bool {
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        crate::witness::add(crate::witness::Site::RunProbes, self.runs.len() as u64);
         self.runs.iter().map(|run| run.sign_of(quad)).sum::<i64>() > 0
+    }
+
+    /// [`Self::contains`], each run's probe and its search's comparisons counted on `visit`
+    /// before they are made ([`crate::visit`]; REAS-3, sweep SW009; fix check r1 F1).
+    pub(crate) fn contains_counted(
+        &self,
+        quad: &EncodedQuad,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        // Asked at least once: a stopped visitor gets `Err` however few the runs.
+        if self.runs.is_empty() && crate::visit::stopped(visit) {
+            return Err(Stopped);
+        }
+        self.contains_with(quad, &mut Ledger::new(visit))
+    }
+
+    /// [`Self::contains_counted`] on a caller's `account`: a probe inside a read that counts all
+    /// its work on one account (an equality read's visibility probes, fix check r2 G1).
+    pub(crate) fn contains_with(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl Account,
+    ) -> Result<bool, Stopped> {
+        let mut sign = 0;
+        for run in self.runs.iter() {
+            sign += run.sign_of_counted(quad, account).ok_or(Stopped)?;
+            // Looked at once its search was counted, the run with it (`bound_counted`).
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+        }
+        Ok(sign > 0)
+    }
+
+    /// [`Self::any_plan`], each run it looks at a unit on `visit`, each search's comparisons
+    /// counted before it is made and, where it counts, the count's work
+    /// ([`Self::count_plan_visiting`]) (REAS-3, sweep SW010; fix check r1 F1).
+    pub(crate) fn any_plan_counted(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        // Asked at least once: a stopped visitor gets `Err` however little there is to read.
+        let Some(adapted) = self.layout.adapt(plan).filter(|_| !self.runs.is_empty()) else {
+            return match crate::visit::stopped(visit) {
+                true => Err(Stopped),
+                false => Ok(false),
+            };
+        };
+        // Whether a run holds tombstones (then the exact count decides): each run looked at a
+        // unit, counted a chunk at a time before it is looked at (REAS-3a sol-loop r1 S2).
+        let mut has_tombstones = false;
+        for runs in self.runs.chunks(nrese_exec::POLL_UNITS as usize) {
+            if has_tombstones {
+                break;
+            }
+            if !visit(runs.len() as u64) {
+                return Err(Stopped);
+            }
+            has_tombstones = runs.iter().any(|run| {
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::RunProbes, 1);
+                !run.permutation(adapted.permutation).tombstones.is_empty()
+            });
+        }
+        if adapted.exclude_default_graph || has_tombstones {
+            let count = self.count_plan_visiting(plan, visit);
+            return count.map(|count| count > 0).ok_or(Stopped);
+        }
+        // Each run's bound search counted before it is made, its comparisons too (fix check
+        // r1 F1, design attack r2 E2).
+        let mut ledger = Ledger::new(visit);
+        for run in self.runs.iter() {
+            let keys = &run.permutation(adapted.permutation).keys;
+            let start = keys
+                .bound_counted(&adapted.low, &mut ledger)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            if start < keys.len() && keys.get(start) <= adapted.high {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Self::scan_plan`] for a counted read. As the scan is made, each run's range search
+    /// and the cursor it adds are counted on `visit` before they are done, the searches'
+    /// comparisons too (REAS-3, sweep SW006; fix check r1 F1, design attack r2 E2). Its steps
+    /// are counted by [`QuadScan::next_counted`] or [`CountedScan`] on the same ledger.
+    pub(crate) fn scan_plan_counted(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'_>,
+    ) -> Result<QuadScan<'_>, Stopped> {
+        let mut ledger = Ledger::new(visit);
+        let mut scan = self.scan_plan_with(plan, &mut ledger)?;
+        scan.ledger = (ledger.left, ledger.run);
+        Ok(scan)
+    }
+
+    /// [`Self::scan_plan_counted`] on a caller's `account`, which then steps it
+    /// ([`QuadScan::step_with`]): one account for a read that does other work between the
+    /// scan's steps (an equality read's unions, copies and probes; fix check r2 G1). The plain
+    /// scan where the account counts nothing.
+    pub(crate) fn scan_plan_with<A: Account>(
+        &self,
+        plan: &AccessPlan,
+        account: &mut A,
+    ) -> Result<QuadScan<'_>, Stopped> {
+        if !A::COUNTED {
+            return Ok(self.scan_plan(plan));
+        }
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return Ok(QuadScan::new(
+                SignedMerge::new(std::iter::empty()),
+                plan.permutation,
+                false,
+            ));
+        };
+        // Each range handed to the merge as it is searched, with no list of them first (the
+        // plain scan's shape: a list per scan cost the counted reads about 2.7 % on the support
+        // update, p2-reas3-cnt4).
+        let mut merge = SignedMerge::new(std::iter::empty());
+        for perm_run in self.runs.iter() {
+            let perm = perm_run.permutation(adapted.permutation);
+            let (start, end) = perm
+                .keys
+                .range_counted(&adapted.low, &adapted.high, account)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            if !merge.add((perm, start, end), account) {
+                return Err(Stopped);
+            }
+        }
+        Ok(QuadScan::new(
+            merge,
+            adapted.permutation,
+            adapted.exclude_default_graph,
+        ))
+    }
+
+    /// [`Self::scan`] for a counted read: made and stepped counted on `visit`
+    /// ([`Self::scan_plan_counted`], [`QuadScan::next_counted`]), ending at once where `visit`
+    /// had stopped (the stop is the visitor's to tell).
+    pub(crate) fn scan_counted<'v>(
+        &self,
+        pattern: &QuadPattern,
+        visit: Visitor<'v>,
+    ) -> CountedScan<'_, 'v> {
+        self.scan_plan_iter_counted(&AccessPlan::for_pattern(pattern), visit)
+    }
+
+    /// [`Self::scan_counted`] for a plan.
+    pub(crate) fn scan_plan_iter_counted<'v>(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'v>,
+    ) -> CountedScan<'_, 'v> {
+        let scan = self
+            .scan_plan_counted(plan, visit)
+            .unwrap_or_else(|Stopped| QuadScan::empty(plan.permutation));
+        scan.counted(visit)
     }
 
     /// All visible quads matching `pattern`, in the order of the chosen permutation.
@@ -410,38 +576,34 @@ impl IndexVersion {
     /// − 2 × tombstones in range): O(r log n) for tombstone-free runs, plus a popcount over
     /// the range otherwise. Plans with a default-graph post-filter count by scanning.
     pub(crate) fn count_plan(&self, plan: &AccessPlan) -> u64 {
-        self.count_plan_visiting(plan, &mut |_| true)
+        self.count_plan_visiting(plan, &|_| true)
             .expect("never stopped")
     }
 
     /// [`Self::count_plan`], calling `visit(n)` (`n` at most `POLL_UNITS`) before the work it
-    /// counts: each run's range search (one), its tombstone words as they are read
-    /// (`PermutationRun::tombstones_in_visiting`), each merge step a default-graph
-    /// post-filter scan takes ([`QuadScan::next_visiting`]). `None` as soon as `visit` returns
-    /// false, nothing more read (REAS-2 fix check r1, R2-F1: the count lives in the reader).
-    pub(crate) fn count_plan_visiting(
-        &self,
-        plan: &AccessPlan,
-        visit: &mut dyn FnMut(u64) -> bool,
-    ) -> Option<u64> {
+    /// counts. That is each run's range search, with its comparisons (`PackedKeys::range_counted`),
+    /// its tombstone words as they are read (`PermutationRun::tombstones_in_visiting`), and
+    /// the merge work of a default-graph post-filter scan ([`QuadScan::next_counted`]).
+    /// `None` as soon as `visit` returns false, nothing more read (REAS-2 fix check r1,
+    /// R2-F1: the count lives in the reader).
+    pub(crate) fn count_plan_visiting(&self, plan: &AccessPlan, visit: Visitor<'_>) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
             return Some(0);
         };
         if adapted.exclude_default_graph {
             let mut count = 0u64;
-            let mut scan = self.scan_plan(plan);
-            while scan.next_visiting(visit).ok()?.is_some() {
+            let mut scan = self.scan_plan_counted(plan, visit).ok()?;
+            while scan.next_counted(visit).ok()?.is_some() {
                 count += 1;
             }
             return Some(count);
         }
         let mut signed: i64 = 0;
         for run in self.runs.iter() {
-            if !visit(1) {
-                return None;
-            }
             let perm = run.permutation(adapted.permutation);
-            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let (start, end) = perm
+                .keys
+                .range_counted(&adapted.low, &adapted.high, &mut { visit })?;
             let tombstones = perm.tombstones_in_visiting(start, end, visit)?;
             signed += (end - start) as i64 - 2 * tombstones as i64;
         }
@@ -689,22 +851,24 @@ impl IndexVersion {
 
     pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
         let Some(plan) = self.layout.adapt(plan) else {
-            return QuadScan {
-                merge: SignedMerge::new(std::iter::empty()),
-                permutation: plan.permutation,
-                exclude_default_graph: false,
-            };
+            return QuadScan::new(
+                SignedMerge::new(std::iter::empty()),
+                plan.permutation,
+                false,
+            );
         };
         let parts = self.runs.iter().map(|run| {
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
             let perm = run.permutation(plan.permutation);
             let (start, end) = perm.range(&plan.low, &plan.high);
             (perm, start, end)
         });
-        QuadScan {
-            merge: SignedMerge::new(parts),
-            permutation: plan.permutation,
-            exclude_default_graph: plan.exclude_default_graph,
-        }
+        QuadScan::new(
+            SignedMerge::new(parts),
+            plan.permutation,
+            plan.exclude_default_graph,
+        )
     }
 
     /// `self` with `extra` on top, for reading only: their signs add to the stack's, so
@@ -860,56 +1024,43 @@ pub(crate) struct QuadScan<'a> {
     merge: SignedMerge<'a>,
     permutation: Permutation,
     exclude_default_graph: bool,
+    /// A counted scan's ledger between its steps: units asked for and not yet taken, and the
+    /// last run asked for ([`Ledger`]).
+    ledger: (u64, u64),
 }
 
-impl Iterator for QuadScan<'_> {
-    type Item = EncodedQuad;
+pub(crate) use crate::visit::{Stopped, Visitor};
 
-    #[inline]
-    fn next(&mut self) -> Option<EncodedQuad> {
-        loop {
-            let (key, sign) = self.merge.next()?;
-            #[cfg(test)]
-            crate::witness::add(crate::witness::Site::ScanSteps, 1);
-            if sign <= 0 {
-                continue;
-            }
-            let quad = self.permutation.key_to_quad(&key);
-            if self.exclude_default_graph && quad.graph.is_default_graph() {
-                continue;
-            }
-            return Some(quad);
+impl<'a> QuadScan<'a> {
+    fn new(merge: SignedMerge<'a>, permutation: Permutation, exclude_default_graph: bool) -> Self {
+        Self {
+            merge,
+            permutation,
+            exclude_default_graph,
+            ledger: (0, 0),
         }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.merge.remaining()))
+    /// A scan of nothing: what a counted read stopped while its scan was being made goes on
+    /// with (its stop the visitor's to tell).
+    pub(crate) fn empty(permutation: Permutation) -> Self {
+        Self::new(SignedMerge::new(std::iter::empty()), permutation, false)
     }
-}
 
-/// A read its visitor stopped ([`QuadScan::next_visiting`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Stopped;
-
-impl QuadScan<'_> {
-    /// [`Iterator::next`], calling `visit(1)` before each merge step, a key passed over
-    /// (deleted, or in the default graph where it is left out) as much as one handed on
-    /// (REAS-2 fix check r1, R2-F1: a count's work is every position its scan passes, so
-    /// a long deleted run can't be drained unseen). `Err` once `visit` returns false,
-    /// nothing more read. Readers that count nothing use `next`, which this leaves as it was.
+    /// The next visible quad, its merge's work counted on `account` ([`SignedMerge::step`]).
+    /// The keys passed over (deleted ones, or the default graph's where it is left out) count
+    /// as much as the one handed on (REAS-2 fix check r1, R2-F1: a long deleted run can't be
+    /// drained unseen). The plain scan, the counted scan and a count all use it.
     #[inline]
-    pub(crate) fn next_visiting(
+    pub(crate) fn step_with(
         &mut self,
-        visit: &mut dyn FnMut(u64) -> bool,
+        account: &mut impl Account,
     ) -> Result<Option<EncodedQuad>, Stopped> {
         loop {
-            if !visit(1) {
-                return Err(Stopped);
-            }
-            let Some((key, sign)) = self.merge.next() else {
+            let Some((key, sign)) = self.merge.step(account)? else {
                 return Ok(None);
             };
-            #[cfg(test)]
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
@@ -920,6 +1071,59 @@ impl QuadScan<'_> {
             }
             return Ok(Some(quad));
         }
+    }
+
+    /// [`Iterator::next`], its work counted on `visit` before it is done, from the ledger
+    /// the scan's making started (REAS-3, sweeps SW005, SW007; fix check r1 F1). `Err` once
+    /// `visit` has stopped, and on every call after: nothing more is read. Readers that count
+    /// nothing use `next`.
+    #[inline]
+    pub(crate) fn next_counted(
+        &mut self,
+        visit: Visitor<'_>,
+    ) -> Result<Option<EncodedQuad>, Stopped> {
+        let mut ledger = Ledger::new(visit);
+        (ledger.left, ledger.run) = self.ledger;
+        let next = self.step_with(&mut ledger);
+        self.ledger = (ledger.left, ledger.run);
+        next
+    }
+
+    /// This scan as an iterator for a counted read: [`Self::next_counted`]'s quads, ending
+    /// where it ends or stops (the stop is the visitor's to tell: `visit(0)`).
+    pub(crate) fn counted<'v>(self, visit: Visitor<'v>) -> CountedScan<'a, 'v> {
+        CountedScan { scan: self, visit }
+    }
+}
+
+impl Iterator for QuadScan<'_> {
+    type Item = EncodedQuad;
+
+    /// [`QuadScan::step_with`], counting nothing. A scan that a counted read stopped reads as
+    /// ended here ([`SignedMerge`]'s iterator).
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step_with(&mut Free).unwrap_or(None)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.merge.remaining()))
+    }
+}
+
+/// [`QuadScan::counted`]: [`QuadScan::next_counted`]'s quads, the visitor asked once per
+/// run of the scan's ledger, not once per step.
+pub(crate) struct CountedScan<'a, 'v> {
+    scan: QuadScan<'a>,
+    visit: Visitor<'v>,
+}
+
+impl Iterator for CountedScan<'_, '_> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.scan.next_counted(self.visit).ok().flatten()
     }
 }
 

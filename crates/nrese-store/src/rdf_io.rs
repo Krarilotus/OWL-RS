@@ -8,9 +8,13 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
-use nrese_rdf::{GraphName, Quad, Triple};
-use nrese_rdf_io::{RdfFormat, RdfParser, RdfSerializer};
+use nrese_exec::{ChargedVec, Reservation};
+use nrese_rdf::{
+    GraphName, GraphNameRef, NamedNodeRef, NamedOrBlankNodeRef, Quad, QuadRef, TermRef, Triple,
+};
+use nrese_rdf_io::{QuadParser, RdfFormat, RdfParser, RdfSerializer};
 use url::Url;
 
 use crate::error::{StoreError, StoreResult};
@@ -54,21 +58,59 @@ fn parser(
     }
 }
 
-/// Parses a single-graph payload into quads of `graph`. Named-graph content in the payload
-/// (possible in N-Quads, TriG and JSON-LD) is an error.
-pub(crate) fn parse_graph(
+// Uploads are read once, as they go: each statement goes to its consumer borrowed from the
+// parser's buffers (a write's transaction, a validation's speculative one, a check) and is
+// gone before the next. A write that fails part-way is discarded with its transaction; the
+// new terms it interned stay in the shared dictionary (stated limit L3 for v1.5, dictionary
+// lifecycle contract). A document's statements are never kept as owned copies uncharged:
+// with one long namespace and many short statements, those copies cost thousands of times
+// the document (the upload sizing). A caller that must keep them gets [`ChargedQuads`].
+
+/// Gives `each` every quad of `quads` in order, borrowed until the next; the first error,
+/// the parser's or `each`'s, ends it.
+fn each_of<R: Read>(
+    mut quads: QuadParser<'_, R>,
+    mut each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
+) -> StoreResult<()> {
+    while let Some(quad) = quads.next_ref() {
+        each(quad?)?;
+    }
+    Ok(())
+}
+
+/// The quads of a single-graph payload, in `graph`, to `each`. Named-graph content in the
+/// payload (possible in N-Quads, TriG and JSON-LD) is an error.
+pub(crate) fn each_graph_quad(
+    format: GraphResultFormat,
+    base_iri: Option<&str>,
+    payload: &[u8],
+    graph: GraphName,
+    blank_nodes: BlankNodes,
+    each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let quads = parser(format.rdf_format(), base_iri, blank_nodes)?
+        .without_named_graphs()
+        .with_default_graph(graph)
+        .for_slice(payload);
+    each_of(quads, each)
+}
+
+/// [`each_graph_quad`] in one pass, from a reader: for a consumer whose interned terms go
+/// with its engine when it fails (the startup preload: a store that fails to open drops its
+/// engine).
+pub(crate) fn each_graph_quad_once(
     format: GraphResultFormat,
     base_iri: Option<&str>,
     payload: impl Read,
     graph: GraphName,
     blank_nodes: BlankNodes,
-) -> StoreResult<Vec<Quad>> {
-    parser(format.rdf_format(), base_iri, blank_nodes)?
+    each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let quads = parser(format.rdf_format(), base_iri, blank_nodes)?
         .without_named_graphs()
         .with_default_graph(graph)
-        .for_reader(payload)
-        .map(|quad| quad.map_err(StoreError::from))
-        .collect()
+        .for_reader(payload);
+    each_of(quads, each)
 }
 
 /// The store graph `graph` names: the default graph for another store's name for it
@@ -85,46 +127,131 @@ pub(crate) fn stored_graph(graph: GraphName) -> GraphName {
     }
 }
 
+/// [`stored_graph`] of a borrowed name, for a quad read as it goes.
+pub(crate) fn stored_graph_ref(graph: GraphNameRef<'_>) -> GraphNameRef<'_> {
+    match graph {
+        GraphNameRef::NamedNode(name)
+            if nrese_sparql::compat::names_default_graph(name.as_str()) =>
+        {
+            GraphNameRef::DefaultGraph
+        }
+        _ => graph,
+    }
+}
+
 /// `quad` in the graph the store keeps it in ([`stored_graph`]).
 pub(crate) fn stored(mut quad: Quad) -> Quad {
     quad.graph_name = stored_graph(quad.graph_name);
     quad
 }
 
-/// Parses a request payload into quads, in the graphs it names as written (the default graph
-/// for triples): a protocol can still tell a graph left out from one named, an alias of the
-/// default graph included. Where the quads are placed, they pass through [`stored`]. Fresh
-/// blank nodes.
+/// The quads of a request payload, in the graphs it names as written (the default graph for
+/// triples): a protocol can still tell a graph left out from one named, an alias of the
+/// default graph included; where they are placed, they pass through [`stored_graph_ref`].
+/// Each to `each`.
+pub(crate) fn each_payload_quad(
+    format: RdfFormat,
+    base_iri: Option<&str>,
+    payload: &[u8],
+    blank_nodes: BlankNodes,
+    each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let quads = parser(format, base_iri, blank_nodes)?.for_slice(payload);
+    each_of(quads, each)
+}
+
+/// The quads of a request payload that must be kept (a repository's configuration, read in
+/// several passes), in the graphs it names, with fresh blank nodes: each charged to
+/// `memory` before it is copied, its slot and every string and triple term it owns. A
+/// refusal is a memory error, with nothing copied past it. The graphs are as written.
 pub fn parse_payload(
     format: GraphResultFormat,
     base_iri: Option<&str>,
     payload: &[u8],
-) -> StoreResult<Vec<Quad>> {
-    parser(format.rdf_format(), base_iri, BlankNodes::Fresh)?
-        .for_slice(payload)
-        .map(|quad| quad.map_err(StoreError::from))
-        .collect()
+    memory: &nrese_exec::Envelope,
+) -> StoreResult<ChargedQuads> {
+    let budget = Arc::new(memory.part());
+    let mut kept = ChargedQuads {
+        quads: ChargedVec::new(Arc::clone(&budget)),
+        terms: Reservation::new(budget),
+    };
+    each_payload_quad(
+        format.rdf_format(),
+        base_iri,
+        payload,
+        BlankNodes::Fresh,
+        |quad| {
+            kept.terms.charge(owned_quad_bytes(quad))?;
+            kept.quads.push(quad.into_owned())?;
+            Ok(())
+        },
+    )?;
+    Ok(kept)
 }
 
-/// [`parse_payload`], with the blank nodes as labelled in the payload: they refer to the
-/// store's (RDF4J's `preserveNodeId`).
-pub fn parse_payload_preserving_blank_nodes(
-    format: GraphResultFormat,
-    base_iri: Option<&str>,
-    payload: &[u8],
-) -> StoreResult<Vec<Quad>> {
-    parser(format.rdf_format(), base_iri, BlankNodes::AsWritten)?
-        .for_slice(payload)
-        .map(|quad| quad.map_err(StoreError::from))
-        .collect()
+/// Quads kept with their memory charged: their slots, and the strings and triple terms they
+/// own. Read them through the slice; they can't be taken out uncharged or cloned. Dropped,
+/// the quads are freed before their charge is released.
+#[derive(Debug)]
+pub struct ChargedQuads {
+    /// Before `terms`: the quads (and their strings) are freed first.
+    quads: ChargedVec<Quad>,
+    terms: Reservation,
 }
 
-/// Parses a dataset payload (N-Quads) into quads, in the graphs [`stored`] keeps them in.
-pub(crate) fn parse_dataset(format: RdfFormat, payload: &[u8]) -> StoreResult<Vec<Quad>> {
-    parser(format, None, BlankNodes::Fresh)?
-        .for_slice(payload)
-        .map(|quad| quad.map(stored).map_err(StoreError::RdfParse))
-        .collect()
+impl std::ops::Deref for ChargedQuads {
+    type Target = [Quad];
+
+    fn deref(&self) -> &[Quad] {
+        &self.quads
+    }
+}
+
+/// The heap bytes an owned copy of `quad` allocates, at most: each IRI, label, literal
+/// value, language and datatype as many bytes as its text (an owned copy of a `&str`
+/// allocates exactly its length), each triple term its box and its own. Saturating: a sum
+/// past the address space is one the charge refuses.
+fn owned_quad_bytes(quad: QuadRef<'_>) -> usize {
+    let graph = match quad.graph_name {
+        GraphNameRef::DefaultGraph => 0,
+        GraphNameRef::NamedNode(node) => node.as_str().len(),
+        GraphNameRef::BlankNode(node) => node.as_str().len(),
+    };
+    owned_triple_bytes(quad.subject, quad.predicate, quad.object).saturating_add(graph)
+}
+
+fn owned_triple_bytes(
+    subject: NamedOrBlankNodeRef<'_>,
+    predicate: NamedNodeRef<'_>,
+    object: TermRef<'_>,
+) -> usize {
+    let subject = match subject {
+        NamedOrBlankNodeRef::NamedNode(node) => node.as_str().len(),
+        NamedOrBlankNodeRef::BlankNode(node) => node.as_str().len(),
+    };
+    subject
+        .saturating_add(predicate.as_str().len())
+        .saturating_add(owned_term_bytes(object))
+}
+
+fn owned_term_bytes(term: TermRef<'_>) -> usize {
+    match term {
+        TermRef::NamedNode(node) => node.as_str().len(),
+        TermRef::BlankNode(node) => node.as_str().len(),
+        // An upper bound: a simple literal's datatype is no allocation of its own.
+        TermRef::Literal(literal) => literal
+            .value()
+            .len()
+            .saturating_add(literal.language().map_or(0, str::len))
+            .saturating_add(literal.datatype().as_str().len()),
+        TermRef::Triple(triple) => {
+            std::mem::size_of::<Triple>().saturating_add(owned_triple_bytes(
+                (&triple.subject).into(),
+                (&triple.predicate).into(),
+                (&triple.object).into(),
+            ))
+        }
+    }
 }
 
 pub(crate) fn serialize_triples(

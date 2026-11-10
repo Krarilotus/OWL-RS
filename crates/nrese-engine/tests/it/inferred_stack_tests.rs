@@ -209,7 +209,7 @@ fn remove_matching_retracts_asserted_statements_only() {
     let mut tx = engine.transaction();
     tx.insert_encoded(triple(1, 2, 3).in_default_graph());
     tx.insert_inferred(triple(1, 2, 4));
-    assert_eq!(tx.remove_matching(&QuadPattern::all()), 1);
+    assert_eq!(tx.remove_matching(&QuadPattern::all()).unwrap(), 1);
     tx.commit().expect("commit");
     let snapshot = engine.snapshot();
     assert_eq!(MODELS.map(|model| snapshot.len_in(model)), [1, 0, 1]);

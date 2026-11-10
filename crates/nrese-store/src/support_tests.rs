@@ -382,7 +382,7 @@ fn the_closure_after_a_change_counts_the_removed_facts_it_passes_over() {
     let snapshot = store.engine().snapshot();
     let removed: Vec<Triple> = (0..n).map(|i| [i, 5, i]).collect();
     let after = After {
-        snapshot: &snapshot,
+        snapshot: snapshot.counted(),
         removed: &removed,
     };
     let fired = std::sync::atomic::AtomicBool::new(false);
@@ -417,7 +417,7 @@ fn the_closure_after_a_change_estimates_within_a_run_of_the_stop() {
     let snapshot = store.engine().snapshot();
     let removed: Vec<Triple> = (0..n).map(|i| [i, 5, i]).collect();
     let after = After {
-        snapshot: &snapshot,
+        snapshot: snapshot.counted(),
         removed: &removed,
     };
     let asks = std::sync::atomic::AtomicUsize::new(0);

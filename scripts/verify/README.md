@@ -3,7 +3,7 @@
 `verify.py` drives a real nrese-server through a scenario file and keeps the evidence: how agents
 prove HTTP-level behaviour instead of claiming it. The skill (when and where to run it, how to
 cite it): [../../.claude/skills/verify/SKILL.md](../../.claude/skills/verify/SKILL.md). The phases,
-the commands and the exit codes: `verify.py`'s docstring (`python scripts/verify/verify.py -h`).
+the commands and the exit codes: `verify.py`'s docstring (`uv run python scripts/verify/verify.py -h`).
 
 | File | What |
 |---|---|
@@ -17,6 +17,17 @@ the commands and the exit codes: `verify.py`'s docstring (`python scripts/verify
 | `scenarios/` | Scenarios that prove something about today's server |
 
 Tests: `benches/suite/tests/test_verify.py` (the suite's contracts; no server built).
+
+## Choose a scenario
+
+Run an existing scenario before you write a new one. Each file's `description` says what it proves, and where that's specified.
+
+| To show | Scenario |
+|---|---|
+| A repository's lifecycle: create, configure, restart, remove, and the catalog's listings | `scenarios/repository-lifecycle.toml` |
+| RDF4J transactions and their isolation levels | `scenarios/rdf4j-isolation.toml` |
+| The `NRESE-Completeness` header under `owl2-dl` | `scenarios/owl2-dl-completeness.toml` |
+| Graph Store Protocol CRUD on a named graph | `scenarios/gsp-named-graph.toml` |
 
 ## Scenario files
 

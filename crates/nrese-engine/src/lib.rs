@@ -32,17 +32,19 @@ mod mapped;
 pub mod memory;
 pub mod quad;
 pub mod term;
-#[cfg(test)]
-mod witness;
+pub mod visit;
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub mod witness;
 
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
 pub use engine::{
-    Applied, AssertedIdentity, BulkLoad, BulkMode, CommitSummary, Content, CorpusTuning, Count,
-    DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats, EqualityClasses, GroupCounts,
-    HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch, LogExpectation,
-    PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation, ScanColumns, SearchRefused,
-    Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
+    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitSummary, Content,
+    CorpusTuning, Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig,
+    EngineStats, EqualityClasses, Finished, GroupCounts, HeavyGroups, ImageInfo, InferredMask,
+    InferredSubset, LogBatch, LogExpectation, NoteError, OwnState, PrivateTransaction, ProbeCursor,
+    ReadModel, Rematerialisation, ScanColumns, SearchRefused, Seek, SharedState, Snapshot,
+    SnapshotIdentity, TextCorpusStats, TextScope, Transaction, WriterHeld,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;
@@ -55,3 +57,4 @@ pub use term::{
     Dictionary, DictionaryStats, Placement, StringScan, StringTest, TermId, TermKind, TermView,
     TextMatch, TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
 };
+pub use visit::{Stopped, Visitor};
