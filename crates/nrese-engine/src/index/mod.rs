@@ -850,10 +850,11 @@ impl IndexVersion {
     }
 
     /// An estimate of the groups [`Self::group_counts`] finds in the runs large enough to be
-    /// walked in parts ([`Self::group_walk_size`]'s): each such run's keys over its first
-    /// group's, found as the serial walk finds it, by a search from the range's first key
-    /// ([`PackedKeys::first_group_len`]). Exact where the groups are of one size; a first
-    /// group larger than the rest underestimates.
+    /// walked in parts ([`Self::group_walk_size`]'s): each such run's keys over the smaller of
+    /// its first and last groups, each found by one search from that end of the range
+    /// ([`PackedKeys::first_group_len`], [`PackedKeys::last_group_len`]). Exact where the
+    /// groups are of one size. A large group at one end is offset by a small one at the
+    /// other; only where both ends hold groups larger than the rest does it underestimate.
     pub(crate) fn parted_groups(&self, plan: &AccessPlan, position: usize) -> usize {
         let Some(adapted) = self.layout.adapt(plan) else {
             return 0;
@@ -861,7 +862,7 @@ impl IndexVersion {
         let position = if adapted.permutation == plan.permutation {
             position
         } else if position == 0 {
-            return 1; // one group: the default graph's (see `group_counts_on`)
+            return 0; // no run in parts: one group, the default graph's (`group_walk_size`)
         } else {
             position - 1
         };
@@ -871,8 +872,9 @@ impl IndexVersion {
             if end - start < 2 * GROUP_PART {
                 return groups;
             }
-            let first = perm.keys.first_group_len(start, end, position).max(1);
-            groups.saturating_add((end - start).div_ceil(first))
+            let first = perm.keys.first_group_len(start, end, position);
+            let last = perm.keys.last_group_len(start, end, position);
+            groups.saturating_add((end - start).div_ceil(first.min(last).max(1)))
         })
     }
 

@@ -584,7 +584,7 @@ fn a_walk_with_room_for_its_parts_peak_runs_in_parts() {
 }
 
 /// A walk whose large runs hold few groups is walked serially, with room for its parts all
-/// the same: up to `SERIAL_GROUPS` by the estimate (each run's keys over its first group's),
+/// the same: up to `SERIAL_GROUPS` by the estimate (each run's keys over its smaller end group's),
 /// and in parts past it. Either way it answers every group's count.
 #[test]
 fn a_walk_of_few_groups_is_walked_serially() {
@@ -596,12 +596,21 @@ fn a_walk_of_few_groups_is_walked_serially() {
     assert!(super::walks_in_parts(&ample, rows as usize, 2, || {
         super::SERIAL_GROUPS + 1
     }));
-    // Four groups of equal size, then groups of two keys: estimated exactly. Each row's
-    // subject, the estimate, and whether the walk runs in parts.
+    // Four groups of equal size, then groups of two keys: estimated exactly. A first or a
+    // last group of half the rows before or after single keys: estimated from the smaller end
+    // group, so a skewed walk of many groups keeps its parts. Each row's subject, the
+    // estimate, and whether the walk runs in parts.
+    const PART: u64 = super::GROUP_PART as u64;
     type Shape = (fn(u64) -> u64, usize, bool);
-    let shapes: [Shape; 2] = [
-        (|i| 1000 + i * 4 / (2 * super::GROUP_PART as u64), 4, false),
+    let shapes: [Shape; 4] = [
+        (|i| 1000 + i * 4 / (2 * PART), 4, false),
         (|i| 1000 + i / 2, super::GROUP_PART, true),
+        (
+            |i| 1000 + i.saturating_sub(PART),
+            2 * super::GROUP_PART,
+            true,
+        ),
+        (|i| 1000 + i.min(PART), 2 * super::GROUP_PART, true),
     ];
     for (subject, groups, in_parts) in shapes {
         let (version, plan) = subject_walk(rows, subject);
@@ -640,18 +649,21 @@ fn a_walk_charges_at_most_its_bound() {
         let (version, plan) = subject_walk(rows, subject);
         let (keys, parts) = version.group_walk_size(&plan, 1);
         assert_eq!((keys, parts > 0), (rows as usize, in_parts), "{rows} rows");
-        let budget = nrese_exec::Budget::new(64 << 20);
-        let mut counts = ChargedVec::new(&budget);
-        version
-            .group_counts(&plan, 1, &mut counts, &budget)
-            .expect("64 MiB fits the walk");
-        assert!(budget.peak() > 0);
-        assert!(
-            budget.peak() <= super::group_walk_peak(keys, parts),
-            "{rows} rows: peak {} over the bound {}",
-            budget.peak(),
-            super::group_walk_peak(keys, parts)
-        );
+        // Serially and, where the range has parts, in parts: the decision picks either.
+        for walk in [false, true].into_iter().filter(|&walk| !walk || in_parts) {
+            let budget = nrese_exec::Budget::new(64 << 20);
+            let mut counts = ChargedVec::new(&budget);
+            version
+                .group_counts_on(&plan, 1, &mut counts, &budget, walk)
+                .expect("64 MiB fits the walk");
+            assert!(budget.peak() > 0);
+            assert!(
+                budget.peak() <= super::group_walk_peak(keys, parts),
+                "{rows} rows, in parts {walk}: peak {} over the bound {}",
+                budget.peak(),
+                super::group_walk_peak(keys, parts)
+            );
+        }
     }
 }
 

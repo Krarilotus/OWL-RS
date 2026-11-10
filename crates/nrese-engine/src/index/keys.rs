@@ -938,8 +938,10 @@ impl PackedKeys {
     }
 
     /// The number of keys in the first group of the keys `start..end` at `position` (the
-    /// run [`Self::groups`] reports first): one gallop over the blocks' first keys and the
-    /// block where the value changes, decoded. Zero for an empty range.
+    /// run [`Self::groups`] reports first), found as that walk finds it: at most three block
+    /// decodes (a start's block from the start, the last block that begins with the value,
+    /// the next) and one gallop over the blocks' first keys, never a scan of the range. Zero
+    /// for an empty range.
     pub(crate) fn first_group_len(&self, start: usize, end: usize, position: usize) -> usize {
         if start >= end {
             return 0;
@@ -968,6 +970,49 @@ impl PackedKeys {
             i = block_end;
         }
         end - start
+    }
+
+    /// The number of keys in the last group of the keys `start..end` at `position` (the run
+    /// [`Self::groups`] reports last): a gallop down over the blocks' first keys to the
+    /// lowest block after `start` that begins with the last key's value (every key from it
+    /// to `end` has that value), then one block decoded, the one before it or the last
+    /// key's own. Zero for an empty range.
+    pub(crate) fn last_group_len(&self, start: usize, end: usize, position: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        let value = self.get(end - 1)[position];
+        let begins = |b: usize| b * BLOCK > start && self.firsts[b][position] == value;
+        let mut block = (end - 1) / BLOCK;
+        if begins(block) {
+            let mut step = 1;
+            while step <= block && begins(block - step) {
+                block -= step;
+                step *= 2;
+            }
+            while step > 1 {
+                step /= 2;
+                if step <= block && begins(block - step) {
+                    block -= step;
+                }
+            }
+            // The group starts in the block before, or where this one does.
+            block -= 1;
+        }
+        let from = start.max(block * BLOCK);
+        let to = end.min((block + 1) * BLOCK);
+        let mut column = Vec::with_capacity(BLOCK);
+        self.decode_column(
+            block,
+            from - block * BLOCK,
+            to - block * BLOCK,
+            position,
+            &mut column,
+        );
+        match column.iter().rposition(|&v| v != value) {
+            Some(k) => end - (from + k + 1),
+            None => end - from,
+        }
     }
 
     /// Appends, for each of `positions`, the key component at that position of the keys
@@ -1320,11 +1365,12 @@ mod tests {
         }
     }
 
-    /// The first group's length is that of the first run of equal values, wherever the
-    /// range starts and ends: on a block's first key or inside a block, in a group of a few
-    /// keys or one spanning many blocks of one value, or a range within one group.
+    /// The first and last groups' lengths are those of the first and last runs of equal
+    /// values, wherever the range starts and ends: on a block's first key or inside a block,
+    /// in a group of a few keys or one spanning many blocks of one value, or a range within
+    /// one group.
     #[test]
-    fn the_first_group_is_the_first_run_of_equal_values() {
+    fn the_end_groups_are_the_first_and_last_runs_of_equal_values() {
         let mut state = 29;
         let long: Vec<Key> = (0..20_000u64)
             .map(|i| [(1 << TAG_SHIFT) | (i / 3000), 0, i, 0])
@@ -1336,6 +1382,9 @@ mod tests {
                 (BLOCK, keys.len()),
                 (2999, 6100),
                 (3000, 3001),
+                (0, 6000),
+                (0, 9000 + 3 * BLOCK + 5),
+                (5 * BLOCK + 7, 12_000),
             ];
             let random = (0..200).map(|_| {
                 let a = (rng(&mut state) as usize) % (keys.len() + 1);
@@ -1351,6 +1400,19 @@ mod tests {
                     packed.first_group_len(start, end, 0),
                     expected,
                     "{start}..{end}"
+                );
+                let expected = match start < end {
+                    true => keys[start..end]
+                        .iter()
+                        .rev()
+                        .take_while(|k| k[0] == keys[end - 1][0])
+                        .count(),
+                    false => 0,
+                };
+                assert_eq!(
+                    packed.last_group_len(start, end, 0),
+                    expected,
+                    "last of {start}..{end}"
                 );
             }
         }
