@@ -29,6 +29,7 @@ use rayon::prelude::*;
 
 use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
+use crate::visit::Account;
 
 /// How index blocks are encoded when they are built (`store.index_encoding`). Reading
 /// takes either, so a store can switch: blocks built after the switch take the new one.
@@ -76,6 +77,18 @@ fn current_encoding() -> IndexEncoding {
 
 /// Keys per block.
 pub(crate) const BLOCK: usize = 128;
+
+/// The most probes a binary search inside one block makes.
+const BLOCK_PROBES: u64 = (usize::BITS - BLOCK.leading_zeros()) as u64;
+
+/// A search's key comparison, `outcome`, counted where it is made in a build with the work
+/// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
+#[inline(always)]
+fn compared(outcome: bool) -> bool {
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    crate::witness::add(crate::witness::Site::SearchWork, 1);
+    outcome
+}
 
 const TAG_SHIFT: u32 = 60;
 const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
@@ -982,6 +995,41 @@ impl PackedKeys {
         (start, self.end_from(start, high))
     }
 
+    /// [`Self::range`], each of its two searches counted on `account` before it is made:
+    /// `None` once the account has stopped (REAS-3a fix check r1 F1, design attack r2 E2: a
+    /// search finding nothing is counted too).
+    pub(crate) fn range_counted(
+        &self,
+        low: &Key,
+        high: &Key,
+        account: &mut impl Account,
+    ) -> Option<(usize, usize)> {
+        let start = self.bound_counted(low, account)?;
+        if start == self.len {
+            // `end_from` compares nothing here.
+            return Some((start, start));
+        }
+        account
+            .take_cost(|| 3 * self.levels() + BLOCK_PROBES)
+            .then(|| (start, self.end_from(start, high)))
+    }
+
+    /// The lower bound of `key` over all the keys, counted on `account` before it is searched
+    /// (the run it reads counted with it): `None` once the account has stopped.
+    pub(crate) fn bound_counted(&self, key: &Key, account: &mut impl Account) -> Option<usize> {
+        account
+            .take_cost(|| self.levels() + BLOCK_PROBES + 1)
+            .then(|| self.bound_in(0, self.len, key, false))
+    }
+
+    /// The most comparisons a search over the blocks' first keys makes, one per level of a
+    /// binary search over them plus its last: a bound search makes one such search and at most
+    /// [`BLOCK_PROBES`] probes inside a block, the range end three (its gallop, the search
+    /// between the gallop's last probes and its bound's) and the probes. At most 65.
+    fn levels(&self) -> u64 {
+        u64::from(usize::BITS - self.firsts.len().leading_zeros()) + 1
+    }
+
     /// [`Self::range`] for a `low` not below the key at `from - 1`: a finger search from
     /// `from` ([`Self::bound_from`]) instead of one from the root. Probes in ascending
     /// order then cost O(log d) for a range d blocks on, not O(log n) each.
@@ -1002,12 +1050,13 @@ impl PackedKeys {
         let block = from / BLOCK;
         // Blocks after `block` whose first key is below `key`: gallop to a failing one.
         let (mut below, mut step) = (block, 1);
-        while below + step < blocks && self.firsts[below + step] < *key {
+        while below + step < blocks && compared(self.firsts[below + step] < *key) {
             below += step;
             step *= 2;
         }
         let until = (below + step).min(blocks);
-        let failing = below + 1 + self.firsts[below + 1..until].partition_point(|k| k < key);
+        let failing =
+            below + 1 + self.firsts[below + 1..until].partition_point(|k| compared(k < key));
         let start = if failing - 1 == block {
             from
         } else {
@@ -1026,12 +1075,12 @@ impl PackedKeys {
         let blocks = self.firsts.len();
         let (mut from, mut step) = (start / BLOCK + 1, 1);
         // Blocks before `from` start at or below `high` (or hold `start`).
-        while from + step - 1 < blocks && self.firsts[from + step - 1] <= *high {
+        while from + step - 1 < blocks && compared(self.firsts[from + step - 1] <= *high) {
             from += step;
             step *= 2;
         }
         let until = (from + step - 1).min(blocks);
-        let failing = from + self.firsts[from..until].partition_point(|k| k <= high);
+        let failing = from + self.firsts[from..until].partition_point(|k| compared(k <= high));
         self.bound_in(start, (failing * BLOCK).min(self.len), high, true)
     }
 
@@ -1043,7 +1092,7 @@ impl PackedKeys {
         if start >= end {
             return start;
         }
-        let below = |k: &Key| if inclusive { k <= key } else { k < key };
+        let below = |k: &Key| compared(if inclusive { k <= key } else { k < key });
         let (first_block, last_block) = (start / BLOCK, (end - 1) / BLOCK);
         let failing =
             first_block + 1 + self.firsts[first_block + 1..=last_block].partition_point(below);
@@ -1053,6 +1102,7 @@ impl PackedKeys {
         let base = block * BLOCK;
         let (mut low, mut high) = (start.max(base), end.min(failing * BLOCK));
         while low < high {
+            compared(true);
             let mid = low + (high - low) / 2;
             let mut ordering = std::cmp::Ordering::Equal;
             for (c, &wanted) in key.iter().enumerate() {

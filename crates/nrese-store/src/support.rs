@@ -46,7 +46,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hashbrown::{HashMap, HashSet};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{
-    EncodedQuad, GraphSelector, InferredMask, QuadPattern, ReadModel, Snapshot, TermId, Transaction,
+    CountedSnapshot, EncodedQuad, GraphSelector, InferredMask, QuadPattern, ReadModel, Snapshot,
+    TermId, Transaction,
 };
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
@@ -444,13 +445,14 @@ impl Closure {
 /// Where `snapshot` asserts facts, its graphs numbered by `graphs` (`index`, sorted by graph,
 /// the other way): read from the snapshot as asked, no list made.
 struct InSnapshot<'s> {
-    snapshot: &'s Snapshot,
+    snapshot: &'s CountedSnapshot,
     graphs: &'s [TermId],
     index: &'s [(TermId, u32)],
 }
 
 /// Store reads the update calls back: the call counted before its lookup, then each quad
-/// read, on the reading task's poller (REAS-2, sweep M14; sol-loop r2 S5).
+/// read, on the reading task's poller (REAS-2, sweep M14; sol-loop r2 S5), and the engine's
+/// work below them (REAS-3, sweep SW022).
 impl Graphs for InSnapshot<'_> {
     fn each(
         &self,
@@ -461,10 +463,13 @@ impl Graphs for InSnapshot<'_> {
         if poll.tick() {
             return Err(ReadStopped);
         }
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
-        {
+        let reads = |n| poll.visit(n);
+        for quad in self.snapshot.quads(
+            ReadModel::Asserted,
+            &pattern(fact, GraphSelector::Any),
+            &reads,
+        ) {
+            let quad = quad?;
             if poll.tick() {
                 return Err(ReadStopped);
             }
@@ -477,12 +482,14 @@ impl Graphs for InSnapshot<'_> {
         if poll.tick() {
             return Err(ReadStopped);
         }
-        Ok(self.graphs.get(graph as usize).is_some_and(|&id| {
-            self.snapshot.exists_in(
-                ReadModel::Asserted,
-                &pattern(fact, GraphSelector::Exact(id)),
-            )
-        }))
+        let Some(&id) = self.graphs.get(graph as usize) else {
+            return Ok(false);
+        };
+        self.snapshot.exists(
+            ReadModel::Asserted,
+            &pattern(fact, GraphSelector::Exact(id)),
+            &|n| poll.visit(n),
+        )
     }
 }
 
@@ -666,9 +673,10 @@ impl SupportSets {
         let graphs = graphs_in_order(snapshot, &self.graphs, kept, working)?;
         let index = index_of(&graphs, working)?;
         // Store reads the update calls back, counted on the reading task's poller
-        // ([`InSnapshot`]'s `Graphs`).
+        // ([`InSnapshot`]'s `Graphs`), the engine's work in them too (REAS-3).
+        let counted = snapshot.counted();
         let graphs_of = InSnapshot {
-            snapshot,
+            snapshot: &counted,
             graphs: &graphs,
             index: &index,
         };
@@ -676,10 +684,11 @@ impl SupportSets {
             if poll.tick() {
                 return Err(ReadStopped);
             }
-            Ok(
-                snapshot.exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any))
-                    || self.axioms.binary_search(&fact).is_ok(),
-            )
+            Ok(counted.exists(
+                ReadModel::Materialised,
+                &pattern(fact, GraphSelector::Any),
+                &|n| poll.visit(n),
+            )? || self.axioms.binary_search(&fact).is_ok())
         };
         let following = Following::new(working);
         let cancelled = || following.cancelled();
@@ -694,7 +703,7 @@ impl SupportSets {
             }
         }
         let source = After {
-            snapshot,
+            snapshot: counted.clone(),
             removed: &removed,
         };
         // Lent from the pool for the whole update, not copied (fix check r2, C1.b residual):
@@ -734,13 +743,19 @@ impl SupportSets {
         // `snapshot` holds them (one read at a time, its working memory reserved).
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
-        // Each quad and graph probe counted on the query's cancellation (sweep M14): stopped,
-        // the answers mean nothing, and the loop below ends `Cancelled`.
+        // Each quad and graph probe counted on the query's cancellation (sweep M14), and the
+        // engine's work in them (REAS-3, sweep SW023): stopped, the answers mean nothing, and
+        // the loop below ends `Cancelled`.
+        let reads = |n| prep.visit(n);
         let starts = |fact: Triple, found: &Annotation| -> (bool, bool) {
             let [s, p, o] = fact.map(TermId::from_raw);
-            let holds = snapshot
-                .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
-                .take_while(|_| !prep.tick())
+            let holds = counted
+                .quads(
+                    ReadModel::Asserted,
+                    &pattern(fact, GraphSelector::Any),
+                    &reads,
+                )
+                .take_while(|quad| quad.is_ok() && !prep.tick())
                 .count();
             if found.is_empty() {
                 return (true, holds > 0);
@@ -748,7 +763,13 @@ impl SupportSets {
             let own = |graph: u32| {
                 !prep.tick()
                     && graphs.get(graph as usize).is_some_and(|&graph| {
-                        snapshot.contains_in(ReadModel::Asserted, &EncodedQuad::new(s, p, o, graph))
+                        counted
+                            .contains(
+                                ReadModel::Asserted,
+                                &EncodedQuad::new(s, p, o, graph),
+                                &reads,
+                            )
+                            .unwrap_or(false)
                     })
             };
             let own_sets = starts_with(
@@ -1032,8 +1053,9 @@ impl SupportSets {
             .chain(self.axioms.iter());
         let cancelled = || working.cancelled();
         let poll = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
+        let counted = snapshot.counted();
         for &fact in candidates {
-            match asserted_counted(snapshot, access, fact, &poll) {
+            match asserted_counted(snapshot, &counted, access, fact, &poll) {
                 None => return Err(Unavailable::Cancelled),
                 Some(Asserted::OutOfReach) => found.push(fact)?,
                 Some(_) => {}
@@ -1170,14 +1192,19 @@ impl SupportSets {
         let poll = Poller::new(stop).ok_or(Unavailable::Cancelled)?;
         // A probe its poller stopped ends the changes (fix check r1, rule 2: it read as "not
         // out of reach").
-        let out_of_reach = |view: &Snapshot, fact: Triple| -> Result<bool, Unavailable> {
-            let asserted = asserted_counted(view, access, fact, &poll);
+        let (counted_before, counted_now) = (before.counted(), snapshot.counted());
+        let out_of_reach = |view: &Snapshot,
+                            counted: &CountedSnapshot,
+                            fact: Triple|
+         -> Result<bool, Unavailable> {
+            let asserted = asserted_counted(view, counted, access, fact, &poll);
             Ok(asserted.ok_or(Unavailable::Cancelled)? == Asserted::OutOfReach)
         };
         let extra = |fact: Triple| -> Result<bool, Unavailable> {
             Ok((earlier.decide(fact, &visible_before) != Decision::Hidden
                 || self.decide(fact, &visible_now) != Decision::Hidden)
-                && (out_of_reach(before, fact)? || out_of_reach(snapshot, fact)?))
+                && (out_of_reach(before, &counted_before, fact)?
+                    || out_of_reach(snapshot, &counted_now, fact)?))
         };
         let mut any_extra = false;
         for &fact in poll.counted(changed.iter()) {
@@ -1199,8 +1226,14 @@ impl SupportSets {
             hide: ChargedVec::new(Arc::clone(working)),
             show: ChargedVec::new(Arc::clone(working)),
         };
+        let reads = |n| poll.visit(n);
+        let held = |view: &CountedSnapshot, quad: &EncodedQuad| {
+            view.contains(ReadModel::Inferred, quad, &reads)
+                .map_err(|ReadStopped| Unavailable::Cancelled)
+        };
         for &fact in changed.iter() {
-            // The fact's four store probes, counted before they are made (review r1 F4).
+            // The fact's four store probes, counted before they are made (review r1 F4), and
+            // each one's runs in the engine (REAS-3, sweep SW009).
             if poll.attempt(4) {
                 return Err(Unavailable::Cancelled);
             }
@@ -1211,22 +1244,13 @@ impl SupportSets {
                 false => Some(Decision::Hidden),
             };
             let (Some(was), Some(is)) = (
-                decided(
-                    earlier,
-                    &visible_before,
-                    before.contains_in(ReadModel::Inferred, &quad),
-                ),
-                decided(
-                    self,
-                    &visible_now,
-                    snapshot.contains_in(ReadModel::Inferred, &quad),
-                ),
+                decided(earlier, &visible_before, held(&counted_before, &quad)?),
+                decided(self, &visible_now, held(&counted_now, &quad)?),
             ) else {
                 return Ok(None);
             };
-            let present = snapshot.contains_in(ReadModel::Inferred, &quad);
-            let hidden_before =
-                before.contains_in(ReadModel::Inferred, &quad) && was == Decision::Hidden;
+            let present = held(&counted_now, &quad)?;
+            let hidden_before = held(&counted_before, &quad)? && was == Decision::Hidden;
             let visible = present && is == Decision::Shown;
             let hidden = present && !visible;
             if visible {
@@ -1387,13 +1411,23 @@ pub(crate) enum Asserted {
 /// One fact's answer, run to its end (an explanation's reader, a commit's report); loops
 /// over many facts use [`asserted_counted`].
 pub(crate) fn asserted(view: &impl ReadView, access: &GraphAccess, fact: Triple) -> Asserted {
-    asserted_counted(view, access, fact, &Poller::never()).expect("never stops")
+    let mut found = Asserted::Nowhere;
+    for quad in view.quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)) {
+        if access.allows_id(view, quad.graph) {
+            return Asserted::InReach;
+        }
+        found = Asserted::OutOfReach;
+    }
+    found
 }
 
-/// [`asserted`], counting the call and each asserting quad it reads on `poll`; `None` once
-/// that has stopped (REAS-2, sweep M15: a loop over facts, each read scanning its copies).
+/// [`asserted`] over `view` read through `counted` (the same snapshot, read counted),
+/// counting the call and each asserting quad it reads on `poll`, and the engine's work below
+/// them (REAS-3, sweep SW024); `None` once that has stopped (REAS-2, sweep M15: a loop over
+/// facts, each read scanning its copies).
 fn asserted_counted(
-    view: &impl ReadView,
+    view: &Snapshot,
+    counted: &CountedSnapshot,
     access: &GraphAccess,
     fact: Triple,
     poll: &Poller<'_>,
@@ -1402,7 +1436,13 @@ fn asserted_counted(
         return None;
     }
     let mut found = Asserted::Nowhere;
-    for quad in view.quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)) {
+    let reads = |n| poll.visit(n);
+    for quad in counted.quads(
+        ReadModel::Asserted,
+        &pattern(fact, GraphSelector::Any),
+        &reads,
+    ) {
+        let quad = quad.ok()?;
         if poll.tick() {
             return None;
         }
@@ -1451,7 +1491,9 @@ fn graphs_in_order(
 /// The closure after a change, and the facts it removed (an update's joins reach what
 /// was derived from them).
 struct After<'a> {
-    snapshot: &'a Snapshot,
+    /// Read only counted: the engine's work below each read on the reading task's poller
+    /// (REAS-3, sweeps SW025, SW026).
+    snapshot: CountedSnapshot,
     /// Sorted.
     removed: &'a [Triple],
 }
@@ -1469,10 +1511,16 @@ fn matches(bound: [Option<u64>; 3], fact: &Triple) -> bool {
 /// removed facts it looks at (REAS-2, sweep M13).
 impl Visits for After<'_> {
     fn visit(&self, bound: [Option<u64>; 3], _: Seg, visit: &mut Visit<'_, '_>) {
+        let poll = visit.poller();
+        let reads = |n| poll.visit(n);
         for quad in self
             .snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &bound_pattern(bound))
+            .quads(ReadModel::Materialised, &bound_pattern(bound), &reads)
         {
+            // Stopped: the scan's caller reads its poller as stopped.
+            let Ok(quad) = quad else {
+                return;
+            };
             if !visit.fact(triple(quad)) {
                 return;
             }
@@ -1501,17 +1549,21 @@ impl Visits for After<'_> {
             .count();
         // A count its stop cut short is `Err` (fix check r1, B9).
         probe.ended()?;
-        let stored = self
-            .snapshot
-            .estimate_in(ReadModel::Materialised, &bound_pattern(bound));
+        let stored =
+            self.snapshot
+                .estimate(ReadModel::Materialised, &bound_pattern(bound), &|n| {
+                    probe.visited(n)
+                })?;
         Ok(usize::try_from(stored).unwrap_or(usize::MAX) + removed)
     }
 
-    fn holds(&self, fact: Triple, _: Probe<'_, '_>) -> Result<bool, ReadStopped> {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, ReadStopped> {
         Ok(self.removed.binary_search(&fact).is_ok()
-            || self
-                .snapshot
-                .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any)))
+            || self.snapshot.exists(
+                ReadModel::Materialised,
+                &pattern(fact, GraphSelector::Any),
+                &|n| probe.visited(n),
+            )?)
     }
 }
 
@@ -2228,8 +2280,9 @@ impl Supports {
         // Each fact's read counted on the query's cancellation (sweep M15).
         let cancelled = || working.cancelled();
         let poll = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
+        let counted = snapshot.counted();
         for &fact in found.facts.iter() {
-            match asserted_counted(snapshot, access, fact, &poll) {
+            match asserted_counted(snapshot, &counted, access, fact, &poll) {
                 None => return Err(Unavailable::Cancelled),
                 Some(Asserted::OutOfReach) => {
                     let [s, p, o] = fact.map(TermId::from_raw);
@@ -2289,16 +2342,20 @@ impl Supports {
             scratch: &working.budget,
         };
         let closure = After {
-            snapshot,
+            snapshot: snapshot.counted(),
             removed: &[],
         };
-        // A store probe, one unit on the reading task's poller (REAS-2, sweep M16); `Err` once
-        // that has stopped (fix check r1, rule 2).
+        // A store probe, one unit on the reading task's poller (REAS-2, sweep M16), its work
+        // in the engine there too (REAS-3); `Err` once that has stopped (fix check r1, rule 2).
         let asserted = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
             if poll.tick() {
                 return Err(ReadStopped);
             }
-            Ok(snapshot.exists_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)))
+            closure.snapshot.exists(
+                ReadModel::Asserted,
+                &pattern(fact, GraphSelector::Any),
+                &|n| poll.visit(n),
+            )
         };
         // The candidates' own probes below, on the query's cancellation.
         let prep = Poller::new(&stop).ok_or(Unavailable::Cancelled)?;
@@ -2352,9 +2409,11 @@ impl Supports {
         };
         let mut updated = None;
         if let Some((earlier, touched)) = earlier {
-            // A store probe, one unit on the query's poller; `Err` once that has stopped, which
+            // A store probe, one unit on the query's poller, its work in the engine there too
+            // (REAS-3, the caller of sweep SW010/SW011); `Err` once that has stopped, which
             // ends the loop (fix check r2, R3-F3: "not in the closure" kept every later
             // touched fact as removed).
+            let counted = snapshot.counted();
             let in_closure = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
                 #[cfg(test)]
                 crate::witness::add(crate::witness::Site::FallbackProbe, 1);
@@ -2362,8 +2421,11 @@ impl Supports {
                     return Err(ReadStopped);
                 }
                 Ok(axioms.binary_search(&fact).is_ok()
-                    || snapshot
-                        .exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any)))
+                    || counted.exists(
+                        ReadModel::Materialised,
+                        &pattern(fact, GraphSelector::Any),
+                        &|n| poll.visit(n),
+                    )?)
             };
             let mut removed: Kept<Triple> =
                 ChargedVec::with_capacity(Arc::clone(working), touched.len())?;
@@ -2373,7 +2435,7 @@ impl Supports {
                 }
             }
             let after = After {
-                snapshot,
+                snapshot: counted.clone(),
                 removed: &removed,
             };
             let candidates = rederived_candidates(&after, &ground, &touched, limit, limits)
