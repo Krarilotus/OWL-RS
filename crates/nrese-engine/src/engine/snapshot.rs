@@ -180,6 +180,29 @@ fn boxed(size: usize) -> usize {
     size + 2 * std::mem::size_of::<usize>()
 }
 
+/// Whether [`Snapshot::pending_within`] takes the reference path whatever the room: only a
+/// test's, on its own thread, to measure what the reference needs (`pending_bound_tests`).
+mod reference {
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn only() -> bool {
+        ONLY.get()
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn only() -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod pending_bound_tests;
+
 /// A charge for memory masks and views keep, shared by every holder of it. The last holder
 /// takes the charge out of its box (freeing the box), drops its parts (the charges of what
 /// it keeps besides: the masks its runs come from, the snapshot it was made from), and
@@ -1092,6 +1115,15 @@ impl Snapshot {
     /// build engine-v2's uncharged path runs, its working memory included); a delta at or
     /// above the parallel threshold adds its exact charges as it builds. Once built, the
     /// bound's rest is released at once, and the reservation is the snapshot's.
+    ///
+    /// The bounds only where the budget's room, read once before anything is charged, covers
+    /// them with the fixed part (CR #237's rule, `IndexVersion::group_counts`); otherwise the
+    /// fixed part alone, and every delta charged exactly as it is built, the reference. So,
+    /// against a budget no one else draws from meanwhile, a build is refused only where the
+    /// reference would be, and no refusal is recorded ([`nrese_exec::Budget::refused`]) where
+    /// it answers (F1 of the dictionary's charged-build review: a bound charged up front
+    /// refused builds exact charging answers). A concurrent draw between the read and the
+    /// charge refuses the bounds: the reference then, that refusal recorded.
     pub(super) fn pending_within(
         &self,
         asserted: [&[EncodedQuad]; 2],
@@ -1102,26 +1134,35 @@ impl Snapshot {
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
         use std::mem::size_of;
         let version = &self.version;
+        let fixed = boxed(size_of::<Version>())
+            + version.asserted.runs_bytes(1)
+            + version.inferred.runs_bytes(1)
+            + 2 * boxed(size_of::<crate::index::run::Run>())
+            + Held::overhead(self.held.count());
         let bounds = [
             version.asserted.change_bound(asserted[0], asserted[1]),
             version.inferred.change_bound(inferred[0], inferred[1]),
         ];
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
-        held.charge(
-            boxed(size_of::<Version>())
-                + version.asserted.runs_bytes(1)
-                + version.inferred.runs_bytes(1)
-                + 2 * boxed(size_of::<crate::index::run::Run>())
-                + Held::overhead(self.held.count())
-                + bounds[0]
-                + bounds[1],
-        )?;
+        let all = fixed + bounds[0] + bounds[1];
+        let bounded = all > fixed
+            && !reference::only()
+            && budget.remaining() >= all
+            && held.charge(all).is_ok();
+        let bounds = match bounded {
+            true => bounds,
+            false => {
+                held.charge(fixed)?;
+                [0, 0]
+            }
+        };
         let (asserted, asserted_kept) = version.asserted.with_change_within(
             asserted[0],
             asserted[1],
             forms,
             budget,
             &mut held,
+            bounded,
         )?;
         let (inferred, inferred_kept) = match version.inferred.with_change_within(
             inferred[0],
@@ -1129,6 +1170,7 @@ impl Snapshot {
             forms,
             budget,
             &mut held,
+            bounded,
         ) {
             Ok(built) => built,
             Err(refused) => {

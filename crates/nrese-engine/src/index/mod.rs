@@ -295,8 +295,10 @@ impl IndexVersion {
     /// [`Self::with_delta_in`] charged to `held`, a reservation of `budget` (DUR-6): the list
     /// of runs made once (with the base's runs in the quad layout, shared and counted in
     /// `forms`, where the delta needs it, not charged: they are the store's). Below the
-    /// parallel threshold the delta's run is built as [`Run::from_delta`] builds it, within
-    /// the [`Self::change_bound`] the caller has charged to `held` first; at or above it,
+    /// parallel threshold, `bounded`, the delta's run is built as [`Run::from_delta`] builds
+    /// it, within the [`Self::change_bound`] the caller has charged to `held` first; not
+    /// `bounded`, with [`Run::from_delta_within`], every array charged to `held` before it is
+    /// made (the reference: refused only where exact charging is). At or above the threshold,
     /// with [`Run::from_delta_within_parallel`], its charge then taken into `held`. The new
     /// version and the bytes its run keeps of that bound (0 for a run charged exactly: `held`
     /// then holds exactly what it keeps), for the caller to release the rest of the bound
@@ -309,6 +311,7 @@ impl IndexVersion {
         forms: &Forms,
         budget: &Arc<nrese_exec::Budget>,
         held: &mut Reservation,
+        bounded: bool,
     ) -> Result<(Self, usize), BudgetExceeded> {
         let n = inserts.len() + deletes.len();
         if n == 0 {
@@ -316,6 +319,7 @@ impl IndexVersion {
         }
         let layout = self.layout_with(inserts, deletes);
         let (run, kept) = match Run::charged_exactly(n) {
+            false if !bounded => (Run::from_delta_within(layout, inserts, deletes, held)?, 0),
             false => {
                 let run = Run::from_delta(layout, inserts, deletes);
                 let kept = run.memory_bytes() as usize;
