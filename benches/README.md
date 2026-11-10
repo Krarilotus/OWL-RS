@@ -171,6 +171,7 @@ benches/
 | [oxigraph-comparison](oxigraph-comparison/README.md) | parsers, serialisers and evaluators against Oxigraph's | `cargo test`, `cargo run --bin bench` | `oxigraph-comparison/results/` | — |
 | perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool, on the perf lab's datasets the `lab-*` cases | `fast.py run --cases lab-…` | — | `baselines/perf-lab/*.json` (until 27 Sep 2026; `compare` reads them) |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
+| [term-reads-count](term-reads-count/src/lib.rs) | instructions and allocations per row of the engine's committed term reads and a transaction's pending deltas, A against B (a count case pending its registry kind; Linux, under `perf stat`) | `term-reads-count --shape … --op …`, `--count allocs` | the job's directory | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
 
 A case without an answer check times only that it ran: consult its checks before reading

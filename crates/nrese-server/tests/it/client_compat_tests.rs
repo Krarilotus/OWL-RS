@@ -127,8 +127,12 @@ async fn one_endpoint_serves_queries_and_updates_as_rdf4j_sends_them() -> TestRe
         // RDF4J asks for its Binary RDF first, and gets it.
         assert_eq!(content_type(&response), "application/x-binary-rdf");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-        let quads =
-            nrese_store::parse_payload(nrese_store::GraphResultFormat::BinaryRdf, None, &bytes)?;
+        let quads = nrese_store::parse_payload(
+            nrese_store::GraphResultFormat::BinaryRdf,
+            None,
+            &bytes,
+            &nrese_exec::Envelope::unlimited(),
+        )?;
         assert!(
             quads
                 .iter()

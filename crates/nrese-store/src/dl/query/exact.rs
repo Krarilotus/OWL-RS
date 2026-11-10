@@ -289,14 +289,6 @@ impl Ids {
     }
 }
 
-fn is_literal(t: u64) -> bool {
-    use nrese_engine::TermKind;
-    !matches!(
-        TermId::from_raw(t).kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-    )
-}
-
 /// The tests that decide one instantiated query: each ground atom not in L, and each
 /// tree of existential variables rolled up.
 fn tests_of(
@@ -378,7 +370,7 @@ pub(crate) fn ground_axiom(
     if Some(p) == ids.same_as {
         return Ok(Axiom::SameIndividual(vec![s, v]));
     }
-    if is_literal(v) {
+    if TermId::from_raw(v).kind().is_literal() {
         note_literal(o, snapshot, v);
         return Ok(Axiom::DataPropertyAssertion(p, s, v));
     }

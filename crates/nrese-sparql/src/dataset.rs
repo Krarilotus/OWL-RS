@@ -5,7 +5,7 @@
 //! SPARQL 1.1 §13.2, which keeps them apart (docs/ops/http-api.md, the owner's decision).
 
 use nrese_engine::TermId;
-use nrese_rdf::{GraphName, NamedOrBlankNodeRef, Term};
+use nrese_rdf::{GraphName, GraphNameRef, NamedOrBlankNodeRef, Term};
 use nrese_sparql_syntax::algebra::QueryDataset;
 
 use crate::results::QueryDatasetSpecification;
@@ -165,11 +165,11 @@ impl ResolvedDataset {
                 .iter()
                 .filter_map(|name| match name {
                     GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
-                    // Jena's name for the default graph (`compat`).
-                    GraphName::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                        Some(TermId::DEFAULT_GRAPH)
-                    }
-                    GraphName::NamedNode(n) => graph(n.as_ref().into()),
+                    // Another store's name for the default graph names it (`compat`).
+                    GraphName::NamedNode(n) => match crate::compat::graph_named(n) {
+                        GraphNameRef::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                        _ => graph(n.as_ref().into()),
+                    },
                     GraphName::BlankNode(b) => graph(b.as_ref().into()),
                 })
                 .collect();

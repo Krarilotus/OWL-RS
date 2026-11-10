@@ -31,7 +31,6 @@ use crate::query::{GraphResultFormat, QueryResultKind, SparqlQueryRequest};
 use crate::{
     CancellationToken, GraphTarget, GraphWriteRequest, ReadModel, ReadScope, ShaclValidation,
     ShaclValidationRequest, ShapesSource, StoreConfig, StoreError, StoreService, ValidatedGraphs,
-    parse_payload,
 };
 
 /// The protocol a draft-check request and reply follow.
@@ -240,7 +239,7 @@ fn store_with(graphs: &[Option<&str>], limits: &DraftLimits) -> Result<StoreServ
                 target: GraphTarget::DefaultGraph,
                 format: GraphResultFormat::NTriples,
                 base_iri: None,
-                payload: text.as_bytes().to_vec(),
+                payload: text.as_bytes().to_vec().into(),
                 replace: false,
             })
             .map_err(|error| failed(format!("an input is not valid N-Triples: {error}")))?;
@@ -257,17 +256,24 @@ fn check_shacl(
         .shapes
         .as_deref()
         .ok_or_else(|| failed("a SHACL check needs shapes"))?;
-    let quads = parse_payload(GraphResultFormat::NTriples, None, shapes.as_bytes())
-        .map_err(|error| failed(format!("the shapes are not valid N-Triples: {error}")))?;
-    let features: BTreeSet<&str> = quads
-        .iter()
-        .filter_map(|quad| {
-            UNSUPPORTED_SHACL
+    // The shapes' features, read as they go.
+    let mut features = BTreeSet::new();
+    crate::rdf_io::each_payload_quad(
+        nrese_rdf_io::RdfFormat::NTriples,
+        None,
+        shapes.as_bytes(),
+        crate::rdf_io::BlankNodes::Fresh,
+        |quad| {
+            if let Some((_, feature)) = UNSUPPORTED_SHACL
                 .iter()
                 .find(|(predicate, _)| quad.predicate.as_str() == *predicate)
-                .map(|(_, feature)| *feature)
-        })
-        .collect();
+            {
+                features.insert(*feature);
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| failed(format!("the shapes are not valid N-Triples: {error}")))?;
     if !features.is_empty() {
         return Err(DraftOutcome::unsupported(
             features.into_iter().map(str::to_owned).collect(),

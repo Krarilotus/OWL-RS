@@ -40,6 +40,20 @@ impl Shapes {
         self.shapes.is_empty() && self.entailments.is_empty()
     }
 
+    /// Whether any shape, nested ones included, has a SHACL-SPARQL constraint (`sh:sparql`
+    /// or a SPARQL-based constraint component): validating it evaluates queries over the
+    /// view's [`nrese_sparql::ReadView::evaluation_snapshot`], not through its quad reads,
+    /// the only read of this crate that does. Deactivated shapes count: it tells what the
+    /// shapes graph declares, so `true` where no query may run is the safe side.
+    pub fn uses_sparql(&self) -> bool {
+        self.shapes.iter().any(|shape| {
+            shape
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, Constraint::Sparql(_)))
+        })
+    }
+
     /// The shapes validation starts from: active ones with a target.
     pub(crate) fn targeted(&self) -> impl Iterator<Item = ShapeRef> + '_ {
         (0..self.shapes.len()).filter(|&shape| {

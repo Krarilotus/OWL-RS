@@ -431,7 +431,7 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
             continue
         for case in planned:
             e = rg.evidence(mine, case)
-            if rg.state(e) != "ok" or e["unchecked"]:
+            if rg.state(e, off_route_ok=side != "b") != "ok" or e["unchecked"]:
                 why = e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
                 problems.append(f"{case} on {side}: {', '.join(map(str, sorted(set(e['status']))))}"
                                 + (f" ({'; '.join(why)})" if why else "")
@@ -474,9 +474,10 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
     # The A-A' arm: A' against A and A against A', each over the family's dimensions; any
     # difference Holm finds there is the instrument's, and the round says nothing.
     aa = rg.gate(of("a", "a2"), {"a2": a, "a": a}, "a2", ["a"], harness, family["blocks"], catalog=catalog,
-                 context=context, family=family["hypotheses"])
+                 context=context, family=family["hypotheses"], baseline_candidate=True)
     back = rg.gate(of("a", "a2"), {"a": a, "a2": a}, "a", ["a2"], harness, family["blocks"], catalog=catalog,
-                   context=context, family=[h.replace("a|", "a2|", 1) for h in family["hypotheses"]])
+                   context=context, family=[h.replace("a|", "a2|", 1) for h in family["hypotheses"]],
+                   baseline_candidate=True)
     problems += [f"A-A' arm: {e}" for e in aa["errors"] + back["errors"]]
     rejected = gatestats.holm({**{("aa", h): p for h, p in aa["pvalues"].items()},
                                **{("back", h): p for h, p in back["pvalues"].items()}})

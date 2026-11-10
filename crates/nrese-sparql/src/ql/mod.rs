@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{
-    AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
+    Admission, AssertedIdentity, GraphSelector, OwnState, QuadPattern, ReadModel, SharedState,
+    Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
-use nrese_rdf::vocab::{owl, rdf, rdfs};
-use nrese_rdf::{NamedNodeRef, Term};
+use nrese_rdf::{NamedNodeRef, Term, vocab};
 
 use crate::GraphAccess;
 
@@ -28,83 +28,164 @@ const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
-// The reader's tables are `nrese_rdf::vocab` constants, built at compile time: a schema read
-// looks them up with no IRI to build and nothing kept on the heap (#155's count).
+/// The terms of the mapping's vocabulary ([`nrese_owl::Vocabulary`], by field) the reader
+/// doesn't read as schema, each for its reason. It reads every other one: a property in
+/// every statement it is the predicate of, a class (capitalised) in the `rdf:type`
+/// statements of its members. So a term the mapping knows is never left out unclassified
+/// (I24c-2; the test `the_reader_reads_the_mapping_vocabulary` holds the list to it).
+const NOT_READ: &[&str] = &[
+    // How the rest is read: declarations through `rdf:type`, lists along their cells.
+    "rdf_type",
+    "first",
+    "rest",
+    "nil",
+    // Entities, not schema vocabulary: their statements are assertions.
+    "owl_top_object_property",
+    "owl_bottom_object_property",
+    "owl_top_data_property",
+    "owl_bottom_data_property",
+    // Individual-level, possibly large, and none adds a schema axiom: equality is read as
+    // present or not ([`has_equality`]); inequality and negative assertions conclude no
+    // fact, and the classes' members are data.
+    "owl_same_as",
+    "owl_different_from",
+    "owl_all_different",
+    "owl_distinct_members",
+    "owl_negative_property_assertion",
+    "owl_source_individual",
+    "owl_assertion_property",
+    "owl_target_individual",
+    "owl_target_value",
+    "owl_named_individual",
+    "owl_thing",
+    "owl_nothing",
+    // The ontology header and annotations, which the mapping reads past.
+    "owl_ontology",
+    "owl_imports",
+    "owl_axiom",
+    "owl_annotation",
+    "owl_annotated_source",
+    "owl_annotated_property",
+    "owl_annotated_target",
+];
+
+// What the reader reads, chosen at compile time from the mapping's vocabulary
+// (`nrese_owl::Vocabulary::IRIS`, `vocab::DATA_IRIS`): fixed IRIs cost nothing at run time
+// (orchestrator, 8 Nov 17:28; #155's count found a `LazyLock` table's 4.6 KB of peak live
+// bytes in every process).
+
+/// Whether `a` and `b` are the same text (in a `const`).
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether vocabulary field `field` is one of [`NOT_READ`].
+const fn not_read(field: &str) -> bool {
+    let mut i = 0;
+    while i < NOT_READ.len() {
+        if same(NOT_READ[i], field) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether an IRI's local name is capitalised: a class, read through its members.
+const fn capitalised(iri: &str) -> bool {
+    let b = iri.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1] != b'#' && b[i - 1] != b'/' {
+        i -= 1;
+    }
+    i < b.len() && b[i].is_ascii_uppercase()
+}
+
+/// Whether `iri` is one of the vocabulary's classes the reader reads.
+const fn read_class(iri: &str) -> bool {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let mut i = 0;
+    while i < iris.len() {
+        let (field, term) = iris[i];
+        if !not_read(field) && capitalised(term) && same(term, iri) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The IRIs the reader reads as classes (`class`) or as schema properties, the first `N`
+/// of them, with how many there are. The properties take the data ranges' facets too
+/// (`DATA_IRIS`, but `rdfs:Literal`: a datatype there and a class here).
+const fn read_iris<const N: usize>(class: bool) -> ([&'static str; N], usize) {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let data = nrese_owl::vocab::DATA_IRIS;
+    let mut out = [""; N];
+    let mut n = 0;
+    let mut i = 0;
+    while i < iris.len() {
+        let (field, iri) = iris[i];
+        if !not_read(field) && capitalised(iri) == class {
+            if n < N {
+                out[n] = iri;
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while !class && j < data.len() {
+        if !read_class(data[j]) {
+            if n < N {
+                out[n] = data[j];
+            }
+            n += 1;
+        }
+        j += 1;
+    }
+    (out, n)
+}
 
 /// The schema properties read, in every graph.
-const SCHEMA: &[NamedNodeRef<'static>] = &[
-    rdfs::SUB_CLASS_OF,
-    owl::EQUIVALENT_CLASS,
-    rdfs::SUB_PROPERTY_OF,
-    owl::EQUIVALENT_PROPERTY,
-    owl::INVERSE_OF,
-    rdfs::DOMAIN,
-    rdfs::RANGE,
-    owl::ON_PROPERTY,
-    owl::SOME_VALUES_FROM,
-    owl::ALL_VALUES_FROM,
-    owl::HAS_VALUE,
-    owl::MIN_CARDINALITY,
-    owl::MIN_QUALIFIED_CARDINALITY,
-    owl::CARDINALITY,
-    owl::QUALIFIED_CARDINALITY,
-    owl::ON_CLASS,
-    owl::ON_DATA_RANGE,
-    owl::INTERSECTION_OF,
-    owl::UNION_OF,
-    owl::DISJOINT_UNION_OF,
-    // What the rewriting doesn't follow, for the completeness it reports (design §7).
-    owl::PROPERTY_CHAIN_AXIOM,
-    owl::HAS_KEY,
-    owl::ONE_OF,
-    owl::COMPLEMENT_OF,
-    owl::HAS_SELF,
-    owl::MAX_CARDINALITY,
-    owl::MAX_QUALIFIED_CARDINALITY,
-    // Disjointness concludes a part's complement, which may be an existential (I24b
-    // fix check r1, F3: `A ⊑ ¬≤0 S.D`).
-    owl::DISJOINT_WITH,
-    owl::MEMBERS,
+const READ_PROPERTIES: [&str; read_iris::<0>(false).1] = read_iris(false).0;
+/// The classes whose members' `rdf:type` statements are read.
+const READ_CLASSES: [&str; read_iris::<0>(true).1] = read_iris(true).0;
+
+/// The list-valued properties whose lists are read, by the vocabulary's fields.
+const LISTS: &[&str] = &[
+    "owl_intersection_of",
+    "owl_union_of",
+    "owl_disjoint_union_of",
+    "owl_property_chain_axiom",
+    "owl_has_key",
+    "owl_one_of",
+    "owl_members",
+    "owl_on_properties",
+    "owl_with_restrictions",
 ];
 
-/// The classes whose members' `rdf:type` statements are read: what the mapping needs to
-/// know about the schema's terms.
-const DECLARATIONS: &[NamedNodeRef<'static>] = &[
-    owl::RESTRICTION,
-    owl::CLASS,
-    rdfs::CLASS,
-    rdfs::DATATYPE,
-    owl::OBJECT_PROPERTY,
-    owl::DATATYPE_PROPERTY,
-    owl::ANNOTATION_PROPERTY,
-    owl::SYMMETRIC_PROPERTY,
-    owl::REFLEXIVE_PROPERTY,
-    owl::TRANSITIVE_PROPERTY,
-    owl::FUNCTIONAL_PROPERTY,
-    owl::INVERSE_FUNCTIONAL_PROPERTY,
-    owl::ALL_DISJOINT_CLASSES,
-];
-
-/// The properties that make their blank subject a class expression (`nrese-owl`'s
-/// mapping): a restriction's and the set operators'.
-const EXPRESSIONS: &[NamedNodeRef<'static>] = &[
-    owl::ON_PROPERTY,
-    owl::INTERSECTION_OF,
-    owl::UNION_OF,
-    owl::COMPLEMENT_OF,
-    owl::ONE_OF,
-];
-
-/// The list-valued properties whose lists are read.
-const LISTS: &[NamedNodeRef<'static>] = &[
-    owl::INTERSECTION_OF,
-    owl::UNION_OF,
-    owl::DISJOINT_UNION_OF,
-    owl::PROPERTY_CHAIN_AXIOM,
-    owl::HAS_KEY,
-    owl::ONE_OF,
-    owl::MEMBERS,
-];
+/// [`LISTS`]' IRIs; a field the vocabulary lacks fails the build.
+const LIST_IRIS: [&str; LISTS.len()] = {
+    let mut out = [""; LISTS.len()];
+    let mut i = 0;
+    while i < LISTS.len() {
+        out[i] = nrese_owl::Vocabulary::iri(LISTS[i]);
+        i += 1;
+    }
+    out
+};
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -137,7 +218,7 @@ pub struct QlRewriting {
     cached: Mutex<Vec<Cached>>,
     /// Whether the data has a witness's tree wherever it folds, per probe, for one
     /// snapshot view (design §3).
-    realised: Mutex<(Option<SnapshotIdentity>, HashMap<String, bool>)>,
+    realised: Mutex<(Option<SnapshotIdentity>, Probes)>,
     /// The latest commits' changes to memberships of class expressions
     /// ([`Self::note_commit`]), oldest first, at most [`NOTES`].
     notes: Mutex<std::collections::VecDeque<Note>>,
@@ -196,6 +277,9 @@ struct Cached {
     /// Compilation also needs the dictionary's id of Thing, even if no schema axiom
     /// mentions it. Ordinary data can introduce that id without changing the schema.
     thing: Option<nrese_owl::Term>,
+    /// Whether the snapshot asserts an equality of individuals, in any graph
+    /// ([`has_equality`]).
+    equality: bool,
     tbox: Arc<Tbox>,
     /// Each expression's membership in the compiled schema, for the next snapshot's read.
     members: Members,
@@ -226,7 +310,7 @@ impl QlRewriting {
             closure,
             limits: Limits::default(),
             cached: Mutex::new(Vec::new()),
-            realised: Mutex::new((None, HashMap::new())),
+            realised: Mutex::new((None, Probes::default())),
             notes: Mutex::new(std::collections::VecDeque::new()),
         }
     }
@@ -290,34 +374,64 @@ impl QlRewriting {
         Some(out)
     }
 
-    /// Whether the data at snapshot `identity` has the tree of probe `key`
-    /// wherever it folds, memoised per view and probe (`None`: not asked, the query's
-    /// questions spent; `false` then, and nothing kept). Concurrent misses may compute
-    /// independently; the query itself runs outside the cache lock.
+    /// Whether the data `snapshot` reads, as a query in `mode` reads it, has the tree of
+    /// probe `key` wherever it folds, memoised per view, mode and probe (`None`: not asked,
+    /// the query's questions spent; `false` then, and nothing kept). Only a published
+    /// snapshot's answer is kept by the store (contract S3); any other's by its own version
+    /// alone (dictionary 3.0c). Concurrent misses may compute independently; the query
+    /// itself runs outside the lock.
     pub(crate) fn realised(
         &self,
-        identity: SnapshotIdentity,
+        snapshot: &Snapshot,
+        mode: ProbeMode,
         key: &str,
         compute: impl FnOnce() -> Option<bool>,
     ) -> bool {
-        {
-            let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
-            if cache.0 == Some(identity)
-                && let Some(&known) = cache.1.get(key)
-            {
-                return known;
+        let identity = snapshot.identity();
+        match snapshot.admission() {
+            Admission::Shared(state) => {
+                {
+                    let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
+                    if cache.0 == Some(identity)
+                        && let Some(known) = cache.1.get(mode, key)
+                    {
+                        return known;
+                    }
+                }
+                // Computed without the lock: the check is a query of its own.
+                let Some(known) = compute() else {
+                    return false;
+                };
+                self.remember(&state, mode, key, known);
+                known
+            }
+            Admission::Own(own) => {
+                let mine = own.get_or_insert_with(QlOwn::default);
+                {
+                    let probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(known) = probes.get(&identity).and_then(|p| p.get(mode, key)) {
+                        return known;
+                    }
+                }
+                let Some(known) = compute() else {
+                    return false;
+                };
+                let mut probes = mine.probes.lock().unwrap_or_else(|p| p.into_inner());
+                probes.entry(identity).or_default().insert(mode, key, known);
+                known
             }
         }
-        // Computed without the lock: the check is a query of its own.
-        let Some(known) = compute() else {
-            return false;
-        };
+    }
+
+    /// Keeps probe `key`'s answer in `mode` for the published snapshot `state` gives,
+    /// replacing another view's probes.
+    fn remember(&self, state: &SharedState<'_>, mode: ProbeMode, key: &str, known: bool) {
+        let identity = state.snapshot().identity();
         let mut cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
         if cache.0 != Some(identity) {
-            *cache = (Some(identity), HashMap::new());
+            *cache = (Some(identity), Probes::default());
         }
-        cache.1.insert(key.to_owned(), known);
-        known
+        cache.1.insert(mode, key, known);
     }
 
     /// The same with other bounds (tests make them small).
@@ -348,8 +462,21 @@ impl QlRewriting {
     /// who sees only the inferences its graphs support (`inferred = "supported"`) gets the
     /// schema of those graphs only; one who sees every inference (`"visible"`) the whole
     /// schema, as the closure it reads was computed with it.
+    ///
+    /// Only a published snapshot changes what the store keeps (contract S3). Any other keeps
+    /// what it reads in its own version (dictionary 3.0c; review r1 F1), so a pending
+    /// snapshot read again reads its schema once, and the store's entries stay as they were.
     pub(crate) fn tbox(&self, snapshot: &Snapshot, access: Option<&GraphAccess>) -> Arc<Tbox> {
         let access = access.filter(|a| a.inferred_by_support);
+        match snapshot.admission() {
+            Admission::Shared(state) => self.shared_tbox(&state, access),
+            Admission::Own(own) => self.own_tbox(&own, access),
+        }
+    }
+
+    /// [`Self::tbox`] of the published snapshot `state` gives, kept in the store's entries.
+    fn shared_tbox(&self, state: &SharedState<'_>, access: Option<&GraphAccess>) -> Arc<Tbox> {
+        let snapshot = state.snapshot();
         let key = snapshot.identity();
         let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
         let at = cached.iter().position(|c| c.access.as_ref() == access);
@@ -358,14 +485,12 @@ impl QlRewriting {
         }
         // A snapshot bounds its dictionary reads, so an identity hit above needs no
         // lookup. Across identities, unchanged statements alone are not sufficient.
-        let thing = snapshot
-            .lookup(nrese_rdf::vocab::owl::THING.into())
-            .map(TermId::raw);
-        let keep = |graph: u64| {
-            access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
-        };
+        let Schema {
+            thing,
+            core,
+            equality,
+        } = Schema::of(snapshot);
         let asserted = snapshot.asserted_identity();
-        let core = read_core(snapshot);
         // An entry of this reader whose core and view mode are this snapshot's, with notes
         // from its memberships' asserted state to this one: its memberships are brought
         // forward by the noted changes, in place (P2-C1 probes, 8 Nov: rebuilding every
@@ -376,89 +501,368 @@ impl QlRewriting {
         if let Some(i) = at {
             let c = &mut cached[i];
             let changes = (c.thing == thing
+                && c.equality == equality
                 && c.members.equality == key.equality
                 && c.members.canonical == key.canonical
                 && *c.core == *core)
                 .then(|| self.changes_between(c.members.at, asserted))
                 .flatten();
             if let Some(changes) = changes {
-                let mut changed = false;
-                for change in changes {
-                    let node = change.statement.triple[2];
-                    // Not an expression of the core: nothing the schema reads.
-                    let Some(member) = c.members.of.get(&node).copied() else {
-                        continue;
-                    };
-                    #[cfg(test)]
-                    count(&EXPRESSIONS_WALKED, 1);
-                    let next = match (member, change.added) {
-                        (None, true) => {
-                            eligible(snapshot, &change.statement, &keep).then_some(change.statement)
-                        }
-                        (Some(kept), false) if kept == change.statement => {
-                            member_of(snapshot, node, &keep)
-                        }
-                        _ => continue,
-                    };
-                    changed |= next.is_some() != member.is_some();
-                    c.members.of.insert(node, next);
-                }
-                c.key = key;
-                c.members.at = asserted;
-                // Which expressions have a member is what the TBox reads (design §7).
-                if !changed {
-                    return Arc::clone(&c.tbox);
-                }
-                let statements = filtered_schema(c, snapshot, &core, access);
-                let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
-                c.tbox = Arc::clone(&tbox);
-                return tbox;
+                return self.bring_forward(state, c, changes, &core, access);
             }
         }
         // Otherwise every expression's membership, read afresh.
-        let expressions = expressions_of(snapshot, &core);
-        #[cfg(test)]
-        count(&EXPRESSIONS_WALKED, expressions.len());
-        let of: HashMap<u64, Member> = expressions
-            .iter()
-            .map(|&node| (node, member_of(snapshot, node, &keep)))
-            .collect();
-        let members = Members {
-            at: asserted,
-            equality: key.equality,
-            canonical: key.canonical,
-            of,
+        let (expressions, members) = fresh_members(snapshot, &core, access);
+        let schema = Schema {
+            thing,
+            core,
+            equality,
         };
-        if let Some(c) = at.map(|i| &mut cached[i]).filter(|c| {
-            c.thing == thing && *c.core == *core && present(&c.members.of) == present(&members.of)
-        }) {
-            c.key = key;
-            c.members = members;
+        if let Some(c) = at
+            .map(|i| &mut cached[i])
+            .filter(|c| schema.reuses(c, &members))
+        {
+            rekey(state, c, members);
             return Arc::clone(&c.tbox);
         }
-        let mut reader_core = core.clone();
-        if let Some(access) = access {
-            reader_core.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
-        }
-        let statements = with_members(&reader_core, expressions.iter().map(|e| &members.of[e]));
-        let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
-        if let Some(i) = at {
-            cached.remove(i);
-        }
-        if cached.len() == READERS {
-            cached.remove(0);
-        }
-        cached.push(Cached {
-            access: access.cloned(),
-            key,
-            core: core.into_boxed_slice(),
-            expressions: expressions.into_boxed_slice(),
-            thing,
-            tbox: Arc::clone(&tbox),
-            members,
-        });
+        let tbox = self.compile_read(snapshot, &schema, access, &expressions, &members);
+        admit(
+            state,
+            &mut cached,
+            at,
+            schema.entry(access, key, expressions, members, Arc::clone(&tbox)),
+        );
         tbox
     }
+
+    /// [`Self::tbox`] of the unpublished snapshot `own` gives, kept in its version alone.
+    /// An entry is this rewriting's (its closure), its reader's and its view's: views of one
+    /// version in other equality modes share the slot, never an entry. A first read reuses
+    /// a TBox its schema matches, the version's or the store's (read only), or compiles.
+    ///
+    /// The version's entries are locked only to look up and to install: the schema is read
+    /// and compiled outside the lock (DICT2, 9 Nov), and a read of the same view installed
+    /// meanwhile stands.
+    fn own_tbox(&self, own: &OwnState<'_>, access: Option<&GraphAccess>) -> Arc<Tbox> {
+        let snapshot = own.snapshot();
+        let key = snapshot.identity();
+        let mine = own.get_or_insert_with(QlOwn::default);
+        let ours = |(closure, c): &&(Closure, Cached)| {
+            *closure == self.closure && c.access.as_ref() == access
+        };
+        let exact = |entries: &[(Closure, Cached)]| {
+            entries
+                .iter()
+                .filter(ours)
+                .find(|(_, c)| c.key == key)
+                .map(|(_, c)| Arc::clone(&c.tbox))
+        };
+        if let Some(tbox) = exact(&mine.entries.lock().unwrap_or_else(|p| p.into_inner())) {
+            return tbox;
+        }
+        let schema = Schema::of(snapshot);
+        let (expressions, members) = fresh_members(snapshot, &schema.core, access);
+        let kept = mine
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(ours)
+            .map(|(_, c)| c)
+            .find(|c| schema.reuses(c, &members))
+            .map(|c| Arc::clone(&c.tbox));
+        let reused = kept.or_else(|| {
+            let shared = self.cached.lock().unwrap_or_else(|p| p.into_inner());
+            shared
+                .iter()
+                .filter(|c| c.access.as_ref() == access)
+                .find(|c| schema.reuses(c, &members))
+                .map(|c| Arc::clone(&c.tbox))
+        });
+        let tbox = reused.unwrap_or_else(|| {
+            self.compile_read(snapshot, &schema, access, &expressions, &members)
+        });
+        let mut entries = mine.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(installed) = exact(&entries) {
+            return installed;
+        }
+        if entries.len() == READERS {
+            entries.remove(0);
+        }
+        let entry = schema.entry(access, key, expressions, members, Arc::clone(&tbox));
+        entries.push((self.closure, entry));
+        tbox
+    }
+
+    /// The TBox of a schema read afresh: `schema`'s core in the reader's graphs, with
+    /// `members`.
+    fn compile_read(
+        &self,
+        snapshot: &Snapshot,
+        schema: &Schema,
+        access: Option<&GraphAccess>,
+        expressions: &[u64],
+        members: &Members,
+    ) -> Arc<Tbox> {
+        #[cfg(test)]
+        building();
+        let statements = with_members(
+            &reader_core(snapshot, &schema.core, access),
+            expressions.iter().map(|e| &members.of[e]),
+        );
+        Arc::new(compile(
+            snapshot,
+            &statements,
+            self.closure,
+            schema.thing,
+            schema.equality,
+        ))
+    }
+
+    /// Brings entry `c`'s memberships forward to the published snapshot `state` gives, by
+    /// the noted `changes`, and recompiles its TBox where an expression gained or lost its
+    /// last member (design §7). Its `thing`, equality flag and `core` are the snapshot's.
+    fn bring_forward(
+        &self,
+        state: &SharedState<'_>,
+        c: &mut Cached,
+        changes: Vec<MembershipChange>,
+        core: &[nrese_owl::Statement],
+        access: Option<&GraphAccess>,
+    ) -> Arc<Tbox> {
+        let snapshot = state.snapshot();
+        let keep = |graph: u64| {
+            access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
+        };
+        let mut changed = false;
+        for change in changes {
+            let node = change.statement.triple[2];
+            // Not an expression of the core: nothing the schema reads.
+            let Some(member) = c.members.of.get(&node).copied() else {
+                continue;
+            };
+            #[cfg(test)]
+            count(&EXPRESSIONS_WALKED, 1);
+            let next = match (member, change.added) {
+                (None, true) => {
+                    eligible(snapshot, &change.statement, &keep).then_some(change.statement)
+                }
+                (Some(kept), false) if kept == change.statement => member_of(snapshot, node, &keep),
+                _ => continue,
+            };
+            changed |= next.is_some() != member.is_some();
+            c.members.of.insert(node, next);
+        }
+        c.key = snapshot.identity();
+        c.members.at = snapshot.asserted_identity();
+        // Which expressions have a member is what the TBox reads (design §7).
+        if !changed {
+            return Arc::clone(&c.tbox);
+        }
+        let statements = filtered_schema(c, snapshot, core, access);
+        let tbox = Arc::new(compile(
+            snapshot,
+            &statements,
+            self.closure,
+            c.thing,
+            c.equality,
+        ));
+        c.tbox = Arc::clone(&tbox);
+        tbox
+    }
+}
+
+/// What an unpublished version keeps of the QL rewriting for its own readers (dictionary
+/// 3.0c; review r1 F1), dropped with the version: the schema entries of every rewriting
+/// (by its closure) that read it, at most [`READERS`], and each view's probes.
+#[derive(Debug, Default)]
+struct QlOwn {
+    entries: Mutex<Vec<(Closure, Cached)>>,
+    probes: Mutex<HashMap<SnapshotIdentity, Probes>>,
+}
+
+/// What, besides the view and its text, decides a probe's answer: the query options that
+/// change what an ASK means (sol-loop r1 S1, r2 S2). Neither the view's identity nor the
+/// probe's text says them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ProbeMode {
+    union_default_graph: bool,
+    geosparql_stated_only: bool,
+    equality_canonical: bool,
+}
+
+impl ProbeMode {
+    /// The mode of a probe asked with `options`. Every option is named: one added to
+    /// [`crate::QueryOptions`] doesn't compile here until it is sorted into the mode or
+    /// out of it.
+    pub(crate) fn of(options: &crate::QueryOptions) -> Self {
+        let crate::QueryOptions {
+            // What the default graph is, and whether relations are computed: an ASK's
+            // answer.
+            union_default_graph,
+            geosparql_stated_only,
+            // A term the probe names stands for its identity class.
+            equality_canonical,
+            // Fixed for every probe by the rewriting's applicability (`ql_rewriting`) and
+            // its data check: no dataset, the materialised statements, no pre-bound
+            // variables, no access restriction, no rewriting of the probe itself.
+            dataset: _,
+            read_model: _,
+            pre_bound: _,
+            access: _,
+            ql: _,
+            // The same answers, by other means or bounds.
+            resources: _,
+            as_written: _,
+            equality_closed: _,
+            equality_early_expansion: _,
+            cross_chunk_rows: _,
+            stream_rows: _,
+            index_joins: _,
+            // Nothing a probe's triple patterns read: federation, search, the result cache.
+            services: _,
+            search_scope: _,
+            result_cache: _,
+            pin: _,
+        } = options;
+        Self {
+            union_default_graph: *union_default_graph,
+            geosparql_stated_only: *geosparql_stated_only,
+            equality_canonical: *equality_canonical,
+        }
+    }
+}
+
+/// One view's probe answers, by mode ([`ProbeMode`]), then by probe.
+#[derive(Debug, Default)]
+pub(crate) struct Probes(HashMap<ProbeMode, HashMap<String, bool>>);
+
+/// [`Probes::all`]: each probe's answer, with its mode and its query, sorted.
+#[cfg(test)]
+pub(crate) type ProbeAnswers = Vec<((ProbeMode, String), bool)>;
+
+impl Probes {
+    fn get(&self, mode: ProbeMode, key: &str) -> Option<bool> {
+        self.0.get(&mode)?.get(key).copied()
+    }
+
+    fn insert(&mut self, mode: ProbeMode, key: &str, known: bool) {
+        self.0
+            .entry(mode)
+            .or_default()
+            .insert(key.to_owned(), known);
+    }
+
+    /// Every answer, with its mode.
+    #[cfg(test)]
+    pub(crate) fn all(&self) -> ProbeAnswers {
+        let mut out: Vec<_> = self
+            .0
+            .iter()
+            .flat_map(|(&mode, probes)| probes.iter().map(move |(k, &v)| ((mode, k.clone()), v)))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// What decides a snapshot's compiled TBox besides its memberships ([`Cached`]'s checks).
+struct Schema {
+    thing: Option<nrese_owl::Term>,
+    core: Vec<nrese_owl::Statement>,
+    equality: bool,
+}
+
+impl Schema {
+    fn of(snapshot: &Snapshot) -> Self {
+        Self {
+            thing: snapshot
+                .lookup(nrese_rdf::vocab::owl::THING.into())
+                .map(TermId::raw),
+            core: read_core(snapshot),
+            equality: has_equality(snapshot),
+        }
+    }
+
+    /// Whether entry `c`'s TBox is this schema's with `members`: what the TBox reads of
+    /// them is which expressions have one (design §7).
+    fn reuses(&self, c: &Cached, members: &Members) -> bool {
+        c.thing == self.thing
+            && c.equality == self.equality
+            && *c.core == *self.core
+            && present(&c.members.of) == present(&members.of)
+    }
+
+    fn entry(
+        self,
+        access: Option<&GraphAccess>,
+        key: SnapshotIdentity,
+        expressions: Vec<u64>,
+        members: Members,
+        tbox: Arc<Tbox>,
+    ) -> Cached {
+        Cached {
+            access: access.cloned(),
+            key,
+            core: self.core.into_boxed_slice(),
+            expressions: expressions.into_boxed_slice(),
+            thing: self.thing,
+            equality: self.equality,
+            tbox,
+            members,
+        }
+    }
+}
+
+/// The class expressions of `core` and each one's membership in `snapshot`, read afresh,
+/// in the graphs `access` admits.
+fn fresh_members(
+    snapshot: &Snapshot,
+    core: &[nrese_owl::Statement],
+    access: Option<&GraphAccess>,
+) -> (Vec<u64>, Members) {
+    #[cfg(test)]
+    building();
+    let keep = |graph: u64| {
+        access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
+    };
+    let expressions = expressions_of(snapshot, core);
+    #[cfg(test)]
+    count(&EXPRESSIONS_WALKED, expressions.len());
+    let of = expressions
+        .iter()
+        .map(|&node| (node, member_of(snapshot, node, &keep)))
+        .collect();
+    let key = snapshot.identity();
+    let members = Members {
+        at: snapshot.asserted_identity(),
+        equality: key.equality,
+        canonical: key.canonical,
+        of,
+    };
+    (expressions, members)
+}
+
+/// Entry `c` stands for the published snapshot `state` gives, with its `members`: what
+/// the TBox reads of them is unchanged.
+fn rekey(state: &SharedState<'_>, c: &mut Cached, members: Members) {
+    c.key = state.snapshot().identity();
+    c.members = members;
+}
+
+/// Keeps `entry` for the published snapshot `state` gives, in place of its reader's entry
+/// at `at`, evicting the oldest past [`READERS`].
+fn admit(state: &SharedState<'_>, cached: &mut Vec<Cached>, at: Option<usize>, entry: Cached) {
+    if let Some(i) = at {
+        cached.remove(i);
+    }
+    if cached.len() == READERS {
+        cached.remove(0);
+    }
+    cached.push(Cached {
+        key: state.snapshot().identity(),
+        ..entry
+    });
 }
 
 /// The schema of entry `c` as its reader compiles it: `core` in the reader's graphs, with
@@ -469,12 +873,44 @@ fn filtered_schema(
     core: &[nrese_owl::Statement],
     access: Option<&GraphAccess>,
 ) -> Vec<nrese_owl::Statement> {
-    let reader_core: Vec<nrese_owl::Statement> = core
-        .iter()
+    with_members(
+        &reader_core(snapshot, core, access),
+        c.expressions.iter().map(|e| &c.members.of[e]),
+    )
+}
+
+/// `core` in the graphs `access` admits.
+fn reader_core(
+    snapshot: &Snapshot,
+    core: &[nrese_owl::Statement],
+    access: Option<&GraphAccess>,
+) -> Vec<nrese_owl::Statement> {
+    core.iter()
         .filter(|s| access.is_none_or(|a| a.allows_id(snapshot, TermId::from_raw(s.graph))))
         .copied()
-        .collect();
-    with_members(&reader_core, c.expressions.iter().map(|e| &c.members.of[e]))
+        .collect()
+}
+
+/// Whether the snapshot asserts an equality of individuals (`owl:sameAs`), in any graph:
+/// one probe. The TBox learns only that ([`Tbox::with_equality`]), never which statement:
+/// no name reaches a reader who can't read its graph (I24c-2 review r1, F1), and no sampled
+/// statement the mapping may leave out stands for the rest (F3). Fail-closed for readers
+/// who see only some graphs.
+fn has_equality(snapshot: &Snapshot) -> bool {
+    iri(snapshot, OWL, "sameAs").is_some_and(|same_as| {
+        snapshot
+            .quads_for_pattern_in(
+                ReadModel::Asserted,
+                &QuadPattern {
+                    subject: None,
+                    predicate: Some(same_as),
+                    object: None,
+                    graph: GraphSelector::Any,
+                },
+            )
+            .next()
+            .is_some()
+    })
 }
 
 /// The expressions with a member in `of`, sorted: what the TBox reads of the memberships.
@@ -521,7 +957,11 @@ fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<Members
 }
 
 fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
-    snapshot.lookup(NamedNodeRef::new_unchecked(&format!("{namespace}{local}")).into())
+    named(snapshot, &format!("{namespace}{local}"))
+}
+
+fn named(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
+    snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
 }
 
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
@@ -550,6 +990,22 @@ fn count(cell: &'static std::thread::LocalKey<std::cell::Cell<usize>>, n: usize)
     cell.set(cell.get() + n);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Called on this thread as a schema read starts its membership build or its compile
+    /// (the lock tests look at which locks are held then).
+    static BUILDING: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn building() {
+    BUILDING.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
+
 /// What an expression's membership is ([`schema_statements`]): one statement, or none.
 type Member = Option<nrese_owl::Statement>;
 
@@ -574,25 +1030,21 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         object,
         graph: GraphSelector::Any,
     };
-    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
-    for &p in SCHEMA {
-        if let Some(p) = lookup(p) {
-            scan(pattern(p, None), &mut out);
-        }
+    for p in READ_PROPERTIES.iter().filter_map(|p| named(snapshot, p)) {
+        scan(pattern(p, None), &mut out);
     }
-    if let Some(rdf_type) = lookup(rdf::TYPE) {
-        for &class in DECLARATIONS {
-            if let Some(class) = lookup(class) {
-                scan(pattern(rdf_type, Some(class)), &mut out);
-            }
+    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
+    if let Some(rdf_type) = lookup(vocab::rdf::TYPE) {
+        for class in READ_CLASSES.iter().filter_map(|c| named(snapshot, c)) {
+            scan(pattern(rdf_type, Some(class)), &mut out);
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
-    let (first, rest) = (lookup(rdf::FIRST), lookup(rdf::REST));
+    let (first, rest) = (lookup(vocab::rdf::FIRST), lookup(vocab::rdf::REST));
     if let (Some(first), Some(rest)) = (first, rest) {
-        let heads: Vec<u64> = LISTS
+        let heads: Vec<u64> = LIST_IRIS
             .iter()
-            .filter_map(|&p| lookup(p))
+            .filter_map(|p| named(snapshot, p))
             .flat_map(|p| {
                 out.iter()
                     .filter(move |s| s.triple[1] == p.raw())
@@ -633,22 +1085,30 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
 
 /// The class expressions `core` makes ([`read_core`]): blank subjects of a restriction's
 /// or a set operator's property, sorted. Read from the core, never from data: an entry
-/// whose core is unchanged keeps its list.
+/// whose core is unchanged keeps its list. `core` is sorted, so each subject's statements
+/// are adjacent, and each subject is taken once, in order.
 fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64> {
-    let operators: Vec<u64> = EXPRESSIONS
-        .iter()
-        .filter_map(|&p| snapshot.lookup(p.into()))
-        .map(TermId::raw)
-        .collect();
-    let mut out: Vec<u64> = core
-        .iter()
-        .filter(|s| operators.contains(&s.triple[1]))
-        .map(|s| s.triple[0])
-        .filter(|&node| TermId::from_raw(node).kind() == nrese_engine::TermKind::BlankNode)
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+    debug_assert!(core.is_sorted());
+    // The mapping's own markers, those it can't read included (an n-ary or a malformed
+    // restriction), so the memberships of every node it would read as a class expression
+    // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
+    let id_of = |iri: &str| named(snapshot, iri).map(TermId::raw);
+    let markers = nrese_owl::mapping::ClassExpressionMarkers::lookup(&id_of);
+    let operators = markers.properties();
+    let types: Vec<u64> = markers.types.into_iter().flatten().collect();
+    let rdf_type = id_of(const { nrese_owl::Vocabulary::iri("rdf_type") });
+    // A restriction has both a marker type and a marker property: matched statement by
+    // statement, each was found twice, then sorted and deduplicated (i24c2-attrib3-da692156).
+    core.chunk_by(|a, b| a.triple[0] == b.triple[0])
+        .filter(|of| {
+            TermId::from_raw(of[0].triple[0]).kind() == nrese_engine::TermKind::BlankNode
+                && of.iter().any(|s| {
+                    operators.contains(&s.triple[1])
+                        || (Some(s.triple[1]) == rdf_type && types.contains(&s.triple[2]))
+                })
+        })
+        .map(|of| of[0].triple[0])
+        .collect()
 }
 
 /// The membership the schema reads of class expression `node` (design §7: individuals
@@ -751,8 +1211,13 @@ fn compile(
     statements: &[nrese_owl::Statement],
     closure: Closure,
     thing: Option<nrese_owl::Term>,
+    equality: bool,
 ) -> Tbox {
     let terms = SnapshotTerms(snapshot);
     let ontology = nrese_owl::read(statements, &terms);
-    Tbox::compile(&ontology, closure, thing)
+    let tbox = Tbox::compile(&ontology, closure, thing);
+    match equality {
+        true => tbox.with_equality(closure),
+        false => tbox,
+    }
 }

@@ -17,7 +17,7 @@ impl TellRequest {
             target: self.target.clone(),
             format: self.format,
             base_iri: self.base_iri.clone(),
-            payload: self.payload.clone(),
+            payload: self.payload.clone().into(),
             replace: false,
         }
     }

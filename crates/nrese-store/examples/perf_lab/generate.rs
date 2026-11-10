@@ -143,7 +143,8 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "dense" => dense(&params, &mut rng, &mut nt)?,
         "chain" => chain(&params, &mut nt)?,
         "layered" => layered(&params, &mut rng, &mut nt, &commits)?,
-        "entities" => entities(&params, &mut rng, &mut nt)?,
+        "entities" => entities(&params, &mut rng, &mut nt, false)?,
+        "entities-turtle" => entities(&params, &mut rng, &mut nt, true)?,
         "churn" => churn(&params, &mut nt, &commits)?,
         "ql-memberships" => ql_memberships(&params, &mut nt, &commits)?,
         "batches" => batches(&params, &mut nt, &commits)?,
@@ -565,21 +566,50 @@ fn layered(p: &Params, rng: &mut Rng, nt: &mut Nt, commits: &str) -> std::io::Re
 }
 
 /// The harness's entity shape (`generate`): a type, a language-tagged label, a link and a
-/// date per entity.
-fn entities(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
+/// date per entity. `entities-turtle` writes the same statements as Turtle, its names
+/// prefixed (`ex:e1 rdf:type ex:Kind1 .`): what an upload with compact prefixes sends.
+fn entities(p: &Params, rng: &mut Rng, nt: &mut Nt, turtle: bool) -> std::io::Result<Expect> {
     let n = p.get("entities", 5_000_000);
+    if turtle {
+        writeln!(
+            nt.out,
+            "@prefix ex: <{EX}> .\n@prefix rdf: <{RDF}> .\n@prefix rdfs: <{RDFS}> .\n@prefix xsd: <{XSD}> ."
+        )?;
+    }
+    let ex = |local: String| match turtle {
+        true => format!("ex:{local}"),
+        false => ex(local),
+    };
+    let (kind, label, link, date_of) = match turtle {
+        true => (
+            "rdf:type".to_owned(),
+            "rdfs:label".to_owned(),
+            "ex:link".to_owned(),
+            "ex:date".to_owned(),
+        ),
+        false => (
+            rdf("type"),
+            rdfs("label"),
+            ex("link".to_owned()),
+            ex("date".to_owned()),
+        ),
+    };
     for i in 0..n {
         let e = ex(format!("e{i}"));
-        nt.t(&e, &rdf("type"), &ex(format!("Kind{}", i % 100)))?;
-        nt.t(&e, &rdfs("label"), &format!("\"entity {i}\"@en"))?;
-        nt.t(&e, &ex("link"), &ex(format!("e{}", rng.below(n))))?;
+        nt.t(&e, &kind, &ex(format!("Kind{}", i % 100)))?;
+        nt.t(&e, &label, &format!("\"entity {i}\"@en"))?;
+        nt.t(&e, &link, &ex(format!("e{}", rng.below(n))))?;
         let date = format!(
             "{}-{:02}-{:02}",
             1900 + rng.below(125),
             1 + rng.below(12),
             1 + rng.below(28)
         );
-        nt.t(&e, &ex("date"), &typed(date, "date"))?;
+        let date = match turtle {
+            true => format!("\"{date}\"^^xsd:date"),
+            false => typed(date, "date"),
+        };
+        nt.t(&e, &date_of, &date)?;
     }
     let mut e = Expect::new();
     e.insert("entities".into(), json!(n));

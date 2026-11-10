@@ -1,0 +1,11 @@
+# Methods only named callers may use: each allowed call site carries `#[allow(clippy::disallowed_methods)]`.
+disallowed-methods = [
+    # REAS-3 (master, 9 Nov 01:37): a counted snapshot's data is read only counted, so a reader's stop sees the
+    # engine's work; the way back to the uncounted snapshot is for readers that run to their end or hand the
+    # snapshot on unread. Its callers: none yet.
+    { path = "nrese_engine::CountedSnapshot::uncounted", reason = "a counted snapshot's reads are counted (REAS-3); only named callers read it uncounted" },
+    # Dictionary 3.0b (IB2250-153c): its views keep their source's publication, which is sound only for
+    # statements the source's own DL bounds derive from it alone. Its callers are `nrese-store/src/dl/bounds.rs`
+    # (the bounds' lower and upper views) and the engine's own test of it.
+    { path = "nrese_engine::Snapshot::with_inferred_derived_within", reason = "only the store's DL bounds derive views that keep publication (dictionary 3.0b)" },
+]

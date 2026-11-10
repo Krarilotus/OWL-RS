@@ -47,6 +47,22 @@ from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, slic
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
+class DeclaredRuntime:
+    """A runtime that says only its kind and that it runs nothing: what an adapter's declarations
+    (images, builds, script_builds, rust_image) may ask of one. Anything else is an AttributeError."""
+    __slots__ = ("kind",)
+    dry = True
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+
+def declared_context(root: Path, kind: str) -> "Context":
+    """The context an adapter declares its images and builds in for runtime `kind`: `root`, no
+    settings (the defaults), never the environment (suite.py coverage: a receipt's own runtime)."""
+    return Context(DeclaredRuntime(kind), root, root, root, Mount("-", "/data"), [], 0, {}, "declared")
+
+
 def images_for(adapter, root: Path) -> list[str]:
     """The images an adapter's containers run, the pulled (`images`) and the built here (`builds`),
     as `suite.py images` asks: the pin set of the tools that pin them at their start
@@ -329,6 +345,13 @@ class Adapter:
         """(image, build context under benches/) for images this repository builds."""
         return []
 
+    def script_builds(self, ctx: Context) -> list[tuple[str, str, str]]:
+        """(image, build context under benches/, the Dockerfile ARG naming its source commit) for
+        images a script builds from a source chosen apart from their context (benches/sparql/images.sh):
+        their build label names that source commit, and a receipt without it is unknown (review
+        image-source-commit r1 F2)."""
+        return []
+
     def supports(self, ctx: Context, inputs: list[str], regime: str) -> str | None:
         if ctx.runtime.kind not in self.runtimes:
             return f"no {ctx.runtime.kind} path (runs: {', '.join(sorted(self.runtimes))})"
@@ -401,8 +424,10 @@ class Nrese(Adapter):
         return str(target / "release" / ("nrese-server.exe" if os.name == "nt" else "nrese-server"))
 
     def target_dir(self, ctx: Context) -> Path:
-        """The host build's output directory."""
-        return Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        """The host build's output directory; a relative CARGO_TARGET_DIR is the repository's (the
+        build runs in an export, removed after it: P1e sol-loop r1 S1)."""
+        target = Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        return target if target.is_absolute() else ctx.root / target
 
     def spec(self, ctx: Context, name: str, store: str, command: list[str], env: dict) -> Spec:
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}
@@ -497,7 +522,7 @@ class Qlever(Adapter):
     result_cache = True
 
     def images(self, ctx):
-        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
+        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:commit-0998359ab0")]
 
     def load(self, ctx, store, inputs, regime):
         fmt = "nt" if all_ntriples(inputs) else "nq" if all(i.endswith(".nq") for i in inputs) else "ttl"
@@ -557,7 +582,7 @@ class Oxigraph(Adapter):
     key = "oxigraph"
 
     def images(self, ctx):
-        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.11")]
+        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.13")]
 
     def load(self, ctx, store, inputs, regime, log_name="load.log"):
         files = [a for i in inputs for a in ("--file", i)]
@@ -768,6 +793,10 @@ class MillenniumDB(Adapter):
     def images(self, ctx):
         return [ctx.setting("MILLENNIUMDB_IMAGE", "nrese-bench/millenniumdb:ecbf6dd")]
 
+    def script_builds(self, ctx):
+        # benches/sparql/images.sh millenniumdb: its source at MDB_COMMIT (the Dockerfile's default).
+        return [(self.images(ctx)[0], "competitors/millenniumdb", "MDB_COMMIT")]
+
     def load(self, ctx, store, inputs, regime):
         buffer = ctx.setting("MDB_IMPORT_BUFFER", "4GB")
         spec = Spec(ctx.name("load"), self.images(ctx)[0],
@@ -880,7 +909,7 @@ class Graphdb(Adapter):
 
     key = "graphdb"
     regimes = GRAPHDB_RULESETS
-    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.1", "GRAPHDB_EDITION": "free",
+    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.2", "GRAPHDB_EDITION": "free",
                 "GRAPHDB_ENTITY_ID_SIZE": "32", "GRAPHDB_ENTITY_INDEX_SIZE": "10000000",
                 "GRAPHDB_CONTEXT_INDEX": "false", "GRAPHDB_CHECK_INCONSISTENCIES": "false"}
 

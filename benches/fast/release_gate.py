@@ -7,12 +7,16 @@ the §0 guards green and the W3C suites' counts what they must be?
         the cases a host giving GB can run at their declared caps; the others, with why
     release_gate.py report --passes DIR --candidate NAME --side NAME=REV ... --require NAME,...
                            --harness-revision REV [--min-passes 4] [--diagnostic]
-                           [--not-run CASE=WHY] [--tradeoffs TOML] [--out MD] [--json JSON]
+                           [--not-run CASE=WHY] [--out MD] [--json JSON]
         the timed part: DIR holds the passes, pass-N-SIDE.json, each a full `fast.py run
         --reps 1 --prepared` report of one side's binaries over the same harness and data
-    release_gate.py w3c LOGDIR --expected benches/fast/w3c-expected.toml [--json JSON]
-    release_gate.py guards --names NAMES --log LOG [--json JSON]
-    release_gate.py verdict --timed JSON [--timed JSON] --w3c JSON --guards JSON [--out MD]
+    release_gate.py w3c LOGDIR --expected benches/fast/w3c-expected.toml [--run --identity ID] [--json JSON]
+        the declared kits (--run: launched here first), each one's outcome and its suites' counts
+    release_gate.py guards [--names NAMES] --log LOG [--run --identity ID] [--json JSON]
+    release_gate.py verdict --candidate REV [--checkout DIR] --timed JSON [--timed JSON] --w3c JSON
+                            --guards JSON [--out MD]
+        every part, each bound to REV's tree (a check by its receipt), under the policy at REV
+        (benches/release-tradeoffs.toml)
 
 Each subcommand exits 0 only when its part passes; `verdict` only when every part does.
 """
@@ -23,13 +27,16 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
+import secrets
 import statistics
+import subprocess
 import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -384,7 +391,9 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     if state(base) == "known" and state(cand) == "known":
         return {**row, "comparable": False, "reason": "a known issue on both sides (no timing verdict)"}
     if state(cand) == "known":
-        if base_state == "ok":
+        # A wrong answer is the owner's policy's to accept or block (verdict(), BAR_OUTCOMES), wherever
+        # the baselines stand; a declared limit where a baseline completed blocks here.
+        if base_state == "ok" and not set(cand["status"]) & BAR_OUTCOMES:
             row["blocks"].append(f"stops at its declared outcome ({', '.join(sorted(set(cand['status'])))}) "
                                  f"where {side} completed")
         return {**row, "comparable": False, "reason": "the candidate's known issue"}
@@ -656,31 +665,78 @@ def decide(parts: list[list[dict]]) -> dict:
             "not_compared": {h: untested[h] for h in family if h in untested}}
 
 
-# --- the owner-approved trade-offs (benches/release-tradeoffs.toml) ----------------------------
+# --- the owner's policy: trade-offs and exceptions (benches/release-tradeoffs.toml) -------------
 
-TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "approved", "by", "reason", "pays_with"}
+# The one file that accepts what the bar forbids, read at the candidate's commit by `verdict`
+# (release_verdict()), never from a report: a report holds what its harness tree held.
+POLICY_FILE = "benches/release-tradeoffs.toml"
+# Bar exceptions and trade-offs are Johannes's alone (role.owners); an entry carries his words and
+# where he said them (rule.record-owner-intent-verbatim).
+OWNER = "Johannes"
+AUTHORITY_KEYS = {"approved", "by", "reason", "quote", "source"}
+TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
+EXCEPTION_KEYS = {"case", "outcome"} | AUTHORITY_KEYS
+# The outcomes the bar forbids, which only an owner exception accepts: a wrong answer. A declared
+# limit (memory-limit, gave-up, timeout, unsupported) blocks where a baseline completes (compare_case)
+# and is named where none does; it is neither a wrong answer nor a loss.
+BAR_OUTCOMES = {"wrong"}
 
 
-def load_tradeoffs(path: Path | None) -> tuple[list[dict], list[str]]:
-    """The approved trade-offs and what's wrong with the file. Each names a case, a dimension,
-    optionally the baseline (`against`), the largest ratio its loss may reach (the worse end of
-    its interval), the owner's approval (`approved` date, `by`, `reason`), and the win that pays
-    for it (`pays_with`: case and dimension, which must show as better in the same report)."""
-    if path is None or not path.is_file():
-        return [], []
-    entries = tomllib.loads(path.read_text(encoding="utf-8")).get("tradeoff", [])
-    errors = []
-    for i, e in enumerate(entries):
-        missing = TRADEOFF_KEYS - set(e)
-        if missing:
-            errors.append(f"trade-off {i + 1}: missing {', '.join(sorted(missing))}")
+class Policy(NamedTuple):
+    """The owner's approved trade-offs and exceptions, and what's wrong with the file (no entry
+    counts while anything is)."""
+    tradeoffs: list[dict]
+    exceptions: list[dict]
+    errors: list[str]
+
+
+NO_POLICY = Policy([], [], [])
+
+
+def authority_error(what: str, e: dict) -> str | None:
+    if e["by"] != OWNER:
+        return f"{what}: by {e['by']!r}: only {OWNER} approves what the bar forbids"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(e["approved"])) or not all(
+            isinstance(e[k], str) and e[k].strip() for k in ("reason", "quote", "source")):
+        return f"{what}: an approval date (YYYY-MM-DD), a reason, {OWNER}'s quote and its source are required"
+    return None
+
+
+def load_policy(text: str) -> Policy:
+    """The policy file's entries, each checked. A trade-off names a case, a dimension, optionally
+    the baseline (`against`), the largest ratio its loss may reach (the worse end of its interval),
+    and the win that pays for it (`pays_with`: case and dimension, which must show as better in
+    the same report). An exception names a case and the outcome it accepts there. Both carry the
+    owner's approval: `approved` (date), `by`, `reason`, `quote` (his words) and `source`."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        return Policy([], [], [f"not TOML: {error}"])
+    errors = [f"unknown table {k!r} (tradeoff, exception)" for k in sorted(set(data) - {"tradeoff", "exception"})]
+    tradeoffs, exceptions = data.get("tradeoff", []), data.get("exception", [])
+    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions)):
+        if not (isinstance(entries, list) and all(isinstance(e, dict) for e in entries)):
+            errors.append(f"{key}: an array of tables ([[{key}]]), not {type(entries).__name__}")
+    if errors:
+        return Policy([], [], errors)
+    for i, e in enumerate(tradeoffs, start=1):
+        if missing := TRADEOFF_KEYS - set(e):
+            errors.append(f"trade-off {i}: missing {', '.join(sorted(missing))}")
+        elif error := authority_error(f"trade-off {i}", e):
+            errors.append(error)
         elif not (isinstance(e["max_ratio"], (int, float)) and e["max_ratio"] > 1):
-            errors.append(f"trade-off {i + 1}: max_ratio must be a number above 1")
-        elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(e["approved"])) or not str(e["reason"]).strip():
-            errors.append(f"trade-off {i + 1}: an approval date (YYYY-MM-DD) and a reason are required")
+            errors.append(f"trade-off {i}: max_ratio must be a number above 1")
         elif not (isinstance(e["pays_with"], dict) and {"case", "dimension"} <= set(e["pays_with"])):
-            errors.append(f"trade-off {i + 1}: pays_with needs the case and dimension of the win")
-    return ([] if errors else entries), errors
+            errors.append(f"trade-off {i}: pays_with needs the case and dimension of the win")
+    for i, e in enumerate(exceptions, start=1):
+        if missing := EXCEPTION_KEYS - set(e):
+            errors.append(f"exception {i}: missing {', '.join(sorted(missing))}")
+        elif error := authority_error(f"exception {i}", e):
+            errors.append(error)
+        elif e["outcome"] not in BAR_OUTCOMES:
+            errors.append(f"exception {i}: outcome {e['outcome']!r}: an exception accepts "
+                          f"{', '.join(sorted(BAR_OUTCOMES))} (a declared limit needs none)")
+    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [])
 
 
 def accepted(tradeoffs: list[dict], side: str, case: str, dimension_: str, r: dict, comparisons: dict) -> dict | None:
@@ -782,12 +838,15 @@ def fmt(x) -> str:
 
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
-         tradeoffs: list[dict] | None = None, catalog: list[dict] | None = None, elsewhere: dict | None = None,
-         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None) -> dict:
+         catalog: list[dict] | None = None, elsewhere: dict | None = None,
+         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
+         baseline_candidate: bool = False) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
-    and the rounds is verdict()'s. `floor`: the host's A-A' noise floor (read_floor())."""
-    not_run, tradeoffs, elsewhere = dict(not_run or {}), list(tradeoffs or []), dict(elsewhere or {})
+    and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
+    at the candidate's commit. `floor`: the host's A-A' noise floor (read_floor()).
+    `baseline_candidate`: an A-A' control's candidate is a baseline, with its own optimizer route."""
+    not_run, elsewhere = dict(not_run or {}), dict(elsewhere or {})
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
     baselines = [s for s in sides if s != candidate]
@@ -811,7 +870,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                           for p in sorted(passes, key=lambda p: p["n"])],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
                "context": context, "flagged": [], "other_blocking": [], "pvalues": {},
-               "not_run": not_run, "elsewhere": elsewhere, "tradeoffs": tradeoffs, "accepted": [], "errors": [],
+               "not_run": not_run, "elsewhere": elsewhere, "errors": [],
                "candidate_failures": {}, "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
     if missing := [s for s in required if s not in baselines]:
         summary["errors"].append(f"required baselines missing: {', '.join(missing)}")
@@ -833,17 +892,18 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
               for c in (catalog or [])}
     for case in planned:
         cand = evidence(by_side[candidate], case)
-        if state(cand) == "failed":
+        cand_state = state(cand, off_route_ok=baseline_candidate)
+        if cand_state == "failed":
             why = cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
             summary["candidate_failures"][case] = f"statuses {', '.join(map(str, cand['status']))}; " + "; ".join(why)
-        elif state(cand) == "known":
+        elif cand_state == "known":
             summary["known_issues"][case] = ", ".join(sorted(set(cand["status"])))
         elif any(x != "ok" for x in cand["expected"]):
             summary["fixed"][case] = ", ".join(sorted(set(cand["expected"]) - {"ok"}))
-        if cand["unchecked"] and state(cand) != "failed":
+        if cand["unchecked"] and cand_state != "failed":
             summary["candidate_failures"][case] = f"{cand['unchecked']} checks unchecked on the candidate"
         for side in baselines:
-            if state(cand) == "failed" or side in aliases:
+            if cand_state == "failed" or side in aliases:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
                                ((floor or {}).get("cases") or {}).get(case))
@@ -897,8 +957,10 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                          for side, rows in summary["comparisons"].items()}
     # One round decides nothing alone: a loss needs two (verdict()). This round passes on its
     # own only when nothing is flagged, failed or missing.
+    # A wrong answer the case declares passes no round alone: only the verdict's policy accepts one.
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
-                         and not summary["flagged"])
+                         and not summary["flagged"]
+                         and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
     return summary
 
 
@@ -967,37 +1029,94 @@ def render(summary: dict) -> str:
 
 # --- W3C and guards ----------------------------------------------------------------------------
 
-def w3c_counts(logs: Path) -> dict[str, dict]:
-    """Each suite's counts from the W3C kits' logs (`-- --nocapture`) and the OWL 2 DL TSV."""
-    out = {}
-    for log in sorted(logs.glob("*.log")):
-        text = log.read_text(encoding="utf-8", errors="replace")
-        title = None
-        for line in text.splitlines():
-            if m := re.match(r"W3C (.+) on engine v2: passed / failed / skipped", line):
-                title = m.group(1)
-            elif (m := re.match(r"\s+total: (\d+) / (\d+) / (\d+)", line)) and title:
-                out[title] = {"passed": int(m[1]), "failed": int(m[2]), "skipped": int(m[3])}
-                title = None
-            elif m := re.match(r"(W3C SHACL[^:]*): (\d+) of (\d+) pass", line):
-                out[m[1].removeprefix("W3C ")] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[2]), "skipped": 0}
-            elif m := re.match(r"W3C (OWL 2 RL)[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped", line):
-                out[m[1]] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[4]), "skipped": int(m[5])}
-            elif m := re.match(r"GeoSPARQL compliance benchmark: (\d+) of (\d+) queries match the reference, "
-                               r"(\d+) don't \((\d+) disputed\)", line):
-                out["GeoSPARQL"] = {"passed": int(m[1]), "failed": int(m[3]) - int(m[4]), "disputed": int(m[4])}
-            elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed", line):
-                out.setdefault("test results", {"passed": 0, "failed": 0})
-                out["test results"]["passed"] += int(m[2])
-                out["test results"]["failed"] += int(m[3])
-    for tsv in sorted(logs.glob("*.tsv")):
-        verdicts = Counter(line.split("\t")[3] for line in tsv.read_text(encoding="utf-8").splitlines()
-                           if line.count("\t") >= 3)
-        # open: undecided (gave up, unsupported); every other verdict but a pass or a
-        # recorded dispute is a failure (a wrong answer).
-        out["OWL 2 DL"] = {"passed": verdicts.pop("pass", 0), "disputed": verdicts.pop("disputed", 0),
-                           "open": verdicts.pop("open", 0), "failed": sum(verdicts.values()), "other": dict(verdicts)}
+class Kit(NamedTuple):
+    """A W3C kit the release gate runs (w3c-expected.toml's [kit."CRATE:TEST"]): the suites whose
+    counts its own log reports, and the table it writes, if any (NRESE_W3C_OUT, in the logs'
+    directory), which reports some of them."""
+    name: str
+    suites: tuple[str, ...]
+    table: str | None
+
+    @property
+    def crate(self) -> str:
+        return self.name.split(":", 1)[0]
+
+    @property
+    def test(self) -> str:
+        return self.name.split(":", 1)[1]
+
+
+def load_w3c_expected(text: str) -> tuple[dict, list[Kit], list[str]]:
+    """The suites' expectations, the kits in launch order, and what's wrong with the file: every
+    expected suite is one kit's, and every kit's suite has an expectation."""
+    data = tomllib.loads(text)
+    suites, kits, errors, owners = data.get("suite", {}), [], [], {}
+    for name, entry in data.get("kit", {}).items():
+        names = entry.get("suites")
+        if name.count(":") != 1 or not isinstance(names, list):
+            errors.append(f'kit {name!r}: [kit."CRATE:TEST"] with suites = [...]')
+            continue
+        for suite in names:
+            if suite in owners:
+                errors.append(f"{suite}: claimed by {owners[suite]} and {name}")
+            owners[suite] = name
+        kits.append(Kit(name, tuple(names), entry.get("table")))
+    errors += [f"{suite}: no kit reports it" for suite in suites if suite not in owners]
+    errors += [f"{suite}: {owners[suite]}'s, with no expectation" for suite in owners if suite not in suites]
+    if not kits:
+        errors.append("no kit declared")
+    return suites, kits, errors
+
+
+def kit_counts(logs: Path, kits: list[Kit]) -> dict[str, dict]:
+    """Each suite's counts, from its own kit's log (`-- --nocapture`) and table only: a suite another
+    kit's log prints doesn't stand for its kit; every kit's libtest summaries summed ("test results")."""
+    out: dict[str, dict] = {}
+    for kit in kits:
+        log = logs / f"{kit.test}.log"
+        counts = log_counts(log.read_text(encoding="utf-8", errors="replace") if log.is_file() else "")
+        if kit.table and (logs / kit.table).is_file():
+            counts.update(table_counts((logs / kit.table).read_text(encoding="utf-8")))
+        for suite, got in counts.items():
+            if suite == "test results":
+                total = out.setdefault(suite, {"passed": 0, "failed": 0})
+                total["passed"], total["failed"] = total["passed"] + got["passed"], total["failed"] + got["failed"]
+            elif suite in kit.suites:
+                out[suite] = got
     return out
+
+
+def log_counts(text: str) -> dict[str, dict]:
+    """The suites' counts one kit's log reports, and its libtest summaries' sums ("test results")."""
+    out: dict[str, dict] = {}
+    title = None
+    for line in text.splitlines():
+        if m := re.match(r"W3C (.+) on engine v2: passed / failed / skipped", line):
+            title = m.group(1)
+        elif (m := re.match(r"\s+total: (\d+) / (\d+) / (\d+)", line)) and title:
+            out[title] = {"passed": int(m[1]), "failed": int(m[2]), "skipped": int(m[3])}
+            title = None
+        elif m := re.match(r"(W3C SHACL[^:]*): (\d+) of (\d+) pass", line):
+            out[m[1].removeprefix("W3C ")] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[2]), "skipped": 0}
+        elif m := re.match(r"W3C (OWL 2 RL)[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped", line):
+            out[m[1]] = {"passed": int(m[2]), "failed": int(m[3]) - int(m[4]), "skipped": int(m[5])}
+        elif m := re.match(r"GeoSPARQL compliance benchmark: (\d+) of (\d+) queries match the reference, "
+                           r"(\d+) don't \((\d+) disputed\)", line):
+            out["GeoSPARQL"] = {"passed": int(m[1]), "failed": int(m[3]) - int(m[4]), "disputed": int(m[4])}
+        elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed", line):
+            out.setdefault("test results", {"passed": 0, "failed": 0})
+            out["test results"]["passed"] += int(m[2])
+            out["test results"]["failed"] += int(m[3])
+    return out
+
+
+def table_counts(text: str) -> dict[str, dict]:
+    """The OWL 2 DL counts of tableau_w3c's table (case, kind, profile, verdict, ...)."""
+    verdicts = Counter(line.split("\t")[3] for line in text.splitlines() if line.count("\t") >= 3)
+    # open: undecided (gave up, unsupported); every other verdict but a pass or a
+    # recorded dispute is a failure (a wrong answer).
+    return {"OWL 2 DL": {"passed": verdicts.pop("pass", 0), "disputed": verdicts.pop("disputed", 0),
+                         "open": verdicts.pop("open", 0), "failed": sum(verdicts.values()), "other": dict(verdicts)}}
 
 
 def w3c_check(counts: dict, expected: dict) -> list[str]:
@@ -1048,6 +1167,209 @@ def guards_check(names: list[str], log: str) -> tuple[list[str], dict]:
         elif any(s != "ok" for s in got):
             errors.append(f"{name}: {', '.join(got)}")
     return errors, {n: results.get(n, []) for n in names}
+
+
+# --- what a check launched, and the receipt that binds it to a tree ----------------------------
+
+class Outcome(NamedTuple):
+    """One launched unit of a check (a W3C kit, the guards' test run): its exit code, its log's
+    SHA-256, and whether the log holds libtest summaries, every one ok."""
+    unit: str
+    exit: int
+    log_sha256: str
+    summary: bool
+
+
+class CheckReceipt(NamedTuple):
+    """What a check ran: the checkout's commit and tree (its tracked files unchanged: `dirty`), the
+    build identity (scripts/lib/gate-key.sh gate_identity: toolchain, flags, tools), the host and
+    fleet job, its step's attempt (attempt_record()), and every unit it launched. `verdict` joins a
+    check only through it (release_verdict()); its inputs' pins are the tree's (fetch-w3c-tests.sh,
+    release-gate.sh's all.rdf), which the fetch verifies."""
+    kind: str
+    commit: str
+    tree: str
+    dirty: bool
+    identity: str
+    host: str
+    job: str
+    attempt: str
+    outcomes: tuple[Outcome, ...]
+
+    def as_json(self) -> dict:
+        return {**self._asdict(), "outcomes": [o._asdict() for o in self.outcomes]}
+
+    @classmethod
+    def of(cls, data) -> "CheckReceipt | None":
+        """A receipt read back (a result's `receipt`); None when there is none or it isn't one, every
+        field of its own type (a "0" is no exit code, a "false" no flag)."""
+        try:
+            r = cls(**{**data, "outcomes": tuple(Outcome(**o) for o in data["outcomes"])})
+        except (TypeError, KeyError):
+            return None
+        typed = (all(isinstance(getattr(r, k), str) for k in ("kind", "commit", "tree", "identity", "host", "job", "attempt"))
+                 and type(r.dirty) is bool
+                 and all(type(o.exit) is int and type(o.summary) is bool and isinstance(o.unit, str)
+                         and isinstance(o.log_sha256, str) for o in r.outcomes))
+        return r if typed else None
+
+
+SUMMARY = re.compile(r"^test result: (ok|FAILED)\.", re.M)
+
+
+def run_unit(unit: str, argv: list[str], log: Path, env: dict | None = None) -> Outcome:
+    """UNIT run here, its output (stdout and stderr) into LOG, which it replaces."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "wb") as out:
+        code = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+    data = log.read_bytes()
+    summaries = SUMMARY.findall(data.decode("utf-8", errors="replace"))
+    return Outcome(unit, code, hashlib.sha256(data).hexdigest(), bool(summaries) and set(summaries) == {"ok"})
+
+
+def outcome_errors(outcomes: tuple[Outcome, ...], units: list[str]) -> list[str]:
+    """Every declared unit launched once and run whole: exit 0 and passing libtest summaries; one
+    launched but not declared counts for nothing and is named."""
+    by_unit = {o.unit: o for o in outcomes}
+    launched = Counter(o.unit for o in outcomes)
+    errors = [f"{unit}: launched, but not declared" for unit in by_unit if unit not in units]
+    errors += [f"{unit}: launched {n} times" for unit, n in launched.items() if n > 1]
+    for unit in units:
+        o = by_unit.get(unit)
+        if o is None:
+            errors.append(f"{unit}: no launch recorded (the gate's step runs it: --run)")
+        elif o.exit == 75:
+            errors.append(f"{unit}: exited 75: the host's guard held or stopped its build, no verdict")
+        elif o.exit != 0:
+            errors.append(f"{unit}: exited {o.exit}")
+        elif not o.summary:
+            errors.append(f"{unit}: exited 0 without passing libtest summaries (killed, truncated or failed)")
+        elif not re.fullmatch(r"[0-9a-f]{64}", o.log_sha256):
+            errors.append(f"{unit}: no SHA-256 of its log")
+    return errors
+
+
+def checkout_receipt(kind: str, identity: str, attempt: str, outcomes: list[Outcome]) -> CheckReceipt:
+    """The receipt of what ran in this directory's checkout (release-gate.sh's checked code checkout)
+    as ATTEMPT."""
+    def git(*args: str) -> str:
+        done = subprocess.run(["git", *args], capture_output=True, text=True, timeout=60)
+        return done.stdout.strip() if done.returncode == 0 else ""
+    return CheckReceipt(kind, git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}"),
+                        bool(git("status", "--porcelain", "--untracked-files=no")), identity,
+                        os.environ.get("FLEET_HOST") or platform.node(), os.environ.get("FLEET_JOB", ""), attempt,
+                        tuple(outcomes))
+
+
+# A check's step writes its attempt record first (release-gate.sh w3c, guards; `release_gate.py
+# attempt`), before it touches an earlier result: KIND.attempt.SEQUENCE.json beside the result, the
+# sequence its name, created exclusively (O_EXCL: two attempts never hold one sequence, however they
+# overlap; a taken name sends an attempt to the next), never replaced or removed: no reader holding an
+# older record or result can stop it. The record holds a fresh random id, which the result and its
+# receipt carry; `verdict` takes a result only of the newest record's id, and nothing at all from a
+# history it can't order (a sequence held twice, a name of another form, at any position). The
+# orchestrator's design, fix checks r2 and r3, 9 Nov 2026. The run directory is per job: old records stay.
+ATTEMPT_SEQUENCE = re.compile(r"(\d+)")
+# Sequences an attempt tries past the highest it found before it refuses: as many steps of one kind
+# overlapping in one job's directory as this is no gate's (one step a kind runs at a time).
+ATTEMPT_TRIES = 64
+
+
+class AttemptHistory(NamedTuple):
+    """KIND's attempt records in a directory: (sequence, path) of each record's name, oldest first;
+    every sequence a name there holds, of any form (an attempt allocates above them all); and what
+    makes the history unordered (a name of another form, a sequence held twice)."""
+    records: list[tuple[int, Path]]
+    sequences: list[int]
+    ambiguous: list[str]
+
+
+def attempt_records(where: Path, kind: str) -> AttemptHistory:
+    """KIND's attempt history in WHERE (AttemptHistory)."""
+    records, sequences, ambiguous = [], [], []
+    for path in sorted(where.glob(f"{kind}.attempt.*")):
+        rest = path.name[len(f"{kind}.attempt."):]
+        number = ATTEMPT_SEQUENCE.match(rest)
+        if number:
+            sequences.append(int(number[1]))
+        if number and rest == f"{int(number[1]):09d}.json":
+            records.append((int(number[1]), path))
+        else:
+            ambiguous.append(f"{path.name}: not an attempt record's name ({kind}.attempt.SEQUENCE.json)")
+    ambiguous += [f"sequence {s} held by {n} names" for s, n in sorted(Counter(sequences).items()) if n > 1]
+    return AttemptHistory(sorted(records), sequences, ambiguous)
+
+
+def attempt_record(kind: str, where: Path) -> str:
+    """A new attempt of KIND's step in this directory's checkout, recorded in WHERE as the next
+    sequence no name there holds (created exclusively: a name taken meanwhile sends it to the next,
+    ATTEMPT_TRIES at most); its id."""
+    tree = git_line(".", "rev-parse", "HEAD^{tree}")
+    if not tree:
+        raise SystemExit(f"attempt: no checkout here to name the tree of: no attempt of {kind}")
+    attempt = secrets.token_hex(16)
+    first = 1 + max(attempt_records(where, kind).sequences, default=0)
+    for sequence in range(first, first + ATTEMPT_TRIES):
+        try:
+            fd = os.open(where / f"{kind}.attempt.{sequence:09d}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue  # another attempt holds it: the next
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"kind": kind, "attempt": attempt, "tree": tree, "sequence": sequence}))
+            out.flush()
+            os.fsync(out.fileno())
+        return attempt
+    raise SystemExit(f"attempt: sequences {first} to {first + ATTEMPT_TRIES - 1} of {kind} in {where} are all "
+                     "taken: no attempt recorded")
+
+
+def newest_attempt(where: Path, kind: str) -> tuple[dict | None, str | None]:
+    """KIND's newest attempt record in WHERE, by sequence, and what's wrong with it: (None, None) when
+    there is none; an unordered history (attempt_records()), or a newest record that isn't one (its
+    content not its name's sequence and kind, no random id or tree), is no record."""
+    history = attempt_records(where, kind)
+    if history.ambiguous:
+        return None, f"its attempt history is ambiguous ({'; '.join(history.ambiguous)})"
+    if not history.records:
+        return None, None
+    sequence, path = history.records[-1]
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        return None, f"its newest attempt record {path.name} can't be read ({error})"
+    if not (isinstance(record, dict) and record.get("kind") == kind and record.get("sequence") == sequence
+            and isinstance(record.get("attempt"), str) and re.fullmatch(r"[0-9a-f]{32}", record["attempt"])
+            and isinstance(record.get("tree"), str) and record["tree"]):
+        return None, f"its newest attempt record {path.name} isn't one"
+    return record, None
+
+
+# The checks' exits: 0 passed and 1 not passed, each with its own published result (the steps keep
+# those for the verdict); CANT_INVALIDATE when an earlier result can't be removed, so no run happened.
+CANT_INVALIDATE = 3
+
+
+def publish(path: Path, data: dict) -> None:
+    """DATA as PATH's JSON, whole or not at all: written beside it, then renamed over it."""
+    part = path.with_name(path.name + ".partial")
+    part.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(part, path)
+
+
+def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckReceipt:
+    """Every declared kit, in order, through this checkout's scripts/cargo-guarded.sh; each kit's log
+    and table its own, an earlier attempt's removed first."""
+    outcomes = []
+    for kit in kits:
+        table = logs / kit.table if kit.table else None
+        if table is not None:
+            table.unlink(missing_ok=True)
+        env = {**os.environ, **({"NRESE_W3C_OUT": str(table)} if table is not None else {})}
+        o = run_unit(kit.name, ["bash", "scripts/cargo-guarded.sh", "test", "--release", "--locked", "-p", kit.crate,
+                                "--test", kit.test, "--", "--nocapture"], logs / f"{kit.test}.log", env)
+        print(f"w3c {kit.name}: exit {o.exit}{'' if o.summary else ', no passing summary'}", file=sys.stderr)
+        outcomes.append(o)
+    return checkout_receipt("w3c", identity, attempt, outcomes)
 
 
 # --- the host each pass met --------------------------------------------------------------------
@@ -1537,16 +1859,22 @@ def measurement_ref(repo: str, ref: str, commit: str, remote: str | None,
     return rev
 
 
-def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
-    """The measurement commits of these sides as a job's git inputs: a job's checkout holds only
-    its own revision's history, and release-gate.sh build needs them in it."""
+def measurement_inputs(checkout: str, rev: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
+    """The measurement commits of these sides that a job's checkout of `rev` doesn't reach, as its
+    git inputs: the checkout holds only `rev`'s history, and release-gate.sh build needs them in it.
+    One that `rev` reaches is staged with it already (and the fleet takes one git input, F150)."""
     import subprocess
     sides = measurement_sides() if sides is None else sides
     inputs = []
-    for rev in dict.fromkeys(revs):
-        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{rev}^{{commit}}"],
+    for side in dict.fromkeys(revs):
+        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{side}^{{commit}}"],
                               capture_output=True, text=True, timeout=60).stdout.strip()
-        if full in sides:
+        if full not in sides:
+            continue
+        # As stored: a replace ref or graft here would reach it only in this repository.
+        reached = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", sides[full], rev],
+                                 capture_output=True, text=True, timeout=60, env={**os.environ, **STORED_OBJECTS})
+        if reached.returncode != 0:  # not reached, or not known here: kept, for the build to find or report
             inputs.append({"name": f"measure-{full[:8]}", "source": {"git": checkout, "rev": sides[full]}})
     return inputs
 
@@ -1574,7 +1902,7 @@ def side_inputs(checkout: str, rev: str, revs: list[str]) -> list[dict]:
     commits (measurement_inputs()), and each side that `rev`'s history doesn't hold, so that its
     build finds it (Sol r1 S4, 2 Nov 2026: a base off the change's history was built unstaged)."""
     import subprocess
-    inputs = measurement_inputs(checkout, revs)
+    inputs = measurement_inputs(checkout, rev, revs)
     for side in dict.fromkeys(revs):
         held = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", side, rev],
                               capture_output=True, text=True, timeout=60)
@@ -2418,14 +2746,48 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
                                                        "rev": checkout_rev(checkout, revs["cand"], harness)}}]}
 
 
-def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
+def known_lines(timed: list[dict], policy: Policy) -> tuple[list[str], list[str]]:
+    """The candidate's known issues under the owner's policy: the verdict's lines, and what blocks.
+    A wrong answer passes only through an exception naming its case and outcome; a declared limit
+    is named; an exception nothing used is named too."""
+    known: dict[str, set[str]] = {}
+    for report in timed:
+        for case, statuses in report.get("known_issues", {}).items():
+            known.setdefault(case, set()).update(s.strip() for s in statuses.split(","))
+    lines, blocking, used = [], [], set()
+    for case in sorted(known):
+        for status in sorted(known[case]):
+            if status not in BAR_OUTCOMES:
+                lines.append(f"- known issue: {case}: {status} (declared; it blocks where a baseline completes)")
+                continue
+            e = next((e for e in policy.exceptions if (e["case"], e["outcome"]) == (case, status)), None)
+            if e is None:
+                blocking.append(f"{case}: {status}, no owner exception ({POLICY_FILE} at the candidate)")
+            else:
+                used.add((case, status))
+                lines.append(f"- owner exception: {case} {status}, approved {e['approved']} by {e['by']} "
+                             f"({e['source']}): \"{e['quote']}\"")
+    lines += [f"- owner exception not used: {e['case']} {e['outcome']} (the candidate doesn't show it)"
+              for e in policy.exceptions if (e["case"], e["outcome"]) not in used]
+    return lines, blocking
+
+
+def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLICY,
+            evidence: list[str] | None = None) -> tuple[bool, str]:
     """Every part together: the family over every timed part decided (decide()), the other blocks
-    of every round, the cases one part left to another, the W3C counts and the guards."""
+    of every round, the cases one part left to another, the W3C counts and the guards, under the
+    owner's POLICY (none: nothing the bar forbids is accepted). EVIDENCE: what binding the parts to
+    the candidate found (release_verdict(), the command's only way here)."""
     parts = rounds_of(timed)
     d = decide(parts)
     lines = ["# Release verdict", "",
              f"Family: {d['m']} hypotheses declared (case x series or metric x baseline, every timed part); "
              f"Holm at {gatestats.ALPHA} over p = min(max(p1, p2) / 0.9, max(p2, p3) / 0.1).", ""]
+    evidence = list(evidence or [])
+    lines += [f"- **not the candidate's**: {e}" for e in evidence]
+    lines += [f"- **policy**: {POLICY_FILE}: {e}" for e in policy.errors]
+    known, wrong = known_lines(timed, policy)
+    lines += [f"- **wrong answer**: {w}" for w in wrong] + known
     errors = [e for rounds in parts for r in rounds for e in r["errors"]]
     other = [b for rounds in parts for r in rounds for b in r.get("other_blocking", [])]
     diagnostic = any(r["diagnostic"] for rounds in parts for r in rounds)
@@ -2433,17 +2795,17 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
     for h in d["losses"]:
         side, case, dim = h.split("|")
         ps = d["rounds"].get(h, [])
-        accepted_ = None
-        for rounds in parts:
-            for report in rounds:
-                r = report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dim)
-                if r is not None:
-                    t = accepted(report.get("tradeoffs", []), side, case, dim, r, report.get("comparisons", {}))
-                    accepted_ = accepted_ or t
+        # The approval must cover the loss in every round that shows it (its worse end within the bound,
+        # its win shown there): one round within the bound never waives another beyond it.
+        covers = [accepted(policy.tradeoffs, side, case, dim, r, report.get("comparisons", {}))
+                  for rounds in parts for report in rounds
+                  if (r := report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dim))
+                  is not None]
+        accepted_ = covers[0] if covers and all(covers) else None
         text = f"{case} against {side}: {dim}: p per round {ps}, combined {d['combined'][h]:.3g}"
         if accepted_:
             lines.append(f"- accepted trade-off: {text} (at most {accepted_['max_ratio']}, approved "
-                         f"{accepted_['approved']} by {accepted_['by']})")
+                         f"{accepted_['approved']} by {accepted_['by']}, {accepted_['source']})")
         else:
             blocking_losses.append(text)
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
@@ -2455,13 +2817,172 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
     if missing:
         lines.append(f"- NOT timed anywhere: {', '.join(missing)} (left to another part, which didn't run them)")
-    lines.append(f"- W3C: {'passed' if w3c['passed'] else 'NOT passed'} ({'; '.join(w3c['errors']) or 'every suite as required'})")
-    lines.append(f"- §0 guards: {'passed' if guards['passed'] else 'NOT passed'} "
-                 f"({'; '.join(guards['errors'][:5]) or str(guards['guards']) + ' guards ran and passed'})")
+    # A check passes only by saying so exactly (True, no errors); a "false" or a missing field is no pass.
+    w3c_ok, guards_ok = (part.get("passed") is True and not part.get("errors") for part in (w3c, guards))
+    lines.append(f"- W3C: {'passed' if w3c_ok else 'NOT passed'} "
+                 f"({'; '.join(map(str, w3c.get('errors') or [])) or 'every suite as required'})")
+    lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
+                 f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
     passed = (not blocking_losses and not d["pending"] and not d["not_compared"] and not other and not errors
-              and not diagnostic and not missing and w3c["passed"] and guards["passed"])
+              and not diagnostic and not missing and w3c_ok and guards_ok
+              and not evidence and not policy.errors and not wrong)
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]
     return passed, "\n".join(lines) + "\n"
+
+
+class Candidate(NamedTuple):
+    """The candidate a verdict is for: its commit and tree, and the tree of any revision as the
+    repository it was named in holds it (None: not there)."""
+    commit: str
+    tree: str
+    tree_of: Callable[[str], "str | None"]
+
+
+CONTRACT_FILES = ("benches/fast/w3c-expected.toml", "docs/design/performance.md")
+
+
+class Contract(NamedTuple):
+    """What the candidate's tree requires of its checks (CONTRACT_FILES, read at the candidate's
+    commit): the W3C suites' counts and the kits that report them, and the §0 guards; and what's
+    wrong with it (nothing passes while anything is)."""
+    suites: dict
+    kits: list[Kit]
+    guards: list[str]
+    errors: list[str]
+
+
+def load_contract(w3c_expected: str | None, performance_md: str | None) -> Contract:
+    """The contract from the two files' texts (None: not in the candidate's tree)."""
+    errors, suites, kits, guards = [], {}, [], []
+    if w3c_expected is None:
+        errors.append(f"{CONTRACT_FILES[0]}: not in the candidate's tree")
+    else:
+        try:
+            suites, kits, bad = load_w3c_expected(w3c_expected)
+        except tomllib.TOMLDecodeError as error:
+            bad = [f"not TOML: {error}"]
+        errors += [f"{CONTRACT_FILES[0]}: {b}" for b in bad]
+    if performance_md is None or "## 0." not in performance_md:
+        errors.append(f"{CONTRACT_FILES[1]}: no §0 in the candidate's tree")
+    elif not (guards := guard_names(performance_md)):
+        errors.append(f"{CONTRACT_FILES[1]}: §0 names no guard")
+    return Contract(suites, kits, guards, errors)
+
+
+def claim_errors(kind: str, result: dict) -> list[str]:
+    """A result's own claim: passed, exactly true, with no errors; what it says otherwise."""
+    if result.get("passed") is True and result.get("errors") == []:
+        return []
+    return [f"{kind}: its result doesn't say passed with no errors "
+            f"(passed {result.get('passed')!r}; {'; '.join(map(str, result.get('errors') or [])) or 'no errors listed'})"]
+
+
+def w3c_result_errors(result: dict, receipt: CheckReceipt, contract: Contract) -> list[str]:
+    """A W3C result against the contract: every declared kit launched once and run whole, every
+    suite's counts as required (the producer's own checks, outcome_errors() and w3c_check())."""
+    counts = result.get("counts")
+    return (outcome_errors(receipt.outcomes, [kit.name for kit in contract.kits])
+            + (w3c_check(counts, contract.suites) if isinstance(counts, dict) else ["w3c: its result holds no counts"]))
+
+
+def guards_result_errors(result: dict, receipt: CheckReceipt, contract: Contract) -> list[str]:
+    """A guards result against the contract: the one test run launched and run whole, and every §0
+    guard among its results, each ok."""
+    results = result.get("results") if isinstance(result.get("results"), dict) else {}
+    errors = outcome_errors(receipt.outcomes, ["guards"])
+    for name in contract.guards:
+        got = results.get(name)
+        if not (isinstance(got, list) and got):
+            errors.append(f"{name}: no test of that name ran (named in performance.md §0)")
+        elif any(s != "ok" for s in got):
+            errors.append(f"{name}: {', '.join(map(str, got))}")
+    return errors
+
+
+RESULT_ERRORS = {"w3c": w3c_result_errors, "guards": guards_result_errors}
+
+
+def attempt_errors(kind: str, result: dict | None, newest: tuple[dict | None, str | None],
+                   candidate: Candidate) -> list[str]:
+    """A check's result against its step's newest attempt record (newest_attempt()): one there, of the
+    candidate's tree, and the result (and its receipt) that attempt's."""
+    record, wrong = newest
+    if wrong:
+        return [f"{kind}: {wrong}"]
+    if record is None:
+        return [f"{kind}: no attempt record ({kind}.attempt.*.json beside its result): no step stands for it"]
+    if result is None:
+        return [f"{kind}: no result for its latest attempt {record['attempt']}"]
+    errors = []
+    carried = {result.get("attempt"), (result.get("receipt") or {}).get("attempt")}
+    if carried != {record["attempt"]}:
+        errors.append(f"{kind}: stale result from an earlier attempt (it carries "
+                      f"{', '.join(sorted(map(str, carried)))}; the latest attempt is {record['attempt']})")
+    if record["tree"] != candidate.tree:
+        errors.append(f"{kind}: its latest attempt ran tree {record['tree']}, not the candidate's {candidate.tree}")
+    return errors
+
+
+def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate: Candidate,
+                    contract: Contract, attempts: dict[str, tuple[dict | None, str | None]]) -> list[str]:
+    """What isn't evidence of the candidate's tree: a timed part that timed another tree, a check
+    without a receipt (one from before receipts, or not the gate's), with a receipt of another tree,
+    of a checkout with changes, or whose commit isn't of the tree it names; a check that isn't its
+    step's latest attempt (ATTEMPTS: each kind's record, attempt_errors()); and a check that isn't
+    the run the candidate's CONTRACT requires (its own `passed` decides nothing). A tree, not a
+    commit: the same tree under a merge commit is the same candidate
+    (rule.owl-rs-results-keyed-by-tree)."""
+    errors = [f"the candidate's contract: {e}" for e in contract.errors]
+    for kind, result in checks.items():
+        errors += attempt_errors(kind, result, attempts.get(kind, (None, None)), candidate)
+    checks = {kind: result for kind, result in checks.items() if result is not None}
+    for report in timed:
+        rev = str((report.get("candidate") or {}).get("revision") or "")
+        tree = candidate.tree_of(rev) if rev else None
+        if tree != candidate.tree:
+            c = report.get("context") or {}
+            errors.append(f"timed part {c.get('prefix') or '?'} on {c.get('host') or '?'}, round {c.get('round', '?')}: "
+                          f"timed {rev[:12] or 'no candidate'} (tree {tree or 'unknown here'}), "
+                          f"not the candidate's tree {candidate.tree}")
+    for kind, result in checks.items():
+        r = CheckReceipt.of(result.get("receipt"))
+        if r is None:
+            errors.append(f"{kind}: no receipt (a result from before receipts, or not the gate's): "
+                          "it can't be bound to the candidate")
+            continue
+        if r.kind != kind:
+            errors.append(f"{kind}: the receipt of a {r.kind} check")
+        if not (r.identity and r.host and r.outcomes):
+            errors.append(f"{kind}: its receipt names no build identity, host or launched unit")
+        if r.dirty:
+            errors.append(f"{kind}: ran a checkout whose tracked files had changes")
+        if r.tree != candidate.tree:
+            errors.append(f"{kind}: ran tree {r.tree or 'none'}, not the candidate's {candidate.tree}")
+        elif candidate.tree_of(r.commit) != r.tree:
+            errors.append(f"{kind}: its commit {r.commit[:12] or 'none'} isn't of tree {r.tree} here")
+        errors += claim_errors(kind, result)
+        if not contract.errors:
+            errors += [f"{kind}: {e}" for e in RESULT_ERRORS[kind](result, r, contract)]
+    return errors
+
+
+def release_verdict(timed: list[dict], w3c: dict | None, guards: dict | None, candidate: Candidate,
+                    policy: Policy, contract: Contract,
+                    attempts: dict[str, tuple[dict | None, str | None]]) -> tuple[bool, str]:
+    """`verdict`: the parts bound to the candidate, each check to its step's latest attempt (ATTEMPTS)
+    and to its tree's contract (evidence_errors()), under its tree's policy. A check without a result
+    (None) is no pass."""
+    evidence = evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract, attempts)
+    passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence)
+    head, rest = text.split("\n", 1)
+    return passed, f"{head}\n\nCandidate: {candidate.commit} (tree {candidate.tree})\n{rest}"
+
+
+def git_line(checkout: str, *args: str) -> str | None:
+    """A git command's output in CHECKOUT, as UTF-8 (the repository's files are; never the host's
+    locale codec), stripped; None when it fails."""
+    done = subprocess.run(["git", "-C", checkout, *args], capture_output=True, encoding="utf-8", timeout=60)
+    return done.stdout.strip() if done.returncode == 0 else None
 
 
 # --- the command line --------------------------------------------------------------------------
@@ -2499,8 +3020,6 @@ def main() -> int:
     s.add_argument("--not-run", action="append", default=[], metavar="CASE=WHY")
     s.add_argument("--elsewhere", action="append", default=[], metavar="CASE=WHERE",
                    help="cases another timed part of the gate runs (the verdict checks that it did)")
-    s.add_argument("--tradeoffs", type=Path, default=ROOT / "benches" / "release-tradeoffs.toml",
-                   help="the owner-approved trade-offs: the only way a loss is accepted")
     s.add_argument("--inputs", type=Path, help="the datasets the passes read, as prepare recorded them")
     s.add_argument("--context", action="append", default=[], metavar="KEY=VALUE",
                    help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb, "
@@ -2512,15 +3031,26 @@ def main() -> int:
     s = sub.add_parser("floor", help="a host's noise floor (noise-floor/HOST.toml) from an A-A' gate's report")
     s.add_argument("report", type=Path, help="its release-gate.json (every side one revision)")
     s.add_argument("--host", required=True, help="fleet's name of the host")
-    s = sub.add_parser("w3c")
-    s.add_argument("logs", type=Path)
-    s.add_argument("--expected", type=Path, required=True)
+    s = sub.add_parser("w3c", help="the W3C kits' outcomes and their suites' counts (release-gate.sh w3c)")
+    s.add_argument("logs", type=Path, nargs="?", help="the kits' logs and tables, and receipt.json")
+    s.add_argument("--expected", type=Path, required=True, help="the kits and the suites' counts (w3c-expected.toml)")
+    s.add_argument("--list-kits", action="store_true", help="the declared kits, in launch order")
+    s.add_argument("--run", action="store_true", help="launch every declared kit in this checkout first, each "
+                                                      "outcome recorded in LOGS/receipt.json")
+    s.add_argument("--identity", help="with --run: the build identity (scripts/lib/gate-key.sh gate_identity)")
+    s.add_argument("--attempt", help="with --run: its step's attempt (release_gate.py attempt), in result and receipt")
     s.add_argument("--json", type=Path)
-    s = sub.add_parser("guards")
+    s = sub.add_parser("guards", help="the §0 guards, run (release-gate.sh guards)")
     s.add_argument("--names", type=Path, help="one guard per line; default: performance.md §0's")
     s.add_argument("--list-names", action="store_true")
     s.add_argument("--log", type=Path)
+    s.add_argument("--run", action="store_true", help="run the guards' tests in this checkout first, into --log")
+    s.add_argument("--identity", help="with --run: the build identity (scripts/lib/gate-key.sh gate_identity)")
+    s.add_argument("--attempt", help="with --run: its step's attempt (release_gate.py attempt), in result and receipt")
     s.add_argument("--json", type=Path)
+    s = sub.add_parser("attempt", help="a new attempt of a check's step, recorded beside its result; prints its id")
+    s.add_argument("kind", choices=("w3c", "guards"))
+    s.add_argument("where", type=Path, help="the step's results directory (KIND.attempt.SEQUENCE.json)")
     s = sub.add_parser("jobs", help="the fleet jobs of a whole gate, as TOML files")
     s.add_argument("candidate", help="the head to gate (a revision of --checkout)")
     s.add_argument("--harness", help="the revision whose fast suite, generator and gate run (default: the candidate)")
@@ -2561,7 +3091,10 @@ def main() -> int:
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
     s.add_argument("--checkout", default=ROOT.as_posix())
     s.add_argument("--out", type=Path, default=Path("."))
-    s = sub.add_parser("verdict")
+    s = sub.add_parser("verdict", help="every part together, for one candidate (release-gate.sh verdict)")
+    s.add_argument("--candidate", required=True, help="the candidate: a revision of --checkout; every part must "
+                                                      "be its tree's, and its tree's policy applies")
+    s.add_argument("--checkout", default=ROOT.as_posix(), help="the repository the candidate is named in")
     s.add_argument("--timed", type=Path, action="append", required=True)
     s.add_argument("--w3c", type=Path, required=True)
     s.add_argument("--guards", type=Path, required=True)
@@ -2595,15 +3128,12 @@ def main() -> int:
         return 0
     if args.command == "report":
         sides = pairs(args.side, "--side")
-        tradeoffs, bad = load_tradeoffs(args.tradeoffs)
-        if bad:
-            raise SystemExit("benches/release-tradeoffs.toml: " + "; ".join(bad))
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
         floor_file = args.floor or (FLOORS / f"{context['host']}.toml" if context.get("host") else None)
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
-                       args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"), tradeoffs,
+                       args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
                        cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
                        read_floor(floor_file) if floor_file else None)
         for key in ("round", "max_gb", "ram_gb", "layouts"):
@@ -2632,14 +3162,52 @@ def main() -> int:
         print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
               f"{floor['blocks']} blocks")
         return 0
+    if args.command in ("w3c", "guards") and args.run:
+        # A run's earlier result (and the W3C receipt) goes before anything that can fail, its setup
+        # included: a run stopped at any point leaves none, never one that speaks for what it didn't run.
+        # Its own is published only once it is whole (publish()).
+        for earlier in (args.json, args.logs / "receipt.json" if args.command == "w3c" and args.logs else None):
+            if earlier is None:
+                continue
+            try:
+                earlier.unlink(missing_ok=True)
+            except OSError as error:
+                # Not a judged result (0 passed, 1 not passed: the step keeps those): a crash, which no
+                # step reads as one (fix check r1: an exit 1 beside the earlier file passed it).
+                print(f"{args.command}: the earlier result {earlier} can't be removed ({error}): no run",
+                      file=sys.stderr)
+                return CANT_INVALIDATE
+    if args.command == "attempt":
+        args.where.mkdir(parents=True, exist_ok=True)
+        print(attempt_record(args.kind, args.where))
+        return 0
     if args.command == "w3c":
-        expected = tomllib.loads(args.expected.read_text(encoding="utf-8"))["suite"]
-        counts = w3c_counts(args.logs)
-        errors = w3c_check(counts, expected)
-        out = {"counts": counts, "expected": expected, "errors": errors, "passed": not errors}
+        expected, kits, bad = load_w3c_expected(args.expected.read_text(encoding="utf-8"))
+        if bad:
+            raise SystemExit(f"{args.expected}: " + "; ".join(bad))
+        if args.list_kits:
+            print("\n".join(kit.name for kit in kits))
+            return 0
+        if args.logs is None or (args.run and not (args.identity and args.attempt)):
+            p.error("w3c: LOGDIR, and with --run its --identity and --attempt")
+        recorded = args.logs / "receipt.json"
+        if args.run:
+            receipt = run_w3c(args.logs, kits, args.identity, args.attempt)
+            publish(recorded, receipt.as_json())
+        else:
+            receipt = CheckReceipt.of(json.loads(recorded.read_text(encoding="utf-8"))) if recorded.is_file() else None
+        counts = kit_counts(args.logs, kits)
+        errors = outcome_errors(receipt.outcomes if receipt else (), [kit.name for kit in kits]) + w3c_check(counts, expected)
+        # Each recorded launch's log is the one it wrote (a re-check reads logs a later run may have replaced).
+        logs_of = {kit.name: args.logs / f"{kit.test}.log" for kit in kits}
+        errors += [f"{o.unit}: its log isn't the one its launch recorded" for o in (receipt.outcomes if receipt else ())
+                   if o.unit in logs_of and (not logs_of[o.unit].is_file()
+                                             or hashlib.sha256(logs_of[o.unit].read_bytes()).hexdigest() != o.log_sha256)]
+        out = {"counts": counts, "expected": expected, "errors": errors, "passed": not errors,
+               **({"attempt": receipt.attempt, "receipt": receipt.as_json()} if receipt else {})}
         print(json.dumps(out, indent=1))
         if args.json:
-            args.json.write_text(json.dumps(out, indent=1), encoding="utf-8")
+            publish(args.json, out)
         return 0 if not errors else 1
     if args.command == "guards":
         names = (args.names.read_text(encoding="utf-8").split() if args.names else
@@ -2647,11 +3215,21 @@ def main() -> int:
         if args.list_names:
             print("\n".join(names))
             return 0
-        errors, results = guards_check(names, args.log.read_text(encoding="utf-8", errors="replace"))
-        out = {"guards": len(names), "results": results, "errors": errors, "passed": not errors}
+        if args.log is None or (args.run and not (args.identity and args.attempt)):
+            p.error("guards: --log, and with --run its --identity and --attempt")
+        receipt = None
+        if args.run:
+            receipt = checkout_receipt("guards", args.identity, args.attempt, [run_unit("guards", [
+                "bash", "scripts/cargo-guarded.sh", "test", "--release", "--locked", "--workspace", "--no-fail-fast",
+                "--lib", "--bins", "--tests", "--", *names], args.log)])
+        errors, results = guards_check(names, args.log.read_text(encoding="utf-8", errors="replace")
+                                       if args.log.is_file() else "")
+        errors = outcome_errors(receipt.outcomes if receipt else (), ["guards"]) + errors
+        out = {"guards": len(names), "results": results, "errors": errors, "passed": not errors,
+               **({"attempt": receipt.attempt, "receipt": receipt.as_json()} if receipt else {})}
         print("\n".join(errors) or f"all {len(names)} guards ran and passed")
         if args.json:
-            args.json.write_text(json.dumps(out, indent=1), encoding="utf-8")
+            publish(args.json, out)
         return 0 if not errors else 1
     if args.command == "calibrate":
         files = [f for p in args.passes for f in
@@ -2745,10 +3323,27 @@ def main() -> int:
         print(said)
         if code == 0:
             print(f"wait: fleet wait set:{prefix}; then fetch each part (fleet results ID --to DIR) and "
-                  f"release-gate.sh verdict TIMED_DIR... CHECKS_DIR")
+                  f"release-gate.sh verdict {candidate} TIMED_DIR... CHECKS_DIR")
         return 0 if code == 0 else 1
-    parts = [json.loads(path.read_text(encoding="utf-8")) for path in [*args.timed, args.w3c, args.guards]]
-    passed, text = verdict(parts[:-2], parts[-2], parts[-1])
+    commit = git_line(args.checkout, "rev-parse", "--verify", "--quiet", f"{args.candidate}^{{commit}}")
+    if not commit:
+        p.error(f"verdict: {args.candidate} is no commit of {args.checkout}")
+    # The policy as the candidate's tree holds it; a tree without the file accepts nothing.
+    policy = load_policy(git_line(args.checkout, "show", f"{commit}:{POLICY_FILE}") or "")
+    candidate = Candidate(commit, git_line(args.checkout, "rev-parse", f"{commit}^{{tree}}") or "",
+                          lambda rev: git_line(args.checkout, "rev-parse", "--verify", "--quiet", f"{rev}^{{tree}}"))
+    # What the candidate's tree requires of its checks: its kits, suites and guards.
+    contract = load_contract(*(git_line(args.checkout, "show", f"{commit}:{rel}") for rel in CONTRACT_FILES))
+    timed = [json.loads(path.read_text(encoding="utf-8")) for path in args.timed]
+    # Each check's result (None: there is none, as when its producer never published) and its step's
+    # newest attempt record beside it (attempt_errors()).
+    checks, attempts = {}, {}
+    for kind, path in (("w3c", args.w3c), ("guards", args.guards)):
+        checks[kind] = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        attempts[kind] = newest_attempt(path.parent, kind)
+    if not all(isinstance(part, dict) for part in [*timed, *(c for c in checks.values() if c is not None)]):
+        p.error("verdict: every part is a JSON object (release-gate.json, w3c.json, guards.json)")
+    passed, text = release_verdict(timed, checks["w3c"], checks["guards"], candidate, policy, contract, attempts)
     print(text)
     if args.out:
         args.out.write_text(text, encoding="utf-8")

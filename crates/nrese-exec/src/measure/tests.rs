@@ -531,3 +531,41 @@ fn the_deadline_is_whole_seconds_or_none() {
         assert!(refusal.is_err(), "{refused:?} taken");
     }
 }
+
+/// Spec: `GlobalAlloc::realloc` may be asked for any size that is a layout at the block's
+/// alignment, and returns null for one it can't serve; `A` is asked only for layouts (its
+/// contract), so a size the header carries past `isize::MAX` is refused before `A` sees it.
+#[test]
+fn a_reallocation_the_header_carries_past_isize_max_never_reaches_the_inner_allocator() {
+    struct Inner(AtomicUsize);
+    // SAFETY: the system's blocks; `realloc` serves none and says so with null.
+    unsafe impl GlobalAlloc for Inner {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: the caller's contract, passed on: `pointer` is the system's block.
+            unsafe { std::alloc::System.dealloc(pointer, layout) }
+        }
+        unsafe fn realloc(&self, _: *mut u8, _: Layout, _: usize) -> *mut u8 {
+            self.0.fetch_add(1, SeqCst);
+            std::ptr::null_mut()
+        }
+    }
+    let measured = Measured(Inner(AtomicUsize::new(0)));
+    let layout = Layout::new::<u8>();
+    // SAFETY: a non-zero layout; `isize::MAX` is a layout at its alignment; the block, its
+    // reallocation refused, is freed with the layout it was made with.
+    unsafe {
+        let block = measured.alloc(layout);
+        assert!(!block.is_null());
+        assert!(
+            measured
+                .realloc(block, layout, isize::MAX as usize)
+                .is_null()
+        );
+        measured.dealloc(block, layout);
+    }
+    assert_eq!(measured.0.0.load(SeqCst), 0, "asked past isize::MAX");
+}
