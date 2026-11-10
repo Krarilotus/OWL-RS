@@ -100,7 +100,7 @@ fn bytes_in(dirs: &[PathBuf]) -> u64 {
 }
 
 fn query(store: &StoreService, text: &str) -> Result<(f64, Vec<String>), Box<dyn Error>> {
-    let prepared = PreparedQuery::parse(&crate::request(text))?;
+    let prepared = PreparedQuery::parse(&crate::tsv_request(text))?;
     let mut out = Vec::new();
     let at = Instant::now();
     store.run_query(&prepared, &CancellationToken::new(), &mut out)?;
