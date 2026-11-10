@@ -737,12 +737,16 @@ impl IndexVersion {
             // PART_FIRST (at most its keys): one budget call where its doublings from a few
             // groups made about ten, all parts' calls on one budget at once (D16-039's NOT
             // EXISTS: 300 K cycles a run in `Budget::take`). The room past the first group is
-            // optional, never refused (sol-loop S2-1).
+            // optional, never refused (sol-loop S2-1), and the parts' together at most half
+            // the room the walk starts with: what a part asks ahead and doesn't fill is held
+            // until the merge, and the merge's own room, at most the parts' groups, must stay
+            // (package review r1, SC-R1-01). Read once, before the parts start.
+            let ahead = budget.remaining() / (2 * (cuts.len() - 1) * size_of::<(u64, i64)>());
             let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
                     let mut part = ChargedVec::new(budget);
-                    part.reserve_hint(1, (cut[1] - cut[0]).min(PART_FIRST))?;
+                    part.reserve_hint(1, (cut[1] - cut[0]).min(PART_FIRST).min(ahead))?;
                     walk(cut[0], cut[1], &mut part)?;
                     Ok(part)
                 })
