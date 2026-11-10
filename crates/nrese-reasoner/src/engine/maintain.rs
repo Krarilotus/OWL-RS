@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use nrese_engine::{
-    EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId,
+    CountedSnapshot, EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, TermId,
     Transaction,
 };
 use nrese_exec::Budget;
@@ -21,8 +21,13 @@ use crate::lists::ListDiagnostic;
 /// and inferred, any graph) without the pending deletes, plus the pending inserts, indexed
 /// in memory. Scanning the transaction itself would filter every pending insert on each
 /// lookup.
+///
+/// The committed state is read only counted ([`CountedSnapshot`]): every read's work in
+/// the engine (its runs, merge steps, deleted copies, equality copies and class build)
+/// counts on the reading task's poller, so a stop is seen within its interval whatever the
+/// engine passes over (REAS-3, sweeps SW016–SW019).
 pub struct EngineBase<'a> {
-    snapshot: &'a Snapshot,
+    snapshot: CountedSnapshot,
     inserts: MemoryBase,
     deletes: HashSet<EncodedQuad>,
     /// The ruleset's axioms (sorted): they count as asserted, so no deletion retracts them.
@@ -33,7 +38,7 @@ impl<'a> EngineBase<'a> {
     pub fn new(tx: &'a Transaction<'_>, axioms: &'a [Triple]) -> Self {
         let inserts: Vec<Triple> = tx.inserted().map(triple).collect();
         Self {
-            snapshot: tx.base(),
+            snapshot: tx.base().counted(),
             inserts: MemoryBase::new(&inserts, &[]),
             deletes: tx.deleted().collect(),
             axioms,
@@ -50,14 +55,17 @@ impl<'a> EngineBase<'a> {
             return Err(Stopped);
         }
         let [s, p, o] = fact.map(Some);
-        Ok(self
+        // Its work in the engine counted too (REAS-3, SW016).
+        let first = self
             .snapshot
-            .quads_for_pattern_in(
+            .quads(
                 ReadModel::Materialised,
                 &pattern([s, p, o], GraphSelector::Any),
+                &|n| poll.visit(n),
             )
             .next()
-            .is_some())
+            .transpose()?;
+        Ok(first.is_some())
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
@@ -70,26 +78,40 @@ impl<'a> EngineBase<'a> {
         probe: Probe<'_, '_>,
     ) -> Result<bool, Stopped> {
         let [s, p, o] = fact.map(Some);
-        let found = self
+        // The engine's work below each copy counted too (REAS-3, SW017).
+        let visit = |n| probe.visited(n);
+        for quad in self
             .snapshot
-            .quads_for_pattern_in(model, &pattern([s, p, o], GraphSelector::Any))
-            .take_while(|_| probe.units(1))
-            .any(|quad| !self.deletes.contains(&quad));
-        if !found {
-            probe.ended()?;
+            .quads(model, &pattern([s, p, o], GraphSelector::Any), &visit)
+        {
+            let quad = quad?;
+            if !probe.units(1) {
+                return Err(Stopped);
+            }
+            if !self.deletes.contains(&quad) {
+                return Ok(true);
+            }
         }
-        Ok(found)
+        Ok(false)
     }
 }
 
 /// Reads count as [`Base`] says: each quad a scan visits is a position, the deleted ones it
-/// passes over skipped, and so is each axiom it checks; the inserts' on their store's.
+/// passes over skipped, and so is each axiom it checks; the inserts' on their store's. The
+/// engine's own work below each quad counts on the same poller ([`CountedSnapshot`]); a scan
+/// it stopped ends, which the scan's caller reads as stopped ([`Poller::ended`]).
 impl VisitsBase for EngineBase<'_> {
     fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
-        {
+        let poll = visit.poller();
+        let reads = |n| poll.visit(n);
+        for quad in self.snapshot.quads(
+            ReadModel::Materialised,
+            &pattern(bound, GraphSelector::Any),
+            &reads,
+        ) {
+            let Ok(quad) = quad else {
+                return;
+            };
             let going = match self.deletes.contains(&quad) {
                 true => visit.skip(),
                 false => visit.fact(triple(quad)),
@@ -106,12 +128,11 @@ impl VisitsBase for EngineBase<'_> {
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         let committed = self
             .snapshot
-            .count_in_visiting(
+            .count(
                 ReadModel::Materialised,
                 &pattern(bound, GraphSelector::Any),
-                &mut |n| probe.visited(n),
-            )
-            .ok_or(Stopped)?
+                &|n| probe.visited(n),
+            )?
             .at_least();
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
@@ -132,10 +153,16 @@ impl VisitsBase for EngineBase<'_> {
     }
 
     fn visit_asserted(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Asserted, &pattern(bound, GraphSelector::Any))
-        {
+        let poll = visit.poller();
+        let reads = |n| poll.visit(n);
+        for quad in self.snapshot.quads(
+            ReadModel::Asserted,
+            &pattern(bound, GraphSelector::Any),
+            &reads,
+        ) {
+            let Ok(quad) = quad else {
+                return;
+            };
             let going = match self.deletes.contains(&quad) {
                 true => visit.skip(),
                 false => visit.fact(triple(quad)),
@@ -742,6 +769,224 @@ mod tests {
         assert!(
             poll.stopped(),
             "{n} deleted copies read without the poller polling"
+        );
+    }
+
+    /// The most work a read may do in the engine between two asks of its stop: `POLL_UNITS`
+    /// counted units plus one run of at most `POLL_UNITS` in progress (REAS-2's invariant;
+    /// REAS-3 design note, "Red witnesses first").
+    #[cfg(debug_assertions)]
+    const LARGEST_GAP: u64 = 2 * nrese_exec::POLL_UNITS as u64;
+
+    /// REAS-3, group E (sweep SW013). Spec (design note's invariant: a unit is each copy an
+    /// equality read makes): an engine base's scan under expanded equality makes a stored
+    /// quad's copies within its poll interval. One stored quad whose subject and object each
+    /// have 128 identities stands for 128 × 128 copies; between two asks of the scan's stop
+    /// (and after the last one) the engine makes at most `LARGEST_GAP` of them. The engine
+    /// builds a quad's whole product before it hands on the first copy, unseen by the stop.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_engine_base_scan_makes_equality_copies_within_its_poll_interval() {
+        use crate::witness::EngineGaps;
+        use nrese_engine::witness::Site;
+        let k = 128;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+        let same_as = iri("http://www.w3.org/2002/07/owl#sameAs");
+        let p = iri("http://example.com/p");
+        let s: Vec<u64> = (0..k)
+            .map(|i| iri(&format!("http://example.com/s{i}")))
+            .collect();
+        let o: Vec<u64> = (0..k)
+            .map(|i| iri(&format!("http://example.com/o{i}")))
+            .collect();
+        tx.insert_encoded(encode([s[0], p, o[0]]).in_default_graph());
+        for i in 1..k {
+            tx.insert_encoded(encode([s[0], same_as, s[i]]).in_default_graph());
+            tx.insert_encoded(encode([o[0], same_as, o[i]]).in_default_graph());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(TermId::from_raw(same_as)));
+        let tx = engine.transaction();
+        let base = EngineBase::new(&tx, &[]);
+        let gaps = EngineGaps::new(Site::ExpandCopies);
+        let stop = || gaps.ask();
+        let poll = Poller::new(&stop).expect("never stops");
+        let mut delivered = 0;
+        base.scan([None, Some(p), None], &poll, &mut |_| delivered += 1)
+            .expect("never stopped");
+        assert_eq!(
+            delivered,
+            k * k,
+            "each identity pair is a copy (equality expanded)"
+        );
+        let largest = gaps.largest();
+        assert!(
+            largest <= LARGEST_GAP,
+            "{largest} equality copies made between two asks of the stop: at most {LARGEST_GAP}"
+        );
+    }
+
+    /// REAS-3, group E (sweep SW012). Spec (design note's invariant: a unit is each `sameAs`
+    /// statement an equality class build reads): an engine base's first read under expanded
+    /// equality builds the version's classes within its poll interval. Three poll intervals
+    /// of `sameAs` statements (classes of two), committed, then one scan: between two asks of
+    /// its stop (and after the last one) the engine takes at most `LARGEST_GAP` merge steps.
+    /// A cold build scans every `sameAs` statement before the read's first step, unseen by the
+    /// scan's count.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_engine_base_scan_builds_equality_classes_within_its_poll_interval() {
+        use crate::witness::EngineGaps;
+        use nrese_engine::witness::Site;
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+        let same_as = iri("http://www.w3.org/2002/07/owl#sameAs");
+        let [p, o] = ["p", "o"].map(|t| iri(&format!("http://example.com/{t}")));
+        let pairs: Vec<(u64, u64)> = (0..n)
+            .map(|i| {
+                (
+                    iri(&format!("http://example.com/s{i}")),
+                    iri(&format!("http://example.com/t{i}")),
+                )
+            })
+            .collect();
+        tx.insert_encoded(encode([pairs[0].0, p, o]).in_default_graph());
+        for &(s, t) in &pairs {
+            tx.insert_encoded(encode([s, same_as, t]).in_default_graph());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(TermId::from_raw(same_as)));
+        let tx = engine.transaction();
+        let base = EngineBase::new(&tx, &[]);
+        let gaps = EngineGaps::new(Site::ScanSteps);
+        let stop = || gaps.ask();
+        let poll = Poller::new(&stop).expect("never stops");
+        let mut delivered = 0;
+        base.scan([None, Some(p), None], &poll, &mut |_| delivered += 1)
+            .expect("never stopped");
+        assert_eq!(
+            delivered, 2,
+            "the statement and its copy for the subject's other identity"
+        );
+        let largest = gaps.largest();
+        assert!(
+            largest <= LARGEST_GAP,
+            "{largest} merge steps between two asks of the scan's stop: at most {LARGEST_GAP}"
+        );
+    }
+
+    /// REAS-3, group A (sweep SW017). Spec (design note's invariant: a unit is each stored
+    /// position a read passes, deleted ones too): an engine base's membership probe passes the
+    /// committed deletions of a fact's graph copies within its poll interval. A fact asserted in
+    /// three poll intervals of graphs plus one, all but the last copy deleted by a later
+    /// commit that stays its own run (a policy that merges no window, as REAS-2's T2: without
+    /// a worker a commit compacts in place): the probe finds the last copy, and between two
+    /// asks of its stop (and after the last one) the scan takes at most `LARGEST_GAP` merge
+    /// steps. The engine passes the deleted copies inside one `next`, unseen by the probe's
+    /// count.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_engine_base_probe_passes_committed_deletions_within_its_poll_interval() {
+        use crate::witness::EngineGaps;
+        use nrese_engine::witness::Site;
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            compaction: nrese_engine::CompactionPolicy {
+                fanout: 0,
+                ..nrese_engine::CompactionPolicy::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into());
+        let [s, p, o] = ["s", "p", "o"].map(|t| iri(&format!("http://example.com/{t}")));
+        let copies: Vec<EncodedQuad> = (0..=n)
+            .map(|g| EncodedQuad::new(s, p, o, iri(&format!("http://example.com/g{g}"))))
+            .collect();
+        for &copy in &copies {
+            tx.insert_encoded(copy);
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for &copy in &copies[..n] {
+            tx.remove_encoded(copy);
+        }
+        tx.commit().unwrap();
+        let tx = engine.transaction();
+        let base = EngineBase::new(&tx, &[]);
+        let gaps = EngineGaps::new(Site::ScanSteps);
+        let stop = || gaps.ask();
+        let poll = Poller::new(&stop).expect("never stops");
+        let held = base.contains([s.raw(), p.raw(), o.raw()], &poll);
+        assert_eq!(held, Ok(true), "the last copy is still committed");
+        let largest = gaps.largest();
+        assert!(
+            largest <= LARGEST_GAP,
+            "{largest} merge steps between two asks of the probe's stop: at most {LARGEST_GAP}"
+        );
+    }
+
+    /// REAS-3, group E (sweep SW006, SW007, SW009). Spec (design note's invariant: a unit is
+    /// each run a read searches or probes): an engine base's membership probe searches a
+    /// stack's runs within its poll interval. While a background merge holds the compaction
+    /// claim, each commit's own compaction is deferred and appends a run (engine/mod.rs, the
+    /// claim in `compact`), so the runs a read meets grow with the commits made meanwhile; a
+    /// policy that merges no window stands for that here. Three poll intervals of commits,
+    /// one statement each: between two asks of the probe's stop (and after the last one) the
+    /// read searches at most `LARGEST_GAP` runs. A scan's construction searches every run
+    /// before its first step, unseen by the probe's count.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn an_engine_base_probe_searches_the_runs_within_its_poll_interval() {
+        use crate::witness::EngineGaps;
+        use nrese_engine::witness::Site;
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            compaction: nrese_engine::CompactionPolicy {
+                fanout: 0,
+                ..nrese_engine::CompactionPolicy::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into());
+        let [p, o] = ["p", "o"].map(|t| iri(&format!("http://example.com/{t}")));
+        let subjects: Vec<TermId> = (0..n)
+            .map(|i| iri(&format!("http://example.com/s{i}")))
+            .collect();
+        tx.commit().unwrap();
+        for &subject in &subjects {
+            let mut tx = engine.transaction();
+            tx.insert_encoded(EncodedQuad::new(subject, p, o, TermId::DEFAULT_GRAPH));
+            tx.commit().unwrap();
+        }
+        let tx = engine.transaction();
+        let base = EngineBase::new(&tx, &[]);
+        let gaps = EngineGaps::new(Site::RunProbes);
+        let stop = || gaps.ask();
+        let poll = Poller::new(&stop).expect("never stops");
+        let held = base.contains([subjects[0].raw(), p.raw(), o.raw()], &poll);
+        assert_eq!(held, Ok(true), "the first commit's statement is committed");
+        let largest = gaps.largest();
+        assert!(
+            largest <= LARGEST_GAP,
+            "{largest} runs searched between two asks of the probe's stop: at most {LARGEST_GAP}"
         );
     }
 

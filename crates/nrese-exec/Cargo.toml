@@ -11,6 +11,10 @@ license.workspace = true
 # The counting allocator and measurements (src/measure.rs), for other crates' tests: a
 # dev-dependency with this feature. Never in product builds.
 measure = ["dep:parking_lot_core"]
+# The union kernel's work counter (src/classes.rs, `witness`), for other crates' tests (REAS-3a):
+# a dev-dependency with this feature, counting only in debug builds. Never in product builds
+# (scripts/check-features.sh).
+witness = []
 
 [dependencies]
 foldhash = { workspace = true }
