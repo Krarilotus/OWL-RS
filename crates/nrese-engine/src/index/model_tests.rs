@@ -392,18 +392,9 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
     assert_eq!(totals, expected);
 }
 
-/// The group walk of `rows` quads of one predicate, the `i`-th with subject `subject(i)`, by
-/// subject under a budget of `limit` bytes: its answer (each subject's count) or refusal, what
-/// the budget still holds once the walk's groups are dropped, and whether it recorded a refusal.
-fn walk_by_subject(
-    rows: u64,
-    subject: impl Fn(u64) -> u64,
-    limit: usize,
-) -> (
-    Result<Vec<(u64, i64)>, nrese_exec::BudgetExceeded>,
-    usize,
-    bool,
-) {
+/// `rows` quads of one predicate, the `i`-th with subject `subject(i)`, and the plan of their
+/// group walk by subject.
+fn subject_walk(rows: u64, subject: impl Fn(u64) -> u64) -> (IndexVersion, AccessPlan) {
     let quads: Vec<EncodedQuad> = (0..rows)
         .map(|i| EncodedQuad::new(term(subject(i)), term(1), term(10_000 + i), graph(0)))
         .collect();
@@ -415,6 +406,21 @@ fn walk_by_subject(
         graph: GraphSelector::Any,
     };
     let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    (version, plan)
+}
+
+/// A group walk's answer: each group's count, or its refusal.
+type WalkAnswer = Result<Vec<(u64, i64)>, nrese_exec::BudgetExceeded>;
+
+/// The group walk of [`subject_walk`]'s quads under a budget of `limit` bytes: its answer,
+/// what the budget still holds once the walk's groups are dropped, and whether it recorded a
+/// refusal.
+fn walk_by_subject(
+    rows: u64,
+    subject: impl Fn(u64) -> u64,
+    limit: usize,
+) -> (WalkAnswer, usize, bool) {
+    let (version, plan) = subject_walk(rows, subject);
     let budget = nrese_exec::Budget::new(limit);
     let answer = {
         let mut counts = ChargedVec::new(&budget);
@@ -494,6 +500,56 @@ fn a_walk_the_serial_walk_fits_is_answered() {
     assert_eq!(counts, expected.into_iter().collect::<Vec<_>>());
     assert!(!refused, "no refusal recorded on the budget");
     assert_eq!(held, 0);
+}
+
+/// Under an ample budget the same range is still walked in parallel parts, so the normal case
+/// keeps its speed; under 1.5 MiB (the walk above) it is walked serially.
+#[test]
+fn a_walk_with_room_for_its_parts_peak_runs_in_parts() {
+    let keys = 2 * super::GROUP_PART;
+    let ample = nrese_exec::Budget::new(64 << 20);
+    let tight = nrese_exec::Budget::new(1_572_864);
+    let empty = ChargedVec::new(&ample);
+    assert!(super::walks_in_parts(keys, 2, &empty, &ample));
+    let empty = ChargedVec::new(&tight);
+    assert!(!super::walks_in_parts(keys, 2, &empty, &tight));
+    assert!(
+        !super::walks_in_parts(keys - 1, 2, &empty, &ample),
+        "a range under two parts is walked serially"
+    );
+}
+
+/// A walk never charges more than its bound, in parts or serially (`group_walk_peak`): a node
+/// count runs its two walks at once only where the room covers both bounds, so a bound short
+/// of a walk's peak would let the pair be refused where the walks one after the other fit.
+#[test]
+fn a_walk_charges_at_most_its_bound() {
+    const PART: u64 = super::GROUP_PART as u64;
+    // Rows, each row's subject, and whether the range is walked in parts.
+    type Shape = (u64, fn(u64) -> u64, bool);
+    let shapes: [Shape; 4] = [
+        (2 * PART, |_| 1000, true),
+        (2 * PART, |i| 1000 + i, true),
+        (2 * PART, |i| 1000 + i * 16_385 / PART, true),
+        (2 * PART - 1, |i| 1000 + i, false),
+    ];
+    for (rows, subject, in_parts) in shapes {
+        let (version, plan) = subject_walk(rows, subject);
+        let (keys, parts) = version.group_walk_size(&plan, 1);
+        assert_eq!((keys, parts > 0), (rows as usize, in_parts), "{rows} rows");
+        let budget = nrese_exec::Budget::new(64 << 20);
+        let mut counts = ChargedVec::new(&budget);
+        version
+            .group_counts(&plan, 1, &mut counts, &budget)
+            .expect("64 MiB fits the walk");
+        assert!(budget.peak() > 0);
+        assert!(
+            budget.peak() <= super::group_walk_peak(keys, parts),
+            "{rows} rows: peak {} over the bound {}",
+            budget.peak(),
+            super::group_walk_peak(keys, parts)
+        );
+    }
 }
 
 /// Every layout keeps the permutation each pattern shape's access plan reads, the pattern's
