@@ -25,7 +25,10 @@ use nrese_owl::ql::{Basic, Closure, Limits, Role, Tbox};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, Ontology};
 use nrese_rdf::{NamedNode, Term, Variable};
 use nrese_sparql_syntax::Query;
-use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression as PathExpr};
+use nrese_sparql_syntax::algebra::{
+    AggregateExpression, Expression, GraphPattern, OrderExpression,
+    PropertyPathExpression as PathExpr,
+};
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
 use super::{OWL, RDF, RDFS, SnapshotTerms, iri, schema_statements};
@@ -82,7 +85,7 @@ pub fn print<V: ReadView>(
     query: &Query,
     form: PrintForm,
 ) -> Result<Printed, QueryEvaluationError> {
-    let snapshot = view.evaluation_snapshot();
+    let snapshot = view.evaluation_snapshot()?;
     let snapshot: &Snapshot = &snapshot;
     let statements = schema_statements(snapshot, &|_| true);
     let ontology = nrese_owl::read(&statements, &SnapshotTerms(snapshot));
@@ -154,6 +157,9 @@ pub fn print<V: ReadView>(
     if !reasons.is_empty() {
         return Ok(Printed::NotExpressible(reasons));
     }
+    // The rewriting's own variables are made names no text holds: written as names the
+    // printed query doesn't use (`internal::printable`).
+    let (printed, _) = nrese_sparql_syntax::internal::printable(printed);
     let query = match query.clone() {
         Query::Select {
             dataset, base_iri, ..
@@ -485,7 +491,7 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 impl Printer<'_> {
     fn fresh(&mut self) -> Variable {
         self.fresh += 1;
-        Variable::new_unchecked(format!("_p{}", self.fresh))
+        nrese_sparql_syntax::internal::variable("ql-print", self.fresh)
     }
 
     fn name(&self, t: u64) -> String {
@@ -587,7 +593,13 @@ impl Printer<'_> {
             },
             GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
                 inner: b(self, inner),
-                expression: expression.clone(),
+                expression: expression
+                    .iter()
+                    .map(|order| match order {
+                        OrderExpression::Asc(e) => OrderExpression::Asc(self.expression(e)),
+                        OrderExpression::Desc(e) => OrderExpression::Desc(self.expression(e)),
+                    })
+                    .collect(),
             },
             GraphPattern::Project { inner, variables } => GraphPattern::Project {
                 inner: b(self, inner),
@@ -620,7 +632,24 @@ impl Printer<'_> {
             } => GraphPattern::Group {
                 inner: b(self, inner),
                 variables: variables.clone(),
-                aggregates: aggregates.clone(),
+                aggregates: aggregates
+                    .iter()
+                    .map(|(variable, aggregate)| {
+                        let aggregate = match aggregate {
+                            AggregateExpression::CountSolutions { .. } => aggregate.clone(),
+                            AggregateExpression::FunctionCall {
+                                name,
+                                expr,
+                                distinct,
+                            } => AggregateExpression::FunctionCall {
+                                name: name.clone(),
+                                expr: self.expression(expr),
+                                distinct: *distinct,
+                            },
+                        };
+                        (variable.clone(), aggregate)
+                    })
+                    .collect(),
             },
         }
     }
@@ -1178,9 +1207,7 @@ fn distinct_projection(pattern: GraphPattern, variables: Vec<Variable>) -> Graph
 /// are subqueries, where a blank node would be another one).
 fn variable_for_blank(t: &TermPattern) -> TermPattern {
     match t {
-        TermPattern::BlankNode(b) => {
-            TermPattern::Variable(Variable::new_unchecked(format!("_b_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => nrese_sparql_syntax::internal::blank_variable(b).into(),
         other => other.clone(),
     }
 }

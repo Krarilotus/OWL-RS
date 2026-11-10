@@ -31,14 +31,20 @@ mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
+#[cfg(test)]
+mod own_state_tests;
+mod pending_traits;
 mod private;
 mod replication;
 #[cfg(test)]
 mod shared_state_tests;
 mod snapshot;
+#[cfg(test)]
+mod speculative_tests;
 pub(crate) mod spill;
 mod statistics;
 mod transaction;
+mod writer;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,13 +65,16 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
+pub use pending_traits::{PendingView, PendingWrite};
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
-    SharedState, Snapshot, SnapshotIdentity, TextScope,
+    Admission, Count, CountedSnapshot, GroupCounts, HeavyGroups, InferredMask, InferredSubset,
+    OwnState, ProbeCursor, ScanColumns, SearchRefused, Seek, SharedState, Snapshot,
+    SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
+pub use writer::{CommitNote, Finished, NoteError, WriterHeld};
 
 /// `slot` (the writer or checkpoint slot, `name`d), taken if free; otherwise waited for off
 /// the Rayon pool, and refused on a pool thread ([`EngineError::SlotBusy`]). Its holder runs
@@ -249,6 +258,9 @@ pub(crate) struct Version {
     pub(crate) asserted_content: AssertedIdentity,
     /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
     pub(crate) canonical: equality::CanonicalCache,
+    /// What readers of its unpublished snapshots keep ([`OwnState`]): empty at every
+    /// construction, never copied.
+    pub(crate) own: snapshot::OwnSlots,
 }
 
 /// The identity of a snapshot's asserted statements ([`Snapshot::asserted_identity`]
@@ -307,6 +319,7 @@ impl Version {
             content: Content::fresh(),
             asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -337,6 +350,7 @@ impl Version {
             content: self.content,
             asserted_content: self.asserted_content,
             canonical: Default::default(),
+            own: Default::default(),
         }
     }
 
@@ -353,6 +367,7 @@ impl Version {
             asserted_content: self.asserted_content,
             // A canonical view of the old runs would hold them: made afresh.
             canonical: Default::default(),
+            own: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -393,8 +408,10 @@ impl Versions {
     /// Replaces the current version with a prebuilt one. The caller must hold the writer slot,
     /// so that no statement changed since `version` was built from the latest content (a merge
     /// or a mapped checkpoint published meanwhile changed runs only, and is replaced), and the
-    /// compaction slot, so that none is published while it is replaced.
-    fn install(&self, version: Arc<Version>) {
+    /// compaction slot, so that none is published while it is replaced. A value, never an
+    /// `Arc`: no snapshot can have held it, so its own slots ([`OwnState`]) are empty.
+    fn install(&self, version: Version) {
+        let version = Arc::new(version);
         *self.current.write() = version;
     }
 
@@ -652,6 +669,7 @@ impl Shared {
                     // A checkpoint mapped: the same statements.
                     asserted_content: current.asserted_content,
                     canonical: Default::default(),
+                    own: Default::default(),
                 }
             });
         }
@@ -1117,12 +1135,45 @@ impl Engine {
         Ok(Transaction::new(&self.inner, Some(slot)))
     }
 
-    /// A transaction over the latest snapshot that never commits and doesn't take the
-    /// writer slot: for reading what pending changes would make (a client transaction's
-    /// reads) while other writers go on. Its changes stay in it; terms it interns are kept
-    /// (as an aborted transaction's are). [`Transaction::commit`] fails on it.
-    pub fn speculative(&self) -> Transaction<'_> {
+    /// A private transaction over the latest snapshot ([`Self::speculative_over`]): for
+    /// reading what pending changes would make (a client transaction's reads, a validation
+    /// preview, an entailment test) while writers go on. Its terms are its own, charged to
+    /// `budget`, and never enter the dictionary; it has no commit. Never refused: the latest
+    /// snapshot is this engine's and published.
+    pub fn speculative(&self, budget: Arc<nrese_exec::Budget>) -> PrivateTransaction<'_> {
+        PrivateTransaction::over_latest(&self.inner, budget)
+    }
+
+    /// The old speculative transaction: the shared kind without the writer slot, whose terms
+    /// enter the dictionary. Temporary: until V1b, for the RL refutation's rule constants
+    /// (`nrese-store/src/entailment.rs`), the one caller the workspace `clippy.toml` allows;
+    /// removed with V1b (the reasoner's maintenance over either transaction kind).
+    /// [`Transaction::commit`] fails on it.
+    #[doc(hidden)]
+    pub fn speculative_shared(&self) -> Transaction<'_> {
         Transaction::new(&self.inner, None)
+    }
+
+    /// The ids of `terms`, each added to the dictionary if it has none, without the writer
+    /// slot: the one way to append to the dictionary outside a writer. Only for system
+    /// vocabulary, names never statements (the lifecycle contract's limit L2): DL and OWL
+    /// vocabulary, fresh entailment names and the DL bounds' generated names, which derive only
+    /// from fixed names, the configuration and the published ontology, never from a request.
+    /// Those names must keep their ids for every later reader (state other operations reach
+    /// holds them), which a private transaction's can't. Every caller is named in the workspace
+    /// `clippy.toml` (dictionary lifecycle V1); a request's terms go through
+    /// [`Self::speculative_over`]'s private vocabulary instead.
+    ///
+    /// Never refused today: the result is the contract for an engine that may not append.
+    pub fn intern_system_vocabulary<'t>(
+        &self,
+        terms: impl IntoIterator<Item = nrese_rdf::TermRef<'t>>,
+    ) -> EngineResult<Vec<TermId>> {
+        let dictionary = &self.inner.shared.dictionary;
+        Ok(terms
+            .into_iter()
+            .map(|term| dictionary.intern(term))
+            .collect())
     }
 
     /// A private transaction over `snapshot`: speculative changes that read its statements,

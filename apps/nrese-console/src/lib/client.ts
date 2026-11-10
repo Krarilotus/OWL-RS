@@ -1,5 +1,5 @@
 import { NRESE_ENDPOINTS, graphQuery, type GraphTarget } from "./endpoints";
-import { fetchJson, fetchText, type FetchLike } from "./http";
+import { fetchJson, fetchText, type FetchLike, type ResponseEnvelope } from "./http";
 import type {
   AiStatus,
   AutocompleteResponse,
@@ -65,12 +65,18 @@ export class NreseClient {
     );
   }
 
-  async runQuery(query: string, accept: string) {
-    return this.text(NRESE_ENDPOINTS.query, {
+  /** The server states every answer's completeness (`NRESE-Completeness`, `complete`
+   * included), so an answer that arrives without it reads as not certified: something on
+   * the way dropped it, or the server predates it (SYN-72). */
+  async runQuery(query: string, accept: string): Promise<ResponseEnvelope> {
+    const response = await this.text(NRESE_ENDPOINTS.query, {
       method: "POST",
       headers: { "Content-Type": "application/sparql-query", Accept: accept },
       body: query,
     });
+    return response.ok && !response.completeness
+      ? { ...response, completeness: { status: "not-certified", header: "absent" } }
+      : response;
   }
 
   async runUpdate(update: string) {

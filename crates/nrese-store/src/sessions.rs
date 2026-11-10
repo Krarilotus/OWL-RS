@@ -373,14 +373,31 @@ mod tests {
 
     /// An ADD of a `bytes`-byte payload.
     fn body(bytes: usize) -> Vec<StatementOp> {
+        filled(b'#', bytes)
+    }
+
+    /// An ADD of `bytes` bytes, each `byte`.
+    fn filled(byte: u8, bytes: usize) -> Vec<StatementOp> {
         vec![StatementOp::Add {
             data: crate::RdfPayload {
-                payload: vec![b'#'; bytes],
+                payload: vec![byte; bytes].into(),
                 format: crate::query::GraphResultFormat::Turtle,
                 base_iri: None,
             },
             contexts: Vec::new(),
         }]
+    }
+
+    /// Each ADD's payload byte, in order (`?` where its payload isn't one byte repeated).
+    fn bytes_of(ops: &[StatementOp]) -> Vec<u8> {
+        let byte = |op: &StatementOp| match op {
+            StatementOp::Add { data, .. } => match data.payload.split_first() {
+                Some((&first, rest)) if rest.iter().all(|&b| b == first) => first,
+                _ => b'?',
+            },
+            _ => b'?',
+        };
+        ops.iter().map(byte).collect()
     }
 
     /// Session `id`, untouched for longer than `sessions` keeps one.
@@ -398,14 +415,17 @@ mod tests {
         let kept = Arc::new(Budget::new(100_000));
         let sessions = Sessions::within(Arc::clone(&kept), SESSION_IDLE);
         let id = sessions.begin(None).unwrap();
-        assert!(sessions.add(&id, None, body(20_000)).unwrap());
+        assert!(sessions.add(&id, None, filled(b'a', 20_000)).unwrap());
         let one = kept.used();
         assert!(one >= 20_000, "{one} charged for a 20 kB body");
-        // A read holds the operations; an add meanwhile copies them, charged.
+        // A read holds the operations; an add meanwhile copies them, charged: the read
+        // keeps what it read, the session has both in order.
         let read = sessions.pending(&id, None).unwrap();
-        assert!(sessions.add(&id, None, body(20_000)).unwrap());
+        assert!(sessions.add(&id, None, filled(b'b', 20_000)).unwrap());
         let both = kept.used();
         assert!(both >= one + 40_000, "{both} with a read held");
+        assert_eq!(bytes_of(&read), b"a");
+        assert_eq!(bytes_of(&sessions.pending(&id, None).unwrap()), b"ab");
         drop(read);
         let two = kept.used();
         assert!((40_000..one + 40_000).contains(&two), "{two} after");
@@ -438,6 +458,22 @@ mod tests {
         assert!(kept.used() >= 20_000);
         drop(commit);
         assert_eq!(kept.used(), 0);
+    }
+
+    /// Spec (D16-039 S12, charged by length): a body that is a slice of a larger request
+    /// buffer is kept as a copy of its own, never holding that buffer past the request.
+    #[test]
+    fn a_session_keeps_a_body_slice_as_its_own_copy() {
+        let sessions = Sessions::within(Arc::new(Budget::new(100_000)), SESSION_IDLE);
+        let id = sessions.begin(None).unwrap();
+        let buffer = bytes::Bytes::from(vec![b'#'; 64 * 1024]);
+        let mut add = body(0);
+        if let StatementOp::Add { data, .. } = &mut add[0] {
+            data.payload = buffer.slice(..10);
+        }
+        assert!(sessions.add(&id, None, add).unwrap());
+        assert!(buffer.is_unique(), "the session holds the request's buffer");
+        assert_eq!(bytes_of(&sessions.pending(&id, None).unwrap()), b"#");
     }
 
     /// Spec (design note N3, I5; triage N3's expiry control): a session idle past its

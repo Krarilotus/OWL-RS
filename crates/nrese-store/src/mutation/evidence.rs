@@ -18,7 +18,7 @@
 use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
 use nrese_rdf::{Quad, Term, TermRef};
 use nrese_reasoner::{RejectEvidence, RejectExplanation};
-use nrese_sparql::{GraphAccess, ReadView};
+use nrese_sparql::{GraphAccess, QueryEvaluationError, ReadView};
 use std::borrow::Cow;
 
 use super::MutationReject;
@@ -219,7 +219,7 @@ impl<'w, V: ReadView> ReadView for Readable<'w, V> {
     }
 
     /// Unfiltered: only SHACL-SPARQL reads it, and it isn't validated through this view.
-    fn evaluation_snapshot(&self) -> Cow<'_, Snapshot> {
+    fn evaluation_snapshot(&self) -> Result<Cow<'_, Snapshot>, QueryEvaluationError> {
         self.view.evaluation_snapshot()
     }
 }

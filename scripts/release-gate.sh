@@ -27,7 +27,9 @@
 #   release-gate.sh plan-blocks HARNESS     each block's plan: the cases whose noise needs its block
 #                                           (benches/fast/measure.toml); `block N HARNESS L PLAN ...`
 #                                           runs it
-#   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
+#   release-gate.sh verdict CAND TIMED_DIR... CHECKS_DIR   every part together, each host's rounds
+#                                           combined, every part bound to CAND's tree, under the
+#                                           policy CAND's tree holds (benches/release-tradeoffs.toml)
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees, and what dead invocations
 #                                           of its process space left (binaries and data stay; a live
@@ -47,7 +49,7 @@
 # GATE_MIN_BLOCKS the blocks of the round (default 2; fewer is diagnostic). GATE_BIG_GB and
 # GATE_BIG_HOST: cases with caps up to it run on that Linux host instead (khaleesi-wsl; its own
 # job: GATE_MIN_GB the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
-# trade-off (benches/release-tradeoffs.toml) accepts a loss. SPARQL_DATA (default
+# trade-off accepts a loss, and an exception a wrong answer (benches/release-tradeoffs.toml). SPARQL_DATA (default
 # ~/owlrs/sparql-data) holds the SPARQL workloads' data and their generated query sets.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -161,6 +163,8 @@ worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, 
 
 # The builds by identity, this gate's pointer to each revision's (bin_of), the age sweep.
 . scripts/lib/gate-publish.sh
+# The checks' build identity (gate_identity: toolchain, flags, tools), named in their receipts.
+. scripts/lib/gate-key.sh
 # Layout L of a revision (GATE_LAYOUTS): 1 the plain build, L > 1 the same with its functions
 # linked in another order (rust-lld --shuffle-sections, seed L): a layout, not other code. Each
 # layout is a build of its own identity (build_identity REV L) and this gate's pointer.
@@ -741,6 +745,13 @@ report)
 
 w3c)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks} NRESE_W3C_REQUIRED=1
+  # This attempt's record first, before the earlier result is touched: the verdict takes only a result
+  # of the latest attempt, so an earlier one that can't be removed stands for nothing (fix check r2).
+  attempt=$(py benches/fast/release_gate.py attempt w3c "$OUT") || { log "w3c: no attempt record: no run"; exit 1; }
+  # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
+  # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
+  { rm -f "$OUT/w3c.json" && [ ! -e "$OUT/w3c.json" ]; } \
+    || { log "w3c: the earlier result $OUT/w3c.json can't be removed: no run"; exit 1; }
   mkdir -p "$OUT/w3c"
   bash scripts/fetch-w3c-tests.sh > "$OUT/w3c/fetch.log" 2>&1 || { tail -20 "$OUT/w3c/fetch.log"; exit 1; }
   # The OWL 2 test cases (the DL suites' data), pinned.
@@ -750,45 +761,65 @@ w3c)
     curl -sSfL -o "$f.partial" https://www.w3.org/2009/11/owl-test/all.rdf && echo "$sum  $f.partial" | sha256sum -c --quiet - \
       && mv "$f.partial" "$f" || { log "the OWL 2 test cases don't match their pin"; exit 1; }
   fi
-  export NRESE_W3C_OWL_TESTS=$PWD/$f NRESE_W3C_OUT=$OUT/w3c/tableau-w3c.tsv
-  for kit in nrese-sparql:w3c_sparql11 nrese-sparql:geosparql_compliance nrese-shacl:w3c_shacl \
-             nrese-store:w3c_owl2_rl nrese-dl:tableau_w3c nrese-owl:w3c_owl2 nrese-reasoner:w3c_n3_reasoner; do
-    crate=${kit%%:*} test=${kit#*:}
-    bash scripts/cargo-guarded.sh test --release --locked -p "$crate" --test "$test" -- --nocapture \
-      > "$OUT/w3c/$test.log" 2>&1
-    log "w3c $test: $(grep -E '^test result' "$OUT/w3c/$test.log" | tail -1)"
-  done
-  # A failed kit or a count short of its requirement is the verdict's (w3c.json); this step
-  # fails only when the data or the counts couldn't be had.
-  py benches/fast/release_gate.py w3c "$OUT/w3c" --expected benches/fast/w3c-expected.toml --json "$OUT/w3c.json" \
-    > "$OUT/w3c/counts.txt"
-  [ -f "$OUT/w3c.json" ] || exit 1
+  export NRESE_W3C_OWL_TESTS=$PWD/$f
+  # The kits w3c-expected.toml declares, each launched and its outcome recorded by the checker
+  # (release_gate.py w3c --run), with the receipt that binds them to this checkout's tree and build
+  # identity (scripts/lib/gate-key.sh). A kit that didn't run whole, or a count short of its
+  # requirement, is the verdict's (w3c.json: the checker exits 0 or 1 with it); this step fails when
+  # the data, the identity or the result couldn't be had, or the checker exited otherwise.
+  identity=$(gate_identity HEAD) || { log "w3c: the gate can't name its toolchain and flags: no receipt"; exit 1; }
+  py benches/fast/release_gate.py w3c "$OUT/w3c" --expected benches/fast/w3c-expected.toml --run \
+    --identity "$identity" --attempt "$attempt" --json "$OUT/w3c.json" > "$OUT/w3c/counts.txt" 2> >(tee -a "$OUT/gate.log" >&2)
+  code=$?
+  { [ "$code" -le 1 ] && [ -f "$OUT/w3c.json" ]; } || { log "w3c: no result (the checker exited $code)"; exit "$(( code > 1 ? code : 1 ))"; }
   log "w3c: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print("passed" if d["passed"] else "NOT passed: " + "; ".join(d["errors"]))' "$OUT/w3c.json")"
   ;;
 
 guards)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks}
+  # This attempt's record first, before the earlier result is touched (as w3c's, fix check r2).
+  attempt=$(py benches/fast/release_gate.py attempt guards "$OUT") || { log "guards: no attempt record: no run"; exit 1; }
+  # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
+  # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
+  { rm -f "$OUT/guards.json" && [ ! -e "$OUT/guards.json" ]; } \
+    || { log "guards: the earlier result $OUT/guards.json can't be removed: no run"; exit 1; }
   mkdir -p "$OUT/guards"
-  py benches/fast/release_gate.py guards --list-names > "$OUT/guards/names.txt" || exit 2
-  # shellcheck disable=SC2046
-  bash scripts/cargo-guarded.sh test --release --locked --workspace --no-fail-fast --lib --bins --tests -- \
-    $(cat "$OUT/guards/names.txt") > "$OUT/guards/test.log" 2>&1
-  py benches/fast/release_gate.py guards --log "$OUT/guards/test.log" --json "$OUT/guards.json" | tee -a "$OUT/gate.log"
-  [ -f "$OUT/guards.json" ] || exit 1  # the guards' verdict is guards.json's
+  # The guards' test run by the checker (release_gate.py guards --run), its exit code and receipt kept.
+  # A guard failing is the verdict's (guards.json: the checker exits 0 or 1 with it); this step fails
+  # when the identity or the result couldn't be had, or the checker exited otherwise.
+  identity=$(gate_identity HEAD) || { log "guards: the gate can't name its toolchain and flags: no receipt"; exit 1; }
+  py benches/fast/release_gate.py guards --run --log "$OUT/guards/test.log" --identity "$identity" \
+    --attempt "$attempt" --json "$OUT/guards.json" | tee -a "$OUT/gate.log"
+  code=${PIPESTATUS[0]}
+  { [ "$code" -le 1 ] && [ -f "$OUT/guards.json" ]; } || { log "guards: no result (the checker exited $code)"; exit "$(( code > 1 ? code : 1 ))"; }
   ;;
 
 verdict)
-  # The timed parts' results directories (the timed host's, the big host's), then the checks'.
+  # The candidate (a revision of the launching checkout), the timed parts' results directories (the
+  # timed host's, the big host's, their confirmations'), then the checks'. Every part must be the
+  # candidate's tree's (release_gate.py verdict); a directory without its result, or a checks'
+  # directory with more than one of a kind (a rerun beside the first), is refused, never one taken.
   shift
   cd "$launch" || exit 2
+  [ $# -ge 3 ] || { echo "usage: release-gate.sh verdict CAND TIMED_DIR... CHECKS_DIR" >&2; exit 2; }
+  candidate=$1
+  shift
   args=()
   while [ $# -gt 1 ]; do
-    for f in "$1"/*/release-gate.json "$1"/release-gate.json; do [ -f "$f" ] && args+=(--timed "$f"); done
+    found=0
+    for f in "$1"/*/release-gate.json "$1"/release-gate.json; do [ -f "$f" ] && args+=(--timed "$f") && found=1; done
+    [ $found = 1 ] || { echo "release-gate.sh verdict: no release-gate.json in $1" >&2; exit 2; }
     shift
   done
-  w3c=$(ls "$1"/w3c.json "$1"/*/w3c.json 2>/dev/null | head -1)
-  guards=$(ls "$1"/guards.json "$1"/*/guards.json 2>/dev/null | head -1)
-  py "$CODE/benches/fast/release_gate.py" verdict "${args[@]}" --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
+  one() {  # NAME DIR: the one NAME in DIR or a directory in it
+    local f found=()
+    for f in "$2/$1" "$2"/*/"$1"; do [ -f "$f" ] && found+=("$f"); done
+    [ ${#found[@]} = 1 ] || { echo "release-gate.sh verdict: ${#found[@]} $1 in $2 (${found[*]}): one, the candidate's" >&2; return 2; }
+    printf '%s' "${found[0]}"
+  }
+  w3c=$(one w3c.json "$1") && guards=$(one guards.json "$1") || exit 2
+  py "$CODE/benches/fast/release_gate.py" verdict --checkout "$launch" --candidate "$candidate" "${args[@]}" \
+    --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
   ;;
 
 pack)

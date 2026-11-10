@@ -62,7 +62,7 @@ fn d066_f1_exact_triple_object_is_not_a_data_assertion() {
 #[test]
 fn d066_f1_upper_triple_object_requires_recompile() {
     let (store, atom) = fixture();
-    let tx = store.engine().speculative();
+    let tx = store.engine().transaction();
     source::intern_vocabulary(&tx);
     let snapshot = tx.base();
     let kept = store.dl().bounds.kept();

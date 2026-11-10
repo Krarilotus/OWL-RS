@@ -243,19 +243,15 @@ fn a_frozen_view_answers_what_it_was_taken_with() {
 }
 
 /// B9. The bounded and charged reads at the edge: the last own id, the first past it, an id below
-/// start, a triple term (whose charged decode is its components', `None`, as the dictionary's).
+/// start, a triple term (decoded and charged as a whole, its components with it: package C3,
+/// `notes/2026-11-09-d039-update-sweep.md` row C3; before it, `None`).
 #[test]
 fn bounded_reads_answer_at_the_own_edge() {
     let budget = unlimited();
     let (_dictionary, overlay) = with_overlay(6, &budget);
     let last = overlay.intern(literal("last").as_ref()).unwrap();
-    let triple = overlay
-        .intern(TermRef::Triple(&Triple::new(
-            iri("s"),
-            iri("p"),
-            literal("last"),
-        )))
-        .unwrap();
+    let triple_term: Term = Triple::new(iri("s"), iri("p"), literal("last")).into();
+    let triple = overlay.intern(triple_term.as_ref()).unwrap();
     let view = Vocabulary::Private(overlay.freeze().unwrap());
     let past = TermId::new(TermKind::String, view_end(&view));
     let below = TermId::new(TermKind::String, 2);
@@ -266,10 +262,15 @@ fn bounded_reads_answer_at_the_own_edge() {
         view.decode_charged(below, 0, ok),
         Ok(Some(literal("old 2")))
     );
-    assert_eq!(view.decode_charged(triple, 0, ok), Ok(None));
+    assert_eq!(
+        view.decode_charged(triple, 0, ok),
+        Ok(Some(triple_term.clone()))
+    );
     assert_eq!(view.decode_bound(last, 0), Some(literal_key_len("last")));
     assert_eq!(view.decode_bound(past, 0), None);
-    assert_eq!(view.decode_bound(triple, 0), None);
+    // What the decoded term holds: `triple_term`'s strings, from `format!`, may hold more.
+    let holds = view.decode(triple).map(|term| term.heap_bytes());
+    assert!(holds.is_some() && view.decode_bound(triple, 0) >= holds);
     assert!(view.decode_bound(below, 0).is_some());
     let text = |v: crate::TermView<'_>| v.str().map(str::to_owned);
     assert_eq!(view.with_view(last, 0, text), Some(Some("last".into())));
@@ -545,4 +546,110 @@ fn view_end(view: &Vocabulary) -> u64 {
 /// A simple literal's key length: its kind byte and its text.
 fn literal_key_len(text: &str) -> usize {
     1 + text.len()
+}
+
+/// Dictionary lifecycle V1, count 2's fix: a lookup through a private vocabulary makes one key
+/// for both of its probes (the dictionary's and its own entries'), never a second copy. The
+/// counted A/B is `dictlc-pv1-count2c-468e813c` (private lookup 973 to 692 instructions a row,
+/// 414,511 to 203,057 allocations); this guards its shape. Measured, alone.
+///
+/// - Input: an overlay with own entries and its view; an IRI of 100,000 bytes neither the
+///   dictionary nor the overlay has, looked up through the overlay and through the view (both
+///   probe the dictionary, then the own entries).
+/// - Expected: no id, and at most one key held at a time: the lookup's peak below twice the
+///   key's length (a second copy of the key for the own probe would hold at least that).
+#[test]
+fn a_private_lookup_holds_one_key_for_both_probes() {
+    if !nrese_exec::measure::alone() {
+        return;
+    }
+    let budget = unlimited();
+    let (_dictionary, overlay) = with_overlay(10, &budget);
+    for i in 0..10 {
+        overlay
+            .intern(LiteralRef::new_simple_literal(&format!("own {i}")).into())
+            .unwrap();
+    }
+    let view = overlay.freeze().unwrap();
+    let absent = NamedNode::new_unchecked(format!("http://example.com/{}", "x".repeat(100_000)));
+    let key = 1 + absent.as_str().len();
+    for (name, lookup) in [
+        (
+            "the overlay",
+            &(|term: TermRef<'_>| overlay.lookup(term)) as &dyn Fn(TermRef<'_>) -> Option<TermId>,
+        ),
+        ("its view", &|term: TermRef<'_>| view.lookup(term)),
+    ] {
+        let (found, peak) = nrese_exec::measure::measure(|| lookup(absent.as_ref().into()));
+        assert_eq!(found, None, "{name}: absent");
+        assert!(
+            peak < 2 * key,
+            "{name}: {peak} bytes held at once for a {key}-byte key: a second copy of it"
+        );
+    }
+}
+
+/// Sol-loop e1 S1: a probe of a key already made allocates nothing on a plain dictionary, so
+/// interning a shared term through the overlay charges its key and not the compressed base's
+/// probe bound.
+///
+/// - Input: a plain dictionary holding an IRI whose key is 1,026 bytes, and the two other terms
+///   of a quad; an overlay at its length with an 8 KiB budget; the IRI interned through it
+///   alone, then as that quad's object.
+/// - Expected: its shared id both times, not a refusal. The parent charged 4,104 bytes for the
+///   single intern: a lookup's own key and the overlay's copy.
+#[test]
+fn a_shared_long_term_is_interned_on_a_plain_base_within_its_key() {
+    let dictionary = Arc::new(Dictionary::default());
+    let long = iri(&"x".repeat(1_016));
+    let shared = dictionary.intern(long.as_ref().into());
+    let (s, p) = (iri("s"), iri("p"));
+    dictionary.intern(s.as_ref().into());
+    dictionary.intern(p.as_ref().into());
+    let start = dictionary.len();
+    let overlay = Overlay::over(Arc::clone(&dictionary), start, Arc::new(Budget::new(8_192)));
+    assert_eq!(overlay.intern(long.as_ref().into()), Ok(shared));
+    let quad = Quad::new(s, p, long, GraphName::DefaultGraph);
+    let encoded = overlay.intern_quad(quad.as_ref());
+    assert_eq!(encoded.map(|quad| quad.object), Ok(shared));
+}
+
+/// V3's own entries (DICT2 9 Nov 04:02). Input: a dictionary of two literals, an overlay at
+/// its length that interns a shared literal, an IRI, a simple and a language-tagged literal of
+/// its own, then is frozen; one more own term interned after the freeze. Expected: the view's
+/// own entries are exactly the three own terms, in id order, each id the overlay's (its kind
+/// the term's, its payload from `start`) and each key decoding back to its term; the shared
+/// literal and the term interned after the freeze are not among them.
+#[test]
+fn own_entries_are_the_views_own_terms_with_their_keys() {
+    let budget = unlimited();
+    let (dictionary, overlay) = with_overlay(2, &budget);
+    let start = dictionary.len();
+    overlay.intern(literal("old 1").as_ref()).unwrap();
+    let own: Vec<Term> = vec![
+        iri("x").into(),
+        literal("new words"),
+        Literal::new_language_tagged_literal_unchecked("neu", "de").into(),
+    ];
+    let ids: Vec<TermId> = own
+        .iter()
+        .map(|term| overlay.intern(term.as_ref()).unwrap())
+        .collect();
+    let view = overlay.freeze().unwrap();
+    overlay
+        .intern(literal("after the freeze").as_ref())
+        .unwrap();
+    let entries: Vec<(TermId, Term)> = view
+        .own_entries()
+        .map(|(id, key)| (id, crate::term::dictionary::decode_key(key)))
+        .collect();
+    let want: Vec<(TermId, Term)> = ids.iter().copied().zip(own).collect();
+    assert_eq!(entries, want);
+    let kinds: Vec<TermKind> = entries.iter().map(|(id, _)| id.kind()).collect();
+    assert_eq!(
+        kinds,
+        [TermKind::Iri, TermKind::String, TermKind::LangString]
+    );
+    let payloads: Vec<u64> = entries.iter().map(|(id, _)| id.payload()).collect();
+    assert_eq!(payloads, [start, start + 1, start + 2]);
 }

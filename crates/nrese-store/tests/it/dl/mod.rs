@@ -1,7 +1,8 @@
 //! The `owl2-dl` mode (docs/design/owl2-dl.md §8), through the store's normal interfaces.
 
 mod bounds;
-mod classification;
+mod cache_admission;
+pub(crate) mod classification;
 mod consistency;
 mod entailment;
 mod explain;
@@ -12,6 +13,7 @@ mod queries;
 mod review;
 mod routing;
 mod safety;
+mod speculative;
 mod versions;
 
 use std::sync::Arc;

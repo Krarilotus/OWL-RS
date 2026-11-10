@@ -47,6 +47,36 @@ fn lookup_scratch(term: TermRef<'_>) -> usize {
         _ => probe_bytes(encoded_len(term)) + encoded_len(term),
     }
 }
+/// The buffer interning makes its keys in, its capacity charged: grown as a key needs, the new
+/// capacity charged before it is allocated and the old released after it is freed. The bytes
+/// are freed before the charge is released (the fields' order).
+struct KeyBuffer<'b> {
+    bytes: Vec<u8>,
+    held: Reservation<&'b Budget>,
+}
+
+impl<'b> KeyBuffer<'b> {
+    fn new(budget: &'b Budget) -> Self {
+        Self {
+            bytes: Vec::new(),
+            held: Reservation::new(budget),
+        }
+    }
+
+    /// The buffer, cleared, with room for a key of `len` bytes: grown, if it must be, to at
+    /// least 64 bytes (as the dictionary's own key buffer starts) or twice what it had.
+    fn room(&mut self, len: usize) -> Result<&mut Vec<u8>, BudgetExceeded> {
+        self.bytes.clear();
+        let had = self.bytes.capacity();
+        if len > had {
+            let target = len.max(64).max(2 * had);
+            self.held.charge(target)?;
+            self.bytes = Vec::with_capacity(target);
+            self.held.release(had);
+        }
+        Ok(&mut self.bytes)
+    }
+}
 use super::hash::key_hash;
 use super::suffix::{Frozen, Suffix};
 use super::{TermId, TermKind, TermView};
@@ -74,10 +104,19 @@ impl Overlay {
         })
     }
 
-    /// Test support: its `start`, which its views report ([`OverlayView::start`]).
-    #[cfg(test)]
+    /// Its `start`, which its views report ([`OverlayView::start`]): where its own ids begin.
     pub(crate) fn start(&self) -> u64 {
         self.start
+    }
+
+    /// What its own entries are charged to.
+    pub(crate) fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
+    /// The end of its ids now: `start` plus its own entries so far.
+    pub(crate) fn end(&self) -> u64 {
+        self.start + self.suffix.lock().len()
     }
 
     /// The id of `term`: inline, the dictionary's below `start`, or this overlay's own, added
@@ -88,40 +127,77 @@ impl Overlay {
         if let Some(id) = self.dictionary.inline_id(term) {
             return Ok(id);
         }
+        if let TermRef::Triple(_) = term {
+            return self.intern_with(term, &mut KeyBuffer::new(&self.budget));
+        }
+        // One term: its key charged first, and freed before the charge is released (declared
+        // after it); no buffer is kept across terms.
+        let len = encoded_len(term);
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(len)?;
+        let mut key = Vec::with_capacity(len);
+        let kind = encode_key(term, &mut key);
+        self.probe_or_own(&key, kind)
+    }
+
+    /// `key`'s id: the dictionary's below `start`, else this overlay's own, added if absent.
+    /// Encoded and hashed once for both. The dictionary's probe is charged as the base it reads
+    /// needs ([`Dictionary::lookup_key_charged`]: nothing on a plain one), decided under the
+    /// probe's own guard, so a rebase between bound and probe can't escape it.
+    fn probe_or_own(&self, key: &[u8], kind: TermKind) -> Result<TermId, BudgetExceeded> {
+        let hash = key_hash(key);
+        let mut scratch = Reservation::new(&*self.budget);
+        let shared = self
+            .dictionary
+            .lookup_key_charged(key, hash, kind, self.start, |bytes| scratch.charge(bytes))?;
+        drop(scratch);
+        if let Some(id) = shared {
+            return Ok(id);
+        }
+        self.own(key, hash, kind)
+    }
+
+    /// [`Self::intern`], making each key in `key`: one buffer for a quad's terms, as the
+    /// dictionary's own `intern_quad` keeps (dictionary lifecycle V1, count 1: a buffer per term
+    /// and a second encoding of an absent one cost the session read and the SHACL preview
+    /// allocations the shared path doesn't make). The key is encoded and hashed once, for the
+    /// dictionary's probe and, absent there, as an own entry's.
+    fn intern_with(
+        &self,
+        term: TermRef<'_>,
+        key: &mut KeyBuffer<'_>,
+    ) -> Result<TermId, BudgetExceeded> {
+        if let Some(id) = self.dictionary.inline_id(term) {
+            return Ok(id);
+        }
         if let TermRef::Triple(triple) = term {
             // The components first: their ids make the key, and come before its own.
             let ids = [
-                self.intern(triple.subject.as_ref().into())?,
-                self.intern(triple.predicate.as_ref().into())?,
-                self.intern(triple.object.as_ref())?,
+                self.intern_with(triple.subject.as_ref().into(), key)?,
+                self.intern_with(triple.predicate.as_ref().into(), key)?,
+                self.intern_with(triple.object.as_ref(), key)?,
             ];
             // The dictionary's probe of the key (on a compressed base, its compressed form too),
             // then this one's key: charged first, at the larger of the two bases' bounds, since
             // the probe takes its own guard and a rebase may change the base meanwhile.
             let mut scratch = Reservation::new(&*self.budget);
-            scratch.charge(probe_bytes(TRIPLE_KEY_LEN) + TRIPLE_KEY_LEN)?;
+            scratch.charge(probe_bytes(TRIPLE_KEY_LEN))?;
             if let Some(id) = self.dictionary.triple_term_bounded(ids, self.start) {
                 return Ok(id);
             }
-            let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
-            triple_key(ids, &mut key);
-            return self.own(&key, TermKind::Triple);
+            let bytes = key.room(TRIPLE_KEY_LEN)?;
+            triple_key(ids, bytes);
+            return self.own(bytes, key_hash(bytes), TermKind::Triple);
         }
-        let mut scratch = Reservation::new(&*self.budget);
-        let shared = self.dictionary.lookup_charged(term, self.start, |bytes| {
-            scratch.charge(bytes + encoded_len(term))
-        })?;
-        if let Some(id) = shared {
-            return Ok(id);
-        }
-        let mut key = Vec::with_capacity(encoded_len(term));
-        let kind = encode_key(term, &mut key);
-        self.own(&key, kind)
+        // The key made in the buffer (its growth charged there); the probe of a key already made
+        // charged as the base it reads needs ([`Self::probe_or_own`]).
+        let bytes = key.room(encoded_len(term))?;
+        let kind = encode_key(term, bytes);
+        self.probe_or_own(bytes, kind)
     }
 
-    /// `key`'s id among this overlay's own entries, added if absent.
-    fn own(&self, key: &[u8], kind: TermKind) -> Result<TermId, BudgetExceeded> {
-        let hash = key_hash(key);
+    /// `key`'s id among this overlay's own entries, added if absent; `hash` is its [`key_hash`].
+    fn own(&self, key: &[u8], hash: u64, kind: TermKind) -> Result<TermId, BudgetExceeded> {
         let mut suffix = self.suffix.lock();
         let id = match suffix.find(hash, key) {
             Some(id) => id,
@@ -136,14 +212,16 @@ impl Overlay {
         &self,
         quad: nrese_rdf::QuadRef<'_>,
     ) -> Result<crate::EncodedQuad, BudgetExceeded> {
+        // One key buffer for the four terms ([`Self::intern_with`]).
+        let mut key = KeyBuffer::new(&self.budget);
         let graph = match super::dictionary::graph_term(quad.graph_name) {
-            Some(term) => self.intern(term)?,
+            Some(term) => self.intern_with(term, &mut key)?,
             None => TermId::DEFAULT_GRAPH,
         };
         Ok(crate::EncodedQuad::new(
-            self.intern(quad.subject.into())?,
-            self.intern(quad.predicate.into())?,
-            self.intern(quad.object)?,
+            self.intern_with(quad.subject.into(), &mut key)?,
+            self.intern_with(quad.predicate.into(), &mut key)?,
+            self.intern_with(quad.object, &mut key)?,
             graph,
         ))
     }
@@ -226,31 +304,39 @@ impl Overlay {
             ];
             return self.triple_term_below(ids, end);
         }
-        if let Some(id) = self.dictionary.lookup_bounded(term, self.start) {
-            return Some(id);
-        }
+        // One key and one hash for both probes, the dictionary's and the own entries'
+        // (dictionary lifecycle V1, count 2: a second encoding, hash and allocation made an
+        // absent term's private lookup ×1.36 the shared one's).
         let mut key = Vec::with_capacity(encoded_len(term));
         let kind = encode_key(term, &mut key);
-        self.find_below(&key, end).map(|id| TermId::new(kind, id))
+        self.probe_below(&key, kind, end)
     }
 
     /// The triple term of `components` below `end`: the dictionary's below `start`, else own.
     fn triple_term_below(&self, components: [TermId; 3], end: u64) -> Option<TermId> {
-        if let Some(id) = self.dictionary.triple_term_bounded(components, self.start) {
-            return Some(id);
-        }
         let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
         triple_key(components, &mut key);
-        self.find_below(&key, end)
-            .map(|id| TermId::new(TermKind::Triple, id))
+        self.probe_below(&key, TermKind::Triple, end)
     }
 
-    /// `key`'s own id, if it is below `end`.
-    fn find_below(&self, key: &[u8], end: u64) -> Option<u64> {
+    /// `key`'s id below `end`: the dictionary's below `start`, else own. No own probe where
+    /// there can be no own entry below `end`.
+    fn probe_below(&self, key: &[u8], kind: TermKind, end: u64) -> Option<TermId> {
+        let hash = key_hash(key);
+        if let Some(id) = self
+            .dictionary
+            .lookup_key_bounded(key, hash, kind, self.start)
+        {
+            return Some(id);
+        }
+        if end <= self.start {
+            return None;
+        }
         self.suffix
             .lock()
-            .find(key_hash(key), key)
+            .find(hash, key)
             .filter(|&id| id < end)
+            .map(|id| TermId::new(kind, id))
     }
 
     /// The entries now, for a snapshot to hold: later interns don't change it. Its lists and
@@ -296,6 +382,30 @@ impl OverlayView {
     /// The end of its ids: `start + n`.
     pub(crate) fn end(&self) -> u64 {
         self.overlay.start + self.frozen.len()
+    }
+
+    /// The private transaction's budget, which its own terms are charged to: what a private
+    /// snapshot's search is charged to where its caller brings no budget and attached no
+    /// reader's (V3 review r1 B1). The view holds it as long as it lives.
+    pub(crate) fn budget(&self) -> &Arc<Budget> {
+        &self.overlay.budget
+    }
+
+    /// Its own entries (ids `start..end`, none of the dictionary's), in id order, each with
+    /// its key: what a private search indexes its own documents from (V3; DICT2 9 Nov
+    /// 04:02).
+    pub(crate) fn own_entries(&self) -> impl Iterator<Item = (TermId, &[u8])> + '_ {
+        self.frozen.entries().map(|(payload, key)| {
+            let kind = match view_key(key) {
+                TermView::Iri(_) => TermKind::Iri,
+                TermView::BlankNode(_) => TermKind::BlankNode,
+                TermView::String(_) => TermKind::String,
+                TermView::LangString { .. } => TermKind::LangString,
+                TermView::Typed { .. } => TermKind::TypedLiteral,
+                TermView::Triple => TermKind::Triple,
+            };
+            (TermId::new(kind, payload), key)
+        })
     }
 
     /// Test support: its own entries' count.
@@ -363,50 +473,24 @@ impl OverlayView {
         triple_ids(self.own_key(id)?)
     }
 
+    /// Own entries first, then the dictionary's, through the dictionary's one decode
+    /// ([`super::dictionary::Terms`]), which the charged decode and its bound share.
     pub(crate) fn decode(&self, id: TermId) -> Option<Term> {
-        if !self.is_own(id) {
-            return self.dictionary().decode(id);
-        }
-        let key = self.own_key(id)?;
-        let Some([s, p, o]) = triple_ids(key) else {
-            return Some(decode_key(key));
-        };
-        let Term::NamedNode(predicate) = self.decode(p)? else {
-            return None;
-        };
-        Some(
-            Triple::new(
-                NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
-                predicate,
-                self.decode(o)?,
-            )
-            .into(),
-        )
+        self.dictionary().terms(Some(self)).decode(id)
     }
 
+    /// As [`Dictionary::decode_charged`]: `charge` called with no lock held, each call an
+    /// increment.
     pub(crate) fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        if !self.is_own(id) {
-            return self.dictionary().decode_charged(id, charge);
-        }
-        // As the dictionary's: a triple term's decode is its components' (`None` here).
-        let Some(key) = self.own_key(id).filter(|_| id.kind() != TermKind::Triple) else {
-            return Ok(None);
-        };
-        charge(key.len())?;
-        Ok(Some(decode_key(key)))
+        self.dictionary().decode_charged_in(Some(self), id, charge)
     }
 
     pub(crate) fn decode_bound(&self, id: TermId) -> Option<usize> {
-        if !self.is_own(id) {
-            return self.dictionary().decode_bound(id);
-        }
-        self.own_key(id)
-            .filter(|_| id.kind() != TermKind::Triple)
-            .map(<[u8]>::len)
+        self.dictionary().terms(Some(self)).bound(id)
     }
 
     pub(crate) fn with_view<R>(&self, id: TermId, f: impl FnOnce(TermView<'_>) -> R) -> Option<R> {
@@ -485,6 +569,16 @@ impl OverlayView {
 
     pub(crate) fn matching_strings(&self, test: &super::StringTest<'_>) -> Vec<TermId> {
         self.matching_strings_scan(test).0
+    }
+}
+
+impl super::dictionary::OwnKeys for OverlayView {
+    fn is_own(&self, id: TermId) -> bool {
+        Self::is_own(self, id)
+    }
+
+    fn own_key(&self, id: TermId) -> Option<&[u8]> {
+        Self::own_key(self, id)
     }
 }
 

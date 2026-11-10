@@ -117,25 +117,18 @@ fn infer(pairs: &[(String, String)]) -> bool {
     param(pairs, "infer") != Some("false")
 }
 
-/// An RDF request body.
+/// An RDF request body, shared, not copied.
 pub(crate) fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
     Ok(RdfPayload {
-        payload: body.to_vec(),
+        payload: body.clone(),
         format: parse_graph_content_format(header_value_str(headers.get(header::CONTENT_TYPE)))?,
         base_iri: parse_rdf_base_iri(headers),
     })
 }
 
-/// `sesame:wildcard`: in a transaction's `DELETE` payload, any value at that position.
-const WILDCARD: &str = "http://www.openrdf.org/schema/sesame#wildcard";
-/// `rdf4j:nil`: in a `DELETE` payload's graph position, the default graph.
-const NIL: &str = "http://rdf4j.org/schema/rdf4j#nil";
-
 /// A transaction's `DELETE`: each statement of the payload a pattern, as RDF4J's server
-/// reads it (its client removes this way, `clear()` too): `sesame:wildcard` matches any
-/// value, a statement without a graph removes from every graph (or from the `context`
-/// parameters), one in `rdf4j:nil` from the default graph. With `preserveNodeId=true`,
-/// blank nodes refer to the store's.
+/// reads it ([`StatementOp::RemovePatterns`]: `sesame:wildcard`, `rdf4j:nil`, the `context`
+/// parameters, `preserveNodeId`). The payload is checked now and kept as it came.
 fn removals(
     pairs: &[(String, String)],
     headers: &HeaderMap,
@@ -143,32 +136,9 @@ fn removals(
 ) -> Result<Vec<StatementOp>, ApiError> {
     let data = payload(headers, body)?;
     let preserve = param(pairs, "preserveNodeId").is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    let parse = match preserve {
-        true => nrese_store::parse_payload_preserving_blank_nodes,
-        false => nrese_store::parse_payload,
-    };
-    let quads = parse(data.format, data.base_iri.as_deref(), &data.payload)
+    let op = StatementOp::remove_patterns(data, contexts(pairs)?, preserve)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let given = contexts(pairs)?;
-    let wildcard = |term: &Term| matches!(term, Term::NamedNode(node) if node.as_str() == WILDCARD);
-    Ok(quads
-        .into_iter()
-        .map(|quad| {
-            let subject: Term = quad.subject.into();
-            let predicate = (quad.predicate.as_str() != WILDCARD).then_some(quad.predicate);
-            let contexts = match quad.graph_name {
-                GraphName::DefaultGraph => given.clone(),
-                GraphName::NamedNode(node) if node.as_str() == NIL => vec![GraphName::DefaultGraph],
-                graph => vec![graph],
-            };
-            StatementOp::RemoveMatching(StatementPattern {
-                subject: (!wildcard(&subject)).then_some(subject),
-                predicate,
-                object: (!wildcard(&quad.object)).then_some(quad.object),
-                contexts,
-            })
-        })
-        .collect())
+    Ok(vec![op])
 }
 
 /// Whether the body is a SPARQL update (a form with `update`, or `sparql-update`).
@@ -389,9 +359,14 @@ pub async fn repository_put(
                 None => nrese_store::GraphResultFormat::Turtle,
                 Some(_) => parse_graph_content_format(content_type)?,
             };
-            let quads = nrese_store::parse_payload(format, None, &body).map_err(|error| {
-                ApiError::bad_request(format!("repository configuration: {error}"))
-            })?;
+            let quads = state
+                .repositories()
+                .parse_configuration(format, &body)
+                .map_err(|error| match error.is_memory_limit() {
+                    // Memory refused as a query's is (the server's budget in use: 503).
+                    true => sparql::map_query_error(&state.policy(), error),
+                    false => ApiError::bad_request(format!("repository configuration: {error}")),
+                })?;
             crate::repository_config::from_config(&id, &quads).map_err(ApiError::bad_request)?
         }
     };

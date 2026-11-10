@@ -954,6 +954,57 @@ async fn transaction_deletes_take_wildcards() {
     assert_eq!(size(&app, Some(graph)).await, 1);
 }
 
+/// A transaction's `DELETE` that isn't RDF is refused when it is sent, not at the commit:
+/// the transaction stays as it was, and commits what it had (RDF4J's server parses it on
+/// arrival). Guard: held while the document was decoded on arrival.
+#[tokio::test]
+async fn a_transaction_delete_that_isnt_rdf_is_refused_on_arrival() {
+    let app = test_app().unwrap();
+    let (status, location) = {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{REPO}/transactions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        (response.status(), location)
+    };
+    assert_eq!(status, StatusCode::CREATED);
+    let action = |name: &str| format!("{location}?action={name}");
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        &action("ADD"),
+        Some("text/turtle"),
+        None,
+        DATA,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        &action("DELETE"),
+        Some("text/turtle"),
+        None,
+        "<http://example.com/a> <http://example.com/p> \"one\" .\n<http://example.com/a> <http://example.com/p> .\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let (status, _) = send(&app, Method::PUT, &action("COMMIT"), None, None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(size(&app, None).await, 3);
+}
+
 /// SYN-54 slice 3 review r1, S3-F1: in a transaction's DELETE, a statement whose graph is
 /// another store's name for the default graph (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`)
 /// names the default graph, as `rdf4j:nil` does: its copy in another graph stays. A statement

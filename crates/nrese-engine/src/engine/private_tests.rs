@@ -9,7 +9,7 @@ use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 
 use super::super::{Engine, EngineConfig, InferredSubset, ReadModel, Snapshot, TextScope};
 use crate::error::EngineError;
-use crate::{EncodedTriple, QuadPattern, SearchRefused, TermId, TextQuery, VectorQuery};
+use crate::{EncodedTriple, QuadPattern, TermId, TextQuery, VectorQuery};
 
 fn iri(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("http://example.com/{local}"))
@@ -265,74 +265,126 @@ fn files(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// B15 (§3; the search owner's one test): searches on a private snapshot.
+/// B15 (§3; the search owner's one test), re-specified by V3 (decision of 10:23 item 1, ADR
+/// V3; DICT2 9 Nov 04:02): searches on a private snapshot answer over what it can see, and
+/// leave the shared indexes as they were.
 ///
-/// - Input: an engine with a label and a vector literal, its text and vector indexes not yet
-///   built; a private transaction's pending snapshot.
-/// - Expected: the six searches and the two corpus helpers return `SearchRefused::Private`;
-///   preparing a vector graph does nothing. Afterwards the dictionary's text coverage and
-///   vector bytes are as before. The published snapshot still searches.
+/// - Input: an engine with a label and a vector literal, searched once published (its text,
+///   IRI and vector indexes built); a private transaction that adds a label and a vector of
+///   its own (overlay terms) and removes the base's label.
+/// - Expected: the six searches and the two corpus helpers answer. The text searches find
+///   the private label alone; the vector searches find the private vector first (nearest),
+///   then the base's; preparing a vector graph does nothing. Afterwards the dictionary's text
+///   coverage, vector bytes and index bytes are as before. The published snapshot still finds
+///   its own label. Red before V3: every search refused (`SearchRefused::Private`).
 #[test]
-fn a_private_snapshot_refuses_every_search_and_leaves_the_shared_indexes() {
+fn a_private_snapshot_searches_what_it_sees_and_leaves_the_shared_indexes() {
     let engine = engine();
-    let vector: Term = Literal::new_typed_literal(
-        nrese_vector::lexical(&[1.0, 0.0]),
-        NamedNode::new_unchecked(nrese_vector::DATATYPE),
-    )
-    .into();
+    let vector = |v: &[f32]| -> Term {
+        Literal::new_typed_literal(
+            nrese_vector::lexical(v),
+            NamedNode::new_unchecked(nrese_vector::DATATYPE),
+        )
+        .into()
+    };
     let mut tx = engine.transaction();
     tx.insert(quad("a", "label", literal("alpha beta")).as_ref());
-    tx.insert(quad("a", "vector", vector).as_ref());
+    tx.insert(quad("a", "vector", vector(&[1.0, 0.0])).as_ref());
     tx.commit().unwrap();
     let base = engine.snapshot();
-    let private = engine.speculative_over(&base, budget()).unwrap();
-    let pending = private.pending_snapshot().unwrap();
-    let stats = || engine.inner.shared.dictionary.stats();
-    let before = stats();
-
     let text = TextQuery {
         text: "alpha".to_owned(),
         all_words: false,
         prefix: false,
         stem: None,
     };
-    let near = VectorQuery::new(vec![1.0, 0.0], 1);
+    let near = VectorQuery::new(vec![0.0, 1.0], 2);
     let unlimited = budget();
     let every = TextScope::EVERY;
     let model = ReadModel::Materialised;
-    let refused = |result: Result<(), SearchRefused>| matches!(result, Err(SearchRefused::Private));
-    assert!(refused(pending.text_search(&text).map(drop)), "text_search");
-    assert!(refused(pending.iri_search(&text).map(drop)), "iri_search");
+    // Published searches first: the shared indexes built, covering the base.
+    assert_eq!(base.text_search(&text).unwrap().len(), 1);
+    base.iri_search(&text).unwrap();
+    base.vector_search(&near, &|_| true, &unlimited).unwrap();
+    base.text_search_in(model, &every, &text, None).unwrap();
+    base.iri_search_in(model, &every, &text, None).unwrap();
+    base.vector_search_in(model, &every, &near, &|_| true, &unlimited)
+        .unwrap();
+    let stats = || engine.inner.shared.dictionary.stats();
+    let before = stats();
+
+    let mut private = engine.speculative_over(&base, budget()).unwrap();
+    private
+        .try_insert(quad("b", "label", literal("alpha private")).as_ref())
+        .unwrap();
+    private
+        .try_insert(quad("b", "vector", vector(&[0.0, 1.0])).as_ref())
+        .unwrap();
     assert!(
-        refused(
-            pending
-                .vector_search(&near, &|_| true, &unlimited)
-                .map(drop)
-        ),
-        "vector_search"
+        private
+            .remove(quad("a", "label", literal("alpha beta")).as_ref())
+            .unwrap()
     );
-    assert!(
-        refused(pending.text_search_in(model, &every, &text, None).map(drop)),
+    let pending = private.pending_snapshot().unwrap();
+    let own = pending.lookup(literal("alpha private").as_ref()).unwrap();
+    let own_vector = pending.lookup(vector(&[0.0, 1.0]).as_ref()).unwrap();
+    let base_vector = pending.lookup(vector(&[1.0, 0.0]).as_ref()).unwrap();
+    let ids = |found: Vec<crate::TextMatch>| -> Vec<TermId> {
+        found.iter().map(|m| TermId::from_raw(m.id)).collect()
+    };
+    assert_eq!(
+        ids(pending.text_search(&text).unwrap()),
+        [own],
+        "text_search"
+    );
+    assert_eq!(
+        ids(pending.text_search_in(model, &every, &text, None).unwrap()),
+        [own],
         "text_search_in"
     );
     assert!(
-        refused(pending.iri_search_in(model, &every, &text, None).map(drop)),
-        "iri_search_in"
+        pending.iri_search(&text).unwrap().is_empty(),
+        "iri_search: no IRI is named alpha"
     );
     assert!(
-        refused(
+        pending
+            .iri_search_in(model, &every, &text, None)
+            .unwrap()
+            .is_empty(),
+        "iri_search_in"
+    );
+    let nearest = |hits: super::super::snapshot::VectorHits<'_>| -> Vec<TermId> {
+        hits.0.iter().map(|&(id, _)| id).collect()
+    };
+    assert_eq!(
+        nearest(pending.vector_search(&near, &|_| true, &unlimited).unwrap()),
+        [own_vector, base_vector],
+        "vector_search"
+    );
+    assert_eq!(
+        nearest(
             pending
                 .vector_search_in(model, &every, &near, &|_| true, &unlimited)
-                .map(drop)
+                .unwrap()
         ),
+        [own_vector, base_vector],
         "vector_search_in"
     );
-    assert!(refused(
-        pending.text_corpus_members(model, &every, false).map(drop)
-    ));
-    assert!(refused(
-        pending.vector_corpus_members(model, &every).map(drop)
-    ));
+    assert!(
+        pending
+            .text_corpus_members(model, &every, false)
+            .unwrap()
+            .0
+            .contains(&own.payload()),
+        "text corpus members"
+    );
+    assert!(
+        pending
+            .vector_corpus_members(model, &every)
+            .unwrap()
+            .contains(&own_vector.payload()),
+        "vector corpus members"
+    );
     pending.prepare_vector_graph(&near);
     let after = stats();
     assert_eq!(after.text_covered, before.text_covered, "text index cover");
@@ -345,15 +397,17 @@ fn a_private_snapshot_refuses_every_search_and_leaves_the_shared_indexes() {
     assert_eq!(
         base.text_search(&text).unwrap().len(),
         1,
-        "the published snapshot searches"
+        "the published snapshot finds its own label"
     );
 }
 
-/// B18 (§3): corpus lineage.
+/// B18 (§3): corpus lineage, re-specified by dictionary 3.2 against the contract's S3 and §5
+/// row 24 (lineage only at publication; DUR's condition 2).
 ///
-/// - Input: an engine whose reader-scoped search keeps a corpus. A write transaction's pending
-///   snapshot (the control), then a private transaction's pending snapshot and its pending view.
-/// - Expected: the write transaction's records a lineage step; the private ones record none.
+/// - Input: an engine whose reader-scoped search keeps a corpus. A write transaction's
+///   commit (the control), then a speculative writer's pending snapshot (private, over the
+///   latest), then a private transaction's pending snapshot and its pending view.
+/// - Expected: the commit records a lineage step; neither pending state records one.
 #[test]
 fn a_private_transaction_records_no_corpus_lineage() {
     let engine = engine();
@@ -372,14 +426,26 @@ fn a_private_transaction_records_no_corpus_lineage() {
     let steps = || engine.snapshot().text_corpus_stats().steps;
     let start = steps();
 
-    let mut writer = engine.speculative();
-    writer.insert(quad("b", "label", literal("gamma")).as_ref());
-    let _control = writer.pending_snapshot();
+    // The control: a publication records its step.
+    let mut published = engine.transaction();
+    published.insert(quad("p", "label", literal("epsilon")).as_ref());
+    published.commit().unwrap();
     let after_writer = steps();
     assert_eq!(
         after_writer,
         start + 1,
-        "the measure sees a write transaction's step"
+        "the measure sees a publication's step"
+    );
+
+    let mut writer = engine.speculative(budget());
+    writer
+        .try_insert(quad("b", "label", literal("gamma")).as_ref())
+        .unwrap();
+    let _pending_writer = writer.pending_snapshot().unwrap();
+    assert_eq!(
+        steps(),
+        after_writer,
+        "no lineage step for a writer's pending state"
     );
 
     let mut private = engine.speculative_over(&base, budget()).unwrap();
@@ -411,8 +477,11 @@ fn private_transactions_at_the_edges() {
     assert_eq!(own.payload(), 0);
     let statement = quad("a", "p", literal("first"));
     assert!(tx.try_insert(statement.as_ref()).unwrap());
-    assert!(tx.remove(statement.as_ref()), "removed once");
-    assert!(!tx.remove(statement.as_ref()), "then nothing to remove");
+    assert!(tx.remove(statement.as_ref()).unwrap(), "removed once");
+    assert!(
+        !tx.remove(statement.as_ref()).unwrap(),
+        "then nothing to remove"
+    );
     assert_eq!(tx.len(), 0);
 }
 
@@ -710,4 +779,73 @@ fn a_pending_view_hiding_an_equality_edge_keeps_its_classes_apart() {
             "{order}: the view keeps its class"
         );
     }
+}
+
+/// The kept pending snapshot after a refused write (V1-engine review r1, F1). A matching
+/// removal refused part way keeps the removals before the refusal (`remove_matching`'s
+/// contract), so they are pending changes, and a pending snapshot must hold them.
+///
+/// - Input: 1,000 committed statements; a private transaction over them with 16 KiB, its
+///   pending snapshot taken (so kept); then the removal of all of them, refused part way.
+/// - Expected: `MemoryLimit`, with some removed; the next pending snapshot has the
+///   transaction's statements (`len`), not the kept snapshot's 1,000.
+#[test]
+fn a_pending_snapshot_after_a_removal_refused_part_way_holds_its_removals() {
+    let engine = engine();
+    let mut load = engine.transaction();
+    for n in 0..1_000 {
+        load.insert(quad("a", "p", literal(&n.to_string())).as_ref());
+    }
+    load.commit().expect("commit");
+    let base = engine.snapshot();
+    let mut tx = engine
+        .speculative_over(&base, Arc::new(Budget::new(16 * 1024)))
+        .unwrap();
+    let reader = budget();
+    assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), 1_000);
+    let refused = tx.remove_matching(&QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "{refused:?}"
+    );
+    assert!(tx.len() < 1_000, "refused part way: {:?}", tx.pending());
+    assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), tx.len());
+}
+
+/// The kept pending snapshot after a write refused before its first change (V1-engine review
+/// r1, R3; the master's decision of 18:12). A matching removal refused before it removed
+/// anything changed nothing, so the kept snapshot still holds.
+///
+/// - Input: ten committed statements; a private transaction over them, its pending snapshot
+///   taken (so kept); its budget then filled, the removal of all of them refused before the
+///   first, and the budget released.
+/// - Expected: `MemoryLimit` with nothing pending; the next pending snapshot for the same
+///   reader budget is the kept one (its identity).
+#[test]
+fn a_pending_snapshot_is_kept_after_a_removal_refused_before_its_first() {
+    let engine = engine();
+    let mut load = engine.transaction();
+    for n in 0..10 {
+        load.insert(quad("a", "p", literal(&n.to_string())).as_ref());
+    }
+    load.commit().expect("commit");
+    let charged = Arc::new(Budget::new(1 << 20));
+    let mut tx = engine
+        .speculative_over(&engine.snapshot(), Arc::clone(&charged))
+        .unwrap();
+    let reader = budget();
+    let kept = tx.pending_snapshot_within(&reader).unwrap().identity();
+    let room = charged.remaining();
+    charged.charge(room).unwrap();
+    let refused = tx.remove_matching(&QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+    charged.release(room);
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "{refused:?}"
+    );
+    assert_eq!(tx.pending(), (0, 0), "refused before the first removal");
+    assert_eq!(
+        tx.pending_snapshot_within(&reader).unwrap().identity(),
+        kept
+    );
 }

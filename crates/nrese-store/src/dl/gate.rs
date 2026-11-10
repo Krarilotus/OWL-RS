@@ -584,7 +584,8 @@ mod tests {
                 &crate::MutationTicket::new(),
             )
             .unwrap();
-        let mut tx = store.engine().speculative();
+        // A writer, never committed: prepare and the gate are a writer's checks.
+        let mut tx = store.engine().transaction();
         tx.insert(
             nrese_rdf::Quad::new(
                 nrese_rdf::NamedNode::new_unchecked("urn:test:ann"),
@@ -630,7 +631,8 @@ mod tests {
     fn rejection_evidence_cannot_restart_an_expired_or_cancelled_gate() {
         let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
         let revision = store.current_revision();
-        let mut tx = store.engine().speculative();
+        // A writer, dropped: the rejection is a writer's.
+        let mut tx = store.engine().transaction();
         let quad = nrese_rdf::Quad::new(
             nrese_rdf::NamedNode::new_unchecked("urn:test:x"),
             nrese_rdf::vocab::rdf::TYPE,

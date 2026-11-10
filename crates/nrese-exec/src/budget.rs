@@ -619,8 +619,13 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         held
     }
 
-    /// Reserves `bytes` more, or fails without reserving anything.
+    /// Reserves `bytes` more, or fails without reserving anything. Nothing, it reserves
+    /// without a call up the budget's levels: an empty table's charge, resize and release cost
+    /// nothing (D16-039's timing: three such calls an empty scan, NOT EXISTS ×1.06).
     pub fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
+        if bytes == 0 {
+            return Ok(());
+        }
         let Some(total) = self.bytes.checked_add(bytes) else {
             return Err(self.budget.refuse(bytes, self.budget.used()));
         };
@@ -634,6 +639,11 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
     /// Returns up to `bytes` of this reservation to the budget.
     pub fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.bytes);
+        // Nothing released, no call up the levels (a reservation dropped empty, after
+        // [`Self::transfer`] too).
+        if bytes == 0 {
+            return;
+        }
         let _released = self.budget.give(bytes);
         self.bytes -= bytes;
         #[cfg(any(test, feature = "measure"))]
@@ -1361,6 +1371,20 @@ impl<T, H: Hold> Charged<T, H> {
         Ok(())
     }
 
+    /// `item` appended within the capacity already charged, with no budget call and no
+    /// refusal to carry; `Err(item)` where there is no room, for the caller to grow first
+    /// ([`Self::reserve`]). For a hot loop of one item an iteration: a [`Self::push`]'s
+    /// `Result` there cost D16-039's group walk a 5 % rise in instructions on NOT EXISTS.
+    #[inline]
+    pub fn push_within(&mut self, item: T) -> Result<(), T> {
+        if self.items.len() < self.items.capacity() {
+            self.items.push(item);
+            Ok(())
+        } else {
+            Err(item)
+        }
+    }
+
     pub fn extend_from_slice(&mut self, items: &[T]) -> Result<(), BudgetExceeded>
     where
         T: Clone,
@@ -1409,6 +1433,16 @@ impl<T, H: Hold> Charged<T, H> {
 
     pub fn truncate(&mut self, len: usize) {
         self.items.truncate(len);
+    }
+
+    /// The capacity cut to the length, through the one path that changes it: the smaller
+    /// capacity charged beside the old while the vector moves, then the old released. A
+    /// refusal leaves the vector as it was.
+    pub fn shrink_to_fit(&mut self) -> Result<(), BudgetExceeded> {
+        match self.items.len() < self.items.capacity() {
+            true => self.set_capacity(self.items.len()),
+            false => Ok(()),
+        }
     }
 
     pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
@@ -1616,6 +1650,76 @@ impl<T> Room<'_, T> {
         // SAFETY: the `n` slots after the items are written, within the capacity.
         unsafe { self.0.set_len(len + n) };
         Ok(())
+    }
+
+    /// Parts of `lengths[i]` items after the room's, in order, part `i` written by
+    /// `fill(i, part)`, the parts in parallel, each by one task through a [`Part`] that can't
+    /// go past its slots: for a writer whose items come in runs of known lengths (a
+    /// closure's pairs, component by component), written in place, with no second copy.
+    /// The first error (by part) is returned and nothing is published: the room holds what
+    /// it held (items are `Copy`: what was written needs no drop). Panics where the room
+    /// has fewer slots than the parts, or a part that returns `Ok` is short, before
+    /// publishing. Its bookkeeping, a slot range and a result a part, is uncharged: the
+    /// caller bounds the parts (the graph's closure: at most four a thread and one more).
+    pub fn try_par_fill_parts<E: Send>(
+        &mut self,
+        lengths: &[usize],
+        fill: impl Fn(usize, &mut Part<'_, T>) -> Result<(), E> + Sync,
+    ) -> Result<(), E>
+    where
+        T: Copy + Send,
+    {
+        use rayon::prelude::*;
+        let total = lengths
+            .iter()
+            .try_fold(0usize, |n, &len| n.checked_add(len))
+            .expect("the parts' length is counted");
+        let len = self.0.len();
+        let spare = self.0.spare_capacity_mut();
+        assert!(total <= spare.len(), "past the room reserved");
+        // Disjoint slots, one run a part, tiling the first `total` spare slots in order.
+        let mut slots = Vec::with_capacity(lengths.len());
+        let mut rest = &mut spare[..total];
+        for &part in lengths {
+            let (head, tail) = rest.split_at_mut(part);
+            slots.push(head);
+            rest = tail;
+        }
+        let written: Vec<Result<usize, E>> = slots
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, slots)| {
+                let mut part = Part { slots, len: 0 };
+                fill(i, &mut part).map(|()| part.len)
+            })
+            .collect();
+        for (written, &part) in written.into_iter().zip(lengths) {
+            assert_eq!(written?, part, "a part left short");
+        }
+        // SAFETY: the parts' slots tile the `total` spare slots after the room's items, in
+        // order (split above), and every part wrote all of its own, slot 0 up (a `Part`
+        // writes only its next slot, and each returned exactly its length, asserted above):
+        // the `total` slots after the items are initialised, within the capacity.
+        unsafe { self.0.set_len(len + total) };
+        Ok(())
+    }
+}
+
+/// The slots of one part of [`Room::try_par_fill_parts`], written in order: it can't write
+/// past them.
+#[derive(Debug)]
+pub struct Part<'s, T> {
+    slots: &'s mut [std::mem::MaybeUninit<T>],
+    len: usize,
+}
+
+impl<T> Part<'_, T> {
+    /// Panics where the part is full.
+    #[inline]
+    pub fn push(&mut self, item: T) {
+        assert!(self.len < self.slots.len(), "past the part");
+        self.slots[self.len].write(item);
+        self.len += 1;
     }
 }
 
@@ -1862,6 +1966,54 @@ mod tests {
         );
         assert_eq!(budget.used(), 0, "the items' memory released");
         assert_eq!(fill(4, &[]), (Ok(()), 101));
+    }
+
+    /// Parts are written in order, each by its writer, in place; a part that errs publishes
+    /// nothing and the room holds what it held; parts past the room, a writer past its part
+    /// and a short part panic before anything is published.
+    #[test]
+    fn parts_are_written_in_order_and_an_error_publishes_nothing() {
+        let budget = Budget::unlimited();
+        let mut vec: ChargedVec<u64, &Budget> = ChargedVec::with_capacity(&budget, 10).unwrap();
+        vec.push(99).unwrap();
+        let lengths = [3, 0, 4];
+        vec.fill(0, |room| {
+            room.try_par_fill_parts(&lengths, |i, part| {
+                for k in 0..lengths[i] {
+                    part.push((10 * i + k) as u64);
+                }
+                Ok::<_, ()>(())
+            })
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(&vec[..], &[99, 0, 1, 2, 20, 21, 22, 23]);
+        let failed = vec
+            .fill(0, |room| {
+                room.try_par_fill_parts(&[1, 1], |i, part| {
+                    part.push(7);
+                    if i == 1 { Err(i) } else { Ok(()) }
+                })
+            })
+            .unwrap();
+        assert_eq!(failed, Err(1));
+        assert_eq!(vec.len(), 8, "nothing published");
+        let mut panics = |lengths: &'static [usize], pushes: usize| {
+            let mut vec = std::panic::AssertUnwindSafe(&mut vec);
+            std::panic::catch_unwind(move || {
+                vec.fill(0, |room| {
+                    room.try_par_fill_parts(lengths, |_, part| {
+                        (0..pushes).for_each(|_| part.push(1));
+                        Ok::<_, ()>(())
+                    })
+                })
+            })
+            .is_err()
+        };
+        assert!(panics(&[5], 5), "parts past the room");
+        assert!(panics(&[1], 2), "a writer past its part");
+        assert!(panics(&[2], 1), "a short part");
+        assert_eq!(&vec[..], &[99, 0, 1, 2, 20, 21, 22, 23]);
     }
 
     /// Two failures both observed return the lower: items 2 and 6 of 8, a range each on two

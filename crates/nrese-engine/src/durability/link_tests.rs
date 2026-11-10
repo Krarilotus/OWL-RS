@@ -616,3 +616,410 @@ fn a_store_whose_wal_is_a_link_names_its_targets_chain() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Makes `link` a symbolic link to the file `target` (as spelled: absolute or relative to the
+/// link's directory); `false` if this host may not make one (Windows without the privilege).
+fn link_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+    #[cfg(windows)]
+    match std::os::windows::fs::symlink_file(
+        target.to_string_lossy().replace('/', "\\"),
+        link.to_string_lossy().replace('/', "\\"),
+    ) {
+        Ok(()) => true,
+        // ERROR_PRIVILEGE_NOT_HELD
+        Err(error) if error.raw_os_error() == Some(1314) => false,
+        Err(error) => panic!(
+            "symlink {} -> {}: {error}",
+            link.display(),
+            target.display()
+        ),
+    }
+}
+
+/// Naming an existing file reached through links (`place::name_existing_file`, DUR-5) syncs
+/// every directory entry its target's resolution reads, beyond the file's own directory, and
+/// refuses what can't be a durable file. Rows, each in its own directory, judged apart:
+/// - a chain of file links (`a/f` → `b/g` → `c/h`): `b`, `c` and their holder synced;
+/// - a relative target (`d/f` → `../c/h`): `c` and its holder synced;
+/// - a target holder's sync failing (`c`, in the chain): refused;
+/// - a dangling link (`e/f` → `missing/h`), a loop (`l/x` ↔ `l/y`), a link to a directory
+///   (`m/f` → `c`): refused;
+/// - guard, a regular file (`c/h`): named, nothing refused.
+///
+/// Before the fix nothing beyond the file's own directory was synced and nothing was refused.
+#[test]
+fn naming_a_file_reaches_through_links() {
+    let mut wrong = Vec::new();
+    let made = |base: &Path| {
+        for dir in ["a", "b", "c", "d", "e", "l", "m"] {
+            std::fs::create_dir(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("c/h"), b"held").unwrap();
+    };
+    // (row, the link to make (link, target), the file named, a holder failing, needed, refused)
+    type FileRow = (
+        &'static str,
+        &'static [(&'static str, &'static str, bool)],
+        &'static str,
+        Option<&'static str>,
+        &'static [&'static str],
+        bool,
+    );
+    let rows: [FileRow; 7] = [
+        (
+            "a chain of file links",
+            &[("b/g", "c/h", true), ("a/f", "b/g", true)],
+            "a/f",
+            None,
+            &["", "b", "c"],
+            false,
+        ),
+        (
+            "a relative target",
+            &[("d/f", "../c/h", false)],
+            "d/f",
+            None,
+            &["", "c"],
+            false,
+        ),
+        (
+            "a target holder failing",
+            &[("b/g", "c/h", true), ("a/f", "b/g", true)],
+            "a/f",
+            Some("c"),
+            &[],
+            true,
+        ),
+        (
+            "a dangling link",
+            &[("e/f", "missing/h", true)],
+            "e/f",
+            None,
+            &[],
+            true,
+        ),
+        (
+            "a loop",
+            &[("l/x", "l/y", true), ("l/y", "l/x", true)],
+            "l/x",
+            None,
+            &[],
+            true,
+        ),
+        (
+            "a link to a directory",
+            &[("m/f", "c", true)],
+            "m/f",
+            None,
+            &[],
+            true,
+        ),
+        ("guard, a regular file", &[], "c/h", None, &[], false),
+    ];
+    'rows: for (row, links, named, failing, needed, refused) in rows {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        made(base);
+        for (at, target, absolute) in links {
+            let target = match absolute {
+                true => base.join(target),
+                false => PathBuf::from(target),
+            };
+            if !link_file(&target, &base.join(at)) {
+                eprintln!("{row}: not run (no privilege to make a file symlink on this host)");
+                continue 'rows;
+            }
+        }
+        fault::FAIL_DIR_SYNC_OF.set(failing.map(|dir| (base.join(dir), std::io::ErrorKind::Other)));
+        let (outcome, synced) = syncs_of(|| place::name_existing_file(&base.join(named)));
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        match (outcome, refused) {
+            (Ok(()), true) => wrong.push(format!("{row}: named, not refused")),
+            (Err(error), false) => wrong.push(format!("{row}: {error}")),
+            _ => {}
+        }
+        let needed: Vec<PathBuf> = needed.iter().map(|dir| base.join(dir)).collect();
+        let needed: Vec<&Path> = needed.iter().map(PathBuf::as_path).collect();
+        wrong.extend(judge(row, &synced, &needed, true));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A file link with a relative target in a directory reached through a link (sol-loop r1 on
+/// DUR-5, S1): its target is taken from the directory the link is in, as reached, not as
+/// spelled. `p` links to `real/q`, and `real/q/f` links to `../data/new/h`: naming `p/f`
+/// syncs `real/data/new` and its holders, where the file is (`data/new/h`, which the spelling
+/// `p/../data/new/h` reads lexically on Windows, is a decoy there). Rows for each link kind.
+/// Before the fix Windows named the decoy's chain; Unix walked `..` physically and was right.
+#[test]
+fn a_relative_file_link_in_a_linked_directory_is_taken_from_where_it_is() {
+    let mut wrong = Vec::new();
+    for kind in kinds() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        for dir in ["real/q", "real/data/new", "data/new"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        std::fs::write(base.join("real/data/new/h"), b"held").unwrap();
+        std::fs::write(base.join("data/new/h"), b"decoy").unwrap();
+        if !link(kind, &base.join("real/q"), &base.join("p"))
+            || !link_file(Path::new("../data/new/h"), &base.join("real/q/f"))
+        {
+            eprintln!("{kind:?} row: not run (no privilege to make one on this host)");
+            continue;
+        }
+        let row = format!("{kind:?}, a relative file link in a linked directory");
+        let (named, synced) = syncs_of(|| place::name_existing_file(&base.join("p/f")));
+        if let Err(error) = named {
+            wrong.push(format!("{row}: {error}"));
+        }
+        let needed = [
+            base.join("real"),
+            base.join("real/data"),
+            base.join("real/data/new"),
+        ];
+        let needed: Vec<&Path> = needed.iter().map(PathBuf::as_path).collect();
+        wrong.extend(judge(&row, &synced, &needed, true));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The newest file in `dir` named `<prefix><revision><suffix>`.
+fn newest_file(dir: &Path, prefix: &str, suffix: &str) -> PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let revision: u64 = name
+                .strip_prefix(prefix)?
+                .strip_suffix(suffix)?
+                .parse()
+                .ok()?;
+            Some((revision, path))
+        })
+        .max_by_key(|(revision, _)| *revision)
+        .unwrap_or_else(|| panic!("no {prefix}*{suffix} in {}", dir.display()))
+        .1
+}
+
+/// A store whose authoritative files are links to files elsewhere has the names their targets'
+/// resolution reads made durable before a commit is acknowledged (DUR-5, fix check r2 on
+/// DUR-4, R2-F1): the open reads the checkpoint it loads and the segments it replays through
+/// such a link, and appends to the active segment through it. A store made and closed, the
+/// file then moved to `data/new-parent/` and linked back. With the sync of `data/new-parent`
+/// (a target ancestor) failing with a non-permission error, the reopen or its first commit is
+/// refused, not acknowledged. The fault cleared, the store reopened (a refusal may poison the
+/// log: a reopen settles it), a commit is acknowledged and is there after another reopen, with
+/// the earlier acknowledged ones. Whether the refused commit is there isn't judged. Rows,
+/// judged apart: the checkpoint loaded (commit 1 then a checkpoint); the active segment
+/// (commit 1, no checkpoint); a replayed segment that isn't the active one (commits 1 and 2 in
+/// segments of their own, the first linked). Windows runs them on file symlinks where the host
+/// may make them, else "not run". Before the fix the commit was acknowledged with
+/// `data/new-parent` never synced: a power loss could leave the link dangling, and the
+/// acknowledged commits with it.
+#[test]
+fn a_store_whose_files_are_links_names_their_targets_chain() {
+    let mut wrong = Vec::new();
+    for row in ["the checkpoint", "the active segment", "a replayed segment"] {
+        let configured = || EngineConfig {
+            durability: DurabilityConfig {
+                // A segment per commit for the replayed row: the first isn't the active one.
+                wal_segment_bytes: match row {
+                    "a replayed segment" => 1,
+                    _ => config().durability.wal_segment_bytes,
+                },
+                ..config().durability
+            },
+            ..config()
+        };
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        let store = base.join("store");
+        let acknowledged: Vec<u64> = {
+            let engine = Engine::open(&store, configured()).unwrap();
+            commit(&engine, 1).unwrap();
+            match row {
+                "the checkpoint" => {
+                    engine.checkpoint().unwrap();
+                    vec![1]
+                }
+                "a replayed segment" => {
+                    commit(&engine, 2).unwrap();
+                    vec![1, 2]
+                }
+                _ => vec![1],
+            }
+        };
+        let file = match row {
+            "the checkpoint" => newest_file(&store, "checkpoint-", ".nck"),
+            "the active segment" => newest_file(&store.join("wal"), "", ".wal"),
+            _ => {
+                let segments = super::wal::list_segments(&store.join("wal")).unwrap();
+                assert!(segments.len() >= 2, "{row}: segments {segments:?}");
+                segments[0].1.clone()
+            }
+        };
+        let target = base
+            .join("data")
+            .join("new-parent")
+            .join(file.file_name().unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::rename(&file, &target).unwrap();
+        if !link_file(&target, &file) {
+            eprintln!("{row}: not run (no privilege to make a file symlink on this host)");
+            continue;
+        }
+        fault::FAIL_DIR_SYNC_OF.set(Some((
+            base.join("data").join("new-parent"),
+            std::io::ErrorKind::Other,
+        )));
+        let refused = match Engine::open(&store, configured()) {
+            Err(_) => true,
+            Ok(engine) => commit(&engine, 7).is_err(),
+        };
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if !refused {
+            wrong.push(format!(
+                "{row}: acknowledged though a target ancestor's sync failed"
+            ));
+        }
+        match Engine::open(&store, configured()) {
+            Ok(engine) => {
+                if let Err(error) = commit(&engine, 3) {
+                    wrong.push(format!("{row}: the commit once the fault cleared: {error}"));
+                }
+            }
+            Err(error) => wrong.push(format!("{row}: the reopen once the fault cleared: {error}")),
+        }
+        match Engine::open(&store, configured()) {
+            Ok(engine) => {
+                for n in acknowledged.iter().copied().chain([3]) {
+                    if !holds(&engine, n) {
+                        wrong.push(format!(
+                            "{row}: acknowledged commit {n} gone after a reopen"
+                        ));
+                    }
+                }
+            }
+            Err(error) => wrong.push(format!("{row}: the last reopen: {error}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The newest segment left after the open's replay is the one `Wal::open` appends to, and is
+/// named when it is a link, whatever the replay did to the segments (review r1 on DUR-5, N2:
+/// the open finds it without listing the log again). Rows, judged apart:
+/// - under a checkpoint: the only segment left holds commit 1, which the checkpoint holds too,
+///   so none of its records is replayed; it is linked to `data/new-parent/`;
+/// - after a point-in-time cut: commits 1, 2 and 3 in segments of their own, the first linked;
+///   an open up to revision 1 removes the other two, so the first is the newest.
+///
+/// With `data/new-parent`'s sync failing, the open (which changed the store, for the cut) or its
+/// first commit is refused. Once it works, a commit is acknowledged and kept after a reopen, with
+/// commit 1. Guards: right before the change too, which listed the log again.
+#[test]
+fn the_newest_segment_left_is_named_after_a_cut_and_under_a_checkpoint() {
+    let mut wrong = Vec::new();
+    for row in ["under a checkpoint", "after a point-in-time cut"] {
+        let small = || EngineConfig {
+            durability: DurabilityConfig {
+                wal_segment_bytes: 1,
+                ..config().durability
+            },
+            ..config()
+        };
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        let store = base.join("store");
+        let wal = store.join("wal");
+        let opening = match row {
+            "under a checkpoint" => {
+                let segment = {
+                    let engine = Engine::open(&store, config()).unwrap();
+                    commit(&engine, 1).unwrap();
+                    let segment = newest_file(&wal, "", ".wal");
+                    std::fs::copy(&segment, base.join("held.wal")).unwrap();
+                    engine.checkpoint().unwrap();
+                    segment
+                };
+                // The log as a checkpoint's release left it undone: its old segment only.
+                for entry in std::fs::read_dir(&wal).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+                std::fs::copy(base.join("held.wal"), &segment).unwrap();
+                config()
+            }
+            _ => {
+                {
+                    let engine = Engine::open(&store, small()).unwrap();
+                    for n in 1..=3 {
+                        commit(&engine, n).unwrap();
+                    }
+                }
+                EngineConfig {
+                    durability: DurabilityConfig {
+                        recover_until: Some(1),
+                        ..small().durability
+                    },
+                    ..small()
+                }
+            }
+        };
+        let file = match row {
+            "under a checkpoint" => newest_file(&wal, "", ".wal"),
+            _ => super::wal::list_segments(&wal).unwrap()[0].1.clone(),
+        };
+        let target = base
+            .join("data")
+            .join("new-parent")
+            .join(file.file_name().unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::rename(&file, &target).unwrap();
+        if !link_file(&target, &file) {
+            eprintln!("{row}: not run (no privilege to make a file symlink on this host)");
+            continue;
+        }
+        fault::FAIL_DIR_SYNC_OF.set(Some((
+            base.join("data").join("new-parent"),
+            std::io::ErrorKind::Other,
+        )));
+        let refused = match Engine::open(&store, opening.clone()) {
+            Err(_) => true,
+            Ok(engine) => commit(&engine, 7).is_err(),
+        };
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if !refused {
+            wrong.push(format!(
+                "{row}: acknowledged though a target ancestor's sync failed"
+            ));
+        }
+        match Engine::open(&store, opening.clone()) {
+            Ok(engine) => {
+                if let Err(error) = commit(&engine, 4) {
+                    wrong.push(format!("{row}: the commit once the fault cleared: {error}"));
+                }
+            }
+            Err(error) => wrong.push(format!("{row}: the reopen once the fault cleared: {error}")),
+        }
+        match Engine::open(&store, config()) {
+            Ok(engine) => {
+                for n in [1, 4] {
+                    if !holds(&engine, n) {
+                        wrong.push(format!(
+                            "{row}: acknowledged commit {n} gone after a reopen"
+                        ));
+                    }
+                }
+            }
+            Err(error) => wrong.push(format!("{row}: the last reopen: {error}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

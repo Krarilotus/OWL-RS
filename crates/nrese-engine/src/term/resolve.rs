@@ -30,10 +30,6 @@ impl Vocabulary {
     /// The contract's b(V) (§4.1): ids below it are the dictionary's, the same in every
     /// vocabulary of that dictionary bounded at or past it. `bound` for shared, `start` for
     /// private.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "alignment by value reads it in package 5")
-    )]
     pub(crate) fn shared_bound(&self, bound: u64) -> u64 {
         match self {
             Self::Shared(_) => bound,
@@ -123,11 +119,13 @@ impl Vocabulary {
         }
     }
 
+    /// As [`Dictionary::decode_charged`]: `charge` called with no lock held, each call an
+    /// increment.
     pub(crate) fn decode_charged<E>(
         &self,
         id: TermId,
         bound: u64,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
         match self {
             Self::Shared(dictionary) => {
