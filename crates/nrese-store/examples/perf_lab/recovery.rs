@@ -246,7 +246,7 @@ pub fn measure(
          \"first_query_ms\": {first_query_ms:.3}, \"primary_open_ms\": {primary_open_ms:.3}, \
          \"image_ms\": {image_ms:.3}, \"image_bytes\": {}, \"feed_ms\": {feed_ms:.3}, \"apply_ms\": {apply_ms:.3}, \
          \"records\": {}, \"frames_bytes\": {}, \"catch_up_memory\": {catch_up_memory}, \
-         \"catch_up_conditions\": \"in process, no network; batches up to {BATCH_BYTES} bytes; store defaults:          durable sync per commit, background maintenance on, not settled in the timed window\",          \"primary_ok\": {primary_ok}, \"restored_ok\": {restored_ok}, \"follower_ok\": {follower_ok}, \"answers_ok\": {ok}}}",
+         \"catch_up_conditions\": \"in process, no network; batches up to {BATCH_BYTES} bytes; store defaults: durable sync per commit, background maintenance on, not settled in the timed window\",          \"primary_ok\": {primary_ok}, \"restored_ok\": {restored_ok}, \"follower_ok\": {follower_ok}, \"answers_ok\": {ok}}}",
         statements,
         bytes_in(std::slice::from_ref(&image)),
         made.bytes,
