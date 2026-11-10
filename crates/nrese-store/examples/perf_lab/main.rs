@@ -10,6 +10,7 @@
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
+//!     [--held-views N,...] [--recovery-prepare COMMITS:QUADS] [--recovery COMMITS:QUADS --store DIR]
 //!     [--support-sets K|off] [--support-reader FILE [--support-commits FILE] [--support-updates FILE]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
@@ -74,6 +75,12 @@
 //!   QUADS statements on a durable primary, then per run a fresh follower catching up from
 //!   its image through the feed (`log_since`) and the apply (`apply_log`), timed apart, with
 //!   the catch-up's peak memory (`modes::replication`; under `--store DIR` when given).
+//!   `--held-views 0,1,8` times what holding views costs, per count of views held: snapshot
+//!   acquisition, commits, reads, private reads in a transaction and their rollback, and the
+//!   memory retained (`views.rs`). `--recovery-prepare` (a case's setup, after `--load`) and
+//!   `--recovery` time an image restore through the retained log, the restored store's open
+//!   and first query, an image, and a follower's catch-up (`recovery.rs`). `NRESE_WAL_ARCHIVE=true`
+//!   keeps the log a checkpoint covers, as the server's setting does.
 //!   `--support-sets K` caps the support graph sets per statement (`off`: none), and
 //!   `--support-reader FILE` times a reader of the default graph and FILE's named graphs with
 //!   `inferred = "supported"`: its first read, then `--support-commits` each followed by a
@@ -90,9 +97,11 @@ use std::collections::BTreeMap;
 use std::io::Write;
 mod generate;
 mod modes;
+mod recovery;
 mod support;
 #[allow(dead_code)]
 mod support_family;
+mod views;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -281,6 +290,9 @@ struct Args {
     split_turtle: Option<(usize, PathBuf)>,
     replication: Option<String>,
     replication_probe: bool,
+    held_views: Vec<usize>,
+    recovery_prepare: Option<String>,
+    recovery: Option<String>,
     upload: Option<PathBuf>,
     upload_format: Option<nrese_store::GraphResultFormat>,
     upload_as: modes::UploadRoute,
@@ -334,6 +346,9 @@ fn parse_args() -> Result<Args, String> {
         split_turtle: None,
         replication: None,
         replication_probe: false,
+        held_views: Vec::new(),
+        recovery_prepare: None,
+        recovery: None,
         upload: None,
         upload_format: None,
         upload_as: modes::UploadRoute::GraphStore,
@@ -438,6 +453,15 @@ fn parse_args() -> Result<Args, String> {
                 "swap-one" => args.replication_probe = true,
                 other => return Err(format!("--replication-probe swap-one, not {other}")),
             },
+            "--held-views" => {
+                args.held_views = value()?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("--held-views: {e}"))?
+            }
+            "--recovery-prepare" => args.recovery_prepare = Some(value()?),
+            "--recovery" => args.recovery = Some(value()?),
             "--upload" => args.upload = Some(value()?.into()),
             "--upload-format" => {
                 args.upload_format = Some(match value()?.as_str() {
@@ -1153,6 +1177,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         checkpoint_after_wal_bytes: args
             .checkpoint_after_wal_bytes
             .unwrap_or(config.checkpoint_after_wal_bytes),
+        wal_archive: setting("NRESE_WAL_ARCHIVE") == "true",
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
@@ -1195,6 +1220,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 args.replication_probe,
             )?,
         ));
+        return Ok(());
+    }
+    if let Some(spec) = &args.recovery {
+        if args.store.is_none() {
+            return Err("--recovery needs --store DIR, the prepared source".into());
+        }
+        report
+            .sections
+            .push(("recovery", recovery::measure(&config, spec)?));
         return Ok(());
     }
     let mut phases: Vec<(&'static str, String)> = Vec::new();
@@ -1445,6 +1479,31 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             ));
         }
         phases.push(("commits", phase.json()));
+    }
+    if !args.held_views.is_empty() || args.recovery_prepare.is_some() {
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner.clone())),
+        );
+        if !args.held_views.is_empty() {
+            let phase = Phase::start();
+            report.sections.extend(views::measure(
+                &pipeline,
+                &texts,
+                &args.held_views,
+                args.runs,
+            )?);
+            phases.push(("held_views", phase.json()));
+        }
+        if let Some(spec) = &args.recovery_prepare {
+            let dir = args
+                .store
+                .as_deref()
+                .ok_or("--recovery-prepare needs --store DIR")?;
+            report
+                .sections
+                .push(("recovery_prepare", recovery::prepare(&pipeline, dir, spec)?));
+        }
     }
     if args.classify {
         let phase = Phase::start();
