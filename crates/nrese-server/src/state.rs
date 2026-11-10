@@ -304,15 +304,33 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Changes this state's repository's settings: its title, and its reasoning, which
-    /// takes effect at once (the inferences are recomputed). The default repository's are
-    /// kept in the data directory (on disk) and override the configuration's reasoning
-    /// at the next start.
-    pub fn change_repository_settings(
+    /// The repository's settings and the reasoning mode in effect, as the catalogue
+    /// published them together ([`crate::repositories::Repository::observe`]): never a
+    /// change's new settings beside its old reasoning, or the reverse. `None` once it is
+    /// removed (or can't serve).
+    pub fn observe_repository(
         &self,
-        settings: crate::repository_config::RepositorySettings,
+    ) -> Option<(crate::repository_config::RepositorySettings, &'static str)> {
+        self.repositories
+            .observe(self.repository_id())
+            .map(|(settings, pipeline)| (settings, pipeline.reasoner().mode_name()))
+    }
+
+    /// Changes this state's repository's settings to what `edit` makes of those current
+    /// when the change applies ([`crate::repositories::Catalog::patch`]): its title, and
+    /// its reasoning, which takes effect at once (the inferences are recomputed). The
+    /// default repository's are kept in the data directory (on disk) and are in effect for it
+    /// after a restart too; the configured reasoning stays the other repositories'.
+    pub fn patch_repository_settings(
+        &self,
+        edit: impl FnOnce(
+            &crate::repository_config::RepositorySettings,
+        ) -> Result<
+            crate::repository_config::RepositorySettings,
+            crate::repositories::CatalogError,
+        >,
     ) -> Result<(), ApiError> {
-        Ok(self.repositories.change(self.repository_id(), settings)?)
+        Ok(self.repositories.patch(self.repository_id(), edit)?)
     }
 
     pub fn mark_ready(&self) {

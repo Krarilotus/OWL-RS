@@ -51,11 +51,6 @@ sampled `MemoryWatch` are not exact pre-allocation admission. See [resource life
 
 Known bypasses:
 
-- `crates/nrese-store/src/rdf_io.rs:59`: `parse_graph` collects an owned `Vec<Quad>` with no envelope.
-- `crates/nrese-store/src/rdf_io.rs:76`: `parse_payload` does the same for uploads.
-- `crates/nrese-store/src/rdf_io.rs:89`: Preserved-blank-node parser duplicates the uncharged collection.
-- `crates/nrese-store/src/rdf_io.rs:101`: Dataset restore parser collects the same way.
-- `crates/nrese-store/src/statements.rs:101`: Context fan-out clones every parsed quad into every context then collects, beside the original parse.
 - `crates/nrese-store/src/statements.rs:212`: Pattern matching materializes decoded quads in a plain growing vector.
 - `crates/nrese-store/src/dl/source.rs:109`: Transaction ontology reader collects all asserted `Statement`s before `nrese_owl::read`, without an envelope parameter.
 - `crates/nrese-store/src/dl/source.rs:126`: Snapshot ontology reader repeats the full uncharged collection.
@@ -77,12 +72,23 @@ Known bypasses:
 
 DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not exact pre-allocation admission.
 
+A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`, open row, owner engine/transaction). Uploads insert each statement as it is read, their pending growth charged (D16-039); one that fails part-way is discarded with its transaction, and the new terms it interned stay, as stated limit L3 accepts for v1.5 (`crates/nrese-store/src/rdf_io.rs`).
+
 ## Lock order
 
 **Owners:** `Engine`, `Transaction`, `Versions` in `crates/nrese-engine/src/engine/mod.rs:21`; `Dictionary` in
 `crates/nrese-engine/src/term/dictionary.rs:24`. Follow writer → checkpoint → compaction → WAL → current version → dictionary; inside the dictionary,
 one index → inner → order → derived bookkeeping, never two locks of one level. Rayon workers use fallible slot admission rather than waiting;
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
+A commit's note (`Transaction::note_commit`, `crates/nrese-engine/src/engine/writer.rs`) runs with the writer slot, the WAL and, where the
+commit converts the stack, the compaction slot held: it takes no lock and calls nothing in the engine, and its journal's sync holds back
+compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
+`WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
+
+**A version's own slots** (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
+value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
+the snapshot and its other slots. The engine takes it under none of its own locks: an installed version is a value no snapshot held
+(`Versions::install`), so nothing drains it.
 
 **The `owl2-dl` bounds (U1):** `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145` (P2-C6b). Its `state` and `view` mutexes guard
 serial work only: taking what a read or a commit needs, a revision check, publishing, applying a computed change. The engine's writer slot and
@@ -107,7 +113,9 @@ Known bypasses and gaps:
 **Owners:** `Durable` (`crates/nrese-engine/src/durability/mod.rs:105`), `Transaction::commit` (`crates/nrese-engine/src/engine/transaction.rs:477`),
 `BulkLoad` (`crates/nrese-engine/src/engine/bulk.rs:3`), and application `MutationPipeline`/`MutationTicket`
 (`crates/nrese-store/src/mutation/pipeline.rs:36`; `crates/nrese-store/src/mutation/ticket.rs:21`). Ordinary commit builds, appends/syncs WAL, then
-publishes. `EveryCommit` survives power loss; `OsBuffered` may lose recent commits after OS/power failure. Checkpoint publication writes aside, syncs,
+publishes. A journal beside the log that must agree with it (the quarantine's resolutions) is written as the commit's note, before the record,
+and holds a record in effect only where the recovered store holds its revision; the log is poisoned wherever a journal may name a revision
+no commit published. `EveryCommit` survives power loss; `OsBuffered` may lose recent commits after OS/power failure. Checkpoint publication writes aside, syncs,
 renames and syncs the directory. Bulk/rematerialisation checkpoint before publication without a large WAL record. If cancellation loses to commit,
 await the actual outcome. See [storage ADR](../adr/0002-engine-storage-lsm-permutations.md) and [one engine API](../adr/0007-one-engine-api.md).
 

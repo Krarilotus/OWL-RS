@@ -52,6 +52,8 @@ pub mod support;
 mod tell;
 pub mod update;
 mod view;
+#[cfg(test)]
+mod witness;
 
 pub use backup::{
     DIGEST_PREFIX, DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, DatasetRestoreReport,
@@ -109,7 +111,7 @@ pub use query::{
     SparqlQueryRequest,
 };
 pub use query_executor::PreparedQuery;
-pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
+pub use rdf_io::{ChargedQuads, convert_file, parse_payload};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use running::{RunningQueries, RunningQuery};
@@ -120,7 +122,7 @@ pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
     ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
 };
-pub use statements::{RdfPayload, StatementOp, StatementPattern, StatementsRequest};
+pub use statements::{RdfPayload, StatementOp, StatementOps, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;
 pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};

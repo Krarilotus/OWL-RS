@@ -1,8 +1,11 @@
 //! Test-only fault points: each makes one durable step fail, on this thread only, so that
 //! tests running in parallel don't see each other's faults.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::thread::LocalKey;
+
+/// A reader of a snapshot ([`IMAGE_READER`]).
+pub(crate) type Reader = Box<dyn FnMut(&crate::Snapshot)>;
 
 thread_local! {
     /// [`Wal::rotate`](super::wal::Wal::rotate) fails before it changes anything.
@@ -26,6 +29,8 @@ thread_local! {
     /// The files this thread synced through `durability::place`, in order.
     pub(crate) static SYNCED: std::cell::RefCell<Vec<std::path::PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// A commit record's write to the log fails, after its note ([`crate::Transaction::note_commit`]).
+    pub(crate) static FAIL_RECORD_WRITE: Cell<bool> = const { Cell::new(false) };
     /// A file sync through `durability::place` fails.
     pub(crate) static FAIL_FILE_SYNC: Cell<bool> = const { Cell::new(false) };
     /// The sync of this directory through `durability::place` fails, with this kind of error.
@@ -36,10 +41,23 @@ thread_local! {
     /// sees at that moment.
     pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<DirSyncHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Reads a durable bulk load's checkpoint image before the checkpoint is written, as a
+    /// reader of it would (the own-state slots' 3.0c item 5).
+    pub(crate) static IMAGE_READER: RefCell<Option<Reader>> = const { RefCell::new(None) };
 }
 
 /// What [`ON_DIR_SYNC`] calls.
 pub(crate) type DirSyncHook = Box<dyn FnMut(&std::path::Path)>;
+
+/// Whether `a` and `b` name the same directory: the same spelling, or the same canonical path
+/// (a sync reaching it through a link or a junction, DUR-4, spells it as the link's target).
+pub(crate) fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
 
 /// An error if `point` is set on this thread.
 pub(crate) fn check(point: &'static LocalKey<Cell<bool>>, what: &str) -> std::io::Result<()> {

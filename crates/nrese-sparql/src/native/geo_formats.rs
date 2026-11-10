@@ -132,7 +132,7 @@ fn geojson_value(geometry: &Geometry<f64>) -> Value {
 
 /// The GML 3.2 text of a geometry in reference system `crs`.
 pub(super) fn to_gml(geometry: &Geometry<f64>, crs: &str) -> String {
-    const NS: &str = "http://www.opengis.net/ont/gml";
+    const NS: &str = "http://www.opengis.net/gml/3.2";
     fn positions(coords: impl Iterator<Item = Coord<f64>>) -> String {
         coords
             .map(|c| format!("{} {}", c.x, c.y))

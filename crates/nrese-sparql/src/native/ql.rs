@@ -627,7 +627,6 @@ impl Rewriter<'_> {
             return false;
         };
         let other = TermPattern::Variable(Variable::new_unchecked("_qlr_other"));
-        let identity = self.snapshot.identity();
         // What a question reads, counted before it runs: each triple pattern's statements
         // with its constant predicate (and class).
         let model = data.options.read_model;
@@ -706,7 +705,8 @@ impl Rewriter<'_> {
             let snapshot = self.snapshot;
             let asked = &mut self.report.checks;
             let budget = self.limits.checks;
-            let has = data.ql.realised(identity, &key, || {
+            let mode = crate::ql::ProbeMode::of(&data.options);
+            let has = data.ql.realised(snapshot, mode, &key, || {
                 if *asked >= budget || data.options.resources.check().is_err() {
                     return None;
                 }
@@ -1086,8 +1086,8 @@ fn path_names(
     Some(())
 }
 
-/// How the variables of a rewritten pattern are written: the query's own, and new ones
-/// (`_ql<pattern>_<n>`, also for the pattern's blank nodes, which the branches share).
+/// How the variables of a rewritten pattern are written: the query's own, and made ones
+/// (`ql <pattern>.<n>`, also for the pattern's blank nodes, which the branches share).
 struct Names<'a> {
     terms: &'a [TermPattern],
     pattern: usize,
@@ -1097,7 +1097,10 @@ impl Names<'_> {
     fn term(&self, v: u32) -> TermPattern {
         match self.terms.get(v as usize) {
             Some(TermPattern::Variable(variable)) => TermPattern::Variable(variable.clone()),
-            _ => TermPattern::Variable(Variable::new_unchecked(format!("_ql{}_{v}", self.pattern))),
+            _ => TermPattern::Variable(nrese_sparql_syntax::internal::variable(
+                "ql",
+                format_args!("{}.{v}", self.pattern),
+            )),
         }
     }
 }

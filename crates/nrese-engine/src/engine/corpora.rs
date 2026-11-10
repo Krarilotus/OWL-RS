@@ -9,9 +9,8 @@
 //! read model, the graphs (the scope, normalised so that equal graph sets share one) and
 //! how the reader reads equality classes (`owl:sameAs` expanded or canonical, or as
 //! stored): its members are the terms the reader's own scans show. Building one walks the
-//! scope's statements; a version that a commit made from another (or a pending state)
-//! instead takes the corpus of its
-//! nearest kept ancestor and looks again at the terms the steps between them touched:
+//! scope's statements; a version that a commit made from another instead takes the corpus
+//! of its nearest kept ancestor and looks again at the terms the steps between them touched:
 //! each is a member if a statement the reader sees in the scope still has it, a probe. So
 //! a search after a small commit costs probes for what the commit touched, not a walk,
 //! and deletes stay exact (a literal stays while any visible statement has it). Where a
@@ -36,6 +35,13 @@
 //! request's budget and serves that search alone, as everything a search builds besides
 //! (the bits, the walk's counts, the probes' list). The budget is the only bound on how
 //! many corpora and steps are kept.
+//!
+//! Only a published snapshot, or a restriction of one, changes the store (the dictionary
+//! lifecycle's S3: its [`super::snapshot::CorpusAdmission`], from its `SharedState`): it makes it,
+//! claims, evicts, keeps, abandons; only a successful publication records a step. Any other
+//! snapshot (a writer's pending state, a view that adds facts) builds for its search alone,
+//! derived from a kept corpus where that corpus's runs are its own runs' prefix
+//! ([`CorpusStore::derive_unadmitted`], reading the store), else walked.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,8 +50,8 @@ use std::sync::{Arc, Weak};
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use parking_lot::Mutex;
 
-use super::snapshot::{Documents, TextScope};
-use super::{Content, ReadModel, Version};
+use super::snapshot::{CorpusAdmission, Documents, TextScope};
+use super::{Content, ReadModel, Stack, Version};
 use crate::term::text::Corpus;
 use crate::term::{TermId, TermKind};
 
@@ -139,7 +145,7 @@ pub(crate) struct KindRef<'a> {
 }
 
 impl KindRef<'_> {
-    fn matches(&self, kind: &CorpusKind) -> bool {
+    pub(crate) fn matches(&self, kind: &CorpusKind) -> bool {
         kind.0 == self.documents
             && kind.1 == self.model
             && kind.2 == *self.scope
@@ -147,7 +153,31 @@ impl KindRef<'_> {
             && kind.4 == self.canonical
     }
 
-    fn to_owned(self) -> CorpusKind {
+    /// The touched terms whose probes can change this kind's members, of a step's or a
+    /// delta's `touched` (sorted raw ids). Blank nodes are never documents: they matter only
+    /// to a reader of equality classes of IRIs (the IRIs' corpora, in a model with inferred
+    /// statements), whose classes may hold them; to any other kind they are left out. Ids
+    /// sort by kind first (its tag is the high bits), so the blank nodes are one range.
+    fn probed<'t>(&self, touched: &'t [u64]) -> [&'t [u64]; 2] {
+        if self.reads_classes() {
+            return [touched, &[]];
+        }
+        let start = touched.partition_point(|&raw| tag(raw) < BLANK);
+        let end = touched.partition_point(|&raw| tag(raw) <= BLANK);
+        [&touched[..start], &touched[end..]]
+    }
+
+    /// Whether this kind's reader may expand equality classes of IRIs ([`reads_classes`]).
+    fn reads_classes(&self) -> bool {
+        reads_classes(self.documents, self.model, self.equality)
+    }
+
+    /// How many of `touched` [`Self::probed`] keeps.
+    fn probed_len(&self, touched: &[u64]) -> usize {
+        self.probed(touched).iter().map(|part| part.len()).sum()
+    }
+
+    pub(crate) fn to_owned(self) -> CorpusKind {
         (
             self.documents,
             self.model,
@@ -170,8 +200,8 @@ pub struct TextCorpusStats {
     pub bytes: u64,
     /// The budget's limit.
     pub budget: u64,
-    /// Lineage steps recorded since the engine started (commits, pending states and views
-    /// made while a corpus was kept).
+    /// Lineage steps recorded since the engine started (publications made while a corpus
+    /// was kept).
     pub steps: u64,
     /// Corpora built by a walk, and derived from an ancestor's, since the engine started.
     pub walked: u64,
@@ -223,14 +253,28 @@ fn key_bytes(kind: KindRef<'_>) -> usize {
     std::mem::size_of::<Kept>() + graphs
 }
 
+/// Whether a corpus of `documents` in `model`, read with `equality`, may expand equality
+/// classes of IRIs (as `Snapshot::corpus_classes` does where a class of two or more
+/// exists): then a statement about a blank node or literal of a class changes the
+/// membership of the class's IRIs (sol-loop r1 R1-S1).
+fn reads_classes(documents: Documents, model: ReadModel, equality: Option<TermId>) -> bool {
+    documents == Documents::Subjects && model != ReadModel::Asserted && equality.is_some()
+}
+
 /// One step of the lineage: the content it was made from, the terms it touched (string
-/// and typed literals as objects, IRIs as subjects; raw ids, sorted) and the predicates of
-/// the statements it added or removed (raw ids, sorted), each on the store's budget. Its
-/// slots in the map and the order are charged with their storage ([`State::slots`]).
+/// and typed literals as objects, IRIs as subjects, and every other subject where
+/// `subjects`; raw ids, sorted) and the predicates of the statements it added or removed
+/// (raw ids, sorted), each on the store's budget. Its slots in the map and the order are
+/// charged with their storage ([`State::slots`]).
 struct Step {
     parent: Content,
     touched: Vec<u64>,
     predicates: Vec<u64>,
+    /// Whether `touched` holds every subject, not only the IRIs: recorded while a corpus
+    /// that reads equality classes is kept, and needed by one to derive across this step
+    /// (sol-loop r2 P1, `dictlc-p32-count4`: holding them always cost a commit of blank-node
+    /// statements 5 % more).
+    subjects: bool,
     _charges: [Reservation; 2],
 }
 
@@ -286,18 +330,29 @@ pub(crate) enum Found {
     },
 }
 
-/// The terms of a statement a corpus may hold: its object if a string literal or a typed
-/// one (a vector, for the corpora of vector searches), its subject if an IRI (raw ids).
+/// A raw id's kind tag, and a blank node's.
+fn tag(raw: u64) -> u64 {
+    raw >> crate::term::PAYLOAD_BITS
+}
+const BLANK: u64 = TermKind::BlankNode as u64;
+
+/// The terms of a statement whose membership it may change (raw ids): its object if a
+/// string literal or a typed one (a vector, for the corpora of vector searches), and its
+/// subject if an IRI, or of any kind with `subjects`. A blank node's or literal's class can
+/// hold IRIs, which a reader of equality classes shows as subjects of the statement: the
+/// derivation expands each term to its class and keeps the identities the corpus's
+/// documents hold (sol-loop r1 R1-S1). No other corpus holds them.
 fn terms(
     subject: TermId,
     object: TermId,
+    subjects: bool,
 ) -> std::iter::Chain<std::option::IntoIter<u64>, std::option::IntoIter<u64>> {
     let object = matches!(
         object.kind(),
         TermKind::String | TermKind::LangString | TermKind::TypedLiteral
     )
     .then_some(object.raw());
-    let subject = (subject.kind() == TermKind::Iri).then_some(subject.raw());
+    let subject = (subjects || subject.kind() == TermKind::Iri).then_some(subject.raw());
     object.into_iter().chain(subject)
 }
 
@@ -323,6 +378,20 @@ fn sort_dedup(items: &mut ChargedVec<u64>) {
         }
     }
     items.truncate(len);
+}
+
+/// The runs `base` holds, where they are the first runs of `version` in both stacks (the
+/// same `Arc`s, in the same layout); `None` otherwise. Both versions hold the runs while
+/// they are compared, so no address is reused meanwhile.
+fn run_prefix(base: &Version, version: &Version) -> Option<usize> {
+    Stack::ALL.into_iter().try_fold(0, |held, stack| {
+        let (base, version) = (base.stack(stack), version.stack(stack));
+        let (had, has) = (base.runs(), version.runs());
+        let prefix = base.layout() == version.layout()
+            && had.len() <= has.len()
+            && had.iter().zip(has).all(|(a, b)| Arc::ptr_eq(a, b));
+        prefix.then_some(held + had.len())
+    })
 }
 
 /// The steps from `from` up its lineage, nearest first, while `steps` holds them.
@@ -392,11 +461,13 @@ impl CorpusStore {
             return;
         }
         let n = statements.clone().count();
-        let terms = statements
-            .clone()
-            .flat_map(|(subject, _, object)| terms(subject, object));
-        let predicates = statements.map(|(_, predicate, _)| predicate.raw());
-        self.record_terms(parent, child, 2 * n, terms, n, predicates);
+        let touched = |subjects: bool| {
+            statements
+                .clone()
+                .flat_map(move |(subject, _, object)| terms(subject, object, subjects))
+        };
+        let predicates = statements.clone().map(|(_, predicate, _)| predicate.raw());
+        self.record_terms(parent, child, 2 * n, touched, n, predicates);
     }
 
     /// A step's terms and predicates, sorted, on `budget`.
@@ -446,6 +517,7 @@ impl CorpusStore {
         parent: Content,
         child: Content,
         (touched, predicates): (ChargedVec<u64>, ChargedVec<u64>),
+        subjects: bool,
     ) {
         let (touched, touched_charge) = touched.into_parts();
         let (predicates, predicates_charge) = predicates.into_parts();
@@ -455,6 +527,7 @@ impl CorpusStore {
                 parent,
                 touched,
                 predicates,
+                subjects,
                 _charges: [touched_charge, predicates_charge],
             },
         );
@@ -466,16 +539,19 @@ impl CorpusStore {
         Self::prune(state);
     }
 
-    /// Records that `child` was made from `parent` touching `terms` (at most `bound`) and
-    /// statements of `predicates` (at most `predicate_bound`), raw ids: charged to the
-    /// budget before they are allocated, the oldest steps let go for room; not recorded
-    /// where they don't fit (a search there walks).
-    fn record_terms(
+    /// Records that `child` was made from `parent` touching `terms(subjects)` (at most
+    /// `bound`) and statements of `predicates` (at most `predicate_bound`), raw ids: charged
+    /// to the budget before they are allocated, the oldest steps let go for room; not
+    /// recorded where they don't fit (a search there walks). `subjects`, whether every
+    /// subject is among the terms, holds where a kept corpus reads equality classes, read
+    /// under the state's lock with the step's insertion: a corpus kept later finds the step
+    /// without them, and walks past it ([`Self::find`]).
+    fn record_terms<T: IntoIterator<Item = u64>>(
         &self,
         parent: Content,
         child: Content,
         bound: usize,
-        terms: impl IntoIterator<Item = u64> + Clone,
+        terms: impl Fn(bool) -> T,
         predicate_bound: usize,
         predicates: impl IntoIterator<Item = u64> + Clone,
     ) {
@@ -491,6 +567,10 @@ impl CorpusStore {
             Self::forget_lineage(&mut state, &budget);
             return;
         }
+        let subjects = state
+            .kept
+            .iter()
+            .any(|k| reads_classes(k.kind.0, k.kind.1, k.kind.3));
         // A slot for it first; the oldest steps let go for room (they free slots).
         while !Self::room_for_step(&mut state, &budget) {
             if !Self::drop_oldest_step(&mut state) {
@@ -501,7 +581,7 @@ impl CorpusStore {
             let attempt = Self::charged_step(
                 &budget,
                 bound,
-                terms.clone(),
+                terms(subjects),
                 predicate_bound,
                 predicates.clone(),
             );
@@ -511,7 +591,7 @@ impl CorpusStore {
                 Err(_) => return,
             }
         };
-        self.insert_step(&mut state, parent, child, built);
+        self.insert_step(&mut state, parent, child, built, subjects);
     }
 
     /// Lets the lineage go, its storage freed before its charge is released; the next
@@ -577,16 +657,18 @@ impl CorpusStore {
         }
     }
 
-    /// The corpus `kind` of `version`: kept, or to build, with the nearest kept ancestor's
-    /// corpus and the terms touched since (collected on `request`, the searching request's
-    /// budget) where the lineage has one; none past a step that changed a `sameAs`
-    /// statement the reader expands.
+    /// The corpus `kind` of the admitted snapshot's version: kept, or to build, with the
+    /// nearest kept ancestor's corpus and the terms touched since (collected on `request`,
+    /// the searching request's budget) where the lineage has one; none past a step that
+    /// changed a `sameAs` statement the reader expands. Only a published snapshot (or a
+    /// restriction of one) is admitted (contract S3): it may claim an entry and evict.
     pub(crate) fn find(
         &self,
-        version: &Arc<Version>,
+        admitted: &CorpusAdmission<'_>,
         kind: KindRef<'_>,
         request: &Arc<Budget>,
     ) -> Result<Found, BudgetExceeded> {
+        let version = admitted.version();
         let content = version.content;
         let per_probe = self.tuning().documents_per_probe;
         let mut state = self.state.lock();
@@ -625,7 +707,12 @@ impl CorpusStore {
             if same_as.is_some_and(|same_as| step.predicates.binary_search(&same_as).is_ok()) {
                 break;
             }
-            terms += step.touched.len();
+            // A step recorded while no corpus read classes lacks the other subjects such
+            // a reader's members change by: walked.
+            if kind.reads_classes() && !step.subjects {
+                break;
+            }
+            terms += kind.probed_len(&step.touched);
             count += 1;
             let at = step.parent;
             if let Some(corpus) = state
@@ -645,7 +732,7 @@ impl CorpusStore {
             Some(base) if worth_deriving(terms, base.documents(), per_probe) => {
                 let all = up(&state.steps, content)
                     .take(count)
-                    .flat_map(|step| step.touched.iter().copied());
+                    .flat_map(|step| kind.probed(&step.touched).into_iter().flatten().copied());
                 let mut touched = ChargedVec::collect(Arc::clone(request), terms, all)?;
                 sort_dedup(&mut touched);
                 Some((base, touched))
@@ -688,12 +775,12 @@ impl CorpusStore {
     /// builds it on its own budget). The build runs without the store's lock.
     pub(crate) fn keep_built(
         &self,
-        version: &Arc<Version>,
+        admitted: &CorpusAdmission<'_>,
         kind: KindRef<'_>,
         bytes: usize,
         build: impl FnOnce(&Arc<Budget>) -> Result<Corpus, BudgetExceeded>,
     ) -> Option<Arc<Corpus>> {
-        let content = version.content;
+        let content = admitted.version().content;
         let budget = self.budget();
         let entry = |state: &State| {
             state
@@ -751,8 +838,8 @@ impl CorpusStore {
     /// Lets go of the entry [`Self::find`] made for the corpus `kind` of `version` while it
     /// has no corpus yet: its build failed (a budget refused it, a read stopped early), so no
     /// corpus will fill it, and a later search builds and keeps its own.
-    pub(crate) fn abandon(&self, version: &Arc<Version>, kind: KindRef<'_>) {
-        let content = version.content;
+    pub(crate) fn abandon(&self, admitted: &CorpusAdmission<'_>, kind: KindRef<'_>) {
+        let content = admitted.version().content;
         let mut state = self.state.lock();
         if let Some(at) = state
             .kept
@@ -763,6 +850,85 @@ impl CorpusStore {
             Self::retire(&mut state, kept);
         }
         Self::prune(&mut state);
+    }
+
+    /// What a snapshot without the shared-state capability (a writer's pending state, a
+    /// view that adds facts) derives its corpus `kind` from: a kept corpus of the same kind
+    /// whose version's runs are a prefix of `version`'s in both stacks (as `with_delta` and
+    /// `with_run` build a pending state: the base's runs and one more), the longest such,
+    /// and the terms of every run past the prefix (inserts and tombstones), collected on
+    /// `request`. `None`: walk. Reads the store only; nothing is claimed, moved, charged to
+    /// the store or evicted (contract S3). The caller's derivation probes each touched term
+    /// in its own snapshot, so the result is exact whatever the runs hold.
+    ///
+    /// A `private` version (a private transaction's, V3) has an equality cell of its own
+    /// whatever it changes, so it is not asked to share the base's: its classes are the
+    /// base's where its extra runs hold no `sameAs` statement, checked below in both stacks
+    /// (the classes read the default graph's `sameAs` statements of both; equality.rs), and
+    /// otherwise it walks. Every other version keeps the cell check (condition c: a
+    /// restricted or adding view has a fresh cell and a fresh content; DICT2 9 Nov 04:02).
+    pub(crate) fn derive_unadmitted(
+        &self,
+        version: &Arc<Version>,
+        kind: KindRef<'_>,
+        private: bool,
+        request: &Arc<Budget>,
+    ) -> Option<(Arc<Corpus>, ChargedVec<u64>)> {
+        let per_probe = self.tuning().documents_per_probe;
+        // The longest prefix among the kept corpora of this kind, under one equality cell:
+        // a pending state that changes `owl:sameAs` has a new one, and walks.
+        let (base, corpus) = {
+            let state = self.state.lock();
+            let mut best: Option<(usize, Arc<Version>, Arc<Corpus>)> = None;
+            for kept in state.kept.iter().filter(|k| kind.matches(&k.kind)) {
+                let Some((corpus, _)) = &kept.corpus else {
+                    continue;
+                };
+                let Some(base) = kept.version.upgrade() else {
+                    continue;
+                };
+                if !private && !Arc::ptr_eq(&base.equality, &version.equality) {
+                    continue;
+                }
+                let Some(prefix) = run_prefix(&base, version) else {
+                    continue;
+                };
+                if best.as_ref().is_none_or(|(longest, ..)| prefix > *longest) {
+                    best = Some((prefix, base, Arc::clone(corpus)));
+                }
+            }
+            let (_, base, corpus) = best?;
+            (base, corpus)
+        };
+        let same_as = kind.equality.map(TermId::raw);
+        let extra: Vec<&Arc<crate::index::run::Run>> = Stack::ALL
+            .into_iter()
+            .flat_map(|stack| {
+                let had = base.stack(stack).runs().len();
+                &version.stack(stack).runs()[had..]
+            })
+            .collect();
+        // A step that changes a `sameAs` statement the reader expands changes its classes:
+        // walked, as a lineage step there would be.
+        if same_as.is_some_and(|same_as| {
+            extra
+                .iter()
+                .any(|run| run.statements().any(|[_, p, _, _]| p == same_as))
+        }) {
+            return None;
+        }
+        let bound: usize = extra.iter().map(|run| 2 * run.entries() as usize).sum();
+        // Every subject only for a reader of classes: no other corpus holds a blank node.
+        let subjects = kind.reads_classes();
+        let all = extra.iter().flat_map(|run| {
+            run.statements()
+                .flat_map(|[s, _, o, _]| terms(TermId::from_raw(s), TermId::from_raw(o), subjects))
+        });
+        // Where the request has no room for the touched terms, the walk is the way left (it
+        // charges what it needs itself).
+        let mut touched = ChargedVec::collect(Arc::clone(request), bound, all).ok()?;
+        sort_dedup(&mut touched);
+        worth_deriving(touched.len(), corpus.documents(), per_probe).then_some((corpus, touched))
     }
 
     /// Counts a corpus built, by a walk or derived.
@@ -826,11 +992,12 @@ mod tests {
         let scope = TextScope::EVERY;
         let request = Arc::new(Budget::unlimited());
         let fresh = Arc::new(Budget::new(1 << 20));
-        let made = store.find(&version, kind(&scope), &request);
+        let admitted = CorpusAdmission::for_tests(&version);
+        let made = store.find(&admitted, kind(&scope), &request);
         assert!(matches!(made, Ok(Found::Build { keep: true, .. })));
-        let served = store.keep_built(&version, kind(&scope), 64, |old| {
+        let served = store.keep_built(&admitted, kind(&scope), 64, |old| {
             store.set_budget(Arc::clone(&fresh));
-            let again = store.find(&version, kind(&scope), &request);
+            let again = store.find(&admitted, kind(&scope), &request);
             assert!(matches!(again, Ok(Found::Build { keep: true, .. })));
             corpus(old)
         });
@@ -854,8 +1021,11 @@ mod tests {
         let scope = TextScope::EVERY;
         let request = Arc::new(Budget::unlimited());
         let first = Arc::new(Version::empty());
-        store.find(&first, kind(&scope), &request).unwrap();
-        store.keep_built(&first, kind(&scope), 64, corpus).unwrap();
+        let admitted = CorpusAdmission::for_tests(&first);
+        store.find(&admitted, kind(&scope), &request).unwrap();
+        store
+            .keep_built(&admitted, kind(&scope), 64, corpus)
+            .unwrap();
         let iri = TermId::new(TermKind::Iri, 1);
         let mut parent = first.content;
         for _ in 0..1000 {
@@ -868,8 +1038,11 @@ mod tests {
             content: parent,
             ..Version::empty()
         });
-        store.find(&last, kind(&scope), &request).unwrap();
-        store.keep_built(&last, kind(&scope), 64, corpus).unwrap();
+        let admitted = CorpusAdmission::for_tests(&last);
+        store.find(&admitted, kind(&scope), &request).unwrap();
+        store
+            .keep_built(&admitted, kind(&scope), 64, corpus)
+            .unwrap();
         let state = store.state.lock();
         assert!(state.steps.is_empty(), "{} steps left", state.steps.len());
         let held = state.steps.capacity() * std::mem::size_of::<(Content, Step)>()

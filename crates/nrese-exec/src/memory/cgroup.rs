@@ -37,7 +37,12 @@ pub(super) struct Unknown;
 /// Above this a limit means "none".
 const NONE_ABOVE: u64 = 1 << 62;
 
-/// Linux's EOPNOTSUPP, which `cgroup.procs` answers in a threaded v2 group.
+/// The errno `cgroup.procs` answers in a threaded v2 group (EOPNOTSUPP), as the target numbers it:
+/// 95 on most Linux ABIs, 122 on MIPS (a hard-coded 95 read such a group as unknown there).
+#[cfg(unix)]
+const EOPNOTSUPP: i32 = libc::EOPNOTSUPP;
+/// Without libc only the tests' declared kernel answers it.
+#[cfg(not(unix))]
 const EOPNOTSUPP: i32 = 95;
 
 /// What the kernel answers about the files the process reaches: the one place paths are
@@ -660,4 +665,16 @@ pub(super) mod declared {
             Ok(text)
         }
     }
+}
+
+/// The number the reader takes for a threaded group's refusal is the one the C library names
+/// "Operation not supported" (glibc's strerror; cgroup-v2.rst: `cgroup.procs` in a threaded group
+/// fails with EOPNOTSUPP), whatever ABI the test is built for.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_threaded_groups_refusal_is_the_targets_eopnotsupp() {
+    assert_eq!(
+        io::Error::from_raw_os_error(EOPNOTSUPP).to_string(),
+        format!("Operation not supported (os error {EOPNOTSUPP})")
+    );
 }
