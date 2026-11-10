@@ -4,15 +4,23 @@
 //! Each input is a key range of one [`PermutationRun`]. The merge yields every distinct key
 //! once, together with the sum of its signs across the inputs (+1 insert, -1 tombstone).
 //! Because of the exact-delta invariant (see [`run`](super::run)), the sum over any
-//! contiguous range of runs is -1, 0 or +1, and summation is order-independent, so cursors
-//! can be kept in any order and dropped with `swap_remove`.
+//! contiguous range of runs is -1, 0 or +1, and summation is order-independent, so a key's
+//! occurrences can be taken in any order.
 //!
-//! Cost: O(k) per distinct key for k inputs. The engine keeps k at O(log_F n) runs via
-//! compaction; a loser tree only pays off for larger k and is left to the Pf work packages.
+//! One step ([`SignedMerge::step`]) serves the plain reads and the counted ones: its work is
+//! counted on an [`Account`] a portion at a time, each portion before it is done (REAS-3a fix
+//! check r1 F1). Over at most [`LINEAR_UP_TO`] inputs a step compares all their keys for the
+//! least, O(k) for k inputs. Over more, their heads are kept in a binary heap with the least
+//! key on top, so each occurrence a step takes costs O(log k) comparisons. A last live input
+//! is read without comparing.
+
+use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 use super::keys::BLOCK;
 use super::run::PermutationRun;
 use crate::quad::Key;
+use crate::visit::{Account, Free, Stopped};
 
 struct Cursor<'a> {
     run: &'a PermutationRun,
@@ -26,28 +34,97 @@ struct Cursor<'a> {
     buffered: usize,
 }
 
-/// The most a merge over `runs` runs holds at once: its list of cursors and each cursor's
-/// buffer of decoded keys, both grown by doubling, so at most an old and a new block of
-/// each at once (a buffer's first block is one key short of [`super::keys::BLOCK`], the
-/// next grows it to twice that).
+/// A live cursor's key and its index in the merge's list, ordered so that the heap's top
+/// holds the least key. Each comparison is counted where it is made, in a build with the
+/// work counters.
+#[derive(PartialEq, Eq)]
+struct Head {
+    key: Key,
+    cursor: usize,
+}
+
+impl Ord for Head {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        worked(1);
+        other
+            .key
+            .cmp(&self.key)
+            .then(other.cursor.cmp(&self.cursor))
+    }
+}
+
+impl PartialOrd for Head {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The most a merge over `runs` runs holds at once. That is its list of cursors and its
+/// heap of their heads, each grown by doubling from a capacity of 4, so at most an old and
+/// a new array of each at once. Each cursor's buffer of decoded keys counts too: a buffer's
+/// first block is at most [`BLOCK`] keys, and the next grows it to twice that. Over at most
+/// [`LINEAR_UP_TO`] inputs the heap holds nothing.
 pub(crate) fn scan_bytes(runs: usize) -> usize {
-    let cursors = runs.next_power_of_two().max(4);
-    let buffer = 3 * super::keys::BLOCK * std::mem::size_of::<Key>();
-    3 * cursors * std::mem::size_of::<Cursor<'_>>() + runs * buffer
+    let capacity = runs.next_power_of_two().max(4);
+    let buffer = 3 * BLOCK * std::mem::size_of::<Key>();
+    3 * capacity * (std::mem::size_of::<Cursor<'_>>() + std::mem::size_of::<Head>()) + runs * buffer
 }
 
 /// A range at least this long left in the current block is decoded block-wise.
 const BUFFER_FROM: usize = 16;
 
+/// The most inputs a merge selects among by comparing all their keys; over more, it keeps a
+/// heap. Measured on the merge alone, 2 to 40 inputs, long merges and short ones of 4 entries
+/// an input (instructions:u, `p2-reas3-sweep1` and `sweep2`): from 4 inputs on, the heap does
+/// less on distinct keys and on one long input among short ones; up to 3 the linear selection
+/// does about as much or less. On keys every input holds, it does less at every count (at 4
+/// inputs, 174 instructions an entry against the heap's 259).
+pub(super) const LINEAR_UP_TO: usize = 3;
+
+/// What building the heap compares at most: a push of each of `LINEAR_UP_TO + 1` heads.
+const HEAP_BUILD: u64 = (LINEAR_UP_TO as u64 + 1) * levels(LINEAR_UP_TO);
+
+// A linear step's selection, and the heap's build with its input, are each one portion.
+const _: () = assert!(2 * (LINEAR_UP_TO as u64) <= crate::visit::PORTION);
+const _: () = assert!(HEAP_BUILD < crate::visit::PORTION);
+
+/// `n` units of a merge's work, counted where they are done in a build with the work
+/// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
+#[inline(always)]
+fn worked(n: usize) {
+    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+    crate::witness::add(crate::witness::Site::MergeWork, n as u64);
+    let _ = n;
+}
+
+/// The levels of a binary heap of `len` entries: what a push onto it compares at most. A
+/// pop or a change of its top compares at most twice that.
+#[inline]
+const fn levels(len: usize) -> u64 {
+    (usize::BITS - len.leading_zeros()) as u64
+}
+
 impl Cursor<'_> {
+    /// The units [`Self::advance`] does, and what a step does with the key it was at. Moving
+    /// and reading the sign is 1, and handing the key on is 1. Then 1 more for reading the
+    /// next key, or the keys of its block it decodes (at most [`BLOCK`]).
     #[inline]
-    fn key(&self) -> &Key {
-        &self.key
+    fn advance_cost(&self) -> u64 {
+        let next = self.pos + 1;
+        if next == self.end || next - self.buffered < self.buffer.len() {
+            return 2;
+        }
+        let block_end = self.end.min((next / BLOCK + 1) * BLOCK);
+        match block_end - next {
+            decoded if decoded >= BUFFER_FROM => 2 + decoded as u64,
+            _ => 3,
+        }
     }
 
     /// Moves to the next entry; false at the end.
     #[inline]
     fn advance(&mut self) -> bool {
+        worked(1);
         self.pos += 1;
         if self.pos == self.end {
             return false;
@@ -59,6 +136,7 @@ impl Cursor<'_> {
         }
         let block_end = self.end.min((self.pos / BLOCK + 1) * BLOCK);
         if block_end - self.pos >= BUFFER_FROM {
+            worked(block_end - self.pos);
             self.buffer.clear();
             self.run
                 .keys
@@ -66,6 +144,7 @@ impl Cursor<'_> {
             self.buffered = self.pos;
             self.key = self.buffer[0];
         } else {
+            worked(1);
             self.key = self.run.keys.get(self.pos);
         }
         true
@@ -82,7 +161,22 @@ impl Cursor<'_> {
 }
 
 pub(crate) struct SignedMerge<'a> {
+    /// The live cursors, an exhausted one removed, until the merge has a heap. Then every
+    /// cursor made, each at a fixed index; an exhausted one is in neither `heads` nor
+    /// `single`, and its buffer is freed.
     cursors: Vec<Cursor<'a>>,
+    /// Whether the merge has a heap: from its input after the [`LINEAR_UP_TO`]th on.
+    heaped: bool,
+    /// The live cursors' heads while two or more are live; empty otherwise or without a heap.
+    heads: BinaryHeap<Head>,
+    /// The live cursor while just one is, after a heap: read without comparing.
+    single: Option<usize>,
+    /// The entries the live cursors have left: summed as they are made, less one for each
+    /// occurrence a step takes, so [`Self::remaining`] reads no cursor (REAS-3a review r1 R2).
+    left: usize,
+    /// A step its account stopped. Every later step answers [`Stopped`] and does nothing,
+    /// whatever its account, until a refill makes this merge a new one (design attack D6).
+    stopped: bool,
 }
 
 impl<'a> SignedMerge<'a> {
@@ -90,36 +184,212 @@ impl<'a> SignedMerge<'a> {
     pub(crate) fn new(parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>) -> Self {
         let mut merge = Self {
             cursors: Vec::new(),
+            heaped: false,
+            heads: BinaryHeap::new(),
+            single: None,
+            left: 0,
+            stopped: false,
         };
         merge.refill(parts);
         merge
     }
 
-    /// The merge of `parts` in place of what this one had left, its cursors' memory reused
-    /// (a probe cursor's per-probe merge: [`super::cursor`]).
+    /// The merge of `parts` in place of what this one had left, its cursors' and heads'
+    /// memory reused (a probe cursor's per-probe merge: [`super::cursor`]).
     pub(crate) fn refill(
         &mut self,
         parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>,
     ) {
         self.cursors.clear();
-        self.cursors.extend(
-            parts
-                .into_iter()
-                .filter(|&(_, start, end)| start < end)
-                .map(|(run, pos, end)| Cursor {
-                    run,
-                    pos,
-                    end,
-                    key: run.keys.get(pos),
-                    buffer: Vec::new(),
-                    buffered: pos + 1,
-                }),
-        );
+        self.heads.clear();
+        (self.heaped, self.single, self.left, self.stopped) = (false, None, 0, false);
+        for part in parts {
+            let added = self.add(part, &mut Free);
+            debug_assert!(added, "nothing is counted");
+        }
     }
 
-    /// Upper bound on the remaining entries.
+    /// Adds the range `start..end` of `run`; an empty one adds nothing. Its first key's read,
+    /// and the push of its head onto the others', are counted on `account` before they are
+    /// done. False once the account has stopped, and then the merge is stopped too.
+    pub(crate) fn add(
+        &mut self,
+        (run, pos, end): (&'a PermutationRun, usize, usize),
+        account: &mut impl Account,
+    ) -> bool {
+        if pos >= end {
+            return true;
+        }
+        debug_assert!(
+            self.single.is_none(),
+            "a merge's inputs come before its steps"
+        );
+        let cursor = self.cursors.len();
+        let push = if self.heaped {
+            levels(self.heads.len())
+        } else if cursor == LINEAR_UP_TO {
+            HEAP_BUILD
+        } else {
+            0
+        };
+        if self.stopped || !account.take(1 + push) {
+            self.stopped = true;
+            return false;
+        }
+        worked(1);
+        let key = run.keys.get(pos);
+        self.cursors.push(Cursor {
+            run,
+            pos,
+            end,
+            key,
+            buffer: Vec::new(),
+            buffered: pos + 1,
+        });
+        self.left += end - pos;
+        if self.heaped {
+            self.heads.push(Head { key, cursor });
+        } else if cursor == LINEAR_UP_TO {
+            for (cursor, input) in self.cursors.iter().enumerate() {
+                self.heads.push(Head {
+                    key: input.key,
+                    cursor,
+                });
+            }
+            self.heaped = true;
+        }
+        true
+    }
+
+    /// The entries left: an upper bound on the keys still to come. O(1).
     pub(crate) fn remaining(&self) -> usize {
-        self.cursors.iter().map(|c| c.end - c.pos).sum()
+        self.left
+    }
+
+    /// The next distinct key and the sum of its signs, or `None` at the end. Its work is
+    /// counted on `account` a portion at a time, each before it is done, and each done before
+    /// the next is taken, so no work counted before a yes is done after it (fix check r3 H1).
+    /// For each occurrence a heap step takes, a portion is the cursor's advance with what it
+    /// reads ([`Cursor::advance_cost`]) together with the heap's repair and the test of whether
+    /// the next head holds the same key. The end is counted too. [`Stopped`] once the account
+    /// has stopped, and the partial sum is dropped. After that every step answers [`Stopped`]
+    /// and does nothing.
+    #[inline]
+    pub(crate) fn step(
+        &mut self,
+        account: &mut impl Account,
+    ) -> Result<Option<(Key, i64)>, Stopped> {
+        if self.stopped {
+            return Err(Stopped);
+        }
+        if !self.heaped {
+            return self.select(account);
+        }
+        if self.heads.len() == 1 {
+            // The last other head went in the step before. Popping a heap's last head
+            // compares nothing.
+            self.single = self.heads.pop().map(|head| head.cursor);
+        }
+        if let Some(i) = self.single {
+            let key = self.cursors[i].key;
+            let (sign, live) = self.take_from(i, 0, account)?;
+            if !live {
+                self.single = None;
+            }
+            return Ok(Some((key, sign)));
+        }
+        let Some(key) = self.heads.peek().map(|head| head.key) else {
+            // Counted too, so a stopped account's read answers Stopped, not the end.
+            return match account.take(1) {
+                true => Ok(None),
+                false => self.stop(),
+            };
+        };
+        let mut sign = 0;
+        while let Some(i) = self.heads.peek().map(|head| head.cursor) {
+            let repair = 2 * levels(self.heads.len()) + 1;
+            let (taken, live) = self.take_from(i, repair, account)?;
+            sign += taken;
+            // The top's change, or its pop, repairs the heap as it ends.
+            if live {
+                let next = self.cursors[i].key;
+                self.heads.peek_mut().expect("peeked").key = next;
+            } else {
+                let _ = PeekMut::pop(self.heads.peek_mut().expect("peeked"));
+            }
+            worked(1);
+            if self.heads.peek().is_none_or(|head| head.key != key) {
+                break;
+            }
+        }
+        Ok(Some((key, sign)))
+    }
+
+    /// [`Self::step`] without a heap, over at most [`LINEAR_UP_TO`] live inputs: the least of
+    /// their keys, then each input at it taken, an exhausted one removed. Comparing and testing
+    /// each input is one portion, done before each advance is counted.
+    #[inline]
+    fn select(&mut self, account: &mut impl Account) -> Result<Option<(Key, i64)>, Stopped> {
+        let n = self.cursors.len();
+        if n == 1 {
+            let key = self.cursors[0].key;
+            let (sign, live) = self.take_from(0, 0, account)?;
+            if !live {
+                self.cursors.clear();
+            }
+            return Ok(Some((key, sign)));
+        }
+        // The end is counted too.
+        if !account.take((2 * n).max(1) as u64) {
+            return self.stop();
+        }
+        worked(2 * n);
+        let Some(&key) = self.cursors.iter().map(|cursor| &cursor.key).min() else {
+            return Ok(None);
+        };
+        let mut at = [false; LINEAR_UP_TO];
+        for (i, cursor) in self.cursors.iter().enumerate() {
+            at[i] = cursor.key == key;
+        }
+        let mut sign = 0;
+        // From the last, so a removed cursor's place is taken by one already handled.
+        for i in (0..n).rev().filter(|&i| at[i]) {
+            let (taken, live) = self.take_from(i, 0, account)?;
+            sign += taken;
+            if !live {
+                self.cursors.swap_remove(i);
+            }
+        }
+        Ok(Some((key, sign)))
+    }
+
+    /// Cursor `i`'s sign, its advance counted first as one portion with `more` units done
+    /// with it (a heap's repair), then whether it has another key. An exhausted cursor's
+    /// buffer is freed. [`Stopped`] where the account refuses. Always inlined: as a call it
+    /// cost a plain load 0.56 % of its instructions (`p2-reas3-abl6`).
+    #[inline(always)]
+    fn take_from(
+        &mut self,
+        i: usize,
+        more: u64,
+        account: &mut impl Account,
+    ) -> Result<(i64, bool), Stopped> {
+        let cursor = &mut self.cursors[i];
+        if !account.take_cost(|| cursor.advance_cost() + more) {
+            return self.stop();
+        }
+        let sign = cursor.sign();
+        self.left -= 1;
+        let live = cursor.advance();
+        if !live {
+            cursor.buffer = Vec::new();
+        }
+        Ok((sign, live))
+    }
+
+    fn stop<T>(&mut self) -> Result<T, Stopped> {
+        self.stopped = true;
+        Err(Stopped)
     }
 }
 
@@ -127,31 +397,12 @@ impl Iterator for SignedMerge<'_> {
     /// A distinct key and the sum of its signs.
     type Item = (Key, i64);
 
+    /// [`SignedMerge::step`], counting nothing. A merge that a counted read stopped reads as
+    /// ended here: the plain reads never stop one, and the counted reader keeps getting
+    /// [`Stopped`] from its own steps (design attack r2, E3).
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if let [cursor] = self.cursors.as_mut_slice() {
-            // Single input: no comparisons needed.
-            let item = (*cursor.key(), cursor.sign());
-            if !cursor.advance() {
-                self.cursors.clear();
-            }
-            return Some(item);
-        }
-        let key = *self.cursors.iter().map(Cursor::key).min()?;
-        let mut sign = 0;
-        let mut i = 0;
-        while i < self.cursors.len() {
-            let cursor = &mut self.cursors[i];
-            if *cursor.key() == key {
-                sign += cursor.sign();
-                if !cursor.advance() {
-                    self.cursors.swap_remove(i);
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        Some((key, sign))
+        self.step(&mut Free).unwrap_or(None)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

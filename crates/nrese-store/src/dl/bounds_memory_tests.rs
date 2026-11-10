@@ -358,6 +358,44 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
 
+/// REAS-3 (C17; master, 9 Nov 02:34). Spec (`GaveUp`'s docs and SYN-61: what memory refused is
+/// never kept, the next read builds it again): a U1 the process's memory stopped is not kept for
+/// its revision, on a read's build and on a commit's. Kept, every later reader of the revision
+/// is answered by the lower bound alone (dl/query/mod.rs: the view's `unavailable`) until the
+/// next commit, though memory may be free again.
+#[test]
+fn an_upper_bound_the_process_memory_stopped_is_not_kept() {
+    if !nrese_exec::memory::READS_MEMORY {
+        return;
+    }
+    let kept = |store: &StoreService| {
+        lock(&store.dl().bounds.state)
+            .as_ref()
+            .is_some_and(|s| s.upper.as_ref().is_err_and(|g| !g.refused))
+    };
+    let store = store(1);
+    assert!(
+        report(&store).unavailable.is_some(),
+        "the process's memory stops U1"
+    );
+    assert!(
+        !kept(&store),
+        "a read keeps no U1 the process's memory stopped"
+    );
+    let store = self::store(1);
+    let tx = store.engine().transaction();
+    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+    assert!(
+        matches!(&prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()),
+        "the commit's U1 is stopped too"
+    );
+    install(&store, prepared, tx.base().revision() + 1);
+    assert!(
+        !kept(&store),
+        "a commit installs no U1 the process's memory stopped"
+    );
+}
+
 #[test]
 fn embedded_zero_memory_policy_leaves_bounds_enabled() {
     let store = store(0);

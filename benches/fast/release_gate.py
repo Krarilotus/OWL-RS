@@ -839,11 +839,13 @@ def fmt(x) -> str:
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          catalog: list[dict] | None = None, elsewhere: dict | None = None,
-         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None) -> dict:
+         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
+         baseline_candidate: bool = False) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
-    at the candidate's commit. `floor`: the host's A-A' noise floor (read_floor())."""
+    at the candidate's commit. `floor`: the host's A-A' noise floor (read_floor()).
+    `baseline_candidate`: an A-A' control's candidate is a baseline, with its own optimizer route."""
     not_run, elsewhere = dict(not_run or {}), dict(elsewhere or {})
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
@@ -890,17 +892,18 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
               for c in (catalog or [])}
     for case in planned:
         cand = evidence(by_side[candidate], case)
-        if state(cand) == "failed":
+        cand_state = state(cand, off_route_ok=baseline_candidate)
+        if cand_state == "failed":
             why = cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
             summary["candidate_failures"][case] = f"statuses {', '.join(map(str, cand['status']))}; " + "; ".join(why)
-        elif state(cand) == "known":
+        elif cand_state == "known":
             summary["known_issues"][case] = ", ".join(sorted(set(cand["status"])))
         elif any(x != "ok" for x in cand["expected"]):
             summary["fixed"][case] = ", ".join(sorted(set(cand["expected"]) - {"ok"}))
-        if cand["unchecked"] and state(cand) != "failed":
+        if cand["unchecked"] and cand_state != "failed":
             summary["candidate_failures"][case] = f"{cand['unchecked']} checks unchecked on the candidate"
         for side in baselines:
-            if state(cand) == "failed" or side in aliases:
+            if cand_state == "failed" or side in aliases:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
                                ((floor or {}).get("cases") or {}).get(case))
@@ -1856,16 +1859,22 @@ def measurement_ref(repo: str, ref: str, commit: str, remote: str | None,
     return rev
 
 
-def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
-    """The measurement commits of these sides as a job's git inputs: a job's checkout holds only
-    its own revision's history, and release-gate.sh build needs them in it."""
+def measurement_inputs(checkout: str, rev: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
+    """The measurement commits of these sides that a job's checkout of `rev` doesn't reach, as its
+    git inputs: the checkout holds only `rev`'s history, and release-gate.sh build needs them in it.
+    One that `rev` reaches is staged with it already (and the fleet takes one git input, F150)."""
     import subprocess
     sides = measurement_sides() if sides is None else sides
     inputs = []
-    for rev in dict.fromkeys(revs):
-        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{rev}^{{commit}}"],
+    for side in dict.fromkeys(revs):
+        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{side}^{{commit}}"],
                               capture_output=True, text=True, timeout=60).stdout.strip()
-        if full in sides:
+        if full not in sides:
+            continue
+        # As stored: a replace ref or graft here would reach it only in this repository.
+        reached = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", sides[full], rev],
+                                 capture_output=True, text=True, timeout=60, env={**os.environ, **STORED_OBJECTS})
+        if reached.returncode != 0:  # not reached, or not known here: kept, for the build to find or report
             inputs.append({"name": f"measure-{full[:8]}", "source": {"git": checkout, "rev": sides[full]}})
     return inputs
 
@@ -1893,7 +1902,7 @@ def side_inputs(checkout: str, rev: str, revs: list[str]) -> list[dict]:
     commits (measurement_inputs()), and each side that `rev`'s history doesn't hold, so that its
     build finds it (Sol r1 S4, 2 Nov 2026: a base off the change's history was built unstaged)."""
     import subprocess
-    inputs = measurement_inputs(checkout, revs)
+    inputs = measurement_inputs(checkout, rev, revs)
     for side in dict.fromkeys(revs):
         held = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", side, rev],
                               capture_output=True, text=True, timeout=60)

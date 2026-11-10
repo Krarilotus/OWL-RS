@@ -92,7 +92,7 @@ fn run(input: &str) -> String {
         "statements-nquads" | "statements-trig" => {
             let add = StatementOp::Add {
                 data: RdfPayload {
-                    payload: document.as_bytes().to_vec(),
+                    payload: document.as_bytes().to_vec().into(),
                     format,
                     base_iri: None,
                 },
@@ -168,7 +168,9 @@ fn with_context(op: &str, writes: &str) -> String {
         ))]
     };
     let triple = |s: &str| RdfPayload {
-        payload: format!("<http://example.com/{s}> <http://example.com/p> \"{s}\" .").into_bytes(),
+        payload: format!("<http://example.com/{s}> <http://example.com/p> \"{s}\" .")
+            .into_bytes()
+            .into(),
         format: GraphResultFormat::NTriples,
         base_iri: None,
     };
@@ -257,7 +259,9 @@ fn graph_target(target: &str) -> String {
         target: target.clone(),
         format: GraphResultFormat::NTriples,
         base_iri: None,
-        payload: b"<http://example.com/w> <http://example.com/p> \"w\" .".to_vec(),
+        payload: b"<http://example.com/w> <http://example.com/p> \"w\" ."
+            .to_vec()
+            .into(),
         replace: false,
     });
     let created = match service.apply(&write, &Requester::all()).unwrap() {

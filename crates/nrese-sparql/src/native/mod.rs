@@ -49,6 +49,8 @@ pub(crate) use pushdown::per_solution;
 mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod optimise_tests;
 pub(crate) mod ql;
 mod ranges;
 mod search;
@@ -664,11 +666,18 @@ fn native_pattern<'q>(
 ///   before the join ([`crate::plan::Plan::eager_aggregation`]).
 /// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
 ///   variables ([`pushdown`]).
+///
+/// A pass runs only where its input has a node it can change (each pass's `changes_at`,
+/// asked of the input as the passes before left it): elsewhere it would return its input,
+/// and building, lowering and comparing its plan was most of a microsecond query's
+/// preparation (entities COUNT: 1 µs on main, 3–4 µs with the passes, 10 Nov 2026). One
+/// search answers all three, again only after a pass changed the pattern.
 fn optimise(
-    pattern: GraphPattern,
+    mut pattern: GraphPattern,
     fired: &mut Vec<&'static str>,
     ctx: &Context<'_>,
 ) -> GraphPattern {
+    use nrese_sparql_syntax::visit::Node;
     let pays = |side: &crate::plan::Plan, keys: &[Variable]| ctx.pre_aggregation_pays(side, keys);
     let eager = |pattern: &GraphPattern| crate::plan::eager_aggregation_where(pattern, &pays);
     type Pass<'p> = &'p dyn Fn(&GraphPattern) -> GraphPattern;
@@ -679,13 +688,46 @@ fn optimise(
             pushdown::push_filters(pattern.clone())
         }),
     ];
-    passes.into_iter().fold(pattern, |pattern, (name, pass)| {
+    // Whether a pattern with this node in it is one the pass can change, in the passes' order.
+    let changes_at: [fn(&GraphPattern) -> bool; 3] = [
+        crate::plan::rewrite_changes_at,
+        crate::plan::eager_aggregation_changes_at,
+        pushdown::changes_at,
+    ];
+    let shapes = |pattern: &GraphPattern| {
+        let mut found = [false; 3];
+        pattern.find(&mut |node| {
+            if let Node::Pattern(p) = node {
+                for (found, changes_at) in found.iter_mut().zip(changes_at) {
+                    *found = *found || changes_at(p);
+                }
+            }
+            found.iter().all(|&found| found)
+        });
+        found
+    };
+    let mut found = shapes(&pattern);
+    for (i, (name, pass)) in passes.into_iter().enumerate() {
+        if !found[i] {
+            debug_assert!(pass(&pattern) == pattern, "{name} changes {pattern}");
+            continue;
+        }
+        #[cfg(test)]
+        PASSES_RUN.set(PASSES_RUN.get() + 1);
         let rewritten = pass(&pattern);
         if rewritten != pattern {
             fired.push(name);
+            pattern = rewritten;
+            found = shapes(&pattern);
         }
-        rewritten
-    })
+    }
+    pattern
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rewrite passes [`optimise`] ran on this thread.
+    static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.

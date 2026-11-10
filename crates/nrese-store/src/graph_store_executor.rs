@@ -7,7 +7,7 @@ use crate::error::StoreResult;
 use crate::graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphTarget, GraphWriteReport, GraphWriteRequest,
 };
-use crate::rdf_io::{BlankNodes, parse_graph, write_quads};
+use crate::rdf_io::{BlankNodes, each_graph_quad, write_quads};
 
 /// Whether the target graph exists in `view` under `model`: the default graph always, a
 /// named graph while it holds a statement. Nothing is decoded (Graph Store Protocol `HEAD`).
@@ -41,19 +41,15 @@ pub(crate) fn write_graph(
     Ok(true)
 }
 
-/// Adds (or, with `replace`, substitutes) the payload's triples in the target graph. The
-/// payload is parsed completely before the transaction is touched.
+/// Adds (or, with `replace`, substitutes) the payload's triples in the target graph, each as
+/// it is read: an invalid payload fails the write, whose transaction is then discarded (the
+/// mutation pipeline commits only a write that ends). The new terms it interned stay in the
+/// shared dictionary (stated limit L3 for v1.5, dictionary lifecycle contract).
 pub(crate) fn apply_graph_write(
     tx: &mut Transaction<'_>,
     request: &GraphWriteRequest,
 ) -> StoreResult<GraphWriteReport> {
-    let quads = parse_graph(
-        request.format,
-        request.base_iri.as_deref(),
-        request.payload.as_slice(),
-        request.target.graph_name()?,
-        BlankNodes::Fresh,
-    )?;
+    let graph = request.target.graph_name()?;
     let existing = request.target.pattern_in(&*tx)?;
     let created = match (request.target.resolved()?, existing) {
         (GraphTarget::DefaultGraph, _) => false,
@@ -69,14 +65,24 @@ pub(crate) fn apply_graph_write(
     {
         tx.remove_matching(&pattern)?;
     }
-    for quad in &quads {
-        tx.try_insert(quad.as_ref())?;
-    }
+    let mut any = false;
+    each_graph_quad(
+        request.format,
+        request.base_iri.as_deref(),
+        &request.payload,
+        graph,
+        BlankNodes::Fresh,
+        |quad| {
+            tx.try_insert(quad)?;
+            any = true;
+            Ok(())
+        },
+    )?;
     Ok(GraphWriteReport {
         target: request.target.clone(),
         // Net change: replacing a graph with identical content modifies nothing.
         modified: tx.pending() != before,
-        created: created && !quads.is_empty(),
+        created: created && any,
         revision: 0,
     })
 }

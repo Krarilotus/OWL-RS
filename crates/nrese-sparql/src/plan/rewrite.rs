@@ -22,6 +22,30 @@ pub fn eager_aggregation_where(
         .into_pattern()
 }
 
+/// Whether [`rewrite`] can change a pattern with this node in it. Only a join can (its
+/// joins merge and its scans gather into one basic graph pattern), or a union of fewer
+/// than two inputs (lowering unwraps it). Every other node lowers back as it was
+/// ([`Plan::into_pattern`]).
+pub fn rewrite_changes_at(node: &GraphPattern) -> bool {
+    match node {
+        GraphPattern::Join { .. } => true,
+        GraphPattern::Union { inputs } => inputs.len() < 2,
+        _ => false,
+    }
+}
+
+/// Whether [`eager_aggregation_where`] can change a pattern with this node in it: where
+/// [`rewrite_changes_at`] says so (it lowers the same way), or at a group with keys and
+/// aggregates over a basic graph pattern of two or more triples, the join
+/// [`Plan::eager_aggregation_where`] splits (a group over a join is already the former).
+pub fn eager_aggregation_changes_at(node: &GraphPattern) -> bool {
+    rewrite_changes_at(node)
+        || matches!(node, GraphPattern::Group { inner, variables, aggregates }
+            if !variables.is_empty()
+                && !aggregates.is_empty()
+                && matches!(&**inner, GraphPattern::Bgp { patterns } if patterns.len() > 1))
+}
+
 impl Plan {
     /// `self` with `f` applied to each input (the plan's direct children).
     fn map_inputs(self, f: &mut impl FnMut(Self) -> Self) -> Self {
