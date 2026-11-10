@@ -10,6 +10,7 @@ mod gap;
 mod gates;
 mod mode;
 mod queries;
+mod representatives;
 mod review;
 mod routing;
 mod safety;
