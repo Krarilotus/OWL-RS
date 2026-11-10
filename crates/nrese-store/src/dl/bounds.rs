@@ -462,6 +462,27 @@ pub(crate) fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
     }
 }
 
+/// Whether L (`lower`, sorted) holds `fact`, one of U1's facts over representatives, for
+/// every identity it stands for: the expanded reads give it each member of `classes`'
+/// classes. Only then is it certain and no gap; L holding it for the representative alone
+/// leaves the other members' facts to U1. Stops at the first member L lacks; a fact L holds
+/// whole costs one search per expanded fact, each of them in L.
+fn held_by_lower(
+    lower: &[Triple],
+    classes: &nrese_reasoner::representatives::EqualityClasses,
+    [s, p, o]: Triple,
+) -> bool {
+    let (ms, mp, mo) = (
+        classes.class_of(s).unwrap_or(std::slice::from_ref(&s)),
+        classes.class_of(p).unwrap_or(std::slice::from_ref(&p)),
+        classes.class_of(o).unwrap_or(std::slice::from_ref(&o)),
+    );
+    ms.iter().all(|&s| {
+        mp.iter()
+            .all(|&p| mo.iter().all(|&o| lower.binary_search(&[s, p, o]).is_ok()))
+    })
+}
+
 fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
     view.quads_for_pattern_in(
         ReadModel::Materialised,
@@ -1054,7 +1075,7 @@ fn parts(
     let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
     for [s, p, o] in upper.stack.iter() {
         // L's memberships from the taxonomy are certain: no gap.
-        if lower.binary_search(&[s, p, o]).is_ok() {
+        if held_by_lower(lower, classes, [s, p, o]) {
             continue;
         }
         for t in [s, p, o] {
