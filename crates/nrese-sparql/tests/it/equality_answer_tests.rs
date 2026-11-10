@@ -18,6 +18,76 @@ use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 
+#[test]
+fn asserted_optional_distinct_does_not_join_same_as_identities() {
+    // Spec: SPARQL 1.1 left join and COUNT(DISTINCT), on asserted statements only:
+    // a is a Person, b has d, and a sameAs b -> (a, 0), irrespective of optimisation.
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for quad in [
+        Quad::new(
+            ex("a"),
+            rdf_type.clone(),
+            ex("Person"),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(ex("b"), ex("doc"), ex("d"), GraphName::DefaultGraph),
+        Quad::new(ex("a"), same_as.clone(), ex("b"), GraphName::DefaultGraph),
+    ] {
+        tx.insert(quad.as_ref());
+    }
+    // Replicated materialisation, not compact equality: the asserted model still sees
+    // only the three statements above, while the materialised model is equality closed.
+    for quad in [
+        Quad::new(ex("b"), rdf_type, ex("Person"), GraphName::DefaultGraph),
+        Quad::new(ex("a"), ex("doc"), ex("d"), GraphName::DefaultGraph),
+        Quad::new(ex("b"), same_as.clone(), ex("a"), GraphName::DefaultGraph),
+        Quad::new(ex("a"), same_as.clone(), ex("a"), GraphName::DefaultGraph),
+        Quad::new(ex("b"), same_as, ex("b"), GraphName::DefaultGraph),
+    ] {
+        let subject = tx.intern(quad.subject.as_ref().into());
+        let predicate = tx.intern(quad.predicate.as_ref().into());
+        let object = tx.intern(quad.object.as_ref());
+        tx.insert_inferred(EncodedTriple::new(subject, predicate, object));
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query(
+            "PREFIX ex: <http://example.com/> SELECT ?p (COUNT(DISTINCT ?d) AS ?n)
+            WHERE { ?p a ex:Person OPTIONAL { ?p ex:doc ?d } } GROUP BY ?p",
+        )
+        .unwrap();
+    for as_written in [false, true] {
+        let options = QueryOptions {
+            read_model: nrese_engine::ReadModel::Asserted,
+            equality_closed: true,
+            as_written,
+            ..QueryOptions::default()
+        };
+        let QueryResults::Solutions(rows) = evaluate_query(&snapshot, &query, &options).unwrap()
+        else {
+            panic!("SELECT")
+        };
+        let rows: Vec<_> = rows
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get("p").cloned(), row.get("n").cloned())
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                Some(ex("a").into()),
+                Some(nrese_rdf::Literal::from(0).into())
+            )],
+            "as_written={as_written}"
+        );
+    }
+}
+
 fn ex(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EX}{local}"))
 }

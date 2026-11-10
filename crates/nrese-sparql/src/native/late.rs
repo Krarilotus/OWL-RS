@@ -113,6 +113,7 @@ impl super::Context<'_> {
             snapshot: std::borrow::Cow::Owned(self.snapshot.with_canonical_equality()),
             model: self.model,
             aliases: RefCell::new(self.aliases.borrow().clone()),
+            aliases_refused: Cell::new(self.aliases_refused.get()),
             evaluator: super::Evaluator::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),

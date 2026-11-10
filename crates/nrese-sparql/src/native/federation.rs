@@ -288,7 +288,16 @@ impl Context<'_> {
             self.check()?;
             // No made name goes out as it is (`internal`): renamed apart from the pattern's,
             // and read back from the answer.
-            let (pattern, sent) = nrese_sparql_syntax::internal::printable(pattern);
+            let (pattern, sent) = if self.aliases.borrow().is_empty() {
+                nrese_sparql_syntax::internal::printable(pattern)
+            } else {
+                nrese_sparql_syntax::internal::printable_with_values(pattern, |name| {
+                    self.aliases
+                        .borrow()
+                        .get(name)
+                        .and_then(|&id| self.term(id))
+                })
+            };
             // Under the query's BASE: an `IRI()` the endpoint evaluates resolves as here.
             let query = Query::Select {
                 dataset: None,

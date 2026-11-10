@@ -171,7 +171,11 @@ impl Context<'_> {
             )),
             form => form,
         };
-        Ok((rewrite.pattern(&pattern), form))
+        let pattern = rewrite.pattern(&pattern);
+        if let Some(refused) = self.aliases_refused.get() {
+            return Err(QueryEvaluationError::MemoryLimit(refused));
+        }
+        Ok((pattern, form))
     }
 }
 
