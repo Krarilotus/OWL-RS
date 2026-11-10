@@ -19,6 +19,10 @@ pub enum EngineError {
     UnsupportedTerm,
     #[error("the write-ahead log failed earlier; reopen the engine to recover")]
     WalPoisoned,
+    /// A commit's note ([`crate::Transaction::note_commit`]) refused it: nothing of the commit
+    /// was written, and the log takes the next one.
+    #[error("the commit's note refused it: {0}")]
+    CommitNoteRefused(std::io::Error),
     /// A bulk load or rematerialisation whose checkpoint may be on disk without its revision
     /// being served (its placement's outcome unknown, or it couldn't be mapped): the engine
     /// takes no more writes, and reopening it recovers whatever is on disk.

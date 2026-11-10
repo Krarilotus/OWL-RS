@@ -251,3 +251,52 @@ fn repeats_are_answered_from_their_written_bytes() {
         .unwrap();
     assert_ne!(answer(&store, &per_city()), first);
 }
+
+/// A session's reads over its pending operations (the lifecycle contract's S3; package 3.6's
+/// design note §4 item 1, its real caller): unpublished state is never admitted into the
+/// store's cache, however often the session reads its kept view (what it keeps, its own
+/// version keeps: §11).
+///
+/// - Input: the per-city query answered and cached; a session adding a person who knows `p0`;
+///   the query three times on the session's pending operations.
+/// - Expected: every pending read is the answer the store gives once the same update is
+///   committed, and the store's cache is as the published query left it (no entry, claim,
+///   miss or hit) until then.
+#[test]
+fn a_sessions_reads_over_its_pending_operations_keep_nothing() {
+    use nrese_store::{SparqlUpdateRequest, StatementOp};
+    let store = store(1 << 20, 4_000);
+    answer(&store, &per_city());
+    let before = (store.query_cache_stats(), store.pinned_queries());
+    let update = format!("INSERT DATA {{ <{EX}new> <{EX}knows> <{EX}p0> }}");
+    let session = store.sessions().begin(None).unwrap();
+    let ops = vec![StatementOp::Update(SparqlUpdateRequest::new(
+        update.clone(),
+    ))];
+    assert!(store.sessions().add(&session, None, ops.clone()).unwrap());
+    let pending = nrese_store::StatementsRequest {
+        ops: ops.into(),
+        session: Some(session),
+    };
+    let prepared = store
+        .prepare_query(&SparqlQueryRequest::all(per_city()))
+        .unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        let mut out = Vec::new();
+        store
+            .run_query_pending(&pending, &prepared, &CancellationToken::new(), &mut out)
+            .unwrap();
+        answers.push(String::from_utf8(out).unwrap());
+    }
+    assert_eq!(
+        (store.query_cache_stats(), store.pinned_queries()),
+        before,
+        "the pending reads admitted nothing"
+    );
+    store.execute_update_str(&update).unwrap();
+    let committed = answer(&store, &per_city());
+    for pending in &answers {
+        assert_eq!(pending, &committed);
+    }
+}

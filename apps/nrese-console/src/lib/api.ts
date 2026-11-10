@@ -1,5 +1,5 @@
 import { NreseClient } from "./client";
-import { NRESE_ENDPOINTS } from "./endpoints";
+import { NRESE_ENDPOINTS, type GraphMode, selectedGraphTarget } from "./endpoints";
 import { resolveBrowserApiBaseUrl } from "./runtimeConfig";
 import type {
   AiStatus,
@@ -57,33 +57,23 @@ export async function runUpdate(update: string) {
   return getBrowserClient().runUpdate(update);
 }
 
-export async function runTell(
-  body: string,
-  graphMode: "default" | "named",
-  graphIri: string,
-) {
-  return getBrowserClient().runTell(body, graphMode, graphIri);
+export async function runTell(body: string, graphMode: GraphMode, graphIri: string) {
+  return getBrowserClient().runTell(body, selectedGraphTarget(graphMode, graphIri));
 }
 
-export async function readGraph(
-  graphMode: "default" | "named",
-  graphIri: string,
-) {
-  return getBrowserClient().readGraph(graphMode, graphIri);
+export async function readGraph(graphMode: GraphMode, graphIri: string) {
+  return getBrowserClient().readGraph(selectedGraphTarget(graphMode, graphIri));
 }
 
 export async function writeGraph(
   method: "PUT" | "POST",
   body: string,
-  graphMode: "default" | "named",
+  graphMode: GraphMode,
   graphIri: string,
 ) {
-  return getBrowserClient().writeGraph(method, body, graphMode, graphIri);
+  return getBrowserClient().writeGraph(method, body, selectedGraphTarget(graphMode, graphIri));
 }
 
-export async function deleteGraph(
-  graphMode: "default" | "named",
-  graphIri: string,
-) {
-  return getBrowserClient().deleteGraph(graphMode, graphIri);
+export async function deleteGraph(graphMode: GraphMode, graphIri: string) {
+  return getBrowserClient().deleteGraph(selectedGraphTarget(graphMode, graphIri));
 }
