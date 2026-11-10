@@ -2828,3 +2828,63 @@ mod count_visiting_tests {
         assert_eq!(counted, None, "a count its visitor stopped answers nothing");
     }
 }
+
+#[cfg(test)]
+mod node_count_tests {
+    use super::*;
+    use nrese_rdf::NamedNode;
+
+    /// A node count is refused only where both walks, serially and one after the other, would
+    /// be (package fix check r4). Two runs of one predicate in the default graph under
+    /// 6,291,584 bytes: the first, 131,072 statements of 65,538 subjects (two parts of 32,769
+    /// disjoint groups) and two objects; the second, 131,075 fresh subjects and one of those
+    /// objects. The subject walk's first run fits its parts' peak; walked in parts, its merge
+    /// leaves the subjects' list where the second run's serial growth is refused by 16 bytes.
+    /// Serially it peaks 128 bytes under the limit, and the objects' two groups fit beside
+    /// its list. Answered, 196,615 nodes, no refusal recorded, nothing held after.
+    #[test]
+    fn a_node_count_the_serial_walks_fit_is_answered() {
+        let part = crate::index::GROUP_PART as u64;
+        let ex = |local: String| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        // The runs kept apart: no window ever merges, and nothing is held inline.
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        // Interned in order, so the ids order the subjects as their numbers do.
+        let (first, second, p, objects) = {
+            let id = |local: String| tx.intern(ex(local).as_ref().into());
+            let first: Vec<TermId> = (0..65_538).map(|j| id(format!("s{j}"))).collect();
+            let second: Vec<TermId> = (0..2 * part + 3).map(|i| id(format!("t{i}"))).collect();
+            (
+                first,
+                second,
+                id("p".into()),
+                [id("o0".into()), id("o1".into())],
+            )
+        };
+        let statement = |s, o| EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
+        for i in 0..2 * part {
+            let subject = first[(i * 32_769 / part) as usize];
+            tx.insert_encoded(statement(subject, objects[(i % 2) as usize]));
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for &subject in &second {
+            tx.insert_encoded(statement(subject, objects[0]));
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let budget = nrese_exec::Budget::new(6_291_584);
+        let count = snapshot.node_count_in(ReadModel::Asserted, GraphSelector::Any, &budget);
+        assert_eq!(count, Ok(Some(196_615)));
+        assert!(!budget.refused(), "no refusal recorded on the budget");
+        assert_eq!(budget.used(), 0);
+    }
+}

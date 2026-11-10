@@ -502,6 +502,50 @@ fn a_walk_the_serial_walk_fits_is_answered() {
     assert_eq!(held, 0);
 }
 
+/// The path is the whole walk's (package fix check r4). Two runs under 6,291,584 bytes: the
+/// first, 131,072 keys in two parts of 32,769 disjoint groups each, fits its parts' peak
+/// exactly; its merge leaves the output at capacity 65,538, from which the second run's
+/// 131,075 groups, walked serially, double to a growth 16 bytes past the limit. The fully
+/// serial walk, one buffer doubling to 262,144, peaks 128 bytes under it and answers.
+/// Answered with every count, no refusal recorded, nothing held once dropped.
+#[test]
+fn a_walk_over_runs_the_serial_walk_fits_is_answered() {
+    let part = super::GROUP_PART as u64;
+    let first: Vec<EncodedQuad> = (0..2 * part)
+        .map(|i| {
+            let subject = 1000 + i * 32_769 / part;
+            EncodedQuad::new(term(subject), term(1), term(10_000 + i), graph(0))
+        })
+        .collect();
+    let second: Vec<EncodedQuad> = (0..2 * part + 3)
+        .map(|i| EncodedQuad::new(term(1_000_000 + i), term(1), term(2_000_000 + i), graph(0)))
+        .collect();
+    let mut expected = std::collections::BTreeMap::new();
+    for quad in first.iter().chain(&second) {
+        *expected.entry(quad.subject.raw()).or_insert(0i64) += 1;
+    }
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, first).with_delta(&second, &[]);
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(term(1)),
+        object: None,
+        graph: GraphSelector::Any,
+    };
+    let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    let budget = nrese_exec::Budget::new(6_291_584);
+    let answer = {
+        let mut counts = ChargedVec::new(&budget);
+        version
+            .group_counts(&plan, 1, &mut counts, &budget)
+            .map(|()| counts.to_vec())
+    };
+    let counts = answer.expect("the fully serial walk fits 6,291,584 bytes");
+    assert_eq!(counts.len(), 196_613);
+    assert_eq!(counts, expected.into_iter().collect::<Vec<_>>());
+    assert!(!budget.refused(), "no refusal recorded on the budget");
+    assert_eq!(budget.used(), 0);
+}
+
 /// Under an ample budget the same range is still walked in parallel parts, so the normal case
 /// keeps its speed; under 1.5 MiB (the walk above) it is walked serially.
 #[test]
