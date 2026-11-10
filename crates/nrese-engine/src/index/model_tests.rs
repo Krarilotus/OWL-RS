@@ -392,15 +392,16 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
     assert_eq!(totals, expected);
 }
 
-/// A walk that fits its budget is answered, however its parts start: two parallel parts of
-/// one group each, whose merge appends that one group, need a few hundred bytes, and under
-/// 32 KiB they are answered with the group's whole count. The room a part asks for ahead is
-/// optional (D16-039, package review r1 SC-R1-01): none of it may refuse the merge.
-#[test]
-fn a_walk_in_parts_that_fits_its_budget_is_answered() {
-    let rows = 2 * super::GROUP_PART as u64;
+/// The group walk of `rows` quads of one predicate, the `i`-th with subject `subject(i)`, by
+/// subject under a budget of `limit` bytes: its answer (each subject's count) or refusal, and
+/// what the budget still holds once the walk's groups are dropped.
+fn walk_by_subject(
+    rows: u64,
+    subject: impl Fn(u64) -> u64,
+    limit: usize,
+) -> (Result<Vec<(u64, i64)>, nrese_exec::BudgetExceeded>, usize) {
     let quads: Vec<EncodedQuad> = (0..rows)
-        .map(|i| EncodedQuad::new(term(1000), term(1), term(10_000 + i), graph(0)))
+        .map(|i| EncodedQuad::new(term(subject(i)), term(1), term(10_000 + i), graph(0)))
         .collect();
     let version = IndexVersion::from_quads(Layout::DefaultGraph, quads);
     let pattern = QuadPattern {
@@ -410,12 +411,64 @@ fn a_walk_in_parts_that_fits_its_budget_is_answered() {
         graph: GraphSelector::Any,
     };
     let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
-    let budget = nrese_exec::Budget::new(32 << 10);
-    let mut counts = ChargedVec::new(&budget);
-    version
-        .group_counts(&plan, 1, &mut counts, &budget)
-        .expect("one group fits 32 KiB");
-    assert_eq!(&counts[..], &[(term(1000).raw(), rows as i64)]);
+    let budget = nrese_exec::Budget::new(limit);
+    let answer = {
+        let mut counts = ChargedVec::new(&budget);
+        version
+            .group_counts(&plan, 1, &mut counts, &budget)
+            .map(|()| counts.to_vec())
+    };
+    (answer, budget.used())
+}
+
+/// A walk that fits its budget is answered, however its parts start: two parallel parts of
+/// one group each, whose merge appends that one group, need a few hundred bytes, and under
+/// 32 KiB they are answered with the group's whole count. The room a part asks for ahead is
+/// optional (D16-039, package review r1 SC-R1-01): none of it may refuse the merge.
+#[test]
+fn a_walk_in_parts_that_fits_its_budget_is_answered() {
+    let rows = 2 * super::GROUP_PART as u64;
+    let (answer, _) = walk_by_subject(rows, |_| 1000, 32 << 10);
+    let counts = answer.expect("one group fits 32 KiB");
+    assert_eq!(counts, [(term(1000).raw(), rows as i64)]);
+}
+
+/// Parts of uneven size, as the parts of a real walk are: one of a single group, one of 513.
+/// Grown as the groups come, they peak near 24.7 KiB with their merge, and under 32 KiB the
+/// walk is answered: no part's room asked ahead and left unfilled may take the merge's
+/// (package fix check r2: a part held 16 KiB for one group, and the merge of 514 was refused).
+#[test]
+fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
+    let part = super::GROUP_PART as u64;
+    let subject = |i: u64| match i < part {
+        true => 1000,
+        false => 2000 + (i - part) * 513 / part,
+    };
+    let (answer, _) = walk_by_subject(2 * part, subject, 32 << 10);
+    let counts = answer.expect("514 groups and their parts fit 32 KiB");
+    let mut expected = std::collections::BTreeMap::new();
+    for i in 0..2 * part {
+        *expected.entry(term(subject(i)).raw()).or_insert(0i64) += 1;
+    }
+    assert_eq!(counts.len(), 514);
+    assert_eq!(counts, expected.into_iter().collect::<Vec<_>>());
+}
+
+/// A walk leaves nothing charged once its groups are dropped, answered or refused: its parts,
+/// their growth and the merge's are all released (package fix check r2).
+#[test]
+fn a_walk_releases_every_charge_answered_or_refused() {
+    let part = super::GROUP_PART as u64;
+    // Groups of two quads: 65,536 of them, about 1 MiB, past 64 KiB and within 8 MiB.
+    let (answered, held) = walk_by_subject(2 * part, |i| 1000 + i / 2, 8 << 20);
+    assert_eq!(
+        answered.ok().map(|counts| counts.len()),
+        Some(part as usize)
+    );
+    assert_eq!(held, 0, "an answered walk's charges");
+    let (refused, held) = walk_by_subject(2 * part, |i| 1000 + i / 2, 64 << 10);
+    assert!(refused.is_err(), "65,536 groups need more than 64 KiB");
+    assert_eq!(held, 0, "a refused walk's charges");
 }
 
 /// Every layout keeps the permutation each pattern shape's access plan reads, the pattern's
