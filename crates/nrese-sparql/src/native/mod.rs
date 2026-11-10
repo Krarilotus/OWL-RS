@@ -220,8 +220,13 @@ fn run(
     options: &QueryOptions,
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    let (solutions, form) = match index_answer(&ctx, query, options) {
+        Some(solutions) => (solutions?, Form::Select),
+        None => {
+            let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
+            (ctx.eval_root(&pattern, options.pin.as_ref())?, form)
+        }
+    };
     ctx.check()?;
     let outcome = match form {
         Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
@@ -297,6 +302,16 @@ pub(crate) fn explain(
     options: &QueryOptions,
 ) -> Result<ExplainParts, QueryEvaluationError> {
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let begun = Instant::now();
+    if let Some(solutions) = index_answer(&ctx, query, options) {
+        let rows = solutions?.table.len();
+        ctx.trace = Some(RefCell::default());
+        let detail = "COUNT(*) of one triple pattern, from the index".to_owned();
+        ctx.note("index answer", detail, Some(1), rows, begun);
+        let steps = ctx.trace.take().unwrap_or_default().into_inner();
+        let decoded = ctx.decodes.load(AtomicOrdering::Relaxed);
+        return Ok((Vec::new(), steps, rows as u64, decoded, None));
+    }
     let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
     let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
@@ -388,12 +403,17 @@ pub(crate) fn write_results(
         _ => {}
     }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = match native_pattern(query, options, &ctx) {
-        Ok(native) => native,
-        Err(error) => return Some(Err(error.into())),
+    let evaluated = match index_answer(&ctx, query, options) {
+        Some(solutions) => solutions.map(|solutions| (solutions, Form::Select)),
+        None => match native_pattern(query, options, &ctx) {
+            Ok((pattern, form, _, _)) => ctx
+                .eval_root(&pattern, options.pin.as_ref())
+                .map(|solutions| (solutions, form)),
+            Err(error) => return Some(Err(error.into())),
+        },
     };
-    let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
-        Ok(solutions) => solutions,
+    let (solutions, form) = match evaluated {
+        Ok(evaluated) => evaluated,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
     if matches!(form, Form::Ask) {
@@ -592,6 +612,83 @@ type NativePattern<'q> = (
     Vec<&'static str>,
     Option<crate::ql::QlReport>,
 );
+
+/// The answer of a query that is the index's count of one triple pattern and nothing else,
+/// `SELECT (COUNT(*) AS ?n) WHERE { s p o }`, from the index alone: without preparing the
+/// query ([`native_pattern`]) or running its operators through the result cache (entities
+/// q03: about 5k of its 23k instructions, 10 Nov 2026). `None` for any other
+/// query, for a count the index doesn't hold ([`Context::index_count`]), and where the
+/// preparation would change the query: an open triple term, the QL rewriting, canonical
+/// answers (or their refusal, which the preparation reports), pre-bound values, a pin, or
+/// `as_written`. The general path answers the same: it is the oracle (index_answer_tests).
+fn index_answer(
+    ctx: &Context<'_>,
+    query: &Query,
+    options: &QueryOptions,
+) -> Option<NativeResult<Solutions>> {
+    let Query::Select { pattern, .. } = query else {
+        return None;
+    };
+    if options.as_written
+        || options.pre_bound.is_some()
+        || options.pin.is_some()
+        || ctx.canonical.is_some()
+        || ctx.canonical_refused.is_some()
+        || ql_rewriting(query, options).is_some()
+    {
+        return None;
+    }
+    let GraphPattern::Project { inner, variables } = pattern else {
+        return None;
+    };
+    let GraphPattern::Extend { inner, bindings } = &**inner else {
+        return None;
+    };
+    let GraphPattern::Group {
+        inner,
+        variables: keys,
+        aggregates,
+    } = &**inner
+    else {
+        return None;
+    };
+    let (
+        [projected],
+        [(name, Expression::Variable(counted))],
+        [(target, AggregateExpression::CountSolutions { distinct: false })],
+        GraphPattern::Bgp { patterns },
+    ) = (
+        variables.as_slice(),
+        bindings.as_slice(),
+        aggregates.as_slice(),
+        &**inner,
+    )
+    else {
+        return None;
+    };
+    let [triple] = patterns.as_slice() else {
+        return None;
+    };
+    if projected != name
+        || counted != target
+        || !keys.is_empty()
+        || search::is_search(triple, patterns)
+        || ctx.is_spatial(triple)
+        || triple_terms::has_open(pattern)
+    {
+        return None;
+    }
+    let answer = || -> NativeResult<Option<Solutions>> {
+        ctx.check()?;
+        let Some(count) = ctx.index_count(triple)? else {
+            return Ok(None);
+        };
+        let solutions = ctx.count_row(name, count)?;
+        ctx.check()?;
+        Ok(Some(solutions))
+    };
+    answer().transpose()
+}
 
 /// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
 /// query form, and the rewrites that changed it: the one preparation every delivery of the
@@ -5133,6 +5230,29 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The index's count of the quads `triple` matches, where that is its number of
+    /// solutions: `None` in the merged default graph (a statement in several graphs is
+    /// several quads there), with a repeated variable, and where the pattern can't match.
+    fn index_count(&self, triple: &TriplePattern) -> NativeResult<Option<u64>> {
+        match self.scan_pattern(triple) {
+            Some(scan) if !scan.repeats_variable() && !scan.merged() => Ok(Some(exact_count(
+                self.snapshot.count_in(self.model, &scan.quad_pattern()),
+            )?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// One row binding `target` to `count`, charged as the query's.
+    fn count_row(&self, target: &Variable, count: u64) -> NativeResult<Solutions> {
+        let mut table = IdTable::new(1);
+        table.push_row(&[self.id(&integer(count))?]);
+        self.produced(Solutions {
+            vars: vec![target.clone()],
+            table,
+            ordered: false,
+        })
+    }
+
     fn group_direct(
         &self,
         inner: &GraphPattern,
@@ -5148,22 +5268,14 @@ impl<'a> Context<'a> {
             && !search::is_search(triple, patterns)
             && !self.is_spatial(triple)
         {
-            let count = match self.scan_pattern(triple) {
-                // The index counts quads; in the merged default graph a statement in
-                // several graphs is several quads, so there the scan counts.
-                Some(scan) if !scan.repeats_variable() && !scan.merged() => {
-                    exact_count(self.snapshot.count_in(self.model, &scan.quad_pattern()))?
-                }
-                Some(scan) => self.scan(&scan, None)?.table.len() as u64,
-                None => 0,
+            let count = match self.index_count(triple)? {
+                Some(count) => count,
+                None => match self.scan_pattern(triple) {
+                    Some(scan) => self.scan(&scan, None)?.table.len() as u64,
+                    None => 0,
+                },
             };
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))?]);
-            return self.produced(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
         }
         // COUNT(*) of a cyclic BGP: its worst-case-optimal join counts the solutions
         // instead of producing them (4-cycles of a social graph: 19.2 M two-paths
@@ -5173,13 +5285,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let Some(count) = self.cyclic_count(patterns)?
         {
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))?]);
-            return self.produced(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
         }
         // COUNT(*) of an open closure (`?a p* ?b`, `?a p+ ?b`): from the closure's size
         // per node, without building its pairs. Its pairs are distinct, so DISTINCT counts
@@ -5203,13 +5309,7 @@ impl<'a> Context<'a> {
                 let detail = format!("COUNT of {path} from the closure's size per component");
                 self.note("closure", detail, Some(1), 1, begun);
             }
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))?]);
-            return self.produced(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
         }
         // GROUP BY one variable with only row counts, over one triple pattern: the index
         // counts each group by binary search (O(groups · log n)), without reading matches.
