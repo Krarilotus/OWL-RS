@@ -158,7 +158,7 @@ impl Context<'_> {
     /// fact asserted only in a named graph has its identity variants inferred in the
     /// default graph, but not itself).
     pub(super) fn representatives(&self) -> Option<Arc<Representatives>> {
-        if !self.equality_closed || self.as_written {
+        if !self.equality_closed || self.as_written || self.model != ReadModel::Materialised {
             return None;
         }
         let scope_ok = match &*self.graph.borrow() {

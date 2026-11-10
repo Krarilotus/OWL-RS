@@ -8,6 +8,54 @@ use nrese_sparql::{QueryOptions, QueryResults, evaluate_query};
 use nrese_sparql_syntax::SparqlParser;
 
 #[test]
+fn same_term_matches_a_prebound_blank_node() {
+    // Spec: SHACL-SPARQL §5.6.2 pre-binding and SPARQL sameTerm: b p b with
+    // $this=b returns b, including when the constant is the first operand.
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let blank = nrese_rdf::BlankNode::new("b").unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(
+        nrese_rdf::Quad::new(
+            blank.clone(),
+            NamedNode::new("urn:p").unwrap(),
+            blank.clone(),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for as_written in [false, true] {
+        for operands in ["?v, $this", "$this, ?v"] {
+            let query = SparqlParser::new()
+                .parse_query(&format!(
+                    "SELECT ?v WHERE {{ $this <urn:p> ?v FILTER(sameTerm({operands})) }}"
+                ))
+                .unwrap();
+            let options = QueryOptions {
+                pre_bound: Some(Arc::new(HashMap::from([(
+                    Variable::new("this").unwrap(),
+                    blank.clone().into(),
+                )]))),
+                as_written,
+                ..QueryOptions::default()
+            };
+            let QueryResults::Solutions(rows) =
+                evaluate_query(&snapshot, &query, &options).unwrap()
+            else {
+                panic!("SELECT")
+            };
+            let rows: Vec<_> = rows.map(|row| row.unwrap().get("v").cloned()).collect();
+            assert_eq!(
+                rows,
+                [Some(blank.clone().into())],
+                "{operands}, as_written={as_written}"
+            );
+        }
+    }
+}
+
+#[test]
 fn triple_this_is_visible_to_inner_bind() {
     // Spec: the user's RDF 1.2 triple is a value even when absent from the store;
     // BIND($this AS ?value) copies exactly that term, including nested triple objects.
