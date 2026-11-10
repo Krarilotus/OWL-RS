@@ -43,6 +43,72 @@ fn a_certain_identity_makes_its_members_answers() {
     }
 }
 
+/// The same identity with the class C also an individual of A (punning): `a = b = C` in
+/// every model, so a is a C, and so is the individual C (it is b). Neither is the smallest
+/// id, so C is a member, never the representative, of the class U1 merges.
+#[test]
+fn a_class_that_is_also_a_member_answers_for_its_members() {
+    let identity = ":a a :A . :A rdfs:subClassOf [ a owl:Class ; owl:oneOf ( :b ) ] . \
+         :C a owl:Class, owl:NamedIndividual, :A .";
+    let membership = ":b a :D . :D rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :E :F ) ] . \
+         :E rdfs:subClassOf :C . :F rdfs:subClassOf :C .";
+    for (order, first, second) in [
+        ("b first", membership, identity),
+        ("a first", identity, membership),
+    ] {
+        let dl = pipeline();
+        insert(&dl, first).expect("data");
+        insert(&dl, second).expect("data");
+        let (rows, status) = query(&dl, "SELECT ?x { ?x a :C }");
+        assert!(
+            rows.iter().all(|r| ["C", "a", "b"].contains(&r.as_str())),
+            "{order}: sound: {rows:?}"
+        );
+        assert!(
+            !status.is_complete() || rows == ["C", "a", "b"],
+            "{order}: a complete answer holds every certain one: {rows:?} {:?}",
+            status.paths
+        );
+        let (rows, status) = query(&dl, "ASK { :a a :C }");
+        assert!(
+            !status.is_complete() || rows == ["true"],
+            "{order}: a is a C in every model: {rows:?} {:?}",
+            status.paths
+        );
+    }
+}
+
+/// A property p that is also an individual of A (punning), with `A ⊑ {b}`: `a = b = p` in
+/// every model, and `b p d`, so `a p d` and `p p d` hold too. p is a member, never the
+/// representative, of the class U1 merges.
+#[test]
+fn a_property_that_is_also_a_member_answers_for_its_members() {
+    let fact = ":b :p :d . :p a owl:ObjectProperty .";
+    let identity = ":a a :A . :p a owl:NamedIndividual, :A . \
+         :A rdfs:subClassOf [ a owl:Class ; owl:oneOf ( :b ) ] .";
+    for (order, first, second) in [("b first", fact, identity), ("a first", identity, fact)] {
+        let dl = pipeline();
+        insert(&dl, first).expect("data");
+        insert(&dl, second).expect("data");
+        let (rows, status) = query(&dl, "SELECT ?x { ?x :p :d }");
+        assert!(
+            rows.iter().all(|r| ["a", "b", "p"].contains(&r.as_str())),
+            "{order}: sound: {rows:?}"
+        );
+        assert!(
+            !status.is_complete() || rows == ["a", "b", "p"],
+            "{order}: a complete answer holds every certain one: {rows:?} {:?}",
+            status.paths
+        );
+        let (rows, status) = query(&dl, "ASK { :a :p :d }");
+        assert!(
+            !status.is_complete() || rows == ["true"],
+            "{order}: a p d holds in every model: {rows:?} {:?}",
+            status.paths
+        );
+    }
+}
+
 /// `A ⊑ {b, c}` and `a ∈ A`: a is b or c, neither in every model. U1 may equate a with both
 /// (an upper bound); `a p d` holds only where a = b, so it isn't certain, and the answers
 /// to `?x p d` are b's alone.
