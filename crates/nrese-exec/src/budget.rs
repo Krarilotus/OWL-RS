@@ -619,8 +619,13 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         held
     }
 
-    /// Reserves `bytes` more, or fails without reserving anything.
+    /// Reserves `bytes` more, or fails without reserving anything. Nothing, it reserves
+    /// without a call up the budget's levels: an empty table's charge, resize and release cost
+    /// nothing (D16-039's timing: three such calls an empty scan, NOT EXISTS ×1.06).
     pub fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
+        if bytes == 0 {
+            return Ok(());
+        }
         let Some(total) = self.bytes.checked_add(bytes) else {
             return Err(self.budget.refuse(bytes, self.budget.used()));
         };
@@ -634,6 +639,11 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
     /// Returns up to `bytes` of this reservation to the budget.
     pub fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.bytes);
+        // Nothing released, no call up the levels (a reservation dropped empty, after
+        // [`Self::transfer`] too).
+        if bytes == 0 {
+            return;
+        }
         let _released = self.budget.give(bytes);
         self.bytes -= bytes;
         #[cfg(any(test, feature = "measure"))]
@@ -1307,11 +1317,34 @@ impl<T, H: Hold> Charged<T, H> {
         let doubled = needed
             .max(self.items.capacity().saturating_mul(2))
             .max(first);
+        self.grow(needed, doubled)
+    }
+
+    /// Room for `additional` more items, and for up to `wanted` more where that fits: the
+    /// room past `additional` is taken as a doubling's is ([`Self::reserve`]), never refused
+    /// and never recorded as refused. For a buffer whose likely size is known ahead (a group
+    /// walk's part): one growth where doublings from a few items made about ten, and no
+    /// refusal where only what is needed fits (D16-039's sol-loop, S2-1).
+    pub fn reserve_hint(&mut self, additional: usize, wanted: usize) -> Result<(), BudgetExceeded> {
+        let needed = self.needed(additional)?;
+        if needed <= self.items.capacity() {
+            return Ok(());
+        }
+        // Without `needed`'s refusal: a hint past what can be counted is no refusal (S3-1).
+        let most = self.items.len().checked_add(wanted).unwrap_or(needed);
+        let most = most.max(needed);
+        self.grow(needed, most)
+    }
+
+    /// The capacity grown to between `needed` items, refused where they don't fit, and
+    /// `most`, as far as that fits.
+    fn grow(&mut self, needed: usize, most: usize) -> Result<(), BudgetExceeded> {
+        let size = std::mem::size_of::<T>();
         if size == 0 {
-            return self.set_capacity(doubled);
+            return self.set_capacity(most);
         }
         let least = Self::bytes(needed).ok_or_else(|| self.held.too_large(TOKEN))?;
-        let most = Self::bytes(doubled).unwrap_or(least);
+        let most = Self::bytes(most).unwrap_or(least);
         // Released when it drops: after the reallocation, or as an unwinding one ends.
         let (_old, held) = self.held.renew_up_to(TOKEN, least, most, size)?;
         let capacity = held / size;
@@ -1359,6 +1392,20 @@ impl<T, H: Hold> Charged<T, H> {
         }
         self.items.push(item);
         Ok(())
+    }
+
+    /// `item` appended within the capacity already charged, with no budget call and no
+    /// refusal to carry; `Err(item)` where there is no room, for the caller to grow first
+    /// ([`Self::reserve`]). For a hot loop of one item an iteration: a [`Self::push`]'s
+    /// `Result` there cost D16-039's group walk a 5 % rise in instructions on NOT EXISTS.
+    #[inline]
+    pub fn push_within(&mut self, item: T) -> Result<(), T> {
+        if self.items.len() < self.items.capacity() {
+            self.items.push(item);
+            Ok(())
+        } else {
+            Err(item)
+        }
     }
 
     pub fn extend_from_slice(&mut self, items: &[T]) -> Result<(), BudgetExceeded>
@@ -2178,6 +2225,42 @@ mod tests {
         assert!(refused.is_err());
         assert_eq!(budget.used(), 800, "nothing charged for the refused one");
         drop(adopted);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A hint past the room is optional: what is needed is reserved, the hint as far as it
+    /// fits, and nothing is refused or recorded as refused; with room, the hint is reserved
+    /// whole, in one growth. What is needed and doesn't fit is refused.
+    #[test]
+    fn a_hint_past_the_room_is_not_refused() {
+        let budget = Budget::new(1 << 10);
+        let mut tight: ChargedVec<(u64, i64), _> = ChargedVec::new(&budget);
+        tight.reserve_hint(1, 1 << 10).expect("one item fits");
+        assert!(
+            (1..1 << 10).contains(&tight.capacity()),
+            "{}",
+            tight.capacity()
+        );
+        assert!(!budget.refused(), "the hint is optional");
+        assert!(budget.used() <= 1 << 10);
+        drop(tight);
+        let roomy = Budget::new(1 << 20);
+        let mut whole: ChargedVec<(u64, i64), _> = ChargedVec::new(&roomy);
+        whole.reserve_hint(1, 1 << 10).unwrap();
+        assert_eq!((whole.capacity(), roomy.used()), (1 << 10, 16 << 10));
+        // A hint past what can be counted is no refusal either (sol-loop S3-1).
+        let fresh = Budget::new(1 << 20);
+        let mut full: ChargedVec<(u64, i64), _> = ChargedVec::with_capacity(&fresh, 1).unwrap();
+        full.push((0, 0)).unwrap();
+        full.reserve_hint(1, usize::MAX)
+            .expect("the second item fits");
+        assert!(full.capacity() >= 2);
+        assert!(!fresh.refused(), "an uncountable hint is optional too");
+        let mut needed: ChargedVec<(u64, i64), _> = ChargedVec::new(&budget);
+        assert!(
+            needed.reserve_hint(100, 100).is_err(),
+            "1,600 bytes need more than 1 KiB"
+        );
         assert_eq!(budget.used(), 0);
     }
 
