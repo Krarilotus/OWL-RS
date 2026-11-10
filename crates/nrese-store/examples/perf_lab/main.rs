@@ -270,10 +270,14 @@ mod freed_tests {
     #[test]
     fn another_thread_s_allocations_and_frees_during_the_span_count_nothing() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        let (go, done) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
-        let (other_go, other_done) = (Arc::clone(&go), Arc::clone(&done));
+        let barrier = || Arc::new(Barrier::new(2));
+        let (ready, go, done) = (barrier(), barrier(), barrier());
+        let (other_ready, other_go, other_done) =
+            (Arc::clone(&ready), Arc::clone(&go), Arc::clone(&done));
         let other = std::thread::spawn(move || {
+            // Made before the span opens (`ready`), freed within it.
             let earlier = black_box(vec![1u8; 1 << 20]);
+            other_ready.wait();
             other_go.wait();
             // Within the span: a free of an earlier allocation, and an allocation kept past it.
             drop(black_box(earlier));
@@ -282,6 +286,7 @@ mod freed_tests {
             kept
         });
         let mine = black_box(vec![3u8; 4096]);
+        ready.wait();
         let freed = super::bytes_freed_by(|| {
             go.wait();
             done.wait();
