@@ -13,7 +13,7 @@ use crate::{
     QuadPattern, SyncPolicy,
 };
 
-fn config() -> EngineConfig {
+pub(super) fn config() -> EngineConfig {
     EngineConfig {
         background_maintenance: false,
         durability: DurabilityConfig {
@@ -24,7 +24,7 @@ fn config() -> EngineConfig {
     }
 }
 
-fn quad(n: u64) -> Quad {
+pub(super) fn quad(n: u64) -> Quad {
     let node = |name: String| NamedNode::new_unchecked(format!("http://example.com/{name}"));
     Quad::new(
         node(format!("s{n}")),
@@ -34,7 +34,7 @@ fn quad(n: u64) -> Quad {
     )
 }
 
-fn contents(engine: &Engine) -> HashSet<Quad> {
+pub(super) fn contents(engine: &Engine) -> HashSet<Quad> {
     let snapshot = engine.snapshot();
     snapshot
         .quads_for_pattern(&QuadPattern::all())
@@ -121,7 +121,7 @@ fn small_segments() -> EngineConfig {
     }
 }
 
-fn commit(engine: &Engine, n: u64) -> EngineResult<CommitSummary> {
+pub(super) fn commit(engine: &Engine, n: u64) -> EngineResult<CommitSummary> {
     let mut tx = engine.transaction();
     tx.insert(quad(n).as_ref());
     tx.commit()

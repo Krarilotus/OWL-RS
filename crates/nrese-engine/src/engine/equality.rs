@@ -29,8 +29,9 @@ use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use parking_lot::Mutex;
 
 use super::{ReadModel, Stack, Version};
-use crate::quad::{EncodedQuad, GraphSelector, Key, Permutation, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Key, Permutation, QuadPattern};
 use crate::term::TermId;
+use crate::visit::{Account, Free, Stopped};
 
 /// The classes of one version, computed at the first read that needs them and passed on
 /// to the next version while no commit changes a `sameAs` statement.
@@ -49,15 +50,36 @@ impl std::fmt::Debug for EqualityCell {
 impl EqualityCell {
     /// The classes of `version` under `same_as`.
     pub(crate) fn classes(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
+        self.classes_with(version, same_as, Unmetered)
+            .expect("an unmetered build never stops")
+    }
+
+    /// [`Self::classes`], a build's work counted on `meter`; `None` where it stopped, nothing
+    /// kept. Built outside the cell's lock (REAS-3, master 9 Nov 01:37 (d)): a reader that
+    /// finds no classes builds its own, the first build finished is kept and a later one
+    /// takes it, so a reader never waits out another's build unseen by its own stop; under
+    /// contention two builds may run at once (their charges are transient). The rule 3.0c's
+    /// own-state slot follows.
+    pub(crate) fn classes_with<M: Metering>(
+        &self,
+        version: &Version,
+        same_as: TermId,
+        meter: M,
+    ) -> Option<Arc<Classes>> {
+        if let Some((id, classes, _)) = self.0.lock().as_ref()
+            && *id == same_as
+        {
+            return Some(Arc::clone(classes));
+        }
+        let built = Arc::new(Classes::of_with(version, same_as, meter)?);
         let mut cell = self.0.lock();
         if let Some((id, classes, _)) = cell.as_ref()
             && *id == same_as
         {
-            return Arc::clone(classes);
+            return Some(Arc::clone(classes));
         }
-        let classes = Arc::new(Classes::of(version, same_as));
-        *cell = Some((same_as, Arc::clone(&classes), None));
-        classes
+        *cell = Some((same_as, Arc::clone(&built), None));
+        Some(built)
     }
 
     /// A cell already holding `classes` under `same_as`, for a version whose default graph
@@ -67,15 +89,23 @@ impl EqualityCell {
     }
 
     /// The classes of `version` read canonically: the same aliases, no members to expand
-    /// to ([`Classes::canonical_view`]); made once per version.
+    /// to ([`Classes::canonical_view`]); made once per version. Made outside the cell's lock,
+    /// as the classes are (REAS-3a sol-loop r1 S5: a counted reader that only checks the cell
+    /// mustn't wait out a copy of every alias), the first view finished kept.
     pub(crate) fn canonical(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
         let full = self.classes(version, same_as);
+        if let Some((_, classes, Some(canonical))) = self.0.lock().as_ref()
+            && Arc::ptr_eq(classes, &full)
+        {
+            return Arc::clone(canonical);
+        }
+        let view = Arc::new(full.canonical_view());
         let mut cell = self.0.lock();
         match cell.as_mut() {
             Some((_, classes, canonical)) if Arc::ptr_eq(classes, &full) => {
-                Arc::clone(canonical.get_or_insert_with(|| Arc::new(full.canonical_view())))
+                Arc::clone(canonical.get_or_insert(view))
             }
-            _ => Arc::new(full.canonical_view()),
+            _ => view,
         }
     }
 }
@@ -323,6 +353,7 @@ fn canonical_version(
         // Its asserted stack renamed to representatives: not the stored ids.
         asserted_content: super::AssertedIdentity::fresh(),
         canonical: Default::default(),
+        own: Default::default(),
     });
     Ok(Some(View(Some(Arc::new(ViewData {
         version,
@@ -342,8 +373,10 @@ pub struct Classes {
 }
 
 impl Classes {
-    /// The classes the `sameAs` statements of `version`'s default graph make.
-    fn of(version: &Version, same_as: TermId) -> Self {
+    /// The classes the `sameAs` statements of `version`'s default graph make, the build's
+    /// work counted on `meter` (each statement its scan passes, each identity it copies);
+    /// `None` where it stopped (REAS-3, sweep SW012).
+    fn of_with<M: Metering>(version: &Version, same_as: TermId, meter: M) -> Option<Self> {
         let pattern = QuadPattern {
             subject: None,
             predicate: Some(same_as),
@@ -352,36 +385,92 @@ impl Classes {
         };
         // The reasoner's union kernel (G7 of the investigation of 6 October 2026).
         let mut union = nrese_exec::classes::Classes::default();
+        // One account for all of the build's work: its scans' searches and steps, its unions'
+        // moves and its finish, so at most `POLL_UNITS` units of it follow any yes (fix check
+        // r2 G1: a scan's ledger and the unions' credit apart allowed both).
+        let mut account = OnMeter::new(meter);
+        let plan = AccessPlan::for_pattern(&pattern);
         for stack in Stack::ALL {
-            for quad in version.stack(stack).scan(&pattern) {
+            let index = version.stack(stack);
+            let mut scan = index.scan_plan_with(&plan, &mut account).ok()?;
+            while let Some(quad) = scan.step_with(&mut account).ok()? {
                 let (a, b) = (quad.subject.raw(), quad.object.raw());
-                if a != b {
-                    union.union(a, b);
+                if a == b {
+                    continue;
                 }
+                // A union moves the smaller side's members, each counted before it moves, a
+                // chunk at a time (REAS-3a sol-loop r1 S1, fix check r1 R1); a pair already in
+                // one class moves none (sol-loop r2 S6). A stopped union leaves the kernel half
+                // made: dropped with this build.
+                union.union_asking(a, b, |n| account.take(n))?;
             }
         }
-        let members = union
-            .classes()
-            .map(|(representative, members)| (representative, members.to_vec()));
-        let mut classes = Self::default();
-        for (_, mut identities) in members {
-            if identities.len() < 2 {
+        // Finishing the classes (REAS-3a review r1 R1, fix check r1 R1): each class the kernel
+        // lists, and each identity copied out of it, sorted, checked for a literal and indexed,
+        // is counted before it is handled, a chunk of at most `POLL_UNITS` units at a time, so
+        // a stop is seen within a run of work however large a class is (a counted sort:
+        // `sort_counted`). The maps are made at their final size before the first insert,
+        // counted as the identities they will hold, so no insert grows them (their
+        // initialisation is held for the owner: fix check r1 F2).
+        let chunk = nrese_exec::POLL_UNITS as usize;
+        let mut listed = union.classes();
+        let mut copies: Vec<Vec<u64>> = Vec::with_capacity(listed.len());
+        let mut identities_in_all = 0;
+        loop {
+            if !account.take(1) {
+                return None;
+            }
+            let Some((_, members)) = listed.next() else {
+                break;
+            };
+            if members.len() < 2 {
                 continue;
             }
-            identities.sort_unstable();
-            classes.literals |= identities
-                .iter()
-                .any(|&id| is_literal(TermId::from_raw(id)));
+            let mut identities = Vec::with_capacity(members.len());
+            for part in members.chunks(chunk) {
+                if !account.take(part.len() as u64) {
+                    return None;
+                }
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::ClassFinish, part.len() as u64);
+                identities.extend_from_slice(part);
+            }
+            identities_in_all += identities.len();
+            copies.push(identities);
+        }
+        if !account.take(identities_in_all as u64) {
+            return None;
+        }
+        let mut classes = Self {
+            aliases: HashMap::with_capacity(identities_in_all - copies.len()),
+            members: HashMap::with_capacity(copies.len()),
+            literals: false,
+        };
+        for mut identities in copies {
+            if !M::COUNTED {
+                identities.sort_unstable();
+            } else if !sort_counted(&mut identities, |n| account.take(n)) {
+                return None;
+            }
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
-            for &identity in &identities[1..] {
-                classes.aliases.insert(identity, representative);
+            classes.literals |= is_literal(TermId::from_raw(representative));
+            for part in identities[1..].chunks(chunk) {
+                if !account.take(part.len() as u64) {
+                    return None;
+                }
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::ClassFinish, part.len() as u64);
+                for &identity in part {
+                    classes.literals |= is_literal(TermId::from_raw(identity));
+                    classes.aliases.insert(identity, representative);
+                }
             }
             classes
                 .members
                 .insert(representative, identities.into_boxed_slice());
         }
-        classes
+        Some(classes)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -556,11 +645,7 @@ impl Classes {
 
 /// Whether `id` is a literal: any kind but IRIs, blank nodes and triple terms.
 fn is_literal(id: TermId) -> bool {
-    use crate::term::TermKind;
-    !matches!(
-        id.kind(),
-        TermKind::Iri | TermKind::BlankNode | TermKind::Triple | TermKind::DefaultGraph
-    )
+    id.kind().is_literal()
 }
 
 enum Values<'a> {
@@ -574,6 +659,186 @@ impl Values<'_> {
             Values::One(value) => std::slice::from_ref(value),
             Values::Many(values) => values,
         }
+    }
+}
+
+/// How an equality read counts its work ([`crate::visit`]): not at all ([`Unmetered`], what
+/// every uncounted read compiles to, its calls inlined to nothing and its scans the plain
+/// ones), or on a counted read's visitor. Its scans and probes are the index's counted twins
+/// there; once the visitor has stopped they end early and the read is the visitor's to fail
+/// (REAS-3, sweeps SW012–SW015).
+pub(crate) trait Metering: Copy {
+    /// Whether it counts anything (resolved when compiled).
+    const COUNTED: bool;
+    /// Counts `n` units before they are done: false once stopped.
+    fn units(self, n: u64) -> bool;
+    /// Whether it has stopped, counting nothing.
+    fn stopped(self) -> bool;
+    /// `index`'s held count for `plan`; `None` once stopped.
+    fn count_plan(
+        self,
+        index: &crate::index::IndexVersion,
+        plan: &crate::quad::AccessPlan,
+    ) -> Option<u64>;
+}
+
+/// Sorts `ids` (distinct identities), `take(n)` called before each `n` units of its work, `n`
+/// at most `POLL_UNITS` (REAS-3a fix check r1 R1): runs of [`SORT_RUN`] ids each sorted alone,
+/// counted as `len · (⌊log2 len⌋ + 1)` comparisons before it, then merged pairwise into a
+/// second list, each id a merge moves a unit, counted a chunk at a time. False once `take`
+/// answers false: `ids` is then in no particular order.
+fn sort_counted(ids: &mut Vec<u64>, mut take: impl FnMut(u64) -> bool) -> bool {
+    let comparisons = |len: usize| (len * (usize::BITS - len.leading_zeros()) as usize) as u64;
+    for run in ids.chunks_mut(SORT_RUN) {
+        if !take(comparisons(run.len())) {
+            return false;
+        }
+        #[cfg(not(any(test, all(feature = "witness", debug_assertions))))]
+        run.sort_unstable();
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        run.sort_unstable_by(|a, b| {
+            crate::witness::add(crate::witness::Site::SortWork, 1);
+            a.cmp(b)
+        });
+    }
+    let len = ids.len();
+    if len <= SORT_RUN {
+        return true;
+    }
+    let chunk = nrese_exec::POLL_UNITS as usize;
+    let mut from = std::mem::take(ids);
+    let mut into: Vec<u64> = Vec::with_capacity(len);
+    let mut width = SORT_RUN;
+    while width < len {
+        into.clear();
+        for lo in (0..len).step_by(2 * width) {
+            let (mid, hi) = ((lo + width).min(len), (lo + 2 * width).min(len));
+            let (mut i, mut j) = (lo, mid);
+            while i < mid || j < hi {
+                let part = chunk.min(mid - i + hi - j);
+                if !take(part as u64) {
+                    *ids = from;
+                    return false;
+                }
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::SortWork, part as u64);
+                for _ in 0..part {
+                    if j == hi || (i < mid && from[i] < from[j]) {
+                        into.push(from[i]);
+                        i += 1;
+                    } else {
+                        into.push(from[j]);
+                        j += 1;
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut from, &mut into);
+        width *= 2;
+    }
+    *ids = from;
+    true
+}
+
+/// The ids [`sort_counted`] sorts alone before merging: their sort is at most about
+/// `SORT_RUN · log2 SORT_RUN` comparisons, a fraction of `POLL_UNITS`.
+const SORT_RUN: usize = 256;
+
+/// A meter as an [`Account`]: the one account of an equality read for all its work, its
+/// scans' steps, its probes and its own (fix check r2 G1 and its siblings: a class build, an
+/// expanded count, an expansion; [`Read`]). Portions are taken from a run asked of the meter:
+/// `POLL_UNITS`, or a portion where that is more (a union's chunk, a sort's run), counted in
+/// runs of at most `POLL_UNITS` and then done whole. What a run has left when a portion doesn't
+/// fit is dropped, so between two asks there is at most one run of work (REAS-2's r8 form: a
+/// call per unit cost +0.6 % on replicate, the run form noise). A refusal is final (fix check
+/// r3 H2). Nothing for an unmetered read.
+pub(crate) struct OnMeter<M: Metering> {
+    /// Units asked for and not yet taken.
+    left: u64,
+    refused: bool,
+    meter: M,
+}
+
+impl<M: Metering> OnMeter<M> {
+    /// An account on `meter` with nothing asked for yet.
+    pub(crate) fn new(meter: M) -> Self {
+        Self {
+            left: 0,
+            refused: false,
+            meter,
+        }
+    }
+}
+
+impl<M: Metering> Account for OnMeter<M> {
+    const COUNTED: bool = M::COUNTED;
+
+    #[inline(always)]
+    fn take(&mut self, n: u64) -> bool {
+        if !M::COUNTED {
+            return true;
+        }
+        if self.left < n {
+            if self.refused {
+                return false;
+            }
+            let run = n.max(u64::from(nrese_exec::POLL_UNITS));
+            if !self.meter.units(run) {
+                (self.left, self.refused) = (0, true);
+                return false;
+            }
+            self.left = run;
+        }
+        self.left -= n;
+        true
+    }
+}
+
+/// Counting nothing: the plain reads.
+#[derive(Clone, Copy)]
+pub(crate) struct Unmetered;
+
+impl Metering for Unmetered {
+    const COUNTED: bool = false;
+
+    #[inline(always)]
+    fn units(self, _: u64) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn stopped(self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn count_plan(
+        self,
+        index: &crate::index::IndexVersion,
+        plan: &crate::quad::AccessPlan,
+    ) -> Option<u64> {
+        Some(index.count_plan(plan))
+    }
+}
+
+impl Metering for crate::visit::Visitor<'_> {
+    const COUNTED: bool = true;
+
+    #[inline]
+    fn units(self, n: u64) -> bool {
+        crate::visit::units(self, n)
+    }
+
+    fn stopped(self) -> bool {
+        crate::visit::stopped(self)
+    }
+
+    fn count_plan(
+        self,
+        index: &crate::index::IndexVersion,
+        plan: &crate::quad::AccessPlan,
+    ) -> Option<u64> {
+        index.count_plan_visiting(plan, self)
     }
 }
 
@@ -597,9 +862,25 @@ impl<'a> Visibility<'a> {
         }
     }
 
-    fn asserted_anywhere(&self, copy: &EncodedQuad) -> bool {
+    /// Whether the asserted stack holds `copy`, counted on `account` where it counts.
+    fn asserted_holds<A: Account>(
+        &self,
+        copy: &EncodedQuad,
+        account: &mut A,
+    ) -> Result<bool, Stopped> {
+        match A::COUNTED {
+            true => self.version.asserted.contains_with(copy, account),
+            false => Ok(self.version.asserted.contains(copy)),
+        }
+    }
+
+    fn asserted_anywhere<A: Account>(
+        &self,
+        copy: &EncodedQuad,
+        account: &mut A,
+    ) -> Result<bool, Stopped> {
         if !self.named_graphs {
-            return self.version.asserted.contains(copy);
+            return self.asserted_holds(copy, account);
         }
         let pattern = QuadPattern {
             subject: Some(copy.subject),
@@ -607,26 +888,170 @@ impl<'a> Visibility<'a> {
             object: Some(copy.object),
             graph: GraphSelector::Any,
         };
-        self.version.asserted.scan(&pattern).next().is_some()
+        let plan = AccessPlan::for_pattern(&pattern);
+        let mut scan = self.version.asserted.scan_plan_with(&plan, account)?;
+        Ok(scan.step_with(account)?.is_some())
     }
 
     /// Whether `copy` (in the default graph), a copy of a stored quad that `touching`
     /// classes or not, is shown.
     pub(crate) fn shows(&self, copy: &EncodedQuad, touching: bool) -> bool {
+        self.shows_with(copy, touching, &mut Free) == Ok(true)
+    }
+
+    /// [`Self::shows`], its probes counted on `account`, the read's one account (REAS-3,
+    /// sweep SW015; fix check r2 G1's siblings): `Err` once it has stopped.
+    pub(crate) fn shows_with<A: Account>(
+        &self,
+        copy: &EncodedQuad,
+        touching: bool,
+        account: &mut A,
+    ) -> Result<bool, Stopped> {
         if self.inferred_only {
-            return !self.asserted_anywhere(copy);
+            return Ok(!self.asserted_anywhere(copy, account)?);
         }
         // Without classes the stored quad is the only copy: asserted in the default graph,
         // or inferred (never asserted anywhere).
         if !touching || !self.named_graphs {
-            return true;
+            return Ok(true);
         }
-        self.version.asserted.contains(copy) || !self.asserted_anywhere(copy)
+        Ok(self.asserted_holds(copy, account)? || !self.asserted_anywhere(copy, account)?)
     }
 
     /// Whether every copy of a stored quad is shown without asking each.
     pub(crate) fn shows_all(&self, touching: bool) -> bool {
         !self.inferred_only && (!touching || !self.named_graphs)
+    }
+}
+
+/// A read's quads one at a time, each step's work counted on the account it is given before it
+/// is done: `Err` once that account has stopped. The parts of a counted equality read (its
+/// stored scans, their merge, the expansion and its named scan) are steps, so the read's one
+/// account ([`Read`]) counts all of their work (fix check r2 G1's siblings: an account of each
+/// part's own let each allow a run after the same yes).
+pub(crate) trait Step {
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped>;
+}
+
+impl Step for crate::index::QuadScan<'_> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        self.step_with(account)
+    }
+}
+
+/// A part a read may not have (a stack the model leaves out).
+impl<S: Step> Step for Option<S> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        match self {
+            Some(part) => part.step(account),
+            None => Ok(None),
+        }
+    }
+}
+
+/// A plain read's input: its quads, counting nothing.
+pub(crate) struct Plain<I>(pub(crate) I);
+
+impl<I: Iterator<Item = EncodedQuad>> Step for Plain<I> {
+    #[inline]
+    fn step(&mut self, _: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        Ok(self.0.next())
+    }
+}
+
+/// A [`Step`] read one quad ahead.
+pub(crate) struct Ahead<S> {
+    step: S,
+    head: Option<Option<EncodedQuad>>,
+}
+
+impl<S: Step> Ahead<S> {
+    fn new(step: S) -> Self {
+        Self { step, head: None }
+    }
+
+    /// The next quad, not taken.
+    #[inline]
+    fn peek(&mut self, account: &mut impl Account) -> Result<Option<&EncodedQuad>, Stopped> {
+        if self.head.is_none() {
+            self.head = Some(self.step.step(account)?);
+        }
+        Ok(self.head.as_ref().and_then(Option::as_ref))
+    }
+
+    #[inline]
+    fn next(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        match self.head.take() {
+            Some(head) => Ok(head),
+            None => self.step.step(account),
+        }
+    }
+}
+
+/// Two steps, each sorted by `permutation`, merged in that order, the left first where their
+/// keys are equal: the snapshot's one merge of two sorted streams. A counted read's parts share
+/// its one account; a plain read's are [`Plain`] iterators (fix check r3 S1).
+pub(crate) struct Merged<L, R> {
+    left: Ahead<L>,
+    right: Ahead<R>,
+    permutation: Permutation,
+}
+
+impl<L: Step, R: Step> Merged<L, R> {
+    pub(crate) fn new(left: L, right: R, permutation: Permutation) -> Self {
+        Self {
+            left: Ahead::new(left),
+            right: Ahead::new(right),
+            permutation,
+        }
+    }
+}
+
+impl<L: Step, R: Step> Step for Merged<L, R> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        let permutation = self.permutation;
+        // Keys are made only where both sides have a quad (`p2-reas3-abl6`: made for one
+        // side alone, they cost a plain load 0.6 % of its instructions).
+        let right_first = match (self.left.peek(account)?, self.right.peek(account)?) {
+            (Some(left), Some(right)) => permutation.to_key(right) < permutation.to_key(left),
+            (left, _) => left.is_none(),
+        };
+        match right_first {
+            true => self.right.next(account),
+            false => self.left.next(account),
+        }
+    }
+}
+
+impl<L, R> Iterator for Merged<Plain<L>, Plain<R>>
+where
+    L: Iterator<Item = EncodedQuad>,
+    R: Iterator<Item = EncodedQuad>,
+{
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step(&mut Free).unwrap_or(None)
+    }
+}
+
+/// A counted read's quads: its parts' ([`Step`]), all of their work on its one account,
+/// ending where they end or stop (the stop is the visitor's to tell).
+pub(crate) struct Read<S, A> {
+    pub(crate) step: S,
+    pub(crate) account: A,
+}
+
+impl<S: Step, A: Account> Iterator for Read<S, A> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step.step(&mut self.account).ok().flatten()
     }
 }
 
@@ -641,8 +1066,13 @@ impl<'a> Visibility<'a> {
 /// heap's growth is charged to the reader's budget before it grows, the old allocation
 /// beside the new while the copies move, and released once freed ([`Reads`]); a growth
 /// the budget refuses ends the scan, the refusal kept for the reader.
-pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
-    input: std::iter::Peekable<I>,
+///
+/// A [`Step`]: a counted read's expansion counts each copy it makes before it makes it, each
+/// copy it hands on, its input's steps and its visibility probes on the read's one account
+/// (REAS-3, sweeps SW013, SW014; fix check r2 G1's siblings). The plain reads' is an iterator
+/// over a plain input, counting nothing.
+pub(crate) struct Expand<'a, S: Step> {
+    input: Ahead<S>,
     classes: Arc<Classes>,
     pattern: QuadPattern,
     permutation: Permutation,
@@ -655,7 +1085,7 @@ pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
     refused: bool,
 }
 
-impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
+impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, Plain<I>> {
     pub(crate) fn new(
         input: I,
         classes: Arc<Classes>,
@@ -665,8 +1095,31 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
         model: ReadModel,
         version: &'a Version,
     ) -> Self {
+        Expand::of(
+            Plain(input),
+            classes,
+            pattern,
+            permutation,
+            named,
+            model,
+            version,
+        )
+    }
+}
+
+impl<'a, S: Step> Expand<'a, S> {
+    /// [`Expand::new`] over any input: a counted read's, stepped with its account.
+    pub(crate) fn of(
+        input: S,
+        classes: Arc<Classes>,
+        pattern: QuadPattern,
+        permutation: Permutation,
+        named: bool,
+        model: ReadModel,
+        version: &'a Version,
+    ) -> Self {
         Self {
-            input: input.peekable(),
+            input: Ahead::new(input),
             classes,
             pattern,
             permutation,
@@ -728,40 +1181,56 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
     }
 
     /// Moves the next input quad's copies into the heap; `false` at the end of the input.
-    fn pull(&mut self) -> bool {
-        let Some(raw) = self.input.next() else {
-            return false;
+    fn pull(&mut self, account: &mut impl Account) -> Result<bool, Stopped> {
+        let Some(raw) = self.input.next(account)? else {
+            return Ok(false);
         };
         if !raw.graph.is_default_graph() {
             if self.named {
                 if !self.room(1) {
-                    return self.refuse();
+                    return Ok(self.refuse());
                 }
                 self.pending.push(Reverse(self.permutation.to_key(&raw)));
             }
-            return true;
+            return Ok(true);
         }
         if !self.classes.is_canonical(&raw) {
-            return true;
+            return Ok(true);
         }
-        if !self.room(self.classes.copies(&raw, &self.pattern)) {
-            return self.refuse();
+        let copies = self.classes.copies(&raw, &self.pattern);
+        if !self.room(copies) {
+            return Ok(self.refuse());
         }
         let (permutation, visibility) = (self.permutation, self.visibility);
         let touching = self.classes.touches(&raw);
         let all = visibility.shows_all(touching);
         let pending = &mut self.pending;
+        let mut stopped = false;
         self.classes.expand(&raw, &self.pattern, &mut |quad| {
-            if all || visibility.shows(&quad, touching) {
+            // Its probe, counting its own work, then the copy, a unit counted before it is
+            // kept (SW013): each portion done before the next is taken (fix check r3 H1).
+            let shown = match all {
+                true => Ok(true),
+                false => visibility.shows_with(&quad, touching, account),
+            };
+            let Ok(shown) = shown.and_then(|shown| account.take(1).then_some(shown).ok_or(Stopped))
+            else {
+                stopped = true;
+                return std::ops::ControlFlow::Break(());
+            };
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::ExpandCopies, 1);
+            if shown {
                 pending.push(Reverse(permutation.to_key(&quad)));
             }
             std::ops::ControlFlow::Continue(())
         });
-        true
+        match stopped {
+            true => Err(Stopped),
+            false => Ok(true),
+        }
     }
-}
 
-impl<I: Iterator<Item = EncodedQuad>> Expand<'_, I> {
     /// Ends the scan after a refused growth: nothing more is given (the refusal is the
     /// reader's to see), the heap freed before its charge is released.
     fn refuse(&mut self) -> bool {
@@ -774,7 +1243,7 @@ impl<I: Iterator<Item = EncodedQuad>> Expand<'_, I> {
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>> Drop for Expand<'_, I> {
+impl<S: Step> Drop for Expand<'_, S> {
     /// The heap freed, then its charge released.
     fn drop(&mut self) {
         self.pending = BinaryHeap::new();
@@ -784,30 +1253,43 @@ impl<I: Iterator<Item = EncodedQuad>> Drop for Expand<'_, I> {
     }
 }
 
-impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, I> {
-    type Item = EncodedQuad;
-
-    fn next(&mut self) -> Option<EncodedQuad> {
+impl<S: Step> Step for Expand<'_, S> {
+    #[inline]
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         if self.refused {
-            return None;
+            return Ok(None);
         }
         loop {
-            // What the heap holds may go out once no later input can sort before it.
+            // What the heap holds may go out once no later input can sort before it. The
+            // input's peek counts its own work; the copy handed on is a unit, counted after
+            // it, just before it is done (fix check r3 H1).
             if let Some(Reverse(first)) = self.pending.peek() {
                 let (pattern, permutation) = (&self.pattern, self.permutation);
-                let safe = match self.input.peek() {
+                let safe = match self.input.peek(account)? {
                     None => true,
                     Some(next) => *first <= Self::least_key(pattern, permutation, next),
                 };
                 if safe {
+                    if !account.take(1) {
+                        return Err(Stopped);
+                    }
                     let Reverse(key) = self.pending.pop().expect("peeked");
-                    return Some(self.permutation.key_to_quad(&key));
+                    return Ok(Some(self.permutation.key_to_quad(&key)));
                 }
             }
-            if !self.pull() && (self.refused || self.pending.is_empty()) {
-                return None;
+            if !self.pull(account)? && (self.refused || self.pending.is_empty()) {
+                return Ok(None);
             }
         }
+    }
+}
+
+impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, Plain<I>> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step(&mut Free).unwrap_or(None)
     }
 }
 
@@ -883,6 +1365,45 @@ mod tests {
         assert_eq!(classes.multiplicity(&quad(10, 5, 20), &pattern), Some(3));
     }
 
+    /// Spec (`sort_counted`): it sorts distinct ids as `sort_unstable` does, asking before at
+    /// most `POLL_UNITS` units at a time, and a false answer ends it with false. Lengths around
+    /// its run size and past several merge passes, the ids a permutation of `0..len`.
+    #[test]
+    fn a_counted_sort_sorts_and_stops_when_told() {
+        for len in [
+            0,
+            1,
+            2,
+            SORT_RUN - 1,
+            SORT_RUN,
+            SORT_RUN + 1,
+            5 * SORT_RUN + 17,
+            20_000,
+        ] {
+            let ids: Vec<u64> = (0..len as u64).map(|i| (i * 7919) % len as u64).collect();
+            let mut counted = ids.clone();
+            let largest = std::cell::Cell::new(0);
+            assert!(sort_counted(&mut counted, |n| {
+                largest.set(largest.get().max(n));
+                true
+            }));
+            let mut plain = ids.clone();
+            plain.sort_unstable();
+            assert_eq!(counted, plain, "{len} ids");
+            assert!(
+                largest.get() <= u64::from(nrese_exec::POLL_UNITS),
+                "{len} ids"
+            );
+        }
+        let mut ids: Vec<u64> = (0..20_000).rev().collect();
+        let asked = std::cell::Cell::new(0);
+        assert!(!sort_counted(&mut ids, |_| {
+            asked.set(asked.get() + 1);
+            asked.get() < 10
+        }));
+        assert_eq!(asked.get(), 10, "no ask after the false one");
+    }
+
     /// One class of 2^22 identities in all three places stands for 2^66 quads, more than a
     /// `u64` holds: the multiplicity says so, neither wrapped (it wrapped to 0, so a snapshot
     /// holding such a class read as empty: PR #70 fix check 1 F2) nor capped (a capped count
@@ -899,5 +1420,478 @@ mod tests {
             ..all
         };
         assert_eq!(classes.multiplicity(&quad(r, r, r), &bound), Some(1 << 44));
+    }
+
+    /// REAS-3a review r1 R1. Spec (`crate::visit`: after its visitor's last yes a counted read
+    /// does at most the units that yes allowed, `POLL_UNITS`, plus a step that can't be split;
+    /// finishing a class is split): a counted read's cold class build finishes its classes
+    /// within its visitor's interval. One asserted chain of three intervals of identities, one
+    /// class built one identity at a time, and one statement about its representative: between
+    /// two asks of the visitor, and after the last, the read does at most an interval of work
+    /// (`work`: fix check r2 G2, the bound itself). Finishing the class after one count of it
+    /// (its members copied, checked for literals and indexed), it handled three times the class
+    /// unseen; with its scan and its unions counted on two credits, each within its own run,
+    /// both runs' work followed a yes (fix check r2 G1).
+    #[test]
+    fn a_counted_class_build_finishes_its_class_within_its_visitor_s_interval() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 3 * interval as usize;
+        let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        for i in 1..n {
+            tx.insert(
+                nrese_rdf::Quad::new(
+                    node(&format!("s{}", i - 1)),
+                    node("sameAs"),
+                    node(&format!("s{i}")),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.insert(
+            nrese_rdf::Quad::new(
+                node("s0"),
+                node("p"),
+                node("o"),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
+        let pattern = QuadPattern {
+            predicate: Some(p),
+            ..QuadPattern::all()
+        };
+        let last = std::cell::Cell::new(work());
+        let largest = std::cell::Cell::new(0);
+        let gap = || {
+            let now = work();
+            largest.set(largest.get().max(now - last.replace(now)));
+        };
+        let counted = snapshot
+            .counted()
+            .count(crate::ReadModel::Materialised, &pattern, &|_| {
+                gap();
+                true
+            });
+        gap();
+        assert_eq!(
+            counted,
+            Ok(crate::Count::Exact(n as u64)),
+            "the statement's copy for each identity"
+        );
+        let largest = largest.get();
+        assert!(
+            largest <= interval,
+            "{largest} units of work between two asks of the visitor: at most {interval}"
+        );
+    }
+
+    /// The work a counted class build does, counted where it is done: scan steps and runs, their
+    /// searches' comparisons and their merges' work, copies, finished identities, sort work, and
+    /// the union kernel's member moves and the slots its enumeration walks (fix check r1 F3, r2
+    /// G2: not what the build told its visitor).
+    fn work() -> u64 {
+        use crate::witness::{self, Site};
+        [
+            Site::ScanSteps,
+            Site::RunProbes,
+            Site::ExpandCopies,
+            Site::ClassFinish,
+            Site::SortWork,
+            Site::SearchWork,
+            Site::MergeWork,
+        ]
+        .into_iter()
+        .map(witness::get)
+        .sum::<u64>()
+            + nrese_exec::classes::witness::moved()
+            + nrese_exec::classes::witness::examined()
+    }
+
+    /// A snapshot under equality whose default graph holds `same_as` statements between the
+    /// names given (interned in the order given first), and `subject p o`; and its pattern
+    /// `? p ?`.
+    fn under_equality(
+        names: &[String],
+        same_as: &[(usize, usize)],
+        subject: usize,
+    ) -> (crate::Snapshot, QuadPattern) {
+        let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let predicate = tx.intern(node("sameAs").as_ref().into());
+        for name in names {
+            tx.intern(node(name).as_ref().into());
+        }
+        let quad = |s: &str, p: &str, o: &str| {
+            nrese_rdf::Quad::new(
+                node(s),
+                node(p),
+                node(o),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+        };
+        for &(a, b) in same_as {
+            tx.insert(quad(&names[a], "sameAs", &names[b]).as_ref());
+        }
+        tx.insert(quad(&names[subject], "p", "o").as_ref());
+        tx.commit().unwrap();
+        engine.set_equality(Some(predicate));
+        let snapshot = engine.snapshot();
+        let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
+        let pattern = QuadPattern {
+            predicate: Some(p),
+            ..QuadPattern::all()
+        };
+        (snapshot, pattern)
+    }
+
+    /// Counts `pattern` on `snapshot` (materialised, its classes cold) with a visitor that
+    /// answers yes `yeses` times, then no: the answer, and the most work done between a yes
+    /// and the visitor's next call (or the read's end).
+    fn stopped_after(
+        snapshot: &crate::Snapshot,
+        pattern: &QuadPattern,
+        yeses: usize,
+    ) -> (Result<crate::Count, crate::Stopped>, u64) {
+        let calls = std::cell::Cell::new(0);
+        let last = std::cell::Cell::new(work());
+        let largest = std::cell::Cell::new(0);
+        let gap = || {
+            let now = work();
+            largest.set(largest.get().max(now - last.replace(now)));
+        };
+        let answer = snapshot
+            .counted()
+            .count(crate::ReadModel::Materialised, pattern, &|_| {
+                gap();
+                calls.set(calls.get() + 1);
+                calls.get() <= yeses
+            });
+        gap();
+        (answer, largest.get())
+    }
+
+    /// Spec (`crate::visit`: after its visitor's last yes a counted read does at most a run of
+    /// work, then stops at its next call; review r1 R1, fix check r1 F3): a counted read's cold
+    /// class build, stopped after its visitor's k-th yes for every k until it finishes, answers
+    /// `Stopped` and does at most an interval of work after any yes (fix check r2 G2: the
+    /// bound itself, `POLL_UNITS`). Then, not stopped, it
+    /// answers every copy. Work is counted where it is done (`work`). Map initialisation, held
+    /// for the owner (fix check r1 F2), is not counted.
+    fn a_cold_class_build_stops_within_an_interval_of_any_yes(
+        names: &[String],
+        same_as: &[(usize, usize)],
+        subject: usize,
+        copies: u64,
+    ) {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        // A stopped build keeps nothing, so each run builds the classes cold again.
+        let (snapshot, pattern) = under_equality(names, same_as, subject);
+        // (stopped after, units of work after a yes) for each run past the bound.
+        let mut over = Vec::new();
+        for yeses in 0.. {
+            let (answer, largest) = stopped_after(&snapshot, &pattern, yeses);
+            if largest > interval {
+                over.push((yeses, largest));
+            }
+            match answer {
+                Err(crate::Stopped) => continue,
+                Ok(count) => {
+                    assert_eq!(count, crate::Count::Exact(copies), "every copy");
+                    break;
+                }
+            }
+        }
+        assert!(
+            over.is_empty(),
+            "units of work after a yes, past {interval} (stopped after, units): {over:?}"
+        );
+    }
+
+    /// REAS-3a fix check r1 R1 (the union and the sort) and F3. Two chains of three intervals
+    /// of identities each, then one statement joining them, last in every order of the scan
+    /// (its ends are interned last): that union moves a whole chain, three intervals of members,
+    /// and the joined class's sort sorts six.
+    #[test]
+    fn a_large_union_and_sort_stop_within_an_interval_of_any_yes() {
+        let half = 3 * nrese_exec::POLL_UNITS as usize;
+        let names: Vec<String> = (0..half - 1)
+            .map(|i| format!("a{i}"))
+            .chain((0..half - 1).map(|i| format!("b{i}")))
+            .chain(["a-end".to_owned(), "b-end".to_owned()])
+            .collect();
+        let (a, b) = (|i: usize| i, |i: usize| half - 1 + i);
+        let (a_end, b_end) = (2 * half - 2, 2 * half - 1);
+        let mut same_as: Vec<(usize, usize)> = (1..half - 1)
+            .flat_map(|i| [(a(i - 1), a(i)), (b(i - 1), b(i))])
+            .collect();
+        same_as.extend([(a(half - 2), a_end), (b(half - 2), b_end), (a_end, b_end)]);
+        a_cold_class_build_stops_within_an_interval_of_any_yes(
+            &names,
+            &same_as,
+            a(0),
+            2 * half as u64,
+        );
+    }
+
+    /// REAS-3a fix check r2, a class build whose classes are joined into one. Three intervals of
+    /// classes of two, then each joined to a hub interned last (so its statements come last in
+    /// the scan): the build's scans, unions, listing and finish stay within an interval of any
+    /// yes. It covers the combined build and G1 (red at G1's 5,480); G3, listing the classes
+    /// from the kernel's dense list, has no red of its own (fix check r3 H3).
+    #[test]
+    fn classes_joined_into_one_enumerate_within_an_interval_of_any_yes() {
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let names: Vec<String> = (0..n)
+            .flat_map(|i| [format!("c{i}"), format!("d{i}")])
+            .chain(["hub".to_owned()])
+            .collect();
+        let hub = 2 * n;
+        let same_as: Vec<(usize, usize)> = (0..n)
+            .flat_map(|i| [(2 * i, 2 * i + 1), (hub, 2 * i)])
+            .collect();
+        a_cold_class_build_stops_within_an_interval_of_any_yes(
+            &names,
+            &same_as,
+            0,
+            2 * n as u64 + 1,
+        );
+    }
+
+    /// REAS-3a fix check r1 F3, the many-small-classes shape: three intervals of classes of two.
+    #[test]
+    fn many_small_classes_stop_within_an_interval_of_any_yes() {
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let names: Vec<String> = (0..n)
+            .flat_map(|i| [format!("c{i}"), format!("d{i}")])
+            .collect();
+        let same_as: Vec<(usize, usize)> = (0..n).map(|i| (2 * i, 2 * i + 1)).collect();
+        a_cold_class_build_stops_within_an_interval_of_any_yes(&names, &same_as, 0, 2);
+    }
+
+    /// The most work `read` does between two asks of its visitor, which always answers yes, or
+    /// after the last until it returns.
+    fn largest_gap(read: impl FnOnce(crate::visit::Visitor<'_>)) -> u64 {
+        let last = std::cell::Cell::new(work());
+        let largest = std::cell::Cell::new(0);
+        let gap = || {
+            let now = work();
+            largest.set(largest.get().max(now - last.replace(now)));
+        };
+        read(&|_| {
+            gap();
+            true
+        });
+        gap();
+        largest.get()
+    }
+
+    fn node(name: &str) -> nrese_rdf::NamedNode {
+        nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"))
+    }
+
+    fn statement(s: &str, p: &str, o: &str) -> nrese_rdf::Quad {
+        nrese_rdf::Quad::new(
+            node(s),
+            node(p),
+            node(o),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+    }
+
+    /// REAS-3a fix check r2, G1's sibling in an expansion (`Expand`). Spec (`crate::visit`: at
+    /// most an interval of work after any yes): a counted sorted read under equality does at most
+    /// an interval of work between two asks of its visitor, its stored scan's steps and its
+    /// copies together, and answers as the plain read does. Every quad, read by SPOG: a class of
+    /// three first in the order (`rep`, then two aliases interned after it) and six intervals of
+    /// statements `rep p o_i`: every alias's copy waits for the input's end, so the expansion
+    /// asks for full runs. Its scan's ledger and its own credit each allowed a run after the
+    /// same yes.
+    #[test]
+    fn an_expanded_read_steps_and_copies_within_an_interval_of_any_yes() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 6 * interval as usize;
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let rep = tx.intern(node("rep").as_ref().into());
+        let aliases = ["alias1", "alias2"].map(|alias| tx.intern(node(alias).as_ref().into()));
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        for alias in aliases {
+            tx.insert_inferred(crate::EncodedTriple {
+                subject: alias,
+                predicate: same_as,
+                object: rep,
+            });
+        }
+        for i in 0..n {
+            tx.insert(statement("rep", "p", &format!("o{i}")).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
+        let plain: Vec<_> = snapshot
+            .scan_sorted_in(model, &pattern, Permutation::Spog)
+            .expect("SPOG answers it")
+            .collect();
+        assert!(plain.len() >= 3 * n, "each statement's three copies");
+        let mut read: Vec<EncodedQuad> = Vec::new();
+        let largest = largest_gap(|visit| {
+            read = snapshot
+                .counted()
+                .scan_sorted(model, &pattern, Permutation::Spog, visit)
+                .expect("SPOG answers it")
+                .collect::<Result<_, _>>()
+                .expect("never stopped");
+        });
+        assert_eq!(read, plain, "the plain read's quads, in its order");
+        assert!(
+            largest <= interval,
+            "{largest} units of work between two asks of the visitor: at most {interval}"
+        );
+    }
+
+    /// REAS-3a fix check r2, G1's sibling in a sorted read without equality. Spec
+    /// (`crate::visit`): a counted sorted read of both stacks does at most an interval of work
+    /// between two asks of its visitor, and answers as the plain read does. Every quad, read by
+    /// SPOG: three intervals of statements in each stack, their objects alternating, so the merge steps both scans in
+    /// turn. Each scan's ledger allowed a run after the same yes.
+    #[test]
+    fn a_sorted_read_of_both_stacks_steps_within_an_interval_of_any_yes() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 3 * interval as usize;
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let (s, p) = (
+            tx.intern(node("s").as_ref().into()),
+            tx.intern(node("p").as_ref().into()),
+        );
+        for i in 0..2 * n {
+            let o = tx.intern(node(&format!("o{i}")).as_ref().into());
+            match i % 2 {
+                0 => {
+                    tx.insert(statement("s", "p", &format!("o{i}")).as_ref());
+                }
+                _ => {
+                    tx.insert_inferred(crate::EncodedTriple {
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                    });
+                }
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
+        let plain: Vec<_> = snapshot
+            .scan_sorted_in(model, &pattern, Permutation::Spog)
+            .expect("SPOG answers it")
+            .collect();
+        assert_eq!(plain.len(), 2 * n, "both stacks' statements");
+        let mut read: Vec<EncodedQuad> = Vec::new();
+        let largest = largest_gap(|visit| {
+            read = snapshot
+                .counted()
+                .scan_sorted(model, &pattern, Permutation::Spog, visit)
+                .expect("SPOG answers it")
+                .collect::<Result<_, _>>()
+                .expect("never stopped");
+        });
+        assert_eq!(read, plain, "the plain read's quads, in its order");
+        assert!(
+            largest <= interval,
+            "{largest} units of work between two asks of the visitor: at most {interval}"
+        );
+    }
+
+    /// REAS-3a fix check r3 H2. Spec (`crate::visit`: once `visit` answers false the read
+    /// does no more work and answers `Stopped`, never a value): a counted sorted read stopped
+    /// while its scans are being made hands on no quad after the stop. Two asserted commits of
+    /// 129 and 8,065 statements and one inferred statement, read by SPOG and stopped at each of
+    /// its asks in turn. The asserted scan's stop left its account the rest of a run, which
+    /// made the inferred scan and handed its statement on.
+    #[test]
+    fn a_sorted_read_stopped_while_its_scans_are_made_hands_on_nothing_after() {
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            // No window ever merges, so each commit keeps its own run.
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        for (prefix, n) in [("a", 129), ("b", 8_065)] {
+            let mut tx = engine.transaction();
+            for i in 0..n {
+                tx.insert(statement("s", "p", &format!("{prefix}{i}")).as_ref());
+            }
+            if prefix == "b" {
+                let [s, p, o] = ["s", "p", "c"].map(|name| tx.intern(node(name).as_ref().into()));
+                tx.insert_inferred(crate::EncodedTriple {
+                    subject: s,
+                    predicate: p,
+                    object: o,
+                });
+            }
+            tx.commit().unwrap();
+        }
+        let snapshot = engine.snapshot();
+        let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
+        for yeses in 0.. {
+            let asked = std::cell::Cell::new(0);
+            let visit = |_: u64| {
+                asked.set(asked.get() + 1);
+                asked.get() <= yeses
+            };
+            let (mut after, mut stopped) = (0, false);
+            let counted = snapshot.counted();
+            let read = counted
+                .scan_sorted(model, &pattern, Permutation::Spog, &visit)
+                .expect("SPOG answers it");
+            for quad in read {
+                match quad {
+                    Ok(_) if asked.get() > yeses => after += 1,
+                    Ok(_) => {}
+                    Err(Stopped) => stopped = true,
+                }
+            }
+            if asked.get() <= yeses {
+                break;
+            }
+            assert_eq!(
+                after,
+                0,
+                "stopped at ask {}: quads after the stop",
+                yeses + 1
+            );
+            assert!(stopped, "stopped at ask {}: answers Stopped", yeses + 1);
+        }
     }
 }

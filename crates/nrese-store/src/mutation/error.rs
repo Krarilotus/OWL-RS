@@ -35,9 +35,12 @@ pub enum MutationError {
 }
 
 /// Details of a gate rejection, shared by HTTP problem responses and operator diagnostics.
+/// A committer that may read only some graphs is told only what its own view shows
+/// ([`super::evidence`], the one place that makes a rejection).
 #[derive(Debug, Clone)]
 pub struct MutationReject {
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
+    pub(super) _projected: super::evidence::Projected,
 }

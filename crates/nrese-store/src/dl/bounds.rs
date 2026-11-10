@@ -38,6 +38,10 @@ use crate::StoreService;
 mod memory_tests;
 
 #[cfg(test)]
+#[path = "bounds_token_tests.rs"]
+mod token_tests;
+
+#[cfg(test)]
 #[path = "bounds_lock_tests.rs"]
 mod lock_tests;
 
@@ -300,7 +304,17 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     let pending = tx.pending_snapshot();
     let deadline = Deadline::after(store.config().dl.timeout);
     let memory = store.memory_stop();
-    let stop = move || stop() || deadline.passed() || memory.exceeded();
+    // Whether the memory watch stopped U1: then it is refused, never kept (REAS-3, C17).
+    let memory_hit = std::sync::atomic::AtomicBool::new(false);
+    let hit = &memory_hit;
+    let stop = move || {
+        stop()
+            || deadline.passed()
+            || (memory.exceeded() && {
+                hit.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            })
+    };
     // U1 at the base, taken under the state and changed without it (U1-I): readers never
     // wait for a commit's (parallel) change.
     let current: Option<(bool, Result<Arc<Upper>, GaveUp>)> = lock(&store.dl().bounds.state)
@@ -356,7 +370,9 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     Err(gave_up) => {
                         return Preparation {
                             base,
-                            prepared: Prepared::Rebuilt(Box::new(Err(gave_up))),
+                            prepared: Prepared::Rebuilt(Box::new(Err(
+                                gave_up.by_memory(&memory_hit)
+                            ))),
                             decided_by: "upper-bound",
                             proves_consistency: false,
                             ontology: None,
@@ -406,7 +422,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         &|t| Some(tx.intern(t)),
         &stop,
         store.dl().bounds.kept(),
-    );
+    )
+    .map_err(|gave_up| gave_up.by_memory(&memory_hit));
     Preparation {
         base,
         decided_by: "upper-bound",
@@ -720,12 +737,22 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
     let normalised = nrese_owl::normalise(&ontology);
     let deadline = Deadline::after(store.config().dl.timeout);
     let memory = store.memory_stop();
-    let stop = move || deadline.passed() || memory.exceeded();
+    // Whether the memory watch stopped U1: then it is refused, never kept (REAS-3, C17).
+    let memory_hit = std::sync::atomic::AtomicBool::new(false);
+    let hit = &memory_hit;
+    let stop = move || {
+        deadline.passed()
+            || (memory.exceeded() && {
+                hit.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            })
+    };
     let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Build);
     let kept = store.dl().bounds.kept();
-    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept);
+    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept)
+        .map_err(|gave_up| gave_up.by_memory(&memory_hit));
     (upper, false)
 }
 
@@ -872,7 +899,11 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
     } = parts;
     let revision = view.revision;
     if !lower.is_empty() {
-        match snapshot.with_inferred_added_within(&lower, kept) {
+        // Derived from `snapshot` alone, so the view keeps its publication (dictionary 3.0b):
+        // one of the method's two allowed callers (the workspace's clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let derived = snapshot.with_inferred_derived_within(&lower, kept);
+        match derived {
             Ok(lower) => view.lower = lower,
             Err(_) => return (refused(snapshot, revision), false),
         }
@@ -888,7 +919,9 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
             return (refused(snapshot, revision), false);
         }
         drop(facts);
-        let Ok(upper_view) = snapshot.with_inferred_added_within(&triples, kept) else {
+        // The other allowed caller.
+        #[allow(clippy::disallowed_methods)]
+        let Ok(upper_view) = snapshot.with_inferred_derived_within(&triples, kept) else {
             return (refused(snapshot, revision), false);
         };
         // Read expanded to every identity of U1's classes (the stack keeps representatives).

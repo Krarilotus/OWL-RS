@@ -350,7 +350,7 @@ fn split(
 impl Context<'_> {
     /// A variable no query can name, for a column the executor adds for itself (`what`, one
     /// word: [`nrese_sparql_syntax::internal::variable`]).
-    fn synthetic(&self, what: &str) -> Variable {
+    pub(super) fn synthetic(&self, what: &str) -> Variable {
         let n = self.synthetic.get();
         self.synthetic.set(n + 1);
         nrese_sparql_syntax::internal::variable(what, n)
@@ -537,7 +537,7 @@ impl Context<'_> {
                     terms.insert(variable.clone(), term);
                 }
             }
-            let substituted = super::substitute::Values { terms: &terms }.pattern(pattern);
+            let substituted = super::substitute::Values::new(self, &terms)?.pattern(pattern);
             let found = match graph {
                 Some(id) => self.in_graph(
                     GraphScope::Named(nrese_engine::TermId::from_raw(id)),

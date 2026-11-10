@@ -246,6 +246,67 @@ fn a_repository_switches_the_ql_rewriting() {
     ));
 }
 
+/// A change from `owl2-dl` (whose bounds give the existentials, so no QL rewriting runs
+/// under it) to `owl2-rl` with the QL rewriting on answers through the existential at once:
+/// whether the setting changes with the reasoning or was on already. Specified: as
+/// [`a_repository_switches_the_ql_rewriting`]'s `on`; with it `off`, no bob (the control:
+/// the answer comes from the rewriting, not from stored inferences). The data is written
+/// through the repository's own write path, so `owl2-dl` stays active up to the change (a
+/// write path of other reasoning, as the test support's, switches it off). Catalogue slice
+/// sol-loop r1–r2, S1.
+#[test]
+fn a_change_from_owl2_dl_to_owl2_rl_keeps_the_ql_rewriting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = open(dir.path());
+    let settings = |reasoning: &str, ql: Option<&str>| RepositorySettings {
+        reasoning: Some(reasoning.to_owned()),
+        ql_rewriting: ql.map(str::to_owned),
+        ..RepositorySettings::default()
+    };
+    let mut wrong = Vec::new();
+    for (id, under_dl, after, bob) in [
+        ("with", None, "on", true),
+        ("already", Some("on"), "on", true),
+        ("control", None, "off", false),
+    ] {
+        catalog
+            .create(id, settings("owl2-dl", under_dl))
+            .expect("created");
+        let pipeline = std::sync::Arc::clone(&*catalog.get(id).expect("created").pipeline.read());
+        let store = std::sync::Arc::clone(pipeline.store());
+        pipeline
+            .execute_update_str(
+                "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+                 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                 INSERT DATA {
+                    <urn:Employee> rdfs:subClassOf [ a owl:Restriction ;
+                        owl:onProperty <urn:worksFor> ; owl:someValuesFrom owl:Thing ] .
+                    <urn:bob> a <urn:Employee> .
+                 }",
+            )
+            .expect("written");
+        assert!(
+            store.dl().active(),
+            "{id}: owl2-dl is active before the change"
+        );
+        catalog
+            .change(id, settings("owl2-rl", Some(after)))
+            .expect("changed");
+        let result = store
+            .execute_query_str("SELECT ?x WHERE { ?x <urn:worksFor> ?y }")
+            .expect("answered");
+        let answer = String::from_utf8(result.payload).expect("utf-8");
+        if answer.contains("urn:bob") != bob {
+            let ruleset = store.reasoning_state().map(|state| state.ruleset);
+            wrong.push(format!(
+                "{id}: bob {}expected, ruleset {ruleset:?}, answer {answer}",
+                if bob { "" } else { "not " }
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A change of reasoning whose inferences can't be recomputed (here: the process's memory
 /// limit) leaves the old reasoning in effect, its write path open, and the old settings.
 #[test]
@@ -255,12 +316,13 @@ fn a_failed_reconfiguration_keeps_the_old_reasoning() {
         ..StoreConfig::in_memory()
     })
     .expect("store");
-    store
-        .execute_update_str(
-            "INSERT DATA { <http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
-                           <http://e/a> a <http://e/C> }",
-        )
-        .expect("written");
+    // Loaded past the pipeline: a write's pending changes draw on the process's memory, 1 byte
+    // here (D16-039), and the data is the reconfiguration's, not what this tests.
+    crate::support::load_past_the_pipeline(
+        &store,
+        "<http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
+         <http://e/a> a <http://e/C> .",
+    );
     let catalog =
         Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue");
     let pipeline = || Arc::clone(&*catalog.default_repository().pipeline.read());

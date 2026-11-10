@@ -35,11 +35,13 @@ use std::borrow::Cow;
 
 use keys::PackedKeys;
 use merge::SignedMerge;
-use nrese_exec::{BudgetExceeded, ChargedVec, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::TermId;
+use crate::visit::{Account, Free, Ledger};
 
 pub use compaction::CompactionPolicy;
 pub use keys::{IndexEncoding, set_index_encoding};
@@ -146,6 +148,48 @@ impl Layout {
 /// Keys per part of a group walk over a large range, walked in parallel: a multiple of
 /// the block size.
 pub(crate) const GROUP_PART: usize = 1 << 16;
+
+/// The most bytes a group walk over `keys` keys charges, into an output that starts without
+/// capacity, its runs walked in `parts` parallel parts in all (or serially), bounded by the
+/// keys alone: a group has at least one. Let `S` be the keys walked before a run of `k` keys
+/// in `p` parts. The output then holds at most `2S + 4` groups; the run's parts grow to at
+/// most `2k + 4p` beside it, `3k + 4p` while one reallocates. While the output reallocates,
+/// its old capacity is under `S + k`, its new one at most `2(S + k) + 4`, the finished parts
+/// at most `2k + 4p`. That is `3S + 5k + 4p + 4` groups, at most `5·keys + 4·parts + 4`.
+pub(crate) fn group_walk_peak(keys: usize, parts: usize) -> usize {
+    keys.saturating_mul(5)
+        .saturating_add(parts.saturating_mul(4))
+        .saturating_add(4)
+        .saturating_mul(size_of::<(u64, i64)>())
+}
+
+/// Whether a group walk over `keys` keys, `parts` parallel parts in its large runs, runs in
+/// parts: where it has any, and `budget`'s room covers the whole walk's peak.
+pub(crate) fn walks_in_parts(budget: &Budget, keys: usize, parts: usize) -> bool {
+    parts > 0 && budget.remaining() >= group_walk_peak(keys, parts)
+}
+
+/// [`IndexVersion::group_counts`]'s walk past its capacity, out of its hot loop: `group`
+/// pushed after a growth charged first, or dropped where the walk was refused (that
+/// refusal kept, the first one).
+#[cold]
+#[inline(never)]
+fn grow_then_push(
+    out: &mut ChargedVec<(u64, i64), &Budget>,
+    group: (u64, i64),
+    refused: &mut Option<BudgetExceeded>,
+) {
+    if refused.is_some() {
+        return;
+    }
+    match out.reserve(1) {
+        Ok(()) => {
+            let pushed = out.push_within(group);
+            debug_assert!(pushed.is_ok(), "room after a growth");
+        }
+        Err(error) => *refused = Some(error),
+    }
+}
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
 #[derive(Debug, Clone, Default)]
@@ -218,17 +262,99 @@ impl IndexVersion {
         self.layout
     }
 
-    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
-    /// stack that receives a quad in a named graph turns into a quad stack first
-    /// ([`with_quads_layout`](Self::with_quads_layout)).
-    pub(crate) fn with_delta(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Self {
+    /// The layout `self` takes with the delta `inserts` and `deletes`: the quad layout once a
+    /// quad of them is in a named graph.
+    fn layout_with(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Layout {
         let named = |quads: &[EncodedQuad]| Layout::holding(quads) == Layout::Quads;
-        let base = match self.layout == Layout::DefaultGraph && (named(inserts) || named(deletes)) {
-            true => self.with_quads_layout(),
-            false => self.clone(),
+        match self.layout == Layout::DefaultGraph && (named(inserts) || named(deletes)) {
+            true => Layout::Quads,
+            false => self.layout,
+        }
+    }
+
+    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
+    /// stack that receives a quad in a named graph turns into a quad stack first, its runs
+    /// converted for this version alone: never installed as their shared forms (which would
+    /// then go uncounted). For stacks no reader shares a conversion of: an inferred stack
+    /// (its statements are in the default graph), a test's. An asserted stack a pending
+    /// version reads goes through [`Self::with_delta_in`], which shares and counts it (DUR-6).
+    pub(crate) fn with_delta(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Self {
+        let base = match self.layout_with(inserts, deletes) == self.layout {
+            true => self.clone(),
+            false => self.with_quads_layout_alone(),
         };
         let run = Run::from_delta(base.layout, inserts, deletes);
         base.with_run(run)
+    }
+
+    /// The same quads in the quad layout, made for this version alone: its runs are its own,
+    /// counted as the index's own runs (`Engine::stats`), never installed as shared forms.
+    /// For a version that replaces its source for good (a recovery's replay, a bulk load's
+    /// publication), where nothing else would share the form.
+    pub(crate) fn with_quads_layout_alone(&self) -> Self {
+        if self.layout == Layout::Quads {
+            return self.clone();
+        }
+        Self {
+            layout: Layout::Quads,
+            runs: self
+                .runs
+                .iter()
+                .map(|run| Arc::new(run.with_quads_layout()))
+                .collect(),
+            len: self.len,
+        }
+    }
+
+    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
+    /// stack that receives a quad in a named graph reads its runs in the quad layout, each
+    /// run's form shared and counted in `forms` ([`Self::with_quads_layout`], DUR-6).
+    pub(crate) fn with_delta_in(
+        &self,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        forms: &Forms,
+    ) -> Self {
+        let base = match self.layout_with(inserts, deletes) == self.layout {
+            true => self.clone(),
+            false => self.with_quads_layout(forms),
+        };
+        let run = Run::from_delta(base.layout, inserts, deletes);
+        base.with_run(run)
+    }
+
+    /// [`Self::with_delta_in`] charged to `budget` (DUR-6): the delta's run built with
+    /// [`Run::from_delta_within_parallel`], and the list of runs made once (with the base's
+    /// runs in the quad layout, shared and counted in `forms`, where the delta needs it, not
+    /// charged: they are the store's). The new version and the reservation of what its run
+    /// keeps; the list ([`Self::runs_bytes`] of one more) and the run's box are the caller's
+    /// to charge first.
+    pub(crate) fn with_change_within(
+        &self,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        forms: &Forms,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<(Self, Reservation), BudgetExceeded> {
+        let layout = self.layout_with(inserts, deletes);
+        let (run, held) = Run::from_delta_within_parallel(layout, inserts, deletes, budget)?;
+        let converting = layout != self.layout;
+        let extra = (run.entries() > 0).then(|| Arc::new(run));
+        let net = extra.as_ref().map_or(0, |run| run.net());
+        let runs: Arc<[Arc<Run>]> = self
+            .runs
+            .iter()
+            .map(|run| match converting {
+                true => run.quads_layout_shared(forms),
+                false => Arc::clone(run),
+            })
+            .chain(extra)
+            .collect();
+        let len = self
+            .len
+            .checked_add_signed(net)
+            .expect("exact delta can't make the quad count negative");
+        Ok((Self { layout, runs, len }, held))
     }
 
     /// [`Self::with_delta`] for default-graph `inserts` (which fit either layout, so no stack
@@ -247,9 +373,11 @@ impl IndexVersion {
 
     /// The same quads in the quad layout: each run's graph-first permutations are its
     /// graph-last ones with the graph moved to the front (all its quads are in the default
-    /// graph, so both sort alike). O(n) for n entries, once per store: at its first quad in
-    /// a named graph.
-    pub(crate) fn with_quads_layout(&self) -> Self {
+    /// graph, so both sort alike). O(n) for n entries, once per run while any holder keeps
+    /// its form: each run's form is shared and counted in `forms` from when it is made until
+    /// its last holder drops it ([`Run::quads_layout_shared`], DUR-6), so pending versions,
+    /// and the commit that publishes one, share it.
+    pub(crate) fn with_quads_layout(&self, forms: &Forms) -> Self {
         if self.layout == Layout::Quads {
             return self.clone();
         }
@@ -258,7 +386,7 @@ impl IndexVersion {
             runs: self
                 .runs
                 .iter()
-                .map(|run| Arc::new(run.with_quads_layout()))
+                .map(|run| run.quads_layout_shared(forms))
                 .collect(),
             len: self.len,
         }
@@ -270,7 +398,172 @@ impl IndexVersion {
 
     /// True if `quad` is visible. O(r log n).
     pub(crate) fn contains(&self, quad: &EncodedQuad) -> bool {
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        crate::witness::add(crate::witness::Site::RunProbes, self.runs.len() as u64);
         self.runs.iter().map(|run| run.sign_of(quad)).sum::<i64>() > 0
+    }
+
+    /// [`Self::contains`], each run's probe and its search's comparisons counted on `visit`
+    /// before they are made ([`crate::visit`]; REAS-3, sweep SW009; fix check r1 F1).
+    pub(crate) fn contains_counted(
+        &self,
+        quad: &EncodedQuad,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        // Asked at least once: a stopped visitor gets `Err` however few the runs.
+        if self.runs.is_empty() && crate::visit::stopped(visit) {
+            return Err(Stopped);
+        }
+        self.contains_with(quad, &mut Ledger::new(visit))
+    }
+
+    /// [`Self::contains_counted`] on a caller's `account`: a probe inside a read that counts all
+    /// its work on one account (an equality read's visibility probes, fix check r2 G1).
+    pub(crate) fn contains_with(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl Account,
+    ) -> Result<bool, Stopped> {
+        let mut sign = 0;
+        for run in self.runs.iter() {
+            sign += run.sign_of_counted(quad, account).ok_or(Stopped)?;
+            // Looked at once its search was counted, the run with it (`bound_counted`).
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+        }
+        Ok(sign > 0)
+    }
+
+    /// [`Self::any_plan`], each run it looks at a unit on `visit`, each search's comparisons
+    /// counted before it is made and, where it counts, the count's work
+    /// ([`Self::count_plan_visiting`]) (REAS-3, sweep SW010; fix check r1 F1).
+    pub(crate) fn any_plan_counted(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        // Asked at least once: a stopped visitor gets `Err` however little there is to read.
+        let Some(adapted) = self.layout.adapt(plan).filter(|_| !self.runs.is_empty()) else {
+            return match crate::visit::stopped(visit) {
+                true => Err(Stopped),
+                false => Ok(false),
+            };
+        };
+        // Whether a run holds tombstones (then the exact count decides): each run looked at a
+        // unit, counted a chunk at a time before it is looked at (REAS-3a sol-loop r1 S2).
+        let mut has_tombstones = false;
+        for runs in self.runs.chunks(nrese_exec::POLL_UNITS as usize) {
+            if has_tombstones {
+                break;
+            }
+            if !visit(runs.len() as u64) {
+                return Err(Stopped);
+            }
+            has_tombstones = runs.iter().any(|run| {
+                #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                crate::witness::add(crate::witness::Site::RunProbes, 1);
+                !run.permutation(adapted.permutation).tombstones.is_empty()
+            });
+        }
+        if adapted.exclude_default_graph || has_tombstones {
+            let count = self.count_plan_visiting(plan, visit);
+            return count.map(|count| count > 0).ok_or(Stopped);
+        }
+        // Each run's bound search counted before it is made, its comparisons too (fix check
+        // r1 F1, design attack r2 E2).
+        let mut ledger = Ledger::new(visit);
+        for run in self.runs.iter() {
+            let keys = &run.permutation(adapted.permutation).keys;
+            let start = keys
+                .bound_counted(&adapted.low, &mut ledger)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            if start < keys.len() && keys.get(start) <= adapted.high {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Self::scan_plan`] for a counted read. As the scan is made, each run's range search
+    /// and the cursor it adds are counted on `visit` before they are done, the searches'
+    /// comparisons too (REAS-3, sweep SW006; fix check r1 F1, design attack r2 E2). Its steps
+    /// are counted by [`QuadScan::next_counted`] or [`CountedScan`] on the same ledger.
+    pub(crate) fn scan_plan_counted(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'_>,
+    ) -> Result<QuadScan<'_>, Stopped> {
+        let mut ledger = Ledger::new(visit);
+        let mut scan = self.scan_plan_with(plan, &mut ledger)?;
+        scan.ledger = (ledger.left, ledger.run);
+        Ok(scan)
+    }
+
+    /// [`Self::scan_plan_counted`] on a caller's `account`, which then steps it
+    /// ([`QuadScan::step_with`]): one account for a read that does other work between the
+    /// scan's steps (an equality read's unions, copies and probes; fix check r2 G1). The plain
+    /// scan where the account counts nothing.
+    pub(crate) fn scan_plan_with<A: Account>(
+        &self,
+        plan: &AccessPlan,
+        account: &mut A,
+    ) -> Result<QuadScan<'_>, Stopped> {
+        if !A::COUNTED {
+            return Ok(self.scan_plan(plan));
+        }
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return Ok(QuadScan::new(
+                SignedMerge::new(std::iter::empty()),
+                plan.permutation,
+                false,
+            ));
+        };
+        // Each range handed to the merge as it is searched, with no list of them first (the
+        // plain scan's shape: a list per scan cost the counted reads about 2.7 % on the support
+        // update, p2-reas3-cnt4).
+        let mut merge = SignedMerge::new(std::iter::empty());
+        for perm_run in self.runs.iter() {
+            let perm = perm_run.permutation(adapted.permutation);
+            let (start, end) = perm
+                .keys
+                .range_counted(&adapted.low, &adapted.high, account)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            if !merge.add((perm, start, end), account) {
+                return Err(Stopped);
+            }
+        }
+        Ok(QuadScan::new(
+            merge,
+            adapted.permutation,
+            adapted.exclude_default_graph,
+        ))
+    }
+
+    /// [`Self::scan`] for a counted read: made and stepped counted on `visit`
+    /// ([`Self::scan_plan_counted`], [`QuadScan::next_counted`]), ending at once where `visit`
+    /// had stopped (the stop is the visitor's to tell).
+    pub(crate) fn scan_counted<'v>(
+        &self,
+        pattern: &QuadPattern,
+        visit: Visitor<'v>,
+    ) -> CountedScan<'_, 'v> {
+        self.scan_plan_iter_counted(&AccessPlan::for_pattern(pattern), visit)
+    }
+
+    /// [`Self::scan_counted`] for a plan.
+    pub(crate) fn scan_plan_iter_counted<'v>(
+        &self,
+        plan: &AccessPlan,
+        visit: Visitor<'v>,
+    ) -> CountedScan<'_, 'v> {
+        let scan = self
+            .scan_plan_counted(plan, visit)
+            .unwrap_or_else(|Stopped| QuadScan::empty(plan.permutation));
+        scan.counted(visit)
     }
 
     /// All visible quads matching `pattern`, in the order of the chosen permutation.
@@ -301,22 +594,38 @@ impl IndexVersion {
     /// − 2 × tombstones in range): O(r log n) for tombstone-free runs, plus a popcount over
     /// the range otherwise. Plans with a default-graph post-filter count by scanning.
     pub(crate) fn count_plan(&self, plan: &AccessPlan) -> u64 {
+        self.count_plan_visiting(plan, &|_| true)
+            .expect("never stopped")
+    }
+
+    /// [`Self::count_plan`], calling `visit(n)` (`n` at most `POLL_UNITS`) before the work it
+    /// counts. That is each run's range search, with its comparisons (`PackedKeys::range_counted`),
+    /// its tombstone words as they are read (`PermutationRun::tombstones_in_visiting`), and
+    /// the merge work of a default-graph post-filter scan ([`QuadScan::next_counted`]).
+    /// `None` as soon as `visit` returns false, nothing more read (REAS-2 fix check r1,
+    /// R2-F1: the count lives in the reader).
+    pub(crate) fn count_plan_visiting(&self, plan: &AccessPlan, visit: Visitor<'_>) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return 0;
+            return Some(0);
         };
         if adapted.exclude_default_graph {
-            return self.scan_plan(plan).count() as u64;
+            let mut count = 0u64;
+            let mut scan = self.scan_plan_counted(plan, visit).ok()?;
+            while scan.next_counted(visit).ok()?.is_some() {
+                count += 1;
+            }
+            return Some(count);
         }
-        let signed: i64 = self
-            .runs
-            .iter()
-            .map(|run| {
-                let perm = run.permutation(adapted.permutation);
-                let (start, end) = perm.range(&adapted.low, &adapted.high);
-                (end - start) as i64 - 2 * perm.tombstones_in(start, end) as i64
-            })
-            .sum();
-        u64::try_from(signed).expect("exact deltas never make a range count negative")
+        let mut signed: i64 = 0;
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm
+                .keys
+                .range_counted(&adapted.low, &adapted.high, &mut { visit })?;
+            let tombstones = perm.tombstones_in_visiting(start, end, visit)?;
+            signed += (end - start) as i64 - 2 * tombstones as i64;
+        }
+        Some(u64::try_from(signed).expect("exact deltas never make a range count negative"))
     }
 
     /// True if some visible quad matches `plan`: one bound search per run, where no run has
@@ -386,14 +695,43 @@ impl IndexVersion {
     /// run, appended to `out`: sorted by value within a run, a value once per run that has
     /// it. Each run's range is walked group by group ([`PackedKeys::groups`]): no search per
     /// group, so many small groups cost a scan of the column, few large ones a search each.
-    pub(crate) fn group_counts(
+    ///
+    /// `out` and each part walked in parallel grow charged to `budget` (`out`'s), one
+    /// charge a growth, before they allocate: a reader's walk can't outgrow its budget
+    /// (D16-039 F7). Refused, the walk ends with what it charged released.
+    ///
+    /// Its large runs are walked in parallel parts only where the budget's room, read once
+    /// before anything grows, covers the whole walk's peak ([`group_walk_peak`]); otherwise
+    /// every run is walked serially, the reference. So, against a budget no one else draws
+    /// from during the walk, a walk is refused only where the fully serial walk would be. A
+    /// concurrent consumer can take room after the check: the walk is then refused, typed,
+    /// never answered short.
+    pub(crate) fn group_counts<'b>(
         &self,
         plan: &AccessPlan,
         position: usize,
-        out: &mut Vec<(u64, i64)>,
-    ) {
+        out: &mut ChargedVec<(u64, i64), &'b Budget>,
+        budget: &'b Budget,
+    ) -> Result<(), BudgetExceeded> {
+        let (keys, parts) = self.group_walk_size(plan, position);
+        let in_parts = out.capacity() == 0 && walks_in_parts(budget, keys, parts);
+        self.group_counts_on(plan, position, out, budget, in_parts)
+    }
+
+    /// [`Self::group_counts`] on a path chosen for the whole walk: its large runs in parallel
+    /// parts (`in_parts`), or every run serially. The caller's choice keeps the guarantee
+    /// only where it is [`Self::group_counts`]'s: parts only where the room covers the peak
+    /// of every walk that may run beside this one, `out` without capacity at the start.
+    pub(crate) fn group_counts_on<'b>(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        out: &mut ChargedVec<(u64, i64), &'b Budget>,
+        budget: &'b Budget,
+        in_parts: bool,
+    ) -> Result<(), BudgetExceeded> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return;
+            return Ok(());
         };
         debug_assert!(
             !adapted.exclude_default_graph,
@@ -404,21 +742,33 @@ impl IndexVersion {
         let position = if adapted.permutation == plan.permutation {
             position
         } else if position == 0 {
-            out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
-            return;
+            return out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
         } else {
             position - 1
         };
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
-            let walk = |start: usize, end: usize, out: &mut Vec<(u64, i64)>| {
+            // The walk can't stop between groups: a refused group ends what it appends, and
+            // the walk only skips over the rest. A group costs a push within the capacity
+            // charged; only a growth, logarithmically many, calls the budget.
+            let walk = |start: usize,
+                        end: usize,
+                        out: &mut ChargedVec<(u64, i64), &'b Budget>|
+             -> Result<(), BudgetExceeded> {
+                let mut refused = None;
                 perm.keys.groups(start, end, position, |value, i, j| {
-                    out.push((value, (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64));
+                    let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                    if let Err(group) = out.push_within((value, count)) {
+                        grow_then_push(out, group, &mut refused);
+                    }
                 });
+                refused.map_or(Ok(()), Err)
             };
-            if end - start < 2 * GROUP_PART {
-                walk(start, end, out);
+            // The path is the whole walk's (package fix checks r3, r4): a run walked serially
+            // after a merged one would grow from the merge's capacity, not the reference's.
+            if !in_parts || end - start < 2 * GROUP_PART {
+                walk(start, end, out)?;
                 continue;
             }
             // Large ranges in parts on every core, cut at block boundaries; a group that
@@ -427,27 +777,62 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
-            let parts: Vec<Vec<(u64, i64)>> = cuts
+            let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
-                    let mut part = Vec::new();
-                    walk(cut[0], cut[1], &mut part);
-                    part
+                    let mut part = ChargedVec::new(budget);
+                    walk(cut[0], cut[1], &mut part)?;
+                    Ok(part)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, BudgetExceeded>>()?;
+            // The merge's room at once, for exactly the groups it appends: a group spanning
+            // a cut is added to the one before it, not appended (sol-loop S2-2).
+            let mut last = None;
+            let mut appended = 0;
+            for part in &parts {
+                if let (Some(&(value, _)), Some(&(end, _))) = (part.first(), part.last()) {
+                    appended += part.len() - usize::from(last == Some(value));
+                    last = Some(end);
+                }
+            }
+            out.reserve(appended)?;
             let first = out.len();
             for part in parts {
-                let mut groups = part.into_iter();
-                if let Some((value, count)) = groups.next() {
-                    let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
-                    match out.last_mut() {
-                        Some(last) if spans => last.1 += count,
-                        _ => out.push((value, count)),
-                    }
+                let Some((&(value, count), rest)) = part.split_first() else {
+                    continue;
+                };
+                let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
+                match out.last_mut() {
+                    Some(last) if spans => last.1 += count,
+                    _ => out.push((value, count))?,
                 }
-                out.extend(groups);
+                out.extend_from_slice(rest)?;
             }
         }
+        Ok(())
+    }
+
+    /// The keys [`Self::group_counts`] reads for `plan` over this version's runs, and the
+    /// parallel parts of the runs large enough to be walked in parts: what bounds its charge
+    /// ([`group_walk_peak`]).
+    pub(crate) fn group_walk_size(&self, plan: &AccessPlan, position: usize) -> (usize, usize) {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return (0, 0);
+        };
+        if adapted.permutation != plan.permutation && position == 0 {
+            return (1, 0);
+        }
+        self.runs.iter().fold((0, 0), |(keys, parts), run| {
+            let (start, end) = run
+                .permutation(adapted.permutation)
+                .range(&adapted.low, &adapted.high);
+            let run_parts = if end - start >= 2 * GROUP_PART {
+                end.div_ceil(GROUP_PART) - start / GROUP_PART
+            } else {
+                0
+            };
+            (keys + (end - start), parts + run_parts)
+        })
     }
 
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
@@ -474,31 +859,37 @@ impl IndexVersion {
         }
     }
 
-    /// Appends, for each of `components` (quad components: subject 0, predicate 1, object
-    /// 2, graph 3), its values among the quads matching `plan`, in the plan's order, to
-    /// the matching vector of `out`, decoded a block and a column at a time. Answers only
-    /// for a version of at most one run without tombstones (`false`, nothing appended,
-    /// otherwise: then quads must be merged and cancelled one by one).
-    pub(crate) fn scan_columns(
+    /// The scan, a block and a column at a time, of `components` (quad components:
+    /// subject 0, predicate 1, object 2, graph 3) among the quads matching `plan`, in the
+    /// plan's order: its rows are known before anything is decoded, so a caller charges
+    /// them first ([`ColumnScan::rows`], then [`ColumnScan::decode`]). Answers only for a
+    /// version of at most one run without tombstones (`None` otherwise: then quads must be
+    /// merged and cancelled one by one).
+    pub(crate) fn column_scan(
         &self,
         plan: &AccessPlan,
         components: &[usize],
-        out: &mut [Vec<u64>],
-    ) -> bool {
+    ) -> Option<ColumnScan<'_>> {
+        let nothing = ColumnScan {
+            keys: None,
+            start: 0,
+            end: 0,
+            positions: Vec::new(),
+        };
         let Some(adapted) = self.layout.adapt(plan) else {
-            return true; // nothing this layout holds matches
+            return Some(nothing); // nothing this layout holds matches
         };
         if adapted.exclude_default_graph {
-            return false;
+            return None;
         }
         let run = match &*self.runs {
-            [] => return true,
+            [] => return Some(nothing),
             [run] => run,
-            _ => return false,
+            _ => return None,
         };
         let perm = run.permutation(adapted.permutation);
         if !perm.tombstones.is_empty() {
-            return false;
+            return None;
         }
         let order = adapted.permutation.order();
         let positions: Vec<usize> = components
@@ -511,28 +902,34 @@ impl IndexVersion {
             })
             .collect();
         let (start, end) = perm.range(&adapted.low, &adapted.high);
-        perm.keys.decode_columns(start, end, &positions, out);
-        true
+        Some(ColumnScan {
+            keys: Some(&perm.keys),
+            start,
+            end,
+            positions,
+        })
     }
 
     pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
         let Some(plan) = self.layout.adapt(plan) else {
-            return QuadScan {
-                merge: SignedMerge::new(std::iter::empty()),
-                permutation: plan.permutation,
-                exclude_default_graph: false,
-            };
+            return QuadScan::new(
+                SignedMerge::new(std::iter::empty()),
+                plan.permutation,
+                false,
+            );
         };
         let parts = self.runs.iter().map(|run| {
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
             let perm = run.permutation(plan.permutation);
             let (start, end) = perm.range(&plan.low, &plan.high);
             (perm, start, end)
         });
-        QuadScan {
-            merge: SignedMerge::new(parts),
-            permutation: plan.permutation,
-            exclude_default_graph: plan.exclude_default_graph,
-        }
+        QuadScan::new(
+            SignedMerge::new(parts),
+            plan.permutation,
+            plan.exclude_default_graph,
+        )
     }
 
     /// `self` with `extra` on top, for reading only: their signs add to the stack's, so
@@ -659,20 +1056,73 @@ impl IndexVersion {
     }
 }
 
+/// A column scan of one version ([`IndexVersion::column_scan`]): how many rows it decodes,
+/// known before it decodes them.
+pub(crate) struct ColumnScan<'a> {
+    keys: Option<&'a PackedKeys>,
+    start: usize,
+    end: usize,
+    positions: Vec<usize>,
+}
+
+impl ColumnScan<'_> {
+    /// The rows [`Self::decode`] appends to each column.
+    pub(crate) fn rows(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Appends each component's values to the matching vector of `out`, which grows by
+    /// exactly [`Self::rows`]: the capacity a caller charged for them.
+    pub(crate) fn decode(&self, out: &mut [Vec<u64>]) {
+        if let Some(keys) = self.keys {
+            keys.decode_columns(self.start, self.end, &self.positions, out);
+        }
+    }
+}
+
 /// Iterator returned by [`IndexVersion::scan`].
 pub(crate) struct QuadScan<'a> {
     merge: SignedMerge<'a>,
     permutation: Permutation,
     exclude_default_graph: bool,
+    /// A counted scan's ledger between its steps: units asked for and not yet taken, and the
+    /// last run asked for ([`Ledger`]).
+    ledger: (u64, u64),
 }
 
-impl Iterator for QuadScan<'_> {
-    type Item = EncodedQuad;
+pub(crate) use crate::visit::{Stopped, Visitor};
 
+impl<'a> QuadScan<'a> {
+    fn new(merge: SignedMerge<'a>, permutation: Permutation, exclude_default_graph: bool) -> Self {
+        Self {
+            merge,
+            permutation,
+            exclude_default_graph,
+            ledger: (0, 0),
+        }
+    }
+
+    /// A scan of nothing: what a counted read stopped while its scan was being made goes on
+    /// with (its stop the visitor's to tell).
+    pub(crate) fn empty(permutation: Permutation) -> Self {
+        Self::new(SignedMerge::new(std::iter::empty()), permutation, false)
+    }
+
+    /// The next visible quad, its merge's work counted on `account` ([`SignedMerge::step`]).
+    /// The keys passed over (deleted ones, or the default graph's where it is left out) count
+    /// as much as the one handed on (REAS-2 fix check r1, R2-F1: a long deleted run can't be
+    /// drained unseen). The plain scan, the counted scan and a count all use it.
     #[inline]
-    fn next(&mut self) -> Option<EncodedQuad> {
+    pub(crate) fn step_with(
+        &mut self,
+        account: &mut impl Account,
+    ) -> Result<Option<EncodedQuad>, Stopped> {
         loop {
-            let (key, sign) = self.merge.next()?;
+            let Some((key, sign)) = self.merge.step(account)? else {
+                return Ok(None);
+            };
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
             }
@@ -680,8 +1130,41 @@ impl Iterator for QuadScan<'_> {
             if self.exclude_default_graph && quad.graph.is_default_graph() {
                 continue;
             }
-            return Some(quad);
+            return Ok(Some(quad));
         }
+    }
+
+    /// [`Iterator::next`], its work counted on `visit` before it is done, from the ledger
+    /// the scan's making started (REAS-3, sweeps SW005, SW007; fix check r1 F1). `Err` once
+    /// `visit` has stopped, and on every call after: nothing more is read. Readers that count
+    /// nothing use `next`.
+    #[inline]
+    pub(crate) fn next_counted(
+        &mut self,
+        visit: Visitor<'_>,
+    ) -> Result<Option<EncodedQuad>, Stopped> {
+        let mut ledger = Ledger::new(visit);
+        (ledger.left, ledger.run) = self.ledger;
+        let next = self.step_with(&mut ledger);
+        self.ledger = (ledger.left, ledger.run);
+        next
+    }
+
+    /// This scan as an iterator for a counted read: [`Self::next_counted`]'s quads, ending
+    /// where it ends or stops (the stop is the visitor's to tell: `visit(0)`).
+    pub(crate) fn counted<'v>(self, visit: Visitor<'v>) -> CountedScan<'a, 'v> {
+        CountedScan { scan: self, visit }
+    }
+}
+
+impl Iterator for QuadScan<'_> {
+    type Item = EncodedQuad;
+
+    /// [`QuadScan::step_with`], counting nothing. A scan that a counted read stopped reads as
+    /// ended here ([`SignedMerge`]'s iterator).
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.step_with(&mut Free).unwrap_or(None)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -689,5 +1172,23 @@ impl Iterator for QuadScan<'_> {
     }
 }
 
+/// [`QuadScan::counted`]: [`QuadScan::next_counted`]'s quads, the visitor asked once per
+/// run of the scan's ledger, not once per step.
+pub(crate) struct CountedScan<'a, 'v> {
+    scan: QuadScan<'a>,
+    visit: Visitor<'v>,
+}
+
+impl Iterator for CountedScan<'_, '_> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        self.scan.next_counted(self.visit).ok().flatten()
+    }
+}
+
+#[cfg(test)]
+mod count_tests;
 #[cfg(test)]
 mod model_tests;

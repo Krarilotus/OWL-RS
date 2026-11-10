@@ -115,15 +115,16 @@ fn classification_needs_a_scope_that_reads_everything() {
     }
 }
 
-/// Term ids for a generated ontology, with their N-Triples text.
+/// Term ids for a generated ontology, with their N-Triples text (the DL-oracle
+/// differential's cases too).
 #[derive(Default)]
-struct Table {
-    text: Vec<String>,
-    ids: HashMap<String, Term>,
+pub(crate) struct Table {
+    pub(crate) text: Vec<String>,
+    pub(crate) ids: HashMap<String, Term>,
 }
 
 impl Table {
-    fn id(&mut self, text: String) -> Term {
+    pub(crate) fn id(&mut self, text: String) -> Term {
         if let Some(&id) = self.ids.get(&text) {
             return id;
         }
