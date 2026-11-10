@@ -17,9 +17,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
-use nrese_rdf::{BlankNode, NamedNode, Variable};
+use nrese_rdf::{BlankNode, NamedNode, Term, Variable};
 
-use crate::algebra::{Expression, GraphPattern};
+use crate::algebra::{Expression, Function, GraphPattern};
 use crate::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 use crate::visit::NodeMut;
 
@@ -74,11 +74,78 @@ const SENT_CONSTANT: &str = "urn:nrese:substituted-blank-node:";
 /// variable, so the two stay one node. A pattern that would match a made constant matches
 /// nothing ([`unmatchable`]). Unchanged, and nothing renamed, when the pattern holds no
 /// made name.
-pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
+pub fn printable(pattern: GraphPattern) -> (GraphPattern, Sent) {
+    printable_avoiding(pattern, [])
+}
+
+/// Also reserves variables outside the pattern, such as CONSTRUCT template variables.
+pub fn printable_avoiding(
+    pattern: GraphPattern,
+    reserved: impl IntoIterator<Item = Variable>,
+) -> (GraphPattern, Sent) {
+    printable_names(
+        pattern,
+        reserved
+            .into_iter()
+            .map(|v| v.as_str().to_owned())
+            .collect(),
+    )
+}
+
+/// Prints resolved ground triple values as RDF1.2 terms (or TRIPLE expressions).
+/// Blank identities remain local-only, as in printable without a resolver.
+pub fn printable_with_values(
+    mut pattern: GraphPattern,
+    value: impl Fn(&str) -> Option<Term>,
+) -> (GraphPattern, Sent) {
+    let ground = |n: &NamedNode| {
+        if !is_constant(n.as_str()) {
+            return None;
+        }
+        let term = value(n.as_str())?;
+        if !matches!(term, Term::Triple(_)) {
+            return None;
+        }
+        GroundTerm::try_from(term).ok()
+    };
+    let mut stack = vec![NodeMut::Pattern(&mut pattern)];
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeMut::Pattern(p) => {
+                match p {
+                    GraphPattern::Bgp { patterns } => {
+                        for t in patterns {
+                            sent_term(&mut t.subject, &ground);
+                            sent_term(&mut t.object, &ground);
+                        }
+                    }
+                    GraphPattern::Path {
+                        subject, object, ..
+                    } => {
+                        sent_term(subject, &ground);
+                        sent_term(object, &ground);
+                    }
+                    _ => {}
+                }
+                stack.extend(p.children_mut());
+            }
+            NodeMut::Expression(e) => {
+                if let Expression::NamedNode(n) = e
+                    && let Some(term) = ground(n)
+                {
+                    *e = sent_expression(term);
+                }
+                stack.extend(e.children_mut());
+            }
+        }
+    }
+    printable_names(pattern, HashSet::new())
+}
+
+fn printable_names(mut pattern: GraphPattern, mut taken: HashSet<String>) -> (GraphPattern, Sent) {
     // First what the pattern names, then the renames: a new name is clear of every one.
     let mut made: HashSet<Variable> = HashSet::new();
     let mut constants = false;
-    let mut taken: HashSet<String> = HashSet::new();
     walk_mut(NodeMut::Pattern(&mut pattern), &mut |slot| match slot {
         SlotMut::Variable(v) if is_variable(v) => {
             made.insert(v.clone());
@@ -131,6 +198,36 @@ pub fn printable(mut pattern: GraphPattern) -> (GraphPattern, Sent) {
     }
     let local = names.into_iter().map(|(made, sent)| (sent, made)).collect();
     (pattern, Sent(local))
+}
+
+fn sent_term(term: &mut TermPattern, ground: &impl Fn(&NamedNode) -> Option<GroundTerm>) {
+    match term {
+        TermPattern::NamedNode(n) => {
+            if let Some(value) = ground(n) {
+                *term = value.into();
+            }
+        }
+        TermPattern::Triple(t) => {
+            sent_term(&mut t.subject, ground);
+            sent_term(&mut t.object, ground);
+        }
+        _ => {}
+    }
+}
+
+fn sent_expression(term: GroundTerm) -> Expression {
+    match term {
+        GroundTerm::NamedNode(n) => Expression::NamedNode(n),
+        GroundTerm::Literal(l) => Expression::Literal(l),
+        GroundTerm::Triple(t) => Expression::FunctionCall(
+            Function::Triple,
+            vec![
+                Expression::NamedNode(t.subject),
+                Expression::NamedNode(t.predicate),
+                sent_expression(t.object),
+            ],
+        ),
+    }
 }
 
 /// Each basic graph pattern, path and GRAPH of `pattern` that would match a made constant

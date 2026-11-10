@@ -9,6 +9,61 @@ use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql_syntax::SparqlParser;
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
+/// Spec: retaining an alias reserves at least its copied literal payload, once (F1).
+#[test]
+fn e1_followup_alias_retention_is_charged_once() {
+    let engine = store([]);
+    let payload = "x".repeat(65_536);
+    let term: Term = nrese_rdf::Triple::new(
+        node("s"),
+        node("p"),
+        nrese_rdf::Literal::from(payload.as_str()),
+    )
+    .into();
+    let mut tx = engine.transaction();
+    tx.insert(Quad::new(node("r"), node("p"), term.clone(), GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let id = ctx.id(&term).ok().unwrap();
+    let alias = internal::class_constant(id);
+    let before = ctx.budget.used();
+    ctx.register_alias(alias.as_str(), id);
+    let after = ctx.budget.used();
+    assert!(
+        after - before >= payload.len(),
+        "retained triple copy must draw from the budget"
+    );
+    ctx.register_alias(alias.as_str(), id);
+    assert_eq!(ctx.budget.used(), after, "same alias retains no new value");
+    let options = QueryOptions {
+        resources: crate::Resources {
+            memory: Envelope::new(Some(payload.len() - 1), None),
+            ..crate::Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let limited = Context::new(&snapshot, &options, None, None);
+    assert!(
+        limited.check().is_ok(),
+        "reader state fits before the alias"
+    );
+    limited.register_alias(alias.as_str(), id);
+    assert!(limited.check().is_err(), "the copied payload cannot fit");
+    assert!(
+        limited.aliases.borrow().is_empty(),
+        "nothing kept on refusal"
+    );
+    let query = SparqlParser::new()
+        .parse_query("SELECT * WHERE {}")
+        .unwrap();
+    assert!(
+        native_pattern(&query, &options, &limited).is_err(),
+        "preparation must propagate the alias refusal too"
+    );
+}
+
 fn node(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{local}"))
 }
