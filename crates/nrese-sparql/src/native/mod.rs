@@ -49,6 +49,8 @@ pub(crate) use pushdown::per_solution;
 mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod optimise_tests;
 pub(crate) mod ql;
 mod ranges;
 mod search;
@@ -680,12 +682,20 @@ fn optimise(
         }),
     ];
     passes.into_iter().fold(pattern, |pattern, (name, pass)| {
+        #[cfg(test)]
+        PASSES_RUN.set(PASSES_RUN.get() + 1);
         let rewritten = pass(&pattern);
         if rewritten != pattern {
             fired.push(name);
         }
         rewritten
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rewrite passes [`optimise`] ran on this thread.
+    static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.
