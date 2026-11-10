@@ -65,6 +65,52 @@ fn scan(snapshot: &Snapshot, model: ReadModel) -> BTreeSet<EncodedQuad> {
 }
 
 #[test]
+fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
+    // Spec: Engine::set_equality expands the current version's classes. Removing
+    // a sameAs edge while disabled must split the class after re-enabling, just as
+    // reopening does; an older snapshot must retain its original answers.
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
+    intern_terms(&engine);
+    let (a, b, same_as, p, o) = (id(1), id(2), id(3), id(4), id(5));
+    let edge = EncodedTriple::new(a, same_as, b).in_default_graph();
+    let fact = EncodedTriple::new(a, p, o).in_default_graph();
+    engine.set_equality(Some(same_as));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(edge);
+    tx.insert_encoded(fact);
+    tx.commit().unwrap();
+    let held = engine.snapshot();
+    let before = scan(&held, ReadModel::Materialised);
+    assert!(before.contains(&EncodedTriple::new(b, p, o).in_default_graph()));
+    engine.set_equality(None);
+    let mut tx = engine.transaction();
+    tx.remove_encoded(edge);
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let after = scan(&engine.snapshot(), ReadModel::Materialised);
+    assert_eq!(
+        after,
+        BTreeSet::from([fact]),
+        "the removed edge no longer equates a and b"
+    );
+    assert_eq!(
+        scan(&held, ReadModel::Materialised),
+        before,
+        "held snapshot"
+    );
+    drop(held);
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config).unwrap();
+    reopened.set_equality(Some(same_as));
+    assert_eq!(after, scan(&reopened.snapshot(), ReadModel::Materialised));
+}
+
+#[test]
 fn read_models_select_the_stacks() {
     let engine = engine();
     let asserted = triple(1, 2, 3).in_default_graph();
