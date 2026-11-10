@@ -1152,6 +1152,7 @@ name = "nrese-sparql-syntax"
 version = "0.1.0"
 dependencies = [
  "nrese-rdf",
+ "smallvec",
  "thiserror 2.0.21",
 ]
 
