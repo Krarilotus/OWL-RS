@@ -94,8 +94,8 @@ fn a_global_engine_keeps_no_corpora() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     base(&engine);
     let snapshot = engine.snapshot();
-    assert_eq!(snapshot.text_search(&query("alpha beta")).len(), 3);
-    assert_eq!(snapshot.iri_search(&query("alpha")).len(), 0);
+    assert_eq!(snapshot.text_search(&query("alpha beta")).unwrap().len(), 3);
+    assert_eq!(snapshot.iri_search(&query("alpha")).unwrap().len(), 0);
     let mut tx = engine.transaction();
     tx.insert(label("c", "gamma", None).as_ref());
     let _pending = tx.pending_snapshot();
@@ -402,14 +402,14 @@ fn check(
         }
     }
     let typed: Vec<u64> = typed.into_iter().collect();
-    let vectors = snapshot.vector_corpus_members(model, scope);
+    let vectors = snapshot.vector_corpus_members(model, scope).unwrap();
     if vectors != typed {
         failed.push(format!(
             "{context}, {model:?}, {scope:?}, vectors: {vectors:?} != {typed:?}"
         ));
     }
     for iris in [false, true] {
-        let (members, documents, _) = snapshot.text_corpus_members(model, scope, iris);
+        let (members, documents, _) = snapshot.text_corpus_members(model, scope, iris).unwrap();
         let expected = visible(snapshot, model, scope, iris);
         if members != expected || documents != expected.len() as u64 {
             failed.push(format!(
@@ -1094,4 +1094,209 @@ fn a_vector_search_of_an_absent_dimension_builds_no_corpus() {
         .vector_search_in(MODEL, &EVERY, &query, &|_| true, &budget)
         .map(|(hits, report)| (hits.len(), report.space, report.scanned));
     assert_eq!(found.ok(), Some((0, 0, 0)));
+}
+
+/// A statement about a non-IRI identity of a class (`_:b owl:sameAs ex:needle`, or
+/// `"needle" owl:sameAs ex:needle`) shows its IRI identities as subjects to a reader of
+/// equality classes: inserting `_:b ex:p ex:o` into `ex:g` puts `ex:needle` in the IRI
+/// corpus of `ex:g`, deleting it takes `ex:needle` out (3.2 sol-loop r1 R1-S1: the touched
+/// terms left non-IRI subjects out before the class expansion, so the derived corpus missed
+/// the change). Both derivations: a writer's pending state over the base's kept corpus, and
+/// a commit's lineage step. Expanded and canonical readers, the identities interned in
+/// either order. Each IRI search equals an independent engine's holding the same statements
+/// (walked), and the corpus is derived.
+#[test]
+fn a_statement_about_a_non_iri_identity_changes_its_class_in_the_iri_corpus() {
+    use nrese_rdf::BlankNode;
+    let ex = |s: &str| NamedNode::new_unchecked(format!("http://example.com/{s}"));
+    // An engine with the class of `other` and `ex:needle` (inferred, `ex:needle` interned
+    // first where `needle_first`), `ex:filler ex:p ex:o` in `ex:g`, and `other ex:p ex:o`
+    // there where `with_held`; that statement and the scope of `ex:g`.
+    let setup = |other: &Term, needle_first: bool, with_held: bool| {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        engine.set_corpus_tuning(nrese_engine::CorpusTuning {
+            documents_per_probe: 1,
+            ..nrese_engine::CorpusTuning::DEFAULT
+        });
+        let mut tx = engine.transaction();
+        let needle: Term = ex("needle").into();
+        let (first, second) = match needle_first {
+            true => (&needle, other),
+            false => (other, &needle),
+        };
+        let (first, second) = (tx.intern(first.as_ref()), tx.intern(second.as_ref()));
+        // Stored as the reasoner stores a class: `identity sameAs representative`, the
+        // representative its smallest id.
+        let (rep, alias) = (first.min(second), first.max(second));
+        let same_as = tx.intern(
+            NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+                .as_ref()
+                .into(),
+        );
+        assert!(tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        }));
+        let held = EncodedQuad {
+            subject: tx.intern(other.as_ref()),
+            predicate: tx.intern(ex("p").as_ref().into()),
+            object: tx.intern(ex("o").as_ref().into()),
+            graph: tx.intern(ex("g").as_ref().into()),
+        };
+        assert!(tx.insert(Quad::new(ex("filler"), ex("p"), ex("o"), ex("g")).as_ref()));
+        if with_held {
+            assert!(tx.insert_encoded(held));
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let scope = TextScope::Graphs(GraphSelector::Exact(held.graph));
+        (engine, held, scope)
+    };
+    let read = |snapshot: &Snapshot, canonical: bool| match canonical {
+        true => snapshot.with_canonical_equality(),
+        false => snapshot.clone(),
+    };
+    let found = |snapshot: &Snapshot, scope: &TextScope| -> Vec<(String, f64)> {
+        let found = snapshot
+            .iri_search_in(MODEL, scope, &query("needle filler"), None)
+            .unwrap();
+        let mut found: Vec<_> = found
+            .iter()
+            .map(|m| match snapshot.decode(TermId::from_raw(m.id)) {
+                Some(Term::NamedNode(n)) => (n.as_str().to_owned(), m.relevance),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    };
+    let others: [(&str, Term); 2] = [
+        ("blank node", BlankNode::new_unchecked("b").into()),
+        ("literal", Literal::new_simple_literal("needle").into()),
+    ];
+    let mut failed = Vec::new();
+    for (other_name, other) in &others {
+        for needle_first in [true, false] {
+            for canonical in [false, true] {
+                for insert in [true, false] {
+                    let (truth, _, truth_scope) = setup(other, needle_first, insert);
+                    let want = found(&read(&truth.snapshot(), canonical), &truth_scope);
+                    for pending in [true, false] {
+                        let case = format!(
+                            "{other_name}, needle first {needle_first}, canonical {canonical}, \
+                             insert {insert}, pending {pending}"
+                        );
+                        let (engine, held, scope) = setup(other, needle_first, !insert);
+                        let published = engine.snapshot();
+                        found(&read(&published, canonical), &scope);
+                        let (walked, derived) = built(&published);
+                        let mut tx = engine.transaction();
+                        match insert {
+                            true => assert!(tx.insert_encoded(held)),
+                            false => assert!(tx.remove_encoded(held)),
+                        }
+                        let got = match pending {
+                            true => found(&read(&tx.pending_snapshot(), canonical), &scope),
+                            false => {
+                                tx.commit().unwrap();
+                                found(&read(&engine.snapshot(), canonical), &scope)
+                            }
+                        };
+                        if got != want {
+                            failed.push(format!("{case}: {got:?} != {want:?}"));
+                        }
+                        let (walked_after, derived_after) = built(&published);
+                        if walked_after != walked || derived_after <= derived {
+                            failed.push(format!(
+                                "{case}: walked {walked} -> {walked_after}, \
+                                 derived {derived} -> {derived_after}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} rows failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// A lineage step recorded while no corpus read equality classes holds only IRI subjects
+/// (sol-loop r2 P1: holding every subject always cost commits of blank-node statements 5 %,
+/// `dictlc-p32-count4`). A reader of classes whose corpus is kept only afterwards, for the
+/// step's parent, walks past it instead of deriving with the subjects missing.
+/// - Input: `_:b owl:sameAs ex:needle` (inferred) and `ex:filler ex:p ex:o` in `ex:g`; only
+///   a literal corpus kept; a commit of `_:b ex:p ex:o` into `ex:g` (its step); then the
+///   canonical IRI corpus of `ex:g` kept for the version before the commit, and searched
+///   for the version after it.
+/// - Expected: `ex:needle` found, as an engine with the same statements finds it.
+#[test]
+fn a_reader_of_classes_walks_past_a_step_without_its_subjects() {
+    use nrese_rdf::BlankNode;
+    let ex = |s: &str| NamedNode::new_unchecked(format!("http://example.com/{s}"));
+    let held = || Quad::new(BlankNode::new_unchecked("b"), ex("p"), ex("o"), ex("g"));
+    let setup = |with_held: bool| {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        engine.set_corpus_tuning(nrese_engine::CorpusTuning {
+            documents_per_probe: 1,
+            ..nrese_engine::CorpusTuning::DEFAULT
+        });
+        let mut tx = engine.transaction();
+        let needle = tx.intern(ex("needle").as_ref().into());
+        let blank = tx.intern(BlankNode::new_unchecked("b").as_ref().into());
+        let same_as = tx.intern(
+            NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+                .as_ref()
+                .into(),
+        );
+        // `identity sameAs representative`, the representative the smallest id.
+        assert!(tx.insert_inferred(EncodedTriple {
+            subject: needle.max(blank),
+            predicate: same_as,
+            object: needle.min(blank),
+        }));
+        tx.insert(Quad::new(ex("filler"), ex("p"), ex("o"), ex("g")).as_ref());
+        tx.insert(label("a", "alpha", None).as_ref());
+        if with_held {
+            assert!(tx.insert(held().as_ref()));
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        engine
+    };
+    let search = |snapshot: &Snapshot| {
+        let g = snapshot.lookup(ex("g").as_ref().into()).unwrap();
+        let scope = TextScope::Graphs(GraphSelector::Exact(g));
+        let found = snapshot
+            .with_canonical_equality()
+            .iri_search_in(MODEL, &scope, &query("needle filler"), None)
+            .unwrap();
+        let mut found: Vec<String> = found
+            .iter()
+            .map(|m| match snapshot.decode(TermId::from_raw(m.id)) {
+                Some(Term::NamedNode(n)) => n.as_str().to_owned(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let want = search(&setup(true).snapshot());
+    let engine = setup(false);
+    let before = engine.snapshot();
+    // A literal corpus only: the commit's step is recorded, without the blank node.
+    every(&before, "alpha");
+    let mut tx = engine.transaction();
+    assert!(tx.insert(held().as_ref()));
+    tx.commit().unwrap();
+    // The reader of classes keeps its corpus for the version before the step.
+    search(&before);
+    let got = search(&engine.snapshot());
+    assert_eq!(got, want);
+    assert!(want.iter().any(|iri| iri.ends_with("/needle")), "{want:?}");
 }

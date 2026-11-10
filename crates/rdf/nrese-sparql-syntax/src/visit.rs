@@ -32,54 +32,66 @@ impl GraphPattern {
     /// The nodes directly in this pattern: its sub-patterns and the expressions attached
     /// to it, in the order they are written.
     pub fn children(&self) -> Vec<Node<'_>> {
+        let mut nodes = Vec::new();
+        self.each_child(|node| nodes.push(node));
+        nodes
+    }
+
+    /// Each of [`Self::children`] given to `f`, in order, without allocating.
+    pub fn each_child<'a>(&'a self, mut f: impl FnMut(Node<'a>)) {
         match self {
-            Self::Bgp { .. } | Self::Path { .. } | Self::Values { .. } => Vec::new(),
+            Self::Bgp { .. } | Self::Path { .. } | Self::Values { .. } => {}
             Self::Join { inputs } | Self::Union { inputs } => {
-                inputs.iter().map(Node::Pattern).collect()
+                inputs.iter().for_each(|input| f(Node::Pattern(input)));
             }
             Self::Lateral { left, right } | Self::Minus { left, right } => {
-                vec![Node::Pattern(left), Node::Pattern(right)]
+                f(Node::Pattern(left));
+                f(Node::Pattern(right));
             }
             Self::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                let mut nodes = vec![Node::Pattern(left), Node::Pattern(right)];
-                nodes.extend(expression.as_ref().map(Node::Expression));
-                nodes
+                f(Node::Pattern(left));
+                f(Node::Pattern(right));
+                if let Some(expression) = expression {
+                    f(Node::Expression(expression));
+                }
             }
-            Self::Filter { expr, inner } => vec![Node::Pattern(inner), Node::Expression(expr)],
-            Self::Extend { inner, bindings } => std::iter::once(Node::Pattern(inner))
-                .chain(bindings.iter().map(|(_, e)| Node::Expression(e)))
-                .collect(),
-            Self::OrderBy { inner, expression } => std::iter::once(Node::Pattern(inner))
-                .chain(
-                    expression
-                        .iter()
-                        .map(|order| Node::Expression(order.expression())),
-                )
-                .collect(),
+            Self::Filter { expr, inner } => {
+                f(Node::Pattern(inner));
+                f(Node::Expression(expr));
+            }
+            Self::Extend { inner, bindings } => {
+                f(Node::Pattern(inner));
+                bindings.iter().for_each(|(_, e)| f(Node::Expression(e)));
+            }
+            Self::OrderBy { inner, expression } => {
+                f(Node::Pattern(inner));
+                for order in expression {
+                    f(Node::Expression(order.expression()));
+                }
+            }
             Self::Group {
                 inner, aggregates, ..
-            } => std::iter::once(Node::Pattern(inner))
-                .chain(
-                    aggregates
-                        .iter()
-                        .filter_map(|(_, aggregate)| match aggregate {
-                            AggregateExpression::CountSolutions { .. } => None,
-                            AggregateExpression::FunctionCall { expr, .. } => {
-                                Some(Node::Expression(expr))
-                            }
-                        }),
-                )
-                .collect(),
+            } => {
+                f(Node::Pattern(inner));
+                for (_, aggregate) in aggregates {
+                    match aggregate {
+                        AggregateExpression::CountSolutions { .. } => {}
+                        AggregateExpression::FunctionCall { expr, .. } => {
+                            f(Node::Expression(expr));
+                        }
+                    }
+                }
+            }
             Self::Graph { inner, .. }
             | Self::Service { inner, .. }
             | Self::Project { inner, .. }
             | Self::Distinct { inner }
             | Self::Reduced { inner }
-            | Self::Slice { inner, .. } => vec![Node::Pattern(inner)],
+            | Self::Slice { inner, .. } => f(Node::Pattern(inner)),
         }
     }
 
@@ -148,10 +160,15 @@ impl GraphPattern {
 impl Expression {
     /// The nodes directly in this expression: its operands, or an `EXISTS`'s pattern.
     pub fn children(&self) -> Vec<Node<'_>> {
+        let mut nodes = Vec::new();
+        self.each_child(|node| nodes.push(node));
+        nodes
+    }
+
+    /// Each of [`Self::children`] given to `f`, in order, without allocating.
+    pub fn each_child<'a>(&'a self, mut f: impl FnMut(Node<'a>)) {
         match self {
-            Self::NamedNode(_) | Self::Literal(_) | Self::Variable(_) | Self::Bound(_) => {
-                Vec::new()
-            }
+            Self::NamedNode(_) | Self::Literal(_) | Self::Variable(_) | Self::Bound(_) => {}
             Self::Or(a, b)
             | Self::And(a, b)
             | Self::Equal(a, b)
@@ -163,20 +180,24 @@ impl Expression {
             | Self::Add(a, b)
             | Self::Subtract(a, b)
             | Self::Multiply(a, b)
-            | Self::Divide(a, b) => vec![Node::Expression(a), Node::Expression(b)],
-            Self::In(a, list) => std::iter::once(Node::Expression(a))
-                .chain(list.iter().map(Node::Expression))
-                .collect(),
-            Self::UnaryPlus(a) | Self::UnaryMinus(a) | Self::Not(a) => vec![Node::Expression(a)],
-            Self::If(a, b, c) => vec![
-                Node::Expression(a),
-                Node::Expression(b),
-                Node::Expression(c),
-            ],
-            Self::Coalesce(list) | Self::FunctionCall(_, list) => {
-                list.iter().map(Node::Expression).collect()
+            | Self::Divide(a, b) => {
+                f(Node::Expression(a));
+                f(Node::Expression(b));
             }
-            Self::Exists(pattern) => vec![Node::Pattern(pattern)],
+            Self::In(a, list) => {
+                f(Node::Expression(a));
+                list.iter().for_each(|e| f(Node::Expression(e)));
+            }
+            Self::UnaryPlus(a) | Self::UnaryMinus(a) | Self::Not(a) => f(Node::Expression(a)),
+            Self::If(a, b, c) => {
+                f(Node::Expression(a));
+                f(Node::Expression(b));
+                f(Node::Expression(c));
+            }
+            Self::Coalesce(list) | Self::FunctionCall(_, list) => {
+                list.iter().for_each(|e| f(Node::Expression(e)));
+            }
+            Self::Exists(pattern) => f(Node::Pattern(pattern)),
         }
     }
 
@@ -223,14 +244,21 @@ impl Expression {
     }
 }
 
+/// The nodes [`find`]'s stack holds in place before it allocates: more than a query's algebra
+/// leaves pending at once (its nesting and its widest node's children), so a search of one
+/// allocates nothing; a deeper or wider tree is still searched, its stack on the heap.
+const FIND_INLINE: usize = 32;
+
 /// Depth first and left to right, with a stack of its own: any tree can be searched.
 fn find(node: Node<'_>, f: &mut impl FnMut(Node<'_>) -> bool) -> bool {
-    let mut stack = vec![node];
+    let mut stack: smallvec::SmallVec<[Node<'_>; FIND_INLINE]> = smallvec::smallvec![node];
     while let Some(node) = stack.pop() {
         if f(node) {
             return true;
         }
-        stack.extend(node.children().into_iter().rev());
+        let first = stack.len();
+        node.each_child(|child| stack.push(child));
+        stack[first..].reverse();
     }
     false
 }
@@ -240,6 +268,13 @@ impl<'a> Node<'a> {
         match self {
             Node::Pattern(pattern) => pattern.children(),
             Node::Expression(expression) => expression.children(),
+        }
+    }
+
+    fn each_child(self, f: impl FnMut(Node<'a>)) {
+        match self {
+            Node::Pattern(pattern) => pattern.each_child(f),
+            Node::Expression(expression) => expression.each_child(f),
         }
     }
 }

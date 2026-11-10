@@ -17,6 +17,35 @@ headers = { location = { contains = "/repositories/nrese/transactions/" } }
 tx = { header = "location", regex = "/transactions/([^/?]+)$" }
 
 [[step]]
+name = "stage an RDF load in the first transaction"
+method = "PUT"
+path = "/repositories/nrese/transactions/${tx}"
+params = { action = "ADD" }
+headers = { Content-Type = "text/turtle" }
+body = '<http://example.com/private> <http://example.com/value> "staged" .'
+[step.expect]
+status = 200
+
+[[step]]
+name = "the first transaction reads its own load"
+method = "PUT"
+path = "/repositories/nrese/transactions/${tx}"
+params = { action = "QUERY", query = "ASK { <http://example.com/private> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = true }
+
+[[step]]
+name = "a separate request cannot see the uncommitted load"
+path = "/repositories/nrese"
+params = { query = "ASK { <http://example.com/private> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = false }
+
+[[step]]
 name = "roll it back"
 method = "DELETE"
 path = "/repositories/nrese/transactions/${tx}"
@@ -49,6 +78,16 @@ form = { "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLev
 status = 201
 [step.capture]
 tx_read = { header = "location", regex = "/transactions/([^/?]+)$" }
+
+[[step]]
+name = "a second transaction cannot see the rolled-back load"
+method = "PUT"
+path = "/repositories/nrese/transactions/${tx_read}"
+params = { action = "QUERY", query = "ASK { <http://example.com/private> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = false }
 
 [[step]]
 name = "roll back the SNAPSHOT_READ transaction"

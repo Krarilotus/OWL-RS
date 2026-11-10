@@ -6,7 +6,7 @@ use nrese_server::policy::{PolicyConfig, RateLimitConfig};
 use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, readyz_text, test_app_with_policy, test_app_with_store_config};
+use crate::support::{body_text, test_app_with_policy, test_app_with_store_config};
 
 fn admin_policy() -> PolicyConfig {
     PolicyConfig {
@@ -162,7 +162,16 @@ async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
         .await?;
     assert!(body_text(ask).await?.contains("true"));
 
-    assert!(readyz_text(app).await?.contains("\"revision\":1"));
+    let info = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/info")
+                .header("authorization", "Bearer reader")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(info.status(), StatusCode::OK);
+    assert!(body_text(info).await?.contains("\"revision\":1"));
 
     Ok(())
 }

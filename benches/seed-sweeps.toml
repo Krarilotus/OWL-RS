@@ -29,12 +29,16 @@ memory_mib = 8192
 [[target]]
 crate = "nrese-engine"
 lib = true
-filters = ["random_commits_with_policy_compaction_match_the_model", "arbitrary_compaction_windows_preserve_contents"]
+filters = ["index::model_tests::random_commits_with_policy_compaction_match_the_model",
+           "index::model_tests::arbitrary_compaction_windows_preserve_contents",
+           "index::model_tests::old_versions_are_unaffected_by_later_writes",
+           "index::model_tests::default_graph_versions_turn_into_quad_versions_at_a_named_graph"]
 
 [[target]]
 crate = "nrese-engine"
 test = "it"
-filters = ["both_stacks_match_the_model_with_compaction", "both_stacks_survive_checkpoints_and_reopening"]
+filters = ["inferred_stack_tests::both_stacks_match_the_model_with_compaction",
+           "inferred_stack_tests::both_stacks_survive_checkpoints_and_reopening"]
 
 [[target]]
 crate = "nrese-fuzz"
@@ -49,27 +53,63 @@ filters = ["clauses_and_ontologies_have_the_same_models"]
 [[target]]
 crate = "nrese-reasoner"
 lib = true
-filters = ["every_maintenance_plan_keeps_the_stack_equal_to_recomputation", "delta_equals_rematerialisation_under_random_changes",
-           "closed_families_skip_their_own_output_exactly", "in_place_drivers_visit_what_a_scan_visits",
-           "list_rules_follow_list_edits_under_the_delta_executor"]
+filters = ["representatives_expand_to_the_replicated_closure", "every_maintenance_plan_keeps_the_stack_equal_to_recomputation", "delta_equals_rematerialisation_under_random_changes",
+           "in_place_drivers_visit_what_a_scan_visits", "every_profile_batch_equals_naive",
+           "hidden_unnamed_classes_leave_the_rest_of_the_closure",
+           "guarded_maintenance_equals_rematerialisation_over_representatives", "delta_equality_equals_rematerialisation",
+           "materialisation_stops_when_asked", "batch_equals_naive_on_random_ontologies",
+           "graph_sets::tests::support_sets_give_the_closure_of_each_set_of_graphs",
+           "graph_sets::tests::updates_equal_recomputation"]
 
 [[target]]
 crate = "nrese-server"
 test = "it"
-filters = ["random_requests_get_answers_not_server_errors", "random_requests_with_tokens_get_answers_not_server_errors"]
+filters = ["http_fuzz_tests::random_requests_get_answers_not_server_errors",
+           "http_fuzz_tests::random_requests_with_tokens_get_answers_not_server_errors"]
 
 [[target]]
 crate = "nrese-shacl"
 test = "it"
-filters = ["incremental_validation_equals_the_difference_of_full_validations"]
+filters = ["incremental_tests::incremental_validation_equals_the_difference_of_full_validations"]
 
 [[target]]
 crate = "nrese-sparql"
 test = "it"
-filters = ["native_updates_equal_the_reference", "updates_over_the_merged_default_graph_equal_the_reference",
-           "updates_with_a_dataset_equal_the_reference", "multi_operation_updates_equal_the_reference"]
+filters = ["native_differential_tests::native_results_equal_the_reference_on_random_queries",
+           "native_differential_tests::pushed_filters_equal_the_reference",
+           "native_differential_tests::paths_from_bound_values_equal_the_reference",
+           "native_differential_tests::open_closures_and_their_counts_equal_the_reference",
+           "native_differential_tests::computed_values_equal_the_reference",
+           "native_differential_tests::duplicate_insensitive_queries_equal_both_evaluations",
+           "native_differential_tests::joins_on_unbound_variables_equal_the_reference",
+           "native_differential_tests::cyclic_bgps_equal_the_reference",
+           "native_differential_tests::construct_equals_the_reference",
+           "native_differential_tests::graph_patterns_equal_the_reference",
+           "native_differential_tests::string_functions_casts_and_group_concat_equal_the_reference",
+           "native_differential_tests::native_updates_equal_the_reference",
+           "native_differential_tests::direct_results_equal_the_results_serialiser",
+           "native_differential_tests::the_merged_default_graph_equals_the_reference",
+           "native_differential_tests::updates_over_the_merged_default_graph_equal_the_reference",
+           "native_differential_tests::datasets_and_graph_patterns_equal_the_reference",
+           "native_differential_tests::updates_with_a_dataset_equal_the_reference",
+           "native_differential_tests::joins_over_graph_sets_by_probes_and_by_scans_equal_the_reference",
+           "native_differential_tests::exists_equal_the_reference",
+           "native_differential_tests::describe_equals_the_reference",
+           "native_differential_tests::the_remaining_functions_run_natively",
+           "native_differential_tests::sideways_joins_equal_the_reference",
+           "native_differential_tests::multi_operation_updates_equal_the_reference",
+           "native_differential_tests::identity_classes_shrink_detached_optionals",
+           "native_differential_tests::triple_terms_and_base_directions_equal_the_reference",
+           "native_differential_tests::reified_edges_hop_through_triple_terms_as_the_reference",
+           "native_differential_tests::grouped_cross_products_equal_the_reference",
+           "native_differential_tests::equalities_across_patterns_equal_the_reference",
+           "native_differential_tests::streamed_groups_equal_the_reference",
+           "native_differential_tests::eager_aggregation_equals_the_reference_on_random_groups",
+           "native_differential_tests::paths_ordered_with_patterns_equal_the_reference"]
 
 [[target]]
 crate = "nrese-store"
 test = "it"
-filters = ["compact_equality_answers_as_replication_on_random_data", "compact_equality_survives_a_restart"]
+filters = ["equality_compact_tests::compact_equality_answers_as_replication_on_random_data",
+           "equality_compact_tests::late_expansion_answers_as_early_expansion_and_replication",
+           "dl_oracle_tests::generated_cases_answer_as_the_dl_oracle"]

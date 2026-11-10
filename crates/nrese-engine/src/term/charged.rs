@@ -6,11 +6,6 @@
 //! the value out of its `Arc` ([`Arc::into_inner`], which frees the block), then lets the value
 //! and the block's own reservation drop.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "suffixes and overlays are made from package 2b")
-)]
-
 use std::sync::Arc;
 
 use nrese_exec::{Budget, BudgetExceeded, Reservation};

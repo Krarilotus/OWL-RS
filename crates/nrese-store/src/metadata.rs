@@ -145,8 +145,10 @@ pub(crate) mod tests {
     /// Expected, judged apart:
     /// - the reopen and its reads work (guard: a reopen changes nothing on disk);
     /// - a namespace change is refused, not published, and leaves the store available;
-    /// - the reasoning marker of a rematerialisation is refused (`InferencesNotRecorded`: the
-    ///   inferences are published in memory, unrecorded);
+    /// - a rematerialisation is refused before it publishes anything: the removal of the
+    ///   certificate of the closure it would replace can't be made durable (Q06 remainder,
+    ///   review r1 F3; before it, the marker was refused after the publication,
+    ///   `InferencesNotRecorded`), and the inferences aren't there;
     /// - reopened, neither the binding nor the reasoning is there;
     /// - once naming works, the same change and rematerialisation are acknowledged (a retry
     ///   after a refusal), and the binding and the reasoning are there after a reopen;
@@ -203,11 +205,17 @@ pub(crate) mod tests {
             ));
         }
         match store.rematerialise(&program) {
-            Err(StoreError::InferencesNotRecorded(_)) => {}
+            Err(StoreError::Io(_)) => {}
             other => wrong.push(format!(
-                "a reasoning marker placed before its store was named: {:?}",
+                "a rematerialisation not refused before it published, its store not named: {:?}",
                 other.map(drop)
             )),
+        }
+        let derived = store
+            .execute_query_str("ASK { <http://example.com/a> a <http://example.com/D> }")
+            .unwrap();
+        if String::from_utf8_lossy(&derived.payload).contains("true") {
+            wrong.push("a refused rematerialisation published its inferences".to_owned());
         }
         FAIL_NAMING_OF.set(None);
         // Reopened (the refusals' durable outcome, modelled): neither is there.
@@ -250,5 +258,159 @@ pub(crate) mod tests {
         std::fs::create_dir(dir.path().join("settings.json.tmp")).unwrap();
         assert!(super::write(&file, b"{\"new\": 2}").is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"{\"old\": 1}");
+    }
+
+    /// Makes `link` a link to the directory `target` (absolute): a symbolic link on Linux, a
+    /// junction on Windows (which needs no privilege).
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            // `cmd` reads a `/` in an argument as an option's start: backslashes only.
+            let native = |path: &std::path::Path| path.to_string_lossy().replace('/', "\\");
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(native(link))
+                .arg(native(target))
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "mklink /J: {made:?}");
+        }
+    }
+
+    /// One row of [`metadata_through_a_link_waits_for_every_name_it_reads`].
+    struct LinkRow {
+        name: &'static str,
+        /// The store's physical directory.
+        physical: &'static str,
+        /// The link, and the directory it points to.
+        link: &'static str,
+        target: &'static str,
+        /// The path the store is opened by.
+        opened: &'static str,
+        /// The directory whose sync fails.
+        failing: &'static str,
+        /// Other directories there.
+        extra: &'static [&'static str],
+    }
+
+    /// A store reached through a link has its metadata acknowledged only once every name the
+    /// link's resolution reads is durable (DUR-4, fix check DEFER-F1-SYM): the link's own entry
+    /// and the target's chain. A copied store at `data/new/store`, reached as `stable/store`
+    /// (the store's own level a link) or `a/b/store` with `a` → `real/a` (an intermediate
+    /// link); a sync of one directory failing with a non-permission error
+    /// (`nrese_engine::fault_points`). Expected, row by row, judged apart:
+    /// - a **target holder** failing (`data/new`; `real`, which holds the target `a`): a
+    ///   namespace change refused, not
+    ///   published, the store available; reopened, no binding; the fault cleared, a retry
+    ///   acknowledged and there after a reopen;
+    /// - the **link's holder** failing (`stable`; the link's own name): refused alike;
+    /// - Windows, `..` after a link (`b\alias\..\tenant\store`, which Windows takes as
+    ///   `b\tenant\store`): the actual holder `b\tenant` failing refuses alike.
+    ///
+    /// Before the fix only the path's lexical holders were synced, so a target holder's fault
+    /// was never reached and the change was acknowledged (the link-holder row refused then too).
+    #[test]
+    fn metadata_through_a_link_waits_for_every_name_it_reads() {
+        use crate::{StoreConfig, StoreService};
+        use nrese_engine::fault_points::fail_dir_sync_of;
+        let new = "https://example.test/new/";
+        let mut wrong = Vec::new();
+        let rows = [
+            LinkRow {
+                name: "the store's level a link, a target holder failing",
+                physical: "data/new/store",
+                link: "stable/store",
+                target: "data/new/store",
+                opened: "stable/store",
+                failing: "data/new",
+                extra: &[],
+            },
+            LinkRow {
+                name: "an intermediate link, a target holder failing",
+                physical: "real/a/b/store",
+                link: "a",
+                target: "real/a",
+                opened: "a/b/store",
+                failing: "real",
+                extra: &[],
+            },
+            LinkRow {
+                name: "the store's level a link, the link's holder failing",
+                physical: "data/new/store",
+                link: "stable/store",
+                target: "data/new/store",
+                opened: "stable/store",
+                failing: "stable",
+                extra: &[],
+            },
+        ];
+        // Windows takes `..` lexically (sol-loop round 1, S1): `b\alias\..\tenant\store` is
+        // `b\tenant\store`, though `alias` → `t\deep` and a `t\tenant\store` is there too; the
+        // actual holder `b\tenant` failing must refuse.
+        #[cfg(windows)]
+        let rows = rows.into_iter().chain([LinkRow {
+            name: "`..` after a link, the actual holder failing",
+            physical: "b/tenant/store",
+            link: "b/alias",
+            target: "t/deep",
+            opened: "b/alias/../tenant/store",
+            failing: "b/tenant",
+            extra: &["t/deep", "t/tenant/store"],
+        }]);
+        for LinkRow {
+            name: row,
+            physical,
+            link,
+            target,
+            opened,
+            failing,
+            extra,
+        } in rows
+        {
+            let base = tempfile::tempdir().unwrap();
+            let base = base.path();
+            for dir in extra {
+                std::fs::create_dir_all(base.join(dir)).unwrap();
+            }
+            drop(StoreService::new(StoreConfig::on_disk(base.join(physical))).unwrap());
+            if let Some(holder) = base.join(link).parent() {
+                std::fs::create_dir_all(holder).unwrap();
+            }
+            link_dir(&base.join(target), &base.join(link));
+            let dir = base.join(opened);
+            let store = StoreService::new(StoreConfig::on_disk(&dir)).unwrap();
+            fail_dir_sync_of(Some((&base.join(failing), std::io::ErrorKind::Other)));
+            let refused = store.namespaces().set("ex", new);
+            fail_dir_sync_of(None);
+            if refused.is_ok() {
+                wrong.push(format!("{row}: acknowledged before every name was durable"));
+            }
+            if store.namespaces().get("ex").is_some() {
+                wrong.push(format!("{row}: a refused change published"));
+            }
+            if let Some(why) = store.unavailable() {
+                wrong.push(format!(
+                    "{row}: a refused change made the store unavailable: {why}"
+                ));
+            }
+            drop(store);
+            let store = StoreService::new(StoreConfig::on_disk(&dir)).unwrap();
+            if store.namespaces().get("ex").is_some() {
+                wrong.push(format!("{row}: a refused change there after a reopen"));
+            }
+            if let Err(error) = store.namespaces().set("ex", new) {
+                wrong.push(format!("{row}: the retry: {error}"));
+            }
+            drop(store);
+            let store = StoreService::new(StoreConfig::on_disk(&dir)).unwrap();
+            if store.namespaces().get("ex").as_deref() != Some(new) {
+                wrong.push(format!(
+                    "{row}: the acknowledged change gone after a reopen"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

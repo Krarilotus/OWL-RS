@@ -121,7 +121,8 @@ Do not:
 - Browser UI can be built and hosted separately from the backend.
 - Browser UI can target a non-same-origin backend through runtime config. The backend has no CORS policy of its
   own: the proxy in front of it answers the preflight and sends `Access-Control-Allow-Origin`. The backend marks
-  `NRESE-Completeness` with `Access-Control-Expose-Headers` on every query answer that carries it, so the console
+  `NRESE-Completeness` with `Access-Control-Expose-Headers` on every query answer (each carries it, `complete`
+  where no reasoning path can leave answers out; the client reads an answer without it as `not-certified`), so the console
   can tell complete answers from sound-only, unsound and not-certified ones on another origin too; a proxy
   that sets its own exposed headers must name that one (a wildcard doesn't cover requests with credentials).
 - `not-certified`, and any other token the client doesn't know, warns that answers may be missing or wrong.

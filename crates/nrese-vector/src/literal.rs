@@ -32,6 +32,13 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// The most bytes [`parse`] allocates for a lexical form of `text_len` bytes: its numbers
+/// (at most one a two bytes, in a vector grown by doubling: twice that) and an error's copy
+/// of a part: what a caller charges before it parses.
+pub const fn parse_bytes(text_len: usize) -> usize {
+    4 * 2 * (text_len / 2 + 1) + text_len
+}
+
 /// The numbers of the lexical form `text`.
 pub fn parse(text: &str) -> Result<Vec<f32>, ParseError> {
     let inner = text

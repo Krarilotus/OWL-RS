@@ -3,7 +3,7 @@ NRESE-Completeness header (docs/ops/http-api.md, "Under owl2-dl, every answer ca
 status"; docs/design/owl2-dl.md §8). Here x is a D only through a union no rule reads (A is
 B or C, both D), so the rules' lower bound has y and w, the upper bound x as well, and the exact
 services prove x: complete, with the bounds' counts, three answers. Asserted statements alone
-(infer=false) carry no status."""
+(infer=false) are `complete` with no regime: no reasoning path can leave them out."""
 
 [server]
 set = { "reasoner.mode" = "owl2-dl" }
@@ -36,11 +36,36 @@ body = [{ contains = "http://example.com/x" }, { contains = "http://example.com/
         { contains = "http://example.com/w" }]
 
 [[step]]
-name = "asserted statements alone: no status"
+name = "asserted statements alone: complete, no regime"
 path = "/dataset/query"
 params = { query = "SELECT ?x { ?x a <http://example.com/D> }", infer = "false" }
 headers = { Accept = "application/sparql-results+json" }
 [step.expect]
 status = 200
-headers = { nrese-completeness = { present = false } }
+headers = { nrese-completeness = "complete" }
 rows = 0
+
+[[step]]
+name = "reopen the committed ontology"
+restart = true
+
+[[step]]
+name = "the exact answer and its completeness survive reopen"
+path = "/dataset/query"
+params = { query = "SELECT ?x { ?x a <http://example.com/D> }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = "complete; regime=owl2-dl; lower=2; upper=3; unresolved=0" }
+rows = 3
+# Three distinct values in three rows fix the set without requiring an order.
+json = { "$.results.bindings[*].x.value" = { length = 3, matches = '^(?=.*"http://example\.com/w")(?=.*"http://example\.com/x")(?=.*"http://example\.com/y")' } }
+
+[[step]]
+name = "export the reopened ontology's instances"
+path = "/dataset/data?default"
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 200
+body = [{ contains = '<http://example.com/x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/A> .' },
+        { contains = '<http://example.com/y> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/B> .' }]

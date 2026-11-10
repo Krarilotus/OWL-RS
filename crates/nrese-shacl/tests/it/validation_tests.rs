@@ -64,6 +64,25 @@ fn compiled(snapshot: &Snapshot) -> Shapes {
 
 const DEFAULT: Selection = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
 
+// Spec: SHACL node kinds containing Literal do not accept an RDF 1.2 triple term.
+#[test]
+fn d066_f1_triple_term_is_not_a_literal_node_kind() {
+    for kind in ["Literal", "BlankNodeOrLiteral", "IRIOrLiteral"] {
+        let store = engine(
+            "ex:s ex:p <<( ex:a ex:b ex:c )>> .",
+            &format!("ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:nodeKind sh:{kind} ."),
+        );
+        let snapshot = store.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(!report.conforms(), "a triple term is not sh:{kind}");
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(
+            report.results[0].component.as_str(),
+            Component::NodeKind.iri()
+        );
+    }
+}
+
 fn ex(local: &str) -> String {
     format!("<http://example.com/{local}>")
 }
@@ -110,6 +129,114 @@ fn ill_formed_shapes_are_errors_that_name_the_shape() {
             "{shape}: {errors:?}"
         );
         assert!(!errors[0].shape.is_empty());
+    }
+}
+
+/// SHACL 1.0 §4.1.2: a literal matches `sh:datatype` only if it isn't ill-typed. Which
+/// lexical forms a datatype has is the engine's one datatype map (nrese-xsd's), as OWL
+/// reads it: the same literal isn't ill-typed to one and well-typed to the other. Each row:
+/// ex:a's one value of ex:v against `sh:datatype`, and whether it is a result. Controls: a
+/// valid binary; a valid form past what the engine represents (a 200-digit integer; a
+/// dateTimeStamp with 30 fractional digits), which is well-typed, only not represented; a
+/// language-tagged literal against rdf:langString. xsd:string takes XML 1.0's characters, as
+/// the map does (XSD 1.1 leaves XML 1.0 or 1.1 to the implementation): a string holding
+/// U+0001 is ill-typed; a plain string is the control.
+#[test]
+fn sh_datatype_rejects_what_the_datatype_map_calls_ill_typed() {
+    let huge = "9".repeat(200);
+    let rows: [(&str, String, &str, bool); 12] = [
+        (
+            "string holding U+0001",
+            "\"a\\u0001b\"^^xsd:string".into(),
+            "xsd:string",
+            true,
+        ),
+        (
+            "control: a plain string",
+            "\"plain\"".into(),
+            "xsd:string",
+            false,
+        ),
+        (
+            "hexBinary GG",
+            "\"GG\"^^xsd:hexBinary".into(),
+            "xsd:hexBinary",
+            true,
+        ),
+        (
+            "base64Binary !!!!",
+            "\"!!!!\"^^xsd:base64Binary".into(),
+            "xsd:base64Binary",
+            true,
+        ),
+        (
+            "dateTimeStamp without a timezone",
+            "\"2026-11-09T00:00:00\"^^xsd:dateTimeStamp".into(),
+            "xsd:dateTimeStamp",
+            true,
+        ),
+        (
+            "token with a double space",
+            "\"a  b\"^^xsd:token".into(),
+            "xsd:token",
+            true,
+        ),
+        (
+            "control: hexBinary 0FA1",
+            "\"0FA1\"^^xsd:hexBinary".into(),
+            "xsd:hexBinary",
+            false,
+        ),
+        (
+            "control: a 200-digit integer",
+            format!("\"{huge}\"^^xsd:integer"),
+            "xsd:integer",
+            false,
+        ),
+        (
+            "control: a 200-digit nonNegativeInteger",
+            format!("\"{huge}\"^^xsd:nonNegativeInteger"),
+            "xsd:nonNegativeInteger",
+            false,
+        ),
+        (
+            "control: dateTimeStamp past the represented precision",
+            "\"2026-11-09T00:00:00.123456789012345678901234567890Z\"^^xsd:dateTimeStamp".into(),
+            "xsd:dateTimeStamp",
+            false,
+        ),
+        (
+            "control: a language-tagged literal",
+            "\"a\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+        // RDF 1.1 Concepts §3.3: a language-tagged string is any lexical form with a tag; the
+        // XML character restriction is xsd:string's (the U+0001 row above), not rdf:langString's.
+        (
+            "language-tagged string holding U+0001",
+            "\"a\\u0001b\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+    ];
+    for (row, value, datatype, result) in rows {
+        let engine = engine(
+            &format!("ex:a ex:v {value} ."),
+            &format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+                   sh:property [ sh:path ex:v ; sh:datatype {datatype} ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(
+            report.results.len(),
+            usize::from(result),
+            "{row}: {:?}",
+            report.results
+        );
     }
 }
 
@@ -450,6 +577,53 @@ fn a_component_constrains_once_per_combination_of_its_parameter_values() {
     let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.results.len(), 3, "{:?}", report.results);
+}
+
+/// `Shapes::uses_sparql` (Q07): a store confines a restricted reader's validation to its
+/// graphs through the view's quad reads, which SHACL-SPARQL's queries bypass. Each form,
+/// nested and deactivated shapes say so; SHACL Core alone doesn't.
+#[test]
+fn shapes_tell_whether_any_constraint_is_a_sparql_query() {
+    let component = "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:p1 ] ;
+        sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK { FILTER (true) }''' ] .";
+    let select = "sh:sparql [ sh:select 'SELECT $this WHERE { FILTER (false) }' ]";
+    let cases = [
+        (
+            "core only",
+            "ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; sh:minCount 1 ] .".to_owned(),
+            false,
+        ),
+        (
+            "sh:sparql",
+            format!("ex:S sh:targetNode ex:a ; {select} ."),
+            true,
+        ),
+        (
+            "component",
+            format!("{component} ex:S sh:targetNode ex:a ; ex:p1 1 ."),
+            true,
+        ),
+        (
+            "nested in sh:node",
+            format!("ex:S sh:targetNode ex:a ; sh:node ex:N . ex:N {select} ."),
+            true,
+        ),
+        (
+            "nested in sh:property",
+            format!("ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; {select} ] ."),
+            true,
+        ),
+        (
+            "deactivated",
+            format!("ex:S sh:targetNode ex:a ; sh:deactivated true ; {select} ."),
+            true,
+        ),
+    ];
+    for (case, shapes, expected) in cases {
+        let engine = engine("ex:a ex:p ex:b .", &shapes);
+        let snapshot = engine.snapshot();
+        assert_eq!(compiled(&snapshot).uses_sparql(), expected, "{case}");
+    }
 }
 
 /// Shapes with a constraint component of `parameters` parameters, `values` values each on
@@ -1334,6 +1508,26 @@ fn a_stored_triple_term_is_the_same_value_bound_or_not() {
         "the same value, the same result: {:?}",
         introduced.results
     );
+}
+
+/// Spec: SHACL §5.6.2 pre-binds a targetObjectsOf triple focus as $this; an inner
+/// BIND copies it, preserving the blank subject's stored identity (D16-067).
+#[test]
+fn triple_focus_is_copied_by_inner_bind() {
+    let store = engine(
+        "ex:s ex:p <<( _:b ex:q ex:o )>> .",
+        "ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:sparql [ sh:select '''
+            SELECT $this ?value WHERE {
+                BIND($this AS ?value) FILTER(BOUND(?value))
+            }''' ] .",
+    );
+    let snapshot = store.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(report.results.len(), 1, "BIND exposes the triple focus");
+    let result = &report.results[0];
+    assert!(matches!(result.value, Some(nrese_rdf::Term::Triple(_))));
+    assert_eq!(result.value.as_ref(), Some(&result.focus_node));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
 }
 
 /// The same across a change of the shapes (sol r2 S3): a constraint component's property
