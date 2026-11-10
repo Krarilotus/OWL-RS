@@ -134,9 +134,9 @@ pub fn measure(
     };
     let lookups: Vec<PreparedQuery> = queries
         .iter()
-        .map(|q| PreparedQuery::parse(&crate::request(q)))
+        .map(|q| PreparedQuery::parse(&crate::tsv_request(q)))
         .collect::<Result<_, _>>()?;
-    let delta_query = PreparedQuery::parse(&crate::request(QUERY))?;
+    let delta_query = PreparedQuery::parse(&crate::tsv_request(QUERY))?;
     let mut tag = 0;
     // A fresh process may reopen a store an earlier one changed: its delta goes first.
     commit(format!(

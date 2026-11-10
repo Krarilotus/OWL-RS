@@ -1082,6 +1082,14 @@ pub(crate) fn request(text: &str) -> SparqlQueryRequest {
     )
 }
 
+/// [`request`] answering SELECT in TSV, as the query set's runs do by default: what the modes
+/// that read their answers back (`views.rs`, `recovery.rs`) parse.
+pub(crate) fn tsv_request(text: &str) -> SparqlQueryRequest {
+    let mut request = request(text);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    request
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("generate") {
