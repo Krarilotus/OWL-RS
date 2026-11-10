@@ -4,22 +4,30 @@
 //!   an image backup of the loaded store into `DIR-image` (the server's `backup`), then
 //!   COMMITS commits of QUADS new statements each through the mutation pipeline. With
 //!   `NRESE_WAL_ARCHIVE=true` their log is retained as the server retains it.
-//! - `--recovery COMMITS:QUADS` with `--store DIR`, a fresh process per repetition: the
+//! - `--recovery COMMITS:QUADS` with `--store DIR --load FILE` (FILE: the source's fixture,
+//!   read, not loaded), a fresh process per repetition: the
 //!   restore of that image and the retained log up to the middle commit
 //!   (`nrese_store::restore_until`, what `nrese-server restore` calls), the restored store's
 //!   open and first correct query, an image of the latest store, and a follower's catch-up
 //!   from the image through the feed and the apply a replica uses, timed apart. The restore
 //!   runs first, before the source opens, so a cold run's restore reads from disk.
 //!
-//! Checked after the timed windows: the restored store is at the chosen revision and holds
-//! exactly the source's statements minus the later commits'; the follower holds exactly the
-//! source's. In-process catch-up with no network: no replication-lag claim.
+//! Checked after the timed windows, against contents made without any store: the fixture as
+//! parsed and the commits as generated. The source holds them all, the restored store those up
+//! to the chosen revision (and is at it), the follower all of them.
+//!
+//! What runs: the stores with the store's defaults (background maintenance on, durable sync per
+//! commit; a follower publishes each record as one such commit); `restore_until` itself runs
+//! without background maintenance. The catch-up is in process, fed in batches of up to 8 MiB,
+//! with no network: no replication-lag claim; maintenance the apply leaves running isn't waited
+//! for (no settle in the timed window).
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_store::{
     CancellationToken, MutationCommand, MutationPipeline, MutationTicket, PreparedQuery, Requester,
     SparqlUpdateRequest, StoreConfig, StoreService,
@@ -114,9 +122,26 @@ fn query(store: &StoreService, text: &str) -> Result<(f64, Vec<String>), Box<dyn
     Ok((ms, rows))
 }
 
-/// One repetition's measurement (`config`: the prepared source's).
-pub fn measure(config: &StoreConfig, text: &str) -> Result<String, Box<dyn Error>> {
+/// The digest of the contents after commits `0..upto`: the fixture's statements as parsed
+/// and the commits' as generated.
+fn expected(fixture: &[String], upto: u64, quads: u64) -> String {
+    let mut lines = fixture.to_vec();
+    lines.extend((0..upto).flat_map(|c| (0..quads).map(move |i| quad(c, i).to_string())));
+    lines.sort_unstable();
+    lines.dedup();
+    digest(lines)
+}
+
+/// One repetition's measurement (`config`: the prepared source's; `fixture`: what it loaded).
+pub fn measure(
+    config: &StoreConfig,
+    fixture: &[PathBuf],
+    text: &str,
+) -> Result<String, Box<dyn Error>> {
     let (commits, quads) = spec(text)?;
+    if fixture.is_empty() {
+        return Err("--recovery needs --load FILE, the source's fixture".into());
+    }
     let source = config.data_dir.clone();
     let image = image_dir(&source);
     let image_revision = nrese_store::read_manifest(&image)?.revision;
@@ -182,25 +207,29 @@ pub fn measure(config: &StoreConfig, text: &str) -> Result<String, Box<dyn Error
     )?;
     let catch_up_memory = phase.json();
 
-    // The answers, after every timed window.
-    let source_lines = contents(&primary.read_snapshot(None)?)?;
-    let later: std::collections::HashSet<String> = (commits / 2..commits)
-        .flat_map(|c| (0..quads).map(move |i| quad(c, i).to_string()))
-        .collect();
-    let at_cut: Vec<String> = source_lines
-        .iter()
-        .filter(|line| !later.contains(*line))
-        .cloned()
-        .collect();
-    let commits_ok = latest == image_revision + commits;
+    // The answers, after every timed window, against the fixture and the generated commits.
+    let mut parsed = Vec::new();
+    for file in fixture {
+        for quad in RdfParser::from_format(RdfFormat::NTriples).for_slice(&std::fs::read(file)?) {
+            parsed.push(quad?.to_string());
+        }
+    }
+    let (all, at_cut) = (
+        expected(&parsed, commits, quads),
+        expected(&parsed, commits / 2, quads),
+    );
+    drop(parsed);
+    let source = contents(&primary.read_snapshot(None)?)?;
+    let statements = source.len();
+    let primary_ok = latest == image_revision + commits && digest(source) == all;
     let restored_ok = restored_revision == cut
         && restored.current_revision() == cut
-        && digest(contents(&restored.read_snapshot(None)?)?) == digest(at_cut)
+        && digest(contents(&restored.read_snapshot(None)?)?) == at_cut
         && first_rows == included_rows
         && excluded_rows.is_empty();
     let follower_ok = follower.current_revision() == latest
-        && digest(contents(&follower.read_snapshot(None)?)?) == digest(source_lines.clone());
-    let ok = commits_ok && restored_ok && follower_ok;
+        && digest(contents(&follower.read_snapshot(None)?)?) == all;
+    let ok = primary_ok && restored_ok && follower_ok;
     let (feed_ms, apply_ms) = (
         caught.feed.as_secs_f64() * 1e3,
         caught.apply.as_secs_f64() * 1e3,
@@ -217,8 +246,8 @@ pub fn measure(config: &StoreConfig, text: &str) -> Result<String, Box<dyn Error
          \"first_query_ms\": {first_query_ms:.3}, \"primary_open_ms\": {primary_open_ms:.3}, \
          \"image_ms\": {image_ms:.3}, \"image_bytes\": {}, \"feed_ms\": {feed_ms:.3}, \"apply_ms\": {apply_ms:.3}, \
          \"records\": {}, \"frames_bytes\": {}, \"catch_up_memory\": {catch_up_memory}, \
-         \"commits_ok\": {commits_ok}, \"restored_ok\": {restored_ok}, \"follower_ok\": {follower_ok}, \"answers_ok\": {ok}}}",
-        source_lines.len(),
+         \"catch_up_conditions\": \"in process, no network; batches up to {BATCH_BYTES} bytes; store defaults:          durable sync per commit, background maintenance on, not settled in the timed window\",          \"primary_ok\": {primary_ok}, \"restored_ok\": {restored_ok}, \"follower_ok\": {follower_ok}, \"answers_ok\": {ok}}}",
+        statements,
         bytes_in(std::slice::from_ref(&image)),
         made.bytes,
         caught.records,

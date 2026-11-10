@@ -10,7 +10,8 @@
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
-//!     [--held-views N,...] [--recovery-prepare COMMITS:QUADS] [--recovery COMMITS:QUADS --store DIR]
+//!     [--held-views N,...] [--staggered-views VIEWS:ROWS]
+//!     [--recovery-prepare COMMITS:QUADS] [--recovery COMMITS:QUADS --store DIR --load FILE]
 //!     [--support-sets K|off] [--support-reader FILE [--support-commits FILE] [--support-updates FILE]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
@@ -77,9 +78,12 @@
 //!   the catch-up's peak memory (`modes::replication`; under `--store DIR` when given).
 //!   `--held-views 0,1,8` times what holding views costs, per count of views held: snapshot
 //!   acquisition, commits, reads, private reads in a transaction and their rollback, and the
-//!   memory retained (`views.rs`). `--recovery-prepare` (a case's setup, after `--load`) and
-//!   `--recovery` time an image restore through the retained log, the restored store's open
-//!   and first query, an image, and a follower's catch-up (`recovery.rs`). `NRESE_WAL_ARCHIVE=true`
+//!   live bytes the views retain; `--staggered-views 8:100000` holds 8 views, one after each of
+//!   8 commits replacing 100,000 statements (`views.rs`). `--recovery-prepare` (a case's setup,
+//!   after `--load`) and `--recovery` time an image restore through the retained log, the
+//!   restored store's open and first query, an image, and a follower's catch-up
+//!   (`recovery.rs`); `--recovery` loads nothing: its `--load` files are the source's fixture,
+//!   read for the expected contents. `NRESE_WAL_ARCHIVE=true`
 //!   keeps the log a checkpoint covers, as the server's setting does.
 //!   `--support-sets K` caps the support graph sets per statement (`off`: none), and
 //!   `--support-reader FILE` times a reader of the default graph and FILE's named graphs with
@@ -214,6 +218,23 @@ fn allocations() -> (u64, u64) {
     )
 }
 
+/// The live requested bytes `f` frees (negative: allocates more than it frees), counted over
+/// its span alone, whether or not `--count-allocations` counts the rest; every thread's
+/// allocations in the span count, so a caller settles background work first. `None` under
+/// another allocator (`system_alloc`, `alloc_profile`): nothing is counted there.
+pub(crate) fn bytes_freed_by(f: impl FnOnce()) -> Option<i64> {
+    if cfg!(any(system_alloc, alloc_profile)) {
+        f();
+        return None;
+    }
+    let counting = COUNT_ALLOCATIONS.swap(true, Ordering::SeqCst);
+    let before = LIVE.load(Ordering::SeqCst);
+    f();
+    let freed = before - LIVE.load(Ordering::SeqCst);
+    COUNT_ALLOCATIONS.store(counting, Ordering::SeqCst);
+    Some(freed)
+}
+
 /// The memory a phase used: its peak (Linux: the resident set's, in a window started with
 /// the phase; Windows: none, its peak can't be reset) and, when counted, its allocations, the
 /// bytes they requested in all, and its peak live requested bytes.
@@ -291,6 +312,7 @@ struct Args {
     replication: Option<String>,
     replication_probe: bool,
     held_views: Vec<usize>,
+    staggered_views: Option<String>,
     recovery_prepare: Option<String>,
     recovery: Option<String>,
     upload: Option<PathBuf>,
@@ -347,6 +369,7 @@ fn parse_args() -> Result<Args, String> {
         replication: None,
         replication_probe: false,
         held_views: Vec::new(),
+        staggered_views: None,
         recovery_prepare: None,
         recovery: None,
         upload: None,
@@ -460,6 +483,7 @@ fn parse_args() -> Result<Args, String> {
                     .collect::<Result<_, _>>()
                     .map_err(|e| format!("--held-views: {e}"))?
             }
+            "--staggered-views" => args.staggered_views = Some(value()?),
             "--recovery-prepare" => args.recovery_prepare = Some(value()?),
             "--recovery" => args.recovery = Some(value()?),
             "--upload" => args.upload = Some(value()?.into()),
@@ -1236,7 +1260,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         }
         report
             .sections
-            .push(("recovery", recovery::measure(&config, spec)?));
+            .push(("recovery", recovery::measure(&config, &args.load, spec)?));
         return Ok(());
     }
     let mut phases: Vec<(&'static str, String)> = Vec::new();
@@ -1488,17 +1512,18 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         }
         phases.push(("commits", phase.json()));
     }
-    if !args.held_views.is_empty() || args.recovery_prepare.is_some() {
+    let views = !args.held_views.is_empty() || args.staggered_views.is_some();
+    if views || args.recovery_prepare.is_some() {
         let pipeline = MutationPipeline::new(
             Arc::clone(&store),
             Arc::new(ReasonerService::new(reasoner.clone())),
         );
-        if !args.held_views.is_empty() {
+        if views {
             let phase = Phase::start();
             report.sections.extend(views::measure(
                 &pipeline,
-                &texts,
                 &args.held_views,
+                args.staggered_views.as_deref(),
                 args.runs,
             )?);
             phases.push(("held_views", phase.json()));
