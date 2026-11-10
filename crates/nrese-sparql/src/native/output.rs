@@ -156,9 +156,9 @@ impl DirectResults<'_> {
             ResultsFormat::Tsv => (b'\t', b"\n"),
             ResultsFormat::Csv => (b',', b"\r\n"),
         };
-        // Each distinct id's bytes, once: their place in `encoded`, one buffer for the block.
+        // Each distinct id's bytes, written once: where they lie in `buffer`, which only grows
+        // while this cache lives.
         let mut cache: IdMap<(u32, u32)> = IdMap::default();
-        let mut encoded: Vec<u8> = Vec::new();
         self.snapshot.with_views(|view| {
             for row in rows {
                 if json {
@@ -187,19 +187,16 @@ impl DirectResults<'_> {
                         continue;
                     }
                     buffer.extend_from_slice(key);
-                    if let Some(&(start, len)) = cache.get(&id) {
-                        let start = start as usize;
-                        buffer.extend_from_slice(&encoded[start..start + len as usize]);
+                    if let Some(&(start, end)) = cache.get(&id) {
+                        buffer.extend_from_within(start as usize..end as usize);
                     } else {
                         let start = buffer.len();
                         self.id(id, view, buffer);
-                        let term = &buffer[start..];
                         if cache.len() < CACHE_ENTRIES
-                            && let (Ok(at), Ok(len)) =
-                                (u32::try_from(encoded.len()), u32::try_from(term.len()))
+                            && let (Ok(start), Ok(end)) =
+                                (u32::try_from(start), u32::try_from(buffer.len()))
                         {
-                            encoded.extend_from_slice(term);
-                            cache.insert(id, (at, len));
+                            cache.insert(id, (start, end));
                         }
                     }
                 }
