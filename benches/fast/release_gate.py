@@ -1871,8 +1871,9 @@ def measurement_inputs(checkout: str, rev: str, revs: list[str], sides: dict[str
                               capture_output=True, text=True, timeout=60).stdout.strip()
         if full not in sides:
             continue
+        # As stored: a replace ref or graft here would reach it only in this repository.
         reached = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", sides[full], rev],
-                                 capture_output=True, text=True, timeout=60)
+                                 capture_output=True, text=True, timeout=60, env={**os.environ, **STORED_OBJECTS})
         if reached.returncode != 0:  # not reached, or not known here: kept, for the build to find or report
             inputs.append({"name": f"measure-{full[:8]}", "source": {"git": checkout, "rev": sides[full]}})
     return inputs

@@ -3026,6 +3026,10 @@ printf '%s\\n' "$out"; exit $code
         with patch.object(gate_module, "measurement_sides", return_value={self.side: commit}):
             self.assertEqual(gate_module.side_inputs(self.repo, holding, [self.side]), [])
             self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
+            # Review r1 R1: a replace ref here that gives `later` the commit as a parent reaches it
+            # only in this repository, not in the history a job's checkout is staged with.
+            self.git("replace", "--graft", self.later, self.side, commit)
+            self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
 
     def test_main_and_v1_5_are_measured_at_their_commits(self):
         table = gate_module.tomllib.loads(gate_module.MEASUREMENT_SIDES.read_text(encoding="utf-8"))["side"]
