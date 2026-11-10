@@ -50,6 +50,7 @@ ns_name() { printf 'nrese-%s-%s-%s' "$(ns_slug "$1")" "$(ns_namespace "$2")" "$(
 
 ns_labels() {
   NS_LABELS=(--label "nrese.ns=$(ns_namespace "$1")" --label "nrese.checkout=$(ns_checkout "$1")" --label "nrese.owner=$2")
+  if [ -n "${FLEET_JOB:-}" ]; then NS_LABELS+=(--label "fleet.job=$FLEET_JOB"); fi
 }
 
 ns_run_args() { ns_labels "$2" "$3"; NS_ARGS=(--name "$1" "${NS_LABELS[@]}"); }
@@ -60,7 +61,6 @@ ns_maker_args() {
   shift 3
   NS_ARGS=("${NS_LABELS[@]}")
   [ "$name" = - ] || NS_ARGS=(--name "$name" "${NS_ARGS[@]}")
-  [ -z "${FLEET_JOB:-}" ] || NS_ARGS+=(--label "fleet.job=$FLEET_JOB")
   if [ -n "${NRESE_MAKER_MEMORY_GB:-}" ]; then
     NS_ARGS+=(--memory "${NRESE_MAKER_MEMORY_GB}g" --memory-swap "${NRESE_MAKER_MEMORY_GB}g"
               --cpus "${NRESE_MAKER_CPUS:?NRESE_MAKER_CPUS goes with NRESE_MAKER_MEMORY_GB}")
