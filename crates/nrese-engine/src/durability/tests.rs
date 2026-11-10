@@ -13,7 +13,7 @@ use crate::{
     QuadPattern, SyncPolicy,
 };
 
-fn config() -> EngineConfig {
+pub(super) fn config() -> EngineConfig {
     EngineConfig {
         background_maintenance: false,
         durability: DurabilityConfig {
@@ -24,7 +24,7 @@ fn config() -> EngineConfig {
     }
 }
 
-fn quad(n: u64) -> Quad {
+pub(super) fn quad(n: u64) -> Quad {
     let node = |name: String| NamedNode::new_unchecked(format!("http://example.com/{name}"));
     Quad::new(
         node(format!("s{n}")),
@@ -34,7 +34,7 @@ fn quad(n: u64) -> Quad {
     )
 }
 
-fn contents(engine: &Engine) -> HashSet<Quad> {
+pub(super) fn contents(engine: &Engine) -> HashSet<Quad> {
     let snapshot = engine.snapshot();
     snapshot
         .quads_for_pattern(&QuadPattern::all())
@@ -121,7 +121,7 @@ fn small_segments() -> EngineConfig {
     }
 }
 
-fn commit(engine: &Engine, n: u64) -> EngineResult<CommitSummary> {
+pub(super) fn commit(engine: &Engine, n: u64) -> EngineResult<CommitSummary> {
     let mut tx = engine.transaction();
     tx.insert(quad(n).as_ref());
     tx.commit()
@@ -941,6 +941,603 @@ fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
     let engine = Engine::open(dir.path(), small_segments()).unwrap();
     assert_eq!(contents(&engine), [quad(1)].into_iter().collect());
     commit(&engine, 4).unwrap();
+}
+
+/// A directory sync is a real one on every platform (F2): syncing a directory that isn't
+/// there fails. Before the fix it was a no-op on Windows, so a checkpoint's or segment's
+/// rename there wasn't durable when its commit was acknowledged. (A guard on Unix, where the
+/// sync was always real; red on Windows.)
+#[test]
+fn a_directory_sync_is_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("not-there");
+    assert!(
+        super::sync_dir(&missing).is_err(),
+        "synced a missing directory"
+    );
+    super::sync_dir(dir.path()).unwrap();
+}
+
+/// The directories an open creates for its store are durably named before it takes commits
+/// (review r1, R1-F2): each new one's entry in the directory holding it is synced, so a power
+/// loss can't take the store's name with every commit acknowledged in it. Here the sync of
+/// that holding directory fails (`fault::FAIL_DIR_SYNC_OF`), and the open must refuse. Before
+/// the fix only the store's own directory was synced, so it opened. Rows, judged apart:
+/// - two missing levels, the sync of the existing directory above them failing;
+/// - one missing level, the same;
+/// - a relative single directory, the sync of `.` failing (made in the working directory,
+///   removed after);
+/// - the same open tried again, the sync still failing (sol-loop on review r1, S1): the first
+///   refusal mustn't leave a directory the retry takes for durably named;
+/// - a directory that exists, made by someone else (another attempt, another process) and not
+///   known to be named durably: its holder's sync failing, the open refuses (it makes the
+///   store's WAL directory in it, so it syncs every name at once);
+/// - an existing store, its holder's sync failing: the open succeeds, as it changes nothing and
+///   leaves its names to the first durable write, and the first commit is refused
+///   (deferred-sync design note of 8 Nov);
+/// - guards: an existing directory whose holder can't be opened for the sync (no permission)
+///   opens, as nothing more can be done for its name there; two missing levels open with every
+///   sync working.
+#[test]
+fn an_open_names_every_directory_it_creates() {
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
+    let base = tempfile::tempdir().unwrap();
+    let relative = PathBuf::from(format!("dur3-relative-{}", std::process::id()));
+    std::fs::create_dir(base.path().join("made")).unwrap();
+    // A store made and closed while every sync works.
+    drop(Engine::open(base.path().join("kept"), config()).unwrap());
+    // What the last attempt must do.
+    #[derive(Clone, Copy, Debug)]
+    enum Must {
+        Open,
+        RefuseTheOpen,
+        RefuseTheFirstCommit,
+    }
+    // (row, store directory, the directory whose sync fails and how, attempts, what the last
+    // must do)
+    type Row<'a> = (&'a str, PathBuf, Option<(PathBuf, ErrorKind)>, usize, Must);
+    let failing = |dir: &std::path::Path| Some((dir.to_path_buf(), ErrorKind::Other));
+    let rows: [Row; 8] = [
+        (
+            "two missing levels",
+            base.path().join("a").join("b"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "one missing level",
+            base.path().join("c"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "a relative single directory",
+            relative.clone(),
+            failing(std::path::Path::new(".")),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "tried again",
+            base.path().join("r").join("s"),
+            failing(base.path()),
+            2,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "a directory someone else made",
+            base.path().join("made"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "an existing store",
+            base.path().join("kept"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheFirstCommit,
+        ),
+        (
+            "an existing directory, its holder not to be opened (guard)",
+            base.path().to_path_buf(),
+            base.path()
+                .parent()
+                .map(|parent| (parent.to_path_buf(), ErrorKind::PermissionDenied)),
+            1,
+            Must::Open,
+        ),
+        (
+            "two missing levels, every sync working (guard)",
+            base.path().join("d").join("e"),
+            None,
+            1,
+            Must::Open,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, dir, failing, attempts, must) in rows {
+        fault::FAIL_DIR_SYNC_OF.set(failing);
+        let mut opened = Err(EngineError::Configuration("not tried".to_owned()));
+        for _ in 0..attempts {
+            opened = Engine::open(&dir, config()).map(|engine| commit(&engine, 0).map(drop));
+        }
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        let ok = match must {
+            Must::Open => matches!(opened, Ok(Ok(()))),
+            Must::RefuseTheOpen => opened.is_err(),
+            Must::RefuseTheFirstCommit => matches!(opened, Ok(Err(_))),
+        };
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: {:?}", opened.map(|_| "opened")));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&relative);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A directory is made only where its name can be made durable (sol-loop round 2 on review r1,
+/// S1): made first and its holder's sync then refused (`PermissionDenied`), it is in sight of
+/// another process opening the same path, which finds it, can't sync its holder either, takes
+/// it for one provisioned beforehand and commits into a name never made durable. Here the
+/// holder's sync is refused that way: when it is tried, the new directory must not exist yet,
+/// and the open refuses. Before the fix it was made first. Guard: once the sync works, it is
+/// made and opens.
+#[test]
+fn a_directory_is_made_only_where_its_name_can_be_made_durable() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("q");
+    let in_sight = Rc::new(Cell::new(false));
+    let (seen, holder, level) = (Rc::clone(&in_sight), base.path().to_path_buf(), dir.clone());
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |synced: &std::path::Path| {
+        if synced == holder && level.exists() {
+            seen.set(true);
+        }
+    })));
+    fault::FAIL_DIR_SYNC_OF.set(Some((
+        base.path().to_path_buf(),
+        std::io::ErrorKind::PermissionDenied,
+    )));
+    let opened = Engine::open(&dir, config());
+    fault::FAIL_DIR_SYNC_OF.set(None);
+    fault::ON_DIR_SYNC.set(None);
+    let mut wrong = Vec::new();
+    if opened.is_ok() {
+        wrong.push("opened though its holder can't be synced".to_owned());
+    }
+    drop(opened);
+    if in_sight.get() {
+        wrong.push("the new directory was in sight while its holder couldn't be synced".to_owned());
+    }
+    if let Err(error) = Engine::open(&dir, config()) {
+        wrong.push(format!(
+            "guard: once its holder syncs, the open fails: {error}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Every directory a store, its log or archive, a restore, a backup or a replica's bootstrap
+/// places what recovery reads in is made through the placement owner (sol-loop round 3 on review
+/// r1, S1): a directory made elsewhere, then found by `place::create_dir_all`, is taken for one
+/// provisioned beforehand where its holder can't be synced, and its name is never made durable
+/// (replica bootstrap made its data directory that way). Files recovery reads are renamed into
+/// place through it too (round 5, S3: the quarantine's, and the reasoning marker). A source scan
+/// of those callers, their test modules left out.
+#[test]
+fn store_directories_are_made_through_the_placement_owner() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let files = [
+        "nrese-engine/src/durability/mod.rs",
+        "nrese-engine/src/durability/wal.rs",
+        "nrese-engine/src/durability/tail.rs",
+        "nrese-engine/src/durability/checkpoint.rs",
+        "nrese-store/src/image_backup.rs",
+        "nrese-store/src/catalog.rs",
+        "nrese-store/src/metadata.rs",
+        "nrese-server/src/replication.rs",
+        "nrese-server/src/http/admin_dataset.rs",
+        // DUR-3 sol-loop round 5, S3, and the sweep after it: the quarantine and the reasoning
+        // marker are read at open too.
+        "nrese-store/src/quarantine.rs",
+        "nrese-store/src/service.rs",
+    ];
+    // A rename recovery doesn't read: the catalogue moves a removed repository aside to delete
+    // it (a lost move leaves it to its tombstone, which is synced).
+    let exempt = ["std::fs::rename(&dir, &trash)"];
+    let mut found = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(crates.join(file)).unwrap();
+        let lines = match product_lines(&text) {
+            Ok(lines) => lines,
+            Err(error) => {
+                found.push(format!("{file}: {error}"));
+                continue;
+            }
+        };
+        for (n, line) in lines {
+            let makes = ["create_dir_all(", "create_dir(", "fs::rename("]
+                .into_iter()
+                .any(|call| {
+                    line.contains(call)
+                        && !line.contains(&format!("place::{}", call.trim_start_matches("fs::")))
+                });
+            // A raw write may only make a temporary, which is then synced and placed (fix check
+            // r1: the backup manifest was written under its own name, unsynced).
+            let writes = ["fs::write(", "File::create("]
+                .iter()
+                .any(|call| line.contains(call))
+                && !["tmp", "temporary", "staged", "partial", "placing"]
+                    .iter()
+                    .any(|temporary| line.contains(temporary));
+            if (makes || writes) && !exempt.iter().any(|exempt| line.contains(exempt)) {
+                found.push(format!("{file}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "made outside durability::place: {found:#?}"
+    );
+}
+
+/// The product code of a Rust source file, with each line's index: every line but those of its
+/// inline test modules. A test module is `#[cfg(test)]` at column 0 followed by a `mod … {`
+/// line at column 0 (any name; an out-of-line `mod tests;` is none: sol-loop round 4, S2), and
+/// it ends at a bare `}` at column 0. Any other line at column 0 that starts with `}` inside one,
+/// or a file ending inside one, is refused rather than guessed (fix check r2, N4: a close like
+/// `} // comment` skipped the product code after it).
+fn product_lines(text: &str) -> Result<Vec<(usize, &str)>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut product = Vec::new();
+    let mut in_tests: Option<usize> = None;
+    for (n, line) in lines.iter().enumerate() {
+        if let Some(start) = in_tests {
+            if *line == "}" {
+                in_tests = None;
+            } else if line.starts_with('}') {
+                return Err(format!(
+                    "the test module at line {} closes as {line:?} at line {}: only a bare `}}` is read",
+                    start + 1,
+                    n + 1
+                ));
+            }
+            continue;
+        }
+        let module = *line == "#[cfg(test)]"
+            && lines.get(n + 1).is_some_and(|next| {
+                !next.starts_with(char::is_whitespace)
+                    && next.contains("mod ")
+                    && next.trim_end().ends_with('{')
+            });
+        if module {
+            in_tests = Some(n);
+            continue;
+        }
+        product.push((n, *line));
+    }
+    match in_tests {
+        Some(start) => Err(format!(
+            "the test module at line {} never closes",
+            start + 1
+        )),
+        None => Ok(product),
+    }
+}
+
+/// [`product_lines`] reads the shapes it is given, and refuses others (fix check r2, N4). Rows:
+/// a test module named anything, closed by a bare `}`, then product code; an out-of-line
+/// `mod tests;` (no module: the code after it is read); a `#[cfg(test)]` seam inside a function
+/// (indented: read); a module closed by `} // comment` (refused); a module never closed
+/// (refused).
+#[test]
+fn the_scan_reads_product_code_only_in_the_shapes_it_knows() {
+    fn read(text: &str) -> Result<Vec<&str>, String> {
+        product_lines(text).map(|lines| lines.into_iter().map(|(_, line)| line).collect())
+    }
+    let mut wrong = Vec::new();
+    let module = "fn a() {}\n#[cfg(test)]\nmod checks {\n    fn t() {}\n}\nfn b() {}\n";
+    if read(module) != Ok(vec!["fn a() {}", "fn b() {}"]) {
+        wrong.push(format!("a test module: {:?}", read(module)));
+    }
+    let out_of_line = "#[cfg(test)]\nmod tests;\nfn b() {}\n";
+    if read(out_of_line) != Ok(vec!["#[cfg(test)]", "mod tests;", "fn b() {}"]) {
+        wrong.push(format!("out of line: {:?}", read(out_of_line)));
+    }
+    let seam = "fn a() {\n    #[cfg(test)]\n    if seam() {\n    }\n}\n";
+    if read(seam).map(|lines| lines.len()) != Ok(5) {
+        wrong.push(format!("a seam: {:?}", read(seam)));
+    }
+    let commented = "#[cfg(test)]\nmod tests {\n} // tests\nfn b() {}\n";
+    if read(commented).is_ok() {
+        wrong.push(format!("a commented close: {:?}", read(commented)));
+    }
+    let unclosed = "#[cfg(test)]\nmod tests {\n    fn t() {}\n";
+    if read(unclosed).is_ok() {
+        wrong.push(format!("never closed: {:?}", read(unclosed)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// What an open replayed is durable before it takes new commits (F5): the segments it
+/// replayed records from are synced. Before the fix nothing was, so under `OsBuffered` (or an
+/// `EveryCommit` record written but not synced when the process died) a power loss after the
+/// reopen could take the replayed tail, though commits acknowledged after it were in a new
+/// segment.
+#[test]
+fn an_open_syncs_what_it_replayed() {
+    let buffered = || EngineConfig {
+        durability: DurabilityConfig {
+            sync: SyncPolicy::OsBuffered,
+            ..config().durability
+        },
+        ..config()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), buffered()).unwrap();
+        commit(&engine, 1).unwrap();
+        commit(&engine, 2).unwrap();
+    }
+    let segments: Vec<std::path::PathBuf> =
+        super::wal::list_segments(&super::wal::wal_dir(dir.path()))
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+    fault::SYNCED.with_borrow_mut(Vec::clear);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let synced = fault::SYNCED.take();
+    assert_eq!(contents(&engine), [quad(1), quad(2)].into_iter().collect());
+    for segment in &segments {
+        assert!(
+            synced.contains(segment),
+            "{} replayed but not synced (synced: {synced:?})",
+            segment.display()
+        );
+    }
+}
+
+/// The names a reopen of the store in `root` makes durable (R1-F2 and F5): each directory
+/// holding a level of its path (the root, or a Windows prefix, holds nothing), the WAL's
+/// directory and the store's own, each once.
+fn names_of(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    let mut names: std::collections::BTreeMap<_, _> = root
+        .ancestors()
+        .skip(1)
+        .filter(|level| !level.as_os_str().is_empty())
+        .map(|level| (level.to_path_buf(), 1))
+        .collect();
+    names.insert(super::wal::wal_dir(root), 1);
+    names.insert(root.to_path_buf(), 1);
+    names
+}
+
+/// What `step` returns, and the directories it synced, each with how often.
+fn dir_syncs_of<T>(
+    step: impl FnOnce() -> T,
+) -> (T, std::collections::BTreeMap<std::path::PathBuf, usize>) {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    let synced = Rc::new(std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new()));
+    let seen = Rc::clone(&synced);
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |dir: &Path| {
+        *seen.borrow_mut().entry(dir.to_path_buf()).or_default() += 1;
+    })));
+    let out = step();
+    fault::ON_DIR_SYNC.set(None);
+    (out, synced.take())
+}
+
+/// A store at `<base>/store` with one commit in its log and no checkpoint, closed.
+fn a_closed_store(config: EngineConfig) -> (tempfile::TempDir, std::path::PathBuf) {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("store");
+    let engine = Engine::open(&root, config).unwrap();
+    commit(&engine, 1).unwrap();
+    (base, root)
+}
+
+/// A reopen syncs its names once, by its first commit (timing of 8 Nov, the master's decisions
+/// of 12:15 and 14:37): the open itself syncs no directory, as the first sync an open does pays
+/// the journal's commit and a device flush (+0.5 ms a reopen on the timing host); the first
+/// commit syncs each of its names (`names_of`) once, before it is acknowledged; the second
+/// syncs none. Before the fix the open synced them all and the commit none. Rows, judged
+/// apart: a reopen; a reopen with the WAL archive.
+#[test]
+fn a_reopen_syncs_its_names_once_by_its_first_commit() {
+    let mut wrong = Vec::new();
+    for (row, wal_archive) in [("a reopen", false), ("a reopen with the WAL archive", true)] {
+        let archived = || EngineConfig {
+            durability: DurabilityConfig {
+                wal_archive,
+                ..config().durability
+            },
+            ..config()
+        };
+        let (_base, root) = a_closed_store(archived());
+        let (opened, at_open) = dir_syncs_of(|| Engine::open(&root, archived()));
+        let engine = match opened {
+            Ok(engine) => engine,
+            Err(error) => {
+                wrong.push(format!("{row}: the reopen failed: {error}"));
+                continue;
+            }
+        };
+        let (first, at_first) = dir_syncs_of(|| commit(&engine, 2));
+        let (second, at_second) = dir_syncs_of(|| commit(&engine, 3));
+        eprintln!("row {row}: open {at_open:?}; first commit {at_first:?}; second {at_second:?}");
+        if !at_open.is_empty() {
+            wrong.push(format!("{row}: the open synced {at_open:#?}"));
+        }
+        if let Err(error) = first.and(second) {
+            wrong.push(format!("{row}: a commit failed: {error}"));
+        }
+        if at_first != names_of(&root) {
+            wrong.push(format!(
+                "{row}: the first commit synced {at_first:#?}, expected each name once: {:#?}",
+                names_of(&root)
+            ));
+        }
+        if !at_second.is_empty() {
+            wrong.push(format!("{row}: the second commit synced {at_second:#?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Whatever relies on a reopened store's names first syncs them (the deferred-sync design
+/// note's invariant): a checkpoint, a bulk publication and the log served to a follower each
+/// sync every name (`names_of`) before they return, when no commit came first. Before the fix
+/// the open had synced them, and none of these did again. Rows, judged apart.
+#[test]
+fn a_reopen_syncs_its_names_before_anything_relies_on_them() {
+    type Step = fn(&Engine) -> Result<(), String>;
+    let steps: [(&str, Step); 3] = [
+        ("a checkpoint", |engine| {
+            engine.checkpoint().map(drop).map_err(|e| e.to_string())
+        }),
+        ("a bulk publication", |engine| {
+            let load = engine.bulk_load(BulkMode::Append);
+            load.add(&[quad(10)]);
+            load.finish().map(drop).map_err(|e| e.to_string())
+        }),
+        ("the log served", |engine| {
+            engine
+                .log_since(0, usize::MAX)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (row, step) in steps {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        let (done, synced) = dir_syncs_of(|| step(&engine));
+        eprintln!("row {row}: {synced:?}");
+        if let Err(error) = done {
+            wrong.push(format!("{row}: failed: {error}"));
+        }
+        let missing: Vec<_> = names_of(&root)
+            .into_keys()
+            .filter(|name| !synced.contains_key(name))
+            .collect();
+        if !missing.is_empty() {
+            wrong.push(format!("{row}: returned with {missing:?} not synced"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Naming an existing directory (`place::name_existing`, which the store's metadata writes go
+/// through: fix check DEFER-F1) syncs the holder of each level of its path, each once, and
+/// makes nothing. Rows, judged apart: an existing directory; one that isn't there (refused,
+/// `NotFound`, and not made: a write into a directory gone meanwhile mustn't make it again); a
+/// holder whose sync fails (refused); a holder this process may not open (`PermissionDenied`:
+/// left as it is, as for any found level). Written with the function (no earlier code to fail).
+#[test]
+fn naming_a_directory_syncs_its_holders_and_makes_nothing() {
+    use std::io::ErrorKind;
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("a").join("b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut wrong = Vec::new();
+    let (named, synced) = dir_syncs_of(|| super::place::name_existing(&dir));
+    let holders: std::collections::BTreeMap<_, _> = dir
+        .ancestors()
+        .skip(1)
+        .filter(|level| !level.as_os_str().is_empty())
+        .map(|level| (level.to_path_buf(), 1))
+        .collect();
+    if let Err(error) = named {
+        wrong.push(format!("an existing directory: {error}"));
+    }
+    if synced != holders {
+        wrong.push(format!(
+            "an existing directory: synced {synced:#?}, expected each holder once: {holders:#?}"
+        ));
+    }
+    let gone = base.path().join("gone");
+    match super::place::name_existing(&gone) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        other => wrong.push(format!("a directory not there: {other:?}")),
+    }
+    if gone.exists() {
+        wrong.push("a directory not there was made".to_owned());
+    }
+    for (kind, refused) in [
+        (ErrorKind::Other, true),
+        (ErrorKind::PermissionDenied, false),
+    ] {
+        fault::FAIL_DIR_SYNC_OF.set(Some((base.path().to_path_buf(), kind)));
+        let named = super::place::name_existing(&dir);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if named.is_err() != refused {
+            wrong.push(format!("a holder failing with {kind:?}: {named:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A first commit whose names can't be synced is not acknowledged (the design note's attack
+/// 2): the store's directory sync failing, the commit returns an error and publishes nothing,
+/// and the log takes no more commits (the record is written, its outcome unknown, as for a
+/// record whose own sync failed); reopened, the store opens, with or without that commit.
+/// Before the fix the commit didn't sync the names, and succeeded. Second row: a checkpoint
+/// whose names can't be synced fails before it writes anything, and the log stays usable.
+#[test]
+fn a_first_commit_whose_names_cant_be_synced_is_refused() {
+    let mut wrong = Vec::new();
+    {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        fault::FAIL_DIR_SYNC_OF.set(Some((root.clone(), std::io::ErrorKind::Other)));
+        let first = commit(&engine, 2);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if first.is_ok() {
+            wrong.push("commit: acknowledged though the store's name wasn't synced".to_owned());
+        }
+        if engine.snapshot().revision() != 1 {
+            wrong.push("commit: the refused commit was published".to_owned());
+        }
+        if !matches!(commit(&engine, 3), Err(EngineError::WalPoisoned)) {
+            wrong.push("commit: the log took a commit after an unknown outcome".to_owned());
+        }
+        drop(engine);
+        match Engine::open(&root, config()) {
+            Ok(engine) if [1, 2].contains(&engine.snapshot().revision()) => {}
+            other => wrong.push(format!(
+                "commit: the reopen: {:?}",
+                other.map(|engine| engine.snapshot().revision())
+            )),
+        }
+    }
+    {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        fault::FAIL_DIR_SYNC_OF.set(Some((root.clone(), std::io::ErrorKind::Other)));
+        let checkpointed = engine.checkpoint();
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if checkpointed.is_ok() {
+            wrong.push("checkpoint: written though the store's name wasn't synced".to_owned());
+        }
+        if super::checkpoint::exists(&root, 1) {
+            wrong.push("checkpoint: a checkpoint was placed".to_owned());
+        }
+        if let Err(error) = commit(&engine, 2) {
+            wrong.push(format!(
+                "checkpoint: the log refused the next commit: {error}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A commit that fails leaves the asserted identity it was to publish

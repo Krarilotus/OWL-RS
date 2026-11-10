@@ -12,6 +12,7 @@
 //! once and compares compressed bytes; the hash table keeps the plain keys' hashes. Both
 //! the writer and every reader compress with a compressor rebuilt from the stored table.
 
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -261,6 +262,26 @@ impl Codec {
         let len = decompressor.decompress_into(rest, out.spare_capacity_mut());
         // SAFETY: `decompress_into` initialised `len` bytes of the spare capacity.
         unsafe { out.set_len(out.len() + len) };
+    }
+
+    /// [`Self::decompress`] into `room`, allocating nothing: the plain key of `stored`, or
+    /// `None` where `room` is shorter than FSST's bound for it (8 bytes a code, and 17 more).
+    pub(crate) fn decompress_in<'r>(
+        &self,
+        stored: &[u8],
+        room: &'r mut [MaybeUninit<u8>],
+    ) -> Option<&'r [u8]> {
+        let (&tag, rest) = stored.split_first()?;
+        let decompressor = self.table(tag).decompressor();
+        let (first, out) = room.split_first_mut()?;
+        if out.len() < decompressor.max_decompression_capacity(rest) + 8 {
+            return None;
+        }
+        first.write(tag);
+        let len = 1 + decompressor.decompress_into(rest, out);
+        // SAFETY: the tag and the `len - 1` bytes `decompress_into` wrote after it are
+        // initialised.
+        Some(unsafe { std::slice::from_raw_parts(room.as_ptr().cast::<u8>(), len) })
     }
 
     /// The tables as stored (module docs of [`crate::durability::checkpoint`]).

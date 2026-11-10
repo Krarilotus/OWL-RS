@@ -26,7 +26,8 @@ pub struct GraphWriteRequest {
     pub target: GraphTarget,
     pub format: GraphResultFormat,
     pub base_iri: Option<String>,
-    pub payload: Vec<u8>,
+    /// The request's body as it came, shared, never copied (D16-039 S12).
+    pub payload: bytes::Bytes,
     pub replace: bool,
 }
 

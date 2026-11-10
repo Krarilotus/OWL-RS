@@ -345,16 +345,20 @@ fn unpublished_node_counts_and_heavy_groups_are_kept_for_no_one() {
             .expect("walkable")
             .len()
     };
+    let unlimited = Budget::unlimited();
     for _ in 0..2 {
-        assert_eq!(pending.node_count_in(MODEL, GraphSelector::Any), Some(540));
+        assert_eq!(
+            pending.node_count_in(MODEL, GraphSelector::Any, &unlimited),
+            Ok(Some(540))
+        );
         assert_eq!(heavy(&pending), 100);
     }
     assert!(statistics.nodes.lock().is_empty(), "no node count kept");
     assert!(statistics.heavy.lock().is_empty(), "no heavy groups kept");
     assert_eq!(statistics.heavy_walks(), 2, "each pending read walks");
     assert_eq!(
-        published.node_count_in(MODEL, GraphSelector::Any),
-        Some(600)
+        published.node_count_in(MODEL, GraphSelector::Any, &unlimited),
+        Ok(Some(600))
     );
     assert_eq!(heavy(&published), 100);
     assert_eq!(statistics.nodes.lock().len(), 1);
@@ -454,7 +458,11 @@ fn no_view_of_an_unpublished_snapshot_admits() {
     }
     for (name, view) in &shared {
         let _ = view.distinct_estimate_in(MODEL, &pattern, Permutation::Posg);
-        let _ = view.node_count_in(ReadModel::Asserted, GraphSelector::Any);
+        let _ = view.node_count_in(
+            ReadModel::Asserted,
+            GraphSelector::Any,
+            &Budget::unlimited(),
+        );
         let _ = view.heavy_groups_in(
             ReadModel::Asserted,
             &QuadPattern::all(),

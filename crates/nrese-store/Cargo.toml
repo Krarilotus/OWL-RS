@@ -20,6 +20,8 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 hashbrown = { workspace = true }
+# A request's body, shared with the transport rather than copied (D16-039 S12).
+bytes = "1.11.1"
 rayon = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -43,6 +45,9 @@ libmimalloc-sys = { workspace = true }
 mimalloc = { workspace = true }
 # The support graph sets' memory guard measures against budgets (tests/support_memory.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
+# The engine's work counters, for the tests of the work a read does after its stop (REAS-3), and
+# a directory sync the store's own tests make fail (nrese_engine::fault_points): DUR-4.
+nrese-engine = { path = "../nrese-engine", features = ["witness", "fault-points"] }
 tempfile = { workspace = true }
 
 [lints]

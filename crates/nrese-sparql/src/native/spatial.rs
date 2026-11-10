@@ -51,6 +51,7 @@ use nrese_engine::{
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF};
 use nrese_rdf::{Literal, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, Function};
+use nrese_sparql_syntax::internal::blank_variable;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use rayon::prelude::*;
 
@@ -584,11 +585,7 @@ fn decoded(
     if id.kind() != TermKind::TypedLiteral {
         return Ok(None);
     }
-    let mut decoding = 0;
-    let term = snapshot.decode_charged(id, |bytes| {
-        decoding = bytes;
-        held.charge(bytes)
-    })?;
+    let (term, decoding) = in_increments(held, |charge| snapshot.decode_charged(id, charge))?;
     let Some(Term::Literal(literal)) = &term else {
         held.release(decoding);
         return Ok(None);
@@ -604,6 +601,30 @@ fn decoded(
     let kept = shape.as_ref().map_or(0, shape_bytes);
     held.resize(held.bytes() - bound + kept)?;
     Ok(shape.map(Arc::new))
+}
+
+/// What `decode` gives, its charge made to `held` in the increments it asks for (more than one
+/// where a checkpoint came between the decoder's bound and its decode), and their sum. Refused,
+/// every increment made is released: `held` is as it was.
+fn in_increments<T>(
+    held: &mut Held,
+    decode: impl FnOnce(
+        &mut dyn FnMut(usize) -> Result<(), BudgetExceeded>,
+    ) -> Result<T, BudgetExceeded>,
+) -> Result<(T, usize), BudgetExceeded> {
+    let mut charged = 0;
+    let decoded = decode(&mut |bytes| {
+        held.charge(bytes)?;
+        charged += bytes;
+        Ok(())
+    });
+    match decoded {
+        Ok(decoded) => Ok((decoded, charged)),
+        Err(refused) => {
+            held.release(charged);
+            Err(refused)
+        }
+    }
 }
 
 /// Records that `object` has a placement at `p`.
@@ -1616,7 +1637,7 @@ impl Context<'_> {
                 None => Side::Free(v.clone()),
             },
             TermPattern::BlankNode(b) => {
-                let v = Variable::new_unchecked(format!("_bnode_{}", b.as_str()));
+                let v = blank_variable(b);
                 match solutions.column(&v) {
                     Some(c) => Side::Bound(c),
                     None => Side::Free(v),
@@ -1649,7 +1670,7 @@ impl Context<'_> {
         // the columns, at most two wider than the rows joined.
         let named = |term: &TermPattern| match term {
             TermPattern::Variable(v) => size_of::<Variable>() + v.as_str().len(),
-            TermPattern::BlankNode(b) => size_of::<Variable>() + "_bnode_".len() + b.as_str().len(),
+            TermPattern::BlankNode(b) => size_of::<Variable>() + blank_variable(b).as_str().len(),
             _ => 0,
         };
         let most = solutions.vars.len() + 2;
@@ -1734,11 +1755,18 @@ impl Context<'_> {
         drop((s, o, line));
         self.consumed(solutions);
         self.check()?;
-        let table = match joined {
-            // No column: only the count of rows, which holds no memory.
-            0 => IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-            _ => charged_table(columns.into_iter()),
-        };
+        if joined == 0 {
+            // No column: only the count of rows, charged as rows without columns are
+            // ([`IdTable::memory_bytes`]); whoever consumes it releases that.
+            drop(columns);
+            drop(working);
+            return self.produced(Solutions {
+                vars,
+                table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                ordered: false,
+            });
+        }
+        let table = charged_table(columns.into_iter());
         drop(working);
         Ok(Solutions {
             vars,
@@ -1862,6 +1890,49 @@ mod tests {
     /// shape or R-tree entry. Over one graph the literals are as unscoped and a scope that
     /// shows the graph checks nothing; over several, a placement's graph is its run's, one
     /// run per graph and kind, and features within one graph cross nothing.
+    /// Spec (sol-loop r1 S2 of `pkg/zero-width-budget`): a relation with both sides
+    /// constant makes rows without columns, which count one id each
+    /// ([`IdTable::memory_bytes`]); its result is charged as every table is, so consuming
+    /// it leaves the query's other charges in place. 1,000 rows, each matching.
+    #[test]
+    fn rows_without_columns_of_a_relation_are_charged() {
+        let snapshot = snapshot_with(&[GraphName::DefaultGraph], |_| {
+            ("asWKT", "wktLiteral", "POINT(0 0)".to_owned())
+        });
+        let options = QueryOptions::default();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let g0 = TermPattern::NamedNode(node("urn:g0".to_owned()));
+        let relation = TriplePattern {
+            subject: g0.clone(),
+            predicate: NamedNodePattern::NamedNode(node(format!("{GEO}sfEquals"))),
+            object: g0,
+        };
+        // Another table of the query, live throughout.
+        let other = 1 << 20;
+        ctx.budget.charge(other).unwrap();
+        let rows = 1_000;
+        let input = ctx
+            .produced(Solutions {
+                vars: Vec::new(),
+                table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                ordered: false,
+            })
+            .ok()
+            .expect("room");
+        let joined = ctx
+            .spatial_join(input, &relation)
+            .ok()
+            .expect("the relation's rows");
+        assert_eq!(joined.table.len(), rows);
+        ctx.consumed(joined);
+        assert!(
+            ctx.budget.used() >= other,
+            "consuming the relation's rows released {} bytes of another table's charge",
+            other - ctx.budget.used()
+        );
+        ctx.budget.release(other);
+    }
+
     #[test]
     fn graphs_are_runs_not_marks() {
         let named = GraphName::NamedNode(NamedNode::new_unchecked("urn:graph"));
@@ -2269,5 +2340,31 @@ mod tests {
         assert_eq!(envelope.used(), 0);
         // Past the constant's charge: the candidates were charged as they grew.
         assert!(envelope.peak() > shape_bound(square.len()) && envelope.peak() <= limit);
+    }
+
+    /// Package C3 (review r1): a charged decode charges in increments, more than one where a
+    /// checkpoint came between its bound and its decode. Of a reservation holding 10 bytes of a
+    /// 100-byte budget, one of 40 and one of 60 are asked: the second refused, the first is
+    /// released and the reservation holds its 10 again; 40 and 50 fit, and their sum, 90, is the
+    /// decoding's.
+    #[test]
+    fn a_refused_later_increment_releases_the_earlier_ones() {
+        let budget = Arc::new(Budget::new(100));
+        let mut held = Reservation::new(Arc::clone(&budget));
+        held.charge(10).unwrap();
+        let refused = in_increments(&mut held, |charge| {
+            charge(40)?;
+            charge(60)?;
+            Ok(())
+        });
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!((held.bytes(), budget.used()), (10, 10));
+        let fit = in_increments(&mut held, |charge| {
+            charge(40)?;
+            charge(50)?;
+            Ok("decoded")
+        });
+        assert_eq!(fit, Ok(("decoded", 90)));
+        assert_eq!((held.bytes(), budget.used()), (100, 100));
     }
 }
