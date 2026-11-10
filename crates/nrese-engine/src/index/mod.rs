@@ -326,12 +326,17 @@ impl IndexVersion {
     /// What [`Self::with_change_within`] needs charged before it is called for `inserts` and
     /// `deletes` (DUR-6 slice 2): below the parallel threshold, the bound of its run's build
     /// ([`Run::delta_bound`]), working memory included; nothing for an empty delta (nothing is
-    /// built) or at or above the threshold (that build charges exactly as it goes).
-    pub(crate) fn change_bound(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> usize {
+    /// built). None at or above the threshold: that build charges exactly as it goes, and no
+    /// bound charged beside it covers its peak (review r1 on slice 2, DUR6B-R1-01).
+    pub(crate) fn change_bound(
+        &self,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+    ) -> Option<usize> {
         match inserts.len() + deletes.len() {
-            0 => 0,
-            n if Run::charged_exactly(n) => 0,
-            n => Run::delta_bound(self.layout_with(inserts, deletes), n),
+            0 => Some(0),
+            n if Run::charged_exactly(n) => None,
+            n => Some(Run::delta_bound(self.layout_with(inserts, deletes), n)),
         }
     }
 
