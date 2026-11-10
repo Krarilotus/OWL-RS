@@ -562,6 +562,16 @@ struct Shared {
     forms: crate::index::Forms,
 }
 
+impl Drop for Shared {
+    /// The statistics' directory stops being theirs before the store's `LOCK` is released
+    /// (`durable` drops after this body): a rebuild or snapshot that outlives the store
+    /// writes and reads it no more, and a save under way ends first
+    /// ([`statistics::Statistics::close_dir`]).
+    fn drop(&mut self) {
+        self.statistics.close_dir();
+    }
+}
+
 impl Shared {
     /// A stamp for a new commit: never before the store's clock, which takes it.
     fn stamp(&self) -> u64 {
@@ -1047,10 +1057,18 @@ impl Engine {
     /// the machine with their build.
     pub fn prepare_statistics(&self) {
         let snapshot = self.snapshot();
+        // The engine's own acquisition is published (`Shared::snapshot`).
+        debug_assert!(
+            snapshot.shared_state().is_some(),
+            "the engine's snapshot is published"
+        );
+        let Some(state) = snapshot.shared_state() else {
+            return;
+        };
         self.inner
             .shared
             .statistics
-            .prepare_sets(&snapshot, ReadModel::default());
+            .prepare_sets(&state, ReadModel::default());
     }
 
     /// What the planner's statistics kept are charged to from now on: their owner's budget
