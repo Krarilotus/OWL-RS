@@ -53,6 +53,7 @@ mod graph_tests;
 mod optimise_tests;
 pub(crate) mod ql;
 mod ranges;
+mod scan_columns;
 mod search;
 mod sets;
 mod sideways;
@@ -3539,6 +3540,10 @@ impl<'a> Context<'a> {
                 Some((v.clone(), position))
             })
             .collect();
+        // The lists' charge, while they live: the columns decoded for them are charged before
+        // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
+        let mut held = Reservation::new(&*self.budget);
+        // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
         for i in 0..scans.len() {
             // Pairs of patterns: cancelled, the rest is left out, and the orderer that
@@ -3564,18 +3569,26 @@ impl<'a> Context<'a> {
                         let pattern = scans[k].quad_pattern();
                         // A column at a time where the index allows (a few ns a value;
                         // a quad at a time took 50: LUBM-10 q11 0.06 → 0.18 ms).
-                        lists[k] = self
-                            .snapshot
-                            .scan_columns_in(self.model, &pattern, permutation, &[*position])
-                            .and_then(|mut columns| columns.pop())
-                            .or_else(|| {
-                                let quads = self.snapshot.scan_sorted_in(
-                                    self.model,
-                                    &pattern,
-                                    permutation,
-                                )?;
-                                Some(quads.map(|q| q.components()[*position]).collect())
-                            });
+                        let decoded = self.snapshot.scan_columns_in(
+                            self.model,
+                            &pattern,
+                            permutation,
+                            &[*position],
+                            &self.budget,
+                        );
+                        lists[k] = match decoded {
+                            Ok(Some(columns)) => {
+                                let (mut columns, charge) = columns.into_parts();
+                                held.absorb(charge);
+                                columns.pop()
+                            }
+                            Ok(None) => self
+                                .snapshot
+                                .scan_sorted_in(self.model, &pattern, permutation)
+                                .map(|quads| quads.map(|q| q.components()[*position]).collect()),
+                            // Refused: no overlap known for it; the plan goes without.
+                            Err(_) => None,
+                        };
                     }
                 }
                 let (Some(x), Some(y)) = (&lists[i], &lists[j]) else {
@@ -4003,24 +4016,39 @@ impl<'a> Context<'a> {
         // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
         if !merged && !scan.repeats_variable() {
             let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
-            if let Some(columns) =
-                self.snapshot
-                    .scan_columns_in(self.model, &pattern, permutation, &components)
+            // Charged before they are decoded ([`Snapshot::scan_columns_in`]): the table
+            // takes over their charge.
+            if let Some(columns) = self
+                .snapshot
+                .scan_columns_in(self.model, &pattern, permutation, &components, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             {
-                let table = if vars.is_empty() {
+                let sorted = sorted_columns(scan, permutation, &vars);
+                if vars.is_empty() {
                     let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
-                } else {
-                    IdTable::from_columns(columns)
-                };
-                return self.produced(Solutions {
-                    vars: vars.clone(),
-                    table: table.assume_sorted_by(sorted_columns(scan, permutation, &vars)),
-                    ordered: false,
-                });
+                    let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+                    return self.produced(Solutions {
+                        vars: vars.clone(),
+                        table: table.assume_sorted_by(sorted),
+                        ordered: false,
+                    });
+                }
+                let (columns, held) = columns.into_parts();
+                return self.holding(
+                    held,
+                    Solutions {
+                        vars: vars.clone(),
+                        table: IdTable::from_columns(columns).assume_sorted_by(sorted),
+                        ordered: false,
+                    },
+                );
             }
         }
-        let mut table = IdTable::new(vars.len());
+        if vars.is_empty() {
+            return self.scan_without_columns(scan, permutation);
+        }
+        // Rows known only as they are read: each column charged before it grows.
+        let mut columns = scan_columns::Columns::new(&self.budget, vars.len());
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
@@ -4054,14 +4082,80 @@ impl<'a> Context<'a> {
                 }
                 *slot = value;
             }
-            table.push_row(&row);
+            columns
+                .push_row(&row)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
         }
+        let (table, held) = columns
+            .into_table()
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table,
+                ordered: false,
+            },
+        )
+    }
+
+    /// [`Self::scan`] of a pattern without variables, matched quad by quad: its rows hold
+    /// nothing until something makes a column of them, charged as such
+    /// ([`IdTable::memory_bytes`]) once they are counted.
+    fn scan_without_columns(
+        &self,
+        scan: &ScanPattern,
+        permutation: Permutation,
+    ) -> NativeResult<Solutions> {
+        let pattern = scan.quad_pattern();
+        let merged = scan.merged();
+        let mut table = IdTable::new(0);
+        let quads = self
+            .snapshot
+            .scan_sorted_in(self.model, &pattern, permutation)
+            .expect("permutation_for returns a usable permutation");
+        let mut previous: Option<[u64; 3]> = None;
+        for (n, quad) in quads.enumerate() {
+            if n % (1 << 16) == 0 {
+                self.check()?;
+            }
+            if merged {
+                if let Some(graphs) = &self.merge_set
+                    && !graphs.contains(&quad.graph)
+                {
+                    continue;
+                }
+                // Graph-last order: the copies of a statement follow each other.
+                let components = quad.components();
+                let statement = [components[0], components[1], components[2]];
+                if previous == Some(statement) {
+                    continue;
+                }
+                previous = Some(statement);
+            }
+            table.push_row(&[]);
+        }
         self.produced(Solutions {
-            vars,
+            vars: Vec::new(),
             table,
             ordered: false,
         })
+    }
+
+    /// `solutions`, whose table `held` holds the charge of (exactly its bytes, once
+    /// resized): the charge handed on with them, never released and charged again. A
+    /// cancelled query fails here, as at [`Self::produced`].
+    fn holding(
+        &self,
+        mut held: Reservation<&Budget>,
+        solutions: Solutions,
+    ) -> NativeResult<Solutions> {
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
     }
 
     /// Scans `scan` over `ranges` of its object (the first free component of
@@ -4099,21 +4193,27 @@ impl<'a> Context<'a> {
                 solutions
             });
         }
-        // Each range a block and a column at a time where the index can, else quad by quad.
-        let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
+        // Each range a block and a column at a time where the index can, else quad by quad;
+        // what each range decodes and the table it goes into charged before they grow.
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut out = scan_columns::Columns::new(&self.budget, vars.len());
+        let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
             self.check()?;
-            if let Some(decoded) = self.snapshot.scan_range_columns_in(
-                self.model,
-                &pattern,
-                permutation,
-                low,
-                high,
-                &columns,
-            ) {
-                for (column, values) in out.iter_mut().zip(decoded) {
-                    column.extend(values);
-                }
+            if let Some(decoded) = self
+                .snapshot
+                .scan_range_columns_in(
+                    self.model,
+                    &pattern,
+                    permutation,
+                    low,
+                    high,
+                    &columns,
+                    &self.budget,
+                )
+                .map_err(memory)?
+            {
+                out.extend(decoded.columns()).map_err(memory)?;
                 continue;
             }
             let Some(quads) =
@@ -4127,21 +4227,25 @@ impl<'a> Context<'a> {
                     self.check()?;
                 }
                 let components = quad.components();
-                for (column, &c) in out.iter_mut().zip(&columns) {
-                    column.push(components[c]);
+                for (slot, &c) in row.iter_mut().zip(&columns) {
+                    *slot = components[c];
                 }
+                out.push_row(&row).map_err(memory)?;
             }
         }
         let object = vars
             .iter()
             .position(|v| scan.slots[2].is_var(v))
             .expect("ranged object");
-        let table = IdTable::from_columns(out).assume_sorted_by(vec![object]);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let (table, held) = out.into_table().map_err(memory)?;
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table: table.assume_sorted_by(vec![object]),
+                ordered: false,
+            },
+        )
     }
 
     /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the
@@ -5228,10 +5332,12 @@ impl<'a> Context<'a> {
         {
             let permutation = scan.permutation_for(Some(key));
             let start = std::time::Instant::now();
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
             if scan.first_free(permutation) == Some(component)
-                && let Some(groups) =
-                    self.snapshot
-                        .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+                && let Some(groups) = self
+                    .snapshot
+                    .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                    .map_err(QueryEvaluationError::MemoryLimit)?
             {
                 if self.trace.is_some() {
                     let detail = format!("{key} of {triple}");
@@ -5248,7 +5354,7 @@ impl<'a> Context<'a> {
                     let mut columns = Vec::with_capacity(vars.len());
                     columns.push(groups.iter().map(|(value, _)| value.raw()).collect());
                     let mut counts = Vec::with_capacity(groups.len());
-                    for &(_, n) in &groups {
+                    for &(_, n) in groups.iter() {
                         counts.push(match TermId::inline_integer(n as i64) {
                             Some(id) => id.raw(),
                             None => self.id(&integer(n))?,
