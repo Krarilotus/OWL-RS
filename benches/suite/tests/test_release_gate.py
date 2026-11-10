@@ -3016,6 +3016,17 @@ printf '%s\\n' "$out"; exit $code
                                                 {self.side: commit})
         self.assertEqual(inputs, [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}])
 
+    def test_a_job_takes_no_measurement_commit_its_checkout_already_reaches(self):
+        """Master, 10 Nov (IB0343-654a): the fleet stages a job's checkout with its history and takes one git
+        input (F150), so a measurement commit the checkout reaches is no input of its own; one it doesn't
+        reach still is. Both checkouts hold the side itself, so neither takes it as an input."""
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        holding = self.commit({"README.md": "holds it\n"}, "a checkout that reaches it", commit)
+        kept = [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}]
+        with patch.object(gate_module, "measurement_sides", return_value={self.side: commit}):
+            self.assertEqual(gate_module.side_inputs(self.repo, holding, [self.side]), [])
+            self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
+
     def test_main_and_v1_5_are_measured_at_their_commits(self):
         table = gate_module.tomllib.loads(gate_module.MEASUREMENT_SIDES.read_text(encoding="utf-8"))["side"]
         self.assertTrue({gate_module.MAIN, gate_module.BASE} <= set(table))
