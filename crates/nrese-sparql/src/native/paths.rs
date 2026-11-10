@@ -47,9 +47,10 @@ use std::sync::Arc;
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::graph::{
-    Adjacency, closure, closure_sizes_until, reachable, transitive_closure_until,
+    Adjacency, Probes, closure_sizes_within, closure_within, reachable_within,
+    transitive_closure_within,
 };
-use nrese_exec::{Budget, BudgetExceeded, Charged, ChargedMap, Pool, Share};
+use nrese_exec::{Budget, BudgetExceeded, Charged, ChargedMap, Pool, Share, Stop};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 /// A buffer of a path's evaluation: charged to the query's budget through the evaluator's
@@ -525,18 +526,6 @@ impl PathEvaluator<'_> {
         true
     }
 
-    /// A vector a producer that doesn't charge made ([`nrese_exec::graph`]'s closures),
-    /// charged now it has arrived; refused, freed, and the evaluator stops.
-    fn adopted<T>(&self, values: Vec<T>) -> Buf<'_, T> {
-        match self.buf().adopt_vec(values) {
-            Ok(values) => values,
-            Err(refused) => {
-                self.refuse(refused);
-                self.buf()
-            }
-        }
-    }
-
     /// The values of a bag, without their copies (a value may still come more than once).
     fn values<'e, T: Copy>(&'e self, bag: Bag<'e, T>) -> Buf<'e, T> {
         match bag {
@@ -567,33 +556,84 @@ impl PathEvaluator<'_> {
         values
     }
 
-    /// [`transitive_closure_until`] stopped with the query: then empty. None of edges a
-    /// refused charge cut short (sol-loop r1 S2 of EMS-R1): they are no path's, and their
-    /// closure would be built for nothing (no charge is taken while it runs).
-    fn closure_of(&self, edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    /// A closure's result, charged to the evaluator's pool while it was made
+    /// ([`nrese_exec::graph`]'s `_within` kernels): a refused charge is the evaluator's
+    /// refusal, a stop its cancellation (which the caller's check reports); either way empty.
+    fn closed<'e, T>(&'e self, made: Result<Buf<'e, T>, Stop>) -> Buf<'e, T> {
+        match made {
+            Ok(values) => values,
+            Err(Stop::Memory(refused)) => {
+                self.refuse(refused);
+                self.buf()
+            }
+            Err(_) => self.buf(),
+        }
+    }
+
+    /// The query's cancellation, as the graph kernels poll it.
+    fn cancelled(&self) -> impl Fn() -> bool + Sync + '_ {
+        let cancellation = self.cancellation;
+        move || cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+    }
+
+    /// [`transitive_closure_within`] of `edges` on the evaluator's pool, stopped with the
+    /// query: then empty. None of edges a refused charge cut short (sol-loop r1 S2 of
+    /// EMS-R1): they are no path's, and their closure would be built for nothing.
+    fn closure_of(&self, edges: &[(u64, u64)]) -> Buf<'_, (u64, u64)> {
         if self.stopped() {
-            return Vec::new();
+            return self.buf();
         }
         self.closures.set(self.closures.get() + 1);
-        let cancellation = self.cancellation;
-        let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
-        transitive_closure_until(edges, &stop).unwrap_or_default()
+        self.closed(transitive_closure_within(
+            edges,
+            &self.pool,
+            &self.cancelled(),
+        ))
     }
 
-    /// One step of a search forwards over `path` from `node`: none once stopped, which
-    /// ends the search.
-    /// The search takes each end once, however many ways lead there.
-    fn step_from(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
-        if !self.stopped() {
-            out.extend_from_slice(&self.support_from(path, node));
+    /// The evaluator's stop as a search's: its refusal, or the query's cancellation.
+    fn halted(&self) -> Result<(), Stop> {
+        match self.refused.get() {
+            Some(refused) => Err(Stop::Memory(refused)),
+            None if self.stopped() => Err(Stop::Cancelled),
+            None => Ok(()),
         }
     }
 
-    /// [`Self::step_from`] backwards.
-    fn step_to(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
-        if !self.stopped() {
-            out.extend_from_slice(&self.support_to(path, node));
+    /// One step of a search over `path` from `node`, forwards (`forward`) or backwards: its
+    /// ends, in a buffer of the evaluation. Refused while they were found (a refusal cuts them
+    /// short), the refusal, which ends the search; the query's cancellation the search polls
+    /// itself, once per batch of work. The search takes each end once, however many ways lead
+    /// there.
+    fn ends_of(&self, path: &Path, node: u64, forward: bool) -> Result<Buf<'_, u64>, Stop> {
+        let ends = match forward {
+            true => self.support_from(path, node),
+            false => self.support_to(path, node),
+        };
+        match self.refused.get() {
+            Some(refused) => Err(Stop::Memory(refused)),
+            None => Ok(ends),
         }
+    }
+
+    /// The closure of `step` from `node` (`forward`) or into it: the nodes it reaches in one
+    /// or more steps, or zero or more with `include`, each once, in breadth-first order. The
+    /// search's buffers are charged to the evaluator's pool while it searches
+    /// ([`reachable_within`]; review r1 of the graph closure package, R1-F1): refused, the
+    /// evaluator's refusal; stopped, empty.
+    fn search(&self, step: &Path, node: u64, include: bool, forward: bool) -> Buf<'_, u64> {
+        self.closed(self.searched(node, include, |node| self.ends_of(step, node, forward)))
+    }
+
+    /// [`Self::search`] with each node's ends found by `ends`, and its stop returned.
+    fn searched<'e, S: std::ops::Deref<Target = [u64]>>(
+        &'e self,
+        node: u64,
+        include: bool,
+        ends: impl FnMut(u64) -> Result<S, Stop>,
+    ) -> Result<Buf<'e, u64>, Stop> {
+        self.halted()?;
+        reachable_within(node, include, Probes(ends), &self.pool, &self.cancelled())
     }
 
     /// The ends of `path` from `node`, for a set-valued path (a search's step, `p?`): each
@@ -797,11 +837,11 @@ impl PathEvaluator<'_> {
             return Ok(None);
         };
         self.closures.set(self.closures.get() + 1);
-        let cancellation = self.cancellation;
-        let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
         let edges = self.answer(self.edges(step))?;
-        let Some(sizes) = closure_sizes_until(&edges, &stop) else {
-            return Ok(None);
+        let sizes = match closure_sizes_within(&edges, &self.pool, &self.cancelled()) {
+            Ok(sizes) => sizes,
+            Err(Stop::Memory(refused)) => return Err(refused),
+            Err(_) => return Ok(None),
         };
         drop(edges);
         if matches!(path, Path::OneOrMore(_)) {
@@ -833,18 +873,19 @@ impl PathEvaluator<'_> {
             return None;
         };
         let expanded = std::cell::Cell::new(0usize);
-        let reached = reachable(node, matches!(path, Path::ZeroOrMore(_)), |n, out| {
+        let reached = self.searched(node, matches!(path, Path::ZeroOrMore(_)), |n| {
             if expanded.get() < budget {
                 expanded.set(expanded.get() + 1);
-                match forward {
-                    true => self.step_from(step, n, out),
-                    false => self.step_to(step, n, out),
-                }
+                self.ends_of(step, n, forward)
             } else {
+                // Past the budget: no more nodes expanded, and no estimate.
                 expanded.set(budget + 1);
+                Ok(self.buf())
             }
         });
-        (expanded.get() <= budget && self.refused.get().is_none()).then_some(reached.len())
+        // Stopped or refused: no estimate (the planner's own evaluator, nothing the query keeps).
+        let reached = reached.ok()?.len();
+        (expanded.get() <= budget && self.refused.get().is_none()).then_some(reached)
     }
 
     /// Ends reachable from `start` (a bag), or the charge refused while they were found.
@@ -893,14 +934,12 @@ impl PathEvaluator<'_> {
                     |p, values| self.stream(p, values, Some(start), None, |(_, _, o)| o),
                 );
             }
-            Path::OneOrMore(p) => {
-                self.adopted(reachable(start, false, |n, out| self.step_from(p, n, out)))
-            }
+            Path::OneOrMore(p) => self.search(p, start, false, true),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(start) {
                     return Bag::Copies(self.buf());
                 }
-                self.adopted(reachable(start, true, |n, out| self.step_from(p, n, out)))
+                self.search(p, start, true, true)
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(start) {
@@ -1108,14 +1147,12 @@ impl PathEvaluator<'_> {
                     |p, values| self.stream(p, values, None, Some(end), |(s, _, _)| s),
                 );
             }
-            Path::OneOrMore(p) => {
-                self.adopted(reachable(end, false, |n, out| self.step_to(p, n, out)))
-            }
+            Path::OneOrMore(p) => self.search(p, end, false, false),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(end) {
                     return Bag::Copies(self.buf());
                 }
-                self.adopted(reachable(end, true, |n, out| self.step_to(p, n, out)))
+                self.search(p, end, true, false)
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(end) {
@@ -1191,12 +1228,10 @@ impl PathEvaluator<'_> {
                 if start == end {
                     self.is_node(start)
                 } else {
-                    reachable(start, false, |n, out| self.step_from(p, n, out)).contains(&end)
+                    self.search(p, start, false, true).contains(&end)
                 }
             }
-            Path::OneOrMore(p) => {
-                reachable(start, false, |n, out| self.step_from(p, n, out)).contains(&end)
-            }
+            Path::OneOrMore(p) => self.search(p, start, false, true).contains(&end),
             Path::ZeroOrOne(p) => {
                 if start == end {
                     self.is_node(start)
@@ -1229,7 +1264,9 @@ impl PathEvaluator<'_> {
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                Bag::Copies(self.adopted(pairs_of(closure(&adjacency, starts, reflexive))))
+                let pairs =
+                    closure_within(&adjacency, starts, reflexive, &self.pool, &self.cancelled());
+                Bag::Copies(self.closed(pairs))
             }
             _ => self.pairs_at(
                 starts,
@@ -1262,7 +1299,9 @@ impl PathEvaluator<'_> {
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                let mut pairs = self.adopted(pairs_of(closure(&adjacency, ends, reflexive)));
+                let pairs =
+                    closure_within(&adjacency, ends, reflexive, &self.pool, &self.cancelled());
+                let mut pairs = self.closed(pairs);
                 for pair in pairs.iter_mut() {
                     *pair = (pair.1, pair.0);
                 }
@@ -1359,14 +1398,14 @@ impl PathEvaluator<'_> {
                     |p, values| self.stream(p, values, None, None, |(s, _, o)| (s, o)),
                 );
             }
-            // The closure's pairs charged as they arrive, while its edges are still held.
+            // The closure's pairs charged before they are made, beside its edges.
             Path::OneOrMore(p) => {
                 let edges = self.edges(p);
-                self.adopted(self.closure_of(&edges))
+                self.closure_of(&edges)
             }
             Path::ZeroOrMore(p) => {
                 let edges = self.edges(p);
-                let mut pairs = self.adopted(self.closure_of(&edges));
+                let mut pairs = self.closure_of(&edges);
                 drop(edges);
                 // Every node with itself, unless the closure has it already (on a cycle).
                 let mut on_cycle =
@@ -1395,15 +1434,6 @@ impl PathEvaluator<'_> {
         };
         Bag::Copies(copies)
     }
-}
-
-fn pairs_of(table: nrese_exec::IdTable) -> Vec<(u64, u64)> {
-    table
-        .column(0)
-        .iter()
-        .copied()
-        .zip(table.column(1).iter().copied())
-        .collect()
 }
 
 /// Calls `f` for each value of the union of two sorted, distinct lists, in order.

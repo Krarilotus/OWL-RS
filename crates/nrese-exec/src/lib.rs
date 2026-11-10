@@ -55,8 +55,8 @@ pub mod table;
 pub mod workers;
 
 pub use budget::{
-    Budget, BudgetExceeded, Charged, ChargedVec, Envelope, Gauge, Grant, Hold, Pool, Reservation,
-    Room, Share, SharedBudget,
+    Budget, BudgetExceeded, Charged, ChargedVec, Envelope, Gauge, Grant, Hold, Part, Pool,
+    Reservation, Room, Share, SharedBudget,
 };
 pub use charged_map::ChargedMap;
 
