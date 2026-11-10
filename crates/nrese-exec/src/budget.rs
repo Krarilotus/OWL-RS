@@ -619,8 +619,13 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         held
     }
 
-    /// Reserves `bytes` more, or fails without reserving anything.
+    /// Reserves `bytes` more, or fails without reserving anything. Nothing, it reserves
+    /// without a call up the budget's levels: an empty table's charge, resize and release cost
+    /// nothing (D16-039's timing: three such calls an empty scan, NOT EXISTS ×1.06).
     pub fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
+        if bytes == 0 {
+            return Ok(());
+        }
         let Some(total) = self.bytes.checked_add(bytes) else {
             return Err(self.budget.refuse(bytes, self.budget.used()));
         };
@@ -634,6 +639,11 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
     /// Returns up to `bytes` of this reservation to the budget.
     pub fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.bytes);
+        // Nothing released, no call up the levels (a reservation dropped empty, after
+        // [`Self::transfer`] too).
+        if bytes == 0 {
+            return;
+        }
         let _released = self.budget.give(bytes);
         self.bytes -= bytes;
         #[cfg(any(test, feature = "measure"))]
@@ -1359,6 +1369,20 @@ impl<T, H: Hold> Charged<T, H> {
         }
         self.items.push(item);
         Ok(())
+    }
+
+    /// `item` appended within the capacity already charged, with no budget call and no
+    /// refusal to carry; `Err(item)` where there is no room, for the caller to grow first
+    /// ([`Self::reserve`]). For a hot loop of one item an iteration: a [`Self::push`]'s
+    /// `Result` there cost D16-039's group walk a 5 % rise in instructions on NOT EXISTS.
+    #[inline]
+    pub fn push_within(&mut self, item: T) -> Result<(), T> {
+        if self.items.len() < self.items.capacity() {
+            self.items.push(item);
+            Ok(())
+        } else {
+            Err(item)
+        }
     }
 
     pub fn extend_from_slice(&mut self, items: &[T]) -> Result<(), BudgetExceeded>
