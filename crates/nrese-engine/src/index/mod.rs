@@ -147,6 +147,30 @@ impl Layout {
 /// Keys per part of a group walk over a large range, walked in parallel: a multiple of
 /// the block size.
 pub(crate) const GROUP_PART: usize = 1 << 16;
+/// The groups a part of a parallel group walk has room for from the start (16 KiB).
+const PART_FIRST: usize = 1 << 10;
+
+/// [`IndexVersion::group_counts`]'s walk past its capacity, out of its hot loop: `group`
+/// pushed after a growth charged first, or dropped where the walk was refused (that
+/// refusal kept, the first one).
+#[cold]
+#[inline(never)]
+fn grow_then_push(
+    out: &mut ChargedVec<(u64, i64), &Budget>,
+    group: (u64, i64),
+    refused: &mut Option<BudgetExceeded>,
+) {
+    if refused.is_some() {
+        return;
+    }
+    match out.reserve(1) {
+        Ok(()) => {
+            let pushed = out.push_within(group);
+            debug_assert!(pushed.is_ok(), "room after a growth");
+        }
+        Err(error) => *refused = Some(error),
+    }
+}
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
 #[derive(Debug, Clone, Default)]
@@ -522,16 +546,17 @@ impl IndexVersion {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
             // The walk can't stop between groups: a refused group ends what it appends, and
-            // the walk only skips over the rest.
+            // the walk only skips over the rest. A group costs a push within the capacity
+            // charged; only a growth, logarithmically many, calls the budget.
             let walk = |start: usize,
                         end: usize,
                         out: &mut ChargedVec<(u64, i64), &'b Budget>|
              -> Result<(), BudgetExceeded> {
                 let mut refused = None;
                 perm.keys.groups(start, end, position, |value, i, j| {
-                    if refused.is_none() {
-                        let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
-                        refused = out.push((value, count)).err();
+                    let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                    if let Err(group) = out.push_within((value, count)) {
+                        grow_then_push(out, group, &mut refused);
                     }
                 });
                 refused.map_or(Ok(()), Err)
@@ -546,14 +571,31 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
+            // Each part starts at room for its first group and, where that fits, for up to
+            // PART_FIRST (at most its keys): one budget call where its doublings from a few
+            // groups made about ten, all parts' calls on one budget at once (D16-039's NOT
+            // EXISTS: 300 K cycles a run in `Budget::take`). The room past the first group is
+            // optional, never refused (sol-loop S2-1).
             let parts = cuts
                 .par_windows(2)
                 .map(|cut| {
                     let mut part = ChargedVec::new(budget);
+                    part.reserve_hint(1, (cut[1] - cut[0]).min(PART_FIRST))?;
                     walk(cut[0], cut[1], &mut part)?;
                     Ok(part)
                 })
                 .collect::<Result<Vec<_>, BudgetExceeded>>()?;
+            // The merge's room at once, for exactly the groups it appends: a group spanning
+            // a cut is added to the one before it, not appended (sol-loop S2-2).
+            let mut last = None;
+            let mut appended = 0;
+            for part in &parts {
+                if let (Some(&(value, _)), Some(&(end, _))) = (part.first(), part.last()) {
+                    appended += part.len() - usize::from(last == Some(value));
+                    last = Some(end);
+                }
+            }
+            out.reserve(appended)?;
             let first = out.len();
             for part in parts {
                 let Some((&(value, count), rest)) = part.split_first() else {
