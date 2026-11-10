@@ -372,11 +372,11 @@ impl<'e> Transaction<'e> {
         view.with_version(version)
     }
 
-    /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
-    /// equality classes: then the next version computes its classes anew.
+    /// Whether the next version must compute its equality classes anew. While expansion
+    /// is disabled no predicate is known: do not inherit a cell an older reader may fill.
     fn changes_equality(&self) -> bool {
         let Some(same_as) = *self.engine.shared.equality.read() else {
-            return false;
+            return true;
         };
         self.pending.touches_predicate(same_as)
     }
