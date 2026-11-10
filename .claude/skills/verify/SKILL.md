@@ -34,18 +34,16 @@ run unless one of the three above applies.
   by `verify.py jobs`. Read the fleet-jobs skill first: your own `FLEET_OWNER` and webhook, a
   priority with its reason, stale jobs cancelled.
 - **Never on phuoc-yu**, and never to time anything: timings are recorded, never judged.
-- **On the main PC**, a local run goes through the commit slot, like any local build (brief v3,
-  Current operations): `--server target/debug/nrese-server.exe`.
-- Never build or run on a fleet host except through a fleet job.
+- Builds and runs, the main PC's included, are fleet jobs within their admission and host grants.
 
 ## Run it through the fleet
 
 1. **The scenario.** Use one in `scripts/verify/scenarios/` or write one (below); check it with
-   `python scripts/verify/verify.py check FILE`. Commit it: a fleet job sees git only. The
+   `uv run python scripts/verify/verify.py check FILE`. Commit it: a fleet job sees git only. The
    commit holding the runner and the scenarios is the *harness*; it may differ from the server's.
 2. **The jobs.**
 
-       python scripts/verify/verify.py jobs --rev <server commit> --harness <harness commit> \
+       uv run python scripts/verify/verify.py jobs --rev <server commit> --harness <harness commit> \
            --reason "<what this run decides>" [--priority 790 --verifies <fix commit>] SCENARIO...
 
    It writes `tmp/verify/jobs/verify-build-<sha8>-<stamp>.toml` and `verify-run-…toml` and

@@ -118,7 +118,7 @@ nrese_query_memory_limit_bytes {limit}
         "# HELP nrese_index_runs Index runs of both stacks.
 # TYPE nrese_index_runs gauge
 nrese_index_runs {}
-# HELP nrese_index_bytes Index data by where it lives: heap, or mapped from the checkpoint.
+# HELP nrese_index_bytes Index data by where it lives: heap (with the quad-layout forms pending reads share), or mapped from the checkpoint.
 # TYPE nrese_index_bytes gauge
 nrese_index_bytes{{place=\"heap\"}} {}
 nrese_index_bytes{{place=\"mapped\"}} {}

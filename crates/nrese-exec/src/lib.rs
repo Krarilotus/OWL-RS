@@ -36,6 +36,7 @@
 
 pub mod budget;
 pub mod cell;
+pub mod charged_map;
 pub mod classes;
 pub mod graph;
 pub mod group;
@@ -54,8 +55,10 @@ pub mod table;
 pub mod workers;
 
 pub use budget::{
-    Budget, BudgetExceeded, ChargedVec, Envelope, Gauge, Reservation, Room, SharedBudget,
+    Budget, BudgetExceeded, Charged, ChargedVec, Envelope, Gauge, Grant, Hold, Part, Pool,
+    Reservation, Room, Share, SharedBudget,
 };
+pub use charged_map::ChargedMap;
 
 /// The unit tests' allocator: the system's, counting what measured operations hold.
 #[cfg(test)]

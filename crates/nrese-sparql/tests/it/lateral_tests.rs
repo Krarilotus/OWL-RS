@@ -10,6 +10,30 @@ use nrese_sparql_syntax::SparqlParser;
 const EX: &str = "http://example.com/";
 const PREFIXES: &str = "PREFIX ex: <http://example.com/> ";
 
+// Spec: SEP-0006 evaluates the right side for each outer solution, including UNDEF;
+// grouping equivalent substitutions must preserve that solution's multiplicity.
+#[test]
+fn d066_lateral_undef_does_not_join_other_groups() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    for (values, expected) in [
+        ("UNDEF 1", vec![vec!["-", "2"], vec!["1", "1"]]),
+        (
+            "UNDEF 1 1",
+            vec![vec!["-", "2"], vec!["1", "1"], vec!["1", "1"]],
+        ),
+    ] {
+        assert_eq!(
+            rows(
+                &engine,
+                &format!(
+                    "SELECT ?x ?y {{ VALUES ?x {{ {values} }} LATERAL {{ BIND(COALESCE(?x,2) AS ?y) }} }}"
+                ),
+            ),
+            expected,
+        );
+    }
+}
+
 fn ex(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EX}{local}"))
 }

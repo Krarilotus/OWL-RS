@@ -194,7 +194,7 @@ follow from their rules); nothing is assumed.
 | A2 `Decoded::keep` without the moved `Box` | done | Raw pointers with a `Drop`; a test |
 | A2 Miri over the engine's unsafe code | deferred | Never ran (Miri isn't installed on the main PC). Planned with the refactoring after the merge to `main` ([roadmap](ROADMAP.md) step 4) |
 | A2 Dead wildcard arms | done | Four deleted; six covered real variants and name them |
-| A3 `scripts/check.sh` gate, pre-commit and pre-push hooks | done | The pre-push gate tests the changed crates and every crate depending on them, on the fleet; the pre-commit hook checks format, lock files and Docker names |
+| A3 `scripts/check.sh` gate, pre-commit, pre-merge-commit and pre-push hooks | done | The pre-push gate tests the changed crates and every crate depending on them, on the fleet; pre-merge-commit calls pre-commit so ordinary commits and clean merges check format, lock files and Docker names |
 | A3 Workspace lints, resolver 3, `rust-version`, `publish = false` | done | Suppressions are `#[expect]`, except a few `#[allow]` that remain (`git grep -n '#\[allow('`: test-only `dead_code` and clippy argument/type lints) |
 | A3 Dependencies declared once in the workspace | done | Every external dependency two or more crates use (22 workspace entries) |
 | A3 Duplicate dependency versions | partly | Our direct dependencies are aligned; duplicates pulled in by third-party crates remain (`rand` 0.9/0.10, `getrandom` 0.2/0.3/0.4, `digest` 0.10/0.11, `syn` 2/3, `thiserror` 1/2, `winnow` 0.7/1.0) |

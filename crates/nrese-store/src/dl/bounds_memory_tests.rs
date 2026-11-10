@@ -358,6 +358,44 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
 
+/// REAS-3 (C17; master, 9 Nov 02:34). Spec (`GaveUp`'s docs and SYN-61: what memory refused is
+/// never kept, the next read builds it again): a U1 the process's memory stopped is not kept for
+/// its revision, on a read's build and on a commit's. Kept, every later reader of the revision
+/// is answered by the lower bound alone (dl/query/mod.rs: the view's `unavailable`) until the
+/// next commit, though memory may be free again.
+#[test]
+fn an_upper_bound_the_process_memory_stopped_is_not_kept() {
+    if !nrese_exec::memory::READS_MEMORY {
+        return;
+    }
+    let kept = |store: &StoreService| {
+        lock(&store.dl().bounds.state)
+            .as_ref()
+            .is_some_and(|s| s.upper.as_ref().is_err_and(|g| !g.refused))
+    };
+    let store = store(1);
+    assert!(
+        report(&store).unavailable.is_some(),
+        "the process's memory stops U1"
+    );
+    assert!(
+        !kept(&store),
+        "a read keeps no U1 the process's memory stopped"
+    );
+    let store = self::store(1);
+    let tx = store.engine().speculative();
+    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+    assert!(
+        matches!(&prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()),
+        "the commit's U1 is stopped too"
+    );
+    install(&store, prepared, tx.base().revision() + 1);
+    assert!(
+        !kept(&store),
+        "a commit installs no U1 the process's memory stopped"
+    );
+}
+
 #[test]
 fn embedded_zero_memory_policy_leaves_bounds_enabled() {
     let store = store(0);
@@ -416,4 +454,42 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
     assert!(!prepared.proves_consistency);
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
+}
+
+/// REAS-2 fix check r1 (R2-F3, U1). Spec (design note, rule 2: a stop is an error the
+/// consumer has to handle, never an answer): U1's change for a commit ends at its stop. U1
+/// built over an existential axiom and one member, then a change deleting 16 × `POLL_UNITS`
+/// facts U1 doesn't hold, the stop firing at its first ask after the first of their view
+/// lookups: the change gives up, and no more than one lookup is made after the stop fired.
+/// Read as "not in the view", a stopped lookup kept every deleted fact after it, and the
+/// keep looked each one up.
+#[test]
+fn a_change_s_deleted_facts_are_looked_up_until_its_stop() {
+    use crate::witness::{self, Site};
+    let n = 16 * u64::from(nrese_exec::POLL_UNITS);
+    let store = pooled(&members(1));
+    let tx = store.engine().speculative();
+    source::intern_vocabulary(&tx);
+    let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
+    let normalised = nrese_owl::normalise(&ontology);
+    let upper = Upper::build(
+        &ontology,
+        &normalised,
+        tx.base(),
+        &|t| Some(tx.intern(t)),
+        nrese_reasoner::eval::NEVER,
+        store.dl().bounds.kept(),
+    )
+    .unwrap();
+    // Ids no term has: facts in neither U1's program nor the view.
+    let deleted: Vec<Triple> = (0..n).map(|i| [1 << 40 | i, 1 << 41, 1 << 42]).collect();
+    let first = witness::FirstWork::new(Site::InView);
+    let stop = || first.ask();
+    let change = upper.change(tx.base(), &[], &deleted, &stop);
+    let after = first.after();
+    assert!(
+        after <= 1,
+        "{after} view lookups after the stop fired, of {n}: at most the one that saw it"
+    );
+    assert!(change.is_err(), "a stopped change gives up");
 }

@@ -19,6 +19,50 @@ async fn version_endpoint_exposes_capabilities() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// SYN-72 C-1105: every query answer carries `NRESE-Completeness`, `complete` where no
+/// reasoning path can leave answers out (reasoning off, or `infer=false`), so a client can
+/// read a missing header as a status it was not told, never as "complete".
+#[tokio::test]
+async fn answers_no_reasoning_can_shorten_say_complete() -> Result<(), Box<dyn std::error::Error>> {
+    for (mode, uri) in [
+        (
+            ReasoningMode::Disabled,
+            "/dataset/query?query=SELECT%20*%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D",
+        ),
+        (ReasoningMode::Disabled, "/dataset/query?query=ASK%20%7B%7D"),
+        (
+            ReasoningMode::Disabled,
+            "/dataset/query?query=CONSTRUCT%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D",
+        ),
+        (
+            ReasoningMode::Owl2Rl,
+            "/dataset/query?query=SELECT%20*%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D&infer=false",
+        ),
+    ] {
+        let app = test_app_with_settings(PolicyConfig::default(), ReasonerConfig::for_mode(mode))?;
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{mode:?} {uri}");
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("nrese-completeness")
+                .and_then(|v| v.to_str().ok()),
+            Some("complete"),
+            "{mode:?} {uri}: {headers:?}"
+        );
+        assert_eq!(
+            headers
+                .get("access-control-expose-headers")
+                .and_then(|v| v.to_str().ok()),
+            Some("nrese-completeness"),
+            "{mode:?} {uri}: {headers:?}"
+        );
+    }
+    Ok(())
+}
+
 /// `/version` names the semantics the closure has, so a client can tell when an upgrade
 /// changes what is inferred.
 #[tokio::test]

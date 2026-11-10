@@ -15,13 +15,25 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 | code | path -> its git object id at that commit: what a cell can execute in the repository |
 |  | (code_paths(): benches/ by entry less RESULTS, scripts, rust-toolchain.toml, .cargo; and |
 |  | BUILD_PATHS for a compiled NRESE or harness); coarse, exact: any change re-qualifies it |
-| images | image -> the id its containers ran, from the run's pin map (ns.pinned) |
-| build | NRESE's server and the timing harness: built in this run from `commit`, or unknown |
-| settings | the suite settings in force (manifest `settings`) |
+| images | image -> `id`, the one its containers ran (the run's pin map, ns.pinned), and `source`, |
+|  | read off that id, never off the tag: "built from benches/CONTEXT@TREE" (its build label), |
+|  | "pulled, pinned DIGEST" (the id holds its tag's pin, images.toml), else unknown, with why |
+| build | NRESE's server and the timing harness: built in this run from `commit` (its `dirty`), with |
+|  | `target_cpu`, inherited `rustflags_env`, `sources` (its program's BUILD_SOURCES -> git id at |
+|  | the build's own commit, which is not the invocation's: its declared dependency envelope, by |
+|  | content, a superset of what any one build reads), `inputs` |
+|  | (BUILD_INPUTS -> "no files" or a digest: what its build scripts read from outside git, from |
+|  | the clean export it builds in: "no files"), `toolchain` (rustc, cargo, host as the build ran |
+|  | them), `controlled` (true: the export, the declared toolchain, the owner's environment, no |
+|  | cargo config outside it; else unknown, why), and in Docker `rust_image`, the pinned |
+|  | `rust_image_id` it compiled in, and `rustflags`; or unknown |
+| settings | the suite settings in force that change a measurement (manifest `settings` less |
+|  | OPERATIONAL_SETTINGS: where a run keeps its files) |
+| protocol | the attempt's own (manifest `protocol`): runs, query runs, cache modes, order, limits |
 | data | input -> the SHA-256 of its bytes as the cell read them |
-| outcome | its own rows' outcome (summary.Pair.outcome()) |
-| answers | its worst answer verdict this attempt (answers.PRECEDENCE); `not captured` without |
-|  | --answers full; `pending` until the run wrote its answers |
+| outcome | its own rows' outcome (summary.Pair.outcome(): a table, its verdict in `outcome`) |
+| answers | `worst`, `verdicts` (count each) and `qualified` (every query ok or deviates) of this |
+|  | attempt; `not captured` without --answers full; `pending` until the run wrote its answers |
 
 What a cell can't evidence is `{unknown = "why"}`, never an empty map: a driver or kit plan's
 inputs, images and settings (they are its child's), an input outside the datasets, an external
@@ -40,6 +52,25 @@ from pathlib import Path
 CODE_ROOTS = ("benches", "scripts", "rust-toolchain.toml", ".cargo")
 RESULTS = ("benches/runs", "benches/baselines", "benches/STATUS.md", "benches/STANDINGS.md", "benches/CATALOG.md")
 BUILD_PATHS = ("crates", "Cargo.toml", "Cargo.lock")  # a compiled NRESE server or timing harness
+# Each program's declared dependency envelope (P1d review r1 F2): the repository paths whose content
+# can change what its build makes, with the toolchain's configuration (rustup and cargo read
+# rust-toolchain.toml and .cargo from the repository root, where both builds run). Conservative, not
+# an exact read set: a change anywhere in it re-qualifies the build, though a given build may read
+# less (whole crates/ trees; the launcher, which a Docker NRESE build doesn't run, as cargo runs in
+# its image). Exact per-runtime sets, if ever wanted, are declared here, never in a reader. The
+# harness is a workspace of its own (--manifest-path, its own Cargo.lock) whose path dependencies
+# are crates/ members that inherit fields from the root Cargo.toml; it doesn't read the root
+# Cargo.lock. The launcher: scripts/cargo-guarded.sh and the two it sources for the compiler's flags
+# and room (P2 design check r4 B); on Windows it also runs scripts/lib/memory-cap.ps1, admission
+# only, which shapes no program content and isn't in the envelope.
+LAUNCHER = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")
+BUILD_SOURCES = {
+    "nrese": (*BUILD_PATHS, "rust-toolchain.toml", ".cargo", *LAUNCHER),
+    "harness": ("benches/nrese-bench-harness", "crates", "Cargo.toml", "rust-toolchain.toml", ".cargo", *LAUNCHER),
+}
+# What a program's build scripts read that git doesn't hold (r4 A): crates/nrese-server/build.rs
+# embeds every file of the ignored console build.
+BUILD_INPUTS = {"nrese": ("apps/nrese-console/dist",), "harness": ()}
 
 
 def code_paths(root: Path, commit: str) -> tuple[str, ...]:
