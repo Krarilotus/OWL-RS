@@ -1097,6 +1097,9 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     record["expected_outcome"] = wanted
     record["verdict"] = verdict(case, record)
     record["result"] = slim(result)
+    # Each fresh process's result, not only the last's: every phase keeps its spread.
+    if "_repeats" in result:
+        record["repetitions"] = [slim(r) for r in result["_repeats"]]
     return record
 
 
