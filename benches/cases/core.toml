@@ -2483,7 +2483,7 @@ check = { "view_checks.answers_ok" = "true", "view_checks.levels" = 3, "staggere
 route = {}
 cap_gb = 4
 systems = []
-est_min = 10
+est_min = 1
 
 [[case]]
 name = "recovery-catchup-cost"
@@ -2503,7 +2503,7 @@ check = { "recovery.answers_ok" = "true", "recovery.records" = 100 }
 route = {}
 cap_gb = 4
 systems = []
-est_min = 12
+est_min = 1
 
 # Background checkpoints overlapping reads and commits (IB0024 fix check F1): a checkpoint
 # runs as a job of the global pool, its file writing on one of its threads. A durable store,
