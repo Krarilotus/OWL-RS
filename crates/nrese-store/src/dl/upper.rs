@@ -32,7 +32,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use nrese_dl::bounds;
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_engine::{CountedSnapshot, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Normalised, Ontology};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::delta::{self, Base, VisitsBase};
@@ -423,7 +423,9 @@ fn value_of(view: &Snapshot, id: u64) -> Option<nrese_xsd::owl::Value> {
 /// view after the change and the program's facts count as asserted, the stack as
 /// inferred. The view's literals are read as their representatives ([`Values`]).
 struct UpperBase<'a> {
-    view: &'a Snapshot,
+    /// Read only counted: the engine's work below each read on the reading task's poller
+    /// (REAS-3, sweeps SW020, SW021).
+    view: CountedSnapshot,
     facts: &'a HashSet<Triple>,
     stack: &'a Stack,
     values: &'a Noting<'a>,
@@ -441,19 +443,24 @@ impl UpperBase<'_> {
         if poll.tick() {
             return Err(Stopped);
         }
-        let found = poll.counted(self.values.members(o)).any(|o| {
-            self.view
-                .quads_for_pattern_in(
+        // Each member's lookup counted in the engine too (REAS-3, SW020).
+        let reads = |n| poll.visit(n);
+        for o in poll.counted(self.values.members(o)) {
+            let first = self
+                .view
+                .quads(
                     ReadModel::Materialised,
                     &pattern([Some(s), Some(p), Some(o)]),
+                    &reads,
                 )
                 .next()
-                .is_some()
-        });
-        match found || !poll.stopped() {
-            true => Ok(found),
-            false => Err(Stopped),
+                .transpose()?;
+            if first.is_some() {
+                return Ok(true);
+            }
         }
+        poll.ended()?;
+        Ok(false)
     }
 }
 
@@ -470,6 +477,8 @@ impl VisitsBase for UpperBase<'_> {
             .flatten()
             .map(Some)
             .chain(o.is_none().then_some(None));
+        let poll = visit.poller();
+        let reads = |n| poll.visit(n);
         for o in objects {
             // Each member's lookup is a unit.
             if !visit.skip() {
@@ -477,8 +486,12 @@ impl VisitsBase for UpperBase<'_> {
             }
             for q in self
                 .view
-                .quads_for_pattern_in(ReadModel::Materialised, &pattern([s, p, o]))
+                .quads(ReadModel::Materialised, &pattern([s, p, o]), &reads)
             {
+                // Stopped (SW021): the scan's caller reads its poller as stopped.
+                let Ok(q) = q else {
+                    return;
+                };
                 let fact = self
                     .values
                     .map([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
@@ -508,10 +521,9 @@ impl VisitsBase for UpperBase<'_> {
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         let view = self
             .view
-            .count_in_visiting(ReadModel::Materialised, &pattern(bound), &mut |n| {
+            .count(ReadModel::Materialised, &pattern(bound), &|n| {
                 probe.visited(n)
-            })
-            .ok_or(Stopped)?
+            })?
             .at_least();
         let stack = self.stack.estimate_counted(bound, &|| probe.units(1));
         probe.ended()?;
@@ -591,9 +603,11 @@ impl Change {
     }
 }
 
-/// Why U1 isn't available: its evaluation ran out of its budget, or (`refused`) the queries'
-/// memory couldn't hold what it reads or keeps. A refused U1 is never kept: once memory is
-/// free again the next read builds it (SYN-61); one that gave up stays so for its revision.
+/// Why U1 isn't available: its evaluation ran out of its budget, or (`refused`) memory
+/// couldn't hold what it reads or keeps, or the process's memory stopped it. A refused U1 is
+/// never kept: once memory is free again the next read builds it (SYN-61; REAS-3, C17: kept,
+/// every later reader of the revision would be answered by the lower bound alone,
+/// dl/query/mod.rs); one that gave up stays so for its revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GaveUp {
     pub why: String,
@@ -601,7 +615,7 @@ pub struct GaveUp {
 }
 
 impl GaveUp {
-    /// Gave up within its budgets (time, the memory watch, a missing term).
+    /// Gave up within its budgets (time, a missing term).
     pub fn new(why: impl Into<String>) -> Self {
         Self {
             why: why.into(),
@@ -609,18 +623,46 @@ impl GaveUp {
         }
     }
 
-    /// A budget refused what U1 reads or keeps.
+    /// A budget refused what U1 reads or keeps, or the process's memory stopped it.
     pub fn refused(why: impl Into<String>) -> Self {
         Self {
             why: why.into(),
             refused: true,
         }
     }
+
+    /// `self`, refused where `memory` says the process's memory stopped it (REAS-3, C17): a
+    /// store stop that polls the memory watch remembers whether the watch fired.
+    pub(crate) fn by_memory(self, memory: &std::sync::atomic::AtomicBool) -> Self {
+        match self.refused || !memory.load(std::sync::atomic::Ordering::Relaxed) {
+            true => self,
+            false => Self::refused(format!(
+                "{}: the process's memory is past its limit",
+                self.why
+            )),
+        }
+    }
 }
 
-/// Poll the caller's store watch as well as the process owner's safety fallback.
+/// U1's give-up for an evaluation the reasoner interrupted: refused where the process's
+/// memory stopped it (`Interrupted::memory`, the reasoner's own memory fallback), never kept;
+/// otherwise as `why` says (REAS-3a sol-loop r1 S3).
+fn gave_up(interrupted: &delta::Interrupted, why: &str) -> GaveUp {
+    match interrupted.memory {
+        Some(_) => GaveUp::refused(format!("{why}: the process's memory is past its limit")),
+        None => GaveUp::new(why),
+    }
+}
+
+/// Poll the caller's store watch as well as the process owner's safety fallback; the latter
+/// is the process's memory, so a U1 it stops is refused, never kept (REAS-3, C17).
 fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
-    if stop() || nrese_reasoner::eval::over_memory_limit() {
+    if nrese_reasoner::eval::over_memory_limit() {
+        return Err(GaveUp::refused(
+            "the upper bound's evaluation was stopped: the process's memory is past its limit",
+        ));
+    }
+    if stop() {
         Err(GaveUp::new("the upper bound's evaluation was stopped"))
     } else {
         Ok(())
@@ -804,7 +846,7 @@ impl Upper {
             nrese_reasoner::batch::Listing::Stored,
             stop,
         )
-        .map_err(|_| GaveUp::new("the upper bound's evaluation was stopped"))?;
+        .map_err(|stopped| gave_up(&stopped, "the upper bound's evaluation was stopped"))?;
         let same_as = program.names.same_as;
         // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
         // evaluation's own working set is watched (`stop`), as the support sets' is.
@@ -914,7 +956,7 @@ impl Upper {
         deleted.sort_unstable();
         deleted.dedup();
         let base = UpperBase {
-            view,
+            view: view.counted(),
             facts: &self.facts,
             stack: &self.stack,
             values: &values,
@@ -954,7 +996,7 @@ impl Upper {
             self.ground.as_ref(),
             stop,
         )
-        .map_err(|_| GaveUp::new("the upper bound's maintenance was stopped"))?;
+        .map_err(|stopped| gave_up(&stopped, "the upper bound's maintenance was stopped"))?;
         change.program = update.program;
         // An equality the commit brings (the RL closure's, say: a functional property is
         // OWL 2 RL) or U1 derives: U1 then has classes.
@@ -1076,7 +1118,7 @@ mod tests {
             added: super::Values::default(),
         };
         let base = super::UpperBase {
-            view: &view,
+            view: view.counted(),
             facts: &facts,
             stack: &stack,
             values: &noting,
@@ -1120,7 +1162,7 @@ mod tests {
             added: super::Values::default(),
         };
         let base = super::UpperBase {
-            view: &view,
+            view: view.counted(),
             facts: &facts,
             stack: &stack,
             values: &noting,
@@ -1174,7 +1216,7 @@ mod tests {
             added: super::Values::default(),
         };
         let base = super::UpperBase {
-            view: &view,
+            view: view.counted(),
             facts: &facts,
             stack: &stack,
             values: &noting,
@@ -1219,7 +1261,7 @@ mod tests {
             added: super::Values::default(),
         };
         let base = super::UpperBase {
-            view: &view,
+            view: view.counted(),
             facts: &facts,
             stack: &stack,
             values: &noting,

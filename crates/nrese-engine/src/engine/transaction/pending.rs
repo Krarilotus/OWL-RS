@@ -16,13 +16,19 @@
 //!   transaction's child, and what is `pub(super)` here, `into_parts`, the deltas' sets and the
 //!   takeover among it, is the write transaction's alone. What the private transaction
 //!   (`super::super::private`) reads and changes is `pub(in crate::engine)`.
-//! - **Growth charged where reserved** (SYN-54 review r1, F1; DUR, 8 Nov): one budget, attached
-//!   once for life ([`Pending::charge_to`]), pays for the asserted inserts' table: a reserve
-//!   ([`Pending::try_reserve_inserts`]) charges the grown table before it is allocated, beside
-//!   the old one while both live, and the charge is then exactly the table's allocation. It is
-//!   held as long as the sets are: dropped with them, or handed through [`Pending::into_parts`]
-//!   to the commit, which frees the sets first. Inserts past the reserved room grow the table
-//!   uncharged, as every insert did before; the next reserve charges what they grew.
+//! - **Growth charged before it happens** (SYN-54 review r1, F1; DUR, 8 Nov; D16-039): one
+//!   budget, attached once for life ([`Pending::charge_to`]), pays for both asserted tables, the
+//!   inserts and the deletes. A table grows only after the grown table is charged, beside the
+//!   old one while both live; the charge is then exactly the tables' allocation. That holds for
+//!   a reserve ([`Pending::try_reserve_inserts`]) and for every charged change
+//!   ([`Pending::try_insert_asserted`], [`Pending::try_remove_asserted`],
+//!   [`Pending::try_remove_matching`]), which charge a table at its growth points only: a full
+//!   table's next new entry. It is held as long as the sets are: dropped with them, or handed
+//!   through [`Pending::into_parts`] to the commit, which frees the sets first. The uncharged
+//!   changes ([`Pending::insert_asserted`], [`Pending::remove_asserted`]) are for a `Pending`
+//!   no budget pays for (an engine user's own transaction, a test); on a charged one their
+//!   growth is charged at the next charged change. The inferred stack's delta is the
+//!   reasoner's, and no budget pays for it here.
 
 use std::sync::Arc;
 
@@ -89,27 +95,36 @@ impl Delta {
         self.inserts.len() as i64 - self.deletes.len() as i64
     }
 
-    /// Room for `more` inserts, the grown table charged to `charge` before it is allocated:
-    /// the bound of the table hashbrown grows to (`max(len + more, full capacity + 1)`; the full
-    /// capacity is at most the allocation over an entry's size) beside what is held, then the
-    /// charge trimmed to the new allocation. Refused, nothing changes.
-    fn reserve_inserts(&mut self, more: usize, charge: &mut Reservation) -> EngineResult<()> {
-        let too_large = || EngineError::Configuration(format!("no room for {more} more inserts"));
-        let table = &mut self.inserts;
-        let wanted = table.len().checked_add(more).ok_or_else(too_large)?;
-        let held = charge.bytes().max(table.allocation_size());
-        if table.capacity() >= wanted {
-            // Room already: the charge covers the table as it is.
+    /// What both tables hold.
+    fn allocation(&self) -> usize {
+        self.inserts.allocation_size() + self.deletes.allocation_size()
+    }
+
+    /// Room for `more` entries in the `table`, the grown table charged to `charge` before it is
+    /// allocated: the bound of the table hashbrown grows to (`max(len + more, full capacity +
+    /// 1)`; the full capacity is at most the allocation over an entry's size) beside what both
+    /// tables hold, then the charge trimmed to their new allocation. Refused, nothing changes.
+    fn reserve(&mut self, table: Table, more: usize, charge: &mut Reservation) -> EngineResult<()> {
+        let too_large = || EngineError::Configuration(format!("no room for {more} more changes"));
+        let held = charge.bytes().max(self.allocation());
+        let set = match table {
+            Table::Inserts => &mut self.inserts,
+            Table::Deletes => &mut self.deletes,
+        };
+        let wanted = set.len().checked_add(more).ok_or_else(too_large)?;
+        if set.capacity() >= wanted {
+            // Room already: the charge covers the tables as they are.
             charge.resize(held)?;
             return Ok(());
         }
-        let full = table.allocation_size() / size_of::<EncodedQuad>();
+        let full = set.allocation_size() / size_of::<EncodedQuad>();
         let grown = wanted.max(full + 1);
         let bound =
             nrese_exec::charged_map::table_bound::<EncodedQuad>(grown).ok_or_else(too_large)?;
-        // The new table beside the old one, as the rehash holds both.
+        // The new table beside both, as the rehash holds the old one too.
         charge.resize(held.checked_add(bound).ok_or_else(too_large)?)?;
-        match table.try_reserve(more) {
+        let before = set.allocation_size();
+        match set.try_reserve(more) {
             Ok(()) => {}
             Err(hashbrown::TryReserveError::AllocError { layout }) => {
                 std::alloc::handle_alloc_error(layout)
@@ -118,14 +133,61 @@ impl Delta {
                 unreachable!("a table within its bound has a layout")
             }
         }
-        let allocated = table.allocation_size();
         debug_assert!(
-            allocated <= bound,
-            "{allocated} bytes past the bound {bound}"
+            set.allocation_size() <= bound.max(before),
+            "{} bytes past the bound {bound}",
+            set.allocation_size()
         );
-        charge.resize(allocated)?;
+        charge.resize(self.allocation())?;
         Ok(())
     }
+
+    /// [`Self::insert`], the inserts' table charged to `charge` first where `quad` is a new entry
+    /// of a full one ([`Self::reserve`]). Refused, nothing changes.
+    fn try_insert(
+        &mut self,
+        quad: EncodedQuad,
+        in_base: impl FnOnce() -> bool,
+        charge: &mut Reservation,
+    ) -> EngineResult<bool> {
+        if self.deletes.remove(&quad) {
+            return Ok(true);
+        }
+        if in_base() {
+            return Ok(false);
+        }
+        if self.inserts.len() >= self.inserts.capacity() && !self.inserts.contains(&quad) {
+            self.reserve(Table::Inserts, 1, charge)?;
+        }
+        Ok(self.inserts.insert(quad))
+    }
+
+    /// [`Self::remove`], the deletes' table charged to `charge` first where `quad` is a new entry
+    /// of a full one ([`Self::reserve`]). Refused, nothing changes.
+    fn try_remove(
+        &mut self,
+        quad: EncodedQuad,
+        in_base: impl FnOnce() -> bool,
+        charge: &mut Reservation,
+    ) -> EngineResult<bool> {
+        if self.inserts.remove(&quad) {
+            return Ok(true);
+        }
+        if !in_base() {
+            return Ok(false);
+        }
+        if self.deletes.len() >= self.deletes.capacity() && !self.deletes.contains(&quad) {
+            self.reserve(Table::Deletes, 1, charge)?;
+        }
+        Ok(self.deletes.insert(quad))
+    }
+}
+
+/// One of a [`Delta`]'s two tables.
+#[derive(Clone, Copy)]
+enum Table {
+    Inserts,
+    Deletes,
 }
 
 /// What pays for the pending changes' growth: one budget for life, and what it holds.
@@ -213,7 +275,100 @@ impl Pending {
                 "no budget is attached to the pending changes".to_owned(),
             ));
         };
-        self.asserted.reserve_inserts(more, &mut charge.held)
+        self.asserted
+            .reserve(Table::Inserts, more, &mut charge.held)
+    }
+
+    /// Whether an asserted insert may grow a charged table: a budget is attached and the
+    /// inserts' table is full ([`Self::try_room_for_insert`]).
+    pub(in crate::engine) fn insert_may_grow(&self) -> bool {
+        self.charge.is_some() && self.asserted.inserts.len() >= self.asserted.inserts.capacity()
+    }
+
+    /// Room for one more asserted insert where a budget is attached and the table is full:
+    /// what [`Self::try_insert_asserted`] would charge, reserved before the quad's terms are
+    /// interned, so a refused insert interns nothing. Without a budget, nothing to do.
+    pub(in crate::engine) fn try_room_for_insert(&mut self) -> EngineResult<()> {
+        match &mut self.charge {
+            Some(charge) if self.asserted.inserts.len() >= self.asserted.inserts.capacity() => {
+                self.asserted.reserve(Table::Inserts, 1, &mut charge.held)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Self::insert_asserted`], its growth charged to the attached budget before the table
+    /// grows. Refused ([`EngineError::MemoryLimit`]), nothing changes; without a budget it is
+    /// [`Self::insert_asserted`].
+    pub(in crate::engine) fn try_insert_asserted(
+        &mut self,
+        quad: EncodedQuad,
+    ) -> EngineResult<bool> {
+        // A write, refused or not: the kept pending snapshot goes (DUR-6).
+        self.changed();
+        let Some(charge) = &mut self.charge else {
+            return Ok(self.insert_asserted(quad));
+        };
+        let base = &self.base;
+        self.asserted.try_insert(
+            quad,
+            || base.stack_contains(Stack::Asserted, &quad),
+            &mut charge.held,
+        )
+    }
+
+    /// [`Self::remove_asserted`], its growth charged as [`Self::try_insert_asserted`]'s is.
+    pub(in crate::engine) fn try_remove_asserted(
+        &mut self,
+        quad: EncodedQuad,
+    ) -> EngineResult<bool> {
+        self.changed();
+        let Some(charge) = &mut self.charge else {
+            return Ok(self.remove_asserted(quad));
+        };
+        let base = &self.base;
+        self.asserted.try_remove(
+            quad,
+            || base.stack_contains(Stack::Asserted, &quad),
+            &mut charge.held,
+        )
+    }
+
+    /// Retracts every asserted quad matching `pattern` (SPARQL `CLEAR`/`DROP`, GSP `PUT`/
+    /// `DELETE`): the base's, into the deletes, and the pending inserts'. Returns how many were
+    /// visible, and so removed. The deletes' growth is charged to the attached budget before it
+    /// happens, as [`Self::try_remove_asserted`]'s; nothing else is allocated, whatever the
+    /// number of matches. Refused ([`EngineError::MemoryLimit`]) part way, the quads before the
+    /// refusal stay removed: the caller drops the transaction.
+    pub(in crate::engine) fn try_remove_matching(
+        &mut self,
+        pattern: &QuadPattern,
+    ) -> EngineResult<u64> {
+        self.changed();
+        let Self {
+            base,
+            asserted,
+            charge,
+            ..
+        } = self;
+        let pending = asserted.inserts.len();
+        asserted.inserts.retain(|quad| !pattern.matches(quad));
+        let mut removed = (pending - asserted.inserts.len()) as u64;
+        // Base quads are never pending inserts (the delta is exact): each is in the deletes or
+        // goes there.
+        for quad in base.stack_quads(Stack::Asserted, pattern) {
+            if asserted.deletes.contains(&quad) {
+                continue;
+            }
+            if let Some(charge) = charge.as_mut()
+                && asserted.deletes.len() >= asserted.deletes.capacity()
+            {
+                asserted.reserve(Table::Deletes, 1, &mut charge.held)?;
+            }
+            asserted.deletes.insert(quad);
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     pub(in crate::engine) fn base(&self) -> &Snapshot {
@@ -579,7 +734,15 @@ mod tests {
         for i in 600..1000 {
             assert!(pending.insert_asserted(quad(i)));
         }
-        assert_eq!(pending.asserted.inserts.capacity(), capacity, "no growth");
+        // No growth is no new allocation. `capacity()` is not that measure: it counts the free
+        // slots left, and how many a removal frees depends on the hashes (a tombstone or an
+        // empty slot), which a seeded hasher varies from run to run: 1 in 100 runs of this test
+        // on engine-v2 ab99d53e saw 1786 for 1792 with the same table (D16-039 diagnostic).
+        assert_eq!(
+            pending.asserted.inserts.allocation_size(),
+            charged,
+            "no growth"
+        );
         assert_eq!(
             budget.used(),
             charged,
@@ -620,6 +783,204 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(budget.used(), 0, "a commit releases the charge");
         assert_eq!(engine.snapshot().len_in(ReadModel::Asserted), 1000);
+    }
+
+    /// An engine whose base holds quads 0..`n` (`quad(i)` with real ids interned).
+    fn committed(n: u64) -> (Engine, Vec<EncodedQuad>) {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let iri = |name: String| nrese_rdf::NamedNode::new_unchecked(name);
+        for i in 0..n {
+            tx.insert(
+                nrese_rdf::Quad::new(
+                    iri(format!("http://example.com/s{i}")),
+                    iri("http://example.com/p".to_owned()),
+                    iri("http://example.com/o".to_owned()),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.commit().unwrap();
+        let quads = engine
+            .snapshot()
+            .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
+            .collect();
+        (engine, quads)
+    }
+
+    /// `remove_matching` removes, and counts, what was visible: the base's quads not yet
+    /// deleted and the pending inserts, and leaves nothing matching visible.
+    #[test]
+    fn removing_what_matches_removes_what_was_visible() {
+        let (engine, base) = committed(100);
+        for budget in [None, Some(Arc::new(Budget::unlimited()))] {
+            let mut pending = Pending::over(engine.snapshot());
+            if let Some(budget) = &budget {
+                pending.charge_to(Arc::clone(budget)).unwrap();
+            }
+            for quad in &base[..30] {
+                assert!(pending.remove_asserted(*quad));
+            }
+            for i in 0..20 {
+                assert!(pending.insert_asserted(quad(1000 + i)));
+            }
+            let visible = pending
+                .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
+                .count() as u64;
+            assert_eq!(visible, 70 + 20);
+            assert_eq!(
+                pending.try_remove_matching(&QuadPattern::all()).unwrap(),
+                visible
+            );
+            assert_eq!(
+                pending
+                    .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
+                    .count(),
+                0,
+                "nothing matching is left"
+            );
+            assert_eq!(
+                pending.asserted.counts(),
+                (0, 100),
+                "every base quad deleted once"
+            );
+            assert_eq!(pending.try_remove_matching(&QuadPattern::all()).unwrap(), 0);
+            if let Some(budget) = budget {
+                assert_eq!(
+                    budget.used(),
+                    pending.asserted.allocation(),
+                    "the charge is both tables' allocation"
+                );
+            }
+        }
+    }
+
+    /// The charged changes charge a table before it grows: the budget's peak never passes its
+    /// limit, a refusal is the memory error, and what is charged is the tables' allocation.
+    #[test]
+    fn charged_changes_never_grow_past_their_budget() {
+        let (engine, base) = committed(5000);
+        let limit = 64 * 1024;
+        assert!(base.len() * size_of::<EncodedQuad>() > 2 * limit);
+        let budget = Arc::new(Budget::new(limit));
+        let mut clearing = pending(&engine, &budget);
+        let refused = clearing.try_remove_matching(&QuadPattern::all());
+        assert!(
+            matches!(refused, Err(EngineError::MemoryLimit(_))),
+            "{refused:?}"
+        );
+        assert!(
+            budget.peak() <= limit,
+            "peak {} within {limit}",
+            budget.peak()
+        );
+        assert_eq!(budget.used(), clearing.asserted.allocation());
+
+        let budget = Arc::new(Budget::new(limit));
+        let mut inserting = pending(&engine, &budget);
+        let mut refused = None;
+        for i in 0..5000 {
+            if let Err(error) = inserting.try_insert_asserted(quad(100_000 + i)) {
+                refused = Some(error);
+                break;
+            }
+        }
+        assert!(
+            matches!(refused, Some(EngineError::MemoryLimit(_))),
+            "{refused:?}"
+        );
+        assert!(
+            budget.peak() <= limit,
+            "peak {} within {limit}",
+            budget.peak()
+        );
+        assert_eq!(budget.used(), inserting.asserted.allocation());
+        drop(inserting);
+        assert_eq!(budget.used(), 0, "dropped, nothing stays charged");
+    }
+
+    /// Both tables share one charge (B2's condition, 9 Nov): growing the deletes, then
+    /// reserving inserts, then growing the deletes again never trims the charge below both
+    /// tables' allocation together.
+    #[test]
+    fn one_charge_covers_both_tables() {
+        let (engine, base) = committed(2000);
+        let budget = Arc::new(Budget::unlimited());
+        let mut pending = pending(&engine, &budget);
+        let covers = |pending: &Pending| {
+            let (inserts, deletes) = (
+                pending.asserted.inserts.allocation_size(),
+                pending.asserted.deletes.allocation_size(),
+            );
+            assert!(inserts > 0 || deletes > 0);
+            assert_eq!(
+                budget.used(),
+                inserts + deletes,
+                "the charge is both tables'"
+            );
+        };
+        for quad in &base[..1000] {
+            assert!(pending.try_remove_asserted(*quad).unwrap());
+        }
+        covers(&pending);
+        pending.try_reserve_inserts(3000).unwrap();
+        covers(&pending);
+        for i in 0..3000 {
+            assert!(pending.try_insert_asserted(quad(100_000 + i)).unwrap());
+        }
+        for quad in &base[1000..] {
+            assert!(pending.try_remove_asserted(*quad).unwrap());
+        }
+        covers(&pending);
+        assert_eq!(pending.asserted.counts(), (3000, 2000));
+    }
+
+    /// The charged changes are writes: a pending snapshot kept before one (DUR-6's memo) is not
+    /// what the transaction gives after it, which shows the change.
+    #[test]
+    fn a_charged_change_lets_the_kept_snapshot_go() {
+        let (engine, base) = committed(10);
+        let budget = Arc::new(Budget::unlimited());
+        let mut tx = engine.transaction();
+        tx.charge_pending_to(Arc::clone(&budget)).unwrap();
+        let seen = |tx: &crate::Transaction<'_>| {
+            tx.pending_snapshot_within(&budget)
+                .unwrap()
+                .len_in(ReadModel::Asserted)
+        };
+        assert_eq!(seen(&tx), 10);
+        assert!(tx.try_remove_encoded(base[0]).unwrap());
+        assert_eq!(seen(&tx), 9, "after a charged removal");
+        assert_eq!(tx.remove_matching(&QuadPattern::all()).unwrap(), 9);
+        assert_eq!(seen(&tx), 0, "after a removal of what matches");
+        assert!(tx.try_insert_encoded(base[0]).unwrap());
+        assert_eq!(seen(&tx), 1, "after a charged insert");
+    }
+
+    /// A refused charged insert interns nothing: its room is charged before its terms are.
+    #[test]
+    fn a_refused_charged_insert_interns_nothing() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        tx.charge_pending_to(Arc::new(Budget::new(0))).unwrap();
+        let iri = |name: &str| nrese_rdf::NamedNode::new_unchecked(name);
+        let statement = nrese_rdf::Quad::new(
+            iri("http://example.com/new-s"),
+            iri("http://example.com/new-p"),
+            iri("http://example.com/new-o"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        let refused = tx.try_insert(statement.as_ref());
+        assert!(
+            matches!(refused, Err(EngineError::MemoryLimit(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            tx.lookup(iri("http://example.com/new-s").as_ref().into()),
+            None
+        );
+        assert_eq!(tx.pending(), (0, 0));
     }
 
     #[test]

@@ -143,18 +143,19 @@ pub(crate) fn read_open_segment(file: &mut File, path: &Path) -> EngineResult<Se
     })
 }
 
-/// Cuts a torn tail off a segment and syncs the result.
-pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<()> {
+/// Cuts a torn tail off a segment and syncs the result. Whether the segment is still there: one
+/// left without even its header is removed.
+pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<bool> {
     let file = OpenOptions::new().write(true).open(path)?;
     if valid_len < SEGMENT_MAGIC.len() as u64 {
         file.set_len(0)?;
         drop(file);
         fs::remove_file(path)?;
-        return Ok(());
+        return Ok(false);
     }
     file.set_len(valid_len)?;
     file.sync_all()?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) struct Wal {
@@ -311,10 +312,18 @@ impl Wal {
     /// rotation are done and just before it is written and synced: the time is that of the
     /// commit, not of its build (review r1, R1-F1). Without `stamp` (a replicated record)
     /// the record's own time is kept.
+    ///
+    /// A local commit's `note` ([`crate::Transaction::note_commit`]) is called after the
+    /// rotation, the stamp and the encoding, the steps whose failure leaves the log as it was,
+    /// and before the record is written: so the time logged precedes the note's own I/O, as it
+    /// precedes the record's sync. The log is poisoned while the note runs, so that a note that
+    /// panics, having perhaps written its journal, leaves no later commit to take its revision;
+    /// `Ok` and a refusal clear that, an unknown journal keeps it.
     pub(crate) fn append(
         &mut self,
         record: &CommitRecord,
         stamp: Option<&mut dyn FnMut() -> u64>,
+        note: Option<crate::engine::CommitNote<'_>>,
     ) -> EngineResult<Option<u64>> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
@@ -334,14 +343,28 @@ impl Wal {
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
         encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
+        if let Some(note) = note {
+            self.poisoned = true;
+            match note(record.revision) {
+                Ok(()) => self.poisoned = false,
+                Err(crate::engine::NoteError::Refused(error)) => {
+                    self.poisoned = false;
+                    return Err(EngineError::CommitNoteRefused(error));
+                }
+                Err(crate::engine::NoteError::Unknown(error)) => return Err(error.into()),
+            }
+        }
+        #[cfg(test)]
+        let written = super::fault::check(&super::fault::FAIL_RECORD_WRITE, "the record's write");
+        #[cfg(not(test))]
+        let written = Ok(());
         // The names the open left pending are synced after the record, before it is
         // acknowledged: the record's sync commits the journal and flushes the device, and the
         // directories' syncs after it find nothing left to flush (measured on the timing host:
         // in the other order the record's sync paid a second flush; deferred-sync design note).
         // A failure there leaves the record written, its outcome unknown: it poisons the log.
-        let result = self
-            .active
-            .write_all(&self.buffer)
+        let result = written
+            .and_then(|()| self.active.write_all(&self.buffer))
             .and_then(|()| match self.sync {
                 SyncPolicy::EveryCommit => self.active.sync_data(),
                 SyncPolicy::OsBuffered => Ok(()),

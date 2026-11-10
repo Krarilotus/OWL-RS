@@ -10,7 +10,8 @@
 //! blank node is put in as a made constant ([`internal::blank_constant`] of its label),
 //! which the evaluation context reads as the node itself: in patterns
 //! ([`Context::lookup_const`]) and in expressions ([`super::expr::Evaluator`]'s aliases).
-//! No IRI is spelt like one.
+//! Triple terms use the same typed alias route, under [`internal::class_constant`] of
+//! their stored or computed id. No IRI is spelt like one.
 
 use std::collections::HashMap;
 
@@ -21,19 +22,37 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
+use super::{Context, NativeResult};
+
 /// An outer solution's values, as constants to put in.
 pub(super) struct Values<'a> {
-    pub(super) terms: &'a HashMap<Variable, Term>,
+    terms: &'a HashMap<Variable, Term>,
+    triples: HashMap<Variable, NamedNode>,
 }
 
-impl Values<'_> {
+impl<'a> Values<'a> {
+    /// Triple terms have no expression constant in the algebra. Register their typed
+    /// value under an existing made constant, using the context's charged computed ids
+    /// when the triple is not stored. The same alias works in patterns and expressions.
+    pub(super) fn new(ctx: &Context<'_>, terms: &'a HashMap<Variable, Term>) -> NativeResult<Self> {
+        let mut triples = HashMap::new();
+        for (variable, term) in terms {
+            if matches!(term, Term::Triple(_)) {
+                let id = ctx.id(term)?;
+                let name = internal::class_constant(id);
+                ctx.register_alias(name.as_str(), id);
+                triples.insert(variable.clone(), name);
+            }
+        }
+        Ok(Self { terms, triples })
+    }
+
     fn constant(&self, variable: &Variable) -> Option<Constant> {
         Some(match self.terms.get(variable)? {
             Term::NamedNode(n) => Constant::Iri(n.clone()),
             Term::Literal(l) => Constant::Literal(l.clone()),
             Term::BlankNode(b) => Constant::Iri(internal::blank_constant(b.as_str())),
-            // Triple terms aren't substituted into the pattern: it stays a join.
-            Term::Triple(_) => return None,
+            Term::Triple(_) => Constant::Iri(self.triples.get(variable)?.clone()),
         })
     }
 
@@ -209,17 +228,19 @@ impl Values<'_> {
                 variables,
                 bindings,
             } => {
-                let put: Vec<(usize, Option<Constant>)> = variables
+                let put: Vec<(usize, &Term)> = variables
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| self.terms.contains_key(*v))
-                    .map(|(i, v)| (i, self.constant(v)))
+                    .filter_map(|(i, v)| self.terms.get(v).map(|term| (i, term)))
                     .collect();
                 let agrees = |row: &[Option<GroundTerm>]| {
-                    put.iter().all(|(i, constant)| match (&row[*i], constant) {
+                    put.iter().all(|(i, term)| match (&row[*i], *term) {
                         (None, _) => true,
-                        (Some(GroundTerm::NamedNode(n)), Some(Constant::Iri(m))) => n == m,
-                        (Some(GroundTerm::Literal(l)), Some(Constant::Literal(m))) => l == m,
+                        (Some(GroundTerm::NamedNode(n)), Term::NamedNode(m)) => n == m,
+                        (Some(GroundTerm::Literal(l)), Term::Literal(m)) => l == m,
+                        (Some(value @ GroundTerm::Triple(_)), Term::Triple(_)) => {
+                            Term::from(value.clone()) == **term
+                        }
                         _ => false,
                     })
                 };
@@ -263,7 +284,13 @@ impl Values<'_> {
                         .filter(|(v, _)| variables.contains(v))
                         .map(|(v, t)| (v.clone(), t.clone()))
                         .collect();
-                    Box::new(Values { terms: &visible }.pattern(inner))
+                    Box::new(
+                        Values {
+                            terms: &visible,
+                            triples: self.triples.clone(),
+                        }
+                        .pattern(inner),
+                    )
                 };
                 GraphPattern::Project {
                     inner,
@@ -371,7 +398,12 @@ mod tests {
                 Term::from(nrese_rdf::BlankNode::new_unchecked("b7")),
             ),
         ]);
-        let text = Values { terms: &terms }.pattern(&pattern).to_string();
+        let text = Values {
+            terms: &terms,
+            triples: HashMap::new(),
+        }
+        .pattern(&pattern)
+        .to_string();
         assert!(!text.contains("?o"), "{text}");
         assert!(
             text.contains(&format!("<{}>", internal::blank_constant("b7").as_str())),

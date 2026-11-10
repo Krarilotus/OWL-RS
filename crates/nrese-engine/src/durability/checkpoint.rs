@@ -766,6 +766,8 @@ pub(crate) fn stack_index(
 
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
+    /// The file it was read from, under its name in the root (it may be a link: DUR-5).
+    pub path: PathBuf,
     pub revision: u64,
     /// When its last commit was made (format 12); `None` where that isn't known.
     pub committed_micros: Option<u64>,
@@ -902,6 +904,7 @@ pub(crate) fn load_latest(
             .map_err(|error| corrupt(&error))?;
         lap("packed permutations");
         return Ok(Some(Loaded {
+            path: path.clone(),
             revision,
             committed_micros,
             clock_micros,
@@ -926,6 +929,7 @@ pub(crate) fn load_latest(
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| corrupt("truncated inferred"))?;
     Ok(Some(Loaded {
+        path: path.clone(),
         revision,
         committed_micros: None,
         clock_micros: 0,
@@ -1331,6 +1335,46 @@ mod tests {
             "bytes held beyond the charges: the overlay's own block alone"
         );
         assert_eq!(budget.used(), 0);
+    }
+
+    /// Package C3: a charged decode calls its charge with no lock of the dictionary held, so
+    /// a checkpoint's rebase can come between its bound and its decode. Here one does, in its
+    /// first charge: a literal of 1,000 bytes interned (plain, on the heap), bounded at its
+    /// key, then rebased onto a compressed base whose bound for it is larger. The decode
+    /// charges the difference as a second increment, with no lock held either, and gives the
+    /// literal: the two sum to the bound of the state it decodes from, which a compressed
+    /// decode holds no more than (`tests/read_bounds_memory.rs`, `decode_charged_kinds.rs`).
+    /// A charged lookup's charge, too, runs with no lock held.
+    #[test]
+    fn a_rebase_between_a_charged_decodes_bound_and_its_decode_is_charged_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = Dictionary::default();
+        for i in 0..10_000 {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        }
+        let literal = Literal::new_simple_literal("word ".repeat(200));
+        let id = dictionary.intern(literal.as_ref().into());
+        let plain = dictionary.decode_bound(id).unwrap();
+        let mut base = Some(mapped_base(&dictionary, dictionary.len(), dir.path()));
+        let mut charges = Vec::new();
+        let decoded = dictionary.decode_charged(id, |bytes| {
+            assert!(dictionary.unlocked(), "charged under the dictionary's lock");
+            charges.push(bytes);
+            if let Some(base) = base.take() {
+                assert!(dictionary.rebase(base).unwrap());
+            }
+            Ok::<(), ()>(())
+        });
+        assert!(base.is_none(), "the rebase ran in the first charge");
+        assert_eq!(decoded, Ok(Some(literal.clone().into())));
+        let compressed = dictionary.decode_bound(id).unwrap();
+        assert!(compressed > plain, "{compressed} compressed, {plain} plain");
+        assert_eq!(charges, [plain, compressed - plain]);
+        let found = dictionary.lookup_charged(literal.as_ref().into(), u64::MAX, |_| {
+            assert!(dictionary.unlocked(), "charged under the dictionary's lock");
+            Ok::<(), ()>(())
+        });
+        assert_eq!(found, Ok(Some(id)));
     }
 
     /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST

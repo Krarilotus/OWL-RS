@@ -48,7 +48,7 @@ impl PermutationRun {
             return 0;
         }
         let (first, last) = (start / 64, (end - 1) / 64);
-        #[cfg(test)]
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
         crate::witness::add(
             crate::witness::Site::TombstoneWords,
             (last - first + 1) as u64,
@@ -77,7 +77,7 @@ impl PermutationRun {
         &self,
         start: usize,
         end: usize,
-        visit: &mut dyn FnMut(u64) -> bool,
+        visit: crate::visit::Visitor<'_>,
     ) -> Option<u64> {
         if self.tombstones.is_empty() || start >= end {
             return Some(0);
@@ -92,7 +92,7 @@ impl PermutationRun {
             if !visit((upto - at) as u64) {
                 return None;
             }
-            #[cfg(test)]
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
             crate::witness::add(crate::witness::Site::TombstoneWords, (upto - at) as u64);
             for (i, &word) in self.tombstones[at..upto].iter().enumerate() {
                 let i = at + i;
@@ -360,6 +360,12 @@ impl Run {
         self.inserts + self.deletes
     }
 
+    /// Every entry, inserts and tombstones alike, as `[subject, predicate, object, graph]`
+    /// (raw ids), in SPOG order: every layout keeps that permutation.
+    pub(crate) fn statements(&self) -> impl Iterator<Item = Key> + '_ {
+        self.permutation(Permutation::Spog).keys.iter()
+    }
+
     /// This run (of the default-graph layout) in the quad layout: SPOG, POSG and OSPG
     /// shared or copied, the graph-first permutations from the graph-last ones with each
     /// key's graph moved to the front, the same order since every graph is the default
@@ -454,13 +460,24 @@ impl Run {
 
     /// Sign of `quad` in this run: +1 insert, -1 tombstone, 0 absent. O(log n).
     pub(crate) fn sign_of(&self, quad: &EncodedQuad) -> i64 {
+        self.sign_of_counted(quad, &mut crate::visit::Free)
+            .expect("nothing is counted")
+    }
+
+    /// [`Self::sign_of`], its searches counted on `account` before they are made: `None`
+    /// once the account has stopped (REAS-3a fix check r1 F1).
+    pub(crate) fn sign_of_counted(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl crate::visit::Account,
+    ) -> Option<i64> {
         let perm = self.permutation(Permutation::Spog);
         let key = Permutation::Spog.to_key(quad);
-        match perm.range(&key, &key) {
+        Some(match perm.keys.range_counted(&key, &key, account)? {
             (start, end) if start == end => 0,
             (start, _) if perm.is_tombstone(start) => -1,
             _ => 1,
-        }
+        })
     }
 }
 

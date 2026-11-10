@@ -116,7 +116,11 @@ impl super::Context<'_> {
             evaluator: super::Evaluator::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
-            decoded: RefCell::default(),
+            decoded: RefCell::new(super::decode_cache::DecodeCache::new(
+                &self.budget,
+                super::DECODE_CACHE_ENTRIES,
+                1,
+            )),
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),

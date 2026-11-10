@@ -68,12 +68,37 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
+        // One certified closure (review r1, F1): reads start only on a settled certificate (an
+        // even epoch; odd, a change is in progress and the old certificate may still be
+        // visible), and an answer stands only if no change began while they took their
+        // snapshots. An open or changed certificate refuses without waiting or retrying.
+        let epoch = self.certificate_epoch();
+        if epoch.is_multiple_of(2) {
+            let answer = self.entails_once(&program, conclusion)?;
+            if self.certificate_epoch() == epoch {
+                return Ok(answer);
+            }
+        }
+        Err(StoreError::Configuration(format!(
+            "the inferred statements aren't {}'s closure: rematerialise first",
+            program.name()
+        )))
+    }
+
+    /// One try of [`Self::entails`]; it stands only if the certificate didn't change meanwhile.
+    fn entails_once(
+        &self,
+        program: &RuleProgram,
+        conclusion: &[Triple],
+    ) -> StoreResult<Entailment> {
         if !self.reasoning_is_current(program.clone()) {
             return Err(StoreError::Configuration(format!(
                 "the inferred statements aren't {}'s closure: rematerialise first",
                 program.name()
             )));
         }
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
         if matches!(
             self.consistency(),
             crate::ConsistencyStatus::Inconsistent { .. }
@@ -85,7 +110,7 @@ impl StoreService {
             return Ok(Entailment::NotEntailed);
         }
         for opposite in &split.refutations {
-            if !self.refutes(&program, opposite)? {
+            if !self.refutes(program, opposite)? {
                 return Ok(Entailment::NotEntailed);
             }
         }
