@@ -16,9 +16,12 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
   classification and realisation tasks, reading each task's functional-syntax file
   (`CASES/files/ID.owl`) and writing the canonical taxonomy or realisation itself. The
   detail column holds the hash, then the driver's profile (phases and counters: tests,
-  candidates, branch points, clashes, the Horn bound's share); a task that ends
-  incomplete or past `--timeout` is `timeout`, with the reasons it printed. Counts don't
-  depend on the machine where the run is complete: set them beside a baseline's times.
+  candidates, branch points, clashes, the Horn bound's share). The status is the driver's
+  own outcome: `inconsistent` (its verdict, as the references report it), `unsupported`
+  (an input it doesn't decide, such as one outside OWL 2 DL), `timeout` (its `dl.timeout`
+  reached or killed past `--timeout`), `undecided` (another budget), with the reasons it
+  printed. Counts don't depend on the machine where the run is complete: set them beside a
+  baseline's times.
 """
 
 import argparse
@@ -86,6 +89,27 @@ def el(args):
             print(f"{t}: {ms} ms; {run.stderr.strip().splitlines()[-1] if run.stderr.strip() else ''}")
 
 
+def outcome(code, stdout, stderr, wrote, ext):
+    """A `dl_classify` run's status from its own outcome: the verdict ending its summary
+    line (`… unsatisfiable, consistent|inconsistent|unknown`) and its `incomplete:` lines."""
+    if code == -9:
+        return "timeout"
+    summary = next((l for l in reversed(stderr.splitlines()) if " unsatisfiable, " in l), "")
+    verdict = summary.rsplit(", ", 1)[-1].strip() if summary else ""
+    incomplete = [l for l in stdout.splitlines() if l.startswith("incomplete: ")]
+    if code != 0 or not verdict:
+        return "error"
+    if verdict == "inconsistent":
+        return "inconsistent"
+    if any("(unsupported" in l for l in incomplete):
+        return "unsupported"
+    if any("dl.timeout reached" in l for l in incomplete):
+        return "timeout"
+    if incomplete or verdict != "consistent":
+        return "undecided"
+    return ("classified" if ext == "tax" else "realised") if wrote else "error"
+
+
 def dl(args):
     cases = pathlib.Path(args.cases).resolve()
     path, rows = results(cases)
@@ -116,15 +140,15 @@ def dl(args):
             ms = int((time.monotonic() - started) * 1000)
             profile = next((l[len("profile "):] for l in reversed(stderr.splitlines())
                             if l.startswith("profile ")), "")
-            incomplete = " | ".join(l[len("incomplete: "):] for l in stdout.splitlines()
-                                    if l.startswith("incomplete: "))
-            if code == 0 and target.exists() and not incomplete:
-                digest = hashlib.sha256(target.read_bytes()).hexdigest()
-                status, detail = ("classified" if ext == "tax" else "realised"), f"{digest} {profile}"
-            elif code in (0, -9):
-                status, detail = "timeout", f"{incomplete[:300]} {profile}"
+            status = outcome(code, stdout, stderr, target.exists(), ext)
+            if status in ("classified", "realised", "inconsistent") and target.exists():
+                detail = f"{hashlib.sha256(target.read_bytes()).hexdigest()} {profile}"
+            elif status == "error":
+                detail = stderr.strip()[-200:]
             else:
-                status, detail = "error", stderr.strip()[-200:]
+                incomplete = " | ".join(l[len("incomplete: "):] for l in stdout.splitlines()
+                                        if l.startswith("incomplete: "))
+                detail = f"{incomplete[:300]} {profile}"
             out.write(f"{t}\tnrese-dl\t{kind}\t{status}\t{ms}\t{detail}".rstrip() + "\n")
             out.flush()
             print(f"{t}: {status}, {ms} ms")
