@@ -243,19 +243,15 @@ fn a_frozen_view_answers_what_it_was_taken_with() {
 }
 
 /// B9. The bounded and charged reads at the edge: the last own id, the first past it, an id below
-/// start, a triple term (whose charged decode is its components', `None`, as the dictionary's).
+/// start, a triple term (decoded and charged as a whole, its components with it: package C3,
+/// `notes/2026-11-09-d039-update-sweep.md` row C3; before it, `None`).
 #[test]
 fn bounded_reads_answer_at_the_own_edge() {
     let budget = unlimited();
     let (_dictionary, overlay) = with_overlay(6, &budget);
     let last = overlay.intern(literal("last").as_ref()).unwrap();
-    let triple = overlay
-        .intern(TermRef::Triple(&Triple::new(
-            iri("s"),
-            iri("p"),
-            literal("last"),
-        )))
-        .unwrap();
+    let triple_term: Term = Triple::new(iri("s"), iri("p"), literal("last")).into();
+    let triple = overlay.intern(triple_term.as_ref()).unwrap();
     let view = Vocabulary::Private(overlay.freeze().unwrap());
     let past = TermId::new(TermKind::String, view_end(&view));
     let below = TermId::new(TermKind::String, 2);
@@ -266,10 +262,15 @@ fn bounded_reads_answer_at_the_own_edge() {
         view.decode_charged(below, 0, ok),
         Ok(Some(literal("old 2")))
     );
-    assert_eq!(view.decode_charged(triple, 0, ok), Ok(None));
+    assert_eq!(
+        view.decode_charged(triple, 0, ok),
+        Ok(Some(triple_term.clone()))
+    );
     assert_eq!(view.decode_bound(last, 0), Some(literal_key_len("last")));
     assert_eq!(view.decode_bound(past, 0), None);
-    assert_eq!(view.decode_bound(triple, 0), None);
+    // What the decoded term holds: `triple_term`'s strings, from `format!`, may hold more.
+    let holds = view.decode(triple).map(|term| term.heap_bytes());
+    assert!(holds.is_some() && view.decode_bound(triple, 0) >= holds);
     assert!(view.decode_bound(below, 0).is_some());
     let text = |v: crate::TermView<'_>| v.str().map(str::to_owned);
     assert_eq!(view.with_view(last, 0, text), Some(Some("last".into())));
@@ -454,6 +455,12 @@ fn an_overlay_and_its_views_hold_only_what_they_charged() {
 
 /// B16. An overlay's intern reads the dictionary with recursive read guards and takes only its
 /// own leaf lock: it returns while a reader holds the dictionary and a writer is queued behind it.
+///
+/// - Input: a reader holding the dictionary's views; a writer's intern, seen queued behind it
+///   (a plain read of the entries then fails: review P2A-F2, 8 Nov, no sleep); then an
+///   overlay's intern of a new term.
+/// - Expected: the overlay's intern returns before the reader lets go, within [`DEADLINE`],
+///   with the overlay's first own id, which its view decodes to that term.
 #[test]
 fn an_overlay_intern_returns_behind_a_queued_writer() {
     let budget = unlimited();
@@ -484,8 +491,7 @@ fn an_overlay_intern_returns_behind_a_queued_writer() {
         let dictionary = Arc::clone(&dictionary);
         std::thread::spawn(move || dictionary.intern(literal("queued").as_ref()))
     };
-    // The writer queues for the write lock behind the reader.
-    std::thread::sleep(Duration::from_millis(50));
+    let queued = until(DEADLINE, || dictionary.writer_waiting());
     let (sent, answer) = std::sync::mpsc::channel();
     let interning = {
         let overlay = Arc::clone(&overlay);
@@ -494,15 +500,40 @@ fn an_overlay_intern_returns_behind_a_queued_writer() {
             let _ = sent.send(id);
         })
     };
-    let id = answer.recv_timeout(Duration::from_secs(10));
+    let id = if queued {
+        answer.recv_timeout(DEADLINE)
+    } else {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    };
     done.store(true, Ordering::Release);
     reader.join().unwrap();
     writer.join().unwrap();
     interning.join().unwrap();
+    assert!(queued, "the writer queued behind the reader");
     let id = id
         .expect("the overlay's intern returned behind a queued writer")
         .unwrap();
     assert_eq!(id.payload(), 4, "the overlay's first own id");
+    assert_eq!(
+        overlay.freeze().unwrap().decode(id),
+        Some(literal("behind the writer")),
+        "the returned id is the term's"
+    );
+}
+
+/// How long a call that should return may take: far above any run.
+const DEADLINE: Duration = Duration::from_secs(10);
+
+/// Waits until `state` holds or `limit` passes; whether it held.
+fn until(limit: Duration, state: impl Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while !state() {
+        if start.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
 }
 
 fn view_end(view: &Vocabulary) -> u64 {
@@ -515,4 +546,44 @@ fn view_end(view: &Vocabulary) -> u64 {
 /// A simple literal's key length: its kind byte and its text.
 fn literal_key_len(text: &str) -> usize {
     1 + text.len()
+}
+
+/// V3's own entries (DICT2 9 Nov 04:02). Input: a dictionary of two literals, an overlay at
+/// its length that interns a shared literal, an IRI, a simple and a language-tagged literal of
+/// its own, then is frozen; one more own term interned after the freeze. Expected: the view's
+/// own entries are exactly the three own terms, in id order, each id the overlay's (its kind
+/// the term's, its payload from `start`) and each key decoding back to its term; the shared
+/// literal and the term interned after the freeze are not among them.
+#[test]
+fn own_entries_are_the_views_own_terms_with_their_keys() {
+    let budget = unlimited();
+    let (dictionary, overlay) = with_overlay(2, &budget);
+    let start = dictionary.len();
+    overlay.intern(literal("old 1").as_ref()).unwrap();
+    let own: Vec<Term> = vec![
+        iri("x").into(),
+        literal("new words"),
+        Literal::new_language_tagged_literal_unchecked("neu", "de").into(),
+    ];
+    let ids: Vec<TermId> = own
+        .iter()
+        .map(|term| overlay.intern(term.as_ref()).unwrap())
+        .collect();
+    let view = overlay.freeze().unwrap();
+    overlay
+        .intern(literal("after the freeze").as_ref())
+        .unwrap();
+    let entries: Vec<(TermId, Term)> = view
+        .own_entries()
+        .map(|(id, key)| (id, crate::term::dictionary::decode_key(key)))
+        .collect();
+    let want: Vec<(TermId, Term)> = ids.iter().copied().zip(own).collect();
+    assert_eq!(entries, want);
+    let kinds: Vec<TermKind> = entries.iter().map(|(id, _)| id.kind()).collect();
+    assert_eq!(
+        kinds,
+        [TermKind::Iri, TermKind::String, TermKind::LangString]
+    );
+    let payloads: Vec<u64> = entries.iter().map(|(id, _)| id.payload()).collect();
+    assert_eq!(payloads, [start, start + 1, start + 2]);
 }

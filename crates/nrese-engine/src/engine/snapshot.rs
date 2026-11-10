@@ -4,11 +4,16 @@ use std::sync::Arc;
 
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
-use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisibility};
+use super::equality::{
+    Classes as EqualityClasses, Expand, Merged, Metering, OnMeter, Plain, Unmetered,
+    Visibility as CopyVisibility,
+};
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
+use crate::term::resolve::Vocabulary;
 use crate::term::{Dictionary, TermId};
+use crate::visit::Account;
 
 /// A pattern's heavy groups as the engine keeps them ([`Snapshot::heavy_groups_in`]): values
 /// with their match counts, in id order, charged for as long as any holder keeps them.
@@ -17,9 +22,16 @@ pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
+mod own_state;
+pub(crate) use own_state::OwnSlots;
+pub use own_state::{Admission, OwnState};
+
 mod reader_search;
-pub(crate) use reader_search::Documents;
 pub use reader_search::TextScope;
+pub(crate) use reader_search::{CorpusAdmission, Documents};
+
+mod counted;
+pub use counted::CountedSnapshot;
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
@@ -37,7 +49,14 @@ pub use reader_search::TextScope;
 #[derive(Clone)]
 pub struct Snapshot {
     version: Arc<Version>,
-    dictionary: Arc<Dictionary>,
+    /// What its ids mean: the engine's dictionary, bounded by `version.dictionary_len`, or a
+    /// private transaction's overlay view. Every snapshot made from this one keeps it.
+    vocabulary: Vocabulary,
+    /// Whether its statements are a published version's, or a restriction of them: what
+    /// [`Self::shared_state`] grants. Set at construction, copied by the constructors that
+    /// only restrict or reinterpret (the design note's matrix), cleared by those that add
+    /// unpublished statements, never set on an existing snapshot.
+    published: bool,
     statistics: Arc<Statistics>,
     /// `owl:sameAs`, when reads expand equality classes.
     equality: Option<TermId>,
@@ -158,6 +177,10 @@ fn unlimited() -> &'static Arc<nrese_exec::Budget> {
 #[derive(Debug, Default)]
 pub struct InferredMask {
     runs: Vec<Arc<crate::index::run::Run>>,
+    /// Whether it ever showed a statement the stack it was made over didn't hold, so that
+    /// a view through it adds statements never published ([`Snapshot::with_inferred_mask`]).
+    /// Kept by every mask changed from it: an addition stays one.
+    adds: bool,
     /// The charge of its runs and its list, the earlier masks' among its parts. After
     /// `runs`: released once they are freed.
     held: Held,
@@ -268,8 +291,24 @@ impl InferredMask {
             let run = crate::index::run::Run::from_delta_within(layout, show, hide, &mut held)?;
             runs.push(Arc::new(run));
         }
+        // A statement shown that the stack doesn't hold, visible through the mask: the
+        // view adds it (the store's support views show facts asserted out of a reader's
+        // reach). One sign sum per shown statement, over the stack's runs and the mask's,
+        // as the view will read it; nothing allocated.
+        let stack = &snapshot.version.inferred;
+        let visible = |quad: &EncodedQuad| {
+            let sign: i64 = (stack.runs().iter().chain(&runs))
+                .map(|run| run.sign_of(quad))
+                .sum();
+            sign > 0
+        };
+        let adds = self.adds
+            || show
+                .iter()
+                .any(|quad| !stack.contains(quad) && visible(quad));
         Ok(Self {
             runs,
+            adds,
             held: Held::new(self.held.with(0), held),
         })
     }
@@ -347,6 +386,9 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    /// A snapshot of `version`, not published: no [`SharedState`]. The bulk path's checkpoint
+    /// image is made so, of a version that is never installed (one made from it is). Never of
+    /// an installed version: its own slots ([`OwnState`]) would be that version's.
     pub(super) fn new(
         version: Arc<Version>,
         dictionary: Arc<Dictionary>,
@@ -356,7 +398,8 @@ impl Snapshot {
     ) -> Self {
         Self {
             version,
-            dictionary,
+            vocabulary: Vocabulary::Shared(dictionary),
+            published: false,
             statistics,
             equality,
             canonical: false,
@@ -364,6 +407,42 @@ impl Snapshot {
             views,
             reads: None,
             held: Held::default(),
+        }
+    }
+
+    /// [`Self::new`] of a version the engine has installed or recovered: published, so it
+    /// grants a [`SharedState`]. Only the engine's own snapshot acquisition calls it.
+    pub(super) fn published(
+        version: Arc<Version>,
+        dictionary: Arc<Dictionary>,
+        statistics: Arc<Statistics>,
+        equality: Option<TermId>,
+        views: Arc<nrese_exec::Budget>,
+    ) -> Self {
+        Self {
+            published: true,
+            ..Self::new(version, dictionary, statistics, equality, views)
+        }
+    }
+
+    /// Where what this snapshot derives may be kept (the lifecycle contract's S3): in state
+    /// other operations reach for a published snapshot ([`SharedState`]), in its own
+    /// version's slots for a pending, private, staged or added-to one ([`OwnState`]).
+    pub fn admission(&self) -> Admission<'_> {
+        match self.published {
+            true => Admission::Shared(SharedState { snapshot: self }),
+            false => Admission::Own(OwnState::new(self)),
+        }
+    }
+
+    /// The capability to admit into state other operations reach, for a published snapshot
+    /// alone ([`Self::admission`]'s `Shared`); `None` for a pending, private, staged or
+    /// added-to one, which computes for its request or keeps it in its own version instead.
+    /// Reading entries made from published snapshots needs none.
+    pub fn shared_state(&self) -> Option<SharedState<'_>> {
+        match self.admission() {
+            Admission::Shared(state) => Some(state),
+            Admission::Own(_) => None,
         }
     }
 
@@ -590,13 +669,31 @@ impl Snapshot {
     /// ([`InferredSubset::Only`]). The result has statistics and equality classes of its
     /// own, so nothing it reads is cached for, or taken from, the whole snapshot.
     pub fn with_inferred_subset(&self, subset: InferredSubset) -> Snapshot {
-        let inferred = match subset {
-            InferredSubset::Without(hidden) => self.version.inferred.with_delta(&[], &hidden),
+        let (inferred, of) = match subset {
+            InferredSubset::Without(hidden) => (
+                self.version.inferred.with_delta(&[], &hidden),
+                ViewOf::Restriction,
+            ),
             InferredSubset::Only(kept) => {
-                crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
+                let of = self.kept_among_inferred(&kept);
+                let layout = self.version.inferred.layout();
+                (crate::index::IndexVersion::from_quads(layout, kept), of)
             }
         };
-        self.restricted(inferred, self.held.clone())
+        self.restricted(inferred, self.held.clone(), of)
+    }
+
+    /// What a view keeping only `kept` of its inferred statements is to this snapshot: a
+    /// restriction if they are all among them, an addition otherwise. The store's support
+    /// views merge facts asserted out of a reader's reach into their lists, so this is
+    /// checked in every build. It costs about as much as building the view: 24.5 against
+    /// 21.2 ms for 100 k of 1 M statements (sizing probe `dictlc-p30-probe-d6cf4e5a`), once
+    /// per view built.
+    fn kept_among_inferred(&self, kept: &[EncodedQuad]) -> ViewOf {
+        match kept.iter().all(|quad| self.version.inferred.contains(quad)) {
+            true => ViewOf::Restriction,
+            false => ViewOf::Addition,
+        }
     }
 
     /// [`Self::with_inferred_subset`] of [`InferredSubset::Only`] `kept` (sorted, each
@@ -608,6 +705,7 @@ impl Snapshot {
         kept: &[EncodedQuad],
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        let of = self.kept_among_inferred(kept);
         let layout = self.version.inferred.layout();
         let empty = crate::index::IndexVersion::empty(layout);
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
@@ -620,7 +718,7 @@ impl Snapshot {
         let run = crate::index::run::Run::from_delta_within(layout, kept, &[], &mut held)?;
         let held = Held::new(self.held.with(0), held);
         let inferred = empty.with_run(run);
-        Ok(self.restricted(inferred, held))
+        Ok(self.restricted(inferred, held, of))
     }
 
     /// This snapshot with `added` statements in its inferred stack, for a reader of facts
@@ -633,6 +731,7 @@ impl Snapshot {
         self.restricted(
             self.version.inferred.with_delta(added, &[]),
             self.held.clone(),
+            ViewOf::Addition,
         )
     }
 
@@ -646,6 +745,28 @@ impl Snapshot {
         &self,
         added: &[crate::quad::EncodedTriple],
         budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        self.inferred_added_within(added, budget, ViewOf::Addition)
+    }
+
+    /// [`Self::with_inferred_added_within`] for statements this snapshot's own DL bounds
+    /// derive from it alone: the view keeps this snapshot's publication (a published
+    /// snapshot's gets a token, an unpublished one's none). F2's contract revision for the
+    /// store's DL bounds (the master, 8 Nov): they are its only caller. The workspace's
+    /// `clippy.toml` disallows it everywhere else, a source policy, not a capability.
+    pub fn with_inferred_derived_within(
+        &self,
+        derived: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        self.inferred_added_within(derived, budget, ViewOf::Derived)
+    }
+
+    fn inferred_added_within(
+        &self,
+        added: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+        of: ViewOf,
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
         use std::mem::size_of;
         let stack = &self.version.inferred;
@@ -666,7 +787,7 @@ impl Snapshot {
         let (inferred, run) = built?;
         let held =
             nrese_exec::Reservation::adopt(Arc::clone(budget), held.transfer() + run.transfer());
-        Ok(self.restricted(inferred, Held::new(self.held.with(0), held)))
+        Ok(self.restricted(inferred, Held::new(self.held.with(0), held), of))
     }
 
     /// This snapshot with the inferred statements `mask` hides removed, as
@@ -692,7 +813,11 @@ impl Snapshot {
         parts.push(mask.held.clone());
         let held = Held::new(parts, held);
         let inferred = stack.with_runs(&mask.runs);
-        Ok(Some(self.restricted(inferred, held)))
+        let of = match mask.adds {
+            true => ViewOf::Addition,
+            false => ViewOf::Restriction,
+        };
+        Ok(Some(self.restricted(inferred, held, of)))
     }
 
     /// What [`Self::restricted`] allocates for a view: its version, equality cell and
@@ -706,8 +831,9 @@ impl Snapshot {
 
     /// This snapshot with `inferred` as its inferred stack, holding `held`: a version of
     /// its own (new statements at its revision), with statistics and equality classes of
-    /// its own.
-    fn restricted(&self, inferred: crate::index::IndexVersion, held: Held) -> Snapshot {
+    /// its own. Published as its source is if `inferred` only restricts the source's
+    /// inferred statements; never if it adds any ([`ViewOf`]).
+    fn restricted(&self, inferred: crate::index::IndexVersion, held: Held, of: ViewOf) -> Snapshot {
         let version = Arc::new(Version {
             content: super::Content::fresh(),
             // A masked or restricted view: the same asserted stack.
@@ -719,6 +845,7 @@ impl Snapshot {
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
+            own: Default::default(),
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {
@@ -726,7 +853,11 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             reads: self.reads.clone(),
             version,
-            dictionary: Arc::clone(&self.dictionary),
+            vocabulary: self.vocabulary.clone(),
+            published: match of {
+                ViewOf::Restriction | ViewOf::Derived => self.published,
+                ViewOf::Addition => false,
+            },
             statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
@@ -762,6 +893,37 @@ impl Snapshot {
             ),
             None => Cow::Borrowed(pattern),
         }
+    }
+
+    /// [`Self::expanding`], a build of the classes counted on `meter`: `Err` where it stopped
+    /// (REAS-3, sweep SW012). A canonical snapshot's alias view is made as `expanding` makes
+    /// it: no counted reader reads canonically (REAS-3 design note, residuals).
+    fn expanding_with<M: super::equality::Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Result<Option<Arc<EqualityClasses>>, crate::visit::Stopped> {
+        let default_graph = match pattern.graph {
+            GraphSelector::Any => true,
+            GraphSelector::AnyNamed => false,
+            GraphSelector::Exact(graph) => graph.is_default_graph(),
+        };
+        if model == ReadModel::Asserted || !default_graph {
+            return Ok(None);
+        }
+        let Some(same_as) = self.equality else {
+            return Ok(None);
+        };
+        let classes = match self.canonical {
+            true => self.version.equality.canonical(&self.version, same_as),
+            false => self
+                .version
+                .equality
+                .classes_with(&self.version, same_as, meter)
+                .ok_or(crate::visit::Stopped)?,
+        };
+        Ok((!classes.is_empty()).then_some(classes))
     }
 
     /// The classes a read of `pattern` in `model` expands: equality is on, some class
@@ -814,11 +976,11 @@ impl Snapshot {
             true => Some(AccessPlan::in_permutation(pattern, permutation)?),
             false => None,
         };
-        let stored = SortedMerge {
-            left: data.asserted.scan_plan(&plan).peekable(),
-            right: data.inferred.scan_plan(&plan).peekable(),
+        let stored = Merged::new(
+            Plain(data.asserted.scan_plan(&plan)),
+            Plain(data.inferred.scan_plan(&plan)),
             permutation,
-        };
+        );
         let expanded = Expand::new(
             stored,
             classes,
@@ -833,11 +995,7 @@ impl Snapshot {
             .into_iter()
             .flat_map(move |plan| data.asserted.scan_plan(&plan))
             .filter(|quad| !quad.graph.is_default_graph());
-        Some(SortedMerge {
-            left: expanded.peekable(),
-            right: named.peekable(),
-            permutation,
-        })
+        Some(Merged::new(Plain(expanded), Plain(named), permutation))
     }
 
     /// The expanded matches of `pattern` in `model`, in the order of its access plan,
@@ -858,23 +1016,39 @@ impl Snapshot {
     /// the stored matches over representatives weighted by how many quads each stands for,
     /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
     /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
-    /// holds (its maximum then; PR #70 fix check 2 F3).
-    fn expanded_count(
+    /// holds (its maximum then; PR #70 fix check 2 F3). A counted count ([`Metering`]) counts
+    /// each stored position its scans pass, deleted ones included (REAS-2 fix check r1,
+    /// R2-F1), each copy it expands and each visibility probe; `None` once its meter has
+    /// stopped, nothing more read ([`Self::count_in_visiting`]). [`Self::count_in`]'s is
+    /// unmetered: the plain scans and probes (REAS-3, the master's 01:37 condition (b)).
+    fn expanded_count<M: Metering>(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
         limit: u64,
-    ) -> Count {
+        meter: M,
+    ) -> Option<Count> {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
         let mut count: u64 = 0;
+        // One account for the count's scans, copies and visibility probes, so at most
+        // `POLL_UNITS` units of them follow any yes (fix check r2 G1's sibling: a scan's
+        // ledger, the copies' credit and each probe's own allowed one each).
+        let mut account = OnMeter::new(meter);
         for stack in Stack::ALL {
-            for quad in data.stack(stack).scan(&normalised) {
+            let mut scan = data
+                .stack(stack)
+                .scan_plan_with(&AccessPlan::for_pattern(&normalised), &mut account)
+                .ok()?;
+            loop {
                 if count >= limit {
-                    return Count::AtLeast(count);
+                    return Some(Count::AtLeast(count));
                 }
+                let Some(quad) = scan.step_with(&mut account).ok()? else {
+                    break;
+                };
                 if !quad.graph.is_default_graph() {
                     count += u64::from(
                         model == ReadModel::Materialised
@@ -890,19 +1064,37 @@ impl Snapshot {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
                         let (mut copies, wanted) = (0, limit - count);
+                        let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
-                            copies += u64::from(visibility.shows(&copy, touching));
+                            // Its probe, counting its own work, then the copy, a unit counted
+                            // before it is counted in (fix check r3 H1).
+                            let shown = visibility
+                                .shows_with(&copy, touching, &mut account)
+                                .and_then(|shown| {
+                                    account
+                                        .take(1)
+                                        .then_some(shown)
+                                        .ok_or(crate::visit::Stopped)
+                                });
+                            let Ok(shown) = shown else {
+                                stopped = true;
+                                return std::ops::ControlFlow::Break(());
+                            };
+                            copies += u64::from(shown);
                             match copies >= wanted {
                                 true => std::ops::ControlFlow::Break(()),
                                 false => std::ops::ControlFlow::Continue(()),
                             }
                         });
+                        if stopped {
+                            return None;
+                        }
                         Some(copies)
                     }
                 };
                 match copies.and_then(|copies| count.checked_add(copies)) {
                     Some(sum) => count = sum,
-                    None => return Count::AtLeast(u64::MAX),
+                    None => return Some(Count::AtLeast(u64::MAX)),
                 }
             }
         }
@@ -912,18 +1104,21 @@ impl Snapshot {
             && normalised != *pattern
             && !self.canonical
         {
-            count += self
-                .data(model)
+            let mut scan = data
                 .asserted
-                .scan(pattern)
-                .filter(|quad| !quad.graph.is_default_graph())
-                .take(usize::try_from(limit - count).unwrap_or(usize::MAX))
-                .count() as u64;
+                .scan_plan_with(&AccessPlan::for_pattern(pattern), &mut account)
+                .ok()?;
+            while count < limit {
+                let Some(quad) = scan.step_with(&mut account).ok()? else {
+                    break;
+                };
+                count += u64::from(!quad.graph.is_default_graph());
+            }
         }
-        match count >= limit {
+        Some(match count >= limit {
             true => Count::AtLeast(count),
             false => Count::Exact(count),
-        }
+        })
     }
 
     /// An estimate of [`count_in`](Self::count_in) for planning, O(r log n): with
@@ -956,7 +1151,60 @@ impl Snapshot {
         Arc::ptr_eq(&self.version, &other.version)
     }
 
-    /// A snapshot of `version` over this one's dictionary and statistics.
+    /// A snapshot of `version` over this one's vocabulary and statistics: a transaction's
+    /// pending state, never published, whatever this one is.
+    /// A pending version over this snapshot's (DUR-6): its asserted stack with the `asserted`
+    /// inserts and deletes and its inferred stack with the `inferred` ones, each as one more
+    /// run (the asserted base read in the quad layout where they need it, its runs' forms
+    /// shared and counted in `forms`, the store's index memory, not charged here), in the
+    /// version `make` builds of the two. What it makes is charged to `budget` before it is
+    /// made and held by the result until its last holder lets it go: its version, its runs,
+    /// their lists, the charge's own box and parts. A refusal leaves nothing made.
+    pub(super) fn pending_within(
+        &self,
+        asserted: [&[EncodedQuad]; 2],
+        inferred: [&[EncodedQuad]; 2],
+        forms: &crate::index::Forms,
+        budget: &Arc<nrese_exec::Budget>,
+        make: impl FnOnce(crate::index::IndexVersion, crate::index::IndexVersion) -> Version,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        use std::mem::size_of;
+        let version = &self.version;
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(
+            boxed(size_of::<Version>())
+                + version.asserted.runs_bytes(1)
+                + version.inferred.runs_bytes(1)
+                + 2 * boxed(size_of::<crate::index::run::Run>())
+                + Held::overhead(self.held.count()),
+        )?;
+        let (asserted, asserted_held) =
+            version
+                .asserted
+                .with_change_within(asserted[0], asserted[1], forms, budget)?;
+        let (inferred, inferred_held) =
+            match version
+                .inferred
+                .with_change_within(inferred[0], inferred[1], forms, budget)
+            {
+                Ok(built) => built,
+                Err(refused) => {
+                    // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
+                    drop(asserted);
+                    drop(asserted_held);
+                    return Err(refused);
+                }
+            };
+        let held = nrese_exec::Reservation::adopt(
+            Arc::clone(budget),
+            held.transfer() + asserted_held.transfer() + inferred_held.transfer(),
+        );
+        let held = Held::new(self.held.with(0), held);
+        let mut snapshot = self.with_version(make(asserted, inferred));
+        snapshot.held = held;
+        Ok(snapshot)
+    }
+
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         let version = Arc::new(version);
         let canonical_data = self.canonical_view(&version);
@@ -965,7 +1213,8 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             reads: self.reads.clone(),
             version,
-            dictionary: Arc::clone(&self.dictionary),
+            vocabulary: self.vocabulary.clone(),
+            published: false,
             statistics: Arc::clone(&self.statistics),
             equality: self.equality,
             canonical: self.canonical,
@@ -973,19 +1222,47 @@ impl Snapshot {
         }
     }
 
+    /// This snapshot with `view` as its vocabulary: a private transaction's pending state
+    /// ([`super::PrivateTransaction`]). Every snapshot made from it keeps the view. Its
+    /// statistics are its own, as a restricted view's are: nothing built from its statements,
+    /// whose own ids mean nothing to the engine, is kept for published snapshots.
+    pub(super) fn private(mut self, view: crate::term::overlay::OverlayView) -> Snapshot {
+        self.vocabulary = Vocabulary::Private(view);
+        self.published = false;
+        self.statistics = Arc::new(self.statistics.for_view());
+        self
+    }
+
     pub(crate) fn version(&self) -> &Version {
         &self.version
     }
 
-    pub(crate) fn dictionary(&self) -> &Dictionary {
-        &self.dictionary
+    /// The published dictionary, for readers of published state (the checkpoint, the
+    /// statistics' saved sets): `None` for a private snapshot, whose ids past its start mean
+    /// terms the dictionary doesn't have. Those readers refuse or skip it.
+    pub(crate) fn shared_dictionary(&self) -> Option<&Arc<Dictionary>> {
+        self.vocabulary.dictionary()
+    }
+
+    /// The dictionary under this snapshot's vocabulary, private or not, for what reads its
+    /// shared state only (planning, sizes, search's indexes). Never a decoder of this
+    /// snapshot's ids: a private snapshot's own ids aren't in it.
+    fn underlying(&self) -> &Dictionary {
+        self.vocabulary.underlying()
     }
 
     /// Whether dictionary IDs denote the same terms in both snapshots. This is distinct
     /// from content identity: derived views can share a dictionary while reading different
-    /// statements. It says nothing about query-local computed IDs.
+    /// statements. It says nothing about query-local computed IDs. Two private snapshots
+    /// share one only if they are views of the same transaction's vocabulary; a private one
+    /// never shares one with a published one.
     pub fn shares_dictionary_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.dictionary, &other.dictionary)
+        self.vocabulary.same_as(&other.vocabulary)
+    }
+
+    /// Whether this snapshot's ids include a private transaction's own terms.
+    pub fn is_private(&self) -> bool {
+        self.vocabulary.is_private()
     }
 
     /// Dictionary entries visible to this snapshot.
@@ -1140,10 +1417,70 @@ impl Snapshot {
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
     /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
+        self.count_with(model, pattern, Unmetered)
+            .expect("never stopped")
+    }
+
+    /// [`Self::count_in`], calling `visit(n)` before the work it counts, `n` at most
+    /// `nrese_exec::POLL_UNITS`: each stored position a scan passes, deleted ones included,
+    /// and each copy it expands (1 each); each run's range search a held count makes (1),
+    /// and its tombstone words, a run of at most `POLL_UNITS` at a time as they are read.
+    /// `None` as soon as `visit` returns false, nothing more read: the count is abandoned,
+    /// nothing is cached. A reader whose stop must see a long count counts with it (REAS-2
+    /// review r1 F2; fix check r1 R2-F1: the count lives in the reader).
+    pub fn count_in_visiting(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<Count> {
+        // The counted reads share one visitor among their producers ([`crate::visit`]): this
+        // one, called from one place at a time, is shared through a cell, and latched as the
+        // contract has it: once it says stop it is not asked again, and `visit(0)` (whether
+        // it has stopped) is answered here, never passed on.
+        let visit = std::cell::RefCell::new(visit);
+        let stopped = std::cell::Cell::new(false);
+        self.count_visited(model, pattern, &|n| {
+            if stopped.get() {
+                return false;
+            }
+            if n == 0 {
+                return true;
+            }
+            let go = (visit.borrow_mut())(n);
+            stopped.set(!go);
+            go
+        })
+    }
+
+    /// [`Self::count_in_visiting`] on a counted read's visitor ([`crate::visit`]), the
+    /// equality classes it needs built counted too (REAS-3, sweep SW012).
+    pub(crate) fn count_visited(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: crate::visit::Visitor<'_>,
+    ) -> Option<Count> {
+        self.count_with(model, pattern, visit)
+    }
+
+    /// [`Self::count_in`]'s work on `meter`: unmetered, the plain reads; on a visitor,
+    /// counted.
+    fn count_with<M: Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Option<Count> {
+        // Asked once whatever the count does (a layout that holds nothing of it does no
+        // work): a stopped visitor always gets `None`.
+        if meter.stopped() {
+            return None;
+        }
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
-        if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, u64::MAX);
+        if let Some(classes) = self.expanding_with(model, pattern, meter).ok()? {
+            return self.expanded_count(&classes, model, pattern, u64::MAX, meter);
         }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan, both
@@ -1157,19 +1494,29 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            return Count::Exact(self.held_count(model, &every) - self.held_count(model, &default));
+            let every = self.held_count(model, &every, meter)?;
+            let default = self.held_count(model, &default, meter)?;
+            return Some(Count::Exact(every - default));
         }
-        Count::Exact(self.held_count(model, pattern))
+        self.held_count(model, pattern, meter).map(Count::Exact)
     }
 
-    /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion.
-    fn held_count(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+    /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion,
+    /// each run's work counted on `meter` (`IndexVersion::count_plan_visiting`).
+    fn held_count<M: Metering>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        meter: M,
+    ) -> Option<u64> {
         let plan = AccessPlan::for_pattern(pattern);
-        Stack::ALL
-            .into_iter()
-            .filter(|&stack| model.includes(stack))
-            .map(|stack| self.data(model).stack(stack).count_plan(&plan))
-            .sum()
+        let mut sum = 0;
+        for stack in Stack::ALL {
+            if model.includes(stack) {
+                sum += meter.count_plan(self.data(model).stack(stack), &plan)?;
+            }
+        }
+        Some(sum)
     }
 
     /// True if some quad matches `pattern` in `model`; cheaper than
@@ -1178,7 +1525,11 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, 1).at_least() > 0;
+            return self
+                .expanded_count(&classes, model, pattern, 1, Unmetered)
+                .expect("never stopped")
+                .at_least()
+                > 0;
         }
         if pattern.graph == GraphSelector::AnyNamed {
             return self.count_in(model, pattern).at_least() > 0;
@@ -1221,11 +1572,11 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(Either::Right(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
+        Some(Either::Right(Merged::new(
+            Plain(scan(Stack::Asserted)),
+            Plain(scan(Stack::Inferred)),
             permutation,
-        }))
+        )))
     }
 
     /// Like [`scan_sorted_in`](Self::scan_sorted_in), with the first unbound component of the
@@ -1247,16 +1598,18 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(SortedMerge {
-            left: scan(Stack::Asserted).peekable(),
-            right: scan(Stack::Inferred).peekable(),
+        Some(Merged::new(
+            Plain(scan(Stack::Asserted)),
+            Plain(scan(Stack::Inferred)),
             permutation,
-        })
+        ))
     }
 
     /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
-    /// a time ([`Self::scan_columns_in`]); `None` where that can't answer.
-    pub fn scan_range_columns_in(
+    /// a time and charged to `budget` before they are ([`Self::scan_columns_in`]); `None`
+    /// where that can't answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_range_columns_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
@@ -1264,9 +1617,12 @@ impl Snapshot {
         low: TermId,
         high: TermId,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
-        let plan = self.range_plan(model, pattern, permutation, low, high)?;
-        self.columns_of_stacks(model, &plan, permutation, components)
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
+        let Some(plan) = self.range_plan(model, pattern, permutation, low, high) else {
+            return Ok(None);
+        };
+        self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
     /// Whether a statement read in `model` has a triple term (RDF 1.2): triple terms are
@@ -1339,26 +1695,61 @@ impl Snapshot {
     ///
     /// This answers `GROUP BY ?x` with `COUNT(*)` over one triple pattern without reading its
     /// matches: a walk over the groups of each run (see `IndexVersion::group_counts`).
-    pub fn group_counts_in(
+    ///
+    /// The groups are charged to `budget` as they are found, one charge a growth, before
+    /// they are allocated, and the result holds exactly their charge: a walk over many
+    /// groups can't outgrow its budget (D16-039 F7). Refused, nothing is held.
+    ///
+    /// The walk's large runs go in parallel parts only where the budget's room, read once,
+    /// covers the whole walk's peak over every included stack; otherwise every run is walked
+    /// serially. Against a budget no one else draws from during the walk, a walk is refused
+    /// only where the fully serial walk would be. A concurrent consumer can take room after
+    /// the check: the walk is then refused, typed, never answered short.
+    pub fn group_counts_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
-    ) -> Option<Vec<(TermId, u64)>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
+        self.group_counts_on(model, pattern, permutation, budget, None)
+    }
+
+    /// [`Self::group_counts_in`] on the path `in_parts` chose for the whole walk, or, where
+    /// `None`, on the path its budget's room allows.
+    fn group_counts_on<'b>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        budget: &'b nrese_exec::Budget,
+        in_parts: Option<bool>,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
-        let (plan, bound) = self.group_plan(model, &pattern, permutation)?;
-        let mut counts = Vec::new();
+        let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
+            return Ok(None);
+        };
+        let in_parts = in_parts.unwrap_or_else(|| {
+            let (keys, parts) = self.group_walk_size(model, &plan, bound);
+            crate::index::walks_in_parts(budget, keys, parts)
+        });
+        let mut counts = nrese_exec::ChargedVec::new(budget);
         let mut sources = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
                 let before = counts.len();
-                self.data(model)
-                    .stack(stack)
-                    .group_counts(&plan, bound, &mut counts);
+                self.data(model).stack(stack).group_counts_on(
+                    &plan,
+                    bound,
+                    &mut counts,
+                    budget,
+                    in_parts,
+                )?;
                 sources += usize::from(counts.len() > before);
             }
         }
-        // One run of one stack yields each value once, in order; otherwise merge.
+        let (mut counts, mut held) = counts.into_parts();
+        // One run of one stack yields each value once, in order; otherwise merge (in place).
         if sources > 1 || !counts.is_sorted_by(|a, b| a.0 < b.0) {
             counts.sort_unstable_by_key(|&(value, _)| value);
             counts.dedup_by(|later, kept| {
@@ -1369,13 +1760,28 @@ impl Snapshot {
                 same
             });
         }
-        Some(
-            counts
-                .into_iter()
-                .filter(|&(_, count)| count > 0)
-                .map(|(value, count)| (TermId::from_raw(value), count as u64))
-                .collect(),
-        )
+        // In place: the pairs keep their layout, so the collection reuses their buffer.
+        let counts: Vec<(TermId, u64)> = counts
+            .into_iter()
+            .filter(|&(_, count)| count > 0)
+            .map(|(value, count)| (TermId::from_raw(value), count as u64))
+            .collect();
+        if let Err(refused) = held.resize(counts.capacity() * size_of::<(TermId, u64)>()) {
+            drop(counts);
+            return Err(refused);
+        }
+        Ok(Some(GroupCounts { counts, held }))
+    }
+
+    /// The keys [`Self::group_counts_in`]'s walk of `plan` reads over every included stack,
+    /// and the parallel parts of its large runs: what bounds its charge
+    /// ([`crate::index::group_walk_peak`]).
+    fn group_walk_size(&self, model: ReadModel, plan: &AccessPlan, bound: usize) -> (usize, usize) {
+        Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| self.data(model).stack(stack).group_walk_size(plan, bound))
+            .fold((0, 0), |(keys, parts), (k, p)| (keys + k, parts + p))
     }
 
     /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
@@ -1496,29 +1902,37 @@ impl Snapshot {
     /// time instead of a quad at a time. `None` where that can't answer: the matches lie
     /// in several runs or a run with deletions, which must be merged quad by quad, or in
     /// both stacks with columns that can't order them ([`Self::columns_of_stacks`]); or
-    /// the plan needs a post-filter.
-    pub fn scan_columns_in(
+    /// the plan needs a post-filter. Decided before anything is charged.
+    ///
+    /// The columns are charged to `budget` before they are decoded (each stack's rows are
+    /// known from its index first), and the result holds exactly their charge: a query's
+    /// scan can't decode past its budget (D16-039 F1, F2). Refused, nothing is decoded
+    /// beyond what was charged, and the budget is as it was.
+    pub fn scan_columns_in<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
-            return None;
+            return Ok(None);
         }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let Some(plan) = AccessPlan::in_permutation(pattern, permutation) else {
+            return Ok(None);
+        };
         if plan.exclude_default_graph {
-            return None;
+            return Ok(None);
         }
         if Stack::ALL.into_iter().any(|stack| {
             model.includes(stack) && !self.data(model).stack(stack).layout().supports(permutation)
         }) {
-            return None;
+            return Ok(None);
         }
-        self.columns_of_stacks(model, &plan, permutation, components)
+        self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
     /// The columns `components` of the quads matching `plan` in each stack of `model`, each
@@ -1527,14 +1941,20 @@ impl Snapshot {
     /// statements of one pattern, as reasoning gives them. `None` where a stack can't be
     /// decoded so (several runs, deletions), or where both have matches and the columns
     /// can't order them: rows compare on the columns alone, so every column the plan lets
-    /// vary must be among them up to the last of them in `permutation`'s order.
-    fn columns_of_stacks(
+    /// vary must be among them up to the last of them in `permutation`'s order. Every
+    /// "can't" is decided before anything is charged.
+    ///
+    /// Charged to `budget` before anything is decoded: each stack's part (its rows are
+    /// its index range's), and where both have matches their merge too, which exists
+    /// beside them until they are freed. Then the charge of exactly the result's columns.
+    fn columns_of_stacks<'b>(
         &self,
         model: ReadModel,
         plan: &AccessPlan,
         permutation: Permutation,
         components: &[usize],
-    ) -> Option<Vec<Vec<u64>>> {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<ScanColumns<'b>>, nrese_exec::BudgetExceeded> {
         let matching = Stack::ALL
             .map(|stack| model.includes(stack) && self.data(model).stack(stack).any_plan(plan));
         let order = permutation.order();
@@ -1545,36 +1965,65 @@ impl Snapshot {
                 .all(|position| plan.low[position] == plan.high[position] || projected(position))
         });
         if matching.iter().all(|&matches| matches) && !ordered {
-            return None;
+            return Ok(None);
         }
-        let mut parts: Vec<Vec<Vec<u64>>> = Vec::new();
+        let mut scans = Vec::with_capacity(Stack::ALL.len());
         for (stack, matches) in Stack::ALL.into_iter().zip(matching) {
             if !matches {
                 continue;
             }
-            let index = self.data(model).stack(stack);
-            let mut out = vec![Vec::new(); components.len()];
-            if !index.scan_columns(plan, components, &mut out) {
-                return None;
+            match self.data(model).stack(stack).column_scan(plan, components) {
+                Some(scan) => scans.push(scan),
+                None => return Ok(None),
             }
-            parts.push(out);
         }
-        match parts.len() {
-            0 => Some(vec![Vec::new(); components.len()]),
-            1 => parts.pop(),
+        let width = components.len();
+        let bytes = |rows: usize| rows.saturating_mul(width).saturating_mul(size_of::<u64>());
+        let rows: usize = scans
+            .iter()
+            .map(crate::index::ColumnScan::rows)
+            .fold(0, usize::saturating_add);
+        let merged = if scans.len() > 1 { bytes(rows) } else { 0 };
+        let mut held = nrese_exec::Reservation::new(budget);
+        held.charge(bytes(rows).saturating_add(merged))?;
+        // Declared after `held`: freed before their charge is released.
+        let mut parts: Vec<Vec<Vec<u64>>> = scans
+            .iter()
+            .map(|scan| {
+                let mut out = vec![Vec::new(); width];
+                scan.decode(&mut out);
+                out
+            })
+            .collect();
+        let columns = match parts.len() {
+            0 => vec![Vec::new(); width],
+            1 => parts.pop().expect("one part"),
             _ => {
                 let right = parts.pop().expect("two parts");
                 let left = parts.pop().expect("two parts");
-                Some(merge_columns(left, right, permutation, components))
+                merge_columns(left, right, permutation, components)
             }
-        }
+        };
+        held.resize(columns_bytes(&columns))?;
+        Ok(Some(ScanColumns { columns, held }))
     }
 
     /// The number of distinct terms used as subject or object in `graphs` (one graph, or
     /// every graph) in `model`: what zero-length property paths start from. Exact; kept
-    /// for this version once computed. The two walks (subjects, objects) run in parallel.
+    /// for this version once computed. The two walks (subjects, objects) run at once, each in
+    /// parallel parts, where the budget's room covers both their peaks; otherwise both
+    /// serially, one after the other ([`Self::group_counts_in`]).
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
-    pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
+    ///
+    /// The two walks' lists are charged to `budget` as they grow, before they are allocated
+    /// (D16-039 F4): the reader that counts first holds them while it counts, and the count
+    /// is kept, not the lists. Refused, nothing is kept and nothing is held.
+    pub fn node_count_in(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        budget: &nrese_exec::Budget,
+    ) -> Result<Option<u64>, nrese_exec::BudgetExceeded> {
         let pattern = self
             .read_pattern(
                 model,
@@ -1588,9 +2037,12 @@ impl Snapshot {
         if self.expanding(model, &pattern).is_some()
             || (self.canonical_data.is_some() && model != ReadModel::Asserted)
         {
-            return None;
+            return Ok(None);
         }
-        self.statistics
+        // A refusal is the caller's error, never a count kept for the version.
+        let refused = std::sync::Mutex::new(None);
+        let count = self
+            .statistics
             .node_count(&self.version, model, graphs, || {
                 let (pattern, by_subject, by_object) = match graphs {
                     GraphSelector::Exact(graph) => (
@@ -1600,17 +2052,48 @@ impl Snapshot {
                     ),
                     _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
                 };
-                let distinct = |permutation| -> Option<Vec<TermId>> {
-                    let counts = self.group_counts_in(model, &pattern, permutation)?;
-                    Some(counts.into_iter().map(|(id, _)| id).collect())
+                // The groups as the walk charged them, read in place: no list copied out.
+                let distinct = |permutation, in_parts| match self.group_counts_on(
+                    model,
+                    &pattern,
+                    permutation,
+                    budget,
+                    Some(in_parts),
+                ) {
+                    Ok(groups) => groups,
+                    Err(error) => {
+                        refused
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get_or_insert(error);
+                        None
+                    }
                 };
-                let (subjects, objects) =
-                    rayon::join(|| distinct(by_subject), || distinct(by_object));
-                let (subjects, objects) = (subjects?, objects?);
+                // One decision for both walks (package fix checks r3, r4): at once, each in
+                // parts, where the room, read once, covers both whole walks' peaks; otherwise
+                // both serially, one after the other, the reference. Against a budget no one
+                // else draws from meanwhile, a count is refused only where that would be.
+                let peak = |permutation| {
+                    let pattern = self.read_pattern(model, &pattern);
+                    self.group_plan(model, &pattern, permutation)
+                        .map_or(0, |(plan, bound)| {
+                            let (keys, parts) = self.group_walk_size(model, &plan, bound);
+                            crate::index::group_walk_peak(keys, parts)
+                        })
+                };
+                let peaks = peak(by_subject).saturating_add(peak(by_object));
+                let (subjects, objects) = if budget.remaining() >= peaks {
+                    let (subjects, objects) =
+                        rayon::join(|| distinct(by_subject, true), || distinct(by_object, true));
+                    (subjects?, objects?)
+                } else {
+                    let subjects = distinct(by_subject, false)?;
+                    (subjects, distinct(by_object, false)?)
+                };
                 // |S ∪ O| by a merge of the two sorted lists.
                 let (mut i, mut j, mut both) = (0, 0, 0u64);
                 while i < subjects.len() && j < objects.len() {
-                    match subjects[i].cmp(&objects[j]) {
+                    match subjects[i].0.cmp(&objects[j].0) {
                         std::cmp::Ordering::Less => i += 1,
                         std::cmp::Ordering::Greater => j += 1,
                         std::cmp::Ordering::Equal => {
@@ -1621,7 +2104,11 @@ impl Snapshot {
                     }
                 }
                 Some(subjects.len() as u64 + objects.len() as u64 - both)
-            })
+            });
+        match refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            Some(error) => Err(error),
+            None => Ok(count),
+        }
     }
 
     /// The number of distinct values of the first unbound component of `pattern` in
@@ -1735,15 +2222,16 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
-    /// [`Self::lookup`], what it allocates charged first through `charge`
-    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
-    /// dictionary, which a checkpoint may otherwise change between them).
+    /// [`Self::lookup`], what it allocates charged first through `charge`, which is called
+    /// with no lock of the dictionary held ([`Dictionary::lookup_charged`]: at the larger of
+    /// a plain and a compressed base's bounds, since a checkpoint may change the base before
+    /// the lookup).
     pub fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
         charge: impl FnOnce(usize) -> Result<(), E>,
     ) -> Result<Option<TermId>, E> {
-        self.dictionary
+        self.vocabulary
             .lookup_charged(term, self.version.dictionary_len, charge)
     }
 
@@ -1762,13 +2250,12 @@ impl Snapshot {
     }
 
     pub fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
-        self.dictionary
-            .lookup_bounded(term, self.version.dictionary_len)
+        self.vocabulary.lookup(term, self.version.dictionary_len)
     }
 
     pub fn lookup_quad(&self, quad: QuadRef<'_>) -> Option<EncodedQuad> {
-        self.dictionary
-            .lookup_quad_bounded(quad, self.version.dictionary_len)
+        self.vocabulary
+            .lookup_quad(quad, self.version.dictionary_len)
     }
 
     /// The triple term `<<( subject predicate object )>>` of these ids as of this snapshot:
@@ -1780,58 +2267,54 @@ impl Snapshot {
         predicate: TermId,
         object: TermId,
     ) -> Option<TermId> {
-        self.dictionary
-            .triple_term_bounded([subject, predicate, object], self.version.dictionary_len)
+        self.vocabulary
+            .triple_term([subject, predicate, object], self.version.dictionary_len)
     }
 
     /// The subject, predicate and object ids of the triple term `id`, nothing decoded.
     /// `None` for another kind of term, one this snapshot doesn't know, and a triple term
     /// the first RDF 1.2 version keyed by its text ([`crate::Dictionary::components`]).
     pub fn components(&self, id: TermId) -> Option<[TermId; 3]> {
-        if id.payload() >= self.version.dictionary_len {
-            return None;
-        }
-        self.dictionary.components(id)
+        self.vocabulary.components(id, self.version.dictionary_len)
     }
 
     pub fn decode(&self, id: TermId) -> Option<Term> {
-        self.dictionary.decode(id)
+        self.vocabulary.decode(id)
     }
 
-    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
-    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
-    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
-    /// snapshot doesn't know.
+    /// [`Self::decode`] of `id`, what it allocates charged first through `charge`, for every
+    /// kind of term: inline, the dictionary's, a private snapshot's own, and a triple term
+    /// with its components. `Ok(None)` for an id that isn't a term this snapshot knows.
+    ///
+    /// `charge` is called with no lock of the dictionary held, once, or again where a
+    /// checkpoint's rebase came between the bound and the decode
+    /// ([`Dictionary::decode_charged`]): each call charges an increment, and what the decode
+    /// holds is covered by their sum. A refusal ends it, nothing decoded; what was charged
+    /// before stays the caller's to release.
     pub fn decode_charged<E>(
         &self,
         id: TermId,
-        charge: impl FnOnce(usize) -> Result<(), E>,
+        charge: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return Ok(None);
-        }
-        self.dictionary.decode_charged(id, charge)
+        self.vocabulary
+            .decode_charged(id, self.version.dictionary_len, charge)
     }
 
     /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
     /// as stored now: a checkpoint may store the term compressed after, so a charge for a
-    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
-    /// ids this snapshot doesn't know.
+    /// decode goes through [`Self::decode_charged`]. `None` for ids this snapshot doesn't
+    /// know.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
-        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return None;
-        }
-        self.dictionary.decode_bound(id)
+        self.vocabulary
+            .decode_bound(id, self.version.dictionary_len)
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id` (see
     /// [`Dictionary::with_view`](crate::Dictionary::with_view)); `None` for inline ids and
     /// ids this snapshot doesn't know.
     pub fn with_view<R>(&self, id: TermId, f: impl FnOnce(crate::TermView<'_>) -> R) -> Option<R> {
-        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return None;
-        }
-        self.dictionary.with_view(id, f)
+        self.vocabulary
+            .with_view(id, self.version.dictionary_len, f)
     }
 
     /// Calls `f` with a lookup of the views of this snapshot's dictionary terms, under one
@@ -1840,11 +2323,11 @@ impl Snapshot {
         &self,
         f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<crate::TermView<'v>>) -> R,
     ) -> R {
-        self.dictionary.with_views(self.version.dictionary_len, f)
+        self.vocabulary.with_views(self.version.dictionary_len, f)
     }
 
     pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
-        self.dictionary.decode_quad(quad)
+        self.vocabulary.decode_quad(quad)
     }
 
     /// The dictionary terms this snapshot knows whose text passes `test`, sorted (whether
@@ -1852,7 +2335,7 @@ impl Snapshot {
     /// worth it where a pattern has many more rows than the dictionary has bytes per row
     /// of a random read.
     pub fn matching_strings(&self, test: &crate::StringTest<'_>) -> Vec<TermId> {
-        self.dictionary
+        self.vocabulary
             .matching_strings(test, self.version.dictionary_len)
     }
 
@@ -1861,44 +2344,107 @@ impl Snapshot {
         &self,
         test: &crate::StringTest<'_>,
     ) -> (Vec<TermId>, crate::StringScan) {
-        self.dictionary
+        self.vocabulary
             .matching_strings_scan(test, self.version.dictionary_len)
     }
 
     /// Whether a prefix test ([`crate::Placement::Start`]) is answered from the text order
     /// by binary search, rather than by a pass over the dictionary.
     pub fn text_order_ready(&self) -> bool {
-        self.dictionary.text_order_ready()
+        self.underlying().text_order_ready()
     }
 
     /// The size of this snapshot's dictionary text in bytes (the arena: what
     /// [`matching_strings`](Self::matching_strings) reads).
     pub fn dictionary_bytes(&self) -> u64 {
-        self.dictionary.stats().arena_bytes
+        self.underlying().stats().arena_bytes
     }
 
     /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check).
-    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// (whether statements still use them is the caller's to check). A private snapshot's
+    /// shared indexes don't cover its own terms, and extending them would change state every
+    /// snapshot shares: it searches what it can see instead, as a reader of every graph in the
+    /// materialised model ([`Self::text_search_in`]; V3, DICT2 9 Nov 04:02 Q2).
+    pub fn text_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
+        if self.is_private() {
+            return self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None);
+        }
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search(query);
+        let mut matches = self.underlying().text_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
     }
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
     /// (whether statements still use them is the caller's to check, in `accept`). What the
     /// search holds, the hits included, is charged to `budget` before it is allocated: a
-    /// search the budget has no room for is refused, with nothing left charged.
+    /// search the budget has no room for is refused, with nothing left charged. A private
+    /// snapshot searches what it can see, as [`Self::text_search`] does
+    /// ([`Self::vector_search_in`]): run within what `budget` has left, held on it meanwhile.
     pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b nrese_exec::Budget,
-    ) -> Result<VectorHits<'b>, nrese_exec::BudgetExceeded> {
+    ) -> Result<VectorHits<'b>, SearchRefused> {
+        if self.is_private() {
+            // A snapshot reading within this very budget (a query's envelope): the reader
+            // path charges it through its own `Arc`, as its reads do (sol-loop r1 B3: a
+            // bridge holding the budget's room would refuse those reads).
+            let reading = self.reads.as_ref().and_then(|reads| reads.0.as_ref());
+            if let Some(reads) = reading.filter(|reads| std::ptr::eq(&*reads.budget, budget)) {
+                let (hits, report) = self.vector_search_in(
+                    ReadModel::Materialised,
+                    &TextScope::EVERY,
+                    query,
+                    accept,
+                    &reads.budget,
+                )?;
+                // Handed over on `budget`: charged there before they are copied.
+                let found =
+                    nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+                drop(hits);
+                return Ok((found?, report));
+            }
+            // Otherwise an `Arc`'d budget of what `budget` has left, that room held on
+            // `budget` until the search is done, then the hits charged there. The snapshot's
+            // reads, where it has any, charge their own budget, not this one. (A reader's
+            // budget beside `budget` under one parent would find the parent's room held:
+            // no caller passes one; SPARQL passes the reader's, the others unbounded ones.)
+            let (inner, held) = match budget.is_bounded() {
+                true => {
+                    let room = budget.remaining();
+                    let mut held = nrese_exec::Reservation::new(budget);
+                    held.charge(room)?;
+                    (nrese_exec::Budget::new(room), Some(held))
+                }
+                false => (nrese_exec::Budget::unlimited(), None),
+            };
+            let inner = Arc::new(inner);
+            let (hits, report) = self.vector_search_in(
+                ReadModel::Materialised,
+                &TextScope::EVERY,
+                query,
+                accept,
+                &inner,
+            )?;
+            // Of the held room, what the copy takes is let go for it, the rest held until the
+            // inner hits are freed (sol-loop r2 B3: no gap where neither is counted).
+            let held = held.map(|mut held| {
+                held.release(hits.len() * std::mem::size_of::<(TermId, f32)>());
+                held
+            });
+            let found = nrese_exec::ChargedVec::collect(budget, hits.len(), hits.iter().copied());
+            drop(hits);
+            drop(held);
+            return Ok((found?, report));
+        }
         let (hits, report) =
-            self.dictionary
+            self.underlying()
                 .vector_search(query, self.version.dictionary_len, accept, budget)?;
         let len = hits.len();
         let (hits, held) = hits.into_parts();
@@ -1914,50 +2460,177 @@ impl Snapshot {
 
     /// Builds the graph searches like `query` use, covering every vector of its
     /// dimension, before returning: a warm-up (searches build it themselves, a large one
-    /// on a thread of its own while they scan exactly).
+    /// on a thread of its own while they scan exactly). Nothing for a private snapshot,
+    /// whose searches scan exactly: a build is shared state.
     pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        self.dictionary.prepare_vector_graph(query);
+        if !self.is_private() {
+            self.underlying().prepare_vector_graph(query);
+        }
     }
 
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check).
-    pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// first (whether statements still use them is the caller's to check). A private
+    /// snapshot searches what it can see, as [`Self::text_search`] does.
+    pub fn iri_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
+        if self.is_private() {
+            return self.iri_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None);
+        }
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.iri_search(query);
+        let mut matches = self.underlying().iri_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
     }
 }
 
-/// Two quad streams sorted by one permutation, merged into one sorted stream. The inputs
-/// come from disjoint stacks, so equal keys never occur.
-struct SortedMerge<L: Iterator<Item = EncodedQuad>, R: Iterator<Item = EncodedQuad>> {
-    left: std::iter::Peekable<L>,
-    right: std::iter::Peekable<R>,
-    permutation: Permutation,
+/// The capability to admit into state other operations reach (the lifecycle contract's S3):
+/// held only for a published snapshot ([`Snapshot::shared_state`]), and carrying it, so an
+/// owner that takes one works on its snapshot and no other. Proves eligibility only: it
+/// replaces none of a cache's key dimensions or reader filters.
+///
+/// ```
+/// let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+/// let snapshot = engine.snapshot();
+/// let state = snapshot.shared_state().expect("a published snapshot");
+/// assert!(std::ptr::eq(state.snapshot(), &snapshot));
+/// assert!(engine.speculative().pending_snapshot().shared_state().is_none());
+/// ```
+///
+/// No code outside the engine can make one:
+///
+/// ```compile_fail
+/// fn forge(snapshot: &nrese_engine::Snapshot) -> nrese_engine::SharedState<'_> {
+///     nrese_engine::SharedState { snapshot }
+/// }
+/// ```
+#[derive(Clone, Copy)]
+pub struct SharedState<'s> {
+    snapshot: &'s Snapshot,
 }
 
-impl<L, R> Iterator for SortedMerge<L, R>
-where
-    L: Iterator<Item = EncodedQuad>,
-    R: Iterator<Item = EncodedQuad>,
-{
-    type Item = EncodedQuad;
+impl<'s> SharedState<'s> {
+    /// The published snapshot it was taken from.
+    pub fn snapshot(&self) -> &'s Snapshot {
+        self.snapshot
+    }
+}
 
-    #[inline]
-    fn next(&mut self) -> Option<EncodedQuad> {
-        match (self.left.peek(), self.right.peek()) {
-            (Some(l), Some(r)) => {
-                if self.permutation.to_key(l) <= self.permutation.to_key(r) {
-                    self.left.next()
-                } else {
-                    self.right.next()
-                }
-            }
-            (Some(_), None) => self.left.next(),
-            (None, _) => self.right.next(),
+/// What a restricted view's inferred stack is to its source's ([`Snapshot::restricted`]):
+/// a restriction or a derivation keeps the source's publication, an addition never has one.
+#[derive(Clone, Copy)]
+enum ViewOf {
+    /// Fewer of the source's inferred statements: a subset, `Only` or a mask.
+    Restriction,
+    /// Statements the source doesn't have, never published.
+    Addition,
+    /// Statements the source's own DL bounds derive from it alone
+    /// ([`Snapshot::with_inferred_derived_within`]).
+    Derived,
+}
+
+/// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
+#[derive(Debug, Clone, Copy)]
+pub enum SearchRefused {
+    /// The search's budget had no room ([`nrese_exec::BudgetExceeded`]).
+    Memory(nrese_exec::BudgetExceeded),
+    /// Not returned since V3: a private snapshot ([`Snapshot::is_private`]) searches what it
+    /// can see. Kept while callers still match it (`nrese-sparql`'s results).
+    Private,
+}
+
+impl From<nrese_exec::BudgetExceeded> for SearchRefused {
+    fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
+        Self::Memory(exceeded)
+    }
+}
+
+impl std::fmt::Display for SearchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(exceeded) => exceeded.fmt(f),
+            Self::Private => f.write_str("a private snapshot can't be searched"),
         }
     }
+}
+
+impl std::error::Error for SearchRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(exceeded) => Some(exceeded),
+            Self::Private => None,
+        }
+    }
+}
+
+/// The columns of a scan ([`Snapshot::scan_columns_in`]) and the charge of exactly their
+/// capacity, together: neither is dropped or handed on without the other. Dropped, the
+/// columns are freed, then their charge released; [`Self::into_parts`] hands both to a
+/// table that counts them, never released and charged again.
+#[derive(Debug)]
+pub struct ScanColumns<'b> {
+    /// Before `held`: fields drop in order, the columns first.
+    columns: Vec<Vec<u64>>,
+    held: nrese_exec::Reservation<&'b nrese_exec::Budget>,
+}
+
+impl<'b> ScanColumns<'b> {
+    pub fn columns(&self) -> &[Vec<u64>] {
+        &self.columns
+    }
+
+    /// The columns, and the charge of their capacity, for a holder that keeps it until
+    /// they are freed or hands it on with them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<Vec<u64>>,
+        nrese_exec::Reservation<&'b nrese_exec::Budget>,
+    ) {
+        let Self { columns, held } = self;
+        (columns, held)
+    }
+}
+
+/// The groups of a walk ([`Snapshot::group_counts_in`]), each value with its number of
+/// matching quads in id order, and the charge of exactly their capacity, together. Dropped,
+/// the groups are freed, then their charge released.
+#[derive(Debug)]
+pub struct GroupCounts<'b> {
+    /// Before `held`: fields drop in order, the groups first.
+    counts: Vec<(TermId, u64)>,
+    held: nrese_exec::Reservation<&'b nrese_exec::Budget>,
+}
+
+impl std::ops::Deref for GroupCounts<'_> {
+    type Target = [(TermId, u64)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.counts
+    }
+}
+
+impl<'b> GroupCounts<'b> {
+    /// The groups, and the charge of their capacity, for a holder that keeps it until they
+    /// are freed or hands it on with them.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(TermId, u64)>,
+        nrese_exec::Reservation<&'b nrese_exec::Budget>,
+    ) {
+        let Self { counts, held } = self;
+        (counts, held)
+    }
+}
+
+/// The bytes `columns` hold, by capacity: what a table of them counts.
+fn columns_bytes(columns: &[Vec<u64>]) -> usize {
+    columns
+        .iter()
+        .map(|column| column.capacity() * size_of::<u64>())
+        .sum()
 }
 
 /// Two column sets (`components` of quads), each sorted in `permutation`'s order, merged
@@ -2091,5 +2764,151 @@ mod canonical_lifetime_tests {
                 "the view's charge is released with its version"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod count_visiting_tests {
+    use super::*;
+    use crate::witness::{self, Site};
+    use nrese_rdf::{GraphName, NamedNode};
+
+    /// REAS-2 fix check r1 (R2-F1, compact counts). Spec (`Snapshot::count_in_visiting`'s
+    /// contract): `visit` is called before the work it counts, and nothing more is read once
+    /// it returns false; a count's work is every stored position its scan passes, deleted
+    /// ones included. Under equality (one class, `a sameAs b`, unrelated to the data), 4 ×
+    /// `POLL_UNITS` statements `s_i p o`, then a commit deleting them, the runs kept apart:
+    /// counting `? p ?` scans a long run of deleted positions. A visitor that answers "stop"
+    /// at its first call: the count answers nothing, and the scan took at most `POLL_UNITS`
+    /// plus one run of steps in all. Counted per position handed on, the visitor was never
+    /// asked while the scan drained them.
+    #[test]
+    fn a_compact_count_tells_its_visitor_of_the_deleted_positions_it_passes() {
+        let interval = u64::from(nrese_exec::POLL_UNITS);
+        let n = 4 * interval;
+        let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        // No window ever merges (an older run of any size is more than 0 times a newer
+        // one): the commit after each one compacts in place without a worker, and would
+        // cancel the deletions against their inserts.
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let statement = |i: u64| {
+            Quad::new(
+                ex(&format!("s{i}")),
+                ex("p"),
+                ex("o"),
+                GraphName::DefaultGraph,
+            )
+        };
+        let mut tx = engine.transaction();
+        let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+        let same_as = tx.intern(same_as.as_ref().into());
+        let (a, b) = (
+            tx.intern(ex("a").as_ref().into()),
+            tx.intern(ex("b").as_ref().into()),
+        );
+        tx.insert_inferred(crate::EncodedTriple {
+            subject: a,
+            predicate: same_as,
+            object: b,
+        });
+        for i in 0..n {
+            tx.insert(statement(i).as_ref());
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for i in 0..n {
+            tx.remove(statement(i).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let p = snapshot.lookup(ex("p").as_ref().into()).unwrap();
+        let pattern = QuadPattern {
+            predicate: Some(p),
+            ..QuadPattern::all()
+        };
+        assert!(
+            snapshot
+                .expanding(ReadModel::Materialised, &pattern)
+                .is_some(),
+            "the count expands"
+        );
+        let before = witness::get(Site::ScanSteps);
+        let counted = snapshot.count_in_visiting(ReadModel::Materialised, &pattern, &mut |_| false);
+        let steps = witness::get(Site::ScanSteps) - before;
+        assert!(
+            steps <= 2 * interval,
+            "{steps} scan steps after the visitor was first due: more than {interval} plus one \
+             run of {interval}"
+        );
+        assert_eq!(counted, None, "a count its visitor stopped answers nothing");
+    }
+}
+
+#[cfg(test)]
+mod node_count_tests {
+    use super::*;
+    use nrese_rdf::NamedNode;
+
+    /// A node count is refused only where both walks, serially and one after the other, would
+    /// be (package fix check r4). Two runs of one predicate in the default graph under
+    /// 6,291,584 bytes: the first, 131,072 statements of 65,538 subjects (two parts of 32,769
+    /// disjoint groups) and two objects; the second, 131,075 fresh subjects and one of those
+    /// objects. The subject walk's first run fits its parts' peak; walked in parts, its merge
+    /// leaves the subjects' list where the second run's serial growth is refused by 16 bytes.
+    /// Serially it peaks 128 bytes under the limit, and the objects' two groups fit beside
+    /// its list. Answered, 196,615 nodes, no refusal recorded, nothing held after.
+    #[test]
+    fn a_node_count_the_serial_walks_fit_is_answered() {
+        let part = crate::index::GROUP_PART as u64;
+        let ex = |local: String| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        // The runs kept apart: no window ever merges, and nothing is held inline.
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            compaction: crate::CompactionPolicy {
+                fanout: 0,
+                inline_entry_limit: 0,
+            },
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        // Interned in order, so the ids order the subjects as their numbers do.
+        let (first, second, p, objects) = {
+            let id = |local: String| tx.intern(ex(local).as_ref().into());
+            let first: Vec<TermId> = (0..65_538).map(|j| id(format!("s{j}"))).collect();
+            let second: Vec<TermId> = (0..2 * part + 3).map(|i| id(format!("t{i}"))).collect();
+            (
+                first,
+                second,
+                id("p".into()),
+                [id("o0".into()), id("o1".into())],
+            )
+        };
+        let statement = |s, o| EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
+        for i in 0..2 * part {
+            let subject = first[(i * 32_769 / part) as usize];
+            tx.insert_encoded(statement(subject, objects[(i % 2) as usize]));
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for &subject in &second {
+            tx.insert_encoded(statement(subject, objects[0]));
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let budget = nrese_exec::Budget::new(6_291_584);
+        let count = snapshot.node_count_in(ReadModel::Asserted, GraphSelector::Any, &budget);
+        assert_eq!(count, Ok(Some(196_615)));
+        assert!(!budget.refused(), "no refusal recorded on the budget");
+        assert_eq!(budget.used(), 0);
     }
 }

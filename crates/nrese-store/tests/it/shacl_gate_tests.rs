@@ -268,6 +268,25 @@ fn a_shapes_graph_asking_for_an_unsupported_entailment_can_be_removed() {
     update(&pipeline, "INSERT DATA { ex:a ex:name \"A\" }").expect("then writes are accepted");
 }
 
+/// SYN-56 review r1 F5, through the gate: a constraint whose query computes its result's path
+/// (`urn:computed-path`, which no statement uses) has that result before and after a write
+/// that stores the very IRI as an unrelated statement's predicate. The write introduces no
+/// result, so the enforcing gate accepts it.
+#[test]
+fn a_write_that_stores_a_term_a_constraint_computed_is_accepted() {
+    let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+    load_shapes(
+        &pipeline,
+        r#"<http://example.com/S> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<http://example.com/S> <http://www.w3.org/ns/shacl#targetNode> <http://example.com/a> .
+<http://example.com/S> <http://www.w3.org/ns/shacl#sparql> _:q .
+_:q <http://www.w3.org/ns/shacl#select> "SELECT $this (IRI(CONCAT(\"urn:computed-\", \"path\")) AS ?path) WHERE { }" ."#,
+    );
+    update(&pipeline, "INSERT DATA { ex:z <urn:computed-path> ex:w }")
+        .expect("a write that introduces no result is accepted");
+    assert!(holds(&pipeline, "ex:z <urn:computed-path> ex:w"));
+}
+
 /// SS-22: a validation request runs on its caller's cancellation (the server cancels it at
 /// its deadline and when the client is gone): cancelled, it stops with that, not a report.
 #[test]

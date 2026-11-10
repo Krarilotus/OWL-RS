@@ -123,9 +123,7 @@ fn bds(triple: &TriplePattern) -> Option<&str> {
 fn subject_variable(term: &TermPattern) -> Option<Variable> {
     match term {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(nrese_sparql_syntax::internal::blank_variable(b)),
         _ => None,
     }
 }
@@ -300,7 +298,8 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
     let (mut searches, mut joins, mut consumed) = (Vec::new(), Vec::new(), Vec::new());
     for (index, triple) in triples.iter().enumerate().filter(|(_, t)| is_jena(t)) {
         let n = searches.len();
-        let fresh = |what: &str| Variable::new_unchecked(format!("_text_{what}_{n}"));
+        let fresh =
+            |what: &str| nrese_sparql_syntax::internal::variable(&format!("text-{what}"), n);
         let variable = |term: &TermPattern| match term {
             TermPattern::Variable(v) => Some(v.clone()),
             _ => None,
@@ -400,12 +399,15 @@ impl Context<'_> {
     /// it.
     fn found(&self, search: &Search) -> NativeResult<Vec<nrese_engine::TextMatch>> {
         Ok(match self.search_in()? {
-            SearchIn::Global => self.snapshot.text_search(&search.query),
+            SearchIn::Global => self
+                .snapshot
+                .text_search(&search.query)
+                .map_err(crate::QueryEvaluationError::from)?,
             SearchIn::Reader(None) => Vec::new(),
             SearchIn::Reader(Some((_charge, scope))) => self
                 .snapshot
                 .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
-                .map_err(crate::QueryEvaluationError::MemoryLimit)?,
+                .map_err(crate::QueryEvaluationError::from)?,
         })
     }
 
@@ -556,10 +558,10 @@ impl Context<'_> {
             }
             let mut row = vec![found.id];
             if search.relevance.is_some() {
-                row.push(self.id(&Term::from(Literal::from(found.relevance))));
+                row.push(self.id(&Term::from(Literal::from(found.relevance)))?);
             }
             if search.rank.is_some() {
-                row.push(self.id(&Term::from(Literal::from(rank as i64))));
+                row.push(self.id(&Term::from(Literal::from(rank as i64)))?);
             }
             table.push_row(&row);
         }
@@ -642,10 +644,10 @@ impl Context<'_> {
                 }
                 let mut row = vec![found.id];
                 if search.relevance.is_some() {
-                    row.push(self.id(&Term::from(Literal::from(found.relevance))));
+                    row.push(self.id(&Term::from(Literal::from(found.relevance)))?);
                 }
                 if search.rank.is_some() {
-                    row.push(self.id(&Term::from(Literal::from(rank as i64))));
+                    row.push(self.id(&Term::from(Literal::from(rank as i64)))?);
                 }
                 super::reserve_rows(&mut table, &mut held, 1, usize::MAX).map_err(memory)?;
                 table.push_row(&row);

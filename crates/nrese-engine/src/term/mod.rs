@@ -23,6 +23,7 @@ pub(crate) mod slot;
 mod strings;
 pub(crate) mod suffix;
 pub mod text;
+mod text_triple;
 pub mod vectors;
 pub(crate) mod vocabulary;
 #[cfg(test)]
@@ -112,6 +113,22 @@ impl TermKind {
                 | Self::TypedLiteral
                 | Self::Triple
         )
+    }
+
+    /// True for every RDF literal kind; triple terms and the graph marker are not literals.
+    pub const fn is_literal(self) -> bool {
+        match self {
+            Self::String
+            | Self::Integer
+            | Self::Boolean
+            | Self::Decimal
+            | Self::Date
+            | Self::DateTime
+            | Self::LangString
+            | Self::TypedLiteral
+            | Self::DerivedInteger => true,
+            Self::DefaultGraph | Self::Iri | Self::BlankNode | Self::Triple => false,
+        }
     }
 
     /// True for dictionary-backed literal kinds.
@@ -230,6 +247,33 @@ pub(crate) use inline::{inline_to_literal, try_inline_literal};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_classification_covers_every_raw_tag() {
+        // Spec: DICT2's literal-kind contract; reserved/executor tags are not RDF literals.
+        let cases = [
+            (0, false),  // default graph
+            (1, false),  // IRI
+            (2, false),  // blank node
+            (3, true),   // string
+            (4, true),   // integer
+            (5, true),   // boolean
+            (6, true),   // decimal
+            (7, true),   // date
+            (8, true),   // dateTime
+            (9, true),   // langString
+            (10, true),  // typed literal
+            (11, false), // triple term
+            (12, true),  // derived integer
+            (13, false), // reserved
+            (14, false), // computed id
+            (15, false), // UNDEF tag
+        ];
+        for (tag, expected) in cases {
+            let id = TermId::from_raw(tag << PAYLOAD_BITS);
+            assert_eq!(id.kind().is_literal(), expected, "raw tag {tag}");
+        }
+    }
 
     #[test]
     fn kind_and_payload_roundtrip() {

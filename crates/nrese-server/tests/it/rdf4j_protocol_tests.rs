@@ -953,3 +953,135 @@ async fn transaction_deletes_take_wildcards() {
     assert_eq!(size(&app, None).await, 1);
     assert_eq!(size(&app, Some(graph)).await, 1);
 }
+
+/// A transaction's `DELETE` that isn't RDF is refused when it is sent, not at the commit:
+/// the transaction stays as it was, and commits what it had (RDF4J's server parses it on
+/// arrival). Guard: held while the document was decoded on arrival.
+#[tokio::test]
+async fn a_transaction_delete_that_isnt_rdf_is_refused_on_arrival() {
+    let app = test_app().unwrap();
+    let (status, location) = {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{REPO}/transactions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        (response.status(), location)
+    };
+    assert_eq!(status, StatusCode::CREATED);
+    let action = |name: &str| format!("{location}?action={name}");
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        &action("ADD"),
+        Some("text/turtle"),
+        None,
+        DATA,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        &action("DELETE"),
+        Some("text/turtle"),
+        None,
+        "<http://example.com/a> <http://example.com/p> \"one\" .\n<http://example.com/a> <http://example.com/p> .\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let (status, _) = send(&app, Method::PUT, &action("COMMIT"), None, None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(size(&app, None).await, 3);
+}
+
+/// SYN-54 slice 3 review r1, S3-F1: in a transaction's DELETE, a statement whose graph is
+/// another store's name for the default graph (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`)
+/// names the default graph, as `rdf4j:nil` does: its copy in another graph stays. A statement
+/// without a graph still means every graph (guard). With and without `preserveNodeId`.
+#[tokio::test]
+async fn transaction_deletes_of_a_default_graph_alias_stay_in_the_default_graph() {
+    let keep = "<urn:keep>";
+    let statement = "<urn:s> <urn:p> <urn:o>";
+    let cases = [
+        ("<urn:x-arq:DefaultGraph>", "true", 1),
+        ("<urn:x-arq:DefaultGraph>", "false", 1),
+        ("<urn:x-rdflib:default>", "true", 1),
+        ("<urn:x-rdflib:default>", "false", 1),
+        ("", "false", 0),
+    ];
+    let mut failures = Vec::new();
+    for (graph, preserve, kept) in cases {
+        let app = test_app().unwrap();
+        for context in [None, Some(keep)] {
+            let uri = match context {
+                Some(context) => format!("{REPO}/statements?{}", encode(&[("context", context)])),
+                None => format!("{REPO}/statements"),
+            };
+            let body = format!("{statement} .");
+            let (status, _) =
+                send(&app, Method::POST, &uri, Some("text/turtle"), None, &body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{REPO}/transactions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tx = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = format!("{statement} {graph} .");
+        let (status, text) = send(
+            &app,
+            Method::PUT,
+            &format!("{tx}?preserveNodeId={preserve}&action=DELETE"),
+            Some("application/n-quads"),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            &format!("{tx}?action=COMMIT"),
+            None,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let got = (size(&app, None).await, size(&app, Some(keep)).await);
+        let ok = got == (kept, kept);
+        println!(
+            "{} graph '{graph}' preserveNodeId={preserve}: total {}, in {keep} {}",
+            if ok { "ok" } else { "FAILED" },
+            got.0,
+            got.1
+        );
+        if !ok {
+            failures.push(format!(
+                "{graph} {preserve}: expected ({kept}, {kept}), got {got:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

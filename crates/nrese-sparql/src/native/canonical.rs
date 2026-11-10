@@ -194,8 +194,8 @@ struct Rewrite<'c, 'a> {
 
 impl Rewrite<'_, '_> {
     /// The constant for `term`'s representative, if `term` is another identity of a class.
-    /// A blank node (or, where only an IRI may stand, a literal) is put in as an alias IRI
-    /// that stands for it ([`super::substitute`]).
+    /// A blank node (or, where only an IRI may stand, a literal) is put in as a made
+    /// constant that stands for it ([`super::substitute`]).
     fn constant(&self, term: TermRef<'_>, iri_only: bool) -> Option<Constant> {
         let (id, representative) = self.names.representative(term)?;
         Some(match representative {
@@ -203,7 +203,7 @@ impl Rewrite<'_, '_> {
             Term::Literal(l) if !iri_only => Constant::Literal(l),
             Term::Triple(_) => return None,
             Term::BlankNode(_) | Term::Literal(_) => {
-                let alias = super::substitute::alias(&format!("canonical-{id}"));
+                let alias = nrese_sparql_syntax::internal::class_constant(id);
                 self.ctx.register_alias(alias.as_str(), id);
                 Constant::Iri(alias)
             }

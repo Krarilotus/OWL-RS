@@ -36,6 +36,14 @@ pub struct Closure {
     pub lists: bool,
 }
 
+impl Closure {
+    /// Whether it applies equality between individuals (`eq-*`): `owl2-rl`'s rules do, as
+    /// they have the list rules; `owl2-ql`'s have neither.
+    pub fn equality(self) -> bool {
+        self.lists
+    }
+}
+
 /// A generating axiom `left ⊑ ∃role.filler` (`filler` `None`: `owl:Thing`, or a data
 /// value), with the type of the anonymous element it makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,6 +126,12 @@ struct Builder {
     /// This is the ledger the hazards classify, so what the TBox leaves out is never
     /// re-derived there.
     unread: std::collections::BTreeSet<(ExprId, bool)>,
+    /// The axioms (their indices in the ontology) the TBox reads only in part or not at all.
+    /// One it reads whole the rewriting answers, so the closure's profile doesn't bound it
+    /// (I24c). Ascending and without repeats: axioms are read in order ([`Self::mark_partial`]).
+    partial: Vec<usize>,
+    /// The axiom being read.
+    current: usize,
 }
 
 impl Tbox {
@@ -130,16 +144,47 @@ impl Tbox {
         };
         b.tbox.thing = thing;
         b.basic(Basic::Thing);
-        for axiom in &ontology.axioms {
+        for (i, axiom) in ontology.axioms.iter().enumerate() {
+            b.current = i;
             b.axiom(ontology, axiom);
         }
         let unread = std::mem::take(&mut b.unread);
+        let partial = std::mem::take(&mut b.partial);
         let mut tbox = b.finish();
-        tbox.hazards = super::hazards::hazards(ontology, &tbox.types, &unread, &|id| {
-            tbox.basics[id as usize]
-        });
+        let read = super::hazards::Read {
+            unread: &unread,
+            partial: &partial,
+            rl: closure.lists,
+        };
+        tbox.hazards =
+            super::hazards::hazards(ontology, &tbox.types, &read, &|id| tbox.basics[id as usize]);
+        // An axiom the mapping drops supports no claim: any term may miss its conclusions
+        // (I24c-2). An existing global hazard's reason is the more specific.
+        if tbox.hazards.global.is_none() {
+            use crate::diagnostics::Diagnostic;
+            tbox.hazards.global = ontology.diagnostics.iter().find_map(|d| match *d {
+                Diagnostic::Malformed { node, .. } | Diagnostic::Unsupported { node, .. } => {
+                    Some(Hazard::Dropped(node))
+                }
+                Diagnostic::BrokenList { head } => Some(Hazard::Dropped(head)),
+                _ => None,
+            });
+        }
         tbox.rewritable = tbox.rewritable_terms();
         tbox
+    }
+
+    /// The source holds an equality of individuals (`owl:sameAs`) that isn't among the
+    /// axioms compiled. The store's reader reads only whether one exists, in any graph, so no
+    /// name of it reaches a reader who can't read it, and no sampled statement can be lost
+    /// to the mapping (I24c-2 review r1, F1, F3). Where `closure` applies no equality
+    /// (owl2-ql), any fact may follow: the hazard is global, [`Hazard::Equating`], unless one
+    /// already is.
+    pub fn with_equality(mut self, closure: Closure) -> Self {
+        if !closure.equality() && self.hazards.global.is_none() {
+            self.hazards.global = Some(Hazard::Equating);
+        }
+        self
     }
 
     /// Why answers to `cq` through anonymous individuals may be missing
@@ -467,6 +512,13 @@ fn reach(edges: &[Vec<u32>], start: impl IntoIterator<Item = u32>) -> Vec<u32> {
 }
 
 impl Builder {
+    /// Records that the axiom being read is read only in part or not at all.
+    fn mark_partial(&mut self) {
+        if self.partial.last() != Some(&self.current) {
+            self.partial.push(self.current);
+        }
+    }
+
     fn basic(&mut self, basic: Basic) -> u32 {
         if let Some(&id) = self.tbox.ids.get(&basic) {
             return id;
@@ -519,6 +571,7 @@ impl Builder {
                     // the union's existentials are each part's.
                     self.unread.insert((part, true));
                 }
+                self.mark_partial();
                 self.disjoint(parts);
             }
             Axiom::DisjointClasses(classes) => self.disjoint(classes),
@@ -549,8 +602,13 @@ impl Builder {
             Axiom::ObjectCharacteristic(Characteristic::Symmetric, property) => {
                 self.role(*property, property.inverse(), true);
             }
+            // Read for anonymous individuals. Named ones' loops are QL's closure's
+            // (`prp-refl-*`), not RL's: under RL its profile decides (DL44).
             Axiom::ObjectCharacteristic(Characteristic::Reflexive, property) => {
                 self.tbox.reflexive.insert(property.named());
+                if self.lists {
+                    self.mark_partial();
+                }
             }
             Axiom::SubDataPropertyOf(a, b) => {
                 self.tbox.data.extend([*a, *b]);
@@ -571,7 +629,10 @@ impl Builder {
                 let left = self.basic(Basic::Exists(ObjProp::Named(*property)));
                 self.superclass(o, left, *class, true);
             }
-            _ => {}
+            // Not read: what the closure's profile says of it decides (I24c).
+            _ => {
+                self.mark_partial();
+            }
         }
     }
 
@@ -584,6 +645,7 @@ impl Builder {
     fn disjoint(&mut self, parts: &[ExprId]) {
         if parts.len() >= 2 {
             self.unread.extend(parts.iter().map(|&p| (p, false)));
+            self.mark_partial();
         }
     }
 
@@ -600,6 +662,7 @@ impl Builder {
         // F1: `A ⊓ B ⊑ ∃S.D`).
         if !whole {
             self.unread.insert((sup, true));
+            self.mark_partial();
         }
     }
 
@@ -671,6 +734,7 @@ impl Builder {
             }
             _ => {
                 self.unread.insert((expr, true));
+                self.mark_partial();
             }
         }
     }

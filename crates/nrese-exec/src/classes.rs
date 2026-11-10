@@ -13,13 +13,51 @@
 
 use hashbrown::HashMap;
 
+/// Test-only: the members unions moved on this thread, counted where they are moved, so a
+/// counted caller's tests see the work itself and not what it was told (REAS-3a fix check r1
+/// F3). Compiled for this crate's tests, or with the `witness` feature in a debug build (other
+/// crates' tests, as a dev-dependency).
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub mod witness {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MOVED: Cell<u64> = const { Cell::new(0) };
+        static EXAMINED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add(n: u64) {
+        MOVED.with(|moved| moved.set(moved.get() + n));
+    }
+
+    pub(crate) fn examine(n: u64) {
+        EXAMINED.with(|examined| examined.set(examined.get() + n));
+    }
+
+    /// The members unions have moved on this thread so far.
+    pub fn moved() -> u64 {
+        MOVED.with(Cell::get)
+    }
+
+    /// The steps listing the classes has taken on this thread so far (fix check r2 G3).
+    pub fn examined() -> u64 {
+        EXAMINED.with(Cell::get)
+    }
+}
+
 /// Classes of two or more ids; an id in none is its own class.
 #[derive(Debug, Clone, Default)]
 pub struct Classes {
     /// Every id in a class of two or more, with its parent (a root is its own parent).
     parent: HashMap<u64, u64>,
-    /// Per root: the class's smallest id and its members, in no particular order.
-    roots: HashMap<u64, (u64, Vec<u64>)>,
+    /// Per root: the class's smallest id, its members (in no particular order) and its root's
+    /// place in `listed`.
+    roots: HashMap<u64, (u64, Vec<u64>, usize)>,
+    /// The roots, densely. Listing the classes walks only these, never a table emptied by
+    /// unions (fix check r2 G3); a lookup reads `roots` alone, as before G3 (`p2-reas3-abl3`:
+    /// a lookup through the list cost reasoning and equality queries up to 0.4 % of their
+    /// instructions).
+    listed: Vec<u64>,
 }
 
 impl PartialEq for Classes {
@@ -77,15 +115,18 @@ impl Classes {
     }
 
     /// The classes of two or more ids: representative and members (in no particular
-    /// order).
-    pub fn classes(&self) -> impl Iterator<Item = (u64, &[u64])> {
-        self.roots
-            .values()
-            .map(|(representative, members)| (*representative, members.as_slice()))
+    /// order), each class one step of a dense list.
+    pub fn classes(&self) -> impl ExactSizeIterator<Item = (u64, &[u64])> {
+        self.listed.iter().map(|root| {
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            witness::examine(1);
+            let (representative, members, _) = &self.roots[root];
+            (*representative, members.as_slice())
+        })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.roots.is_empty()
+        self.listed.is_empty()
     }
 
     /// `fact` with every id replaced by its representative.
@@ -119,22 +160,48 @@ impl Classes {
     /// Merges the classes of `a` and `b`; returns the representative that lost its place
     /// (the larger of the two smallest ids), or `None` if they were one class.
     pub fn union(&mut self, a: u64, b: u64) -> Option<u64> {
+        self.union_asking(a, b, |_| true)
+            .expect("a union never told to stop finishes")
+    }
+
+    /// [`Self::union`], `ask(n)` called before each `n` members it moves, `n` at most
+    /// [`crate::POLL_UNITS`], so a caller that counts its work for a stop sees it within a run
+    /// of members however large the classes are (the engine's counted reads,
+    /// `nrese_engine::visit`; REAS-3a fix check r1 R1). `None` once `ask` answers false: the
+    /// union is then half made and these classes are no use, so a caller that stops drops
+    /// them. (Growing the larger side's list and the maps, allocator work, is held for the
+    /// owner with the engine's map initialisation: fix check r1 F2.)
+    pub fn union_asking(
+        &mut self,
+        a: u64,
+        b: u64,
+        mut ask: impl FnMut(u64) -> bool,
+    ) -> Option<Option<u64>> {
         let (ra, rb) = (self.root_or_new(a), self.root_or_new(b));
         if ra == rb {
             self.drop_if_single(ra);
-            return None;
+            return Some(None);
         }
-        let (keep, gone) = match self.roots[&ra].1.len() >= self.roots[&rb].1.len() {
+        let size = |root: u64| self.roots[&root].1.len();
+        let (keep, gone) = match size(ra) >= size(rb) {
             true => (ra, rb),
             false => (rb, ra),
         };
-        let (gone_min, moved) = self.roots.remove(&gone).expect("a root");
+        let (gone_min, moved) = self.remove_root(gone);
         self.parent.insert(gone, keep);
-        let (keep_min, members) = self.roots.get_mut(&keep).expect("a root");
-        members.extend(moved);
+        let (keep_min, members, _) = self.roots.get_mut(&keep).expect("a root");
+        members.reserve(moved.len());
+        for part in moved.chunks(crate::POLL_UNITS as usize) {
+            if !ask(part.len() as u64) {
+                return None;
+            }
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            witness::add(part.len() as u64);
+            members.extend_from_slice(part);
+        }
         let lost = gone_min.max(*keep_min);
         *keep_min = gone_min.min(*keep_min);
-        Some(lost)
+        Some(Some(lost))
     }
 
     /// Merges the classes of each pair; returns the representatives that lost their place.
@@ -151,10 +218,22 @@ impl Classes {
             Some(root) => root,
             None => {
                 self.parent.insert(id, id);
-                self.roots.insert(id, (id, vec![id]));
+                self.roots.insert(id, (id, vec![id], self.listed.len()));
+                self.listed.push(id);
                 id
             }
         }
+    }
+
+    /// Takes `root`'s class out (the last listed root moved into its place): its smallest id
+    /// and members.
+    fn remove_root(&mut self, root: u64) -> (u64, Vec<u64>) {
+        let (min, members, at) = self.roots.remove(&root).expect("a root");
+        self.listed.swap_remove(at);
+        if let Some(moved) = self.listed.get(at) {
+            self.roots.get_mut(moved).expect("a root").2 = at;
+        }
+        (min, members)
     }
 
     /// Forgets `root` if its class is one id (made for a union of an id with itself).
@@ -162,9 +241,9 @@ impl Classes {
         if self
             .roots
             .get(&root)
-            .is_some_and(|(_, members)| members.len() == 1)
+            .is_some_and(|(_, members, _)| members.len() == 1)
         {
-            self.roots.remove(&root);
+            self.remove_root(root);
             self.parent.remove(&root);
         }
     }

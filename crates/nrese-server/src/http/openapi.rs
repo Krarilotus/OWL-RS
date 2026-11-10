@@ -189,7 +189,7 @@ protocol!(
     params(("id" = String, Path, description = ID)),
     responses((
         status = 200,
-        description = "Readiness, sizes and settings",
+        description = "Readiness, sizes and settings; whole-dataset readers or administrators only",
         body = serde_json::Value
     ))
 );
