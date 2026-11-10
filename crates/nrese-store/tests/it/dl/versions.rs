@@ -104,7 +104,7 @@ fn in_transaction(
 
 fn ntriples(text: &str) -> RdfPayload {
     RdfPayload {
-        payload: text.as_bytes().to_vec(),
+        payload: text.as_bytes().to_vec().into(),
         format: GraphResultFormat::NTriples,
         base_iri: None,
     }

@@ -73,13 +73,16 @@ impl Context<'_> {
                 }
                 if let Some(term) = self.term(id) {
                     if let Term::BlankNode(b) = &term {
-                        self.register_alias(super::substitute::alias(b.as_str()).as_str(), id);
+                        self.register_alias(
+                            nrese_sparql_syntax::internal::blank_constant(b.as_str()).as_str(),
+                            id,
+                        );
                     }
                     terms.insert(variable.clone(), term);
                     put_in.push((variable.clone(), id));
                 }
             }
-            let substituted = super::substitute::Values { terms: &terms }.pattern(right);
+            let substituted = super::substitute::Values::new(self, &terms)?.pattern(right);
             let graph = key.last().copied().filter(|&id| id != UNDEF);
             let found = match graph {
                 Some(id) => self.in_graph(

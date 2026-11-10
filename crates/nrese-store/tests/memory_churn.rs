@@ -141,7 +141,7 @@ impl Soak {
                 target: graph,
                 format: GraphResultFormat::NTriples,
                 base_iri: None,
-                payload: data.into_bytes(),
+                payload: data.into_bytes().into(),
                 replace: replace == 1,
             })),
         }

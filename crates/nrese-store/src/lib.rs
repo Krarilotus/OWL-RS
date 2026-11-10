@@ -111,7 +111,7 @@ pub use query::{
     SparqlQueryRequest,
 };
 pub use query_executor::PreparedQuery;
-pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
+pub use rdf_io::{ChargedQuads, convert_file, parse_payload};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use running::{RunningQueries, RunningQuery};

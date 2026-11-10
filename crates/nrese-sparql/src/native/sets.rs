@@ -111,7 +111,7 @@ pub(super) fn shares(a: &[Variable], b: &[Variable]) -> bool {
 /// The group a row belongs to, as a column next to the row's values. No variable of a
 /// query can have this name.
 fn group_column() -> Variable {
-    Variable::new_unchecked("group of the row")
+    nrese_sparql_syntax::internal::variable("group", "of the row")
 }
 
 impl Context<'_> {
@@ -321,9 +321,11 @@ impl Context<'_> {
                 continue;
             }
             let start = std::time::Instant::now();
-            let Some(groups) =
-                self.snapshot
-                    .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
+            let Some(groups) = self
+                .snapshot
+                .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             else {
                 continue;
             };
@@ -334,13 +336,16 @@ impl Context<'_> {
                 self.note("group walk", detail, estimate, groups.len(), start);
             }
             // The column at once: a row at a time cost as much as the walk (DBpedia q13,
-            // 363 k subjects).
-            let table =
-                IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
-            let values = self.produced(Solutions {
-                vars: vec![(*kept).clone()],
-                table: table.assume_sorted_by(vec![0]),
-                ordered: false,
+            // 363 k subjects). Charged before it is made: one id a group.
+            let column_bytes = groups.len().saturating_mul(size_of::<u64>());
+            let values = self.made(column_bytes, || {
+                let table =
+                    IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
+                Ok(Solutions {
+                    vars: vec![(*kept).clone()],
+                    table: table.assume_sorted_by(vec![0]),
+                    ordered: false,
+                })
             })?;
             let rest: Vec<TriplePattern> = patterns
                 .iter()

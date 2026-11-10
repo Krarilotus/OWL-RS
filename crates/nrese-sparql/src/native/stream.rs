@@ -47,7 +47,7 @@ enum Final {
 
 /// A column no query variable can be named like.
 fn partial(i: usize) -> Variable {
-    Variable::new_unchecked(format!("partial {i}"))
+    nrese_sparql_syntax::internal::variable("partial", i)
 }
 
 fn of(name: AggregateFunction, expr: Expression) -> AggregateExpression {

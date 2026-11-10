@@ -47,6 +47,45 @@ pub(crate) fn get(site: Site) -> u64 {
     COUNTS.with(|counts| counts[site as usize].get())
 }
 
+/// A stop that never fires and records, at each ask, the work an engine producer did on the
+/// asking thread since the ask before (REAS-3: the work a read does in the engine, below the
+/// adapter that counts what it is handed). The largest such gap is what a stop arriving just
+/// after an ask can't see; the invariant bounds it by `POLL_UNITS` plus one run. The work after
+/// the last ask counts too ([`Self::largest`]): a stop could fire there as well. Debug builds
+/// only, as the engine's counters are.
+#[cfg(debug_assertions)]
+pub(crate) struct EngineGaps {
+    site: nrese_engine::witness::Site,
+    last: std::sync::atomic::AtomicU64,
+    largest: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(debug_assertions)]
+impl EngineGaps {
+    pub(crate) fn new(site: nrese_engine::witness::Site) -> Self {
+        Self {
+            site,
+            last: std::sync::atomic::AtomicU64::new(nrese_engine::witness::get(site)),
+            largest: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The stop's answer, always "go on"; asked on the thread that does the work.
+    pub(crate) fn ask(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = nrese_engine::witness::get(self.site);
+        let gap = now - self.last.swap(now, Relaxed);
+        self.largest.fetch_max(gap, Relaxed);
+        false
+    }
+
+    /// The largest gap so far, the one since the last ask included.
+    pub(crate) fn largest(&self) -> u64 {
+        self.ask();
+        self.largest.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// A stop that fires at its first ask after `site` has counted work on the asking thread
 /// (the stop firing during the first real probe), remembering how much it had counted.
 pub(crate) struct FirstWork {
