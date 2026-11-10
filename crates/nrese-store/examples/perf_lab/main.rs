@@ -253,6 +253,7 @@ pub(crate) fn bytes_freed_by(f: impl FnOnce()) -> Option<i64> {
 /// `bytes_freed_by`'s scope: exactly the calling thread's frees, never another thread's.
 #[cfg(all(test, not(any(system_alloc, alloc_profile))))]
 mod freed_tests {
+    use std::hint::black_box;
     use std::sync::{Arc, Barrier, Mutex};
 
     /// One measurement at a time: `bytes_freed_by` switches counting for the process.
@@ -261,7 +262,8 @@ mod freed_tests {
     #[test]
     fn a_drop_counts_exactly_the_bytes_it_frees() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        let block = vec![7u8; 1 << 20];
+        // black_box: an allocation nothing reads may be elided, and then nothing is counted.
+        let block = black_box(vec![7u8; 1 << 20]);
         assert_eq!(super::bytes_freed_by(|| drop(block)), Some(1 << 20));
     }
 
@@ -271,15 +273,15 @@ mod freed_tests {
         let (go, done) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
         let (other_go, other_done) = (Arc::clone(&go), Arc::clone(&done));
         let other = std::thread::spawn(move || {
-            let earlier = vec![1u8; 1 << 20];
+            let earlier = black_box(vec![1u8; 1 << 20]);
             other_go.wait();
             // Within the span: a free of an earlier allocation, and an allocation kept past it.
-            drop(earlier);
-            let kept = vec![2u8; 3 << 20];
+            drop(black_box(earlier));
+            let kept = black_box(vec![2u8; 3 << 20]);
             other_done.wait();
             kept
         });
-        let mine = vec![3u8; 4096];
+        let mine = black_box(vec![3u8; 4096]);
         let freed = super::bytes_freed_by(|| {
             go.wait();
             done.wait();
