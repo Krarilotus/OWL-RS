@@ -42,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry  # noqa: E402
-from suitekit import gatestats  # noqa: E402
+from suitekit import driver, gatestats  # noqa: E402
 from suitekit.compare import counter_changes  # noqa: E402
 from suitekit import hosts as hosts_registry  # noqa: E402
 from suitekit.hosts import run_identity  # noqa: E402
@@ -1218,7 +1218,10 @@ SUMMARY = re.compile(r"^test result: (ok|FAILED)\.", re.M)
 
 
 def run_unit(unit: str, argv: list[str], log: Path, env: dict | None = None) -> Outcome:
-    """UNIT run here, its output (stdout and stderr) into LOG, which it replaces."""
+    """UNIT run here, its output (stdout and stderr) into LOG, which it replaces; a `bash` in the
+    repository's bash (driver.bash(): a bare one on Windows is WSL's launcher)."""
+    if argv[0] == "bash":
+        argv = [driver.bash(), *argv[1:]]
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "wb") as out:
         code = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, env=env).returncode
