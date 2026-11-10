@@ -1186,9 +1186,10 @@ impl Snapshot {
     ///
     /// One reservation (DUR-6 slice 2): charged once, before anything is made, with the
     /// fixed part and each delta's bound ([`crate::index::IndexVersion::change_bound`]: the
-    /// build engine-v2's uncharged path runs, its working memory included); a delta at or
-    /// above the parallel threshold adds its exact charges as it builds. Once built, the
-    /// bound's rest is released at once, and the reservation is the snapshot's.
+    /// build engine-v2's uncharged path runs, its working memory included), where every delta
+    /// is below the parallel threshold; a pair with a delta at or above it is built with exact
+    /// charges throughout. Once built, the bound's rest is released at once, and the
+    /// reservation is the snapshot's.
     ///
     /// The bounds only where the budget's room, read once before anything is charged, covers
     /// them with the fixed part (CR #237's rule, `IndexVersion::group_counts`); otherwise the
@@ -1218,16 +1219,21 @@ impl Snapshot {
             version.inferred.change_bound(inferred[0], inferred[1]),
         ];
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
-        let all = fixed + bounds[0] + bounds[1];
-        let bounded = all > fixed
-            && !reference::only()
-            && budget.remaining() >= all
-            && held.charge(all).is_ok();
-        let bounds = match bounded {
-            true => bounds,
-            false => {
+        // Bounded only where every delta has a bound: one at or above the parallel threshold
+        // charges exactly as it builds, beside the other's bound, a peak the room read doesn't
+        // cover (review r1, DUR6B-R1-01). Such a pair is built exactly throughout.
+        let (bounded, bounds) = match bounds {
+            [Some(a), Some(i)]
+                if a + i > 0
+                    && !reference::only()
+                    && budget.remaining() >= fixed + a + i
+                    && held.charge(fixed + a + i).is_ok() =>
+            {
+                (true, [a, i])
+            }
+            _ => {
                 held.charge(fixed)?;
-                [0, 0]
+                (false, [0, 0])
             }
         };
         let (asserted, asserted_kept) = version.asserted.with_change_within(
@@ -1255,8 +1261,10 @@ impl Snapshot {
             }
         };
         // What the builds held beside what their runs keep: their working memory, freed now.
-        // A run never keeps more than its bound (`with_change_within` asserts it): saturating,
-        // so a wrong bound could only keep too much charged, never release what is still held.
+        // Sound because a run never keeps more than its bound: `Run::delta_bound` is derived as
+        // an upper bound of what `Run::from_delta` allocates (`with_change_within` asserts it in
+        // debug builds only). The subtraction saturates, but that doesn't make an underestimated
+        // bound safe: the part kept beyond it would go uncharged (review r1, DUR6B-R1-02).
         held.release(
             bounds[0].saturating_sub(asserted_kept) + bounds[1].saturating_sub(inferred_kept),
         );
