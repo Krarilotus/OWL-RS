@@ -666,30 +666,52 @@ fn native_pattern<'q>(
 ///   before the join ([`crate::plan::Plan::eager_aggregation`]).
 /// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
 ///   variables ([`pushdown`]).
+///
+/// A pass runs only where its input has a node it can change (each pass's `changes_at`,
+/// asked of the input as the passes before left it): elsewhere it would return its input,
+/// and building, lowering and comparing its plan was most of a microsecond query's
+/// preparation (entities COUNT: 1 µs on main, 3–4 µs with the passes, 10 Nov 2026).
 fn optimise(
     pattern: GraphPattern,
     fired: &mut Vec<&'static str>,
     ctx: &Context<'_>,
 ) -> GraphPattern {
+    use nrese_sparql_syntax::visit::Node;
     let pays = |side: &crate::plan::Plan, keys: &[Variable]| ctx.pre_aggregation_pays(side, keys);
     let eager = |pattern: &GraphPattern| crate::plan::eager_aggregation_where(pattern, &pays);
     type Pass<'p> = &'p dyn Fn(&GraphPattern) -> GraphPattern;
-    let passes: [(&'static str, Pass<'_>); 3] = [
-        ("join-groups", &crate::plan::rewrite),
-        ("eager-aggregation", &eager),
-        ("filter-pushdown", &|pattern| {
+    // Whether a pattern with this node in it is one the pass can change.
+    type ChangesAt = fn(&GraphPattern) -> bool;
+    let passes: [(&'static str, ChangesAt, Pass<'_>); 3] = [
+        (
+            "join-groups",
+            crate::plan::rewrite_changes_at,
+            &crate::plan::rewrite,
+        ),
+        (
+            "eager-aggregation",
+            crate::plan::eager_aggregation_changes_at,
+            &eager,
+        ),
+        ("filter-pushdown", pushdown::changes_at, &|pattern| {
             pushdown::push_filters(pattern.clone())
         }),
     ];
-    passes.into_iter().fold(pattern, |pattern, (name, pass)| {
-        #[cfg(test)]
-        PASSES_RUN.set(PASSES_RUN.get() + 1);
-        let rewritten = pass(&pattern);
-        if rewritten != pattern {
-            fired.push(name);
-        }
-        rewritten
-    })
+    passes
+        .into_iter()
+        .fold(pattern, |pattern, (name, changes_at, pass)| {
+            if !pattern.find(&mut |node| matches!(node, Node::Pattern(p) if changes_at(p))) {
+                debug_assert!(pass(&pattern) == pattern, "{name} changes {pattern}");
+                return pattern;
+            }
+            #[cfg(test)]
+            PASSES_RUN.set(PASSES_RUN.get() + 1);
+            let rewritten = pass(&pattern);
+            if rewritten != pattern {
+                fired.push(name);
+            }
+            rewritten
+        })
 }
 
 #[cfg(test)]
