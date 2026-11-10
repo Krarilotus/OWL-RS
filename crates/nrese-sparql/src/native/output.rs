@@ -12,11 +12,10 @@
 //! each under one read lock of the dictionary, and written out in order a window of
 //! blocks at a time, so output still streams and memory stays bounded.
 
-use std::collections::HashMap;
 use std::io::Write;
 
 use nrese_engine::{Snapshot, TermId, TermView};
-use nrese_exec::{IdTable, UNDEF, computed_index};
+use nrese_exec::{IdMap, IdTable, UNDEF, computed_index};
 use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef, Term, TermRef, Variable};
 use nrese_sparql_results::QueryResultsFormat;
 
@@ -157,8 +156,9 @@ impl DirectResults<'_> {
             ResultsFormat::Tsv => (b'\t', b"\n"),
             ResultsFormat::Csv => (b',', b"\r\n"),
         };
-        let mut cache: HashMap<u64, Box<[u8]>> = HashMap::new();
-        let mut scratch = Vec::new();
+        // Each distinct id's bytes, written once: where they lie in `buffer`, which only grows
+        // while this cache lives.
+        let mut cache: IdMap<(u32, u32)> = IdMap::default();
         self.snapshot.with_views(|view| {
             for row in rows {
                 if json {
@@ -187,14 +187,16 @@ impl DirectResults<'_> {
                         continue;
                     }
                     buffer.extend_from_slice(key);
-                    if let Some(bytes) = cache.get(&id) {
-                        buffer.extend_from_slice(bytes);
+                    if let Some(&(start, end)) = cache.get(&id) {
+                        buffer.extend_from_within(start as usize..end as usize);
                     } else {
-                        scratch.clear();
-                        self.id(id, view, &mut scratch);
-                        buffer.extend_from_slice(&scratch);
-                        if cache.len() < CACHE_ENTRIES {
-                            cache.insert(id, scratch.as_slice().into());
+                        let start = buffer.len();
+                        self.id(id, view, buffer);
+                        if cache.len() < CACHE_ENTRIES
+                            && let (Ok(start), Ok(end)) =
+                                (u32::try_from(start), u32::try_from(buffer.len()))
+                        {
+                            cache.insert(id, (start, end));
                         }
                     }
                 }

@@ -53,6 +53,26 @@ const UNION: &str = ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subC
      :C rdfs:subClassOf :D . :x a :A . :y a :B . :z :knows :y . \
      :w a [ owl:unionOf ( :B :C ) ] .";
 
+#[test]
+fn minus_over_an_open_dl_gap_does_not_claim_uncertain_answers_are_sound() {
+    // Spec: OWL 2 Direct Semantics entails x:C from A subClassOf B union C,
+    // NotB equivalentTo complementOf B, x:A and x:NotB. SPARQL MINUS must remove x
+    // from certain answers, or the lower-bound result must not be labelled sound.
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] .
+        :NotB owl:equivalentClass [ owl:complementOf :B ] . :x a :A, :NotB .",
+    )
+    .expect("consistent data");
+    let (rows, status) = query(&dl, "SELECT ?x { ?x a :A MINUS { ?x a :C } }");
+    assert!(
+        rows.is_empty() || !status.shared.sound,
+        "not a certain answer: {rows:?}, status: {:?}",
+        status.shared
+    );
+}
+
 const EMPLOYEE: &str = ":Employee rdfs:subClassOf [ a owl:Restriction ; \
        owl:onProperty :worksFor ; owl:someValuesFrom :Org ] . \
      :ann a :Employee . :bob :worksFor :acme .";
