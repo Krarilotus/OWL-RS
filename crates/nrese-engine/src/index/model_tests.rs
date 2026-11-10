@@ -420,13 +420,25 @@ fn walk_by_subject(
     subject: impl Fn(u64) -> u64,
     limit: usize,
 ) -> (WalkAnswer, usize, bool) {
+    walk_by_subject_on(rows, subject, limit, None)
+}
+
+/// [`walk_by_subject`] on the path `in_parts` names, or (`None`) the one the walk decides.
+fn walk_by_subject_on(
+    rows: u64,
+    subject: impl Fn(u64) -> u64,
+    limit: usize,
+    in_parts: Option<bool>,
+) -> (WalkAnswer, usize, bool) {
     let (version, plan) = subject_walk(rows, subject);
     let budget = nrese_exec::Budget::new(limit);
     let answer = {
         let mut counts = ChargedVec::new(&budget);
-        version
-            .group_counts(&plan, 1, &mut counts, &budget)
-            .map(|()| counts.to_vec())
+        match in_parts {
+            None => version.group_counts(&plan, 1, &mut counts, &budget),
+            Some(in_parts) => version.group_counts_on(&plan, 1, &mut counts, &budget, in_parts),
+        }
+        .map(|()| counts.to_vec())
     };
     (answer, budget.used(), budget.refused())
 }
@@ -438,7 +450,7 @@ fn walk_by_subject(
 #[test]
 fn a_walk_in_parts_that_fits_its_budget_is_answered() {
     let rows = 2 * super::GROUP_PART as u64;
-    let (answer, ..) = walk_by_subject(rows, |_| 1000, 32 << 10);
+    let (answer, ..) = walk_by_subject_on(rows, |_| 1000, 32 << 10, Some(true));
     let counts = answer.expect("one group fits 32 KiB");
     assert_eq!(counts, [(term(1000).raw(), rows as i64)]);
 }
@@ -454,7 +466,7 @@ fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
         true => 1000,
         false => 2000 + (i - part) * 513 / part,
     };
-    let (answer, ..) = walk_by_subject(2 * part, subject, 32 << 10);
+    let (answer, ..) = walk_by_subject_on(2 * part, subject, 32 << 10, Some(true));
     let counts = answer.expect("514 groups and their parts fit 32 KiB");
     let mut expected = std::collections::BTreeMap::new();
     for i in 0..2 * part {
@@ -552,22 +564,62 @@ fn a_walk_over_runs_the_serial_walk_fits_is_answered() {
 fn a_walk_with_room_for_its_parts_peak_runs_in_parts() {
     let keys = 2 * super::GROUP_PART;
     let ample = nrese_exec::Budget::new(64 << 20);
-    assert!(super::walks_in_parts(&ample, keys, 2));
+    let many = || usize::MAX;
+    assert!(super::walks_in_parts(&ample, keys, 2, many));
     assert!(
-        super::walks_in_parts(&ample, 2 * keys + 3, 5),
+        super::walks_in_parts(&ample, 2 * keys + 3, 5, many),
         "both runs in parts"
     );
     let tight = nrese_exec::Budget::new(1_572_864);
-    assert!(!super::walks_in_parts(&tight, keys, 2));
+    assert!(!super::walks_in_parts(&tight, keys, 2, many));
     let tight = nrese_exec::Budget::new(6_291_584);
     assert!(
-        !super::walks_in_parts(&tight, 2 * keys + 3, 5),
+        !super::walks_in_parts(&tight, 2 * keys + 3, 5, many),
         "neither run in parts"
     );
     assert!(
-        !super::walks_in_parts(&ample, keys - 1, 0),
+        !super::walks_in_parts(&ample, keys - 1, 0, many),
         "a walk without a run of two parts is walked serially"
     );
+}
+
+/// A walk whose large runs hold few groups is walked serially, with room for its parts all
+/// the same: up to `SERIAL_GROUPS` by the estimate (each run's keys over its first group's),
+/// and in parts past it. Either way it answers every group's count.
+#[test]
+fn a_walk_of_few_groups_is_walked_serially() {
+    let rows = 2 * super::GROUP_PART as u64;
+    let ample = nrese_exec::Budget::new(64 << 20);
+    assert!(!super::walks_in_parts(&ample, rows as usize, 2, || {
+        super::SERIAL_GROUPS
+    }));
+    assert!(super::walks_in_parts(&ample, rows as usize, 2, || {
+        super::SERIAL_GROUPS + 1
+    }));
+    // Four groups of equal size, then groups of two keys: estimated exactly. Each row's
+    // subject, the estimate, and whether the walk runs in parts.
+    type Shape = (fn(u64) -> u64, usize, bool);
+    let shapes: [Shape; 2] = [
+        (|i| 1000 + i * 4 / (2 * super::GROUP_PART as u64), 4, false),
+        (|i| 1000 + i / 2, super::GROUP_PART, true),
+    ];
+    for (subject, groups, in_parts) in shapes {
+        let (version, plan) = subject_walk(rows, subject);
+        let (keys, parts) = version.group_walk_size(&plan, 1);
+        assert_eq!(version.parted_groups(&plan, 1), groups);
+        let parted = || version.parted_groups(&plan, 1);
+        assert_eq!(super::walks_in_parts(&ample, keys, parts, parted), in_parts);
+        let (answer, held, _) = walk_by_subject(rows, subject, 64 << 20);
+        let mut expected = std::collections::BTreeMap::new();
+        for i in 0..rows {
+            *expected.entry(term(subject(i)).raw()).or_insert(0i64) += 1;
+        }
+        assert_eq!(
+            answer.expect("64 MiB fits"),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(held, 0);
+    }
 }
 
 /// A walk never charges more than its bound, in parts or serially (`group_walk_peak`): a node
