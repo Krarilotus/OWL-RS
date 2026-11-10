@@ -3012,8 +3012,8 @@ printf '%s\\n' "$out"; exit $code
 
     def test_a_job_that_builds_a_side_takes_its_measurement_commit_as_an_input(self):
         commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
-        inputs = gate_module.measurement_inputs(self.repo, [self.side, self.later, self.side],
-                                                {self.side: commit})
+        inputs = gate_module.measurement_inputs(self.repo, self.later, [self.side, self.later, self.side],
+                                                {self.side: commit})  # `later` doesn't reach `commit`
         self.assertEqual(inputs, [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}])
 
     def test_a_job_takes_no_measurement_commit_its_checkout_already_reaches(self):
