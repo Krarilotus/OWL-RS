@@ -105,6 +105,9 @@ def main(argv):
     if argv[1:2] == ["run"]:
         from suitekit import driver
         return driver.main(argv[2:], systems, workloads, HERE.parent.parent)
+    if argv[1:2] == ["fleet"]:
+        from suitekit import fleet_cells
+        return fleet_cells.main(argv[2:], systems, workloads, HERE.parent.parent)
     if argv[1:2] == ["images"]:
         from suitekit import driver
         return driver.images(argv[2:], systems, HERE.parent.parent)
