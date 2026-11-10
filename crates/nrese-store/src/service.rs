@@ -1538,12 +1538,18 @@ impl StoreService {
         let access = scope.access().map(|access| &**access);
         use nrese_engine::{GraphSelector, QuadPattern};
         let snapshot = self.engine.snapshot();
+        // A group a graph: as many as the store has graphs, bounded by them, not by a
+        // request (uncharged as before; the store owner's follow-up, D16-039 F7).
+        let unlimited = nrese_exec::Budget::unlimited();
         let counts: Vec<(TermId, u64)> = snapshot
             .group_counts_in(
                 ReadModel::Asserted,
                 &QuadPattern::all(),
                 nrese_engine::quad::Permutation::Gspo,
+                &unlimited,
             )
+            .expect("an unlimited budget")
+            .map(|groups| groups.into_parts().0)
             .unwrap_or_else(|| {
                 std::iter::once(TermId::DEFAULT_GRAPH)
                     .chain(snapshot.named_graphs())
