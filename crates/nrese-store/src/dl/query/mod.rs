@@ -47,7 +47,6 @@ use crate::{StoreError, StoreResult, StoreService};
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 const OWL_THING: &str = "http://www.w3.org/2002/07/owl#Thing";
-const U1: &str = "urn:nrese:u1:";
 
 mod analysis;
 mod exact;

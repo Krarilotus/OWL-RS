@@ -3,12 +3,33 @@ use nrese_engine::{Engine, EngineConfig};
 use nrese_sparql::{QueryEvaluationError, QueryOptions, TypedResults, evaluate_query_typed};
 use std::sync::Arc;
 
+/// The IRI `solutions` puts one of U1's own terms in for: no query can name one.
+const MADE: &str = "urn:test:made";
+
 fn solutions(engine: &Engine, values: &str) -> nrese_sparql::SolutionTable {
-    let query = nrese_sparql_syntax::SparqlParser::new()
+    use nrese_sparql_syntax::algebra::GraphPattern;
+    use nrese_sparql_syntax::term::GroundTerm;
+    let mut query = nrese_sparql_syntax::SparqlParser::new()
         .parse_query(&format!(
             "SELECT ?x ?y WHERE {{ VALUES (?x ?y) {{ {values} }} }}"
         ))
         .unwrap();
+    let nrese_sparql_syntax::Query::Select { pattern, .. } = &mut query else {
+        panic!("a SELECT")
+    };
+    let GraphPattern::Project { inner, .. } = pattern else {
+        panic!("{pattern:?}")
+    };
+    let GraphPattern::Values { bindings, .. } = inner.as_mut() else {
+        panic!("{inner:?}")
+    };
+    for term in bindings.iter_mut().flatten().flatten() {
+        if matches!(term, GroundTerm::NamedNode(n) if n.as_str() == MADE) {
+            *term = GroundTerm::NamedNode(nrese_rdf::NamedNode::new_unchecked(
+                nrese_dl::internal::u1("hidden"),
+            ));
+        }
+    }
     let TypedResults::Solutions(rows) =
         evaluate_query_typed(&engine.snapshot(), &query, &QueryOptions::default()).unwrap()
     else {
@@ -30,7 +51,7 @@ fn admitted(gap: &Gap<'_>, pair: &AlignedSolutions) -> Vec<Vec<u64>> {
 fn bounded_id_gap_matches_its_oracle_in_id_order_and_preserves_lower_bags() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let lower_values = "(2 UNDEF) (1 \"a\") (2 UNDEF)";
-    let upper_values = "(3 \"z\") (1 \"a\") (2 UNDEF) (3 \"z\") (<urn:nrese:u1:hidden> 4) (UNDEF 5) (\"a\\n\" \"x\") (\"a\\\"\" \"y\") (<urn:x> 2)";
+    let upper_values = "(3 \"z\") (1 \"a\") (2 UNDEF) (3 \"z\") (<urn:test:made> 4) (<urn:nrese:u1:hidden> 6) (UNDEF 5) (\"a\\n\" \"x\") (\"a\\\"\" \"y\") (<urn:x> 2)";
     for limit in 0..10 {
         let lower = solutions(&engine, lower_values);
         let upper = solutions(&engine, upper_values);
@@ -40,7 +61,7 @@ fn bounded_id_gap_matches_its_oracle_in_id_order_and_preserves_lower_bags() {
         let known: std::collections::HashSet<_> = (0..pair.lower().len())
             .map(|i| ids(pair.lower(), i))
             .collect();
-        let reserved = |id: u64| matches!(pair.term(id), Some(nrese_rdf::Term::NamedNode(n)) if n.as_str().starts_with("urn:nrese:u1:"));
+        let reserved = |id: u64| matches!(pair.term(id), Some(nrese_rdf::Term::NamedNode(n)) if nrese_dl::internal::is_made(n.as_str()));
         let mut expected: Vec<_> = (0..pair.upper().len())
             .map(|i| ids(pair.upper(), i))
             .filter(|r| !known.contains(r) && !r.iter().any(|&id| reserved(id)))
@@ -48,6 +69,11 @@ fn bounded_id_gap_matches_its_oracle_in_id_order_and_preserves_lower_bags() {
         expected.sort();
         expected.dedup();
         let total = expected.len();
+        // Stated apart from the oracle: of the nine distinct upper rows, the two lower
+        // ones and U1's own term's are out; the IRI once spelled like U1's is in.
+        assert_eq!(total, 6);
+        let spelled = |id: u64| matches!(pair.term(id), Some(nrese_rdf::Term::NamedNode(n)) if n.as_str() == "urn:nrese:u1:hidden");
+        assert!(expected.iter().any(|r| spelled(r[0])));
         expected.truncate(limit);
         let gap = select(&mut pair, limit, &budget, &CancellationToken::new()).unwrap();
         assert_eq!(gap.total as usize, total);

@@ -41,6 +41,24 @@ impl Table {
         self.id(NamedNode::new_unchecked(iri).into())
     }
 
+    /// IRIs for U1's own terms, which have none, in a text written with this table's terms
+    /// (`Program::to_n3`): one per term, under a prefix none of the table's IRIs begins
+    /// with, so none is one of them, whatever IRIs the input holds.
+    pub fn own_iris(&self, program: &Program) -> HashMap<u64, String> {
+        let mut prefix = String::from("urn:nrese:bounds-eval:own:");
+        let held = |prefix: &str| {
+            (self.terms.iter())
+                .any(|t| matches!(t, RdfTerm::NamedNode(n) if n.as_str().starts_with(prefix)))
+        };
+        while held(&prefix) {
+            prefix.push_str("x:");
+        }
+        (0..self.terms.len() as u64)
+            .filter(|&t| program.is_internal(t))
+            .map(|t| (t, format!("{prefix}{t}")))
+            .collect()
+    }
+
     /// The N-Triples form of a term.
     pub fn text(&self, id: u64) -> String {
         match &self.terms[id as usize] {
