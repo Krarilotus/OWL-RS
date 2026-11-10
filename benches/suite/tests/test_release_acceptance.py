@@ -15,6 +15,7 @@ import contextlib
 import copy
 import ctypes
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import isolation
 import test_release_gate as fixtures  # the gate's pass and round fixtures (a module: its tests aren't rerun here)
+from suitekit import driver  # noqa: E402 (on the path through the gate's module)
 
 ROOT = Path(__file__).resolve().parents[3]
 GATE = ROOT / "benches/fast/release_gate.py"
@@ -484,6 +486,36 @@ class GuardRun(Scratch):
         self.assertIn("exited 101", " ".join(result["errors"]))
         self.assertEqual([(o["unit"], o["exit"]) for o in result["receipt"]["outcomes"]], [("guards", 101)])
 
+    def test_the_guards_run_in_the_repository_bash(self):
+        # Spec: the guards' producer runs its script in the repository's bash (suitekit.driver.bash(): on
+        # Windows Git's, or NRESE_BASH), never a bare `bash`, which Windows resolves to System32's WSL
+        # launcher. Fixture at the launch boundary: any other bash can't run the script (exit 127, no
+        # output), so a launch outside the resolver leaves every guard unrun.
+        checkout = self.tmp / "checkout"
+        stub = checkout / "scripts" / "cargo-guarded.sh"
+        stub.parent.mkdir(parents=True)
+        stub.write_text("#!/usr/bin/env bash\necho 'test a::first_guard_name_here ... ok'\n"
+                        "echo 'test result: ok. 1 passed; 0 failed; 0 ignored'\n", encoding="utf-8", newline="\n")
+        git(checkout.parent, "init", "-q", str(checkout))
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-q", "-m", "checks")
+        (self.tmp / "names").write_text("first_guard_name_here\n", encoding="utf-8")
+        out = self.tmp / "guards.json"
+        shell, real = driver.bash(), subprocess.run
+
+        def launch(argv, *args, **kwargs):
+            other = Path(argv[0]).stem.lower() == "bash" and argv[0] != shell
+            return subprocess.CompletedProcess(argv, 127) if other else real(argv, *args, **kwargs)
+        argv = ["release_gate.py", "guards", "--run", "--names", str(self.tmp / "names"), "--log",
+                str(self.tmp / "test.log"), "--identity", IDENTITY, "--attempt", ATTEMPT, "--json", str(out)]
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")  # main() reconfigures its stdout
+        with (contextlib.chdir(checkout), patch.object(sys, "argv", argv), patch.object(sys, "stdout", stdout),
+              patch.object(gate_module.subprocess, "run", launch)):
+            code = gate_module.main()
+        result = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual((code, result["results"], result["errors"]), (0, {"first_guard_name_here": ["ok"]}, []),
+                         f"SPEC the guard ran in {shell}")
+
     def test_a_launch_that_fails_leaves_no_earlier_result(self):
         # Spec: review r1 R2, probes guards-launch-error and stale-guard-after-launch-error: a passed
         # guards.json from an earlier run, then a run that fails before it launches (its setup raises: the
@@ -562,7 +594,9 @@ class AttemptRecords(Scratch):
                                "--identity", IDENTITY, "--attempt", attempts["guards"], "--json", str(out / "guards.json")],
                               cwd=self.repo.path, capture_output=True, text=True, timeout=120,
                               env=isolation.inherit("NRESE_", "FLEET_", "CARGO_", PYTHONIOENCODING="utf-8"))
-        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        log = out / "test.log"  # a rejected run names its shell and its log's first bytes
+        self.assertEqual(made.returncode, 0, f"{made.stdout}{made.stderr}\nshell {driver.bash()}\nlog starts "
+                         f"{log.read_bytes()[:160] if log.is_file() else 'missing'!r}")
         guards = json.loads((out / "guards.json").read_text(encoding="utf-8"))
         self.assertEqual((guards["attempt"], guards["receipt"]["attempt"]), (attempts["guards"],) * 2)
         w3c = checks(a, self.repo.tree(a))[0]
