@@ -90,6 +90,16 @@ impl<K: Eq + Hash, V, H: Hold> ChargedMap<K, V, H> {
         })
     }
 
+    /// `value` put under `key`, and the value it replaced: one probe, where an entry probes twice
+    /// for a new key. hashbrown makes room for one more before it probes, so a full table grows
+    /// first, charged, even where `key` is there. Refused, nothing changes.
+    pub fn insert(&mut self, key: K, value: V) -> Result<Option<V>, BudgetExceeded> {
+        if self.map.len() == self.map.capacity() {
+            self.grow()?;
+        }
+        Ok(self.map.insert(key, value))
+    }
+
     /// Room for at least one more entry, doubling: the new table's bound charged beside the
     /// old table's charge, the table grown, then the old charge released (its table freed in
     /// the growth) and the new trimmed to the allocation.
