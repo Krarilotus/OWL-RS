@@ -509,9 +509,10 @@ pub const SETTINGS: &[Setting] = &[
     setting(
         "budgets.huge_pages",
         names::HUGE_PAGES,
-        Choice(&["off", "on"]),
+        Choice(&["off", "on", "bulk"]),
         "Transparent huge pages for the server's memory (Linux): on is faster over large \
-         heaps, off holds less memory while serving (default on).",
+         heaps, off holds less memory while serving, bulk has them only while a bulk load \
+         or a materialisation runs (default on).",
     ),
     setting(
         "budgets.reasoning_release",

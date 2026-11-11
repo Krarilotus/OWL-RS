@@ -268,7 +268,8 @@ pub fn set_process_limit(limit: u64) {
 /// for one touched byte, and gives back nothing of it while one of its small pages is in
 /// use: under a server's many threads that kept 3 times the memory the system allocator
 /// holds for the same work (soak, 7 October 2026). Applies from the next page touched,
-/// arenas reserved earlier included. Returns whether the setting was applied.
+/// arenas reserved earlier included. Returns whether the setting was applied. A store
+/// sets it through its mode ([`set_huge_pages`]), which bulk phases follow.
 pub fn set_transparent_huge_pages(allowed: bool) -> bool {
     imp::set_transparent_huge_pages(allowed)
 }
@@ -850,6 +851,9 @@ fn linux_remaining(fs: &impl cgroup::Fs) -> Option<u64> {
 
 #[cfg(any(target_os = "linux", test))]
 mod cgroup;
+
+mod huge_pages;
+pub use huge_pages::{HugePages, HugePagesPhase, set_huge_pages, transparent_huge_pages};
 
 #[cfg(test)]
 mod discovery_tests;
