@@ -262,13 +262,19 @@ const SCHEMA: &str = ":Person rdfs:subClassOf [ a owl:Restriction ; owl:onProper
      :child owl:inverseOf :parent . \
      :i0 a :Person . :i1 :parent :i0 .";
 
-/// U1's facts, its own terms (named `urn:nrese:u1:…`) as one name, with their counts
-/// (`bounds.rs`'s `canonical`).
+/// A made name: one of the DL's own terms, apart from every IRI (D16-051).
+fn own(term: &str) -> bool {
+    term.strip_prefix('<')
+        .is_some_and(nrese_dl::internal::is_made)
+}
+
+/// U1's facts, its own terms ([`own`]) as one name, with their counts (`bounds.rs`'s
+/// `canonical`).
 fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     let mut out = std::collections::BTreeMap::new();
     for fact in facts {
-        let key = fact.clone().map(|t| match t.starts_with("<urn:nrese:u1:") {
-            true => "<urn:nrese:u1:*>".to_owned(),
+        let key = fact.clone().map(|t| match own(&t) {
+            true => "<U1's own>".to_owned(),
             false => t,
         });
         *out.entry(key).or_insert(0) += 1;
@@ -293,10 +299,7 @@ fn a_cold_upper_facts_report_decodes_every_name() {
     crate::support::load_past_the_pipeline(dl.store(), &turtle);
     let facts = dl.store().dl_upper_facts(true).expect("U1 afresh");
     let terms: Vec<&String> = facts.iter().flatten().collect();
-    assert!(
-        terms.iter().any(|t| t.starts_with("<urn:nrese:u1:")),
-        "U1's own names: {facts:?}"
-    );
+    assert!(terms.iter().any(|t| own(t)), "U1's own names: {facts:?}");
     let undecoded: Vec<&&String> = terms.iter().filter(|t| t.starts_with('#')).collect();
     assert!(undecoded.is_empty(), "undecoded: {undecoded:?}");
 }

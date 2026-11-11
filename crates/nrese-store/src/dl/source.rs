@@ -11,12 +11,12 @@ use nrese_owl::{Ontology, Statement, TermKind, Terms};
 use nrese_rdf::{NamedNodeRef, Term};
 
 /// The individuals entailment tests add to an ontology (`¬(C ⊑ D)` as `(C ⊓ ¬D)(x)`):
-/// IRIs no data uses, the same in every store.
+/// apart from every term the data can hold (`nrese_dl::internal`), the same in every store.
 pub(crate) const FRESH: usize = 8;
 
-/// The `i`th of the [`FRESH`] individuals' IRIs.
+/// The text of the `i`th of the [`FRESH`] individuals.
 pub(crate) fn fresh_iri(i: usize) -> String {
-    format!("urn:nrese:dl:fresh:{i}")
+    nrese_dl::internal::individual(i)
 }
 
 /// The OWL vocabulary's IRIs and the fresh individuals of entailment tests.
