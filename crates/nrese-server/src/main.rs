@@ -43,11 +43,133 @@ fn main() -> Result<()> {
     // What threads freed goes back to the system after bulk loads and reasoning.
     // SAFETY: mimalloc's `mi_collect` may be called at any time, from any thread.
     nrese_store::set_memory_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("starting the async runtime failed")?
-        .block_on(run())
+        .context("starting the async runtime failed")?;
+    let result = runtime.block_on(run());
+    // After a stop, work a drain cut short (a long query on a blocking thread) isn't waited
+    // for: the process ends as on a kill, and every acknowledged commit is already synced.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+/// How long the requests in flight may finish after a stop signal, leaving the rest of
+/// [`STOP_DEADLINE`] for the replica's follower and the store to close.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The whole stop's bound, from the signal: inside the 10 s a container runtime
+/// (`docker stop`) waits before it kills, with room for the process to end.
+const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// What a stop under way waits for: an index into [`STOP_STEPS`], for the line the deadline
+/// logs.
+static STOP_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const STOP_STEPS: [&str; 3] = [
+    "the requests in flight",
+    "the replica's follower",
+    "the store's close (a checkpoint or merge in progress)",
+];
+
+fn stop_step(step: usize) {
+    STOP_STEP.store(step, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A close that takes long (a checkpoint of a large store), for the stop deadline's test:
+/// `NRESE_TEST_HOLD_CLOSE_MS` in a debug build. A release build has no such hold.
+fn hold_the_close_for_a_test() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("NRESE_TEST_HOLD_CLOSE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// The stop's deadline: a thread made before the server serves (it doesn't serve without
+/// one), armed by the signal. At [`STOP_DEADLINE`] after it, if the stop hasn't ended the
+/// process, it ends it with code 0, as a kill would, saying what the stop still waited
+/// for. What is left is abandoned: every acknowledged commit is synced, and the next open
+/// recovers from the checkpoint and the log.
+struct StopDeadline(std::sync::mpsc::Sender<&'static str>);
+
+impl StopDeadline {
+    fn start() -> std::io::Result<Self> {
+        let (arm, armed) = std::sync::mpsc::channel::<&'static str>();
+        std::thread::Builder::new()
+            .name("nrese-stop-deadline".to_owned())
+            .spawn(move || {
+                // Never armed: the server ended without a signal.
+                let Ok(signal) = armed.recv() else { return };
+                std::thread::sleep(STOP_DEADLINE);
+                let step = STOP_STEP.load(std::sync::atomic::Ordering::SeqCst);
+                let waiting_for = STOP_STEPS[step.min(STOP_STEPS.len() - 1)];
+                // The line on a thread of its own, given a moment: a log reader that stopped
+                // reading can't hold the end.
+                let _ = std::thread::Builder::new().spawn(move || {
+                    tracing::warn!(
+                        signal,
+                        seconds = STOP_DEADLINE.as_secs(),
+                        waiting_for,
+                        "nrese-server stop deadline reached: ending the process"
+                    );
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                end_now();
+            })?;
+        Ok(Self(arm))
+    }
+
+    /// Starts the deadline: the stop has begun.
+    fn arm(&self, signal: &'static str) {
+        let _ = self.0.send(signal);
+    }
+}
+
+/// Ends the process at once with code 0, as a kill would: no exit handlers, no destructors,
+/// nothing that could wait.
+fn end_now() -> ! {
+    #[cfg(unix)]
+    // SAFETY: `_exit` takes no pointers and only ends the process.
+    unsafe {
+        libc::_exit(0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // SAFETY: the current process's pseudo-handle, which needs no closing.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+        // Not reached: the process ends in `TerminateProcess`.
+        std::process::abort()
+    }
+}
+
+/// The stop signals, listened for from the call on: SIGTERM (`docker stop`, systemd,
+/// Kubernetes) and SIGINT (ctrl-c). Resolves to the one that came first.
+#[cfg(unix)]
+fn stop_signals() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        }
+    })
+}
+
+/// The stop signal on Windows: ctrl-c in the server's console.
+#[cfg(windows)]
+fn stop_signals() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        ctrl_c.recv().await;
+        "ctrl-c"
+    })
 }
 
 async fn run() -> Result<()> {
@@ -247,6 +369,9 @@ async fn run() -> Result<()> {
     let bound_address = listener
         .local_addr()
         .with_context(|| format!("reading the address bound for {}", config.bind_address))?;
+    // Before the server says it serves: a stop sent from then on is heard, and bounded.
+    let stop = stop_signals().context("listening for stop signals")?;
+    let deadline = StopDeadline::start().context("starting the stop's deadline")?;
     tracing::info!(
         bind_address = %bound_address,
         deployment_posture = config.deployment_posture.as_str(),
@@ -267,14 +392,54 @@ async fn run() -> Result<()> {
             tracing::debug!(%error, "could not set TCP_NODELAY on a connection");
         }
     });
-    // Peer addresses for the mtls mode's trusted proxies.
-    let served = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await;
+    // Peer addresses for the mtls mode's trusted proxies. On a stop signal it accepts no
+    // more connections, closes idle ones, and lets the requests in flight finish, for up to
+    // DRAIN; then the replica's follower stops and the store closes, all within
+    // STOP_DEADLINE of the signal.
+    let (stopping, mut stopped_by) = tokio::sync::oneshot::channel();
+    let mut serve = Box::pin(std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            // The deadline runs from here, whichever way serving then ends.
+            let signal = stop.await;
+            deadline.arm(signal);
+            let _ = stopping.send((signal, std::time::Instant::now()));
+        }),
+    ));
+    let mut stopped = None;
+    let served = tokio::select! {
+        Ok((signal, started)) = &mut stopped_by => {
+            let drained = tokio::time::timeout(DRAIN, &mut serve).await;
+            stopped = Some((signal, started, drained.is_err()));
+            drained.unwrap_or(Ok(()))
+        }
+        served = &mut serve => served,
+    };
+    // Serving can end in the same poll as the signal that ended it.
+    let stopped = stopped.or_else(|| {
+        let (signal, started) = stopped_by.try_recv().ok()?;
+        Some((signal, started, false))
+    });
+    stop_step(1);
     if let Some(follower) = follower {
         follower.stop().await;
+    }
+    // The store closes here (its maintenance ends first) unless a request the drain cut
+    // still holds it; then at the runtime's shutdown.
+    stop_step(2);
+    drop(serve);
+    hold_the_close_for_a_test();
+    drop(store);
+    if let Some((signal, started, requests_cut)) = stopped {
+        tracing::info!(
+            signal,
+            ms = started.elapsed().as_millis() as u64,
+            requests_cut,
+            "nrese-server stopped"
+        );
     }
     served.context("nrese-server terminated unexpectedly")
 }
