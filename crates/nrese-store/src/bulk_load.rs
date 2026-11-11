@@ -247,15 +247,18 @@ impl<'a> Source<'a> {
         blank_nodes: &BlankNodeScope,
         skipping: Option<Skipping<'_, '_>>,
     ) -> StoreResult<u64> {
-        let threads = rayon::current_num_threads();
         let recovering = |parser: RdfParser| match skipping {
             Some(_) => parser.recovering(),
             None => parser,
         };
         match self.format {
             // Split exactly (Turtle and TriG at statement ends, by a skim of the file) and
-            // parsed on every thread.
+            // parsed on its lanes, a thread each.
             RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle | RdfFormat::TriG => {
+                let parts = lanes(
+                    std::fs::metadata(self.path)?.len(),
+                    rayon::current_num_threads(),
+                );
                 let parser = RdfParser::from_format(self.format)
                     .with_base_iri(file_base_iri(self.path)?)
                     .map_err(|error| StoreError::Configuration(error.to_string()))?;
@@ -264,7 +267,7 @@ impl<'a> Source<'a> {
                     false => parser.with_default_graph(graph.clone()),
                 };
                 let chunks =
-                    recovering(parser).split_file_for_parallel_parsing(self.path, threads)?;
+                    recovering(parser).split_file_for_parallel_parsing(self.path, parts)?;
                 let first = *next_chunk;
                 *next_chunk += u32::try_from(chunks.len()).expect("fewer than 2^32 chunks");
                 chunks
@@ -362,6 +365,12 @@ fn feed(
     Ok(parsed + batch.len() as u64)
 }
 
+/// The lanes a file of `bytes` is parsed and interned on, with `threads` in the pool: a
+/// chunk of the file and a thread each.
+fn lanes(_bytes: u64, threads: usize) -> usize {
+    threads
+}
+
 /// Makes blank-node labels unique to one load by prefixing them. Deterministic per label,
 /// so every chunk of the load maps a label the same way.
 struct BlankNodeScope {
@@ -424,5 +433,39 @@ impl BlankNodeScope {
                 other => other,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lanes;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A file of up to 512 MiB is parsed on 8 lanes however many threads the pool has
+    /// beyond them: each lane's thread heap holds memory until the load ends (D16-468).
+    #[test]
+    fn a_file_up_to_512_mib_is_parsed_on_eight_lanes() {
+        for bytes in [0, 1, 113_565_549, 337_695_911, 512 * MIB] {
+            assert_eq!(lanes(bytes, 16), 8, "{bytes} bytes, 16 threads");
+            assert_eq!(lanes(bytes, 32), 8, "{bytes} bytes, 32 threads");
+        }
+    }
+
+    /// Past 512 MiB a lane is added for every further 64 MiB, up to the pool's threads.
+    #[test]
+    fn a_larger_file_takes_a_lane_per_64_mib_up_to_the_threads() {
+        assert_eq!(lanes(512 * MIB + 1, 32), 9);
+        assert_eq!(lanes(1_110_583_574, 32), 17);
+        assert_eq!(lanes(1_110_583_574, 16), 16);
+        assert_eq!(lanes(4096 * MIB, 32), 32);
+    }
+
+    /// A pool of fewer threads than 8 parses on all of them.
+    #[test]
+    fn a_small_pool_parses_on_every_thread() {
+        assert_eq!(lanes(113_565_549, 1), 1);
+        assert_eq!(lanes(113_565_549, 4), 4);
+        assert_eq!(lanes(1_110_583_574, 4), 4);
     }
 }
