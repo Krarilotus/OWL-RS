@@ -131,3 +131,23 @@ fn a_conclusions_anonymous_filler_leaves_it_undecided() {
     let answer = entailed(premise, conclusion);
     assert!(matches!(answer, Entailed::Unknown(_)), "{answer:?}");
 }
+
+/// - Input: conclusions `B(_:c)`, which say that some individual is a `B` (*OWL 2 Direct
+///   Semantics* §2.3.7–2.4), over premises where an individual is one: `B(x)`, and a
+///   premise's own anonymous filler `_:b` asserted `B`; and over `⊤ ⊑ B`.
+/// - Expected: never "not entailed" over the first two (both entail it), "entailed" over
+///   the last (every individual is a `B`).
+#[test]
+fn a_conclusions_anonymous_individual_is_some_individual() {
+    let conclusion = "_:c a :B .";
+    let filler = ":p a owl:ObjectProperty . _:b a :B . :x a :A . :A rdfs:subClassOf \
+                  [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue _:b ] .";
+    for premise in [":x a :B .", filler] {
+        let answer = entailed(premise, conclusion);
+        assert_ne!(answer, Entailed::No, "{premise}");
+    }
+    assert_eq!(
+        entailed("owl:Thing rdfs:subClassOf :B .", conclusion),
+        Entailed::Yes
+    );
+}
