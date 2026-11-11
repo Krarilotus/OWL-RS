@@ -1193,7 +1193,9 @@ def same_taxonomy(case: dict) -> str | None:
 
 def classify_failure(code: int, err: str, result: dict) -> str:
     text = (err or "") + json.dumps(result.get("error", ""))
-    if code == 137 or "memory limit" in text.lower() or "ProcessMemoryLimit" in text:
+    # A kill, or the engine's own refusal: its process limit (`ProcessMemoryLimit`) or its shared
+    # query budget (`MemoryLimit(BudgetExceeded …)`).
+    if code == 137 or "memory limit" in text.lower() or "MemoryLimit" in text:
         return "memory-limit"
     if code == 124:
         return "timeout"
