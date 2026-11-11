@@ -57,8 +57,9 @@ async fn call(app: &axum::Router, method: Method, uri: &str, body: Option<Value>
 }
 
 /// Started as `main` starts it (the configuration installed, the default repository opened,
-/// then the app state with its system store), the server runs with the operator's values,
-/// and still does after a draft check opened its scratch store.
+/// then the app state with its system store), the server runs with the operator's values:
+/// from the install on, before any store, so a store with the defaults opened first can't
+/// win, and still after a draft check opened its scratch store.
 #[test]
 fn the_configured_settings_hold_through_start_up_and_a_draft_check() {
     if !measure::alone() {
@@ -67,6 +68,17 @@ fn the_configured_settings_hold_through_start_up_and_a_draft_check() {
     let config = operators();
     let configured = Some(ProcessSettings::of(&config.store));
     config.install_process_settings().unwrap();
+    assert_eq!(
+        process_settings(),
+        configured,
+        "after the install, before any store"
+    );
+    let _helper = StoreService::new(StoreConfig::in_memory()).unwrap();
+    assert_eq!(
+        process_settings(),
+        configured,
+        "after a store with the defaults opened first"
+    );
     let store = StoreService::new(config.store.clone()).unwrap();
     let state = AppState::try_new(
         store,
