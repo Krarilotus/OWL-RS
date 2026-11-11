@@ -5,7 +5,7 @@
 # jobs take it as an input (measurement_inputs). Each commit is pushed as its ref.
 
 [side.a0020134c20a33eabe8ead0402f814585b9c7fd0]  # main
-commit = "b39985d7451f0fe68eb2ceb572b2f23c85ee474f"
+commit = "feb0bcb857dbbcc8236db5d73180950fb8854e64"
 ref = "refs/measure/main3s-a0020134"
 
 [side.d348a8a1a9e40cd23381df1faa726d3ffa44948c]  # v1.5, the release gate's base
