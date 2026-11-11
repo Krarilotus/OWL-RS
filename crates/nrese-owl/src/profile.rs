@@ -711,8 +711,9 @@ pub fn equating_properties(o: &Ontology) -> std::collections::HashSet<Term> {
     }
 }
 
-/// Whether an uncovered axiom's conclusion can make individuals equal, fail-closed by
-/// construction (fix check r1; master, 8 Nov 12:41): it can when it contains, in either
+/// Whether an uncovered axiom's conclusion (of a subclass axiom, either side's, as for an
+/// equivalence) can make individuals equal, fail-closed by construction (fix check r1;
+/// master, 8 Nov 12:41): it can when it contains, in either
 /// polarity, a nominal (also `hasValue`), `Self`, a counting restriction that bounds from
 /// above in one of its polarities (`≤ n` and `= n` for n ≥ 1, `≥ n` for n ≥ 2), or a
 /// property of `equating` ([`equating_properties`]). No witness or polarity reading: a
@@ -747,7 +748,8 @@ pub fn concludes_equality(
     }
     let any = |v: &[ExprId]| v.iter().any(|&e| contains(o, e, equating));
     match axiom {
-        Axiom::SubClassOf(_, b) => contains(o, *b, equating),
+        // Both sides: `L ⊑ R` is `¬R ⊑ ¬L`, so `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R` (D16-492 r1, F1).
+        Axiom::SubClassOf(a, b) => contains(o, *a, equating) || contains(o, *b, equating),
         Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) | Axiom::DisjointUnion(_, v) => {
             any(v.as_slice())
         }

@@ -597,8 +597,9 @@ fn disjointness_concludes_the_complement_of_its_parts() {
 /// - `¬∃S.D ⊑ C`, `≤ 0 S.D ⊑ C` and `∀S.¬D ⊑ C` each put everything outside `C` in `∃S.D`.
 /// - `C ≡ ≤ 0 S.D`, in its direction from the restriction to `C`.
 ///
-/// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` and
-/// `A ⊓ B ⊑ C` conclude nothing of `S` or `D` from their left side: no concern.
+/// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` concludes
+/// nothing of `S` or `D`, and `A ⊓ B ⊑ C` nothing of `A` or `B` (review r1, F3: each guard
+/// queries the terms of its own left side): no concern.
 #[test]
 fn a_left_side_outside_the_profile_concludes_its_complement() {
     let none = "ObjectMaxCardinality(0 :S :D)";
@@ -619,15 +620,100 @@ fn a_left_side_outside_the_profile_concludes_its_complement() {
                 ));
             }
         }
-        for axioms in [
-            "SubClassOf(ObjectSomeValuesFrom(:S :D) owl:Nothing)",
-            "SubClassOf(ObjectIntersectionOf(:A :B) :C)",
+        for (axioms, atoms) in [
+            (
+                "SubClassOf(ObjectSomeValuesFrom(:S :D) owl:Nothing)",
+                "S(?x ?y), D(?y)",
+            ),
+            ("SubClassOf(ObjectIntersectionOf(:A :B) :C)", "A(?x), B(?x)"),
         ] {
-            let found = concerns_over(axioms, "S(?x ?y), D(?y)", lists);
+            let found = concerns_over(axioms, atoms, lists);
             if !found.is_empty() {
                 wrong.push(format!(
                     "{axioms} (lists {lists}): {found:?}, expected nothing"
                 ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An axiom outside the profile whose left side, negated, makes individuals equal is a
+/// global hazard, as one whose right side does (review r1 of D16-492, F1):
+/// - `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R`: `R` is functional, so `a R b` and `a R c` make `b = c`.
+/// - `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`: every individual is `b`.
+///
+/// Neither names a term its conclusion adds a positive fact on, so only equality reaches
+/// the answers it changes. Under QL's closure and RL's, both are global. Guard: `∀R.D ⊑ C`
+/// is `⊤ ⊑ ∃R.¬D ⊔ C`, which equates nobody.
+#[test]
+fn an_equating_left_side_outside_the_profile_is_global() {
+    let mut wrong = Vec::new();
+    for lists in [false, true] {
+        for axioms in [
+            "SubClassOf(ObjectMinCardinality(2 :R) owl:Nothing)",
+            "SubClassOf(ObjectComplementOf(ObjectOneOf(:b)) owl:Nothing)",
+        ] {
+            let (tbox, _) = tbox(axioms, lists);
+            if tbox.global_hazard().is_none() {
+                wrong.push(format!("{axioms} (lists {lists}): no global hazard"));
+            }
+        }
+        let guard = "SubClassOf(ObjectAllValuesFrom(:R :D) :C)";
+        if let Some(h) = tbox(guard, lists).0.global_hazard() {
+            wrong.push(format!("{guard} (lists {lists}): global {h:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// What an uncovered axiom's conclusions miss reaches an axiom through every term it reads,
+/// its right side's too (D16-492 fix check r1, F1). Under RL's closure, a reflexive `R`
+/// (outside RL) may miss `R(a, a)`:
+/// - With `A ⊑ ∀R.B`, an `A` is then missed in `B`; with `S`'s range `∀R.B`, so is an
+///   `S`-successor. Both axioms are RL, so only the missed `R` edges reach `B`.
+/// - With `D ⊑ ¬¬B` (outside RL) and `A ⊑ ≤ 1 R.B`, a `D` may be missed in `B`, and with
+///   it the equality of an `A`'s two `R`-successors in `D`: global.
+#[test]
+fn a_missed_conclusion_reaches_an_axiom_through_its_right_side() {
+    let reflexive = "ReflexiveObjectProperty(:R)";
+    let mut wrong = Vec::new();
+    for axioms in [
+        format!("{reflexive} SubClassOf(:A ObjectAllValuesFrom(:R :B))"),
+        format!("{reflexive} ObjectPropertyRange(:S ObjectAllValuesFrom(:R :B))"),
+    ] {
+        let found = concerns_over(&axioms, "B(?x)", true);
+        if !found.iter().any(|c| c.starts_with("B: ")) {
+            wrong.push(format!("{axioms}: {found:?}, expected a concern on B"));
+        }
+    }
+    let equality = "SubClassOf(:D ObjectComplementOf(ObjectComplementOf(:B))) \
+                    SubClassOf(:A ObjectMaxCardinality(1 :R :B))";
+    if tbox(equality, true).0.global_hazard().is_none() {
+        wrong.push(format!("{equality}: no global hazard"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// What anonymous individuals may miss reaches an axiom through every term it reads, its
+/// right side's too (D16-492 fix check r2, F1). With `A ⊑ ∃R.C` and `A ⊑ ∀R.B`, an `A`'s
+/// anonymous `R`-successor is a `B`. The rewriting types it `C` only, and under RL's
+/// closure the universal is RL, so only the successor's `R` reaches `B`. Under QL's the
+/// universal is outside the profile and reaches `B` itself. The same holds for `S`'s domain
+/// `∀R.B` with `A ⊑ ∃R.C`: an `A` with an `S` edge has an anonymous `R`-successor in `B`.
+/// A concern on `B` either way.
+#[test]
+fn an_anonymous_individual_reaches_an_axiom_through_its_right_side() {
+    let mut wrong = Vec::new();
+    for axioms in [
+        "SubClassOf(:A ObjectSomeValuesFrom(:R :C)) SubClassOf(:A ObjectAllValuesFrom(:R :B))",
+        "SubClassOf(:A ObjectSomeValuesFrom(:R :C)) \
+         ObjectPropertyDomain(:S ObjectAllValuesFrom(:R :B))",
+    ] {
+        for lists in [false, true] {
+            let found = concerns_over(axioms, "B(?x)", lists);
+            if !found.iter().any(|c| c.starts_with("B: ")) {
+                wrong.push(format!("{axioms} (lists {lists}): {found:?}, expected B"));
             }
         }
     }
@@ -817,7 +903,8 @@ fn a_data_existential_on_the_left_needs_rdfs_literal() {
 /// A minimum cardinality on the left (review A-1202):
 /// - `≥ 2 R.⊤ ⊑ A` with `P ⊑ ∃R` makes neither a `P` nor an individual with one `R` edge an
 ///   `A` (`{u, v}`, `P = {u}`, `R = {(u, v)}`, `A = ∅` is a model): neither is an
-///   alternative, and `A` has a hazard;
+///   alternative. It is `⊤ ⊑ ≤ 1 R ⊔ A`: an individual outside `A` has one `R`-successor
+///   at most, so its hazard is global under QL's closure and RL's (D16-492 r1, F1);
 /// - `≥ 1 R.⊤ ⊑ A` is `∃R ⊑ A`: an `R` edge is an alternative;
 /// - `≥ 0 R.C ⊑ A` is `⊤ ⊑ A`: rewritten as `owl:Thing ⊑ A` is, so an anonymous `S`-successor
 ///   is an `A` too. Inside an intersection on the left it isn't read, and `A` has a hazard
@@ -833,9 +920,10 @@ fn a_minimum_cardinality_on_the_left_is_read_as_it_counts() {
     if out.iter().any(|b| b.contains("R(") || b.contains("P(")) {
         wrong.push(format!("≥ 2: {out:?}"));
     }
-    let found = concerns(two, "A(?x)");
-    if found != hazard {
-        wrong.push(format!("≥ 2 hazard: {found:?}"));
+    for lists in [false, true] {
+        if tbox(two, lists).0.global_hazard().is_none() {
+            wrong.push(format!("≥ 2 (lists {lists}): no global hazard"));
+        }
     }
     let one = rewritten(
         "SubClassOf(ObjectMinCardinality(1 :R owl:Thing) :A)",
