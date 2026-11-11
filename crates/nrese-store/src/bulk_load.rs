@@ -247,15 +247,18 @@ impl<'a> Source<'a> {
         blank_nodes: &BlankNodeScope,
         skipping: Option<Skipping<'_, '_>>,
     ) -> StoreResult<u64> {
-        let threads = rayon::current_num_threads();
         let recovering = |parser: RdfParser| match skipping {
             Some(_) => parser.recovering(),
             None => parser,
         };
         match self.format {
             // Split exactly (Turtle and TriG at statement ends, by a skim of the file) and
-            // parsed on every thread.
+            // parsed on its lanes, a thread each.
             RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle | RdfFormat::TriG => {
+                let parts = lanes(
+                    std::fs::metadata(self.path)?.len(),
+                    rayon::current_num_threads(),
+                );
                 let parser = RdfParser::from_format(self.format)
                     .with_base_iri(file_base_iri(self.path)?)
                     .map_err(|error| StoreError::Configuration(error.to_string()))?;
@@ -264,7 +267,7 @@ impl<'a> Source<'a> {
                     false => parser.with_default_graph(graph.clone()),
                 };
                 let chunks =
-                    recovering(parser).split_file_for_parallel_parsing(self.path, threads)?;
+                    recovering(parser).split_file_for_parallel_parsing(self.path, parts)?;
                 let first = *next_chunk;
                 *next_chunk += u32::try_from(chunks.len()).expect("fewer than 2^32 chunks");
                 chunks
@@ -362,6 +365,33 @@ fn feed(
     Ok(parsed + batch.len() as u64)
 }
 
+/// The lanes a file is parsed and interned on at least, pool permitting (D16-468). Each lane
+/// is a thread heap, and the load's peak grows with the lanes: from 8 to 16 it grew by 19 to
+/// 27 MiB a lane on average (16 threads, two hosts; loads of 113, 330 and 338 MB). Our
+/// reading, not shown, is that with transparent huge pages each heap keeps its partly used
+/// huge pages until the load ends. Fewer lanes cost time instead: at 6 the 338 MB load
+/// (1.78 M triples: `benches/oxigraph-comparison/results/2026-10-01-step-5-end-to-end.md`)
+/// took 0.370 s against 0.345 on 16 lanes, and at 4 the 113 MB one (1.2 M quads) 0.300
+/// against 0.240; at 8 the first was faster than on 16 (0.320 s) and the second within 2 %
+/// (0.245 s), and the peaks of the measured loads were 28 to 45 % lower than on 16.
+const MIN_LANES: usize = 8;
+
+/// The input a lane takes past [`MIN_LANES`] before another is added. A lane added 19 to
+/// 27 MiB to the peak on average (above); what it saves in time was mixed at about 40 MiB a
+/// lane: 16 lanes instead of 8 were 9 % faster on one 330 MB load and 8 % slower on a 338 MB
+/// one. 64 MiB is a step past that, so a lane is added only where it parses more than was
+/// measured; between 338 MB and 1.1 GB the rule is not measured, and from 1.1 GB up a
+/// 16-thread pool keeps its 16.
+const BYTES_PER_LANE: u64 = 64 << 20;
+
+/// The lanes a file of `bytes` is parsed and interned on, with `threads` in the pool: a
+/// chunk of the file and a thread each. [`MIN_LANES`] up to `MIN_LANES` × [`BYTES_PER_LANE`]
+/// (512 MiB), then a lane per `BYTES_PER_LANE`, never more than the pool's threads.
+fn lanes(bytes: u64, threads: usize) -> usize {
+    let by_size = usize::try_from(bytes.div_ceil(BYTES_PER_LANE)).unwrap_or(usize::MAX);
+    threads.min(by_size.max(MIN_LANES))
+}
+
 /// Makes blank-node labels unique to one load by prefixing them. Deterministic per label,
 /// so every chunk of the load maps a label the same way.
 struct BlankNodeScope {
@@ -424,5 +454,39 @@ impl BlankNodeScope {
                 other => other,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lanes;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A file of up to 512 MiB is parsed on 8 lanes however many threads the pool has
+    /// beyond them: each lane's thread heap holds memory until the load ends (D16-468).
+    #[test]
+    fn a_file_up_to_512_mib_is_parsed_on_eight_lanes() {
+        for bytes in [0, 1, 113_565_549, 337_695_911, 512 * MIB] {
+            assert_eq!(lanes(bytes, 16), 8, "{bytes} bytes, 16 threads");
+            assert_eq!(lanes(bytes, 32), 8, "{bytes} bytes, 32 threads");
+        }
+    }
+
+    /// Past 512 MiB a lane is added for every further 64 MiB, up to the pool's threads.
+    #[test]
+    fn a_larger_file_takes_a_lane_per_64_mib_up_to_the_threads() {
+        assert_eq!(lanes(512 * MIB + 1, 32), 9);
+        assert_eq!(lanes(1_110_583_574, 32), 17);
+        assert_eq!(lanes(1_110_583_574, 16), 16);
+        assert_eq!(lanes(4096 * MIB, 32), 32);
+    }
+
+    /// A pool of fewer threads than 8 parses on all of them.
+    #[test]
+    fn a_small_pool_parses_on_every_thread() {
+        assert_eq!(lanes(113_565_549, 1), 1);
+        assert_eq!(lanes(113_565_549, 4), 4);
+        assert_eq!(lanes(1_110_583_574, 4), 4);
     }
 }
