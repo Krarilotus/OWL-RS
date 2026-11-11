@@ -1401,6 +1401,11 @@ def samples(case: dict, result: dict) -> dict:
         return {k: v for k, v in result["phase_samples"].items() if v}
     if metric == "cold_ms":
         return cold_series(result, detailed=True)
+    if metric == "sum_p50_ms" and case.get("queries") == "@cache-log":
+        # A replayed log is one timing, its sum of medians per process: its generated queries,
+        # one execution each, are no series of their own (case_manifest plans `_`).
+        value = metric_value(case, result)
+        return {"_": [value]} if value is not None else {}
     if metric == "sum_p50_ms":
         # A perf lab without samples (main's): its p50, one value per process (estimator()).
         # Repeated processes (`repeat`) pool their samples: the pass's values are all of them.
@@ -1451,6 +1456,8 @@ def case_manifest(catalog: list[dict], root: Path = ROOT) -> dict:
                 series[name] = [f"knn-{q}" for q in range(5)]
             elif query == "@parse":
                 series[name] = list(parse_query_definitions())
+            elif query == "@cache-log":
+                series[name] = ["_"]  # the replay is one timing (samples())
             else:
                 series[name] = [p.stem for p in paths]
         elif case.get("metric") == "cold_ms":
