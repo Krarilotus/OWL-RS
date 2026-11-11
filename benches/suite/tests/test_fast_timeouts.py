@@ -58,6 +58,25 @@ class CaseTimeouts(unittest.TestCase):
         self.assertNotIn("timeout", calls[-1].kwargs)
 
 
+class Repetitions(unittest.TestCase):
+    def test_a_repeated_case_reports_every_process_s_phases(self):
+        # Not only the last process's: each phase of a repeated case keeps its spread.
+        case = dict(name="repeat-contract", data="none", args=[], queries="", metric="load_s",
+                    cap_gb=2, repeat=3)
+        times = iter([1, 2, 3])
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+
+            def measured(*args, **kwargs):
+                report = {"load_s": 1, "phase": {"ms": next(times)}}
+                (scratch / "repeat-contract.json").write_text(json.dumps(report))
+                return 0, "", "", 1
+
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", side_effect=measured):
+                record = fast.measure(case, "contract", 1, {}, {}, "none")
+        self.assertEqual([r["phase"]["ms"] for r in record["repetitions"]], [1, 2, 3])
+
+
 class FreshProcesses(unittest.TestCase):
     """The release gate's `processes` (benches/fast/measure.toml): a DL tool's fresh processes,
     their times pooled (a process's memory layout moves its time, not its work)."""
