@@ -58,7 +58,7 @@ from maintenance import NreseBinary  # noqa: E402
 from suitekit import ns, quiet  # noqa: E402
 from suitekit.adapters import Context, Graphdb, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
-from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
+from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
 WORKLOAD = "ldbc-spb"
@@ -316,7 +316,8 @@ def one(args, key, rep, runtime, writer, results, data, date, stamp, agents, pub
         step = system.load(ctx, store, inputs(data), regime)
         m = step.measured
         writer.write(row("load", status="ok" if m.ok else "timeout" if m.timed_out else "failed", ms=m.ms,
-                         peak_mib=m.peak_mib or "", note="ontologies, reference datasets and creative works, inference included"))
+                         **memory_fields(m.peak_mib, m.memory_kind, m.memory_note,
+                                         before="ontologies, reference datasets and creative works, inference included")))
         if not m.ok:
             return
         endpoint = system.serve(ctx, store, regime)
@@ -346,8 +347,8 @@ def one(args, key, rep, runtime, writer, results, data, date, stamp, agents, pub
                 writer.write(row("query", item="benchmark", repeat=1, status="failed",
                                  note=f"no summary parsed (exit {rc}, {time.monotonic() - started:.0f} s); see benchmark.log"))
         finally:
-            peak = system.stop(ctx)
-            writer.write(row("serve", peak_mib=peak or "", note="the server's peak over the benchmark"))
+            peak, kind, memory_note = system.stop_memory(ctx)
+            writer.write(row("serve", **memory_fields(peak, kind, memory_note, before="the server's peak over the benchmark")))
     finally:
         runtime.remove_store(store)
         shutil.rmtree(work, ignore_errors=True)

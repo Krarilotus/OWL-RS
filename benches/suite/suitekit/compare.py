@@ -320,8 +320,11 @@ def pooled(report: dict) -> dict[str, dict]:
     return out
 
 
-# Kinds that count page cache: recorded beside a peak, never compared.
-CACHE_KINDS = {"cgroup"}
+# Kinds that count page cache: recorded beside a peak, never compared (`sampled`, `docker stats`:
+# the cgroup's usage less inactive file pages, so active page cache counts, 11 Nov 2026).
+CACHE_KINDS = {"cgroup", "sampled"}
+# The one kind of peak a ratio between engines is drawn from (versus, standings): memory in use.
+CROSS_SYSTEM_KIND = "anon-kernel"
 
 
 def kind_of(entry: dict) -> str:
