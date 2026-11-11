@@ -19,6 +19,8 @@ mod calendar;
 mod canonical;
 mod decode_cache;
 mod equality;
+#[cfg(test)]
+mod equality_tests;
 mod equijoin;
 mod estimate;
 mod exists;
@@ -1500,6 +1502,9 @@ struct Context<'a> {
     service_denied: bool,
     /// [`QueryOptions::equality_closed`].
     equality_closed: bool,
+    /// The identities' representatives this query joins on, found at their first use
+    /// ([`Context::representatives`]).
+    representatives: equality::Found,
     /// The equality classes to expand after joins over canonical reads (stage C,
     /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
     late: Option<Arc<nrese_engine::EqualityClasses>>,
@@ -1708,6 +1713,7 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(|access| !access.service),
             equality_closed: options.equality_closed,
+            representatives: equality::Found::default(),
             cache: None,
             pin: RefCell::default(),
             search_scope: options.search_scope,
