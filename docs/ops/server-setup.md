@@ -20,8 +20,8 @@ The test profile is intended to validate:
 - OCI container with orchestrator or standalone runtime.
 
 ## 3. Runtime Topology
-- One `nrese-server` instance manages one active dataset storage directory.
-- Scale-out is read-heavy first, then sharded or partitioned by dataset at architecture level.
+- One `nrese-server` instance manages one data directory: the default repository in it, and each repository created over the API in its `repositories/<id>/` ([HTTP interface](http-api.md#rdf4j-protocol)).
+- Scale-out: read replicas follow a primary's log ([replication](replication.md)); nothing partitions the data across machines.
 - Place reverse proxy in front of NRESE for TLS termination and edge controls.
 
 ### 3.1 Operator UI Endpoint
@@ -46,18 +46,19 @@ The service user MUST own data and log directories with least privilege.
 ## 5. Configuration Surface
 The canonical runtime knob reference is [config-reference.md](./config-reference.md).
 
-Configuration precedence:
-1. CLI config path via `--config` or `-c`
-2. `NRESE_CONFIG_PATH` for selecting the config file path when no CLI path is given
-3. environment variables
-4. `config.toml`
-5. built-in defaults
+Configuration precedence ([config-reference.md](./config-reference.md#precedence)): a value is
+taken from the first of
+1. the command line: `--set KEY=VALUE` with a file key, repeatable, for every command
+   (secrets are refused there)
+2. the environment variable
+3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
+4. the built-in default
 
 Current behavior:
 
 - `config.toml` is supported as a first-class runtime input.
 - Environment variables override file values.
-- CLI currently selects the config file path; per-setting overrides remain file/env based.
+- `--set KEY=VALUE` overrides one file key, over the file and the environment.
 - Typed runtime defaults and validation stay in the owning crates.
 - External parsing, file loading, and precedence stay in `crates/nrese-server/src/config/`.
 - `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` is now the explicit deployment-mode selector for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`.
@@ -84,7 +85,7 @@ External exposure note:
 
 ### 5.2 Reliability and Storage Variables
 
-There are no scheduled-backup or recovery-mode settings yet. Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. Backups are taken through the admin API (see [backup-restore-drills.md](backup-restore-drills.md)). Checkpoint and WAL settings arrive with roadmap WP E4 and will be documented in [config-reference.md](config-reference.md), the only place config knobs are listed.
+No setting schedules backups: they are taken through the admin API or offline with `nrese-server backup` (above, and [backup-restore-drills.md](backup-restore-drills.md)). Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. The checkpoint and log settings (`store.checkpoint_after_wal`, `store.wal_archive`, `store.wal_damage`, `store.verify_on_open`, `store.map_checkpoints`) are in [config-reference.md](config-reference.md), the only place settings are listed.
 
 ### 5.3 Ontology Preload
 
@@ -143,7 +144,7 @@ $env:NRESE_BIND_ADDR = "127.0.0.1:8080"
 $env:NRESE_DEPLOYMENT_POSTURE = "open-workbench"
 $env:NRESE_DATA_DIR = ".\data"
 $env:RUST_LOG = "info"
-$env:NRESE_ONTOLOGY_PATH = "C:\Users\Johannes\Documents\MEPHISTO\Ontology-Development\files\processed\rg_ontology.ttl"
+$env:NRESE_ONTOLOGY_PATH = ".\ontology.ttl"
 cargo run -p nrese-server
 ```
 
@@ -208,6 +209,16 @@ WantedBy=multi-user.target
 - `curl -fsSI http://127.0.0.1:8080/ops`
 - `curl -fsSI http://127.0.0.1:8080/console`
 
+### 6.4 Stopping
+A stop signal ends the server cleanly: SIGTERM (`systemctl stop`, `docker stop`, Kubernetes) or SIGINT (ctrl-c; on Windows, ctrl-c in the server's console). In this order:
+1. It accepts no new connections, closes idle ones, and lets the requests in flight finish, for up to 5 s. A request still running then is cut: its client sees the connection drop, and doesn't know whether a commit it sent was made, as on any kill.
+2. A replica's follower stops, and the store closes; it waits for the maintenance in progress first, the longest of which is a background checkpoint (it rewrites the whole store).
+3. It logs `nrese-server stopped` (the signal, how long the stop took, whether requests were cut) and exits with code 0.
+
+One deadline bounds the stop: 8 s from the signal. A stop not done by then logs `nrese-server stop deadline reached`, naming what it still waited for, and 200 ms later ends the process with code 0, as a kill would. The tests check that a stopped server has ended within 9 s of the signal: give the supervisor a stop allowance above that before it kills (`docker stop` waits 10 s unless `-t` says otherwise). Nothing acknowledged is lost either way: every commit is synced to the log before it is acknowledged, and the next start recovers from the checkpoint and the log, as after a kill ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+
+Not handled: a signal during start-up (while the store opens and start-up reasoning runs) acts as a kill (in the image, Docker kills at the end of its grace period); on Windows, a service stop or `taskkill /F` ends the process without the drain.
+
 ## 7. Container Deployment
 
 ### 7.1 Image Requirements
@@ -227,8 +238,10 @@ docker run -d --name nrese \
   -e NRESE_BIND_ADDR=0.0.0.0:8080 \
   -e NRESE_DATA_DIR=/var/lib/nrese/data \
   -e NRESE_AUTH_MODE=bearer-jwt \
-  ghcr.io/example/nrese-server:latest
+  nrese
 ```
+
+`nrese` is the image built from this repository (`docker build -t nrese .`, as in the [README](../../README.md#quick-start)).
 
 ### 7.3 Kubernetes Notes
 - Use readiness probe `/readyz` and liveness probe `/healthz`.
@@ -286,7 +299,7 @@ server {
 - Recovery procedure:
 1. Stop writer traffic.
 2. Restore latest consistent snapshot to staging path.
-3. Start server in `read-only` validation mode.
+3. Start the server on it with writes disabled (`server.deployment_posture = "read-only-demo"`).
 4. Run integrity checks and smoke queries.
 5. Promote restored dataset and switch traffic.
 
@@ -297,7 +310,7 @@ server {
 - TLS policy validated by security scanner.
 - AuthN/AuthZ tested for reader/writer/admin roles.
 - Metrics and logs collected centrally.
-- Ontology preload path and fallback behavior validated in pre-prod.
+- Ontology preload path validated in pre-prod (there is no fallback: [5.3](#53-ontology-preload)).
 - Alerts configured for:
 - High 5xx rate.
 - Update queue saturation.

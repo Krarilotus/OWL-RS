@@ -7,7 +7,7 @@ anonymous individuals were missing: `SELECT ?x { ?x :worksFor [] }` didn't find 
 `Employee` without a stated employer. This note designs the query rewriting that adds
 them (merge checklist §1; coverage plan §3; research tasks item 4; reasoner-v2 R8).
 
-**Sources** (evidence: *read* = the primary source read in `literature/corpus`; *cited* =
+**Sources** (evidence: *read* = the primary source read; *cited* =
 known through a source read; *ours* = measured or tested here).
 - Rodríguez-Muro, Kontchakov, Zakharyaschev, *Ontology-Based Data Access: Ontop of
   Databases*, ISWC 2013 (*read*, §2.1 and §3.1): the tree-witness rewriting over

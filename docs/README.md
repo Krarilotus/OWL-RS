@@ -6,6 +6,7 @@
 |---|---|
 | How do I run it and send a first query? | the [quick start](../README.md#quick-start), then [getting started](dev/getting-started.md) |
 | What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-can-do) |
+| What doesn't it do, and when should I choose another system? | [Limits and deviations](limits.md) |
 | How do I deploy it, load data and configure it? | [server setup](ops/server-setup.md), [every setting](ops/config-reference.md) |
 | Which endpoints are there? | [the HTTP interface](ops/http-api.md) |
 | What does reasoning compute, and what does an answer promise? | [reasoning-semantics.md](spec/reasoning-semantics.md) |
