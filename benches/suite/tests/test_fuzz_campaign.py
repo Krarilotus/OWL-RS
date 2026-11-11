@@ -21,7 +21,7 @@ class BuildDiagnostics(unittest.TestCase):
             shutil.copyfile(isolation.ROOT / "scripts/fuzz-campaign.sh", campaign)
             (scripts / "lib/fuzz-targets.txt").write_text("nrese-engine:lib:witness\n")
             build = scripts / "cargo-guarded.sh"
-            build.write_text(f"#!/bin/sh\nprintf '%s\\n' '{diagnostic}' >&2\nexit 101\n")
+            build.write_text(f"#!/bin/sh\nprintf '%s\\n' '{diagnostic}' >&2\nexit 101\n", newline="\n")
             build.chmod(0o755)
             out = root / "out"
             done = subprocess.run([shutil.which("bash"), campaign.as_posix(), "0", out.as_posix()],
