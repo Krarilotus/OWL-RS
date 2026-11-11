@@ -107,7 +107,7 @@ pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
     SearchScope,
 };
-pub use process_settings::{ProcessSettings, process_settings};
+pub use process_settings::{ProcessSettings, apply_process_settings, process_settings};
 pub use quarantine::{
     EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,
     QuarantinedStatement, Readmission, Repair, Resolution, readmit,

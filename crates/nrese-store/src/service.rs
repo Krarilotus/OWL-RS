@@ -170,8 +170,8 @@ impl StoreService {
         config.validate()?;
         let process_memory = config.process_memory_bytes.resolve()?;
         config.process_memory_bytes = crate::ProcessMemory::Bytes(process_memory);
-        // The process's settings: the first store's (D16-489).
-        crate::process_settings::apply(&config);
+        // The process's settings, set once (D16-489): a later store's differ and are left.
+        crate::process_settings::apply_process_settings(&config);
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => {

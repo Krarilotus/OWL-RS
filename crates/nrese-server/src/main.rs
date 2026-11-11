@@ -84,6 +84,7 @@ async fn run() -> Result<()> {
     }
     let config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
     config.install_process_memory_policy()?;
+    config.install_process_settings()?;
     // The default repository's settings as changed through the engine API (kept in the data
     // directory) are in effect for it: its reasoning and its store's modes. The configured
     // reasoning stays the server's, for the repositories that name none.

@@ -1,9 +1,10 @@
 //! The settings that are the process's, not a store's: the index encoding, the vocabulary,
 //! huge pages and the reasoning release (D16-489). The engine and the allocator keep one
-//! value each for the whole process, so the first store the process opens sets them, and
-//! every store opened after it leaves them as they are: the server opens its configured
-//! store first, so a store it opens for itself (the system store, a draft check's scratch
-//! store) or another repository can't replace the operator's choice.
+//! value each for the whole process, so they are set once: by the server from its
+//! configuration before it opens a store ([`apply_process_settings`]), otherwise by the first
+//! store the process opens. Every store opened after that leaves them as they are, so a store
+//! the server opens for itself (the system store, a draft check's scratch store) or another
+//! repository can't replace the operator's choice.
 
 use std::sync::OnceLock;
 
@@ -19,7 +20,8 @@ pub struct ProcessSettings {
 }
 
 impl ProcessSettings {
-    fn of(config: &StoreConfig) -> Self {
+    /// The values `config` asks for.
+    pub fn of(config: &StoreConfig) -> Self {
         Self {
             index_encoding: config.index_encoding,
             vocabulary: config.vocabulary,
@@ -31,11 +33,11 @@ impl ProcessSettings {
 
 static APPLIED: OnceLock<ProcessSettings> = OnceLock::new();
 
-/// Sets the process's values from `config` if no store has set them yet, before the first
+/// Sets the process's values from `config` if nothing has set them yet, before the first
 /// store opens (its recovery builds index blocks in the operator's encoding); afterwards
-/// leaves them as they are.
-pub(crate) fn apply(config: &StoreConfig) {
-    APPLIED.get_or_init(|| {
+/// leaves them as they are. Returns the values in effect.
+pub fn apply_process_settings(config: &StoreConfig) -> ProcessSettings {
+    *APPLIED.get_or_init(|| {
         let settings = ProcessSettings::of(config);
         nrese_engine::set_index_encoding(settings.index_encoding);
         nrese_engine::set_vocabulary_encoding(settings.vocabulary);
@@ -45,10 +47,10 @@ pub(crate) fn apply(config: &StoreConfig) {
         nrese_exec::memory::set_huge_pages(settings.huge_pages);
         nrese_engine::memory::set_release_between_rounds(settings.reasoning_release);
         settings
-    });
+    })
 }
 
-/// The values the process runs with: the first opened store's; `None` before any store.
+/// The values the process runs with; `None` before anything set them.
 pub fn process_settings() -> Option<ProcessSettings> {
     APPLIED.get().copied()
 }
