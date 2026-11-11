@@ -1,12 +1,12 @@
 # Benchmark status
 
-Generated 2026-11-02 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
+Generated 2026-11-11 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
 
 ## At a glance
 
 - **Workloads:** 42 (13 partial, 15 planned, 14 ready)
 - **Systems:** 33 (28 free to publish, 5 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 619; run at least once: 103; ok on their newest run: 80
+- **Pairs** (standard tier × system that can run it; build variants apart): 619; run at least once: 103; ok on their newest run: 64; run, outcome kept locally (`ran*`): 22
 - **NRESE:** 19 of its 108 standard tiers ok on their newest run
 - **Run records:** 37, newest 2026-10-12
 - **Before the reset:** 37 of the 37 records, and 222 of the 222 newest outcomes: history, not the current engine's (marked †; the v1.6 baseline measures the current engine)
@@ -95,8 +95,8 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | real-ontologies | planned | · | · | · | – | – | – | · | – | · | · | · | · | – | – | – | · | – | – | – | – | · | n/a | n/a | n/a | · | – | – | – | – | – | – | – | – |
 | consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | n/a | – | n/a | – | – | – | – | – | – | – | – | – |
 | w3c-owl2-rl | ready | 0/1 !† | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | – | – | – | n/a | – | – | – | – | n/a | n/a | – | n/a | – | – | – | – | – | – | – | – | – |
-| ore-2015 | partial | 0/2 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | 1/2† | 0/2 !† | 0/2 !† | 1/2† | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
-| w3c-owl2-dl | ready | 0/1 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | 0/1 !† | 0/1 !† | 0/1 !† | 0/1 !† | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
+| ore-2015 | partial | 0/2 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | 1/2† | 1/2† | 1/2† | 1/2† | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
+| w3c-owl2-dl | ready | 0/1 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | 1/1† | 1/1† | 1/1† | 1/1† | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
 | owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
 | basics-mix | ready | 5/5† | · | 3/5 !† | 4/5 !† | 4/5 !† | 2/5 !† | 5/5† | · | 2/5 !† | – | – | – | – | – | – | – | – | – | – | – | 5/5† | · | n/a | n/a | · | – | – | – | – | – | – | – | – |
 | sparqloscope | ready | · | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · | – | – | – | – | – | – | – | – |
@@ -130,7 +130,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | vector-recall | partial | · | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | n/a | · | – | – | – | – | – | – | – | – |
 | ann-benchmarks | partial | · | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | n/a | · | – | – | – | – | – | – | – | – |
 
-`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it · † before the reset of 25 Oct 2026 (engine-v2 re-based on 59e5e24c): history, not the current engine's result (every outcome of the cell)
+`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; its outcome stays local (a licensed system's, or results kept locally) · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it · † before the reset of 25 Oct 2026 (engine-v2 re-based on 59e5e24c): history, not the current engine's result (every outcome of the cell)
 
 ## Workloads, tier by tier
 
@@ -215,20 +215,20 @@ ready, conformance; tasks RT1, RT4; kit `crates/nrese-store/tests/w3c_owl2_rl` (
 
 ### ore-2015: ORE 2015: classification of 1,920 real ontologies
 
-partial, performance; tasks RT6; kit `benches/reasoning/dl` (outside the driver); checked by: canonical taxonomies compared by hash across the reference reasoners; differences adjudicated (disputed.tsv).
+partial, performance; tasks RT6; kit `benches/reasoning/dl` (outside the driver); checked by: canonical taxonomies compared by hash across the reference reasoners; differences settled by hand.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
 |---|---|---|---|---|---|---|---|
-| dev | part 10-03† | · | · | ok 10-03† | part 10-03† | part 10-03† | ok 10-03† |
+| dev | part 10-03† | · | · | ran* 10-03† | ran* 10-03† | ran* 10-03† | ran* 10-03† |
 | full | · | · | · | · | · | · | · |
 
 ### w3c-owl2-dl: W3C OWL 2 test cases, species DL, direct semantics: consistency, entailment, non-entailment
 
-ready, conformance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driver); checked by: the test types; the working group's published results of 2009 (published-2009.tsv); disputed.tsv.
+ready, conformance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driver); checked by: the test types; the working group's published results of 2009 (published-2009.tsv); differences settled by hand.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
 |---|---|---|---|---|---|---|---|
-| - | part 10-09† | · | · | part 10-03† | WRONG 10-03† | WRONG 10-03† | part 10-03† |
+| - | part 10-09† | · | · | ran* 10-03† | ran* 10-03† | ran* 10-03† | ran* 10-03† |
 
 ### owl2bench-classify: OWL2Bench EL and DL: classification and consistency of the generated ontologies
 
@@ -662,7 +662,7 @@ partial, performance; tasks vector; kit `benches/breadth/vectors` (outside the d
 - fast 6 plain cases on oxigraph: partial (2026-10-06-fast-compete, † pre-reset): 4-cycles timed out
 - fast clients-sweep~plain on virtuoso: partial (2026-10-10-competitors-dc2114a, † pre-reset): incomplete: clients-64 (clients-64: 5 failed of 6)
 - fast dl cases on hermit: partial (2026-10-06-fast-suite, † pre-reset): timeouts at 120 s on most generated ontologies; parse and classify ok on the others
-- fast dl cases on konclude: partial (2026-10-06-fast-suite, † pre-reset): an error on dl-number; timeouts on nominals and Horn classification
+- fast dl cases on konclude: partial (2026-10-06-fast-suite, † pre-reset): timeouts on nominals and Horn classification; no taxonomy on dl-number
 - fast dl cases on openllet: partial (2026-10-06-fast-suite, † pre-reset): timeouts on most
 - fast dl-roles, el-classify on hermit: partial (2026-10-06-fast-compete, † pre-reset): el-classify timed out
 - fast dl-roles, el-classify on openllet: partial (2026-10-06-fast-compete, † pre-reset): el-classify timed out
@@ -680,15 +680,9 @@ partial, performance; tasks vector; kit `benches/breadth/vectors` (outside the d
 - lubm 10 on jena: partial (2026-10-03-office-b, † pre-reset): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 3 timeout of 3); steps: count failed
 - lubm 100 on jena: partial (2026-10-03-office-b, † pre-reset): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 1 timeout of 1); steps: count failed
 - lubm 1000 on nemo-sparq: failed (2026-10-03-office-b, † pre-reset): encoding sparq/owl-rl.rls sha256 9012609fe35f25b7; load time includes concatenating the inputs
-- ore-2015 dev on konclude: partial (2026-10-03-dl-reference, † pre-reset): 1 error
 - ore-2015 dev on nrese: partial (2026-10-03-dl-reference, † pre-reset): EL track only (20/20 agree); the DL tasks wait for phase 3
-- ore-2015 dev on openllet: partial (2026-10-03-dl-reference, † pre-reset): 3 timeouts; differs on ore_ont_1340 (open)
 - owl2bench rl-1 on owlrl: timeout (2026-10-03-office-b, † pre-reset)
-- w3c-owl2-dl - on elk: partial (2026-10-03-dl-reference, † pre-reset): EL tasks only; the rest use constructs outside its fragment
-- w3c-owl2-dl - on hermit: partial (2026-10-03-dl-reference, † pre-reset): 27 timeouts, 1 crash (WebOnt-Thing-003), no wrong result
-- w3c-owl2-dl - on konclude: wrong (2026-10-03-dl-reference, † pre-reset): 30 wrong results, 100 unsupported (datatypes, keys)
 - w3c-owl2-dl - on nrese: partial (2026-10-09-office-conformance-a633, † pre-reset): DL-909 disputed
-- w3c-owl2-dl - on openllet: wrong (2026-10-03-dl-reference, † pre-reset): 6 wrong results, 10 timeouts
 - w3c-owl2-rl - on nrese: partial (2026-10-09-office-conformance-a633, † pre-reset): two import skips, one functional-only premise skip
 
 ### Workloads not ready

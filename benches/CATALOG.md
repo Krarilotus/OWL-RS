@@ -191,7 +191,7 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 
 | Benchmark | Measures; who publishes | Check | Shows about NRESE | Mark | Now |
 |---|---|---|---|---|---|
-| W3C OWL 2 DL tests | 411 tasks of 311 tests | the test types; 2009 published results; `disputed.tsv` | correctness (403 right, 0 wrong on 5 Oct) | covered | ready |
+| W3C OWL 2 DL tests | 411 tasks of 311 tests | the test types; 2009 published results; differences settled by hand | correctness (403 right, 0 wrong on 5 Oct) | covered | ready |
 | ORE 2015 | classification, consistency, realisation of 1,920 real ontologies × 3 tasks; Konclude, HermiT, ELK, FaCT++, Pellet and others published | canonical taxonomies by hash across reference reasoners; adjudication | the DL engine against Konclude and HermiT; the paper's DL section | core | dev subset (80 + 100 tasks) |
 | OWL2Bench EL and DL | classification and consistency at 1 and 10 universities (ABox-heavy); Konclude times out on DL (reported) | taxonomies across reasoners | realisation at ABox scale | representative | planned |
 | PAGOdA's test suite (LUBM, UOBM, FLY, NPD, DBpedia+, ChEMBL, Reactome, UniProt with queries) | query answering beyond RL by bounds; PAGOdA, HermiT, Konclude published | answers against a complete reasoner | the bounds made store state (report item 7, paper contribution 3) | representative | – |

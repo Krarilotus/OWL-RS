@@ -50,6 +50,10 @@ pnpm-debug.log*
 /benches/suite/results/
 /benches/fast/results/
 /benches/oracle/results/
+# The DL kit's per-task results and its record of differences settled by hand stay local
+# (benches/reasoning/dl/README.md)
+/benches/reasoning/dl/results/
+/benches/reasoning/dl/private/
 # Python caches, anywhere
 __pycache__/
 *.py[cod]

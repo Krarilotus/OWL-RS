@@ -33,7 +33,7 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - or against the other systems within the same regime (the driver's cross-check).
 - **Rulesets before times.** The OWL 2 RL rules are complete only for ground assertions over RL ontologies without punning or annotation-property axioms (OWL 2 Profiles, Theorem PR1); elsewhere they are sound only, and stores add or omit axiomatic triples and some RDFS rules. When answer counts differ between rule reasoners, compare their rulesets first: a difference there is a semantics difference, not a wrong answer.
 - **A wrong answer is a finding.** It is reported as `wrong`, never as a time. The report and the comparison list wrong answers first.
-- **No majority votes.** When references disagree, a person settles the case with a minimised witness and records it (`reasoning/dl/disputed.tsv`).
+- **No majority votes.** When references disagree, a person settles the case with a minimised witness and records it (`reasoning/dl/private/disputed.tsv`, kept locally).
 - **Match the oracle to the task.** Exact bags preserve duplicates and RDF term
   identity; a total order additionally permits exact sequence comparison. Unordered
   `LIMIT`, tied ordering and other permitted nondeterminism need case-specific

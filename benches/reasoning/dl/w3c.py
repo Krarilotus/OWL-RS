@@ -6,14 +6,15 @@
     python w3c.py manifest CASES REASONER...     # CASES/manifest.tsv (container paths)
     docker run --rm -v "$PWD/CASES:/work" nrese-bench/dl-reference \
         batch /work/manifest.tsv /work/results.tsv /work/tax 60
-    python w3c.py compare CASES [--disputed disputed.tsv] [--out results/w3c-DATE.tsv]
+    python w3c.py compare CASES [--disputed private/disputed.tsv] [--out results/w3c-DATE.tsv]
 
 A test's premise (and conclusion or non-conclusion) is taken in RDF/XML where the suite
 has it, else in functional syntax, else in OWL/XML; the OWL API reads all three. ELK
 runs on the tests of the EL profile only. Each result is checked against the test's
 type; a wrong result or an error not recorded in the DISPUTED file fails the run (exit 1);
 timeouts and unsupported constructs are counted. DISPUTED records are settled by hand
-with a witness, never by a vote.
+with a witness, never by a vote; the file is kept locally, not in the repository
+(`private/` is git-ignored), and `compare` stops without it.
 """
 
 import argparse
@@ -121,12 +122,14 @@ def manifest(args):
 
 def read_disputed(path):
     """`id<TAB>reasoner<TAB>status<TAB>why`: known differences, each with its reason."""
+    if not path or not pathlib.Path(path).is_file():
+        sys.exit(f"w3c.py compare: no record of differences settled by hand at {path or '(none)'}; "
+                 "it is kept locally, not in the repository: put it there or pass --disputed FILE")
     known = {}
-    if path and pathlib.Path(path).exists():
-        for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
-            if line.strip() and not line.startswith("#"):
-                parts = line.split("\t")
-                known[(parts[0], parts[1])] = (parts[2], parts[3] if len(parts) > 3 else "")
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.startswith("#"):
+            parts = line.split("\t")
+            known[(parts[0], parts[1])] = (parts[2], parts[3] if len(parts) > 3 else "")
     return known
 
 
@@ -166,6 +169,7 @@ def compare(args):
     for item in unexpected:
         print("UNEXPECTED:", *item, sep="\t")
     if args.out:
+        pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter="\t", lineterminator="\n")
             w.writerow(["test", "status", "task", "expected", "reasoner", "result", "ms",
@@ -255,7 +259,8 @@ def main():
     m.add_argument("reasoners", nargs="+")
     c = sub.add_parser("compare")
     c.add_argument("cases")
-    c.add_argument("--disputed", default=str(pathlib.Path(__file__).with_name("disputed.tsv")))
+    c.add_argument("--disputed",
+                   default=str(pathlib.Path(__file__).with_name("private") / "disputed.tsv"))
     c.add_argument("--out")
     pub = sub.add_parser("published")
     pub.add_argument("html")

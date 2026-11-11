@@ -59,7 +59,7 @@ the same shape ([2026-10-11-horn-recovery.toml](2026-10-11-horn-recovery.toml) i
 | `failed`, `timeout` | the load, or the kit, failed or hit its limit |
 | `hangs` | a comparator gave no answer in a past run and isn't run again |
 | `skipped` | the suite didn't run it (`note` says why: a missing capability, licence, regime or input) |
-| `restricted` | a licensed system ran; how it came out stays local until the vendor permits publishing |
+| `restricted` | a system ran and how it came out stays local: a licensed system's until the vendor permits publishing, or results the project keeps locally (`note` says which) |
 
 `runs` counts the repetitions that loaded, and `items` gives the queries or tasks that were
 `ok` out of those run. Records from before 3 October 2026 have `commit = "unknown (before
