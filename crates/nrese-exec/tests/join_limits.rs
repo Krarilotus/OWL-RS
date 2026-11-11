@@ -5,10 +5,11 @@
 //! this file is a test binary of its own, and one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_exec::IdTable;
-use nrese_exec::join::{join, left_join};
+use nrese_exec::join::{RowLimit, join, left_join};
 
 struct Counting;
 
@@ -57,6 +58,24 @@ fn joins_over_their_limit_stop_before_expanding_a_group() {
     assert!(
         peak < 256 * 1024,
         "the inner join allocated {peak} bytes before refusing"
+    );
+    // A stop flag set before the join, and a limit reached in the group's middle: neither
+    // expands the group. (That a refused left row adds no pair is join.rs's unit test.)
+    let stopped = RowLimit {
+        max_rows: usize::MAX,
+        stop: Some(Arc::new(AtomicBool::new(true))),
+    };
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[0], &[0], stopped).is_err());
+    });
+    assert!(peak < 256 * 1024, "a stopped join allocated {peak} bytes");
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[0], &[0], 100_000).is_err());
+    });
+    // Its pairs' row numbers, 8 bytes each, four times over for the vectors' doubling.
+    assert!(
+        peak < 4 * 8 * 102_000,
+        "a join stopped at 100,000 rows allocated {peak} bytes"
     );
     let peak = peak_of(|| {
         assert!(left_join(&left, &right, &[0], &[0], None, 1).is_err());
