@@ -41,5 +41,36 @@ class ReplayedLog(unittest.TestCase):
                 self.assertEqual({s: got.get(s) for s in planned[case["name"]]}, {"_": [21.0]})
 
 
+class OneRecord(unittest.TestCase):
+    """Spec: a smoke's record is checked as a round checks each of its records (abba.py
+    completeness(): every declared content check passing, every declared series at the sample
+    floor), by one callable, abba.record_check(), on one record without a family's manifest or
+    block schedule (the campaign's smoke contract, 11 Nov 2026: "1,000 unrelated one-sample
+    series do not satisfy it")."""
+
+    def record(self, samples: dict) -> dict:
+        # cache-replay-cached's record as a pass file of the huge-pages family holds it: its one
+        # invocation's checks passed (cache.hits), status ok.
+        hits = [{"path": "cache.hits", "expected": ">= 1", "got": "12", "ok": True}]
+        return {"case": "cache-replay-cached", "status": "ok", "expected_outcome": "ok", "notes": [],
+                "checks": hits, "routes": [], "samples": samples,
+                "observations": [{"identity": {"sweep": 0, "repeat": 0, "cache": "warm"}, "checks": hits,
+                                  "samples": samples}]}
+
+    def test_a_replay_split_per_query_fails_and_its_one_series_passes(self):
+        import abba
+        catalog = cases.load()
+        split = self.record({f"{i:05d}": [0.02] for i in range(1000)})
+        self.assertEqual(abba.record_check(catalog, split), ["cache-replay-cached: 0 samples of _, 1 required"])
+        self.assertEqual(abba.record_check(catalog, self.record({"_": [245.6]})), [])
+
+    def test_an_unproven_content_check_fails(self):
+        import abba
+        record = self.record({"_": [245.6]})
+        record["observations"][0]["checks"] = []
+        self.assertEqual(abba.record_check(cases.load(), record),
+                         ["cache-replay-cached: no passing result for its content check cache.hits"])
+
+
 if __name__ == "__main__":
     unittest.main()
