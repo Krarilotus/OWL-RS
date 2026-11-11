@@ -38,6 +38,10 @@ pub enum Diagnostic {
     },
     /// A global restriction of OWL 2 DL broken: an anonymous individual in a nominal or a
     /// `hasValue`, which take named ones only (*OWL 2 Structural Specification* §11.2).
+    /// The Direct Semantics still reads it (§2.3.7–2.4): in an ontology, one individual,
+    /// existential over the whole ontology, which keys skip as they skip every anonymous
+    /// one ([`Diagnostic::is_fatal`]); in a conclusion, one to prove
+    /// ([`Diagnostic::is_fatal_in_conclusion`]).
     AnonymousIndividual { node: Term },
     /// Text the functional-syntax reader can't read (`crate::ofn`), where it is (from 1;
     /// the column in characters): the axiom it is in is left out.
@@ -87,7 +91,10 @@ impl Diagnostic {
     /// Whether reasoning over the ontology may go wrong because of it. Not for what OWL 2
     /// DL forbids but whose meaning is unambiguous: an undeclared property (typed by its
     /// use), a blank node shared by expressions (OWL 1 ontologies do it; the expression
-    /// is the same), a structure no axiom uses (it says nothing).
+    /// is the same), a structure no axiom uses (it says nothing), an anonymous individual
+    /// in a nominal or `hasValue` (one individual: held as a constant, every model of the
+    /// ontology gives one of it and back, so consistency and every conclusion that doesn't
+    /// name it stay as they are).
     pub fn is_fatal(&self) -> bool {
         !matches!(
             self,
@@ -95,7 +102,15 @@ impl Diagnostic {
                 | Self::SharedBlankNode { .. }
                 | Self::Unused { .. }
                 | Self::RepeatedOperand
+                | Self::AnonymousIndividual { .. }
         )
+    }
+
+    /// Whether a conclusion read with it may be answered wrongly: as [`Self::is_fatal`],
+    /// and an anonymous individual in a nominal or `hasValue`, which in a conclusion says
+    /// that *some* individual is so; held as a constant, it would ask for more.
+    pub fn is_fatal_in_conclusion(&self) -> bool {
+        self.is_fatal() || matches!(self, Self::AnonymousIndividual { .. })
     }
 }
 

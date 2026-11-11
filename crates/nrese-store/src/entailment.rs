@@ -446,8 +446,10 @@ impl StoreService {
             },
         );
         // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
-        // conclusions state expressions so); anything else unread leaves it undecided.
-        if let Some(diagnostic) = read.diagnostics.iter().find(|d| d.is_fatal()) {
+        // conclusions state expressions so); anything else unread leaves it undecided, and
+        // so does an anonymous individual in a nominal or `hasValue` (one to prove).
+        let fatal = |d: &&nrese_owl::Diagnostic| d.is_fatal_in_conclusion();
+        if let Some(diagnostic) = read.diagnostics.iter().find(fatal) {
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!(
                     "the conclusion isn't well-formed OWL 2 DL: {diagnostic:?}"
