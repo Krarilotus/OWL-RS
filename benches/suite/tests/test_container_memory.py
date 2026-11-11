@@ -10,7 +10,9 @@ container that touched a page first, and ranked three engines differently on two
 from __future__ import annotations
 
 import csv
+import errno
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -143,6 +145,34 @@ class ContainerMemoryPeak(unittest.TestCase):
                     peak = sampler.stop()
                 self.assertIsNone(peak)
                 self.assertTrue(sampler.why)
+
+    def test_a_cgroup_it_cannot_inspect_is_no_evidence_that_the_container_ended(self):
+        """Only a cgroup directory that is gone (ENOENT) ends the readings with their peak standing. A
+        reading of 120, then a reading and a look at the directory that both fail otherwise (no access,
+        an I/O error): the container may run on, so 120 is no peak. (Red on Linux, where a failed stat
+        made `Path.exists` false; Windows' exists doesn't go through os.stat.)"""
+        for failure in (PermissionError(errno.EACCES, "no access"), OSError(errno.EIO, "I/O error")):
+            with self.subTest(failure=failure.strerror), tempfile.TemporaryDirectory() as tmp:
+                group = Path(tmp)
+                reads, real_stat = [], os.stat
+
+                def read_text(path, *args, **kwargs):
+                    reads.append(path)
+                    if len(reads) == 1:
+                        return "anon 100\nkernel 20\n"
+                    raise failure
+
+                def stat_of(path, *args, **kwargs):
+                    if Path(path) == group:
+                        raise failure
+                    return real_stat(path, *args, **kwargs)
+
+                with patch.object(Path, "read_text", read_text), patch.object(os, "stat", stat_of):
+                    sampler = runtime.ContainerMemory("c", locate=lambda: group, period_s=0.001)
+                    sampler.thread.join(timeout=5)
+                    peak = sampler.stop()
+                self.assertIsNone(peak)
+                self.assertIn(failure.strerror, sampler.why)
 
     def test_a_container_whose_cgroup_is_removed_keeps_the_peak_read_before(self):
         """Linux removes a container's cgroup directory once its processes are gone: the readings
@@ -369,6 +399,24 @@ class ResultsFromAnOlderSchema(unittest.TestCase):
                 Writer(path).write(row(peak_mib=5, memory_kind="anon-kernel"))
             self.assertEqual([r["peak_mib"] for r in read(path)], ["7"])
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["results.csv"])
+
+    def test_compare_draws_no_verdict_from_peaks_of_two_kinds_pooled(self):
+        """Such a file holds a Docker serve peak (sampled: it predates the kind); a later run there
+        appends a process one (lifetime), base 100 MiB, candidate 400 MiB. Each side pools both
+        kinds: compare names them and draws no ratio and no regression from the mixture."""
+        with tempfile.TemporaryDirectory() as tmp:
+            files = []
+            for name, peak in (("base", 100), ("new", 400)):
+                (Path(tmp) / name).mkdir()
+                path = self.older(Path(tmp) / name)
+                Writer(path).write(row(runtime="process", run=2, peak_mib=peak))
+                files.append(path)
+            out = compare.Out()
+            compare.compare_pairs(summarise(read(files[0])), summarise(read(files[1])), 0.1, 2, out,
+                                  (compare.memory_kinds([files[0]]), compare.memory_kinds([files[1]])))
+        text = "\n".join(out.lines["Memory, by kind"])
+        self.assertEqual((bool(re.search(r"\d\.\d\dx", text)), out.regressions), (False, 0))
+        self.assertIn("lifetime/sampled", text)
 
 
 def suite_run(directory: Path, kinds: dict[str, str]):
