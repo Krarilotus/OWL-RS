@@ -1433,6 +1433,7 @@ mod tests {
     /// unseen; with its scan and its unions counted on two credits, each within its own run,
     /// both runs' work followed a yes (fix check r2 G1).
     #[test]
+    #[cfg(debug_assertions)]
     fn a_counted_class_build_finishes_its_class_within_its_visitor_s_interval() {
         let interval = u64::from(nrese_exec::POLL_UNITS);
         let n = 3 * interval as usize;
@@ -1500,7 +1501,9 @@ mod tests {
     /// The work a counted class build does, counted where it is done: scan steps and runs, their
     /// searches' comparisons and their merges' work, copies, finished identities, sort work, and
     /// the union kernel's member moves and the slots its enumeration walks (fix check r1 F3, r2
-    /// G2: not what the build told its visitor).
+    /// G2: not what the build told its visitor). Debug builds only, as the union kernel's
+    /// counters are to this crate's tests (`nrese_exec::classes::witness`).
+    #[cfg(debug_assertions)]
     fn work() -> u64 {
         use crate::witness::{self, Site};
         [
@@ -1522,6 +1525,7 @@ mod tests {
     /// A snapshot under equality whose default graph holds `same_as` statements between the
     /// names given (interned in the order given first), and `subject p o`; and its pattern
     /// `? p ?`.
+    #[cfg(debug_assertions)]
     fn under_equality(
         names: &[String],
         same_as: &[(usize, usize)],
@@ -1564,6 +1568,7 @@ mod tests {
     /// Counts `pattern` on `snapshot` (materialised, its classes cold) with a visitor that
     /// answers yes `yeses` times, then no: the answer, and the most work done between a yes
     /// and the visitor's next call (or the read's end).
+    #[cfg(debug_assertions)]
     fn stopped_after(
         snapshot: &crate::Snapshot,
         pattern: &QuadPattern,
@@ -1594,6 +1599,7 @@ mod tests {
     /// bound itself, `POLL_UNITS`). Then, not stopped, it
     /// answers every copy. Work is counted where it is done (`work`). Map initialisation, held
     /// for the owner (fix check r1 F2), is not counted.
+    #[cfg(debug_assertions)]
     fn a_cold_class_build_stops_within_an_interval_of_any_yes(
         names: &[String],
         same_as: &[(usize, usize)],
@@ -1629,6 +1635,7 @@ mod tests {
     /// (its ends are interned last): that union moves a whole chain, three intervals of members,
     /// and the joined class's sort sorts six.
     #[test]
+    #[cfg(debug_assertions)]
     fn a_large_union_and_sort_stop_within_an_interval_of_any_yes() {
         let half = 3 * nrese_exec::POLL_UNITS as usize;
         let names: Vec<String> = (0..half - 1)
@@ -1656,6 +1663,7 @@ mod tests {
     /// yes. It covers the combined build and G1 (red at G1's 5,480); G3, listing the classes
     /// from the kernel's dense list, has no red of its own (fix check r3 H3).
     #[test]
+    #[cfg(debug_assertions)]
     fn classes_joined_into_one_enumerate_within_an_interval_of_any_yes() {
         let n = 3 * nrese_exec::POLL_UNITS as usize;
         let names: Vec<String> = (0..n)
@@ -1676,6 +1684,7 @@ mod tests {
 
     /// REAS-3a fix check r1 F3, the many-small-classes shape: three intervals of classes of two.
     #[test]
+    #[cfg(debug_assertions)]
     fn many_small_classes_stop_within_an_interval_of_any_yes() {
         let n = 3 * nrese_exec::POLL_UNITS as usize;
         let names: Vec<String> = (0..n)
@@ -1687,6 +1696,7 @@ mod tests {
 
     /// The most work `read` does between two asks of its visitor, which always answers yes, or
     /// after the last until it returns.
+    #[cfg(debug_assertions)]
     fn largest_gap(read: impl FnOnce(crate::visit::Visitor<'_>)) -> u64 {
         let last = std::cell::Cell::new(work());
         let largest = std::cell::Cell::new(0);
@@ -1724,6 +1734,7 @@ mod tests {
     /// asks for full runs. Its scan's ledger and its own credit each allowed a run after the
     /// same yes.
     #[test]
+    #[cfg(debug_assertions)]
     fn an_expanded_read_steps_and_copies_within_an_interval_of_any_yes() {
         let interval = u64::from(nrese_exec::POLL_UNITS);
         let n = 6 * interval as usize;
@@ -1777,6 +1788,7 @@ mod tests {
     /// SPOG: three intervals of statements in each stack, their objects alternating, so the merge steps both scans in
     /// turn. Each scan's ledger allowed a run after the same yes.
     #[test]
+    #[cfg(debug_assertions)]
     fn a_sorted_read_of_both_stacks_steps_within_an_interval_of_any_yes() {
         let interval = u64::from(nrese_exec::POLL_UNITS);
         let n = 3 * interval as usize;
