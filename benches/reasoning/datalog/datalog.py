@@ -55,7 +55,7 @@ sys.path.insert(0, str(ROOT / "benches/suite"))
 import program as P  # noqa: E402
 from suitekit import ns, quiet  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
-from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
+from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
 # RDFox isn't among them: its evaluation licence was refused (owner, 12 Oct 2026). Its
@@ -358,8 +358,9 @@ class Run:
 
     def finish(self, measured, reason_ms: float | None, derived: int | None, note: str):
         load_status = "timeout" if measured.timed_out else "ok" if measured.ok else "failed"
-        self.write(self.row("load", status=load_status, ms=measured.ms, peak_mib=measured.peak_mib or "",
-                            note=note + ("" if measured.ok else f"; exit {measured.rc}")))
+        self.write(self.row("load", status=load_status, ms=measured.ms,
+                            **memory_fields(measured.peak_mib, measured.memory_kind, measured.memory_note,
+                                            before=note + ("" if measured.ok else f"; exit {measured.rc}"))))
         if not measured.ok:
             return
         expected = self.total_expected()
