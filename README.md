@@ -132,7 +132,8 @@ with `nrese-server load` ([server setup](docs/ops/server-setup.md)).
 
 ### From source
 
-With Rust (the version in [rust-toolchain.toml](rust-toolchain.toml)):
+With Rust 1.98 or later (`rust-version` in [Cargo.toml](Cargo.toml); the builds here use the
+version [rust-toolchain.toml](rust-toolchain.toml) names):
 
 ```bash
 cargo run --release -p nrese-server
@@ -273,7 +274,8 @@ one commit, and its operations apply in order, each seeing the ones before it. B
 anything is visible:
 
 1. the reasoner updates the inferred statements from the change, in the same
-   transaction, and checks consistency (under `owl2-dl` also with the DL engines);
+   transaction, and checks consistency (under `owl2-dl` also with the DL engines; a check
+   they don't decide lets the commit through, and the status says `unknown`);
 2. with the SHACL gate on, the shapes validate the focus nodes the change can affect,
    inferred statements included. Only what the commit introduces counts: data that was
    invalid before doesn't block it.
@@ -398,7 +400,8 @@ pinned to a commit.
 Two more crates serve the tests: [`nrese-sparql-reference`](crates/nrese-sparql-reference), a
 SPARQL evaluator written straight from the specification's algebra, which the executor is
 compared against; and [`nrese-fuzz`](crates/nrese-fuzz), fuzz targets for every parser of
-untrusted input ([fuzz/](fuzz/README.md)). Benchmarks live in [benches/](benches/README.md).
+untrusted input ([fuzz/](fuzz/README.md)). Benchmarks live in [benches/](benches/README.md); the
+runs recorded there are as of their dates.
 
 ## Documentation
 
@@ -413,7 +416,8 @@ untrusted input ([fuzz/](fuzz/README.md)). Benchmarks live in [benches/](benches
 
 ## State and limits
 
-What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md); the order
+What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md) (its counts
+and measurements are as of when each was recorded); the order
 of work: [docs/ROADMAP.md](docs/ROADMAP.md); every limit and deviation, and when to choose
 another system: [docs/limits.md](docs/limits.md). The main limits today:
 

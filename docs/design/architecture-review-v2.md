@@ -6,8 +6,7 @@ will be built on it in other repositories? The evidence is the code at `9d5a65fd
 by file and line. No code was changed and nothing was built.
 
 **Reconciled with `c9be1609` (18 October 2026).** The findings below are kept as written
-for `9d5a65fd`; where the code has moved on, this table says so (the ownership audit,
-`Harness/notes/2026-10-18-ownership-consolidation-audit.md`, §5).
+for `9d5a65fd`; where the code has moved on, this table says so.
 
 | Finding | At `c9be1609` |
 |---|---|

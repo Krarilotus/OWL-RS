@@ -59,6 +59,9 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
 - **User rules** (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
+- **Undecided consistency.** Under `owl2-dl`, a commit whose consistency check isn't decided
+  (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
+  complete ([consistency](spec/reasoning-semantics.md#consistency)).
 - **Bulk loads skip the commit gates** ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
   `nrese-server load` fails when the loaded data is inconsistent, and the data stays
   loaded; SHACL isn't checked. A store whose data is found inconsistent is quarantined
