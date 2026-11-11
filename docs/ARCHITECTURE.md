@@ -8,29 +8,33 @@ Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
 
 NRESE is an RDF database and ontology platform, hardware-aware on one machine (every core, the memory, CPU features and GPUs it has) and scaling out to clusters where a use case needs it, each derived setting configurable. It combines:
 
-- **QLever-class query performance and scale** — dictionary-encoded, sorted permutation indexes, merge/worst-case-optimal joins, integrated text search, fast parallel bulk loading.
-- **GraphDB-class semantics and data governance** — materialised, incrementally maintained RDFS / OWL 2 RL reasoning with asserted vs inferred separation, built-in SHACL validation on commit, full-text connectors, transactional writes.
-- **Reasoning beyond the materialisable profiles** — OWL 2 DL (classification, consistency, explanation) is a goal: reasoning is where NRESE means to lead, drawing on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
-- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J, GraphDB compatibility) and the one frontend only translate to it.
+- **Query performance at scale** — dictionary-encoded, sorted permutation indexes, merge/worst-case-optimal joins, integrated text search, fast parallel bulk loading.
+- **Semantics and data governance** — materialised, incrementally maintained RDFS / OWL 2 RL reasoning with asserted vs inferred separation, built-in SHACL validation on commit, full-text search, transactional writes, access control by graph.
+- **Reasoning beyond the materialisable profiles** — OWL 2 DL (consistency, classification, realisation, explanation, and query answers that state their completeness): reasoning is the centre of the project, built on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
+- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it.
 
-Fuseki is no longer the parity target. QLever and GraphDB are, measured with the harness in `benches/nrese-bench-harness` (see [ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
+Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the benchmark kits in [`benches/`](../benches/README.md) ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
 
 ## 2. Layer model
 
-Dependencies point **downwards only**. A crate may use the public API of any crate in a lower layer, never a sibling's internals and never an upper layer.
+Dependencies point **downwards only**: a crate may use the public API of a crate below it in this picture (a lower layer, or a lower row of its own layer), never another crate's internals and never one above. The picture is the order of the manifests' `[dependencies]`; test-only dev-dependencies aren't shown.
 
 ```
 L5  apps/nrese-console            browser UI + CLI (TypeScript), talks HTTP only
 L4  nrese-server                  HTTP transport, auth, policy, posture, UI hosting, AI assistant
 L3  nrese-store                   application service: operations, mutation pipeline, validation gates, backup
-L2  nrese-sparql  nrese-reasoner  nrese-shacl
-                                  query/update evaluation · materialisation & consistency · shape validation
-L1  nrese-engine  nrese-exec  nrese-vector  nrese-owl  nrese-dl
-                                  term dictionary, quad indexes, MVCC snapshots, transactions, durability
-                                  · id tables, joins, grouping, closures, memory budgets · vector indexes
-                                  · the OWL 2 structural model and normaliser · the DL engines
-L0  crates/rdf/: nrese-rdf  nrese-rdf-io  nrese-sparql-syntax  nrese-sparql-results  nrese-xsd  nrese-json
-                                  the RDF model, syntaxes, SPARQL syntax and results, XSD and OWL datatypes
+L2  nrese-shacl                   shape validation (through nrese-sparql's read view and value semantics)
+    nrese-sparql  nrese-reasoner  query/update evaluation · materialisation & consistency
+L1  nrese-engine  nrese-dl        term dictionary, quad indexes, MVCC snapshots, transactions, durability
+                                  · the DL engines
+    nrese-vector                  vector indexes
+    nrese-exec  nrese-owl         id tables, joins, grouping, closures, memory budgets
+                                  · the OWL 2 structural model and normaliser
+L0  crates/rdf/:
+    nrese-rdf-io  nrese-sparql-syntax  nrese-sparql-results
+                                  RDF syntaxes, SPARQL syntax and results
+    nrese-rdf                     the RDF model
+    nrese-json  nrese-xsd         JSON, XSD and OWL datatypes
 ```
 
 Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written from the specification, the oracle of the differential tests; used by tests only), `nrese-fuzz` (fuzz targets for every parser of untrusted input), and `benches/` (the benchmark kits).
@@ -40,14 +44,14 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 | Crate | Owns | Must not own |
 |---|---|---|
 | `crates/rdf/` | The RDF model (`nrese-rdf`: IRIs, terms, quads, canonicalisation), every RDF syntax (`nrese-rdf-io`), SPARQL syntax and algebra (`nrese-sparql-syntax`), the results formats (`nrese-sparql-results`), XSD values and the OWL 2 datatype map (`nrese-xsd`), JSON (`nrese-json`). | Storage, evaluation, reasoning. |
-| `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
+| `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics, the full-text and vector indexes over its literals. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
 | `nrese-exec` | Id-level tables, joins, grouping, graph closures and capacity accounting (the server's budget, each request's envelope) with its one RAII reservation type; the DL batch-width handle (`Workers`). It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics; server-wide admission policy. |
 | `nrese-vector` | Vector literals' distances and indexes (exact scan, HNSW). | Terms, storage, SPARQL. |
-| `nrese-owl` | The OWL 2 structural model read from RDF or the functional syntax, its diagnostics, and the normaliser into DL-clauses (automata for role inclusions, lazy definitions). | Search, storage, rule evaluation. |
+| `nrese-owl` | The OWL 2 structural model read from RDF or the functional syntax, its diagnostics, the profile checker, the normaliser into DL-clauses (automata for role inclusions, lazy definitions), the OWL 2 QL schema compiler and the proof IR (justifications). | Search, storage, rule evaluation. |
 | `nrese-dl` | The OWL 2 DL engines over `nrese-owl`'s clauses: context saturation, tableau search and immutable compiled probes with fresh search state, portfolio, classification and realisation. | Storage, SPARQL, HTTP; when to run (the store and reasoner decide), query-to-assumption adaptation. |
-| `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor (the only one) and its planner (EXPLAIN), the result cache of plan parts (its keys are plan parts, its entries id tables, and only the executor knows what a part's result depends on), query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation. | Commit decisions, validation, persistence, HTTP; the cache's instance and budget (the store's, as with the query memory budget). |
+| `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor (the only one) and its planner (EXPLAIN), the result cache of plan parts (its keys are plan parts, its entries id tables, and only the executor knows what a part's result depends on), query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation; the OWL 2 QL rewriting of queries, full-text, vector and GeoSPARQL search. | Commit decisions, validation, persistence, HTTP; the cache's instance and budget (the store's, as with the query memory budget). |
 | `nrese-reasoner` | Reasoning profiles, rule sets, materialisation, incremental maintenance, consistency checks, explanations. | Storage layout, HTTP, SHACL. |
-| `nrese-shacl` | Shapes-graph compilation, SHACL Core (later SHACL-SPARQL) validation, incremental validation scoped to a delta, validation reports. It reads through `nrese-sparql`'s `ReadView` and uses its value semantics, because SHACL defines its constraints through SPARQL's operators; `nrese-sparql` never depends on it ([design/shacl.md](design/shacl.md)). | Storage layout, reasoning, HTTP, when to validate and what a failure means for a commit. |
+| `nrese-shacl` | Shapes-graph compilation, SHACL Core and SHACL-SPARQL validation, incremental validation scoped to a delta, validation reports. It reads through `nrese-sparql`'s `ReadView` and uses its value semantics, because SHACL defines its constraints through SPARQL's operators; `nrese-sparql` never depends on it ([design/shacl.md](design/shacl.md)). | Storage layout, reasoning, HTTP, when to validate and what a failure means for a commit. |
 | `nrese-store` | Product operations and the **mutation pipeline** (plan → validate → commit), gates, revision reporting and preload; the bulk loader and the quarantine of statements it can't read (re-admitted through the pipeline); one result cache per store; the catalog's shared native query budget (`Runtime`); DL bound orchestration, candidate adaptation and completeness. | HTTP status codes, authentication backends (tokens, OIDC) and request parsing; what a cached result is keyed by; generic execution kernels. It does own the access state: principals, workspaces and policies, and the local users' Argon2id password hashes with their verification and throttling, which are durable data of the system store ([ADR-0008](adr/0008-users-workspaces-policies.md), `access/login.rs`); the server maps a request's credentials to a principal. |
 | `nrese-server` | Routes, content negotiation, auth backends, policy (limits, timeouts, rate limits), deployment posture, operator/console hosting, AI suggestions, mapping store errors to HTTP. | Any data semantics. It never touches the engine directly. |
 

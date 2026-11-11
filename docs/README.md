@@ -3,6 +3,11 @@
 Each question has one document that answers it. When two disagree, the one higher in this
 list wins and the lower one is corrected in the same change.
 
+Using NRESE rather than working on it? Read the [README](../README.md), then
+[getting started](dev/getting-started.md), [server setup](ops/server-setup.md), the
+[HTTP interface](ops/http-api.md), the [configuration](ops/config-reference.md) and
+[what reasoning computes](spec/reasoning-semantics.md).
+
 | Question | Document |
 |---|---|
 | Who owns what; in which layer is a problem fixed? | [ARCHITECTURE.md](ARCHITECTURE.md) |
@@ -14,7 +19,7 @@ list wins and the lower one is corrected in the same change.
 | How is NRESE fast, which ideas worked and which didn't? | [design/performance.md](design/performance.md): the wins to keep with their guards (§0), the ideas by layer, the lab log |
 | How does a component work? | [design/](#design) |
 | What does reasoning compute? | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
-| Where do we stand against QLever and GraphDB? | [spec/06-target-capability-matrix.md](spec/06-target-capability-matrix.md) |
+| What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-can-do) |
 | How is it run and configured? | [ops/](#operations) |
 | How is it measured? | [benches/README.md](../benches/README.md) (the four levels, hosts), the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
 | What should research find out next? | [plan/2026-10-05-research-tasks.md](plan/2026-10-05-research-tasks.md) |
