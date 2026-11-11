@@ -148,6 +148,21 @@ browser console needs Node.js: build it in `apps/nrese-console` (`npm ci && npm 
 before the server, and the server embeds it; without it, `/console` says how
 ([getting started](docs/dev/getting-started.md)).
 
+### From the command line
+
+| Task | Needs a running server | How |
+|---|---|---|
+| Version and capabilities | yes | `curl http://localhost:8080/version`, `curl http://localhost:8080/api/v1/capabilities`; or the console CLI's `capabilities` |
+| Check a configuration, print its JSON Schema | no | `nrese-server check-config --config FILE`, `nrese-server config-schema` |
+| Query the server | yes | `curl` as above; or the console CLI's `query --text "…"`, which with `--require-complete` exits 3 when the answer isn't shown complete |
+| Load files, or query the stored data, offline | no: not on a data directory a server is using | `nrese-server load FILE…`, `nrese-server query "SELECT …"` |
+
+`nrese-server` is the image's entrypoint (`docker run --rm nrese config-schema`), or
+`cargo run --release -p nrese-server -- …` from source; every command takes
+`--set KEY=VALUE` ([configuration](docs/ops/config-reference.md#precedence),
+[offline commands](docs/ops/server-setup.md#54-bulk-loading)). The console CLI is
+`npm run cli -- …` in `apps/nrese-console` ([console CLI](docs/dev/getting-started.md#frontend-cli)).
+
 ## What it can do
 
 Each item links to the specification, document or test that backs it. Limits stand next
@@ -408,6 +423,13 @@ another system: [docs/limits.md](docs/limits.md). The main limits today:
 - Under OWL 2 DL some answers are `sound-only`, and say so.
 - No SHACL Advanced Features; no embeddings computed in the store.
 - No releases on crates.io.
+
+Platforms: the image for `linux/amd64` and `linux/arm64`; the merge checks also build and
+test on Windows ([scripts/check.sh](scripts/check.sh)). After a crash, an on-disk store
+recovers every acknowledged commit; on damage other than a torn last write it refuses to
+open, unless configured otherwise ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)); backups
+and restores: [server setup](docs/ops/server-setup.md#10-backup-and-recovery-setup),
+[drills](docs/ops/backup-restore-drills.md).
 
 ## Thanks
 

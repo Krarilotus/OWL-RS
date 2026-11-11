@@ -46,18 +46,19 @@ The service user MUST own data and log directories with least privilege.
 ## 5. Configuration Surface
 The canonical runtime knob reference is [config-reference.md](./config-reference.md).
 
-Configuration precedence:
-1. CLI config path via `--config` or `-c`
-2. `NRESE_CONFIG_PATH` for selecting the config file path when no CLI path is given
-3. environment variables
-4. `config.toml`
-5. built-in defaults
+Configuration precedence ([config-reference.md](./config-reference.md#precedence)): a value is
+taken from the first of
+1. the command line: `--set KEY=VALUE` with a file key, repeatable, for every command
+   (secrets are refused there)
+2. the environment variable
+3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
+4. the built-in default
 
 Current behavior:
 
 - `config.toml` is supported as a first-class runtime input.
 - Environment variables override file values.
-- CLI currently selects the config file path; per-setting overrides remain file/env based.
+- `--set KEY=VALUE` overrides one file key, over the file and the environment.
 - Typed runtime defaults and validation stay in the owning crates.
 - External parsing, file loading, and precedence stay in `crates/nrese-server/src/config/`.
 - `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` is now the explicit deployment-mode selector for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`.
@@ -143,7 +144,7 @@ $env:NRESE_BIND_ADDR = "127.0.0.1:8080"
 $env:NRESE_DEPLOYMENT_POSTURE = "open-workbench"
 $env:NRESE_DATA_DIR = ".\data"
 $env:RUST_LOG = "info"
-$env:NRESE_ONTOLOGY_PATH = "C:\Users\Johannes\Documents\MEPHISTO\Ontology-Development\files\processed\rg_ontology.ttl"
+$env:NRESE_ONTOLOGY_PATH = ".\ontology.ttl"
 cargo run -p nrese-server
 ```
 
