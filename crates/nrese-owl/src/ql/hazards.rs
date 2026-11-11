@@ -161,6 +161,10 @@ enum Place {
 struct Collect<'a> {
     o: &'a Ontology,
     found: Vec<Hazard>,
+    /// The terms of a counting restriction's filler, with its [`Hazard::Cardinality`]: a
+    /// membership missed there misses an equality the restriction makes (D16-492 fix
+    /// check r1, F1).
+    counted: Vec<(Term, Hazard)>,
 }
 
 impl Collect<'_> {
@@ -226,7 +230,11 @@ impl Collect<'_> {
             }
             ClassExpr::Exact(_, p, f) | ClassExpr::Max(_, p, f) => {
                 partial(self);
-                self.found.push(Hazard::Cardinality(p.named()));
+                let h = Hazard::Cardinality(p.named());
+                self.found.push(h);
+                let mut counted = Vec::new();
+                terms(o, *f, &mut counted);
+                self.counted.extend(counted.into_iter().map(|t| (t, h)));
                 self.walk(*f, Place::Left);
             }
             ClassExpr::All(p, f) => {
@@ -324,6 +332,7 @@ pub(crate) fn hazards(
     let mut collect = Collect {
         o,
         found: Vec::new(),
+        counted: Vec::new(),
     };
     // What axioms whose left side any individual may be in give every anonymous one
     // unread (`open_axiom`): their right sides' terms, and an enumerated individual.
@@ -353,7 +362,11 @@ pub(crate) fn hazards(
                 if matches!(o.class(*r), ClassExpr::OneOf(_)) {
                     found.extend(left.iter().map(|&c| Hazard::Enumeration(c)));
                 }
-                edges.push((left, expr_terms(*r)));
+                // The right side is read too: `A ⊑ ∀R.B` gives an anonymous `R`-successor
+                // of an `A` its `B` (D16-492 fix check r2, F1).
+                let right = expr_terms(*r);
+                let premise = left.iter().chain(&right).copied().collect();
+                edges.push((premise, right));
             }
             Axiom::EquivalentClasses(classes) => {
                 let all: Vec<Term> = classes.iter().flat_map(|&c| expr_terms(c)).collect();
@@ -423,13 +436,19 @@ pub(crate) fn hazards(
                 links.extend(ps.windows(2).map(|w| (w[0], w[1])));
                 edges.push((ps.clone(), ps.clone()));
             }
+            // The class is read too, as a subclass axiom's right side is.
             Axiom::ObjectPropertyDomain(p, c) | Axiom::ObjectPropertyRange(p, c) => {
                 collect.walk(*c, Place::Right(None));
-                edges.push((vec![p.named()], expr_terms(*c)));
+                let class = expr_terms(*c);
+                edges.push((
+                    std::iter::once(p.named()).chain(class.clone()).collect(),
+                    class,
+                ));
             }
             Axiom::DataPropertyDomain(p, c) => {
                 collect.walk(*c, Place::Right(None));
-                edges.push((vec![*p], expr_terms(*c)));
+                let class = expr_terms(*c);
+                edges.push((std::iter::once(*p).chain(class.clone()).collect(), class));
             }
             Axiom::ObjectCharacteristic(Characteristic::Transitive, p) => {
                 found.push(Hazard::Transitive(p.named()));
@@ -483,6 +502,11 @@ pub(crate) fn hazards(
         if h.equates() {
             equating.entry(t).or_insert(h);
         }
+    }
+    // A counted filler's terms equate as its property does (fix check r2, F2: kept apart,
+    // they reached the walk below anyway through the filler's own hazards).
+    for (t, h) in collect.counted {
+        equating.entry(t).or_insert(h);
     }
     // Connected properties (union-find over the links).
     let mut parent: HashMap<Term, Term> = HashMap::new();
@@ -690,11 +714,15 @@ pub(crate) fn hazards(
 /// own, property inclusions, inverses and equivalences as they link. Assertions have
 /// none.
 fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
-    // Premises by every term they read; conclusions by the terms they can add positive
-    // facts on (`profile::positive_terms`, review r1, F3: `∀R.D` adds none on `R`).
-    let t = |e: ExprId| {
+    // Premises by every term they read, the conclusion's own included: `A ⊑ ∀R.B` reads
+    // `R`, so an `R` edge missed misses a `B` (D16-492 fix check r1, F1). Conclusions by
+    // the terms they can add positive facts on (`profile::positive_terms`, review r1, F3:
+    // `∀R.D` adds none on `R`).
+    let t = |es: &[ExprId]| {
         let mut out = Vec::new();
-        terms(o, e, &mut out);
+        for &e in es {
+            terms(o, e, &mut out);
+        }
         out
     };
     let c = |e: ExprId, positive: bool| {
@@ -705,21 +733,25 @@ fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
     let pairs = |v: &[ExprId], positive: bool| -> Vec<(Vec<Term>, Vec<Term>)> {
         v.iter()
             .flat_map(|&a| v.iter().filter(move |&&b| b != a).map(move |&b| (a, b)))
-            .map(|(a, b)| (t(a), c(b, positive)))
+            .map(|(a, b)| (t(&[a, b]), c(b, positive)))
             .collect()
     };
+    let with = |mut premise: Vec<Term>, e: ExprId| {
+        premise.extend(t(&[e]));
+        premise
+    };
     match axiom {
-        Axiom::SubClassOf(l, r) => vec![(t(*l), c(*r, true))],
+        Axiom::SubClassOf(l, r) => vec![(t(&[*l, *r]), c(*r, true))],
         Axiom::EquivalentClasses(v) => pairs(v, true),
         Axiom::DisjointClasses(v) => pairs(v, false),
         Axiom::DisjointUnion(class, parts) => parts
             .iter()
-            .flat_map(|&p| [(t(p), vec![*class]), (vec![*class], c(p, true))])
+            .flat_map(|&p| [(t(&[p]), vec![*class]), (with(vec![*class], p), c(p, true))])
             .collect(),
         Axiom::ObjectPropertyDomain(p, e) | Axiom::ObjectPropertyRange(p, e) => {
-            vec![(vec![p.named()], c(*e, true))]
+            vec![(with(vec![p.named()], *e), c(*e, true))]
         }
-        Axiom::DataPropertyDomain(p, e) => vec![(vec![*p], c(*e, true))],
+        Axiom::DataPropertyDomain(p, e) => vec![(with(vec![*p], *e), c(*e, true))],
         Axiom::SubObjectPropertyOf(chain, sup) => {
             vec![(chain.iter().map(|p| p.named()).collect(), vec![sup.named()])]
         }
@@ -814,6 +846,7 @@ fn read_on_right(o: &Ontology, e: ExprId) -> bool {
     let mut collect = Collect {
         o,
         found: Vec::new(),
+        counted: Vec::new(),
     };
     collect.walk(e, Place::Right(None));
     collect.found.is_empty() && plain(o, e)
