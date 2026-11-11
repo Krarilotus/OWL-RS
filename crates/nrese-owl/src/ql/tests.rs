@@ -371,7 +371,12 @@ fn witnesses_the_query_implies_are_dropped() {
 
 /// The hazards a query's atoms reach, as `term: hazard` with local names.
 fn concerns(axioms: &str, atoms: &str) -> Vec<String> {
-    let (tbox, mut table) = tbox(axioms, true);
+    concerns_over(axioms, atoms, true)
+}
+
+/// [`concerns`] over QL's closure (`lists` false) or RL's.
+fn concerns_over(axioms: &str, atoms: &str, lists: bool) -> Vec<String> {
+    let (tbox, mut table) = tbox(axioms, lists);
     let (query, _) = cq(&mut table, atoms, &[]);
     let name = |t: Term| {
         table.names[t as usize]
@@ -579,6 +584,51 @@ fn disjointness_concludes_the_complement_of_its_parts() {
         let found = concerns(&axioms, "S(?x ?y), D(?y), A(?x)");
         if !found.is_empty() {
             wrong.push(format!("{axioms}: {found:?}, expected nothing"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An axiom outside the profile concludes the complement of its left side too: `L ⊑ R` is
+/// `¬R ⊑ ¬L` (D16-492, seed 700169's case 53). Each row below concludes, of some
+/// individual, an `S`-successor in `D` (OWL 2 Direct Semantics §2.2.3):
+/// - `≥ 1 S.(≤ 0 S.D) ⊑ ⊥` is `⊤ ⊑ ∀S.∃S.D`, so with `a S a` the individual `a` has an
+///   anonymous `S`-successor in `D`.
+/// - `¬∃S.D ⊑ C`, `≤ 0 S.D ⊑ C` and `∀S.¬D ⊑ C` each put everything outside `C` in `∃S.D`.
+/// - `C ≡ ≤ 0 S.D`, in its direction from the restriction to `C`.
+///
+/// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` and
+/// `A ⊓ B ⊑ C` conclude nothing of `S` or `D` from their left side: no concern.
+#[test]
+fn a_left_side_outside_the_profile_concludes_its_complement() {
+    let none = "ObjectMaxCardinality(0 :S :D)";
+    let mut wrong = Vec::new();
+    for lists in [false, true] {
+        for axioms in [
+            format!("SubClassOf(ObjectMinCardinality(1 :S {none}) owl:Nothing)"),
+            "SubClassOf(ObjectComplementOf(ObjectSomeValuesFrom(:S :D)) :C)".to_owned(),
+            format!("SubClassOf({none} :C)"),
+            "SubClassOf(ObjectAllValuesFrom(:S ObjectComplementOf(:D)) :C)".to_owned(),
+            format!("EquivalentClasses(:C {none})"),
+        ] {
+            let found = concerns_over(&axioms, "S(?x ?y), D(?y)", lists);
+            let on = |t: &str| found.iter().any(|c| c.starts_with(t));
+            if !(on("S: ") && on("D: ")) {
+                wrong.push(format!(
+                    "{axioms} (lists {lists}): {found:?}, expected S and D"
+                ));
+            }
+        }
+        for axioms in [
+            "SubClassOf(ObjectSomeValuesFrom(:S :D) owl:Nothing)",
+            "SubClassOf(ObjectIntersectionOf(:A :B) :C)",
+        ] {
+            let found = concerns_over(axioms, "S(?x ?y), D(?y)", lists);
+            if !found.is_empty() {
+                wrong.push(format!(
+                    "{axioms} (lists {lists}): {found:?}, expected nothing"
+                ));
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
