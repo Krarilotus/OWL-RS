@@ -153,9 +153,9 @@ runs out of its budget, or both in the portfolio's way.
 - **D:** transferred facts are deterministic consequences of the class (so backjumping
   ignores them). Blocking on a saturated label needs the JAIR 2015 conditions: not critical,
   not nominal-dependent, no tight at-most restriction.
-- The correctness target: HermiT times out on all three (300 s), and Konclude ends 7914 with
-  an error, so Konclude's taxonomies of 9724 and 9835 are the only references, and 7914 has
-  none (`classify-dev-2026-10-05.tsv`'s "differ" there compares NRESE's incomplete results).
+- The correctness target: of the references run, Konclude gives the taxonomies of 9724 and
+  9835, and 7914 has no reference taxonomy (`classify-dev-2026-10-05.tsv`'s "differ" there
+  compares NRESE's incomplete results).
   So a taxonomy is checked by brute force on fuzzed and shrunk cases (the existing campaign)
   and, on the tasks themselves, against Konclude, every difference adjudicated by a
   hypertableau test of the pair.

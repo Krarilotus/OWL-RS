@@ -25,7 +25,7 @@
   (copies under `shuffled-N/`): an engine whose time depends on the order shows it.
 - The comparison: per ontology the canonical taxonomies' hashes (classification) or the
   answers (consistency). Reference reasoners that disagree are listed: such a case is
-  settled by hand and recorded in `disputed.tsv`, never by a vote.
+  settled by hand and recorded in `private/disputed.tsv` (kept locally), never by a vote.
 - `stats`: per reasoner the solved count, PAR-2 (an unsolved task counts twice the limit),
   the median, p90, p95 and p99 over all tasks (unsolved ones at the limit), and the sum
   over the solved; `--by` stratum, track, family or size gives them per group.
