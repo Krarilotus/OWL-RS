@@ -10,6 +10,7 @@ use super::equality::{
 };
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
+use crate::index::{IndexVersion, QuadScan};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::resolve::Vocabulary;
 use crate::term::{Dictionary, TermId};
@@ -1024,6 +1025,8 @@ impl Snapshot {
     /// The expanded matches of `pattern` in `model`, in the order of its access plan,
     /// merged as they are read: nothing is collected. Every layout keeps the permutation a
     /// pattern's access plan reads (`Layout::supports`, tested over every pattern shape).
+    /// Out of line: only reads under equality build one ([`Self::quads_for_pattern_in`]).
+    #[inline(never)]
     fn expanded<'a>(
         &'a self,
         classes: Arc<EqualityClasses>,
@@ -1463,24 +1466,43 @@ impl Snapshot {
     /// All quads matching `pattern` in `model`: asserted matches first, then inferred ones,
     /// each part in the order of its access permutation. O(r log n + k·r) for k results over
     /// r runs. The iterator borrows only the snapshot, not `pattern`.
+    ///
+    /// Kept small enough to inline where it is called: a caller probing once per binding (a
+    /// text search's object test, a path's step, SHACL's value reads) pays for a call and a
+    /// moved iterator otherwise (docs-prefix-w12 against main, 11 Nov). So the read with no
+    /// equality to apply (the asserted model, or no `owl:sameAs` closure and no canonical
+    /// view) takes the pattern as given from this snapshot's version, and the rest is out of
+    /// line ([`Self::equality_read`], [`Self::expanded`]).
+    #[inline]
     pub fn quads_for_pattern_in<'a>(
         &'a self,
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
-        let pattern = self.read_pattern(model, pattern);
-        let pattern = &*pattern;
-        if let Some(classes) = self.expanding(model, pattern) {
-            return Either::Left(self.expanded(classes, model, pattern));
+        let plain = model == ReadModel::Asserted
+            || (self.equality.is_none() && self.canonical_data.is_none());
+        let (classes, pattern, data) = if plain {
+            (None, *pattern, &self.version)
+        } else {
+            self.equality_read(model, pattern)
+        };
+        if let Some(classes) = classes {
+            return Either::Left(self.expanded(classes, model, &pattern));
         }
-        let pattern = *pattern;
-        let data = self.data(model);
-        Either::Right(
-            Stack::ALL
-                .into_iter()
-                .filter(move |&stack| model.includes(stack))
-                .flat_map(move |stack| data.stack(stack).scan(&pattern)),
-        )
+        Either::Right(StackScans::new(data, model, pattern))
+    }
+
+    /// [`Self::quads_for_pattern_in`]'s setup where equality may apply: the classes the read
+    /// expands by, if any, the pattern as the read takes it ([`Self::read_pattern`]), and the
+    /// version it reads ([`Self::data`]).
+    #[inline(never)]
+    fn equality_read(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+    ) -> (Option<Arc<EqualityClasses>>, QuadPattern, &Arc<Version>) {
+        let pattern = *self.read_pattern(model, pattern);
+        (self.expanding(model, &pattern), pattern, self.data(model))
     }
 
     /// Number of quads matching `pattern`, asserted and inferred ([`Self::count_in`]).
@@ -2793,6 +2815,46 @@ fn merge_columns(
         }
     }
     out
+}
+
+/// [`Snapshot::quads_for_pattern_in`]'s plain read: the matches in a model's stacks, asserted
+/// first, one stack's scan held at a time. A `flat_map` over the stacks held two scans and
+/// the stacks' iterator, all made and moved on every lookup.
+struct StackScans<'a> {
+    scan: QuadScan<'a>,
+    /// The stack still to read once `scan` ends, with the pattern.
+    then: Option<(&'a IndexVersion, QuadPattern)>,
+}
+
+impl<'a> StackScans<'a> {
+    #[inline]
+    fn new(data: &'a Version, model: ReadModel, pattern: QuadPattern) -> Self {
+        let mut stacks = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| data.stack(stack));
+        let scan = stacks
+            .next()
+            .expect("every model reads a stack")
+            .scan(&pattern);
+        let then = stacks.next().map(|stack| (stack, pattern));
+        Self { scan, then }
+    }
+}
+
+impl Iterator for StackScans<'_> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        loop {
+            if let Some(quad) = self.scan.next() {
+                return Some(quad);
+            }
+            let (stack, pattern) = self.then.take()?;
+            self.scan = stack.scan(&pattern);
+        }
+    }
 }
 
 /// One of two iterators.

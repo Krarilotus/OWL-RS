@@ -53,6 +53,15 @@ impl Ord for Head {
     }
 }
 
+impl Head {
+    fn of((cursor, input): (usize, &Cursor<'_>)) -> Self {
+        Self {
+            key: input.key,
+            cursor,
+        }
+    }
+}
+
 impl PartialOrd for Head {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -104,7 +113,22 @@ const fn levels(len: usize) -> u64 {
     (usize::BITS - len.leading_zeros()) as u64
 }
 
-impl Cursor<'_> {
+impl<'a> Cursor<'a> {
+    /// At the start of `run`'s range `pos..end`, its first key read.
+    #[inline]
+    fn at((run, pos, end): (&'a PermutationRun, usize, usize)) -> Self {
+        worked(1);
+        let (key, buffer, buffered) = (run.keys.get(pos), Vec::new(), pos + 1);
+        Self {
+            run,
+            pos,
+            end,
+            key,
+            buffer,
+            buffered,
+        }
+    }
+
     /// The units [`Self::advance`] does, and what a step does with the key it was at. Moving
     /// and reading the sign is 1, and handing the key on is 1. Then 1 more for reading the
     /// next key, or the keys of its block it decodes (at most [`BLOCK`]).
@@ -180,18 +204,31 @@ pub(crate) struct SignedMerge<'a> {
 }
 
 impl<'a> SignedMerge<'a> {
-    /// `parts` are `(run, start, end)` index ranges; empty ranges are dropped up front.
+    /// `parts` are `(run, start, end)` index ranges; empty ranges are dropped up front. Built at
+    /// once, counting nothing, its heap (over more than [`LINEAR_UP_TO`]) from all heads together;
+    /// a counted read adds its ranges instead ([`Self::add`]).
     pub(crate) fn new(parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>) -> Self {
-        let mut merge = Self {
-            cursors: Vec::new(),
-            heaped: false,
-            heads: BinaryHeap::new(),
-            single: None,
-            left: 0,
-            stopped: false,
+        let cursors: Vec<_> = parts
+            .into_iter()
+            .filter(|&(_, pos, end)| pos < end)
+            .map(Cursor::at)
+            .collect();
+        let heaped = cursors.len() > LINEAR_UP_TO;
+        let heads = if heaped {
+            cursors.iter().enumerate().map(Head::of).collect()
+        } else {
+            BinaryHeap::new()
         };
-        merge.refill(parts);
-        merge
+        let left = cursors.iter().map(|cursor| cursor.end - cursor.pos).sum();
+        let (single, stopped) = (None, false);
+        Self {
+            cursors,
+            heaped,
+            heads,
+            single,
+            left,
+            stopped,
+        }
     }
 
     /// The merge of `parts` in place of what this one had left, its cursors' and heads'
@@ -236,25 +273,13 @@ impl<'a> SignedMerge<'a> {
             self.stopped = true;
             return false;
         }
-        worked(1);
-        let key = run.keys.get(pos);
-        self.cursors.push(Cursor {
-            run,
-            pos,
-            end,
-            key,
-            buffer: Vec::new(),
-            buffered: pos + 1,
-        });
+        self.cursors.push(Cursor::at((run, pos, end)));
         self.left += end - pos;
         if self.heaped {
-            self.heads.push(Head { key, cursor });
+            self.heads.push(Head::of((cursor, &self.cursors[cursor])));
         } else if cursor == LINEAR_UP_TO {
-            for (cursor, input) in self.cursors.iter().enumerate() {
-                self.heads.push(Head {
-                    key: input.key,
-                    cursor,
-                });
+            for head in self.cursors.iter().enumerate().map(Head::of) {
+                self.heads.push(head);
             }
             self.heaped = true;
         }
