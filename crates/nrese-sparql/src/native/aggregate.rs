@@ -207,8 +207,10 @@ impl Aggregator<'_> {
         distinct: bool,
     ) -> Option<Agg> {
         let dedup = |ids: &mut Vec<u64>| {
-            let mut seen = std::collections::HashSet::with_capacity(ids.len());
-            ids.retain(|id| seen.insert(*id));
+            // Ids hashed as the joins and groups hash them (foldhash), not by SipHash.
+            let mut seen =
+                nrese_exec::IdMap::with_capacity_and_hasher(ids.len(), Default::default());
+            ids.retain(|&id| seen.insert(id, ()).is_none());
         };
         match name {
             AggregateFunction::Count => {
