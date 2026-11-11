@@ -72,8 +72,10 @@ pub(super) fn parse_store_config(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
             machine,
         )?,
-        huge_pages: match choice(source, names::HUGE_PAGES, &["off", "on"])? {
-            Some(on) => on == 1,
+        huge_pages: match choice(source, names::HUGE_PAGES, &["off", "on", "bulk"])? {
+            Some(0) => nrese_store::memory::HugePages::Off,
+            Some(1) => nrese_store::memory::HugePages::On,
+            Some(_) => nrese_store::memory::HugePages::Bulk,
             None => defaults.huge_pages,
         },
         reasoning_release: match choice(source, names::REASONING_RELEASE, &["off", "on"])? {

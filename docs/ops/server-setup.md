@@ -338,6 +338,12 @@ not leak: the program's own memory stays level (a test checks it,
 `crates/nrese-store/tests/memory_churn.rs`). With `budgets.huge_pages = "off"` the same
 soak held 95 to 120 MiB (the system allocator: 75 to 85 MiB), and materialising LUBM 100
 took 26 % longer. Choose `off` where serving memory matters more than reasoning speed.
+`budgets.huge_pages = "bulk"` takes both: huge pages back the process only while a bulk load
+or a materialisation runs (a load, a rematerialisation at start or after a change of rules, a
+commit's fallback to one), and are off otherwise. On LUBM 100's materialised closure (22 M
+statements; 11 November 2026, a builder host) the allocator held about 13 MiB per pool thread
+after the query mix with huge pages and about 6 MiB without: at 32 threads the process's peak
+was 917 MiB with them and 636 MiB without, the queries' times within their spread.
 
 `benches/probes/soak.py` reads every gauge above beside resident memory and prints each
 one's slope; on Linux it also splits resident memory by mapping (the allocator, stacks,
