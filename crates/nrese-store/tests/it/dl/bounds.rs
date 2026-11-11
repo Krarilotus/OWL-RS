@@ -26,8 +26,9 @@ const SCHEMA: &str = ":Person rdfs:subClassOf [ a owl:Restriction ; owl:onProper
 fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     let mut out = std::collections::BTreeMap::new();
     for fact in facts {
-        let key = fact.clone().map(|t| match t.starts_with("<urn:nrese:u1:") {
-            true => "<urn:nrese:u1:*>".to_owned(),
+        let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
+        let key = fact.clone().map(|t| match own(&t) {
+            true => "<U1's own>".to_owned(),
             false => t,
         });
         *out.entry(key).or_insert(0) += 1;
@@ -184,7 +185,7 @@ fn the_upper_bound_is_never_visible_as_inferred_data() {
         .execute_query_str("SELECT * { ?s ?p ?o }")
         .expect("query");
     let text = String::from_utf8(result.payload).expect("utf8");
-    assert!(!text.contains("urn:nrese:u1:"), "{text}");
+    assert!(!text.contains("dl u1 "), "{text}");
     // That ann has a parent is certain; who isn't.
     assert!(ask(&dl, ":ann :parent ?someone"));
     let result = dl

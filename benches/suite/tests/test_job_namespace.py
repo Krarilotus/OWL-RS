@@ -223,12 +223,16 @@ class JobNamespaces(unittest.TestCase):
             self.assertIn("not removed: nrese-target-work", done.stdout)
 
     def test_python_and_shell_name_alike(self):
+        # Master r3 B1: shell launch labels and Python labels share exact fleet ownership.
         with tempfile.TemporaryDirectory() as tmp:
             for job in ("", "Consol-SCC@office"):
-                done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"',
+                done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"; '
+                                       'printf "\\n"; ns_run_args case "$1" suite; printf "%s\\n" "${NS_ARGS[@]}"',
                                        "-", Path(tmp).as_posix()], env={**os.environ, "FLEET_JOB": job},
                                       capture_output=True, text=True)
-                self.assertEqual(done.stdout, ns.name("target", tmp, {"FLEET_JOB": job}))
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout.splitlines()[0], ns.name("target", tmp, {"FLEET_JOB": job}))
+                self.assertEqual(done.stdout.splitlines()[1:], ns.name_args("case", tmp, "suite", {"FLEET_JOB": job}))
 
 
 @unittest.skipUnless(BASH, "needs bash")

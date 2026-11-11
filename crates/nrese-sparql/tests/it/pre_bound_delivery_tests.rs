@@ -70,7 +70,7 @@ fn with_this(value: Term) -> QueryOptions {
 }
 
 /// A SELECT's rows as sorted lines, each value in projection order.
-fn lines(rows: impl Iterator<Item = Vec<Option<Term>>>) -> Vec<String> {
+pub(crate) fn lines(rows: impl Iterator<Item = Vec<Option<Term>>>) -> Vec<String> {
     let mut out: Vec<String> = rows
         .map(|row| {
             row.iter()
@@ -83,7 +83,7 @@ fn lines(rows: impl Iterator<Item = Vec<Option<Term>>>) -> Vec<String> {
     out
 }
 
-fn serialised(results: QueryResults<'_>, format: QueryResultsFormat) -> Vec<u8> {
+pub(crate) fn serialised(results: QueryResults<'_>, format: QueryResultsFormat) -> Vec<u8> {
     let serializer = QueryResultsSerializer::from_format(format);
     let mut out = Vec::new();
     match results {

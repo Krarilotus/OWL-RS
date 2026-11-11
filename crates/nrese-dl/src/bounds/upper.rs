@@ -60,11 +60,12 @@ use super::program::{
     Approximations, Atom, Names, Origin, Program, Provenance, Rule, Signature, Slot,
 };
 use crate::datatypes::Ranges;
+// U1's own terms (fresh classes, Skolem constants, the clash) are named by `u1`: apart
+// from every term the data holds.
+use crate::internal::u1;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
-/// The namespace of U1's own terms (fresh classes, Skolem constants, the clash).
-pub const U1: &str = "urn:nrese:u1:";
 /// The most atoms U1 puts in a rule head (the reasoner takes fewer than 256 per rule).
 const MAX_HEAD: usize = 128;
 
@@ -109,9 +110,9 @@ pub fn compile_with(
         rdf_type: iri(&format!("{RDF}type")),
         same_as: iri(&format!("{OWL}sameAs")),
         thing: iri(&format!("{OWL}Thing")),
-        clash: iri(&format!("{U1}clash")),
+        clash: iri(&u1("clash")),
         fresh: (0..normalised.fresh.len())
-            .map(|q| iri(&format!("{U1}fresh{q}")))
+            .map(|q| iri(&u1(format_args!("fresh{q}"))))
             .collect(),
         skolems: Vec::new(),
         projections: Vec::new(),
@@ -192,7 +193,7 @@ impl Compiler<'_> {
         if let Some(&class) = self.nominals.get(&a) {
             return class;
         }
-        let class = (self.iri)(&format!("{U1}nominal{a}"));
+        let class = (self.iri)(&u1(format_args!("nominal{a}")));
         self.program.add_internal(class);
         self.nominals.insert(a, class);
         let provenance = Provenance {
@@ -403,7 +404,7 @@ impl Compiler<'_> {
         // 2,429 rules of OWL2Bench's differences), and right under equality by copying
         // and by representatives alike (two equal individuals make `x different x`).
         let clash = self.program.names.clash;
-        let different = self.own(&format!("{U1}different"));
+        let different = self.own(&u1("different"));
         let (x, y) = (Slot::Var(0), Slot::Var(1));
         let mut negated: BTreeMap<Term, Term> = BTreeMap::new();
         for &(a, b, source) in &facts.different {
@@ -420,7 +421,7 @@ impl Compiler<'_> {
             let not = match negated.get(&p) {
                 Some(&not) => not,
                 None => {
-                    let not = self.own(&format!("{U1}not{p}"));
+                    let not = self.own(&u1(format_args!("not{p}")));
                     negated.insert(p, not);
                     not
                 }
@@ -485,7 +486,7 @@ impl Compiler<'_> {
             sources: Vec::new(),
             approximations: Approximations::default(),
         };
-        let domain = self.skolem(&format!("{U1}domain"));
+        let domain = self.skolem(&u1("domain"));
         let fact = [domain, self.program.names.rdf_type, thing];
         self.program.facts.push((fact, provenance.clone()));
         let sig = self.program.signature.clone();
