@@ -15,7 +15,11 @@ queries = "hierarchy"
 metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
 route = { "reason.rounds" = "<= 3" }
-cap_gb = 8
+# 18 GB, not 8 (11 Nov 2026), for both hierarchy cases: main completes this hierarchy only above
+# 8 GB (peaks of 13,780 MiB here and 13,299 MiB under RDFS, at a 16 GB cap; v1.5 and the
+# candidate stay near 2 GiB), and a cap every side completes under, with room for a timed
+# repetition, lets the pair be timed and the memory difference be reported.
+cap_gb = 18
 systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:closure", "oxigraph:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["schema compiled first: sup⁺(c) dispatch, hierarchy module by SCC and bitsets"]
 pinned = "the generator's counts"
@@ -30,7 +34,7 @@ queries = "hierarchy"
 metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
 route = { "reason.rounds" = "<= 3" }
-cap_gb = 8
+cap_gb = 18
 systems = ["jena:rdfs", "rdf4j:rdfs", "graphdb:rdfs", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"
 [[case]]
@@ -1928,6 +1932,7 @@ args = ["--runs", "20"]
 
 [[case]]
 name = "rdf12-join-2g"
+absent = { main = "way to complete this join within 2 GiB", base = "way to complete this join within 2 GiB" }
 area = "service"
 what = "asserted statements joined to the reifiers of their own triple terms, in 2 GiB"
 semantics = "none"
@@ -2645,6 +2650,7 @@ systems = []
 
 [[case]]
 name = "ql-owl2bench"
+absent = { main = "OWL 2 QL tree-witness rewriting and each answer's status" }
 area = "reasoning"
 what = "OWL2Bench's QL profile under owl2-ql: the RL closure and the tree-witness rewriting of each query (its rewrites and completeness recorded)"
 semantics = "owl2-ql"
@@ -2664,6 +2670,7 @@ pinned = "NRESE 6 Oct 2026; the printed queries (ql_print_check) give the same r
 repeat = 4
 [[case]]
 name = "dlmode-lubm1"
+absent = { main = "OWL 2 DL reasoning mode" }
 area = "dl"
 what = "LUBM 1 under owl2-dl: the 14 queries over the bounds, each answer's status (sound, complete) and the path that decided it"
 semantics = "owl2-dl"
