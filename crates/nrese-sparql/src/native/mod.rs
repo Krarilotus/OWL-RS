@@ -5470,8 +5470,10 @@ impl<'a> Context<'a> {
                 ordered: false,
             })
         })?;
-        let pass = self.filter_mask(&keys, expr)?;
-        drop(keys);
+        // The keys' table and its charge go before an error returns, too.
+        let pass = self.filter_mask(&keys, expr);
+        self.consumed(keys);
+        let pass = pass?;
         let passed = walks
             .iter()
             .flat_map(|groups| groups.iter())

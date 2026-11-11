@@ -6752,13 +6752,13 @@ fn counts_under_a_key_filter_equal_the_reference() {
                 .into_iter()
                 .map(|step| step.operator)
                 .collect();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            assert_same_rows(&native, &expected, &text);
             assert!(
                 operators.iter().any(|o| o == "key count"),
                 "{text}: no key count among {operators:?}"
             );
-            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
-            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
-            assert_same_rows(&native, &expected, &text);
         }
     }
     // Not the key's alone: the general path, with the same answers.
@@ -6782,12 +6782,12 @@ fn counts_under_a_key_filter_equal_the_reference() {
             .into_iter()
             .map(|step| step.operator)
             .collect();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_same_rows(&native, &expected, &text);
         assert!(
             !operators.iter().any(|o| o == "key count"),
             "{text}: a key count among {operators:?}"
         );
-        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
-        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
-        assert_same_rows(&native, &expected, &text);
     }
 }
