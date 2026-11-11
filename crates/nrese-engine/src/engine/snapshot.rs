@@ -10,6 +10,7 @@ use super::equality::{
 };
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
+use crate::index::{IndexVersion, QuadScan};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::resolve::Vocabulary;
 use crate::term::{Dictionary, TermId};
@@ -1488,12 +1489,7 @@ impl Snapshot {
         if let Some(classes) = classes {
             return Either::Left(self.expanded(classes, model, &pattern));
         }
-        Either::Right(
-            Stack::ALL
-                .into_iter()
-                .filter(move |&stack| model.includes(stack))
-                .flat_map(move |stack| data.stack(stack).scan(&pattern)),
-        )
+        Either::Right(StackScans::new(data, model, pattern))
     }
 
     /// [`Self::quads_for_pattern_in`]'s setup where equality may apply: the classes the read
@@ -2819,6 +2815,46 @@ fn merge_columns(
         }
     }
     out
+}
+
+/// [`Snapshot::quads_for_pattern_in`]'s plain read: the matches in a model's stacks, asserted
+/// first, one stack's scan held at a time. A `flat_map` over the stacks held two scans and
+/// the stacks' iterator, all made and moved on every lookup.
+struct StackScans<'a> {
+    scan: QuadScan<'a>,
+    /// The stack still to read once `scan` ends, with the pattern.
+    then: Option<(&'a IndexVersion, QuadPattern)>,
+}
+
+impl<'a> StackScans<'a> {
+    #[inline]
+    fn new(data: &'a Version, model: ReadModel, pattern: QuadPattern) -> Self {
+        let mut stacks = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| data.stack(stack));
+        let scan = stacks
+            .next()
+            .expect("every model reads a stack")
+            .scan(&pattern);
+        let then = stacks.next().map(|stack| (stack, pattern));
+        Self { scan, then }
+    }
+}
+
+impl Iterator for StackScans<'_> {
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        loop {
+            if let Some(quad) = self.scan.next() {
+                return Some(quad);
+            }
+            let (stack, pattern) = self.then.take()?;
+            self.scan = stack.scan(&pattern);
+        }
+    }
 }
 
 /// One of two iterators.
