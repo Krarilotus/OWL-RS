@@ -688,25 +688,15 @@ fn generated_cases_answer_as_the_dl_oracle() {
             inconclusive.push(format!("the deadline passed after {i} of {cases} cases"));
             break;
         }
-        // An inconsistent case says nothing of `complete` here, so it is drawn again, up to
-        // three times (counted), and the families keep their share: nearly half the
-        // verdicts of `dlorc-g1-measure2-6cc10f32` were inconsistent.
-        let mut tries = 0u64;
-        let (seed, turtle, family, queries, first) = loop {
-            let seed = (i ^ base.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_add(tries << 40);
-            let (turtle, family, queries) = generated(seed);
-            let case = Case {
-                name: family,
-                turtle: &turtle,
-                query: &queries[0],
-            };
-            let first = verdicts(&case, Relation::Direct, &expiry);
-            if tries == 3 || !first.iter().any(|(_, v)| *v == Verdict::Inconsistent) {
-                break (seed, turtle, family, queries, first);
-            }
-            tries += 1;
-            redrawn += 1;
-        };
+        let Drawn {
+            seed,
+            tries,
+            turtle,
+            family,
+            queries,
+            first,
+        } = drawn(i, base, &expiry);
+        redrawn += tries;
         let at = format!("base {base}, case {i}, redraw {tries}, seed {seed} ({family})");
         for (n, query) in queries.iter().enumerate() {
             let case = Case {
@@ -752,6 +742,64 @@ fn generated_cases_answer_as_the_dl_oracle() {
     inconclusive.extend(judge(&counts, deadline));
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
+}
+
+/// How often a case is drawn again while owl2-dl finds it inconsistent. About one draw in
+/// six is (`NRESE_FUZZ_SEED=158`: 19 redraws for 100 cases). With three, a case still
+/// inconsistent came about once in fifteen runs, and in a family of a few cases it was over
+/// the family's fifth, a run inconclusive on a draw (D16-460); with ten, about once in
+/// three million runs, where the family's draws are as often inconsistent.
+const REDRAWS: u64 = 10;
+
+/// A case of the generated run as drawn: its seed, how often it was drawn again, its
+/// N-Triples, family and queries, and the verdicts of its first query.
+struct Drawn {
+    seed: u64,
+    tries: u64,
+    turtle: String,
+    family: &'static str,
+    queries: Vec<String>,
+    first: Vec<(Ruleset, Verdict)>,
+}
+
+/// Case `i` of the generated run with seed `base`. An inconsistent case says nothing of
+/// `complete` here, so it is drawn again, up to [`REDRAWS`] times, in the family of its
+/// first draw: the families keep their share (nearly half the verdicts of
+/// `dlorc-g1-measure2-6cc10f32` were inconsistent), and a family owl2-dl finds inconsistent
+/// throughout stays counted, over its fifth (D16-460).
+fn drawn(i: u64, base: u64, expiry: &Expiry) -> Drawn {
+    let (mut k, mut tries) = (0u64, 0u64);
+    let mut first_family = None;
+    loop {
+        let seed = seed(i, base, k);
+        k += 1;
+        let (turtle, family, queries) = generated(seed);
+        if *first_family.get_or_insert(family) != family {
+            continue;
+        }
+        let case = Case {
+            name: family,
+            turtle: &turtle,
+            query: &queries[0],
+        };
+        let first = verdicts(&case, Relation::Direct, expiry);
+        if tries == REDRAWS || !first.iter().any(|(_, v)| *v == Verdict::Inconsistent) {
+            return Drawn {
+                seed,
+                tries,
+                turtle,
+                family,
+                queries,
+                first,
+            };
+        }
+        tries += 1;
+    }
+}
+
+/// The seed of draw `k` of case `i` of the generated run with seed `base`.
+fn seed(i: u64, base: u64, k: u64) -> u64 {
+    (i ^ base.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_add(k << 40)
 }
 
 /// Verdicts per family, as the generated test counts them: agree, reported, missed,
@@ -805,4 +853,30 @@ fn a_run_past_its_deadline_is_inconclusive() {
     assert!(judge(&counts, now + std::time::Duration::from_secs(60)).is_empty());
     let past = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
     assert!(!judge(&counts, past).is_empty(), "passed past its deadline");
+}
+
+/// - Input: case 95 of the generated run with `NRESE_FUZZ_SEED=158`, inconsistent in
+///   its first four draws (D16-460): kept so, it was 8 of its family's 34 verdicts, over
+///   the family's fifth, and the run was inconclusive on a draw. Then a family whose every
+///   verdict is inconsistent, beside a family that agrees.
+/// - Expected: the case drawn again, in the family of its first draw, until its first
+///   query's verdicts are compared (neither inconsistent nor undecided). A family owl2-dl
+///   finds inconsistent throughout, which redraws in it keep counted, is over its fifth.
+#[test]
+fn seed_158s_inconsistent_case_is_drawn_again_in_its_family_until_compared() {
+    let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(120));
+    let case = drawn(95, 158, &expiry);
+    let compared = (case.first.iter())
+        .all(|(_, v)| !matches!(v, Verdict::Inconsistent | Verdict::Undecided(_)));
+    assert!(compared, "{:?} after {} redraws", case.first, case.tries);
+    let family = generated(seed(95, 158, 0)).1;
+    assert_eq!(case.family, family, "redrawn in another family");
+    assert!(case.tries > 0, "its first draw is consistent");
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let rejected = [
+        ("asserted", [0, 0, 0, 0, 0, 10]),
+        ("uniform", [90, 0, 0, 0, 0, 0]),
+    ];
+    let rejected: Counts = rejected.into_iter().collect();
+    assert_eq!(judge(&rejected, later), ["asserted: 10 of 10 undecided"]);
 }
