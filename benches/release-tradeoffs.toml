@@ -55,3 +55,347 @@
 # by = "Johannes"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
+
+# The release baselines' measurement builds can't run these cases yet, though their products
+# can (a static audit of each build against each case's command, 11 Nov 2026). Each pair stays
+# uncompared until the port its entry names lands.
+
+[[absence]]
+cases = ["checkpoint-under-readers", "checkpoint-under-readers-commits", "checkpoint-under-readers-w1"]
+side = "base"
+reason = "base's measurement build doesn't parse --checkpoint-after-wal-bytes"
+port = "the measurement tool's checkpoint trigger ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["snapshot-private-cost"]
+side = "base"
+reason = "base's measurement build doesn't parse --held-views --staggered-views"
+port = "the measurement tool's held views ported to base's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["dl-abox-lubm1", "dl-datatypes", "dl-keys-100", "dl-keys-1200", "dl-keys-128x3", "dl-keys-2400", "dl-keys-400", "dl-keys-8x3", "dl-nominals", "dl-number", "dl-number-fragment", "dl-pipeline", "dl-roles", "dl-transitive", "dl-transitive-400"]
+side = "base"
+reason = "base's measurement build doesn't parse --memory-mib"
+port = "the DL consistency tool's shared memory limit ported to base's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["parse-turtle-flat", "parse-turtle-nested"]
+side = "base"
+reason = "base's measurement build doesn't parse --parse-turtle"
+port = "the measurement tool's Turtle parsing mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["vector-knn-filtered"]
+side = "base"
+reason = "base's measurement build doesn't parse --prepare-vector-graph"
+port = "the measurement tool's vector graph preparation ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["graphs4-reader"]
+side = "base"
+reason = "base's measurement build doesn't parse --read-graphs"
+port = "the measurement tool's named-graph reader mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["recovery-catchup-cost"]
+side = "base"
+reason = "base's measurement build doesn't parse --recovery --recovery-prepare"
+port = "the measurement tool's recovery mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["split-turtle-flat", "split-turtle-nested"]
+side = "base"
+reason = "base's measurement build doesn't parse --split-turtle"
+port = "the measurement tool's Turtle splitting mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["support-copies-16", "support-copies-17-capped", "support-copies-256-capped", "support-copies-8", "support-ladder-16", "support-ladder-256-capped", "support-ladder-4096-capped", "support-product-1024-capped", "support-product-256-capped", "support-product-4096-capped", "support-product-64-capped"]
+side = "base"
+reason = "base's measurement build doesn't parse --support-reader --support-commits --support-sets"
+port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["support-copies-16-capped", "support-copies-17", "support-copies-256", "support-copies-8-capped", "support-ladder-16-capped", "support-ladder-256", "support-ladder-4096", "support-product-1024", "support-product-256", "support-product-4096", "support-product-4096-limit", "support-product-4096-limit-capped", "support-product-64"]
+side = "base"
+reason = "base's measurement build doesn't parse --support-sets --support-reader --support-commits"
+port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["support-pending-read", "support-update-committed", "support-update-pending"]
+side = "base"
+reason = "base's measurement build doesn't parse --support-sets --support-reader --support-commits --support-updates"
+port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-graph-nt", "upload-graph-ttl"]
+side = "base"
+reason = "base's measurement build doesn't parse --upload --upload-format"
+port = "the measurement tool's upload mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-statements-contexts", "upload-transaction-delete"]
+side = "base"
+reason = "base's measurement build doesn't parse --upload --upload-format --upload-as"
+port = "the measurement tool's upload mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["cache-replay", "cache-replay-cached"]
+side = "main"
+reason = "main's measurement build doesn't parse --cache-bytes"
+port = "the measurement tool's cache size setting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["canon-twins"]
+side = "main"
+reason = "main's measurement build doesn't parse --canonicalize"
+port = "the measurement tool's canonicalization mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["clients-lookups", "clients-sweep"]
+side = "main"
+reason = "main's measurement build doesn't parse --clients --duration-s"
+port = "the measurement tool's concurrent clients mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["commits-rdfs", "deletes-clique", "deletes-layered", "deletes-tail", "eq-giant-split", "first-load-chain", "first-load-chain-ranged", "rule-delta-sweep"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits"
+port = "the measurement tool's commits mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["commits-plain", "commits-readers", "eq-merge-compact", "ql-memberships-data-commits", "ql-memberships-type-commits-deep", "ql-memberships-type-commits-wide", "writes-under-readers"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits --readers"
+port = "the measurement tool's commits mode and concurrent readers ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["checkpoint-under-readers", "checkpoint-under-readers-commits"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits --readers --checkpoint-after-wal-bytes"
+port = "the measurement tool's commits mode, concurrent readers and checkpoint trigger ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["checkpoint-under-readers-w1"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits --readers --checkpoint-after-wal-bytes --threads"
+port = "the measurement tool's commits mode, concurrent readers, checkpoint trigger and thread setting ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["alloc-load", "alloc-lubm10", "index-join-keys"]
+side = "main"
+reason = "main's measurement build doesn't parse --count-allocations"
+port = "the measurement tool's allocation counting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["snapshot-private-cost"]
+side = "main"
+reason = "main's measurement build doesn't parse --held-views --staggered-views"
+port = "the measurement tool's held views ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["kernel-sort-u128"]
+side = "main"
+reason = "main's measurement build doesn't parse --kernel"
+port = "the measurement tool's kernel mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["parse-large"]
+side = "main"
+reason = "main's measurement build doesn't parse --parse-only"
+port = "the measurement tool's parse-only mode ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["parse-turtle-flat", "parse-turtle-nested"]
+side = "main"
+reason = "main's measurement build doesn't parse --parse-turtle"
+port = "the measurement tool's Turtle parsing mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["plan-estimates"]
+side = "main"
+reason = "main's measurement build doesn't parse --qerror"
+port = "the measurement tool's estimate-error mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["graphs4-reader"]
+side = "main"
+reason = "main's measurement build doesn't parse --read-graphs"
+port = "the measurement tool's named-graph reader mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["recovery-catchup-cost"]
+side = "main"
+reason = "main's measurement build doesn't parse --recovery --recovery-prepare"
+port = "the measurement tool's recovery mode ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["el-classify", "el-classify-irregular", "el-shallow-existentials"]
+side = "main"
+reason = "main's measurement build doesn't parse --repeat"
+port = "the EL classifier tool's repeat setting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["custom-tc"]
+side = "main"
+reason = "main's measurement build doesn't parse --rules"
+port = "the measurement tool's rules mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["split-turtle-flat", "split-turtle-nested"]
+side = "main"
+reason = "main's measurement build doesn't parse --split-turtle"
+port = "the measurement tool's Turtle splitting mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["load-threads", "rl-single-thread"]
+side = "main"
+reason = "main's measurement build doesn't parse --threads"
+port = "the measurement tool's thread setting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-graph-nt", "upload-graph-ttl"]
+side = "main"
+reason = "main's measurement build doesn't parse --upload --upload-format"
+port = "the measurement tool's upload mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-statements-contexts", "upload-transaction-delete"]
+side = "main"
+reason = "main's measurement build doesn't parse --upload --upload-format --upload-as"
+port = "the measurement tool's upload mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
