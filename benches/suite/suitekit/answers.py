@@ -6,8 +6,9 @@ an adjudication, or over several runs at once) without running anything.
 After a pair's timed queries, while its server still runs, each query is posted once more,
 untimed, and its SPARQL JSON result kept under the pair's logs (one file per query, system,
 cache mode and repetition). The recorder holds none of them parsed: it reads them back one
-query at a time when it classifies them, and an answer byte-identical to one already compared
-for the query (the same SHA-256) takes that comparison's result. The server's serve-phase
+query at a time when it classifies them, and an answer whose file holds the bytes it captured,
+byte-identical to one already compared for the query (the same SHA-256), takes that
+comparison's result (a reference's own captures are each checked in full). The server's serve-phase
 memory therefore includes this replay. At
 the end of the run `answers.json`, beside results.csv, holds every capture with its SHA-256,
 one verdict per query and system, and one per group (a distinct query on the same data).
@@ -685,7 +686,7 @@ class Recorder:
             code, body = post(url, {"query": text}, timeout=timeout)
             if code == -1:
                 raise ValueError(body)
-            path.write_text(body, encoding="utf-8")
+            path.write_bytes(body.encode())  # as hashed: the file shows it holds this capture
             capture.sha256 = hashlib.sha256(body.encode()).hexdigest()
             if code == 0:
                 waited = time.monotonic() - started
@@ -698,14 +699,27 @@ class Recorder:
         return capture
 
     @staticmethod
-    def read(capture: Capture) -> Answer | None:
-        """A capture's answer, parsed from its file for as long as the caller holds it; None,
-        and the capture's error set, where it failed or its file can't be read as one."""
+    def body(capture: Capture) -> bytes | None:
+        """A capture's answer as its file holds it; None, and the capture's error set, where it
+        failed or its file can't be read."""
         if capture.error:
             return None
         try:
-            return parse(Path(capture.path).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
+            return Path(capture.path).read_bytes()
+        except OSError as error:
+            capture.error = f"{type(error).__name__}: {error}"[:300]
+            return None
+
+    @classmethod
+    def read(cls, capture: Capture, body: bytes | None = None) -> Answer | None:
+        """A capture's answer, parsed from its file (or BODY, read from it) for as long as the
+        caller holds it; None, and the capture's error set, where it isn't one."""
+        body = cls.body(capture) if body is None else body
+        if body is None:
+            return None
+        try:
+            return parse(body.decode("utf-8"))
+        except ValueError as error:
             capture.error = f"{type(error).__name__}: {error}"[:300]
             return None
 
@@ -715,19 +729,19 @@ class Recorder:
 
     def usable(self, item: tuple, system: str) -> tuple[Answer | None, Answer | None, str]:
         """A reference candidate's answer and its pool without the LIMIT, or None and why not.
-        Its other captures are read one at a time; one byte-identical to the first is the same."""
+        Its other captures are read and checked against the first one at a time, each in full
+        (equal bytes don't show a LIMIT answer's place in the pool)."""
         own = self.own(item, system)
         order, limit = self.orders.get(item, ("bag", None))
         first = self.read(own[0]) if own else None
-        pool = next(filter(None, map(self.read, self.own(item, system, unlimited=True))), None)
+        pools = [self.read(c) for c in self.own(item, system, unlimited=True)]
+        pool = next((p for p in pools if p is not None), None)
         full = pool if order == "limit" else first
         failed, differ = first is None, False
         for c in own[1:]:
-            if first is not None and not c.error and c.sha256 is not None and c.sha256 == own[0].sha256:
-                continue
             answer = self.read(c)
             failed = failed or answer is None
-            if answer is not None and full is not None and not first.blank and not differ:
+            if not failed and not differ and not first.blank and full is not None:
                 differ = not compare(answer, first, order, limit, full)["strict_match"]
         if failed:
             return None, None, f"{system} has no complete answer"
@@ -783,14 +797,19 @@ class Recorder:
             return entry("incomplete", "not captured")
         order, limit = self.orders.get(item, ("bag", None))
         comparing = reference["system"] not in (None, system) and not reference["dispute"]
-        # Each capture read, held against the oracle and compared, one at a time; a byte-identical
-        # answer takes the result of one already compared: the comparison's, nothing of its capture.
+        # Each capture read, held against the oracle and compared, one at a time. One whose file
+        # holds the bytes it captured (its SHA-256) takes the result of a byte-identical answer
+        # already compared: the comparison's, nothing of its capture.
         results, failed = [], []
         for c in own:
-            key = (c.sha256, comparing) if c.sha256 is not None and not c.error else None
+            body = self.body(c)
+            if body is None:
+                failed.append(c)
+                continue
+            key = (c.sha256, comparing) if hashlib.sha256(body).hexdigest() == c.sha256 else None
             found = reference["compared"].get(key)
             if found is None:
-                answer = self.read(c)
+                answer, body = self.read(c, body), None
                 if answer is None:
                     failed.append(c)
                     continue
@@ -844,6 +863,7 @@ class Recorder:
                                 query_sha256=self.queries.get(item), order=order, system=system,
                                 reference=reference["system"] or "-", captures=len(self.own(item, system)),
                                 **self.verdict(item, system, reference)))
+            del reference  # its answers, before the next item's are read
         return out
 
     def group_key(self, item: tuple) -> tuple:
