@@ -44,7 +44,7 @@ from maintenance import CountingWriter, NreseBinary, update  # noqa: E402
 from suitekit import quiet  # noqa: E402
 from suitekit.adapters import Context, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
-from suitekit.runtime import DockerRuntime, Mount  # noqa: E402
+from suitekit.runtime import DockerRuntime, Mount, memory_fields  # noqa: E402
 from suitekit.schema import Result  # noqa: E402
 
 
@@ -125,7 +125,8 @@ def run_case(args, case: dict, rep: int, runtime: DockerRuntime, writer, results
         step = nrese.load(ctx, store, ["/data/facts.nt"], "custom")
         m = step.measured
         writer.write(row("load", status="ok" if m.ok else "timeout" if m.timed_out else "failed", ms=m.ms,
-                         peak_mib=m.peak_mib or "", note=f"the program as user rules, {args.cpus} CPU(s)"))
+                         **memory_fields(m.peak_mib, m.memory_kind, m.memory_note,
+                                         before=f"the program as user rules, {args.cpus} CPU(s)")))
         if not m.ok:
             return
         endpoint = nrese.serve(ctx, store, "custom")
@@ -149,8 +150,9 @@ def run_case(args, case: dict, rep: int, runtime: DockerRuntime, writer, results
                              note="the closure after every sample was deleted and added back: "
                                   + ("the base's size" if same else f"{after} against the base's {base}")))
         finally:
-            peak = nrese.stop(ctx)
-            writer.write(row("serve", peak_mib=peak or "", note="the server's peak over the maintenance"))
+            peak, kind, memory_note = nrese.stop_memory(ctx)
+            writer.write(row("serve", **memory_fields(peak, kind, memory_note,
+                                                      before="the server's peak over the maintenance")))
     finally:
         runtime.remove_store(store)
         shutil.rmtree(work, ignore_errors=True)

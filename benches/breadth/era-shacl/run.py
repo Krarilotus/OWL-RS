@@ -36,6 +36,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import kit  # noqa: E402
+from suitekit.runtime import memory_fields  # noqa: E402  (kit put suitekit on the path)
 
 COMMIT = "fe109c940bf8f1b631f0b703bd7adfad07c570e5"
 REPO = "oeg-upm/ERA-SHACL-Benchmark"
@@ -151,15 +152,15 @@ def steps(args) -> int:
             base = dict(date=date, host=entry["machine"].get("host", ""), runtime="docker",
                         system=SYSTEM.get(engine, engine), version=ENGINES[engine][2], publish="free",
                         workload="era-shacl", tier=subset, regime="none", run=rep)
-            note = f"container peak over load and validation (docker stats, sampled); exit {measured.rc}"
+            peak = (measured.peak_mib, measured.memory_kind, measured.memory_note)
             writer.write(kit.Result(**base, task="load", status=status,
                                     ms=got["load_s"] * 1000 if "load_s" in got else "",
-                                    peak_mib=measured.peak_mib or "", rows=int(got.get("statements", 0)) or "",
-                                    note=note))
+                                    rows=int(got.get("statements", 0)) or "",
+                                    **memory_fields(*peak, before=f"container peak over load and validation; exit {measured.rc}")))
             writer.write(kit.Result(**base, task="validate", item=shape, status=status,
                                     ms=got["validate_s"] * 1000 if "validate_s" in got else "",
-                                    peak_mib=measured.peak_mib or "", rows=results_in(out / "reports" / f"{name}.ttl"),
-                                    note=f"wall {measured.ms / 1000:.1f} s for the container"))
+                                    rows=results_in(out / "reports" / f"{name}.ttl"),
+                                    **memory_fields(*peak, before=f"wall {measured.ms / 1000:.1f} s for the container")))
     finally:
         runtime.cleanup()
     return 0

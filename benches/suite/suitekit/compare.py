@@ -320,8 +320,11 @@ def pooled(report: dict) -> dict[str, dict]:
     return out
 
 
-# Kinds that count page cache: recorded beside a peak, never compared.
-CACHE_KINDS = {"cgroup"}
+# Kinds that count page cache: recorded beside a peak, never compared (`sampled`, `docker stats`:
+# the cgroup's usage less inactive file pages, so active page cache counts, 11 Nov 2026).
+CACHE_KINDS = {"cgroup", "sampled"}
+# The one kind of peak a ratio between engines is drawn from (versus, standings): memory in use.
+CROSS_SYSTEM_KIND = "anon-kernel"
 
 
 def kind_of(entry: dict) -> str:
@@ -793,15 +796,16 @@ def collect(paths: list[Path], systems: set[str] | None, restricted: bool) -> di
 
 def memory_kinds(paths: list[Path]) -> dict[tuple, str]:
     """(workload, tier, system, task) -> the kind of its peaks: the rows' own `memory_kind`,
-    else the runtime's (Docker's are sampled from `docker stats`; processes' are lifetime)."""
-    out: dict[tuple, str] = {}
+    else the runtime's (Docker's are sampled from `docker stats`; processes' are lifetime).
+    Peaks of several kinds (rows of two runs in one file) name them all, `a/b`: never one kind."""
+    out: dict[tuple, set[str]] = {}
     for path in dict.fromkeys(p.resolve() for p in paths):
         for r in read(path):
             if r.get("peak_mib") in ("", None):
                 continue
             kind = r.get("memory_kind") or ("sampled" if r.get("runtime") == "docker" else "lifetime")
-            out[(r["workload"], r["tier"], r["system"], r["task"])] = kind
-    return out
+            out.setdefault((r["workload"], r["tier"], r["system"], r["task"]), set()).add(kind)
+    return {key: "/".join(sorted(kinds)) for key, kinds in out.items()}
 
 
 def manifest_identities(paths: list[Path]) -> list[dict | None]:
@@ -895,9 +899,12 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                 task = metric.split()[0]
                 kb = kinds[0].get((*key, task), "unknown")
                 kn = kinds[1].get((*key, task), "unknown")
-                if CACHE_KINDS & {kb, kn}:
+                if CACHE_KINDS & {*kb.split("/"), *kn.split("/")}:
                     out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): counts page cache, "
                             "recorded, not compared", False)
+                elif "/" in kb or "/" in kn:
+                    out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): peaks of several kinds "
+                            "pooled, not compared", True)
                 elif "unknown" not in (kb, kn) and kb != kn:
                     out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): other kinds, not compared",
                             True)

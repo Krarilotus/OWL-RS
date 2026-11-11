@@ -61,7 +61,7 @@ sys.path.insert(0, str(HERE.parent))
 from suitekit import quiet  # noqa: E402
 from suitekit.adapters import Context, Nrese, adapter, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
-from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
+from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
 WORKLOAD = "commit-latency"
@@ -241,7 +241,8 @@ class Run:
             step = self.system.load(self.ctx, store, inputs, REGIME)
             measured = step.measured
             self.writer.write(self.row("load", status="ok" if measured.ok else "timeout" if measured.timed_out else "failed",
-                                       ms=measured.ms, peak_mib=measured.peak_mib or "", note=step.note))
+                                       ms=measured.ms, **memory_fields(measured.peak_mib, measured.memory_kind,
+                                                                       measured.memory_note, before=step.note)))
             if not measured.ok:
                 return
             endpoint = self.system.endpoint if self.system.in_memory(REGIME) else self.system.serve(self.ctx, store, REGIME)
@@ -249,8 +250,9 @@ class Run:
             try:
                 self.maintain(endpoint)
             finally:
-                peak = self.system.stop(self.ctx)
-                self.writer.write(self.row("serve", peak_mib=peak or "", note="the server's peak over the maintenance run"))
+                peak, kind, memory_note = self.system.stop_memory(self.ctx)
+                self.writer.write(self.row("serve", **memory_fields(peak, kind, memory_note,
+                                                                    before="the server's peak over the maintenance run")))
         finally:
             self.runtime.remove_store(store)
 

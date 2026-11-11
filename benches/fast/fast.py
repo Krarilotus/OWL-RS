@@ -52,7 +52,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
-from suitekit.runtime import end_scope, scope_argv  # noqa: E402
+from suitekit.runtime import anon_kernel_bytes, end_scope, scope_argv  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
@@ -260,18 +260,9 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
 # The scope's anonymous and kernel memory at its peak (research round 8: the gate's Linux memory
 # metric; memory.peak also counts the file cache the case's reads were charged, which depends on
 # what the host had cached). cgroup v2 keeps no such peak: a thread outside the measured process
-# samples memory.stat every 50 ms, so a spike shorter than that can be missed.
+# samples memory.stat every 50 ms, so a spike shorter than that can be missed. The reading itself
+# (anon_kernel_bytes) is suitekit/runtime.py's, which the suite's Docker runtime reads too.
 SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
-KERNEL_PARTS = ("kernel_stack", "pagetables", "sec_pagetables", "percpu", "sock", "vmalloc", "slab")
-
-
-def anon_kernel_bytes(stat: str) -> int | None:
-    """anon + kernel from a cgroup's memory.stat (kernel: its own field, else the sum of its parts)."""
-    fields = dict(line.split() for line in stat.splitlines() if len(line.split()) == 2)
-    if "anon" not in fields:
-        return None
-    kernel = int(fields["kernel"]) if "kernel" in fields else sum(int(fields.get(k, 0)) for k in KERNEL_PARTS)
-    return int(fields["anon"]) + kernel
 
 
 class AnonKernelSampler(threading.Thread):
