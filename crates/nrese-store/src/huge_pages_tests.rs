@@ -1,7 +1,8 @@
 //! `budgets.huge_pages = "bulk"` (`HugePages::Bulk`): transparent huge pages are off while
 //! the store serves, on while a bulk load or a materialisation runs, and off again once
-//! either ends, also when it ends in an error. Read from the kernel (`THP_enabled`), in a
-//! process of its own: the switch is the process's.
+//! either ends, also when it ends in an error. Under the default (`on`) the store never
+//! touches them. Read from the kernel (`THP_enabled`), in a process of its own: the switch
+//! is the process's.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +14,7 @@ use crate::service::hooks;
 use crate::{BulkLoadRequest, GraphTarget, LoadProgress, StoreConfig, StoreError, StoreService};
 
 fn enabled() -> bool {
-    memory::transparent_huge_pages().expect("shown: checked by switchable")
+    memory::transparent_huge_pages().expect("shown: checked before")
 }
 
 /// Whether this kernel lets the process's switch be set on and shows it; where not, the test
@@ -28,9 +29,9 @@ fn switchable() -> bool {
 }
 
 /// What `enabled` read while a bulk load ran: at the load's hook, once it holds the writer
-/// slot and before it reads its files. `then` runs there too.
-fn during_the_load(then: impl FnOnce() + 'static) -> Arc<AtomicBool> {
-    let seen = Arc::new(AtomicBool::new(false));
+/// slot and before it reads its files; `unseen` if the hook didn't run. `then` runs there too.
+fn during_the_load(unseen: bool, then: impl FnOnce() + 'static) -> Arc<AtomicBool> {
+    let seen = Arc::new(AtomicBool::new(unseen));
     let at_hook = Arc::clone(&seen);
     hooks::AFTER_INVALIDATION.set(Some(Box::new(move || {
         at_hook.store(enabled(), Ordering::Relaxed);
@@ -66,14 +67,14 @@ fn bulk_has_huge_pages_only_while_a_load_or_a_materialisation_runs() {
     .unwrap();
     assert!(!enabled(), "off while serving");
 
-    let during = during_the_load(|| {});
+    let during = during_the_load(false, || {});
     store.bulk_load(&request).unwrap();
     assert!(during.load(Ordering::Relaxed), "on while a load runs");
     assert!(!enabled(), "off after a load");
 
     let progress = Arc::new(LoadProgress::default());
     let cancel = Arc::clone(&progress);
-    let during = during_the_load(move || cancel.cancel());
+    let during = during_the_load(false, move || cancel.cancel());
     let failed = store.bulk_load_with(&request, &progress).unwrap_err();
     assert!(matches!(failed, StoreError::LoadCancelled), "{failed}");
     assert!(during.load(Ordering::Relaxed), "on while a load runs");
@@ -98,4 +99,70 @@ fn bulk_has_huge_pages_only_while_a_load_or_a_materialisation_runs() {
 
     store.rematerialise(Ruleset::Rdfs).unwrap();
     assert!(!enabled(), "off after a materialisation");
+}
+
+/// Under the default (`on`), the store leaves the process's switch as the process started
+/// with it, as before `bulk` existed: opening, a bulk load, a failed one, a materialisation
+/// and a stopped one read the same before, during and after. Nothing here sets the switch.
+#[test]
+fn the_default_leaves_huge_pages_as_the_process_started() {
+    if !nrese_exec::measure::alone() {
+        return;
+    }
+    let Some(started) = memory::transparent_huge_pages() else {
+        eprintln!("not checked: this kernel doesn't show the process's huge pages");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("data.ttl");
+    std::fs::write(
+        &input,
+        "@prefix : <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :A rdfs:subClassOf :B . :x a :A .
+",
+    )
+    .unwrap();
+    let request = BulkLoadRequest {
+        files: vec![input],
+        replace: false,
+        graph: GraphTarget::DefaultGraph,
+        invalid: None,
+    };
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    assert_eq!(StoreConfig::in_memory().huge_pages, HugePages::On);
+    assert_eq!(enabled(), started, "after opening");
+
+    let during = during_the_load(!started, || {});
+    store.bulk_load(&request).unwrap();
+    assert_eq!(during.load(Ordering::Relaxed), started, "during a load");
+    assert_eq!(enabled(), started, "after a load");
+
+    let progress = Arc::new(LoadProgress::default());
+    let cancel = Arc::clone(&progress);
+    let during = during_the_load(!started, move || cancel.cancel());
+    store.bulk_load_with(&request, &progress).unwrap_err();
+    assert_eq!(during.load(Ordering::Relaxed), started, "during a load");
+    assert_eq!(enabled(), started, "after a load that failed");
+
+    let during = AtomicBool::new(!started);
+    store
+        .rematerialise_until(Ruleset::Rdfs, &|| {
+            during.store(enabled(), Ordering::Relaxed);
+            true
+        })
+        .unwrap_err();
+    assert_eq!(
+        during.load(Ordering::Relaxed),
+        started,
+        "during a materialisation"
+    );
+    assert_eq!(
+        enabled(),
+        started,
+        "after a materialisation that was stopped"
+    );
+
+    store.rematerialise(Ruleset::Rdfs).unwrap();
+    assert_eq!(enabled(), started, "after a materialisation");
 }
