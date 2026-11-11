@@ -63,6 +63,21 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Sets the process's index encoding, vocabulary, huge pages and reasoning release from
+    /// the configuration, once at startup, before opening stores: no store opened later (the
+    /// system store, a draft check's) changes them (D16-489). Refuses to start if a store
+    /// opened earlier set other values.
+    pub fn install_process_settings(&self) -> Result<()> {
+        let configured = nrese_store::ProcessSettings::of(&self.store);
+        let in_effect = nrese_store::apply_process_settings(&self.store);
+        anyhow::ensure!(
+            in_effect == configured,
+            "a store opened before the configuration was installed set the process's settings \
+             ({in_effect:?}, configured {configured:?})"
+        );
+        Ok(())
+    }
+
     /// The effective settings, one `key = value` per line, for `check-config`. Credentials
     /// are never printed: authentication and AI show their mode and provider only.
     pub fn summary(&self) -> String {
