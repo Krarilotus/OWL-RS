@@ -189,6 +189,7 @@ class DockerStats:
 # runtime's container sampler (ContainerMemory).
 KERNEL_PARTS = ("kernel_stack", "pagetables", "sec_pagetables", "percpu", "sock", "vmalloc", "slab")
 ANON_KERNEL_S = 0.05
+INSPECT_S = 10  # `docker inspect` for a container's PID; a sampler's stop waits this and 10 s more
 
 
 def anon_kernel_bytes(stat: str) -> int | None:
@@ -223,13 +224,13 @@ class ContainerMemory:
         self.name, self.period_s = name, period_s
         self.locate = locate or self.find
         self.peak: int | None = None
-        self.why, self.reads, self.cpu_s = "not read before the container stopped", 0, 0.0
+        self.why, self.reads, self.cpu_s = "no reading of memory.stat yet", 0, 0.0
         self.halt = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
 
     def find(self) -> Path | None:
-        found = run_quiet(["docker", "inspect", "-f", "{{.State.Pid}}", self.name], 30)
+        found = run_quiet(["docker", "inspect", "-f", "{{.State.Pid}}", self.name], INSPECT_S)
         pid = found.stdout.strip()
         if found.returncode or not pid.isdigit():
             raise OSError(f"docker inspect: {(found.stderr or found.stdout).strip()[:200] or 'no PID'}")
@@ -251,11 +252,14 @@ class ContainerMemory:
                         stat = group / "memory.stat" if group else None
                     value = anon_kernel_bytes(stat.read_text(encoding="utf-8")) if stat else None
                     if stat and value is None:
-                        self.why = f"no anon field in {stat}"
+                        self.peak, self.why = None, f"no anon field in {stat}"
+                        break
                 except OSError as error:
-                    if stat is not None and self.peak is not None:
-                        break  # the container ended: its cgroup is gone, its peak stands
-                    self.why = f"memory.stat unreadable: {error}"
+                    if stat is not None and self.peak is not None and not stat.parent.exists():
+                        break  # the container ended: Linux removed its cgroup, its peak stands
+                    # Anything else (no access, a stat gone from a cgroup that stands) leaves
+                    # readings missing while the container may still run: no peak.
+                    self.peak, self.why = None, f"memory.stat unreadable: {error}"
                     break
                 except Exception as error:  # e.g. inspect's timeout, a stat it can't parse: readings are missing
                     self.peak, self.why = None, f"sampler failed: {type(error).__name__}: {error}"
@@ -270,22 +274,43 @@ class ContainerMemory:
     def stop(self) -> int | None:
         """Its peak in bytes, or None (see `why`)."""
         self.halt.set()
-        self.thread.join(timeout=10)
+        self.thread.join(timeout=INSPECT_S + 10)
+        if self.thread.is_alive():
+            self.peak, self.why = None, "the sampler didn't stop"
         return self.peak
 
 
-def container_memory(memory: "ContainerMemory | None", sampled_mib: int | None) -> tuple[int | None, str, str]:
+def container_memory(memory: "ContainerMemory | None", sampled_mib: int | None,
+                     stop: bool = True) -> tuple[int | None, str, str]:
     """A container's peak in MiB, its kind and its note: anon + kernel where memory.stat was read,
-    else no peak, kind `unknown` and why. The `docker stats` peak only in the note, as what it is."""
-    peak = memory.stop() if memory else None
+    else no peak, kind `unknown` and why. The `docker stats` peak only in the note, as what it is.
+    stop=False: the peak so far, the container left running and its sampler with it."""
+    peak = (memory.stop() if stop else memory.peak) if memory else None
     sampled = (f"docker stats {sampled_mib} MiB, page cache included, not compared"
                if sampled_mib is not None else "docker stats: no reading")
     if peak is None:
         why = memory.why if memory else "not sampled"
         return None, "unknown", f"anon-kernel unknown: {why}; {sampled}"
     cost = (f"; sampler {memory.reads} reads, {memory.cpu_s * 1000:.0f} ms CPU"
-            if isinstance(memory, ContainerMemory) else "")
+            if stop and isinstance(memory, ContainerMemory) else "")
     return round(peak / 1048576), "anon-kernel", f"{sampled}{cost}"
+
+
+def memory_now(server: "Server | None") -> tuple[int | None, str, str]:
+    """A running server's peak so far, its kind and note, the server left running: its container's
+    anon + kernel (Docker), else its sampler's peak with no kind (the row's runtime tells it)."""
+    sampled = server.sampler.peak if server and server.sampler else None
+    if server is None or server.memory is None:
+        return sampled, "", ""
+    return container_memory(server.memory, sampled, stop=False)
+
+
+def memory_fields(peak_mib: int | None, kind: str = "", note: str = "", before: str = "") -> dict:
+    """A peak's row fields (schema.Result): its MiB (empty where none), its kind, and the row's own
+    note `before` with the peak's after it. Every row of a peak carries its kind (a reader takes a
+    Docker row without one for `docker stats`)."""
+    return dict(peak_mib=peak_mib if peak_mib is not None else "", memory_kind=kind,
+                note="; ".join(n for n in (before, note) if n))
 
 
 def reap(process: subprocess.Popen, timeout: float) -> tuple[int | None, int | None]:

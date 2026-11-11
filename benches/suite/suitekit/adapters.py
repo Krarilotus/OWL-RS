@@ -42,7 +42,7 @@ from pathlib import Path
 
 from . import ns
 from .manifest import docker_memory_bytes
-from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, slice_limit_mib
+from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, memory_now, slice_limit_mib
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -379,6 +379,13 @@ class Adapter:
         peak = ctx.runtime.stop(self.server)
         self.server = None
         return peak
+
+    def stop_memory(self, ctx: Context) -> tuple[int | None, str, str]:
+        """stop, with the peak's kind and note where the runtime knows them (Docker: anon-kernel
+        or unknown, runtime.container_memory); a row of the peak carries all three."""
+        ctx.runtime.last_memory = ("", "")
+        peak = self.stop(ctx)
+        return (peak, *ctx.runtime.last_memory)
 
     def version(self, ctx: Context, endpoint: Endpoint | None) -> str:
         images = self.images(ctx)
@@ -767,8 +774,8 @@ class Virtuoso(Adapter):
         output.append(text)
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
-        peak = self.stop(ctx)
-        return Step(Measured(ms, peak, rc), note="server start-up excluded")
+        peak, kind, memory_note = self.stop_memory(ctx)
+        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note), note="server start-up excluded")
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(8890, fixed=True)
@@ -883,8 +890,9 @@ class Rdf4j(Adapter):
             rc = 0 if status in (200, 204) else 1
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
-        peak = self.stop(ctx)
-        return Step(Measured(ms, peak, rc), note="server start-up excluded; SPARQL LOAD per file")
+        peak, kind, memory_note = self.stop_memory(ctx)
+        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note),
+                    note="server start-up excluded; SPARQL LOAD per file")
 
     def serve(self, ctx, store, regime):
         spec = self.spec(ctx, ctx.name("serve"), store, ctx.listen(8080))
@@ -1122,8 +1130,9 @@ class Anzograph(Adapter):
             rc = rc or (0 if status == 200 else 1)
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
-        peak = self.server.sampler.peak if self.server and self.server.sampler else None
-        return Step(Measured(ms, peak, rc), note="server start-up excluded; in memory")
+        peak, kind, memory_note = memory_now(self.server)  # it serves on: its peak so far
+        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note),
+                    note="server start-up excluded; in memory")
 
     def serve(self, ctx, store, regime):
         return self.endpoint

@@ -15,6 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from . import cases as registry
+from .compare import CROSS_SYSTEM_KIND
 from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, pre_reset
 
 VERDICTS = ("win", "tie", "loss", "no-verdict")
@@ -184,8 +185,10 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
             if e["case"] in repeated:
                 star += f" ({e.get('run', '?')})"
             memory = e.get("memory")
-            memory = ("-" if not memory else f"{memory['ratio']:.3g} ({memory['kind']})" if "ratio" in memory
-                      else f"no ratio ({memory['kind']})")
+            # A stored entry may predate the refusal: its ratio counts only between anon-kernel peaks.
+            memory = ("-" if not memory else f"{memory['ratio']:.3g} ({memory['kind']})"
+                      if "ratio" in memory and memory.get("kind") == CROSS_SYSTEM_KIND
+                      else f"no ratio ({memory.get('kind', 'unknown')})")
             sections.append(f"| {e['case']}{star} | {e.get('semantics', '-')} | {e['answers']} | {e.get('timed', '-')} | "
                             f"{cell_time(e)} | **{e['verdict']}** | {e.get('load', '-')} | {memory} | "
                             f"[{r['id']}](runs/{r['id']}.toml) ({r.get('host', '?')}, {str(r.get('commit', '?'))[:7]})"

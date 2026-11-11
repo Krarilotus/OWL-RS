@@ -28,12 +28,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from .answers import TimingVerdicts, timed as answer_timed
-from .compare import bootstrap_ratio, thin
+from .compare import CROSS_SYSTEM_KIND, bootstrap_ratio, thin
 from .schema import read
 
 THRESHOLD, MIN_MS = 0.10, 2.0
-# The one kind of peak a ratio between engines is drawn from (suitekit/compare.py, "Memory, by kind").
-CROSS_SYSTEM_KIND = "anon-kernel"
 
 
 def number(text) -> float | None:
