@@ -16,11 +16,11 @@ fn enabled() -> bool {
     memory::transparent_huge_pages().expect("shown: checked by switchable")
 }
 
-/// Whether this kernel shows the process's switch and lets it be set; where not, the test
+/// Whether this kernel lets the process's switch be set on and shows it; where not, the test
 /// says so and checks nothing.
 fn switchable() -> bool {
     let able =
-        memory::transparent_huge_pages().is_some() && memory::set_transparent_huge_pages(true);
+        memory::set_transparent_huge_pages(true) && memory::transparent_huge_pages() == Some(true);
     if !able {
         eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
     }

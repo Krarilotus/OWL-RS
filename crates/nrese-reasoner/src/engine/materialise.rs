@@ -362,7 +362,9 @@ mod tests {
         if !nrese_exec::measure::alone() {
             return;
         }
-        if memory::transparent_huge_pages().is_none() || !memory::set_transparent_huge_pages(true) {
+        if !memory::set_transparent_huge_pages(true)
+            || memory::transparent_huge_pages() != Some(true)
+        {
             eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
             return;
         }

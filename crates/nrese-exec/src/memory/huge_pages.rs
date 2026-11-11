@@ -90,12 +90,10 @@ impl Drop for HugePagesPhase {
 }
 
 /// Whether huge pages may back this process now, as the kernel shows it (`THP_enabled` in
-/// `/proc/self/status`, Linux 5.0 on); `None` where it can't be read: another platform, an
-/// older kernel, or one built without transparent huge pages.
+/// `/proc/self/status`, Linux 5.0 on; always `false` on a kernel built without them); `None`
+/// where it can't be read: another platform or an older kernel.
 pub fn transparent_huge_pages() -> Option<bool> {
-    if !cfg!(target_os = "linux")
-        || !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists()
-    {
+    if !cfg!(target_os = "linux") {
         return None;
     }
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -111,12 +109,12 @@ mod tests {
         transparent_huge_pages().expect("shown: checked by switchable")
     }
 
-    /// Whether this kernel shows the process's switch and lets it be set; where not (an
+    /// Whether this kernel lets the process's switch be set on and shows it; where not (an
     /// older kernel, one without huge pages, a container that refuses the call), the test
     /// says so and checks nothing.
     fn switchable() -> bool {
-        let able =
-            transparent_huge_pages().is_some() && super::super::set_transparent_huge_pages(true);
+        let able = super::super::set_transparent_huge_pages(true)
+            && transparent_huge_pages() == Some(true);
         if !able {
             eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
         }
