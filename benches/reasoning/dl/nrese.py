@@ -25,8 +25,10 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
   baseline's times.
 - `consistency`: the hypertableau (`tableau_consistency`) on the DL tracks' consistency
   tasks; an input it refuses as outside OWL 2 DL goes to `nrese_dl::beyond`
-  (`dl_beyond --decide`) with the rest of the time, whose verdict is the row's, the detail
-  column naming that path (`beyond: …; tableau: …`) and the time both runs'.
+  (`dl_beyond --decide`) in the whole seconds left, whose verdict is the row's, the detail
+  column naming that path (`beyond: …; tableau: …`) and the time both runs'. One budget,
+  `--timeout`, covers both and the reading: a decision past it is a `timeout`, as the
+  references' runner counts it.
 """
 
 import argparse
@@ -179,7 +181,8 @@ def decision(code, stdout, stderr):
     answer, why = line[1], line[-1] or line[2]
     if answer in ("consistent", "inconsistent", "unsupported"):
         return answer, why[:300]
-    return ("timeout" if "timeout" in why else "undecided"), why[:300]
+    out_of_time = "timeout" in why or "time budget ran out" in why  # the tableau's, beyond's
+    return ("timeout" if out_of_time else "undecided"), why[:300]
 
 
 def consistency(args):
@@ -194,11 +197,17 @@ def consistency(args):
             started = time.monotonic()
             status, detail = decision(*launch([args.binary, "--timeout", str(args.timeout), source], args.timeout))
             if status == "unsupported":
-                # Outside OWL 2 DL: nrese_dl::beyond decides it, with the rest of the time.
-                rest = max(1, args.timeout - int(time.monotonic() - started))
-                verdict, why = decision(*launch([args.beyond, "--decide", "--timeout", str(rest), source], rest))
-                status, detail = verdict, f"beyond: {why}; tableau: {detail}"
+                # Outside OWL 2 DL: nrese_dl::beyond decides it, in the whole seconds left.
+                rest = int(args.timeout - (time.monotonic() - started))
+                if rest < 1:
+                    status, detail = "timeout", f"beyond: no time left; tableau: {detail}"
+                else:
+                    verdict, why = decision(*launch([args.beyond, "--decide", "--timeout", str(rest), source], rest))
+                    status, detail = verdict, f"beyond: {why}; tableau: {detail}"
             ms = int((time.monotonic() - started) * 1000)
+            if status in ("consistent", "inconsistent") and ms > args.timeout * 1000:
+                # One budget, reading included, as the references' runner counts it.
+                status, detail = "timeout", f"decided past the {args.timeout} s budget: {detail}"
             out.write(f"{t}\tnrese-dl\tconsistency\t{status}\t{ms}\t{detail}".rstrip() + "\n")
             out.flush()
             print(f"{t}: {status}, {ms} ms")
