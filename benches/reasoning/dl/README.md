@@ -14,7 +14,7 @@ The correctness infrastructure of [docs/design/owl2-dl.md](../../../docs/design/
 | `nrese.py` | NRESE's classifiers in the same comparison (`el`: the EL classifier on the EL track, through the runner's `ntriples` conversion and `canonical.py`; `dl`: the DL driver, `dl_classify`, on the DL tracks' classification and realisation tasks, `--only` for a few); the detail column holds the hash, then the classifier's profile: its phase times in ms and its counters (EL: concepts, contexts, subsumers, links, conclusions; DL: tests, candidates, branch points, clashes, the Horn bound's share), or for an incomplete DL run the reasons it printed; a DL row's status is the driver's own outcome (`inconsistent`, `unsupported`, `timeout`, `undecided`), as the references' rows give theirs; `consistency`: the hypertableau (`tableau_consistency`) on the DL tracks' consistency tasks, an input it refuses as outside OWL 2 DL decided by `nrese_dl::beyond` (`dl_beyond --decide`) in the rest of the time, the detail naming the path |
 | `cargo run -p nrese-owl --example fuzz` | random OWL 2 DL ontologies (`nrese_owl::fuzz`, within the global restrictions) as functional-syntax files with a manifest: differential fuzz campaigns on the references, `ore.py compare` lists disagreements |
 | `canonical.py` | the canonical taxonomy from any subsumption closure (NRESE's EL classifier, later `nrese-dl`), with the reference run's signature |
-| `disputed.tsv` | differences settled by hand: `test/task<TAB>reasoner<TAB>result<TAB>why` |
+| `private/disputed.tsv` | differences settled by hand, kept locally and not in the repository (`private/` is git-ignored): `test/task<TAB>reasoner<TAB>result<TAB>why`; `w3c.py compare` reads it and stops without it |
 | `scope.py` | the small-scope campaign (docs/design/owl2-dl.md §11): every OWL 2 DL ontology up to a bound (`nrese_owl::scope`, `cargo run -p nrese-owl --example scope`) or a covering array (`cover:3`), answered by NRESE (`cargo run -p nrese-dl --example scope_check`) and the references (`runner`'s `nrese.dl.Scope`, many ontologies per JVM, one functional-syntax document a line); `run`, `second` (Openllet where HermiT doesn't decide or differs from NRESE), `compare`, `record` (the gate's answers, `crates/nrese-dl/tests/scope`) |
 | `scope-adjudicated.tsv` | the small-scope cases of the gate's scope the references don't settle, each with the answer the semantics gives and why |
 
@@ -43,7 +43,7 @@ rm -rf ../../../tmp/dlw3c
 
 - **W3C, direct semantics, species DL** (411 tasks of 311 tests; 20 s per task, and a
   rerun at 120 s of the tasks the 2009 results list as passes that ran out of time;
-  `results/w3c-2026-10-03.tsv`).
+  the per-task results are kept locally in `results/`, which is git-ignored).
   - **HermiT** was run on every task; its result on each is in the results file.
   - **Openllet** was run on every task; its result on each is in the results file.
   - **Konclude 0.7.0-1138** was run on every task; its result on each is in the results
@@ -53,7 +53,7 @@ rm -rf ../../../tmp/dlw3c
   - Results that differ from a test's type are settled by hand as under Adjudication
     below.
 - **ORE 2015 development subset** (80 tasks: 40 DL and 20 EL classifications, 20 DL
-  consistency checks up to 5 MB; 300 s per task; `results/ore-dev-2026-10-03.tsv`).
+  consistency checks up to 5 MB; 300 s per task; the per-task results kept locally in `results/`).
   - NRESE's EL classifier gives the same taxonomy as the references on all 20 EL
     ontologies, and solves 20 of 20.
   - HermiT, Konclude, Openllet and ELK (on the EL ones) were run on every task; their
@@ -86,10 +86,8 @@ on any JDK 21+ (`DL_RUNNER_JAR`, `DL_RUNNER_CLASSES`). Each case is answered wit
 | scope `3,3` (the gate's) | 35,505 | 35,454 | 3 | 48 | 0 |
 | covering array of triples (`cover:3`, 3 to 6 axioms of up to size 4; every one of the 47,905 triples of the 67 features) | 3,354 | 3,312 | 3 | 38 | 0; 1 NRESE gave up at the campaign's 20 s |
 
-**Every case in which NRESE differs from a reference, or the references differ, is settled
-by hand from the semantics with a minimised witness (Adjudication below); NRESE's answer
-agrees with the semantics in every one, and the gate's 51 are in `scope-adjudicated.tsv`,
-one line each.**
+**Every case with differing answers is settled by hand from the semantics with a minimised
+witness (Adjudication below); the gate's 51 are in `scope-adjudicated.tsv`, one line each.**
 
 **What the campaign found in NRESE** (each fixed with a guard, 12 October): operands of a
 disjointness the U rewriting made equal were dropped (cases 623, 677, 732, 786: answered
@@ -114,7 +112,6 @@ ontologies with random DL-safe rules over the small-scope names, NRESE's answers
 |---|---|
 | `beyond/run.sh` | the campaigns and the ORE runs as one queue job (its results: cases, NRESE's and the references' answers, decisions, taxonomies, justifications) |
 | `beyond/compare.py` | NRESE against the references on the Scope runner's codes |
-| `beyond/triage.py` | each disagreement with a reference, against the probes |
 | `beyond/probes.py` | minimal probes of how a reasoner reads SWRL's corner cases (empty heads, `x ≠ x`, declared individuals, equality-only variables, inverse property atoms) |
 | `beyond/abba-run.sh` | one run of the A-B-B-A over the DL and QL cases (a queue chunk) |
 
@@ -152,14 +149,14 @@ Openllet by `nrese.dl.Scope`):
 | 4: clean rules (no `=`, `≠`, empty heads), data | 983 | 970 | 8 | 5 |
 | 5: clean rules, no data | 985 | 972 | 12 | 1 |
 
-Every disagreement with a reference was checked against SWRL's semantics, with a minimal
-probe for each kind (`beyond/probes.py`) and samples checked by hand; NRESE answers every
-probe as the semantics does. NRESE's undecided cases (80 of 5,000): 66 models
+`beyond/probes.py` holds a minimal probe for each kind of disagreement with its answer
+under SWRL's semantics; the records that settle disagreements are kept locally. NRESE's
+undecided cases (80 of 5,000): 66 models
 the certificate builder can't fold into a model (counting cases, §10), 14 time budgets.
 
 ## Adjudication
 
 No majority votes (§11). A result that differs from a test's type, or a reference
 reasoner that differs from another, is settled by hand with a minimised witness and a
-proof or a model, and recorded in `disputed.tsv` with the reason. `compare` fails on
+proof or a model, and recorded in `private/disputed.tsv` (kept locally) with the reason. `compare` fails on
 any difference not recorded there; rejected tests are reported but never fail a run.

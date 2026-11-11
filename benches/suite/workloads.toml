@@ -136,7 +136,7 @@ tiers = ["dev", "full"]
 state = "partial"
 kit = "benches/reasoning/dl"
 note = "dev: the development subset (80 tasks: 40 DL and 20 EL classifications, 20 DL consistency checks, up to 5 MB; ore.py subset); full: all 1,920 ontologies x 3 tasks (Draco). NRESE classifies the EL track (benches/reasoning/dl/nrese.py el); its DL engines come with phase 3"
-check = "canonical taxonomies compared by hash across the reference reasoners; differences adjudicated (disputed.tsv)"
+check = "canonical taxonomies compared by hash across the reference reasoners; differences settled by hand"
 
 [w3c-owl2-dl]
 title = "W3C OWL 2 test cases, species DL, direct semantics: consistency, entailment, non-entailment"
@@ -148,7 +148,7 @@ licence = "W3C"
 tiers = ["-"]
 state = "ready"
 kit = "benches/reasoning/dl"
-check = "the test types; the working group's published results of 2009 (published-2009.tsv); disputed.tsv"
+check = "the test types; the working group's published results of 2009 (published-2009.tsv); differences settled by hand"
 note = "411 tasks of 311 tests. The reference reasoners run it today (benches/reasoning/dl/README.md); NRESE once its DL engine exists"
 
 [owl2bench-classify]
