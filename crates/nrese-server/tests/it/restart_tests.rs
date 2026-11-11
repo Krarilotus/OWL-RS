@@ -171,7 +171,8 @@ async fn a_stop_signal_ends_the_server_cleanly_and_keeps_its_commits() -> Outcom
 /// held for 30 s, `NRESE_TEST_HOLD_CLOSE_MS`) ends at the stop deadline all the same: with
 /// code 0, within [`STOPPED`], naming the close it gave up on, and a commit acknowledged
 /// before the signal is there after a restart.
-#[cfg(unix)]
+/// Debug builds only, as the hold is.
+#[cfg(all(unix, debug_assertions))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_ends_at_its_deadline_when_the_store_does_not_close_in_time() -> Outcome {
     let dir = tempfile::tempdir()?;
