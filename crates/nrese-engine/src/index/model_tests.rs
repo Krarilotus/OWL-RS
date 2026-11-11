@@ -631,6 +631,33 @@ fn a_walk_of_few_groups_is_walked_serially() {
     }
 }
 
+/// A walk grouped by graph on a layout of the default graph alone (a graph-first plan
+/// adapted to graph-last) is one group, the default graph's, walked without parts: it adds
+/// no group to the estimate, so a snapshot's other stacks decide alone whether the walk
+/// goes in parts (GS-R2-02).
+#[test]
+fn a_default_graph_walk_by_graph_adds_no_group_to_the_estimate() {
+    let rows = 2 * super::GROUP_PART as u64;
+    let quads: Vec<EncodedQuad> = (0..rows)
+        .map(|i| EncodedQuad::new(term(1000 + i), term(1), term(10_000 + i), graph(0)))
+        .collect();
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+    let plan = AccessPlan::in_permutation(&QuadPattern::all(), Permutation::Gspo).unwrap();
+    let (keys, parts) = version.group_walk_size(&plan, 0);
+    assert_eq!(
+        (keys, parts),
+        (1, 0),
+        "one key, the default graph's, and no part"
+    );
+    assert_eq!(version.parted_groups(&plan, 0), 0);
+    // Another stack's walk of exactly `SERIAL_GROUPS` groups stays serial beside it.
+    let ample = nrese_exec::Budget::new(64 << 20);
+    let others = super::SERIAL_GROUPS;
+    assert!(!super::walks_in_parts(&ample, rows as usize, 2, || {
+        others + version.parted_groups(&plan, 0)
+    }));
+}
+
 /// A walk never charges more than its bound, in parts or serially (`group_walk_peak`): a node
 /// count runs its two walks at once only where the room covers both bounds, so a bound short
 /// of a walk's peak would let the pair be refused where the walks one after the other fit.
