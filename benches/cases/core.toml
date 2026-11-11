@@ -971,7 +971,7 @@ counters = ["support.inferred", "support.first.visible"]
 check = { "q.probe.value" = "true", "q.count.value" = 5030 }
 pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
 outcome = "memory-limit"
-known = "C-310, observed 26 Oct 2026 on 3dc5ab46 (cap-stress-timed-p2-13efe625, both rounds): computing every set was charged to no budget then, passed the 6 GB cap on 1.3 MB of sameAs chains and was killed at the first restricted read; capped at 16 it completes. Re-qualify once O4 charges it"
+known = "C-310, observed 26 Oct 2026 on 3dc5ab46 (cap-stress-timed-p2-13efe625, both rounds): computing every set was charged to no budget then, passed the 6 GB cap on 1.3 MB of sameAs chains and was killed at the first restricted read; capped at 16 it completes. Since O4 charges every set (observed 11 Nov 2026 on 62b9e1854, the release smoke), the shared query budget refuses that read instead (MemoryLimit, BudgetExceeded at 4.5 GiB of the 6 GB cap): a refusal, no kill, the same outcome"
 route = {}
 cap_gb = 6
 est_min = 5
