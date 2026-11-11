@@ -56,6 +56,8 @@ KEYS = {
     "check", "pinned", "route", "expect", "reference", "outcome", "known", "frontier",
     # the comparators
     "systems", "home_turf", "rewrite", "hangs", "tracks", "guards",
+    # a release-gate baseline whose product lacks what the case needs (release_gate.py family_of)
+    "absent",
 }
 REQUIRED = ("name", "area", "what", "semantics", "data", "metric", "cap_gb", "systems")
 
@@ -144,7 +146,15 @@ def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
                 out.append(f"{where}: expect.answers {system!r} must be one of the case's comparators (never NRESE)")
         if workloads is not None and c.get("workload") and c["workload"] not in workloads:
             out.append(f"{where}: workload {c['workload']!r} is not in suite/workloads.toml")
+        absent = c.get("absent", {})
+        if not (isinstance(absent, dict) and set(absent) <= BASELINES
+                and all(isinstance(v, str) and v.strip() for v in absent.values())):
+            out.append(f"{where}: absent: a baseline (base, main) and the capability its product lacks")
     return out
+
+
+# The release gate's baselines a case may declare absent (`absent`: the product lacks the capability).
+BASELINES = {"base", "main"}
 
 
 # Home turfs of systems without a runner here, named for the catalog (fast.py TURF).

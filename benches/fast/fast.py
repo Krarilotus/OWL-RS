@@ -2010,11 +2010,23 @@ def block(args) -> int:
         cases = list(cases)
         random.Random(drawn(seed, "cases", args.block)).shuffle(cases)
     with block_copies(sides, args.fresh_copies, args.block) as timed:
-        return timed_block(args, timed, catalog, cases, prepared, order, place, seed)
+        return timed_block(args, timed, catalog, cases, prepared, order, place, seed, absent_sides(catalog))
+
+
+def absent_sides(catalog: list[dict]) -> dict[tuple[str, str], str]:
+    """Each (case, baseline) the block doesn't run, and why (release_gate.declared_absent): the
+    catalogue's product gaps and the owner's absences in this tree's policy file."""
+    import release_gate
+    path = ROOT / release_gate.POLICY_FILE
+    policy = release_gate.load_policy(path.read_text(encoding="utf-8")) if path.is_file() else release_gate.NO_POLICY
+    return release_gate.declared_absent(catalog, policy)
 
 
 def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict], prepared: dict,
-                order: list[tuple[str, int]], place: dict, seed: str | None) -> int:
+                order: list[tuple[str, int]], place: dict, seed: str | None,
+                absent: dict[tuple[str, str], str] | None = None) -> int:
+    """The block's runs; a side ABSENT for a case isn't run: its record says so, in its place."""
+    absent = absent or {}
     by_name = {s["name"]: s for s in sides}
     started = time.time_ns()
     common = {"started": datetime.datetime.now().isoformat(timespec="seconds"), "git": manifest.git(ROOT),
@@ -2035,13 +2047,18 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
             use_side(by_name[name])
             t0 = time.monotonic()
             start_ns = time.time_ns()
-            try:
-                record = run_case(case, f"gate-{args.block}-{name}", 1)
-            except Exception as error:  # a case that breaks mustn't stop the block
-                record = {"case": case["name"], "rep": 1, "status": "failed", "notes": [str(error)[:300]],
-                          "checks": [], "routes": [], "samples": {}, "metric": None,
-                          "expected_outcome": case.get("outcome", "ok")}
-            record["verdict"] = verdict(case, record)
+            if why := absent.get((case["name"], name)):
+                record = {"case": case["name"], "rep": 1, "status": "absent", "notes": [why], "checks": [],
+                          "routes": [], "samples": {}, "metric": None, "expected_outcome": "absent",
+                          "verdict": {"verdict": "absent", "whose": "-"}}
+            else:
+                try:
+                    record = run_case(case, f"gate-{args.block}-{name}", 1)
+                except Exception as error:  # a case that breaks mustn't stop the block
+                    record = {"case": case["name"], "rep": 1, "status": "failed", "notes": [str(error)[:300]],
+                              "checks": [], "routes": [], "samples": {}, "metric": None,
+                              "expected_outcome": case.get("outcome", "ok")}
+                record["verdict"] = verdict(case, record)
             record["series_units"] = SERIES_UNITS
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
