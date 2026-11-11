@@ -3022,11 +3022,7 @@ impl<'a> Context<'a> {
                 #[cfg(test)]
                 bgp_estimated();
                 let rows = self.snapshot.estimate_in(self.model, &s.quad_pattern());
-                // A prefix found by binary search in the text order costs nothing worth
-                // weighing; otherwise the dictionary pass must be worth its size.
-                let cheap = condition.is_prefix() && self.snapshot.text_order_ready();
-                if (!cheap
-                    && rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW)
+                if !condition.worth_a_pass(&self.snapshot, rows)
                     || (scans.len() > 1
                         && rows
                             > smallest
@@ -5482,16 +5478,35 @@ impl<'a> Context<'a> {
         {
             return Ok(None);
         }
-        let start = Instant::now();
         let pattern = scan.quad_pattern();
+        let hinted = ranges::hints(expr, &self.snapshot)
+            .into_iter()
+            .find(|hint| hint.variable == *key)
+            .map(|hint| hint.ranges);
+        // A text test on the key passes few of its terms: where the dictionary answers it
+        // first (`bgp`'s string hints: an unhinted object in the default graph, the pass
+        // worth its cost), its pass and a scan of those terms' rows beat testing every
+        // key's text. A language alone passes most terms: the key count stays.
+        let mut conjuncts = Vec::new();
+        pushdown::conjuncts_of(expr, &mut conjuncts);
+        if hinted.is_none()
+            && scan.slots[2].is_var(key)
+            && scan.in_default_graph()
+            && strings::combined(conjuncts, key).is_some_and(|condition| {
+                condition.tests_text()
+                    && condition.worth_a_pass(
+                        &self.snapshot,
+                        self.snapshot.estimate_in(self.model, &pattern),
+                    )
+            })
+        {
+            return Ok(None);
+        }
+        let start = Instant::now();
         let memory = QueryEvaluationError::MemoryLimit;
         // The FILTER's ranges of `?k`, each walked apart; many, or none: the whole pattern
         // once (a seek per range would cost more than the walk).
-        let ranges = ranges::hints(expr, &self.snapshot)
-            .into_iter()
-            .find(|hint| hint.variable == *key)
-            .map(|hint| hint.ranges)
-            .filter(|ranges| ranges.len() < MANY_RANGES);
+        let ranges = hinted.filter(|ranges| ranges.len() < MANY_RANGES);
         let mut walks = Vec::new();
         match ranges {
             Some(ranges) => {

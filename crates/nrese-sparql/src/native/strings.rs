@@ -53,6 +53,19 @@ impl Condition<'_> {
             && !self.needle.is_empty()
             && !self.fold_case
     }
+
+    /// A test of the term's text, not of its language alone: few terms pass one.
+    pub(crate) fn tests_text(&self) -> bool {
+        !self.needle.is_empty()
+    }
+
+    /// Whether the dictionary pass for this test is worth its cost on a pattern of `rows`
+    /// rows: a prefix found by binary search in the text order costs nothing worth
+    /// weighing; otherwise the pass must be worth the dictionary's size.
+    pub(crate) fn worth_a_pass(&self, snapshot: &Snapshot, rows: u64) -> bool {
+        (self.is_prefix() && snapshot.text_order_ready())
+            || rows >= snapshot.dictionary_bytes() / DICTIONARY_BYTES_PER_ROW
+    }
 }
 
 /// The string tests `conjuncts` make on `variable`, as one condition: a text test and a
