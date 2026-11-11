@@ -40,6 +40,13 @@ class ReplayedLog(unittest.TestCase):
             with self.subTest(case=case["name"]):
                 self.assertEqual({s: got.get(s) for s in planned[case["name"]]}, {"_": [21.0]})
 
+    def test_repeated_processes_each_give_their_sum(self):
+        # Spec: repeated processes (`repeat`) pool their values per series, one a process
+        # (fast.samples' docstring for its other metrics): two replays of 10 and 30 ms are both.
+        case = next(c for c in cases.load() if c["name"] == "cache-replay-cached")
+        runs = [{"queries": [{"name": "00000", "p50_ms": v, "samples_ms": [v]}], "sum_p50_ms": v} for v in (10.0, 30.0)]
+        self.assertEqual(fast.samples(case, {**runs[-1], "_repeats": runs}), {"_": [10.0, 30.0]})
+
 
 class OneRecord(unittest.TestCase):
     """Spec: a smoke's record is checked as a round checks each of its records (abba.py
@@ -63,6 +70,18 @@ class OneRecord(unittest.TestCase):
         split = self.record({f"{i:05d}": [0.02] for i in range(1000)})
         self.assertEqual(abba.record_check(catalog, split), ["cache-replay-cached: 0 samples of _, 1 required"])
         self.assertEqual(abba.record_check(catalog, self.record({"_": [245.6]})), [])
+
+    def test_a_declared_outcome_counts_and_another_fails(self):
+        # Spec: a case with a declared outcome is checked, not timed (release_gate.family_of); the
+        # gate reads a run that ends at it as a known issue, not a failure (release_gate.gate()).
+        import abba
+        catalog = cases.load()
+        case = next(c for c in catalog if c["name"] == "ctx-ore-9724")
+        self.assertEqual(case.get("outcome"), "unsupported")
+        record = {"case": "ctx-ore-9724", "status": "unsupported", "expected_outcome": "unsupported", "notes": [],
+                  "checks": [], "routes": [], "samples": {}}
+        self.assertEqual(abba.record_check(catalog, record), [])
+        self.assertEqual(abba.record_check(catalog, {**record, "status": "failed"}), ["ctx-ore-9724: failed"])
 
     def test_an_unproven_content_check_fails(self):
         import abba
