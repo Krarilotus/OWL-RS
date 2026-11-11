@@ -76,6 +76,11 @@ class ConsistencyTrack(unittest.TestCase):
         self.assertEqual(row[3], "timeout")
         self.assertEqual([c[0] for c in commands], ["tableau_consistency"])
 
+    def test_a_decision_after_the_budget_is_a_timeout(self):
+        # The tableau decides 300.5 s into a 300 s budget; the references' runner counts that a timeout too.
+        consistent = SimpleNamespace(returncode=0, stderr="", stdout="ore_ont_14766.owl\tconsistent\t-\t\n")
+        self.assertEqual(self.row([consistent], clock=[0.0, 300.5])[0][3], "timeout")
+
     def test_the_beyond_path_gets_only_the_whole_seconds_left(self):
         _, commands = self.row([REFUSED, DECIDED], clock=[0.0, 120.6, 200.0])
         self.assertEqual(commands[1][commands[1].index("--timeout") + 1], "179")
