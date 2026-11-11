@@ -471,12 +471,8 @@ pub fn replication(
     store: Option<&Path>,
     swap_one: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use nrese_engine::{
-        DurabilityConfig, Engine, EngineConfig, QuadPattern, ReadModel, SyncPolicy,
-    };
+    use nrese_engine::{DurabilityConfig, Engine, EngineConfig, SyncPolicy};
     use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
-    use sha2::{Digest, Sha256};
-    const BATCH_BYTES: usize = 8 << 20;
     let (commits, quads) = spec
         .split_once(':')
         .ok_or(format!("--replication COMMITS:QUADS, not {spec}"))?;
@@ -504,42 +500,13 @@ pub fn replication(
             GraphName::DefaultGraph,
         )
     };
-    // The digest of a set of statements: their N-Quads, sorted, hashed.
-    let digest = |mut lines: Vec<String>| {
-        lines.sort_unstable();
-        let mut hasher = Sha256::new();
-        for line in &lines {
-            hasher.update(line.as_bytes());
-            hasher.update(
-                b"
-",
-            );
-        }
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
     let expected = digest(
         std::iter::once(u64::MAX)
             .chain(0..commits * quads)
             .map(|n| quad(n).to_string())
             .collect(),
     );
-    let held = |engine: &Engine| -> Result<String, String> {
-        let snapshot = engine.snapshot();
-        let lines = snapshot
-            .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
-            .map(|q| {
-                snapshot
-                    .decode_quad(q)
-                    .map(|q| q.to_string())
-                    .ok_or_else(|| "a statement doesn't decode".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(digest(lines))
-    };
+    let held = |engine: &Engine| contents(&engine.snapshot()).map(digest);
     let mut tx = primary.transaction();
     tx.insert(quad(u64::MAX).as_ref());
     tx.commit()?;
@@ -580,35 +547,30 @@ pub fn replication(
         }
         // The follower syncs every commit, as a server's replica does by default.
         let follower = Engine::open(&follower_dir, config(SyncPolicy::EveryCommit))?;
-        let (mut feed, mut apply) = (Duration::ZERO, Duration::ZERO);
-        let (mut run_records, mut run_bytes) = (0, 0);
         let phase = crate::Phase::start();
-        let mut at = follower.stats().revision;
-        while at < latest.revision {
-            let started = Instant::now();
-            let batch = primary.log_since(at, BATCH_BYTES)?;
-            feed += started.elapsed();
-            let started = Instant::now();
-            at = follower
-                .apply_log(
-                    &batch.frames,
-                    &batch.expectation(at),
-                    &nrese_exec::stop::StopSource::none(),
-                )?
-                .revision;
-            apply += started.elapsed();
-            run_records += batch.records;
-            run_bytes += batch.frames.len();
-        }
+        let caught = catch_up(
+            follower.stats().revision,
+            latest.revision,
+            |at| primary.log_since(at, BATCH_BYTES),
+            |batch, at| {
+                follower
+                    .apply_log(
+                        &batch.frames,
+                        &batch.expectation(at),
+                        &nrese_exec::stop::StopSource::none(),
+                    )
+                    .map(|applied| applied.revision)
+            },
+        )?;
         peaks.push(phase.json());
         // After the run's window: what the follower holds, against the generator.
         let reached = follower.stats();
         let same = held(&follower).is_ok_and(|held| held == expected);
         content_ok &= same;
         caught_up &= reached.revision == latest.revision && reached.quads == latest.quads && same;
-        (records, bytes) = (run_records, run_bytes);
-        feed_times.push(feed);
-        apply_times.push(apply);
+        (records, bytes) = (caught.records, caught.bytes);
+        feed_times.push(caught.feed);
+        apply_times.push(caught.apply);
         drop(follower);
         std::fs::remove_dir_all(&follower_dir)?;
     }
@@ -640,6 +602,77 @@ pub fn replication(
         apply_samples.join(", "),
         peaks.join(", ")
     ))
+}
+
+/// A replica's catch-up batch size: the server's (8 MiB).
+pub const BATCH_BYTES: usize = 8 << 20;
+
+/// What a catch-up took: the feed's and the apply's time apart, and the records and frame
+/// bytes it carried.
+pub struct CatchUp {
+    pub feed: Duration,
+    pub apply: Duration,
+    pub records: usize,
+    pub bytes: usize,
+}
+
+/// A follower's catch-up from revision `at` to `latest`: each batch read from the primary's
+/// feed (`feed(at)`) and applied (`apply(batch, at)`, the revision reached), timed apart.
+pub fn catch_up<E: std::error::Error + 'static>(
+    mut at: u64,
+    latest: u64,
+    mut feed: impl FnMut(u64) -> Result<nrese_engine::LogBatch, E>,
+    mut apply: impl FnMut(&nrese_engine::LogBatch, u64) -> Result<u64, E>,
+) -> Result<CatchUp, Box<dyn std::error::Error>> {
+    let mut run = CatchUp {
+        feed: Duration::ZERO,
+        apply: Duration::ZERO,
+        records: 0,
+        bytes: 0,
+    };
+    while at < latest {
+        let started = Instant::now();
+        let batch = feed(at)?;
+        run.feed += started.elapsed();
+        let started = Instant::now();
+        at = apply(&batch, at)?;
+        run.apply += started.elapsed();
+        run.records += batch.records;
+        run.bytes += batch.frames.len();
+    }
+    Ok(run)
+}
+
+/// Every asserted statement `snapshot` holds, decoded, as N-Quads lines, sorted.
+pub fn contents(snapshot: &nrese_engine::Snapshot) -> Result<Vec<String>, String> {
+    use nrese_engine::{QuadPattern, ReadModel};
+    let mut lines = snapshot
+        .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
+        .map(|q| {
+            snapshot
+                .decode_quad(q)
+                .map(|q| q.to_string())
+                .ok_or_else(|| "a statement doesn't decode".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    lines.sort_unstable();
+    Ok(lines)
+}
+
+/// The digest of a set of statements: their N-Quads lines, sorted, hashed.
+pub fn digest(mut lines: Vec<String>) -> String {
+    use sha2::{Digest, Sha256};
+    lines.sort_unstable();
+    let mut hasher = Sha256::new();
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// How `--upload` sends its file (`--upload-as`).
