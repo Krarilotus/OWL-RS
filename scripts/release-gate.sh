@@ -730,6 +730,10 @@ report)
       "$own_plan" "$key")
     while IFS= read -r line; do [ -z "$line" ] || args+=("--${key/_/-}" "$line"); done <<< "$listed"
   done
+  # An earlier run's report goes first: this run's stands, or none (a report that fails before
+  # writing left the earlier PASSED one, which the step and the verdict took for this run's).
+  { rm -f "$OUT/release-gate.json" "$OUT/release-gate.md" && [ ! -e "$OUT/release-gate.json" ]; } \
+    || { log "report: the earlier report $OUT/release-gate.json can't be removed: no report"; exit 1; }
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
      --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$own_family" \
      --inputs "$own_inputs" \
