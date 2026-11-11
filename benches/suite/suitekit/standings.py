@@ -184,7 +184,8 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
             if e["case"] in repeated:
                 star += f" ({e.get('run', '?')})"
             memory = e.get("memory")
-            memory = f"{memory['ratio']:.3g} ({memory['kind']})" if memory else "-"
+            memory = ("-" if not memory else f"{memory['ratio']:.3g} ({memory['kind']})" if "ratio" in memory
+                      else f"no ratio ({memory['kind']})")
             sections.append(f"| {e['case']}{star} | {e.get('semantics', '-')} | {e['answers']} | {e.get('timed', '-')} | "
                             f"{cell_time(e)} | **{e['verdict']}** | {e.get('load', '-')} | {memory} | "
                             f"[{r['id']}](runs/{r['id']}.toml) ({r.get('host', '?')}, {str(r.get('commit', '?'))[:7]})"

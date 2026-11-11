@@ -15,7 +15,7 @@ An entry, per case (or workload tier) and comparator:
 | `timed` | queries both answered right and completely, of those both ran; for a rule engine, `reason` (its materialisation), timed only where its relation counts (`count:REL`) passed their checks |
 | `time` | NRESE / comparator: the sum of the timed queries' medians, its 95 % bootstrap interval |
 | `verdict` | `win` (NRESE faster beyond max(10 %, spread) and 2 ms, the interval below 1), `loss` (the other way round), `tie`, or `no-verdict` (nothing timed both answered right) |
-| `load`, `memory` | NRESE / comparator: the median load time; the median serve peak, with its kind |
+| `load`, `memory` | NRESE / comparator: the median load time; the median serve peak, with its kind, only where both sides' peaks are `anon-kernel` (memory in use, never cache: the owner's kind across systems, 13 Oct 2026); otherwise `refused`, naming the kinds, and no ratio (11 Nov 2026: `docker stats` counts active page cache, charged to whichever container touched a page first, and ranked engines differently on two hosts) |
 
 A ratio below 1 is NRESE ahead. Cache modes are compared like with like: NRESE with its
 result cache off against a system's off, or against one without a cache.
@@ -32,6 +32,8 @@ from .compare import bootstrap_ratio, thin
 from .schema import read
 
 THRESHOLD, MIN_MS = 0.10, 2.0
+# The one kind of peak a ratio between engines is drawn from (suitekit/compare.py, "Memory, by kind").
+CROSS_SYSTEM_KIND = "anon-kernel"
 
 
 def number(text) -> float | None:
@@ -167,7 +169,11 @@ def versus(directory: Path, home_turfs: dict[str, str] | None = None) -> list[di
             entry["load"] = load
         peak = ratio(nrese["peaks"], other["peaks"])
         if peak is not None:
-            kinds = nrese["kind"] | other["kind"]
-            entry["memory"] = {"ratio": peak, "kind": "/".join(sorted(kinds)) or "unknown"}
+            kinds = "/".join(sorted(nrese["kind"] | other["kind"])) or "unknown"
+            if nrese["kind"] == other["kind"] == {CROSS_SYSTEM_KIND}:
+                entry["memory"] = {"ratio": peak, "kind": kinds}
+            else:
+                entry["memory"] = {"kind": kinds, "refused": f"no ratio between engines on {kinds}: "
+                                   f"{CROSS_SYSTEM_KIND} on both sides only (memory in use, never cache)"}
         out.append(entry)
     return out
