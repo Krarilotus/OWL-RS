@@ -44,11 +44,14 @@ fn a_dl_query_the_bounds_decide_can_be_pinned() {
     assert!(pinned.is_ok(), "{pinned:?}");
 }
 
-/// - Input: the same store; `?x a :D` asked again and again, nothing committed between.
-/// - Expected: the same answer, both bounds' evaluations answered from the cache on a repeat
-///   (a hit each, no part computed again).
+/// - Input: the same store; `?x a :D` asked again, nothing committed between.
+/// - Expected: the same answer; both bounds' evaluations go through the cache on the repeat,
+///   each a hit or computed again, and each part computed again is kept or counted as
+///   refused. Whether a part is kept depends on what it took to compute (one under
+///   `nrese_sparql::cache::MIN_COST` is refused as cheaper to recompute), so no hit is
+///   asked for.
 #[test]
-fn a_repeated_dl_query_the_bounds_decide_hits_both_bounds() {
+fn a_repeated_dl_query_the_bounds_decide_goes_through_the_cache_for_both_bounds() {
     let dl = store_with_a_gap();
     let store = dl.store();
     let (first, _) = query(&dl, "SELECT ?x { ?x a :D }");
@@ -56,8 +59,15 @@ fn a_repeated_dl_query_the_bounds_decide_hits_both_bounds() {
     let (again, _) = query(&dl, "SELECT ?x { ?x a :D }");
     let after = store.query_cache_stats();
     assert_eq!(first, again);
+    let (hits, misses) = (after.hits - before.hits, after.misses - before.misses);
+    let decided = (after.stored - before.stored) + (after.rejected - before.rejected);
+    let counts = format!("before {before:?}, after {after:?}");
     assert!(
-        after.hits >= before.hits + 2,
-        "both bounds from the cache: before {before:?}, after {after:?}"
+        hits + misses >= 2,
+        "both bounds through the cache: {counts}"
+    );
+    assert_eq!(
+        misses, decided,
+        "each part computed again kept or refused: {counts}"
     );
 }
