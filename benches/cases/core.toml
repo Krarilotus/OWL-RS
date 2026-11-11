@@ -1252,8 +1252,8 @@ cap_gb = 6
 systems = ["elk:el", "konclude:dl", "hermit:dl", "openllet:dl"]
 home_turf = "elk"
 reference = "/fast/ref/el-classes20000-roles12.elk.tax"
-# 6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude at first. Adjudicated
-# (benches/reasoning/dl/disputed.tsv): the generator declared neither the D classes nor the
+# 6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude at first. Settled by
+# hand: the generator declared neither the D classes nor the
 # roles, and the OWL API drops axioms about undeclared terms. Declared, ELK's taxonomy
 # equals NRESE's. The chain is regular now (r1 ∘ r2 ⊑ r1), so HermiT and Openllet run it.
 

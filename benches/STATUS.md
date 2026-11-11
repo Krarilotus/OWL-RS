@@ -1,15 +1,15 @@
 # Benchmark status
 
-Generated 2026-11-02 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
+Generated 2026-11-11 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
 
 ## At a glance
 
 - **Workloads:** 42 (13 partial, 15 planned, 14 ready)
 - **Systems:** 33 (28 free to publish, 5 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 619; run at least once: 103; ok on their newest run: 80
+- **Pairs** (standard tier × system that can run it; build variants apart): 619; run at least once: 95; ok on their newest run: 78
 - **NRESE:** 19 of its 108 standard tiers ok on their newest run
 - **Run records:** 37, newest 2026-10-12
-- **Before the reset:** 37 of the 37 records, and 222 of the 222 newest outcomes: history, not the current engine's (marked †; the v1.6 baseline measures the current engine)
+- **Before the reset:** 37 of the 37 records, and 214 of the 214 newest outcomes: history, not the current engine's (marked †; the v1.6 baseline measures the current engine)
 
 ## Schedule
 
@@ -95,8 +95,8 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | real-ontologies | planned | · | · | · | – | – | – | · | – | · | · | · | · | – | – | – | · | – | – | – | – | · | n/a | n/a | n/a | · | – | – | – | – | – | – | – | – |
 | consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | n/a | – | n/a | – | – | – | – | – | – | – | – | – |
 | w3c-owl2-rl | ready | 0/1 !† | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | – | – | – | n/a | – | – | – | – | n/a | n/a | – | n/a | – | – | – | – | – | – | – | – | – |
-| ore-2015 | partial | 0/2 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | 1/2† | 0/2 !† | 0/2 !† | 1/2† | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
-| w3c-owl2-dl | ready | 0/1 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | 0/1 !† | 0/1 !† | 0/1 !† | 0/1 !† | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
+| ore-2015 | partial | 0/2 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
+| w3c-owl2-dl | ready | 0/1 !† | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
 | owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | n/a | – | – | – | – | – | – | – | – | – | – | – |
 | basics-mix | ready | 5/5† | · | 3/5 !† | 4/5 !† | 4/5 !† | 2/5 !† | 5/5† | · | 2/5 !† | – | – | – | – | – | – | – | – | – | – | – | 5/5† | · | n/a | n/a | · | – | – | – | – | – | – | – | – |
 | sparqloscope | ready | · | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · | – | – | – | – | – | – | – | – |
@@ -215,20 +215,20 @@ ready, conformance; tasks RT1, RT4; kit `crates/nrese-store/tests/w3c_owl2_rl` (
 
 ### ore-2015: ORE 2015: classification of 1,920 real ontologies
 
-partial, performance; tasks RT6; kit `benches/reasoning/dl` (outside the driver); checked by: canonical taxonomies compared by hash across the reference reasoners; differences adjudicated (disputed.tsv).
+partial, performance; tasks RT6; kit `benches/reasoning/dl` (outside the driver); checked by: canonical taxonomies compared by hash across the reference reasoners; differences settled by hand.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
 |---|---|---|---|---|---|---|---|
-| dev | part 10-03† | · | · | ok 10-03† | part 10-03† | part 10-03† | ok 10-03† |
+| dev | part 10-03† | · | · | · | · | · | · |
 | full | · | · | · | · | · | · | · |
 
 ### w3c-owl2-dl: W3C OWL 2 test cases, species DL, direct semantics: consistency, entailment, non-entailment
 
-ready, conformance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driver); checked by: the test types; the working group's published results of 2009 (published-2009.tsv); disputed.tsv.
+ready, conformance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driver); checked by: the test types; the working group's published results of 2009 (published-2009.tsv); differences settled by hand.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
 |---|---|---|---|---|---|---|---|
-| - | part 10-09† | · | · | part 10-03† | WRONG 10-03† | WRONG 10-03† | part 10-03† |
+| - | part 10-09† | · | · | · | · | · | · |
 
 ### owl2bench-classify: OWL2Bench EL and DL: classification and consistency of the generated ontologies
 
@@ -584,7 +584,8 @@ partial, performance; tasks vector; kit `benches/breadth/vectors` (outside the d
 - **integration-rg-gs-gnd:** nrese (example, cohort, full); jena (example, cohort, full); graphdb (example, cohort, full); rdfox (example, cohort, full)
 - **real-ontologies:** nrese (dbpedia-core, yago-tiny); jena (dbpedia-core, yago-tiny); rdf4j (dbpedia-core, yago-tiny); nemo (dbpedia-core, yago-tiny); owlrl (dbpedia-core, yago-tiny); graphdb (dbpedia-core, yago-tiny); anzograph (dbpedia-core, yago-tiny)
 - **consistency:** nrese (lubm-1, owl2bench-rl-1); graphdb (lubm-1, owl2bench-rl-1)
-- **ore-2015:** nrese (full); hermit (full); openllet (full); konclude (full); elk (full)
+- **ore-2015:** nrese (full); hermit (dev, full); openllet (dev, full); konclude (dev, full); elk (dev, full)
+- **w3c-owl2-dl:** hermit (-); openllet (-); konclude (-); elk (-)
 - **owl2bench-classify:** nrese (el-1, dl-1, dl-10); hermit (el-1, dl-1, dl-10); openllet (el-1, dl-1, dl-10); konclude (el-1, dl-1, dl-10); elk (el-1, dl-1, dl-10)
 - **basics-mix:** millenniumdb (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); rdfox (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); anzograph (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m)
 - **sparqloscope:** nrese (sparqloscope-dblp); qlever (sparqloscope-dblp); oxigraph (sparqloscope-dblp); virtuoso (sparqloscope-dblp); jena (sparqloscope-dblp); millenniumdb (sparqloscope-dblp); rdf4j (sparqloscope-dblp); graphdb (sparqloscope-dblp); rdfox (sparqloscope-dblp); anzograph (sparqloscope-dblp)
@@ -680,15 +681,9 @@ partial, performance; tasks vector; kit `benches/breadth/vectors` (outside the d
 - lubm 10 on jena: partial (2026-10-03-office-b, † pre-reset): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 3 timeout of 3); steps: count failed
 - lubm 100 on jena: partial (2026-10-03-office-b, † pre-reset): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 1 timeout of 1); steps: count failed
 - lubm 1000 on nemo-sparq: failed (2026-10-03-office-b, † pre-reset): encoding sparq/owl-rl.rls sha256 9012609fe35f25b7; load time includes concatenating the inputs
-- ore-2015 dev on konclude: partial (2026-10-03-dl-reference, † pre-reset): 1 error
 - ore-2015 dev on nrese: partial (2026-10-03-dl-reference, † pre-reset): EL track only (20/20 agree); the DL tasks wait for phase 3
-- ore-2015 dev on openllet: partial (2026-10-03-dl-reference, † pre-reset): 3 timeouts; differs on ore_ont_1340 (open)
 - owl2bench rl-1 on owlrl: timeout (2026-10-03-office-b, † pre-reset)
-- w3c-owl2-dl - on elk: partial (2026-10-03-dl-reference, † pre-reset): EL tasks only; the rest use constructs outside its fragment
-- w3c-owl2-dl - on hermit: partial (2026-10-03-dl-reference, † pre-reset): 27 timeouts, 1 crash (WebOnt-Thing-003), no wrong result
-- w3c-owl2-dl - on konclude: wrong (2026-10-03-dl-reference, † pre-reset): 30 wrong results, 100 unsupported (datatypes, keys)
 - w3c-owl2-dl - on nrese: partial (2026-10-09-office-conformance-a633, † pre-reset): DL-909 disputed
-- w3c-owl2-dl - on openllet: wrong (2026-10-03-dl-reference, † pre-reset): 6 wrong results, 10 timeouts
 - w3c-owl2-rl - on nrese: partial (2026-10-09-office-conformance-a633, † pre-reset): two import skips, one functional-only premise skip
 
 ### Workloads not ready
@@ -800,7 +795,7 @@ Newest first; the records are in [runs/](runs/).
 | [2026-10-03-office-a](runs/2026-10-03-office-a.toml) | 2026-10-03T17:19 | † pre-reset | suite | sus-ai | 5ccf8dbb2e | 62 | The first comparison batch on the office PC, the benchmark machine since 3 October: query engines without reasoning (basics-mix on five datasets, materialised LUBM 1-100), and NRESE's W3C conformance, write scaling and GeoSPARQL. |
 | [2026-10-03-full](runs/2026-10-03-full.toml) | 2026-10-03T15:34 | † pre-reset | suite | Kraris-GPTler | 5ccf8dbb2e | 12 | Full comparison on the main PC at 5ccf8db; interrupted after 35 min (olympics complete, YAGO tiny begun) and moved to the office PC (2026-10-03-office-a and -b), which runs independently while the main PC is used for development |
 | [2026-10-03-nrese-current](runs/2026-10-03-nrese-current.toml) | 2026-10-03T12:20 | † pre-reset | suite | Kraris-GPTler | b963708 +  | 17 | Regression check before the milestone: NRESE at the head of 3 October on the standard tiers, plus OWL2Bench QL-1 and write scaling 1m |
-| [2026-10-03-dl-reference](runs/2026-10-03-dl-reference.toml) | 2026-10-03 | † pre-reset | reasoning/dl | Kraris-GPTler | 00f9b19 (kit); c0b5e5c (NRESE EL rerun) | 9 | Work package 2.3: the reference reasoners on the W3C OWL 2 DL suite and the ORE 2015 development subset; NRESE's EL classifier on the EL track |
+| [2026-10-03-dl-reference](runs/2026-10-03-dl-reference.toml) | 2026-10-03 | † pre-reset | reasoning/dl | Kraris-GPTler | 00f9b19 (kit); c0b5e5c (NRESE EL rerun) | 1 | Work package 2.3: the reference reasoners on the W3C OWL 2 DL suite and the ORE 2015 development subset; NRESE's EL classifier on the EL track |
 | [2026-10-02-yago-head](runs/2026-10-02-yago-head.toml) | 2026-10-02T08:44 | † pre-reset | suite | Kraris-GPTler | unknown (before run manifests) | 1 | NRESE on YAGO tiny after the fixes of 2 October |
 | [2026-10-02-yago](runs/2026-10-02-yago.toml) | 2026-10-02T06:58 | † pre-reset | suite | Kraris-GPTler | unknown (before run manifests) | 6 | YAGO tiny on every system (its data was missing in 2026-10-02) |
 | [2026-10-02-lubm-materialised](runs/2026-10-02-lubm-materialised.toml) | 2026-10-02T06:11 | † pre-reset | suite | Kraris-GPTler | unknown (before run manifests) | 18 | LUBM with the closure precomputed: the query engines without a reasoner on their own turf |
