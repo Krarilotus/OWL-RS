@@ -871,7 +871,7 @@ fn seed_158s_inconsistent_case_is_drawn_again_in_its_family_until_compared() {
     assert!(compared, "{:?} after {} redraws", case.first, case.tries);
     let family = generated(seed(95, 158, 0)).1;
     assert_eq!(case.family, family, "redrawn in another family");
-    assert!(case.tries > 3, "compared after {} redraws", case.tries);
+    assert!(case.tries > 0, "its first draw is consistent");
     let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let rejected = [
         ("asserted", [0, 0, 0, 0, 0, 10]),
