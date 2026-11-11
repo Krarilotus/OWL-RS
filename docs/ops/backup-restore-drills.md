@@ -69,7 +69,7 @@ Success criteria:
 ## Scenario B: Interrupted Update Recovery
 
 1. Trigger controlled interruption during update workload.
-2. Restart the service on the same data directory: opening replays the log and cuts a last commit that was never acknowledged; other damage stops the start unless `store.wal_damage` says otherwise ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+2. Restart the service on the same data directory: opening replays the log's intact records and cuts a torn last record, if there is one, so a commit whose record is intact is there even if its client got no acknowledgement; other damage stops the start unless `store.wal_damage` says otherwise ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
 3. Validate dataset integrity and revision continuity.
 
 Success criteria:

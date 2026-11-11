@@ -20,7 +20,7 @@ The test profile is intended to validate:
 - OCI container with orchestrator or standalone runtime.
 
 ## 3. Runtime Topology
-- One `nrese-server` instance manages one data directory: the default repository, and the repositories created over the API, each under `repositories/<id>/` ([HTTP interface](http-api.md#rdf4j-protocol)).
+- One `nrese-server` instance manages one data directory: the default repository in it, and each repository created over the API in its `repositories/<id>/` ([HTTP interface](http-api.md#rdf4j-protocol)).
 - Scale-out: read replicas follow a primary's log ([replication](replication.md)); nothing partitions the data across machines.
 - Place reverse proxy in front of NRESE for TLS termination and edge controls.
 
@@ -215,7 +215,7 @@ A stop signal ends the server cleanly: SIGTERM (`systemctl stop`, `docker stop`,
 2. A replica's follower stops, and the store closes; it waits for the maintenance in progress first, the longest of which is a background checkpoint (it rewrites the whole store).
 3. It logs `nrese-server stopped` (the signal, how long the stop took, whether requests were cut) and exits with code 0.
 
-One deadline bounds the whole stop: 8 s from the signal, inside the 10 s `docker stop` waits before it kills (systemd and Kubernetes wait longer by default). A stop not done by then ends the process at once with code 0, after a line `nrese-server stop deadline reached` naming what it still waited for. Nothing acknowledged is lost either way: every commit is synced to the log before it is acknowledged, and the next start recovers from the checkpoint and the log, as after a kill ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+One deadline bounds the stop: 8 s from the signal. A stop not done by then logs `nrese-server stop deadline reached`, naming what it still waited for, and 200 ms later ends the process with code 0, as a kill would. The tests check that a stopped server has ended within 9 s of the signal: give the supervisor a stop allowance above that before it kills (`docker stop` waits 10 s unless `-t` says otherwise). Nothing acknowledged is lost either way: every commit is synced to the log before it is acknowledged, and the next start recovers from the checkpoint and the log, as after a kill ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
 
 Not handled: a signal during start-up (while the store opens and start-up reasoning runs) acts as a kill (in the image, Docker kills at the end of its grace period); on Windows, a service stop or `taskkill /F` ends the process without the drain.
 
