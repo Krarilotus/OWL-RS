@@ -362,7 +362,11 @@ pub(crate) fn hazards(
                 if matches!(o.class(*r), ClassExpr::OneOf(_)) {
                     found.extend(left.iter().map(|&c| Hazard::Enumeration(c)));
                 }
-                edges.push((left, expr_terms(*r)));
+                // The right side is read too: `A ⊑ ∀R.B` gives an anonymous `R`-successor
+                // of an `A` its `B` (D16-492 fix check r2, F1).
+                let right = expr_terms(*r);
+                let premise = left.iter().chain(&right).copied().collect();
+                edges.push((premise, right));
             }
             Axiom::EquivalentClasses(classes) => {
                 let all: Vec<Term> = classes.iter().flat_map(|&c| expr_terms(c)).collect();
@@ -432,13 +436,19 @@ pub(crate) fn hazards(
                 links.extend(ps.windows(2).map(|w| (w[0], w[1])));
                 edges.push((ps.clone(), ps.clone()));
             }
+            // The class is read too, as a subclass axiom's right side is.
             Axiom::ObjectPropertyDomain(p, c) | Axiom::ObjectPropertyRange(p, c) => {
                 collect.walk(*c, Place::Right(None));
-                edges.push((vec![p.named()], expr_terms(*c)));
+                let class = expr_terms(*c);
+                edges.push((
+                    std::iter::once(p.named()).chain(class.clone()).collect(),
+                    class,
+                ));
             }
             Axiom::DataPropertyDomain(p, c) => {
                 collect.walk(*c, Place::Right(None));
-                edges.push((vec![*p], expr_terms(*c)));
+                let class = expr_terms(*c);
+                edges.push((std::iter::once(*p).chain(class.clone()).collect(), class));
             }
             Axiom::ObjectCharacteristic(Characteristic::Transitive, p) => {
                 found.push(Hazard::Transitive(p.named()));
@@ -493,11 +503,10 @@ pub(crate) fn hazards(
             equating.entry(t).or_insert(h);
         }
     }
-    // Apart from `equating`: an anonymous individual's type isn't counted by a restriction
-    // on a property outside it, so only a missed membership is.
-    let mut counted: HashMap<Term, Hazard> = HashMap::new();
+    // A counted filler's terms equate as its property does (fix check r2, F2: kept apart,
+    // they reached the walk below anyway through the filler's own hazards).
     for (t, h) in collect.counted {
-        counted.entry(t).or_insert(h);
+        equating.entry(t).or_insert(h);
     }
     // Connected properties (union-find over the links).
     let mut parent: HashMap<Term, Term> = HashMap::new();
@@ -629,10 +638,9 @@ pub(crate) fn hazards(
         }
         while let Some((t, h)) = queue.pop_front() {
             // An anonymous individual may be in `t` unread, and `t`'s own hazard can equate
-            // it with another: any fact may follow, as for the types' terms above. A missed
-            // membership in a counted filler misses the equality its restriction makes.
+            // it with another: any fact may follow, as for the types' terms above.
             if global.is_none() {
-                global = equating.get(&t).or_else(|| counted.get(&t)).copied();
+                global = equating.get(&t).copied();
             }
             for &u in next.get(&t).into_iter().flatten() {
                 if let std::collections::hash_map::Entry::Vacant(e) = affected.entry(u) {
@@ -685,7 +693,7 @@ pub(crate) fn hazards(
     while let Some((t, h, skip)) = queue.pop_front() {
         affected.entry(t).or_insert(h);
         if global.is_none() {
-            global = equating.get(&t).or_else(|| counted.get(&t)).copied();
+            global = equating.get(&t).copied();
         }
         for &(j, u) in forward.get(&t).into_iter().flatten() {
             if Some(j) == skip {
