@@ -1731,7 +1731,9 @@ impl Snapshot {
         };
         let in_parts = in_parts.unwrap_or_else(|| {
             let (keys, parts) = self.group_walk_size(model, &plan, bound);
-            crate::index::walks_in_parts(budget, keys, parts)
+            crate::index::walks_in_parts(budget, keys, parts, || {
+                self.parted_groups(model, &plan, bound)
+            })
         });
         let mut counts = nrese_exec::ChargedVec::new(budget);
         let mut sources = 0;
@@ -1782,6 +1784,16 @@ impl Snapshot {
             .filter(|&stack| model.includes(stack))
             .map(|stack| self.data(model).stack(stack).group_walk_size(plan, bound))
             .fold((0, 0), |(keys, parts), (k, p)| (keys + k, parts + p))
+    }
+
+    /// The groups [`Self::group_counts_in`]'s walk of `plan` finds in its large runs over
+    /// every included stack, estimated ([`crate::index::IndexVersion::parted_groups`]).
+    fn parted_groups(&self, model: ReadModel, plan: &AccessPlan, bound: usize) -> usize {
+        Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| self.data(model).stack(stack).parted_groups(plan, bound))
+            .fold(0, usize::saturating_add)
     }
 
     /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound

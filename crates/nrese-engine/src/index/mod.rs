@@ -163,10 +163,23 @@ pub(crate) fn group_walk_peak(keys: usize, parts: usize) -> usize {
         .saturating_mul(size_of::<(u64, i64)>())
 }
 
+/// The groups up to which a walk whose large runs could go in parallel parts is walked
+/// serially all the same: a search per group costs less than waking the parts. Compared with
+/// [`IndexVersion::parted_groups`]' estimate.
+pub(crate) const SERIAL_GROUPS: usize = 256;
+
 /// Whether a group walk over `keys` keys, `parts` parallel parts in its large runs, runs in
-/// parts: where it has any, and `budget`'s room covers the whole walk's peak.
-pub(crate) fn walks_in_parts(budget: &Budget, keys: usize, parts: usize) -> bool {
-    parts > 0 && budget.remaining() >= group_walk_peak(keys, parts)
+/// parts: where it has any, `budget`'s room covers the whole walk's peak, and its large runs
+/// hold more than [`SERIAL_GROUPS`] groups by the estimate `groups` gives (asked last, only
+/// where the rest holds). One decision for the whole walk, before its output grows; serially
+/// is the reference, so an estimate can cost a walk speed, never an answer.
+pub(crate) fn walks_in_parts(
+    budget: &Budget,
+    keys: usize,
+    parts: usize,
+    groups: impl FnOnce() -> usize,
+) -> bool {
+    parts > 0 && budget.remaining() >= group_walk_peak(keys, parts) && groups() > SERIAL_GROUPS
 }
 
 /// [`IndexVersion::group_counts`]'s walk past its capacity, out of its hot loop: `group`
@@ -714,7 +727,8 @@ impl IndexVersion {
         budget: &'b Budget,
     ) -> Result<(), BudgetExceeded> {
         let (keys, parts) = self.group_walk_size(plan, position);
-        let in_parts = out.capacity() == 0 && walks_in_parts(budget, keys, parts);
+        let in_parts = out.capacity() == 0
+            && walks_in_parts(budget, keys, parts, || self.parted_groups(plan, position));
         self.group_counts_on(plan, position, out, budget, in_parts)
     }
 
@@ -832,6 +846,35 @@ impl IndexVersion {
                 0
             };
             (keys + (end - start), parts + run_parts)
+        })
+    }
+
+    /// An estimate of the groups [`Self::group_counts`] finds in the runs large enough to be
+    /// walked in parts ([`Self::group_walk_size`]'s): each such run's keys over the smaller of
+    /// its first and last groups, each found by one search from that end of the range
+    /// ([`PackedKeys::first_group_len`], [`PackedKeys::last_group_len`]). Exact where the
+    /// groups are of one size. A large group at one end is offset by a small one at the
+    /// other; only where both ends hold groups larger than the rest does it underestimate.
+    pub(crate) fn parted_groups(&self, plan: &AccessPlan, position: usize) -> usize {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return 0;
+        };
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            return 0; // no run in parts: one group, the default graph's (`group_walk_size`)
+        } else {
+            position - 1
+        };
+        self.runs.iter().fold(0usize, |groups, run| {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            if end - start < 2 * GROUP_PART {
+                return groups;
+            }
+            let first = perm.keys.first_group_len(start, end, position);
+            let last = perm.keys.last_group_len(start, end, position);
+            groups.saturating_add((end - start).div_ceil(first.min(last).max(1)))
         })
     }
 
