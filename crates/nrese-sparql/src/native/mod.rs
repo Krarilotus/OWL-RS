@@ -5371,6 +5371,171 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Row counts, alone or per `?k`, of one triple pattern under a FILTER that reads only
+    /// its key `?k`: every row of a key gets the same verdict, so the counts are the index's
+    /// group counts of the keys that pass ([`Snapshot::group_counts_in_range`] within the
+    /// FILTER's range hints, else of the whole pattern), each key's term tested once. The
+    /// walk reads at most the keys the general path's range scan reads rows. `None` for
+    /// any other shape, or where the index can't walk the pattern (equality classes
+    /// expanded): the general path answers.
+    fn group_key_filtered(
+        &self,
+        inner: &GraphPattern,
+        variables: &[Variable],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Option<Solutions>> {
+        let GraphPattern::Filter { expr, inner } = inner else {
+            return Ok(None);
+        };
+        let GraphPattern::Bgp { patterns } = &**inner else {
+            return Ok(None);
+        };
+        let [triple] = patterns.as_slice() else {
+            return Ok(None);
+        };
+        let read = expression_variables(expr);
+        let Some(key) = read.first() else {
+            return Ok(None);
+        };
+        if read.iter().any(|v| v != key)
+            || !(variables.is_empty() || variables == std::slice::from_ref(key))
+            || aggregates.is_empty()
+            || per_solution(expr)
+            || contains_any_exists(expr)
+            || search::is_search(triple, patterns)
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            return Ok(None);
+        };
+        let permutation = scan.permutation_for(Some(key));
+        if scan.repeats_variable()
+            || scan.merged()
+            || !aggregates
+                .iter()
+                .all(|(_, aggregate)| counts_rows(aggregate, &scan))
+            || (0..4)
+                .find(|&c| scan.slots[c].is_var(key))
+                .is_none_or(|component| scan.first_free(permutation) != Some(component))
+        {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let pattern = scan.quad_pattern();
+        let memory = QueryEvaluationError::MemoryLimit;
+        // The FILTER's ranges of `?k`, each walked apart; many, or none: the whole pattern
+        // once (a seek per range would cost more than the walk).
+        let ranges = ranges::hints(expr, &self.snapshot)
+            .into_iter()
+            .find(|hint| hint.variable == *key)
+            .map(|hint| hint.ranges)
+            .filter(|ranges| ranges.len() < MANY_RANGES);
+        let mut walks = Vec::new();
+        match ranges {
+            Some(ranges) => {
+                for (low, high) in ranges {
+                    self.check()?;
+                    let Some(groups) = self
+                        .snapshot
+                        .group_counts_in_range(
+                            self.model,
+                            &pattern,
+                            permutation,
+                            low,
+                            high,
+                            &self.budget,
+                        )
+                        .map_err(memory)?
+                    else {
+                        return Ok(None);
+                    };
+                    walks.push(groups);
+                }
+            }
+            None => match self
+                .snapshot
+                .group_counts_in(self.model, &pattern, permutation, &self.budget)
+                .map_err(memory)?
+            {
+                Some(groups) => walks.push(groups),
+                None => return Ok(None),
+            },
+        }
+        // The ranges are increasing and apart: their groups, in turn, are in id order.
+        let walked: usize = walks.iter().map(|groups| groups.len()).sum();
+        let keys = self.made(walked.saturating_mul(8), || {
+            let column = walks
+                .iter()
+                .flat_map(|groups| groups.iter().map(|(value, _)| value.raw()))
+                .collect();
+            Ok(Solutions {
+                vars: vec![key.clone()],
+                table: IdTable::from_columns(vec![column]).assume_sorted_by(vec![0]),
+                ordered: false,
+            })
+        })?;
+        // The keys' table and its charge go before an error returns, too.
+        let pass = self.filter_mask(&keys, expr);
+        self.consumed(keys);
+        let pass = pass?;
+        let passed = walks
+            .iter()
+            .flat_map(|groups| groups.iter())
+            .zip(&pass)
+            .filter(|&(_, &pass)| pass)
+            .map(|(&group, _)| group);
+        let mut vars = variables.to_vec();
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        let count_id = |n: u64| match TermId::inline_integer(n as i64) {
+            Some(id) => Ok(id.raw()),
+            None => self.id(&integer(n)),
+        };
+        let solutions = if variables.is_empty() {
+            let mut total = 0u64;
+            for (_, n) in passed {
+                total = total
+                    .checked_add(n)
+                    .ok_or(QueryEvaluationError::CountBeyondRange { at_least: u64::MAX })?;
+            }
+            let row = vec![count_id(total)?; aggregates.len()];
+            let mut table = IdTable::new(row.len());
+            table.push_row(&row);
+            self.produced(Solutions {
+                vars,
+                table,
+                ordered: false,
+            })?
+        } else {
+            let kept = pass.iter().filter(|&&pass| pass).count();
+            self.made(kept.saturating_mul(8).saturating_mul(vars.len()), || {
+                let mut columns = vec![Vec::with_capacity(kept), Vec::with_capacity(kept)];
+                for (value, n) in passed {
+                    columns[0].push(value.raw());
+                    columns[1].push(count_id(n)?);
+                }
+                let counts = columns.pop().expect("two columns");
+                columns.resize(vars.len(), counts);
+                Ok(Solutions {
+                    vars: vars.clone(),
+                    table: IdTable::from_columns(columns).assume_sorted_by(vec![0]),
+                    ordered: false,
+                })
+            })?
+        };
+        if self.trace.is_some() {
+            self.note(
+                "key count",
+                format!("{key} of {triple} where {expr}"),
+                None,
+                walked,
+                start,
+            );
+        }
+        Ok(Some(solutions))
+    }
+
     /// One row binding `target` to `count`, charged as the query's.
     fn count_row(&self, target: &Variable, count: u64) -> NativeResult<Solutions> {
         let mut table = IdTable::new(1);
@@ -5494,6 +5659,11 @@ impl<'a> Context<'a> {
                     })
                 });
             }
+        }
+        if !self.as_written
+            && let Some(solutions) = self.group_key_filtered(inner, variables, aggregates)?
+        {
+            return Ok(solutions);
         }
         if !self.as_written
             && !variables.is_empty()

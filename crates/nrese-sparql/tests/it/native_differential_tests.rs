@@ -6664,3 +6664,130 @@ fn paths_ordered_with_patterns_equal_the_reference() {
         "{planned} of {checked} planned with their paths, a path first in {path_first}"
     );
 }
+
+/// Row counts, alone or per key, of one pattern under a FILTER on its key are counted per
+/// key from the index (`key count`): the same answers as the reference, on dates with
+/// timezones at the range's edges, non-canonical and invalid forms, numbers of every kind,
+/// strings, IRIs and blank nodes, keys held in several graphs and by several subjects, a
+/// FILTER that errors on some keys, ranges with no key, and several counts at once.
+#[test]
+fn counts_under_a_key_filter_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let typed = |lexical: &str, datatype| Term::from(Literal::new_typed_literal(lexical, datatype));
+    let values: Vec<Term> = vec![
+        typed("1450-01-01", xsd::DATE),
+        typed("1450-01-01+14:00", xsd::DATE),
+        typed("1449-12-31-14:00", xsd::DATE),
+        typed("1455-06-01", xsd::DATE),
+        typed("01455-06-01", xsd::DATE),
+        typed("1459-12-31Z", xsd::DATE),
+        typed("1460-01-01", xsd::DATE),
+        typed("1460-01-01-14:00", xsd::DATE),
+        typed("1455-06-01T12:00:00", xsd::DATE_TIME),
+        typed("not a date", xsd::DATE),
+        typed("5", xsd::INTEGER),
+        typed("05", xsd::INTEGER),
+        typed("7.5", xsd::DECIMAL),
+        typed("9.0E0", xsd::DOUBLE),
+        typed("12", xsd::INT),
+        Term::from(Literal::new_simple_literal("1455-06-01")),
+        Term::from(Literal::new_language_tagged_literal_unchecked("x", "en")),
+        Term::from(ex("thing")),
+        Term::from(nrese_rdf::BlankNode::new("b1").unwrap()),
+    ];
+    for (i, value) in values.iter().enumerate() {
+        for copy in 0..=i % 3 {
+            let graph = match copy {
+                1 => GraphName::NamedNode(ex("g")),
+                _ => GraphName::DefaultGraph,
+            };
+            let subject = ex(&format!("p{i}-{copy}"));
+            tx.insert(Quad::new(subject, ex("born"), value.clone(), graph).as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let date = |d: &str| format!("\"{d}\"^^<http://www.w3.org/2001/XMLSchema#date>");
+    let filters = [
+        format!(
+            "?d >= {} && ?d < {}",
+            date("1450-01-01"),
+            date("1460-01-01")
+        ),
+        format!(
+            "?d > {} && ?d <= {}",
+            date("1449-12-31"),
+            date("1460-01-01")
+        ),
+        format!("?d = {}", date("1455-06-01")),
+        format!("?d > {}", date("3000-01-01")),
+        "?d >= 5 && ?d < 10".to_string(),
+        "?d = 5".to_string(),
+        "STRSTARTS(STR(?d), \"14\")".to_string(),
+        "isIRI(?d) || isBlank(?d)".to_string(),
+        "BOUND(?d) && LANG(?d) = \"\"".to_string(),
+        "?d > \"1455\"".to_string(),
+    ];
+    let options = QueryOptions::default();
+    for filter in &filters {
+        for select in [
+            "SELECT (COUNT(*) AS ?n)",
+            "SELECT (COUNT(*) AS ?n) (COUNT(?p) AS ?m)",
+            "SELECT ?d (COUNT(*) AS ?n)",
+            "SELECT ?d (COUNT(?p) AS ?n) (COUNT(*) AS ?m)",
+        ] {
+            let group = if select.starts_with("SELECT ?d") {
+                " GROUP BY ?d"
+            } else {
+                ""
+            };
+            let text = format!("{select} WHERE {{ ?p <{EX}born> ?d FILTER({filter}) }}{group}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let operators: Vec<String> = explain_query(&snapshot, &query, &options)
+                .unwrap()
+                .steps
+                .into_iter()
+                .map(|step| step.operator)
+                .collect();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            assert_same_rows(&native, &expected, &text);
+            assert!(
+                operators.iter().any(|o| o == "key count"),
+                "{text}: no key count among {operators:?}"
+            );
+        }
+    }
+    // Not the key's alone: the general path, with the same answers.
+    for text in [
+        format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?p <{EX}born> ?d FILTER(?d = 5 || ?p = <{EX}p10-0>) }}"
+        ),
+        format!(
+            "SELECT ?p (COUNT(*) AS ?n) WHERE {{ ?p <{EX}born> ?d FILTER(?d = 5) }} GROUP BY ?p"
+        ),
+        format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?p <{EX}born> ?d FILTER(?d = 5 && RAND() < 2) }}"
+        ),
+    ] {
+        let query = SparqlParser::new()
+            .parse_query(&text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        let operators: Vec<String> = explain_query(&snapshot, &query, &options)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|step| step.operator)
+            .collect();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_same_rows(&native, &expected, &text);
+        assert!(
+            !operators.iter().any(|o| o == "key count"),
+            "{text}: a key count among {operators:?}"
+        );
+    }
+}
