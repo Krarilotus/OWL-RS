@@ -4,6 +4,7 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
 
     python nrese.py el CASES [--binary target/release/examples/classify]
     python nrese.py dl CASES [--binary target/release/examples/dl_classify] [--only ID,...]
+    python nrese.py consistency CASES [--binary …/tableau_consistency] [--beyond …/dl_beyond]
 
 - `el`: the OWL 2 EL classifier (crates/nrese-reasoner/src/classify.rs), on the EL
   track's tasks. It reads N-Triples: the runner's `ntriples` task converts each ontology
@@ -22,6 +23,10 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
   reached or killed past `--timeout`), `undecided` (another budget), with the reasons it
   printed. Counts don't depend on the machine where the run is complete: set them beside a
   baseline's times.
+- `consistency`: the hypertableau (`tableau_consistency`) on the DL tracks' consistency
+  tasks; an input it refuses as outside OWL 2 DL goes to `nrese_dl::beyond`
+  (`dl_beyond --decide`) with the rest of the time, whose verdict is the row's, the detail
+  column naming that path (`beyond: …; tableau: …`) and the time both runs'.
 """
 
 import argparse
@@ -110,15 +115,28 @@ def outcome(code, stdout, stderr, wrote, ext):
     return ("classified" if ext == "tax" else "realised") if wrote else "error"
 
 
+def launch(command, timeout):
+    """The exit code, standard output and error of a run killed 60 s past its own timeout."""
+    try:
+        run = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 60)
+        return run.returncode, run.stdout, run.stderr
+    except subprocess.TimeoutExpired:
+        return -9, "", "killed past the timeout"
+
+
+def dl_tasks(rows, kinds, only):
+    tasks = sorted({(r[0], r[2]) for r in rows if r[2] in kinds and ("-dl-" in r[0] or "-pure_dl-" in r[0])})
+    if only:
+        keep = {f"ore_ont_{i}" if i.isdigit() else i for i in only.split(",")}
+        tasks = [(t, k) for t, k in tasks if t.split("-")[0] in keep or t in keep]
+    return tasks
+
+
 def dl(args):
     cases = pathlib.Path(args.cases).resolve()
     path, rows = results(cases)
     have = {(r[0], r[1]) for r in rows}
-    tasks = sorted({(r[0], r[2]) for r in rows if r[2] in ("classify", "realise")
-                    and ("-dl-" in r[0] or "-pure_dl-" in r[0])})
-    if args.only:
-        keep = {f"ore_ont_{i}" if i.isdigit() else i for i in args.only.split(",")}
-        tasks = [(t, k) for t, k in tasks if t.split("-")[0] in keep or t in keep]
+    tasks = dl_tasks(rows, ("classify", "realise"), args.only)
     binary = pathlib.Path(args.binary)
     with open(path, "a", encoding="utf-8", newline="\n") as out:
         for t, kind in tasks:
@@ -132,11 +150,7 @@ def dl(args):
                        "--threads", str(args.threads), "--timeout", str(args.timeout),
                        *args.extra, str(source)]
             started = time.monotonic()
-            try:
-                run = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout + 60)
-                code, stdout, stderr = run.returncode, run.stdout, run.stderr
-            except subprocess.TimeoutExpired:
-                code, stdout, stderr = -9, "", "killed past the timeout"
+            code, stdout, stderr = launch(command, args.timeout)
             ms = int((time.monotonic() - started) * 1000)
             profile = next((l[len("profile "):] for l in reversed(stderr.splitlines())
                             if l.startswith("profile ")), "")
@@ -150,6 +164,42 @@ def dl(args):
                                         if l.startswith("incomplete: "))
                 detail = f"{incomplete[:300]} {profile}"
             out.write(f"{t}\tnrese-dl\t{kind}\t{status}\t{ms}\t{detail}".rstrip() + "\n")
+            out.flush()
+            print(f"{t}: {status}, {ms} ms")
+
+
+def decision(code, stdout, stderr):
+    """A consistency run's status and detail from its line `file<TAB>answer<TAB>…<TAB>why`
+    (`tableau_consistency`; `dl_beyond --decide`, whose undecided is the tableau's gave-up)."""
+    line = next((l.split("\t") for l in stdout.splitlines() if l.count("\t") >= 2), None)
+    if code == -9:
+        return "timeout", "killed past the timeout"
+    if code != 0 or line is None or line[1] in ("error", "parse-error"):
+        return "error", (stderr.strip() or "\t".join(line or []))[-200:]
+    answer, why = line[1], line[-1] or line[2]
+    if answer in ("consistent", "inconsistent", "unsupported"):
+        return answer, why[:300]
+    return ("timeout" if "timeout" in why else "undecided"), why[:300]
+
+
+def consistency(args):
+    cases = pathlib.Path(args.cases).resolve()
+    path, rows = results(cases)
+    have = {(r[0], r[1]) for r in rows}
+    with open(path, "a", encoding="utf-8", newline="\n") as out:
+        for t, _ in dl_tasks(rows, ("consistency",), args.only):
+            if (t, "nrese-dl") in have and not args.again:
+                continue
+            source = str(cases / "files" / f"{t.split('-')[0]}.owl")
+            started = time.monotonic()
+            status, detail = decision(*launch([args.binary, "--timeout", str(args.timeout), source], args.timeout))
+            if status == "unsupported":
+                # Outside OWL 2 DL: nrese_dl::beyond decides it, with the rest of the time.
+                rest = max(1, args.timeout - int(time.monotonic() - started))
+                verdict, why = decision(*launch([args.beyond, "--decide", "--timeout", str(rest), source], rest))
+                status, detail = verdict, f"beyond: {why}; tableau: {detail}"
+            ms = int((time.monotonic() - started) * 1000)
+            out.write(f"{t}\tnrese-dl\tconsistency\t{status}\t{ms}\t{detail}".rstrip() + "\n")
             out.flush()
             print(f"{t}: {status}, {ms} ms")
 
@@ -170,8 +220,15 @@ def main():
     d.add_argument("--timeout", type=int, default=300)
     d.add_argument("--again", action="store_true", help="run tasks that have a row already")
     d.add_argument("extra", nargs="*", help="further dl_classify options, after --")
+    c = sub.add_parser("consistency")
+    c.add_argument("cases")
+    c.add_argument("--binary", default=str(ROOT / "target" / "release" / "examples" / "tableau_consistency"))
+    c.add_argument("--beyond", default=str(ROOT / "target" / "release" / "examples" / "dl_beyond"))
+    c.add_argument("--only", help="task ids or ORE numbers, comma-separated")
+    c.add_argument("--timeout", type=int, default=300)
+    c.add_argument("--again", action="store_true", help="run tasks that have a row already")
     args = p.parse_args()
-    {"el": el, "dl": dl}[args.command](args)
+    {"el": el, "dl": dl, "consistency": consistency}[args.command](args)
 
 
 if __name__ == "__main__":
