@@ -2738,6 +2738,37 @@ exec "{Path(sys.executable).as_posix()}" "$@"
         self.assertEqual(Path(value(confirm, "--family")), gate / "plan.json")
         self.assertIn("confirm-not=why", confirm)
 
+    def test_a_report_that_fails_leaves_no_earlier_report_standing(self):
+        """Review release-gate-zero-passes r1 R2: a part rerun in its results directory whose report
+        fails before writing (a pass file truncated: load_passes() raises) left the earlier run's
+        PASSED release-gate.json in place; the step took its existence for a report and the verdict
+        passed it. The earlier report goes before the new one is made: none stands, the step fails."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        head = self.git("rev-parse", "HEAD")
+        env = self.gate_env(tmp, "rerun")
+        gate, out = Path(env["NRESE_GATE_DIR"]), Path(env["FLEET_OUT"])
+        gate.mkdir(parents=True)
+        (out / "passes").mkdir(parents=True)
+        (out / "plan.json").write_text(json.dumps({"run": ["lab-olympics"], "not_run": {}, "elsewhere": {},
+                                                   "family": []}), encoding="utf-8")
+        (out / "inputs.txt").write_text("inputs\n", encoding="utf-8")
+        (out / "passes" / "pass-1-cand.json").write_text("", encoding="utf-8")
+        earlier = run_gate(passes())  # the earlier run's report: it passed
+        self.assertTrue(earlier["passed"])
+        (out / "release-gate.json").write_text(json.dumps(earlier, default=str), encoding="utf-8")
+        (out / "release-gate.md").write_text(gate_module.render(earlier), encoding="utf-8")
+        done = subprocess.run([bash, "scripts/release-gate.sh", "report", head, f"cand={head}", f"base={head}"],
+                              cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertFalse((out / "release-gate.json").exists(), "the earlier PASSED report still stands")
+        self.assertFalse((out / "release-gate.md").exists())
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The rerun's own report failed where the reviewer's did: reading the empty pass file.
+        self.assertIn("JSONDecodeError", (out / "report.log").read_text(encoding="utf-8"))
+
     def test_callers_at_once_share_no_code_checkout(self):
         """Sol, PR #60 fix check 3 (R3): the code checkout, shared under the launching commit's name,
         had no owner: of two `jobs` started at once on one gate directory, one met the other's
