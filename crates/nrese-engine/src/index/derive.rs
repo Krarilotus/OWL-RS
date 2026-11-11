@@ -17,9 +17,13 @@ use rayon::prelude::*;
 use super::keys::PackedKeys;
 use crate::quad::{Key, Permutation};
 
-/// Distinct values of the partitioning component beyond which the caller sorts instead:
-/// the counting tables grow with them (millions of named graphs).
-const MAX_BUCKETS: usize = 1 << 16;
+/// Distinct values of the partitioning component beyond which the caller sorts instead.
+/// Each part keeps a count and a start per value and searches the values for every key,
+/// so the partition slows with them: past 256 values, loads of 1.2 to 19.2 million quads
+/// with the lower of two caps (256 or 1,024, 1,024 or 8,192) were as fast or faster
+/// (docs/design/performance.md, 11 Nov). An attempt on a component with more values (most
+/// objects) also gives up early: a part stops once it has seen more than this many.
+const MAX_BUCKETS: usize = 1 << 8;
 
 /// Keys per parallel part, at least.
 const PART: usize = 1 << 15;
