@@ -22,6 +22,8 @@ use nrese_dl::verdict::Verdict;
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, Ontology, Term};
 
+mod anonymous;
+
 fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
