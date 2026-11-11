@@ -405,6 +405,7 @@ class Driver(unittest.TestCase):
         Its verdicts are counted, and it qualifies only when each is ok or deviates."""
         cases = {"one never captured": (["deviates", "incomplete"], False),
                  "one only its reference's": (["ok", "reference"], False),
+                 "one answered past the recorder's cap": (["ok", "unchecked"], False),
                  "ok and across datatypes": (["ok", "deviates", "ok"], True)}
         for name, (verdicts, qualified) in cases.items():
             with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
