@@ -70,9 +70,9 @@ def el(args):
     binary = pathlib.Path(args.binary)
     with open(path, "a", encoding="utf-8", newline="\n") as out:
         for t in todo:
-            reference = next((cases / "tax" / f"{t}.{r}.tax" for r in ("hermit", "konclude", "elk", "openllet")
-                              if (cases / "tax" / f"{t}.{r}.tax").exists()), None)
-            if reference is None:
+            taxonomy = next((cases / "tax" / f"{t}.{r}.tax" for r in ("hermit", "konclude", "elk", "openllet")
+                             if (cases / "tax" / f"{t}.{r}.tax").exists()), None)
+            if taxonomy is None:
                 print(f"{t}: no reference taxonomy, skipped", file=sys.stderr)
                 continue
             closure = cases / "tax" / f"{t}.nrese-el.tsv"
@@ -85,7 +85,7 @@ def el(args):
                 out.write(f"{t}\tnrese-el\tclassify\terror\t{ms}\t{run.stderr.strip()[-200:]}\n")
                 continue
             pairs = [tuple(l.rstrip("\n").split("\t")[:2]) for l in open(closure, encoding="utf-8") if "\t" in l]
-            text = canonical.canonical(canonical.signature(reference), pairs)
+            text = canonical.canonical(canonical.signature(taxonomy), pairs)
             (cases / "tax" / f"{t}.nrese-el.tax").write_text(text, encoding="utf-8", newline="\n")
             digest = hashlib.sha256(text.encode()).hexdigest()
             profile = next((l[len("profile "):] for l in reversed(run.stderr.splitlines())
