@@ -132,7 +132,7 @@ class AnswerCap(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 capture = answers.Recorder.post(answers.capped_post, url, ("w", "t", "none", "q.rq"), "s", "off", 1,
                                                 "SELECT * {}", Path(d) / "q.json", 10)
-                self.assertIsNone(capture.answer)
+                self.assertIsNone(capture.sha256)
                 self.assertIn("not compared", capture.error)
             os.environ["NRESE_ANSWER_CAP_MB"] = "16"
             code, text = answers.capped_post(url, {"query": "SELECT * {}"}, timeout=10)

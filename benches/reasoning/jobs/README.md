@@ -1,14 +1,14 @@
 # The reasoning home-turf jobs
 
-> **Superseded (2 Nov 2026):** these job files were written for `suite/queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../../README.md](../../README.md#on-the-fleet)); porting them is a follow-up.
+> **Superseded (2 Nov 2026):** these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../../README.md](../../README.md#on-the-fleet)); porting them is a follow-up.
 
-Measurement-queue jobs ([../../suite/queue.py](../../suite/queue.py)) for this week's reasoning
+Measurement-queue jobs ([../../suite/measurement_queue.py](../../suite/measurement_queue.py)) for this week's reasoning
 families: `lubm` (RDFox's L and LE programs), `claros`, `ldbc-spb`, `datalog-graphs`,
 `commit-latency`. Every system of a job runs on Office-PC (Phuoc-Yu has no Docker), one job
 at a time.
 
 ```sh
-python benches/suite/queue.py submit benches/reasoning/jobs/qualify-lubm-rdfox.toml
+python benches/suite/measurement_queue.py submit benches/reasoning/jobs/qualify-lubm-rdfox.toml
 ```
 
 - **`qualify-*`** (window `any`: they count, they don't time) prepare the data and run each

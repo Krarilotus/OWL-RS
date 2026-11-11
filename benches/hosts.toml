@@ -10,7 +10,7 @@
 # newest first, each from `since` (local time): what changes timings (toolchain, CPU governor,
 # profiling, page-cache control). compare refuses to set runs of two configurations side by
 # side (suitekit/compare.py).
-# `roles` and `queue` are read only by benches/suite/queue.py, scripts/capped-chunk.py and
+# `roles` and `queue` are read only by benches/suite/measurement_queue.py, scripts/capped-chunk.py and
 # scripts/hosts/khaleesi-guard.py, the queue that came before the fleet; they go with them.
 
 [assets]
@@ -104,7 +104,7 @@ assets = false
 # weekends. Timed jobs on weekdays 04:30-21:30, on weekends only while nobody uses it; and on
 # any day never while the console session isn't idle: scripts/hosts/khaleesi-guard.py
 # (Task Scheduler, every minute) writes the retreat file and stops a running timed job, its
-# partial results kept. The runner is a scheduled task too (pythonw queue.py work --log).
+# partial results kept. The runner is a scheduled task too (pythonw measurement_queue.py work --log).
 # free: the owner's FREE-UNTIL, which the guard reads (while it holds, nobody counts as present).
 queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", results = "S:/nrese-scratch/results", windows = ["04:30-21:30"], weekend_windows = ["00:00-24:00"], retreat = "S:/nrese-scratch/RETREAT", free = "S:/nrese-scratch/FREE-UNTIL", keep = "same-day", python = "python", receive_pack = "powershell -NoProfile -Command git-receive-pack" }
 

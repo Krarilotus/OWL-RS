@@ -1,5 +1,5 @@
 """Stopping a process the tools started, with what it started: the one tree stop of the
-measurement queue's chunks (benches/suite/queue.py) and of /verify's server
+measurement queue's chunks (benches/suite/measurement_queue.py) and of /verify's server
 (scripts/verify/verifykit/server.py). A process stopped alone leaves its children running, and a
 child keeps what it holds: a Windows venv's python.exe is a launcher whose child is the
 interpreter, so a server started through it kept its port after its launcher was ended

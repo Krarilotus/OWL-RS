@@ -4,8 +4,12 @@ and `suite.py answers DIR...`, which classifies the captures of one or more runs
 an adjudication, or over several runs at once) without running anything.
 
 After a pair's timed queries, while its server still runs, each query is posted once more,
-untimed, and its SPARQL JSON result kept under the pair's logs (one file per query, cache
-mode and repetition). The server's serve-phase memory therefore includes this replay. At
+untimed, and its SPARQL JSON result kept under the pair's logs (one file per query, system,
+cache mode and repetition). The recorder holds none of them parsed: it reads them back one
+query at a time when it classifies them, and an answer whose file holds the bytes it captured,
+byte-identical to one already compared for the query (the same SHA-256), takes that
+comparison's result (a reference's own captures are each checked in full). The server's serve-phase
+memory therefore includes this replay. At
 the end of the run `answers.json`, beside results.csv, holds every capture with its SHA-256,
 one verdict per query and system, and one per group (a distinct query on the same data).
 
@@ -25,13 +29,14 @@ is `ok` when confirmed (by the second reference or an adjudicated count), else `
 | `wrong` | the values differ: the system's answer is wrong (the reference is checked as above) |
 | `deviates` | the same values only across datatypes (`cross-type`), or a COUNT not typed `xsd:integer`: reported, not timed, not disqualifying |
 | `incomplete` | no answer: an error, a timeout, not JSON, not captured; or no reference answered |
+| `unchecked` | answered, not compared: an answer past the recorder's cap (NRESE_ANSWER_CAP_MB) |
 | `unsupported` | the system can't run the query (the suite skipped the pair, or the system says so) |
 | `unqualified` | the comparison can't decide: blank nodes (they need an isomorphism), a decimal division without an exact oracle, or the references disagree |
 | `reference` | the reference's own answer, not confirmed by a second reference or a count |
 
 A group's verdict is its worst system's, in that order of precedence (PRECEDENCE, the one list
 every report reads): `wrong` (naming whose), `unqualified`, `deviates`, `incomplete`,
-`unsupported`, then `ok`. One deviating system never disqualifies the others.
+`unchecked`, `unsupported`, then `ok`. One deviating system never disqualifies the others.
 
 **The levels** (rule.owl-rs-answer-comparison: the same datatype and value counts as the same
 answer for timing; a numeric match across types is diagnostic only; only wrong answers
@@ -79,17 +84,21 @@ ORDERED = re.compile(r"\bORDER\s+BY\b", re.I)
 FINAL_LIMIT = re.compile(r"\s+(?:OFFSET\s+\d+\s+)?LIMIT\s+(\d+)(?:\s+OFFSET\s+\d+)?\s*$", re.I)
 UNSUPPORTED = re.compile(r"unsupported|not supported|not implemented", re.I)
 
+# An answer nobody checked: one past the recorder's cap (its verdict), or, as timing reads it,
+# one incomplete because no reference answered.
+UNCHECKED = "unchecked"
 # The verdicts, worst first: a group's verdict is its worst system's. Every report reads them
 # from here.
-PRECEDENCE = ("wrong", "unqualified", "deviates", "incomplete", "unsupported", "reference", "ok")
+PRECEDENCE = ("wrong", "unqualified", "deviates", "incomplete", UNCHECKED, "unsupported", "reference", "ok")
 # Those a group names its systems for.
-FAULTS = PRECEDENCE[:5]
+FAULTS = PRECEDENCE[:PRECEDENCE.index("reference")]
 # The only ones whose time a report takes: the reference's answer and one shown to be it. No
-# other is (a capture that failed after the timed runs included: incomplete), nor a name this
-# module doesn't know (answers.json before 12 Oct: match, mismatch).
+# other is (a capture that failed after the timed runs included: incomplete; one past the
+# cap: unchecked), nor a name this module doesn't know (answers.json before 12 Oct: match,
+# mismatch).
 TIMED = PRECEDENCE[len(FAULTS):]
-# An answer incomplete because no reference answered: nobody checked it.
-UNCHECKED = "unchecked"
+# What capped_post's refusal says; a capture failed with it was answered, not compared.
+OVER_CAP = "past the recorder's cap"
 # A query its run recorded no verdict for, though it recorded some for the query's workload,
 # tier, regime and system: the join failed, and nothing shows its answer (T8 PR #56 R3).
 MISSING = "missing"
@@ -512,13 +521,14 @@ def compare(answer: Answer, reference: Answer, order: str = "bag", limit: int | 
 
 @dataclass
 class Capture:
+    """One captured answer; the answer itself stays in its file (`path`), read back when its
+    query is classified (Recorder.read)."""
     item: tuple[str, str, str, str]  # workload, tier, regime, query file
     system: str
     cache: str
     run: int
     path: str
     sha256: str | None = None
-    answer: Answer | None = None
     error: str = ""
     unlimited: bool = False  # the query without its final LIMIT (a reference's pool)
 
@@ -544,7 +554,7 @@ def capped_post(url: str, data: dict, timeout: float = 30) -> tuple[int, str]:
                     break
                 size += len(chunk)
                 if size > cap:
-                    return -1, f"an answer past the recorder's cap of {cap // 1048576} MiB (NRESE_ANSWER_CAP_MB): not compared"
+                    return -1, f"an answer {OVER_CAP} of {cap // 1048576} MiB (NRESE_ANSWER_CAP_MB): not compared"
                 chunks.append(chunk)
             return response.status, b"".join(chunks).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
@@ -659,13 +669,13 @@ class Recorder:
             self.captures.append(Capture(item, system, cache, run, "",
                                          error=f"timed query failed; not recaptured: {prior_error}"))
             return
-        self.captures.append(self.post(post, url, item, system, cache, run, text,
-                                       logs / f"{query.stem}-answers-{cache}.json", timeout))
+        # Each capture's own file, whatever directory its caller gives: it is read back from there.
+        name = f"{query.stem}-answers-{system}-{cache}-r{run}"
+        self.captures.append(self.post(post, url, item, system, cache, run, text, logs / f"{name}.json", timeout))
         if (system in self.references and self.orders[item][0] == "limit"
                 and not any(c.unlimited and c.item == item and c.system == system for c in self.captures)):
             self.captures.append(self.post(post, url, item, system, cache, run, without_limit(text),
-                                           logs / f"{query.stem}-answers-{cache}-without-limit.json", timeout,
-                                           unlimited=True))
+                                           logs / f"{name}-without-limit.json", timeout, unlimited=True))
 
     @staticmethod
     def post(post, url: str, item: tuple, system: str, cache: str, run: int, text: str, path: Path,
@@ -676,36 +686,70 @@ class Recorder:
             code, body = post(url, {"query": text}, timeout=timeout)
             if code == -1:
                 raise ValueError(body)
-            path.write_text(body, encoding="utf-8")
+            path.write_bytes(body.encode())  # as hashed: the file shows it holds this capture
             capture.sha256 = hashlib.sha256(body.encode()).hexdigest()
             if code == 0:
                 waited = time.monotonic() - started
                 raise ValueError(f"timeout after {timeout:g} s" if waited >= 0.95 * timeout else "no response")
             if code != 200:
                 raise ValueError(f"HTTP {code}: {body.strip()[:200]}")
-            capture.answer = parse(body)
+            parse(body)  # a SPARQL JSON result, else the capture failed; not held (Recorder.read)
         except (ValueError, OSError) as error:
             capture.error = f"{type(error).__name__}: {error}"[:300]
         return capture
+
+    @staticmethod
+    def body(capture: Capture) -> bytes | None:
+        """A capture's answer as its file holds it; None, and the capture's error set, where it
+        failed or its file can't be read."""
+        if capture.error:
+            return None
+        try:
+            return Path(capture.path).read_bytes()
+        except OSError as error:
+            capture.error = f"{type(error).__name__}: {error}"[:300]
+            return None
+
+    @classmethod
+    def read(cls, capture: Capture, body: bytes | None = None) -> Answer | None:
+        """A capture's answer, parsed from its file (or BODY, read from it) for as long as the
+        caller holds it; None, and the capture's error set, where it isn't one."""
+        body = cls.body(capture) if body is None else body
+        if body is None:
+            return None
+        try:
+            return parse(body.decode("utf-8"))
+        except ValueError as error:
+            capture.error = f"{type(error).__name__}: {error}"[:300]
+            return None
 
     # --- classification ---
     def own(self, item: tuple, system: str, unlimited: bool = False) -> list[Capture]:
         return [c for c in self.captures if c.item == item and c.system == system and c.unlimited == unlimited]
 
     def usable(self, item: tuple, system: str) -> tuple[Answer | None, Answer | None, str]:
-        """A reference candidate's answer and its pool without the LIMIT, or None and why not."""
+        """A reference candidate's answer and its pool without the LIMIT, or None and why not.
+        Its other captures are read and checked against the first one at a time, each in full
+        (equal bytes don't show a LIMIT answer's place in the pool)."""
         own = self.own(item, system)
-        if not own or any(c.answer is None for c in own):
+        order, limit = self.orders.get(item, ("bag", None))
+        first = self.read(own[0]) if own else None
+        pools = [self.read(c) for c in self.own(item, system, unlimited=True)]
+        pool = next((p for p in pools if p is not None), None)
+        full = pool if order == "limit" else first
+        failed, differ = first is None, False
+        for c in own[1:]:
+            answer = self.read(c)
+            failed = failed or answer is None
+            if not failed and not differ and not first.blank and full is not None:
+                differ = not compare(answer, first, order, limit, full)["strict_match"]
+        if failed:
             return None, None, f"{system} has no complete answer"
-        first = own[0].answer
         if first.blank:
             return None, None, "blank nodes: the answers need an isomorphism check"
-        order, limit = self.orders.get(item, ("bag", None))
-        pool = next((c.answer for c in self.own(item, system, unlimited=True) if c.answer is not None), None)
         if order == "limit" and pool is None:
             return None, None, f"{system} has no answer without the LIMIT"
-        full = pool if order == "limit" else first
-        if any(not compare(c.answer, first, order, limit, full)["strict_match"] for c in own[1:]):
+        if differ:
             return None, None, f"{system}'s captures differ among themselves"
         state, _, note = self.holds(item, first)
         if state in ("contradicts", "deviates"):
@@ -717,7 +761,7 @@ class Recorder:
 
     def reference_of(self, item: tuple) -> dict:
         """The item's reference: system, answer, pool, the confirming system, a dispute, why
-        none."""
+        none; and `compared`, the comparisons made against it, by answer (`verdict`)."""
         found, skipped = [], []
         for system in self.references:
             answer, pool, why = self.usable(item, system)
@@ -728,10 +772,10 @@ class Recorder:
             if len(found) == 2:
                 break
         if not found:
-            return dict(system=None, why="; ".join(skipped) or "no reference system")
+            return dict(system=None, why="; ".join(skipped) or "no reference system", dispute="", compared={})
         system, answer, pool = found[0]
         order, limit = self.orders.get(item, ("bag", None))
-        out = dict(system=system, answer=answer, pool=pool, confirmed="", dispute="", why="")
+        out = dict(system=system, answer=answer, pool=pool, confirmed="", dispute="", why="", compared={})
         if len(found) > 1:
             second, other, other_pool = found[1]
             # A limit is confirmed on the pools, which both references answered in full.
@@ -751,11 +795,35 @@ class Recorder:
             if (item, system) in self.skipped:
                 return entry(*self.skipped[(item, system)])
             return entry("incomplete", "not captured")
-        failed = [c for c in own if c.answer is None]
+        order, limit = self.orders.get(item, ("bag", None))
+        comparing = reference["system"] not in (None, system) and not reference["dispute"]
+        # Each capture read, held against the oracle and compared, one at a time. One whose file
+        # holds the bytes it captured (its SHA-256) takes the result of a byte-identical answer
+        # already compared: the comparison's, nothing of its capture.
+        results, failed = [], []
+        for c in own:
+            body = self.body(c)
+            if body is None:
+                failed.append(c)
+                continue
+            key = (c.sha256, comparing) if hashlib.sha256(body).hexdigest() == c.sha256 else None
+            found = reference["compared"].get(key)
+            if found is None:
+                answer, body = self.read(c, body), None
+                if answer is None:
+                    failed.append(c)
+                    continue
+                found = (self.holds(item, answer), compare(answer, reference["answer"], order, limit, reference["pool"],
+                                                           self.operators.get(item)) if comparing else None)
+                if key is not None:
+                    reference["compared"][key] = found
+            results.append(found)
         if failed:
             errors = "; ".join(dict.fromkeys(c.error for c in failed if c.error))
+            if all(OVER_CAP in c.error for c in failed):
+                return entry(UNCHECKED, errors)
             return entry("unsupported" if UNSUPPORTED.search(errors) else "incomplete", errors)
-        held = [self.holds(item, c.answer) for c in own]
+        held = [h for h, _ in results]
         for state, verdict in (("contradicts", "wrong"), ("deviates", "deviates")):
             if any(s == state for s, _, _ in held):
                 return entry(verdict, next(note for s, _, note in held if s == state), False, False)
@@ -772,9 +840,7 @@ class Recorder:
             confirmed = reference["confirmed"]
             return entry("ok" if confirmed else "reference",
                          f"confirmed by {confirmed}" if confirmed else "the reference, unconfirmed", True, True)
-        order, limit = self.orders.get(item, ("bag", None))
-        each = [compare(c.answer, reference["answer"], order, limit, reference["pool"], self.operators.get(item))
-                for c in own]
+        each = [e for _, e in results]
         bad = [e for e in each if e["verdict"] != "ok"]
         if bad:
             return worst_verdict(bad)
@@ -797,6 +863,7 @@ class Recorder:
                                 query_sha256=self.queries.get(item), order=order, system=system,
                                 reference=reference["system"] or "-", captures=len(self.own(item, system)),
                                 **self.verdict(item, system, reference)))
+            del reference  # its answers, before the next item's are read
         return out
 
     def group_key(self, item: tuple) -> tuple:
@@ -886,15 +953,10 @@ class Recorder:
             for s in record.get("skipped", []):
                 recorder.skipped[(tuple(s["item"]), s["system"])] = (s.get("verdict", "unsupported"), s["why"])
             for c in record["captures"]:
-                capture = Capture(tuple(c["item"]), c["system"], c["cache"], c["run"], c["path"], c.get("sha256"),
-                                  error=c.get("error") or "", unlimited=c.get("unlimited", False))
                 file = Path(c["path"]) if Path(c["path"]).is_absolute() else path.parent / c["path"]
-                if not capture.error:
-                    try:
-                        capture.answer = parse(file.read_text(encoding="utf-8"))
-                    except (OSError, ValueError) as error:
-                        capture.error = f"{type(error).__name__}: {error}"[:300]
-                recorder.captures.append(capture)
+                recorder.captures.append(Capture(tuple(c["item"]), c["system"], c["cache"], c["run"], str(file),
+                                                 c.get("sha256"), error=c.get("error") or "",
+                                                 unlimited=c.get("unlimited", False)))
         return recorder
 
 
