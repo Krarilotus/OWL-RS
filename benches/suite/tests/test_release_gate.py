@@ -376,6 +376,18 @@ class NothingTimed(unittest.TestCase):
                 json.dumps({"verdict": "disturbed"}), encoding="utf-8")
             self.assert_not_passed(*self.report(Path(tmp), family))
 
+    def test_the_verdict_refuses_a_report_that_timed_nothing_written_before_the_fix(self):
+        """Review release-gate-zero-passes r1 R1: a report written by the earlier `report` over no
+        passes (no planned case, no error, passed) passed the verdict; the verdict reads such reports
+        too. Its shape: every report since 18 Oct carries `planned`, here empty."""
+        earlier = run_gate([])
+        earlier["errors"] = [e for e in earlier["errors"] if not e.startswith("nothing timed")]
+        earlier["passed"] = True
+        self.assertEqual((earlier["planned"], earlier["passes"], earlier["errors"]), ([], [], []))
+        passed, text = gate_module.verdict([earlier], Rounds.W3C, Rounds.GUARDS)
+        self.assertFalse(passed)
+        self.assertIn("nothing timed", text)
+
 
 class Layouts(unittest.TestCase):
     def test_any_k_blocks_in_a_row_run_every_layout(self):
