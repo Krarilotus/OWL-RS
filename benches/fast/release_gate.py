@@ -882,6 +882,9 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                                          int(context.get("layouts", 1) or 1))
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
+    # Fail closed: a part that timed nothing (no pass, or none that planned a case) passes nothing.
+    if not planned:
+        summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
     summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
     host_errors, summary["host_notes"] = host_states(passes)
@@ -2820,6 +2823,9 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
     if missing:
         lines.append(f"- NOT timed anywhere: {', '.join(missing)} (left to another part, which didn't run them)")
+    # A timed report that planned no case (one written before gate() refused it) timed nothing.
+    empty = [t for t in timed if not t.get("planned")]
+    lines += [f"- **nothing timed**: round {t.get('context', {}).get('round', '?')} planned no case" for t in empty]
     # A check passes only by saying so exactly (True, no errors); a "false" or a missing field is no pass.
     w3c_ok, guards_ok = (part.get("passed") is True and not part.get("errors") for part in (w3c, guards))
     lines.append(f"- W3C: {'passed' if w3c_ok else 'NOT passed'} "
@@ -2827,7 +2833,7 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
     lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
                  f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
     passed = (not blocking_losses and not d["pending"] and not d["not_compared"] and not other and not errors
-              and not diagnostic and not missing and w3c_ok and guards_ok
+              and not diagnostic and not missing and not empty and w3c_ok and guards_ok
               and not evidence and not policy.errors and not wrong)
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]
     return passed, "\n".join(lines) + "\n"
