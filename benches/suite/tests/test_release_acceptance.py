@@ -971,8 +971,10 @@ def refused(*sides):
 
 
 def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str = "Johannes",
-            extra: str = QUOTE) -> str:
-    return (f'[[absence]]\n{scope}\nside = "{side}"\nreason = "its perf lab has no commits mode"\n'
+            extra: str = QUOTE, side_toml: str | None = None) -> str:
+    """An [[absence]] entry; `side_toml`: its side's TOML value as written (a malformed one)."""
+    side_toml = side_toml if side_toml is not None else f'"{side}"'
+    return (f'[[absence]]\n{scope}\nside = {side_toml}\nreason = "its perf lab has no commits mode"\n'
             f'port = "the commits port, after v1.5"\napproved = "2026-11-11"\nby = "{by}"\n{extra}')
 
 
@@ -1030,17 +1032,38 @@ class DeclaredAbsence(Scratch):
             self.assertEqual(done.returncode, 1, f"SPEC out of scope: {policy}\n{done.stdout}")
             self.assertIn("**not compared**: lab-olympics against main", done.stdout)
 
-    def test_an_absence_without_johannes_s_word_or_its_port_is_refused(self):
-        # Spec: decision 1b: the entry carries by, approved, quote and source as the file already
-        # demands, and the planned port; without them it is a policy error and the verdict NOT PASSED.
+    def test_a_malformed_absence_is_a_policy_error_and_the_verdict_never_passes(self):
+        # Spec: decision 1b and review r1 C-1, F-2 (master, 11 Nov): an entry without by, approved, quote
+        # and source, without its port, with both scopes, or whose side isn't base or main (a list, a
+        # table, a number, a boolean, another name) is a policy error: the verdict NOT PASSED, the entry
+        # named, no crash; on rounds that otherwise pass, every side compared.
         catalog = [absent_case()]
+        a = self.repo.commit()
+        done = verdict(self.repo.path, a, self.rounds(a, refused(), catalog), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 0, f"the rounds pass without a policy\n{done.stdout}{done.stderr}")
         for policy in (absence(by="the owner"), absence(extra=""), absence().replace('port = "the commits port, '
                                                                                      'after v1.5"\n', ""),
-                       absence(scope='cases = ["lab-olympics"]\npattern = "lab-*"')):
+                       absence(scope='cases = ["lab-olympics"]\npattern = "lab-*"'),
+                       *(absence(side_toml=v) for v in ("[]", "{}", "1", "true", '"cand"'))):
             a = self.repo.commit(policy=policy)
-            done = verdict(self.repo.path, a, self.rounds(a, refused("main"), catalog), *checks(a, self.repo.tree(a)))
-            self.assertEqual(done.returncode, 1, f"SPEC {policy}\n{done.stdout}")
+            done = verdict(self.repo.path, a, self.rounds(a, refused(), catalog), *checks(a, self.repo.tree(a)))
+            self.assertIn("**NOT PASSED**", done.stdout, f"SPEC {policy}\n{done.stdout}{done.stderr}")
+            self.assertEqual(done.returncode, 1, f"SPEC {policy}\n{done.stdout}{done.stderr}")
             self.assertIn("**policy**: benches/release-tradeoffs.toml: absence 1", done.stdout)
+            self.assertNotIn("Traceback", done.stderr)
+
+    def test_a_case_the_candidate_fails_is_never_counted_as_compared(self):
+        # Spec: review r1 F-1 (master, 11 Nov): "N compared" counts only cases with an actual comparison;
+        # the candidate failing lab-olympics (main absent by product) leaves base with none compared.
+        catalog = [absent_case(main="supported inference")]
+
+        def records_of(side, n):
+            return [fixtures.record(status="failed" if side == "cand" else "ok", anon=1000)]
+        a = self.repo.commit()
+        done = verdict(self.repo.path, a, self.rounds(a, records_of, catalog), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("base: 0 compared, 0 absent by product, 0 absent by the owner's decision, 1 not compared",
+                      done.stdout)
 
 
 class Tradeoffs(Scratch):
