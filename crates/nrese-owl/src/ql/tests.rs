@@ -667,6 +667,34 @@ fn an_equating_left_side_outside_the_profile_is_global() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// What an uncovered axiom's conclusions miss reaches an axiom through every term it reads,
+/// its right side's too (D16-492 fix check r1, F1). Under RL's closure, a reflexive `R`
+/// (outside RL) may miss `R(a, a)`:
+/// - With `A ⊑ ∀R.B`, an `A` is then missed in `B`; with `S`'s range `∀R.B`, so is an
+///   `S`-successor. Both axioms are RL, so only the missed `R` edges reach `B`.
+/// - With `D ⊑ ¬¬B` (outside RL) and `A ⊑ ≤ 1 R.B`, a `D` may be missed in `B`, and with
+///   it the equality of an `A`'s two `R`-successors in `D`: global.
+#[test]
+fn a_missed_conclusion_reaches_an_axiom_through_its_right_side() {
+    let reflexive = "ReflexiveObjectProperty(:R)";
+    let mut wrong = Vec::new();
+    for axioms in [
+        format!("{reflexive} SubClassOf(:A ObjectAllValuesFrom(:R :B))"),
+        format!("{reflexive} ObjectPropertyRange(:S ObjectAllValuesFrom(:R :B))"),
+    ] {
+        let found = concerns_over(&axioms, "B(?x)", true);
+        if !found.iter().any(|c| c.starts_with("B: ")) {
+            wrong.push(format!("{axioms}: {found:?}, expected a concern on B"));
+        }
+    }
+    let equality = "SubClassOf(:D ObjectComplementOf(ObjectComplementOf(:B))) \
+                    SubClassOf(:A ObjectMaxCardinality(1 :R :B))";
+    if tbox(equality, true).0.global_hazard().is_none() {
+        wrong.push(format!("{equality}: no global hazard"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A bounded restriction makes no successor itself, but it can force an existential on a
 /// successor that exists (fix check r2, F4). With `X = ∃S.D`, each conclusion below gives
 /// an `R`-successor of a `C` an `S`-successor in `D`, or may for some successor (OWL 2
