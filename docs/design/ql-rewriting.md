@@ -183,9 +183,7 @@ differential test leave out 47 witnesses in 600 queries with every answer still 
 - `auto` (the default) rewrites when the inferred stack is current under `owl2-ql`, the
   profile that names these answers;
 - `on` under `owl2-rl` too. Not the default there (the owner's decision of 6 October): a
-  user choosing `owl2-rl` chooses its standard semantics, which also keeps answer counts
-  equal to other systems' `owl2-rl` (the benchmark protocol compares rulesets before
-  times); `owl2-dl` mode gets these answers through the DL bounds;
+  user choosing `owl2-rl` chooses the standard OWL 2 RL/RDF closure; `owl2-dl` mode gets these answers through the DL bounds;
 - `off` never.
 
 Only `owl2-ql` and `owl2-rl` close the data enough (H-complete); other rulesets don't close
@@ -304,15 +302,20 @@ conservatively:
 - an anonymous individual's type is *affected* when a property connected to its role (by
   inclusions, inverses, equivalences or chains) or one of its classes has a hazard;
 - the *affected terms* are the properties and classes of affected types, closed upward
-  along every axiom (from the terms of its premise to those of its conclusion); a hazard
-  that can make individuals equal (functional, keys, cardinality, enumerations) affects
-  every term;
+  along every axiom (from every term the axiom reads, on either side, to the terms it
+  concludes); a hazard that can make individuals equal (functional, keys, cardinality,
+  enumerations, and the classes in a cardinality restriction's filler) affects every term;
 - an axiom whose left side any individual may be in with none of that side's terms
   (`⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`, `¬⊥`, anything negative or bounded above), unless the TBox
   reads it whole (`⊤` or `≥ 0 R.C` on the left, a right side without hazard, union,
   enumeration or complement), meets every anonymous individual: the terms of its right
   side are affected, an enumeration there affects every term, and an existential there makes
-  anonymous individuals of its own.
+  anonymous individuals of its own;
+- an axiom outside the closure's profile that the TBox doesn't read whole: the rules don't
+  answer it for named individuals either, so every term it can conclude is affected, its
+  left side's terms too, read negated (`L ⊑ R` is also `¬R ⊑ ¬L`), and one that can make
+  individuals equal (an at-most, a minimum of two or more, an enumeration, on either side)
+  affects every term.
 
 **Per query:** `sound-only` when an atom reads an affected term, when a pattern reached a
 bound (§5), when a predicate or class is a variable, or when a pattern the rewriting doesn't
@@ -331,8 +334,9 @@ DL design gives every answer (owl2-dl.md, "Every answer carries its status"): `s
 `complete`, optional `bounds` (lower, upper and unresolved counts), `reasons`, each with
 its `source` (`ql` here, `dl` for the bounds), and the `regime` its `complete` refers to (set
 by the producer: `owl2-ql` or `owl2-rl` here, by the closure; `owl2-dl` for the bounds).
-QL's `complete` is every answer the closure's rules and the existentials entail, not every
-certain answer under OWL 2 DL. Sources add reasons and `merge` combines
+QL's `complete` is every certain answer under the OWL 2 Direct Semantics, as under
+`owl2-dl`: the rewriting withholds it wherever an axiom the closure and the rewriting don't
+answer could add an answer the query reads (the hazards above). Sources add reasons and `merge` combines
 statuses; `header()` writes the header (`complete`, `sound-only` or `unsound`, then
 `lower=…; upper=…; unresolved=…` where bounds are known, then the first five reasons). The
 QL rewriting reports `sound` and, under a hazard, not `complete`, without bounds: it

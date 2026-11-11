@@ -7,9 +7,10 @@ are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions
 
 ## Goal
 
-An RDF database and ontology platform that reads like QLever, governs data like GraphDB
-and leads in reasoning: OWL 2 RL materialised and maintained incrementally, OWL 2 DL with
-complete answers where the plan has a complete path, on every core of one machine and
+An RDF database and ontology platform with reasoning at its centre: fast SPARQL over
+large data, writes that are validated, access-controlled and transactional, OWL 2 RL
+materialised and maintained incrementally, and OWL 2 DL with complete answers where the
+plan has a complete path, on every core of one machine and
 across machines where a use case needs it ([vision](spec/00-vision-and-scope.md)).
 
 ## The order (owner, 5 October 2026)
@@ -18,7 +19,8 @@ across machines where a use case needs it ([vision](spec/00-vision-and-scope.md)
    outliers, the store's DL mode, the query items, materialisation memory, OWL 2 QL
    rewriting).
 2. **Benchmark it:** the fast regression suite, the core workloads with the Zebratlas
-   reasoning workload, each competitor on its home turf, a defaults track beside the
+   reasoning workload, workloads other stores are designed for as well (so that no result
+   rests on a choice that suits NRESE), and a defaults track beside the
    best-configuration track ([benches/PROTOCOL.md](../benches/PROTOCOL.md)).
 3. **Merge v2 into `main`** when every guard is green and nothing regressed.
 4. **Concise docs and a major refactoring:** the README and docs short enough to
@@ -65,12 +67,13 @@ performance plan: [design/owl2-dl-performance.md](design/owl2-dl-performance.md)
 1. **Foundations** (done 3 October): the OWL 2 structural model and normaliser, one proof
    format for RL, EL and DL steps with justifications, the W3C suite, reference reasoners
    (Konclude, HermiT, Openllet, ELK), disputes settled by hand, never by majority.
-2. **The engine** (in progress): the hypertableau, complete first (W3C DL suite, then
-   HermiT parity on ORE 2015); fast layers in front of it (a context-saturation core whose
-   rule families switch on step by step, the EL saturation as a separate fast path), the
-   fallback decided by measured growth. Konclude's 1,862 of 1,920 ORE classifications is
-   the final bar.
-3. **DL in the store** (G3, next): the RL closure as the persistent lower bound, a
+2. **The engine** (done for coverage; performance open): the hypertableau, complete first
+   (every case of the W3C DL suite decided); fast layers in front of it (a
+   context-saturation core whose rule families switch on step by step: the Horn stage
+   done, the SRIQ and SROIQ stages open; the EL saturation as a separate fast path), the
+   fallback decided by measured growth. Speed on the ORE 2015 classifications is the open
+   work ([STATUS](STATUS.md#owl-2-dl-v15-branch-v15dl-complete-12-october)).
+3. **DL in the store** (G3, done; tighter bounds open): the RL closure as the persistent lower bound, a
    candidate upper bound never visible as inferred data, tighter bounds per query.
    Completeness is always reported (`sound`, `complete`, the bounds, `unresolved`);
    routing by profile (EL to the consequence-based core, Horn to rules, the rest to the
