@@ -196,7 +196,9 @@ fn unpublished(engine: &Engine, changes: &[(EncodedQuad, bool)]) -> Vec<(&'stati
         pending.with_canonical_equality(),
     ));
     out.push(("a pending", pending));
-    let mut tx = engine.speculative();
+    // The old shared speculative kind, one of the unpublished snapshots, until V1b removes it.
+    #[allow(clippy::disallowed_methods)]
+    let mut tx = engine.speculative_shared();
     apply(&mut tx);
     out.push(("a speculative", tx.pending_snapshot()));
     drop(tx);
@@ -204,8 +206,8 @@ fn unpublished(engine: &Engine, changes: &[(EncodedQuad, bool)]) -> Vec<(&'stati
     let mut tx = engine.speculative_over(&engine.snapshot(), budget).unwrap();
     for &(quad, added) in changes {
         match added {
-            true => tx.insert_encoded(quad),
-            false => tx.remove_encoded(quad),
+            true => tx.try_insert_encoded(quad).unwrap(),
+            false => tx.try_remove_encoded(quad).unwrap(),
         };
     }
     out.push(("a private", tx.pending_snapshot().unwrap()));

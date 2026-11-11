@@ -35,7 +35,7 @@ fn parallel_readers_of_one_pending_snapshot_answer_within_a_deadline() {
                     own.try_insert(quad.as_ref()).unwrap();
                 }
                 for quad in removed() {
-                    own.remove(quad.as_ref());
+                    own.remove(quad.as_ref()).unwrap();
                 }
                 own.pending_snapshot().unwrap()
             }

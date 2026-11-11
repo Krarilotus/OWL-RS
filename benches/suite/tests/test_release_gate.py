@@ -606,6 +606,22 @@ class Rounds(unittest.TestCase):
         self.assertEqual((maker["memory_gb"], maker["cpus"]),
                          gate_module.MAKER_CONTAINERS["bash benches/reasoning/prepare-lubm.sh"])
 
+    def test_a_job_declaring_containers_of_its_own_declares_every_maker_that_can_start_one(self):
+        """#132's second lead, approved by the bench lead (8 Nov 2026): a SPARQL file's maker asks the host nothing
+        (no Docker in `has`), yet benches/sparql/prepare.sh starts its container wherever Docker is. A job that is
+        spec 9 anyway (a suite cell, its measured container declared) is watched, so that maker must be declared too;
+        a job declaring nothing of its own still declares nothing for it (abba: no watcher switched on)."""
+        base = {"roles": ["measure"], "os": "linux", "cores": 16, "ram_gb": 12}
+        sparql = [{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]
+        requires, fields, env = gate_module.data_job(sparql, dict(base), harness=None, containers_declared=True)
+        memory, cpus = gate_module.MAKER_CONTAINERS["bash benches/sparql/prepare.sh"]
+        self.assertEqual(fields, {"spec": 9, "containers": [{"name": "maker", "memory_gb": memory, "cpus": cpus}]})
+        self.assertEqual((requires["ram_gb"], env["NRESE_MAKER_MEMORY_GB"]), (base["ram_gb"] + memory, f"{memory:g}"))
+        self.assertEqual(gate_module.data_job(sparql, dict(base), harness=None)[1:], ({}, {}))
+        # No maker that starts a container: nothing declared, whatever the job declares itself.
+        assets = [{"data": "volume:era-shacl/ERA.ttl"}]
+        self.assertEqual(gate_module.data_job(assets, dict(base), harness=None, containers_declared=True)[1:], ({}, {}))
+
     def test_a_release_gate_part_asks_what_its_harness_makes_and_how(self):
         """Review r1 R1 of pkg/maker-containers (8 Nov 2026): a part's data is made by its harness's own
         prepare (release-gate.sh prepare runs the harness worktree's release_gate.py and catalogue), so

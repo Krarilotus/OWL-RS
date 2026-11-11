@@ -398,6 +398,21 @@ impl PackedKeys {
             .unwrap_or_else(|_| unreachable!("nothing is charged"))
     }
 
+    /// At most what [`Self::from_sorted`] of `n` keys allocates: what the packed keys keep
+    /// (headers, firsts, data), and what the packing holds beside them while it runs (its
+    /// list of slices). The data is at most the raw keys' words and its spare word: per key
+    /// position a block's frame takes the tag's width plus the payload's, at most
+    /// `64 - TAG_SHIFT` plus `TAG_SHIFT` bits, and a palette is chosen only where it is
+    /// smaller ([`Header::of`]), so a block of `n` keys packs into at most `4n` words (DUR-6
+    /// slice 2: what a pending snapshot charges before it builds).
+    pub(crate) fn bound(n: usize) -> (usize, usize) {
+        use std::mem::size_of;
+        let blocks = n.div_ceil(BLOCK);
+        let data = (n * (size_of::<Key>() / size_of::<u64>()) + 1) * size_of::<u64>();
+        let kept = blocks * (size_of::<Header>() + size_of::<Key>()) + data;
+        (kept, blocks * size_of::<&mut [u64]>())
+    }
+
     /// [`Self::from_sorted`], each array reserved on `charge` before it is made (what the
     /// keys keep stays reserved; the packing's working memory is released), on one thread.
     pub(crate) fn from_sorted_within(
@@ -878,25 +893,7 @@ impl PackedKeys {
         while i < end {
             let mut block = i / BLOCK;
             if i == block * BLOCK {
-                // Blocks whose first key has the current value: everything before the last
-                // of them has it too.
-                let (mut last, mut step) = (block, 1);
-                while last + step < self.firsts.len()
-                    && (last + step) * BLOCK < end
-                    && self.firsts[last + step][position] == value
-                {
-                    last += step;
-                    step *= 2;
-                }
-                while step > 1 {
-                    step /= 2;
-                    if last + step < self.firsts.len()
-                        && (last + step) * BLOCK < end
-                        && self.firsts[last + step][position] == value
-                    {
-                        last += step;
-                    }
-                }
+                let last = self.last_block_of(block, end, position, value);
                 if last > block {
                     block = last;
                     i = block * BLOCK;
@@ -933,6 +930,106 @@ impl PackedKeys {
         f(value, from, end);
     }
 
+    /// The last block, from `block` on and starting before `end`, whose first key has
+    /// `value` at `position`, found by galloping over the blocks' first keys: every block
+    /// from `block` to it holds only `value` there ([`Self::groups`]' skip).
+    #[inline]
+    fn last_block_of(&self, block: usize, end: usize, position: usize, value: u64) -> usize {
+        let starts_with = |b: usize| {
+            b < self.firsts.len() && b * BLOCK < end && self.firsts[b][position] == value
+        };
+        let (mut last, mut step) = (block, 1);
+        while starts_with(last + step) {
+            last += step;
+            step *= 2;
+        }
+        while step > 1 {
+            step /= 2;
+            if starts_with(last + step) {
+                last += step;
+            }
+        }
+        last
+    }
+
+    /// The number of keys in the first group of the keys `start..end` at `position` (the
+    /// run [`Self::groups`] reports first), found as that walk finds it: at most three block
+    /// decodes (a start's block from the start, the last block that begins with the value,
+    /// the next) and one gallop over the blocks' first keys, never a scan of the range. Zero
+    /// for an empty range.
+    pub(crate) fn first_group_len(&self, start: usize, end: usize, position: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        let value = self.get(start)[position];
+        let mut i = start;
+        let mut column = Vec::with_capacity(BLOCK);
+        while i < end {
+            let mut block = i / BLOCK;
+            if i == block * BLOCK {
+                block = self.last_block_of(block, end, position, value);
+                i = i.max(block * BLOCK);
+            }
+            let block_end = ((block + 1) * BLOCK).min(end);
+            column.clear();
+            self.decode_column(
+                block,
+                i - block * BLOCK,
+                block_end - block * BLOCK,
+                position,
+                &mut column,
+            );
+            if let Some(k) = column.iter().position(|&v| v != value) {
+                return i + k - start;
+            }
+            i = block_end;
+        }
+        end - start
+    }
+
+    /// The number of keys in the last group of the keys `start..end` at `position` (the run
+    /// [`Self::groups`] reports last): a gallop down over the blocks' first keys to the
+    /// lowest block after `start` that begins with the last key's value (every key from it
+    /// to `end` has that value), then one block decoded, the one before it or the last
+    /// key's own. Zero for an empty range.
+    pub(crate) fn last_group_len(&self, start: usize, end: usize, position: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        let value = self.get(end - 1)[position];
+        let begins = |b: usize| b * BLOCK > start && self.firsts[b][position] == value;
+        let mut block = (end - 1) / BLOCK;
+        if begins(block) {
+            let mut step = 1;
+            while step <= block && begins(block - step) {
+                block -= step;
+                step *= 2;
+            }
+            while step > 1 {
+                step /= 2;
+                if step <= block && begins(block - step) {
+                    block -= step;
+                }
+            }
+            // The group starts in the block before, or where this one does.
+            block -= 1;
+        }
+        let from = start.max(block * BLOCK);
+        let to = end.min((block + 1) * BLOCK);
+        let mut column = Vec::with_capacity(BLOCK);
+        self.decode_column(
+            block,
+            from - block * BLOCK,
+            to - block * BLOCK,
+            position,
+            &mut column,
+        );
+        match column.iter().rposition(|&v| v != value) {
+            Some(k) => end - (from + k + 1),
+            None => end - from,
+        }
+    }
+
     /// Appends, for each of `positions`, the key component at that position of the keys
     /// `start..end` to the matching vector of `out`: block by block, a column at a time.
     pub(crate) fn decode_columns(
@@ -942,8 +1039,9 @@ impl PackedKeys {
         positions: &[usize],
         out: &mut [Vec<u64>],
     ) {
+        // Exactly: what a charged caller reserved for them ([`super::ColumnScan::decode`]).
         for column in out.iter_mut() {
-            column.reserve(end.saturating_sub(start));
+            column.reserve_exact(end.saturating_sub(start));
         }
         let mut i = start;
         while i < end {
@@ -1278,6 +1376,59 @@ mod tests {
                 let mut got = Vec::new();
                 packed.groups(start, end, position, |v, from, to| got.push((v, from, to)));
                 assert_eq!(got, expected, "{start}..{end} at {position}");
+            }
+        }
+    }
+
+    /// The first and last groups' lengths are those of the first and last runs of equal
+    /// values, wherever the range starts and ends: on a block's first key or inside a block,
+    /// in a group of a few keys or one spanning many blocks of one value, or a range within
+    /// one group.
+    #[test]
+    fn the_end_groups_are_the_first_and_last_runs_of_equal_values() {
+        let mut state = 29;
+        let long: Vec<Key> = (0..20_000u64)
+            .map(|i| [(1 << TAG_SHIFT) | (i / 3000), 0, i, 0])
+            .collect();
+        for keys in [random_keys(&mut state, 70_000), long] {
+            let packed = PackedKeys::from_sorted(&keys);
+            let fixed = [
+                (0, keys.len()),
+                (BLOCK, keys.len()),
+                (2999, 6100),
+                (3000, 3001),
+                (0, 6000),
+                (0, 9000 + 3 * BLOCK + 5),
+                (5 * BLOCK + 7, 12_000),
+            ];
+            let random = (0..200).map(|_| {
+                let a = (rng(&mut state) as usize) % (keys.len() + 1);
+                let b = (rng(&mut state) as usize) % (keys.len() + 1);
+                (a.min(b), a.max(b))
+            });
+            for (start, end) in fixed.into_iter().chain(random.collect::<Vec<_>>()) {
+                let expected = match start < end {
+                    true => keys[start..end].partition_point(|k| k[0] == keys[start][0]),
+                    false => 0,
+                };
+                assert_eq!(
+                    packed.first_group_len(start, end, 0),
+                    expected,
+                    "{start}..{end}"
+                );
+                let expected = match start < end {
+                    true => keys[start..end]
+                        .iter()
+                        .rev()
+                        .take_while(|k| k[0] == keys[end - 1][0])
+                        .count(),
+                    false => 0,
+                };
+                assert_eq!(
+                    packed.last_group_len(start, end, 0),
+                    expected,
+                    "last of {start}..{end}"
+                );
             }
         }
     }

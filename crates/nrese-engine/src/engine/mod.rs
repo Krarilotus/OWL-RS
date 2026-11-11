@@ -33,11 +33,14 @@ mod equality;
 mod lock_tests;
 #[cfg(test)]
 mod own_state_tests;
+mod pending_traits;
 mod private;
 mod replication;
 #[cfg(test)]
 mod shared_state_tests;
 mod snapshot;
+#[cfg(test)]
+mod speculative_tests;
 pub(crate) mod spill;
 mod statistics;
 mod transaction;
@@ -62,11 +65,13 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
+pub use pending_traits::{PendingView, PendingWrite};
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Admission, Count, CountedSnapshot, HeavyGroups, InferredMask, InferredSubset, OwnState,
-    ProbeCursor, SearchRefused, Seek, SharedState, Snapshot, SnapshotIdentity, TextScope,
+    Admission, Count, CountedSnapshot, GroupCounts, HeavyGroups, InferredMask, InferredSubset,
+    OwnState, ProbeCursor, ScanColumns, SearchRefused, Seek, SharedState, Snapshot,
+    SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 pub use writer::{CommitNote, Finished, NoteError, WriterHeld};
@@ -561,6 +566,16 @@ struct Shared {
     forms: crate::index::Forms,
 }
 
+impl Drop for Shared {
+    /// The statistics' directory stops being theirs before the store's `LOCK` is released
+    /// (`durable` drops after this body): a rebuild or snapshot that outlives the store
+    /// writes and reads it no more, and a save under way ends first
+    /// ([`statistics::Statistics::close_dir`]).
+    fn drop(&mut self) {
+        self.statistics.close_dir();
+    }
+}
+
 impl Shared {
     /// A stamp for a new commit: never before the store's clock, which takes it.
     fn stamp(&self) -> u64 {
@@ -1046,10 +1061,18 @@ impl Engine {
     /// the machine with their build.
     pub fn prepare_statistics(&self) {
         let snapshot = self.snapshot();
+        // The engine's own acquisition is published (`Shared::snapshot`).
+        debug_assert!(
+            snapshot.shared_state().is_some(),
+            "the engine's snapshot is published"
+        );
+        let Some(state) = snapshot.shared_state() else {
+            return;
+        };
         self.inner
             .shared
             .statistics
-            .prepare_sets(&snapshot, ReadModel::default());
+            .prepare_sets(&state, ReadModel::default());
     }
 
     /// What the planner's statistics kept are charged to from now on: their owner's budget
@@ -1130,12 +1153,45 @@ impl Engine {
         Ok(Transaction::new(&self.inner, Some(slot)))
     }
 
-    /// A transaction over the latest snapshot that never commits and doesn't take the
-    /// writer slot: for reading what pending changes would make (a client transaction's
-    /// reads) while other writers go on. Its changes stay in it; terms it interns are kept
-    /// (as an aborted transaction's are). [`Transaction::commit`] fails on it.
-    pub fn speculative(&self) -> Transaction<'_> {
+    /// A private transaction over the latest snapshot ([`Self::speculative_over`]): for
+    /// reading what pending changes would make (a client transaction's reads, a validation
+    /// preview, an entailment test) while writers go on. Its terms are its own, charged to
+    /// `budget`, and never enter the dictionary; it has no commit. Never refused: the latest
+    /// snapshot is this engine's and published.
+    pub fn speculative(&self, budget: Arc<nrese_exec::Budget>) -> PrivateTransaction<'_> {
+        PrivateTransaction::over_latest(&self.inner, budget)
+    }
+
+    /// The old speculative transaction: the shared kind without the writer slot, whose terms
+    /// enter the dictionary. Temporary: until V1b, for the RL refutation's rule constants
+    /// (`nrese-store/src/entailment.rs`), the one caller the workspace `clippy.toml` allows;
+    /// removed with V1b (the reasoner's maintenance over either transaction kind).
+    /// [`Transaction::commit`] fails on it.
+    #[doc(hidden)]
+    pub fn speculative_shared(&self) -> Transaction<'_> {
         Transaction::new(&self.inner, None)
+    }
+
+    /// The ids of `terms`, each added to the dictionary if it has none, without the writer
+    /// slot: the one way to append to the dictionary outside a writer. Only for system
+    /// vocabulary, names never statements (the lifecycle contract's limit L2): DL and OWL
+    /// vocabulary, fresh entailment names and the DL bounds' generated names, which derive only
+    /// from fixed names, the configuration and the published ontology, never from a request.
+    /// Those names must keep their ids for every later reader (state other operations reach
+    /// holds them), which a private transaction's can't. Every caller is named in the workspace
+    /// `clippy.toml` (dictionary lifecycle V1); a request's terms go through
+    /// [`Self::speculative_over`]'s private vocabulary instead.
+    ///
+    /// Never refused today: the result is the contract for an engine that may not append.
+    pub fn intern_system_vocabulary<'t>(
+        &self,
+        terms: impl IntoIterator<Item = nrese_rdf::TermRef<'t>>,
+    ) -> EngineResult<Vec<TermId>> {
+        let dictionary = &self.inner.shared.dictionary;
+        Ok(terms
+            .into_iter()
+            .map(|term| dictionary.intern(term))
+            .collect())
     }
 
     /// A private transaction over `snapshot`: speculative changes that read its statements,

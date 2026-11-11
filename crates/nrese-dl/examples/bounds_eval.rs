@@ -161,7 +161,11 @@ fn main() {
         eprintln!("diagnostics: {:?}", ontology.diagnostics);
     }
     if let Some(path) = flag("--n3") {
-        let text = program.to_n3(&|t| table.text(t));
+        let own = table.own_iris(&program);
+        let text = program.to_n3(&|t| {
+            own.get(&t)
+                .map_or_else(|| table.text(t), |iri| format!("<{iri}>"))
+        });
         let text = text.unwrap_or_else(|e| format!("# {e}\n"));
         std::fs::write(path, text).expect("the N3 file writes");
     }

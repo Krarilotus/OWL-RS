@@ -1417,19 +1417,27 @@ impl StoreService {
         }
         // Never committed: no writer slot, so other clients commit meanwhile. The operations
         // read as the reader may; what they change is checked at the commit (the view is
-        // the reader's own, and shows the graphs it may read only).
-        let mut tx = self.engine.speculative();
-        // What the operations' transfers reserve of the pending changes is the reading
-        // query's too.
-        tx.charge_pending_to(std::sync::Arc::new(memory.part()))?;
+        // the reader's own, and shows the graphs it may read only). A private transaction
+        // (dictionary lifecycle V1): the operations' own terms and pending changes are charged
+        // to the reading query's envelope, and none enters the dictionary; the commit replays
+        // the operations, never these ids. One budget for the request, so its pending snapshot
+        // is made once (`pending_snapshot_within`'s memo).
+        let budget = std::sync::Arc::new(memory.part());
+        let mut tx = self.engine.speculative(std::sync::Arc::clone(&budget));
         let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
-        crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
-            crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
-        })?;
+        crate::statements::apply_statements(
+            &mut tx,
+            pending,
+            &requester,
+            &budget,
+            &mut |tx, request| {
+                crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
+            },
+        )?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
-            Some(reading) => reading.pending(&tx)?,
-            None => tx.pending_snapshot(),
+            Some(reading) => reading.pending(&tx, &budget)?,
+            None => tx.pending_snapshot_within(&budget)?,
         };
         self.sessions.keep_view(
             tx.base().clone(),
@@ -1538,12 +1546,18 @@ impl StoreService {
         let access = scope.access().map(|access| &**access);
         use nrese_engine::{GraphSelector, QuadPattern};
         let snapshot = self.engine.snapshot();
+        // A group a graph: as many as the store has graphs, bounded by them, not by a
+        // request (uncharged as before; the store owner's follow-up, D16-039 F7).
+        let unlimited = nrese_exec::Budget::unlimited();
         let counts: Vec<(TermId, u64)> = snapshot
             .group_counts_in(
                 ReadModel::Asserted,
                 &QuadPattern::all(),
                 nrese_engine::quad::Permutation::Gspo,
+                &unlimited,
             )
+            .expect("an unlimited budget")
+            .map(|groups| groups.into_parts().0)
             .unwrap_or_else(|| {
                 std::iter::once(TermId::DEFAULT_GRAPH)
                     .chain(snapshot.named_graphs())

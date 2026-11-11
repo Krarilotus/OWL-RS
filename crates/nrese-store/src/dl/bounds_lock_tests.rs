@@ -74,8 +74,9 @@ fn unbuilt(n: usize) -> Arc<StoreService> {
 fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     let mut out = std::collections::BTreeMap::new();
     for fact in facts {
-        let key = fact.clone().map(|t| match t.starts_with("<urn:nrese:u1:") {
-            true => "<urn:nrese:u1:*>".to_owned(),
+        let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
+        let key = fact.clone().map(|t| match own(&t) {
+            true => "<U1's own>".to_owned(),
             false => t,
         });
         *out.entry(key).or_insert(0) += 1;
@@ -150,7 +151,7 @@ fn literals_a_change_reads_by_value_are_kept_only_once_its_commit_happens() {
         )
     };
     // Prepared, never installed: the commit didn't happen.
-    let mut tx = store.engine().speculative();
+    let mut tx = store.engine().transaction();
     tx.insert(key_value("urn:test:d2").as_ref());
     let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
     assert!(

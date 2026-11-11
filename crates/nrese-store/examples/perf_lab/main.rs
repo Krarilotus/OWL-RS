@@ -10,6 +10,8 @@
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
+//!     [--held-views N,...] [--staggered-views VIEWS:ROWS]
+//!     [--recovery-prepare COMMITS:QUADS] [--recovery COMMITS:QUADS --store DIR --load FILE]
 //!     [--support-sets K|off] [--support-reader FILE [--support-commits FILE] [--support-updates FILE]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
@@ -44,7 +46,7 @@
 //!   report, for the fast suite's route checks; a query with one row also records its
 //!   first value there (`value`), the answer of a count.
 //!   `--faults` prints, per query, the first execution's time and page faults beside the
-//!   later runs' median faults (the first execution after opening a mapped store, P6),
+//!   later executions' mean faults (the first execution after opening a mapped store, P6),
 //!   and the working set after opening; the report gets `first_faults` and `faults`.
 //!   `--read-graphs IRI,...` runs every query as a reader restricted to those named graphs
 //!   (graph-level access control: not the default graph, not the inferred statements), the
@@ -74,6 +76,15 @@
 //!   QUADS statements on a durable primary, then per run a fresh follower catching up from
 //!   its image through the feed (`log_since`) and the apply (`apply_log`), timed apart, with
 //!   the catch-up's peak memory (`modes::replication`; under `--store DIR` when given).
+//!   `--held-views 0,1,8` times what holding views costs, per count of views held: snapshot
+//!   acquisition, commits, reads, private reads in a transaction and their rollback, and the
+//!   live bytes the views retain; `--staggered-views 8:100000` holds 8 views, one after each of
+//!   8 commits replacing 100,000 statements (`views.rs`). `--recovery-prepare` (a case's setup,
+//!   after `--load`) and `--recovery` time an image restore through the retained log, the
+//!   restored store's open and first query, an image, and a follower's catch-up
+//!   (`recovery.rs`); `--recovery` loads nothing: its `--load` files are the source's fixture,
+//!   read for the expected contents. `NRESE_WAL_ARCHIVE=true`
+//!   keeps the log a checkpoint covers, as the server's setting does.
 //!   `--support-sets K` caps the support graph sets per statement (`off`: none), and
 //!   `--support-reader FILE` times a reader of the default graph and FILE's named graphs with
 //!   `inferred = "supported"`: its first read, then `--support-commits` each followed by a
@@ -90,10 +101,13 @@ use std::collections::BTreeMap;
 use std::io::Write;
 mod generate;
 mod modes;
+mod recovery;
 mod support;
 #[allow(dead_code)]
 mod support_family;
+mod views;
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -132,6 +146,13 @@ static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK_LIVE: AtomicI64 = AtomicI64::new(0);
 static LIVE_PEAK_RUN: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    /// The live bytes this thread's own allocations and frees changed while `bytes_freed_by`
+    /// measures on it (`None` otherwise). Constant and without a destructor: the allocator
+    /// reads it without allocating, even while the thread ends.
+    static HERE: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
 /// mimalloc, counting allocations when asked (one relaxed load when not).
 #[cfg(not(any(system_alloc, alloc_profile)))]
 struct Counting;
@@ -152,6 +173,11 @@ impl Counting {
             let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
             PEAK_LIVE.fetch_max(now, Ordering::Relaxed);
             LIVE_PEAK_RUN.fetch_max(now, Ordering::Relaxed);
+            let _ = HERE.try_with(|here| {
+                if let Some(bytes) = here.get() {
+                    here.set(Some(bytes + delta));
+                }
+            });
         }
     }
 }
@@ -203,6 +229,72 @@ fn allocations() -> (u64, u64) {
         ALLOCATIONS.load(Ordering::Relaxed),
         ALLOCATED_BYTES.load(Ordering::Relaxed),
     )
+}
+
+/// The live requested bytes `f` frees on the calling thread (negative: allocates more than it
+/// frees), counted at the allocator for this thread's own allocations and frees while `f`
+/// runs: other threads' count nothing, whatever they do meanwhile. What `f` lets go of that
+/// another thread still holds, and frees later there, isn't counted: a lower bound of what
+/// `f` releases. One measurement at a time in the process (counting is switched on for it).
+/// `None` under another allocator (`system_alloc`, `alloc_profile`): nothing is counted there.
+pub(crate) fn bytes_freed_by(f: impl FnOnce()) -> Option<i64> {
+    if cfg!(any(system_alloc, alloc_profile)) {
+        f();
+        return None;
+    }
+    let counting = COUNT_ALLOCATIONS.swap(true, Ordering::SeqCst);
+    HERE.set(Some(0));
+    f();
+    let changed = HERE.replace(None).unwrap_or(0);
+    COUNT_ALLOCATIONS.store(counting, Ordering::SeqCst);
+    Some(-changed)
+}
+
+/// `bytes_freed_by`'s scope: exactly the calling thread's frees, never another thread's.
+#[cfg(all(test, not(any(system_alloc, alloc_profile))))]
+mod freed_tests {
+    use std::hint::black_box;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    /// One measurement at a time: `bytes_freed_by` switches counting for the process.
+    static ONE: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_drop_counts_exactly_the_bytes_it_frees() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        // black_box: an allocation nothing reads may be elided, and then nothing is counted.
+        let block = black_box(vec![7u8; 1 << 20]);
+        assert_eq!(super::bytes_freed_by(|| drop(block)), Some(1 << 20));
+    }
+
+    #[test]
+    fn another_thread_s_allocations_and_frees_during_the_span_count_nothing() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let barrier = || Arc::new(Barrier::new(2));
+        let (ready, go, done) = (barrier(), barrier(), barrier());
+        let (other_ready, other_go, other_done) =
+            (Arc::clone(&ready), Arc::clone(&go), Arc::clone(&done));
+        let other = std::thread::spawn(move || {
+            // Made before the span opens (`ready`), freed within it.
+            let earlier = black_box(vec![1u8; 1 << 20]);
+            other_ready.wait();
+            other_go.wait();
+            // Within the span: a free of an earlier allocation, and an allocation kept past it.
+            drop(black_box(earlier));
+            let kept = black_box(vec![2u8; 3 << 20]);
+            other_done.wait();
+            kept
+        });
+        let mine = black_box(vec![3u8; 4096]);
+        ready.wait();
+        let freed = super::bytes_freed_by(|| {
+            go.wait();
+            done.wait();
+            drop(mine);
+        });
+        drop(other.join().expect("the other thread"));
+        assert_eq!(freed, Some(4096));
+    }
 }
 
 /// The memory a phase used: its peak (Linux: the resident set's, in a window started with
@@ -281,6 +373,10 @@ struct Args {
     split_turtle: Option<(usize, PathBuf)>,
     replication: Option<String>,
     replication_probe: bool,
+    held_views: Vec<usize>,
+    staggered_views: Option<String>,
+    recovery_prepare: Option<String>,
+    recovery: Option<String>,
     upload: Option<PathBuf>,
     upload_format: Option<nrese_store::GraphResultFormat>,
     upload_as: modes::UploadRoute,
@@ -334,6 +430,10 @@ fn parse_args() -> Result<Args, String> {
         split_turtle: None,
         replication: None,
         replication_probe: false,
+        held_views: Vec::new(),
+        staggered_views: None,
+        recovery_prepare: None,
+        recovery: None,
         upload: None,
         upload_format: None,
         upload_as: modes::UploadRoute::GraphStore,
@@ -438,6 +538,16 @@ fn parse_args() -> Result<Args, String> {
                 "swap-one" => args.replication_probe = true,
                 other => return Err(format!("--replication-probe swap-one, not {other}")),
             },
+            "--held-views" => {
+                args.held_views = value()?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("--held-views: {e}"))?
+            }
+            "--staggered-views" => args.staggered_views = Some(value()?),
+            "--recovery-prepare" => args.recovery_prepare = Some(value()?),
+            "--recovery" => args.recovery = Some(value()?),
             "--upload" => args.upload = Some(value()?.into()),
             "--upload-format" => {
                 args.upload_format = Some(match value()?.as_str() {
@@ -529,9 +639,9 @@ struct Measured {
     /// The query's first execution in this process (the warm-up, or the first measured run).
     first: Option<Duration>,
     error: Option<String>,
-    /// Page faults of the first execution, and of each later one (sorted).
+    /// Page faults of the first execution, and the later executions' mean.
     first_faults: Option<u64>,
-    faults: Vec<u64>,
+    faults: Option<u64>,
 }
 
 /// Runs the query `executions` times back to back under one timeout: the rows of an execution
@@ -614,7 +724,7 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
                 first: None,
                 error: Some(e.to_string()),
                 first_faults: None,
-                faults: Vec::new(),
+                faults: None,
             };
         }
     };
@@ -624,18 +734,22 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
         first: None,
         error: None,
         first_faults: None,
-        faults: Vec::new(),
+        faults: None,
     };
+    // Page faults are read before the first execution, after it, and after the last sample,
+    // never between two later samples: a read there (a /proc file on Linux) left the next
+    // execution colder than another perf lab's that reads none, which a microsecond query's
+    // time shows (entities q03, one execution a sample: IPC 2.17, batched 2.76; 10 Nov 2026).
+    let start = nrese_exec::memory::page_faults();
+    let mut after_first = None;
+    let mut later_executions = 0u64;
     for i in 0..args.warmup + args.runs {
-        let faults = nrese_exec::memory::page_faults();
         let executions = if i >= args.warmup { batch } else { 1 };
         match run_once(store, &prepared, args.timeout, executions) {
             Ok((rows, elapsed)) => {
-                if let (Ok(before), Ok(after)) = (faults, nrese_exec::memory::page_faults()) {
-                    match measured.first_faults {
-                        None => measured.first_faults = Some(after - before),
-                        Some(_) => measured.faults.push(after - before),
-                    }
+                match i {
+                    0 => after_first = Some(nrese_exec::memory::page_faults()),
+                    _ => later_executions += executions as u64,
                 }
                 measured.rows = rows;
                 measured.first.get_or_insert(elapsed);
@@ -649,8 +763,16 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
             }
         }
     }
+    if let (Ok(start), Some(Ok(first)), Ok(end)) =
+        (start, after_first, nrese_exec::memory::page_faults())
+    {
+        measured.first_faults = Some(first.saturating_sub(start));
+        measured.faults = Some(match later_executions {
+            0 => 0,
+            n => (end.saturating_sub(first) as f64 / n as f64).round() as u64,
+        });
+    }
     measured.times.sort();
-    measured.faults.sort();
     measured
 }
 
@@ -1046,6 +1168,14 @@ pub(crate) fn request(text: &str) -> SparqlQueryRequest {
     )
 }
 
+/// [`request`] answering SELECT in TSV, as the query set's runs do by default: what the modes
+/// that read their answers back (`views.rs`, `recovery.rs`) parse.
+pub(crate) fn tsv_request(text: &str) -> SparqlQueryRequest {
+    let mut request = request(text);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    request
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("generate") {
@@ -1141,6 +1271,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         checkpoint_after_wal_bytes: args
             .checkpoint_after_wal_bytes
             .unwrap_or(config.checkpoint_after_wal_bytes),
+        wal_archive: setting("NRESE_WAL_ARCHIVE") == "true",
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
@@ -1183,6 +1314,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 args.replication_probe,
             )?,
         ));
+        return Ok(());
+    }
+    if let Some(spec) = &args.recovery {
+        if args.store.is_none() {
+            return Err("--recovery needs --store DIR, the prepared source".into());
+        }
+        report
+            .sections
+            .push(("recovery", recovery::measure(&config, &args.load, spec)?));
         return Ok(());
     }
     let mut phases: Vec<(&'static str, String)> = Vec::new();
@@ -1434,6 +1574,32 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         }
         phases.push(("commits", phase.json()));
     }
+    let views = !args.held_views.is_empty() || args.staggered_views.is_some();
+    if views || args.recovery_prepare.is_some() {
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner.clone())),
+        );
+        if views {
+            let phase = Phase::start();
+            report.sections.extend(views::measure(
+                &pipeline,
+                &args.held_views,
+                args.staggered_views.as_deref(),
+                args.runs,
+            )?);
+            phases.push(("held_views", phase.json()));
+        }
+        if let Some(spec) = &args.recovery_prepare {
+            let dir = args
+                .store
+                .as_deref()
+                .ok_or("--recovery-prepare needs --store DIR")?;
+            report
+                .sections
+                .push(("recovery_prepare", recovery::prepare(&pipeline, dir, spec)?));
+        }
+    }
     if args.classify {
         let phase = Phase::start();
         report
@@ -1612,13 +1778,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             extra.push_str(&format!(",\n      \"first_ms\": {:.3}", ms(first)));
         }
         if let Some(first) = m.first_faults {
-            let later = m.faults.get(m.faults.len() / 2).copied().unwrap_or(0);
+            let later = m.faults.unwrap_or(0);
             extra.push_str(&format!(
                 ",\n      \"first_faults\": {first},\n      \"faults\": {later}"
             ));
             if args.faults {
                 println!(
-                    "    first {:.2} ms, {first} page faults; later runs {later} faults (median)",
+                    "    first {:.2} ms, {first} page faults; later runs {later} faults (mean)",
                     m.first.map_or(0.0, ms)
                 );
             }

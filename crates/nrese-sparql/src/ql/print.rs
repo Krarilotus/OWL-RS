@@ -85,7 +85,7 @@ pub fn print<V: ReadView>(
     query: &Query,
     form: PrintForm,
 ) -> Result<Printed, QueryEvaluationError> {
-    let snapshot = view.evaluation_snapshot();
+    let snapshot = view.evaluation_snapshot()?;
     let snapshot: &Snapshot = &snapshot;
     let statements = schema_statements(snapshot, &|_| true);
     let ontology = nrese_owl::read(&statements, &SnapshotTerms(snapshot));
@@ -125,6 +125,7 @@ pub fn print<V: ReadView>(
         }
         Query::Describe { pattern, .. } => (pattern, None, true),
     };
+    let reserved = needed.clone().unwrap_or_default();
     let (rewritten, report) =
         // Without the data check: the printed query holds for any data.
         crate::native::ql::rewrite_query(
@@ -158,8 +159,8 @@ pub fn print<V: ReadView>(
         return Ok(Printed::NotExpressible(reasons));
     }
     // The rewriting's own variables are made names no text holds: written as names the
-    // printed query doesn't use (`internal::printable`).
-    let (printed, _) = nrese_sparql_syntax::internal::printable(printed);
+    // whole query doesn't use, including variables present only in its template.
+    let (printed, _) = nrese_sparql_syntax::internal::printable_avoiding(printed, reserved);
     let query = match query.clone() {
         Query::Select {
             dataset, base_iri, ..

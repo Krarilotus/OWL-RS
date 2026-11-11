@@ -53,7 +53,7 @@ enum End {
 
 fn end_of(term: &TermPattern) -> End {
     match term {
-        TermPattern::NamedNode(n) if n.as_str().starts_with(U1) => End::Hidden,
+        TermPattern::NamedNode(n) if nrese_dl::internal::is_made(n.as_str()) => End::Hidden,
         TermPattern::NamedNode(_) | TermPattern::Literal(_) => End::Term,
         TermPattern::Variable(v) => End::Var(v.as_str().to_owned()),
         _ => End::Hidden,
@@ -409,7 +409,7 @@ pub(super) fn check_closed_for_answers(
         (Answers::Solutions(l), Answers::Solutions(u)) => {
             let named = |row: &Vec<Option<Term>>| {
                 !row.iter()
-                    .any(|t| matches!(t, Some(Term::NamedNode(n)) if n.as_str().starts_with(U1)))
+                    .any(|t| matches!(t, Some(Term::NamedNode(n)) if nrese_dl::internal::is_made(n.as_str())))
             };
             let l: HashSet<Vec<Option<Term>>> = (0..l.len()).map(|i| l.row(i)).collect();
             let u: HashSet<Vec<Option<Term>>> =

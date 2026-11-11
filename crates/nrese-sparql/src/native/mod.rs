@@ -19,6 +19,8 @@ mod calendar;
 mod canonical;
 mod decode_cache;
 mod equality;
+#[cfg(test)]
+mod equality_tests;
 mod equijoin;
 mod estimate;
 mod exists;
@@ -53,6 +55,7 @@ mod graph_tests;
 mod optimise_tests;
 pub(crate) mod ql;
 mod ranges;
+mod scan_columns;
 mod search;
 mod sets;
 mod sideways;
@@ -220,8 +223,13 @@ fn run(
     options: &QueryOptions,
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    let (solutions, form) = match index_answer(&ctx, query, options) {
+        Some(solutions) => (solutions?, Form::Select),
+        None => {
+            let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
+            (ctx.eval_root(&pattern, options.pin.as_ref())?, form)
+        }
+    };
     ctx.check()?;
     let outcome = match form {
         Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
@@ -297,6 +305,16 @@ pub(crate) fn explain(
     options: &QueryOptions,
 ) -> Result<ExplainParts, QueryEvaluationError> {
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let begun = Instant::now();
+    if let Some(solutions) = index_answer(&ctx, query, options) {
+        let rows = solutions?.table.len();
+        ctx.trace = Some(RefCell::default());
+        let detail = "COUNT(*) of one triple pattern, from the index".to_owned();
+        ctx.note("index answer", detail, Some(1), rows, begun);
+        let steps = ctx.trace.take().unwrap_or_default().into_inner();
+        let decoded = ctx.decodes.load(AtomicOrdering::Relaxed);
+        return Ok((Vec::new(), steps, rows as u64, decoded, None));
+    }
     let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
     let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
@@ -388,12 +406,17 @@ pub(crate) fn write_results(
         _ => {}
     }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = match native_pattern(query, options, &ctx) {
-        Ok(native) => native,
-        Err(error) => return Some(Err(error.into())),
+    let evaluated = match index_answer(&ctx, query, options) {
+        Some(solutions) => solutions.map(|solutions| (solutions, Form::Select)),
+        None => match native_pattern(query, options, &ctx) {
+            Ok((pattern, form, _, _)) => ctx
+                .eval_root(&pattern, options.pin.as_ref())
+                .map(|solutions| (solutions, form)),
+            Err(error) => return Some(Err(error.into())),
+        },
     };
-    let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
-        Ok(solutions) => solutions,
+    let (solutions, form) = match evaluated {
+        Ok(evaluated) => evaluated,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
     if matches!(form, Form::Ask) {
@@ -593,6 +616,83 @@ type NativePattern<'q> = (
     Option<crate::ql::QlReport>,
 );
 
+/// The answer of a query that is the index's count of one triple pattern and nothing else,
+/// `SELECT (COUNT(*) AS ?n) WHERE { s p o }`, from the index alone: without preparing the
+/// query ([`native_pattern`]) or running its operators through the result cache (entities
+/// q03: about 5k of its 23k instructions, 10 Nov 2026). `None` for any other
+/// query, for a count the index doesn't hold ([`Context::index_count`]), and where the
+/// preparation would change the query: an open triple term, the QL rewriting, canonical
+/// answers (or their refusal, which the preparation reports), pre-bound values, a pin, or
+/// `as_written`. The general path answers the same: it is the oracle (index_answer_tests).
+fn index_answer(
+    ctx: &Context<'_>,
+    query: &Query,
+    options: &QueryOptions,
+) -> Option<NativeResult<Solutions>> {
+    let Query::Select { pattern, .. } = query else {
+        return None;
+    };
+    if options.as_written
+        || options.pre_bound.is_some()
+        || options.pin.is_some()
+        || ctx.canonical.is_some()
+        || ctx.canonical_refused.is_some()
+        || ql_rewriting(query, options).is_some()
+    {
+        return None;
+    }
+    let GraphPattern::Project { inner, variables } = pattern else {
+        return None;
+    };
+    let GraphPattern::Extend { inner, bindings } = &**inner else {
+        return None;
+    };
+    let GraphPattern::Group {
+        inner,
+        variables: keys,
+        aggregates,
+    } = &**inner
+    else {
+        return None;
+    };
+    let (
+        [projected],
+        [(name, Expression::Variable(counted))],
+        [(target, AggregateExpression::CountSolutions { distinct: false })],
+        GraphPattern::Bgp { patterns },
+    ) = (
+        variables.as_slice(),
+        bindings.as_slice(),
+        aggregates.as_slice(),
+        &**inner,
+    )
+    else {
+        return None;
+    };
+    let [triple] = patterns.as_slice() else {
+        return None;
+    };
+    if projected != name
+        || counted != target
+        || !keys.is_empty()
+        || search::is_search(triple, patterns)
+        || ctx.is_spatial(triple)
+        || triple_terms::has_open(pattern)
+    {
+        return None;
+    }
+    let answer = || -> NativeResult<Option<Solutions>> {
+        ctx.check()?;
+        let Some(count) = ctx.index_count(triple)? else {
+            return Ok(None);
+        };
+        let solutions = ctx.count_row(name, count)?;
+        ctx.check()?;
+        Ok(Some(solutions))
+    };
+    answer().transpose()
+}
+
 /// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
 /// query form, and the rewrites that changed it: the one preparation every delivery of the
 /// answer reads (results, typed results, the direct writer, EXPLAIN and its plan), so a
@@ -654,6 +754,9 @@ fn native_pattern<'q>(
         }
         None => pattern,
     };
+    if let Some(refused) = ctx.aliases_refused.get() {
+        return Err(QueryEvaluationError::MemoryLimit(refused));
+    }
     Ok((pattern, form, rewrites, ql_report))
 }
 
@@ -1339,6 +1442,8 @@ struct Context<'a> {
     model: ReadModel,
     /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
     aliases: RefCell<HashMap<String, u64>>,
+    /// An alias reservation refused; checked before any answer is delivered.
+    aliases_refused: Cell<Option<nrese_exec::BudgetExceeded>>,
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
@@ -1397,6 +1502,9 @@ struct Context<'a> {
     service_denied: bool,
     /// [`QueryOptions::equality_closed`].
     equality_closed: bool,
+    /// The identities' representatives this query joins on, found at their first use
+    /// ([`Context::representatives`]).
+    representatives: equality::Found,
     /// The equality classes to expand after joins over canonical reads (stage C,
     /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
     late: Option<Arc<nrese_engine::EqualityClasses>>,
@@ -1578,6 +1686,7 @@ impl<'a> Context<'a> {
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
+            aliases_refused: Cell::new(None),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             // One thread fills it, with no sibling grant: the whole spare.
@@ -1604,6 +1713,7 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(|access| !access.service),
             equality_closed: options.equality_closed,
+            representatives: equality::Found::default(),
             cache: None,
             pin: RefCell::default(),
             search_scope: options.search_scope,
@@ -1649,10 +1759,18 @@ impl<'a> Context<'a> {
         self.snapshot.lookup(term)
     }
 
-    /// Makes `alias` stand for the blank node `id` in patterns and expressions.
+    /// Retains one typed alias, reserved before either map keeps it. Refusal is sticky,
+    /// like a refused read during preparation, and every delivery checks it.
     fn register_alias(&self, alias: &str, id: u64) {
-        self.aliases.borrow_mut().insert(alias.to_owned(), id);
+        if self.aliases_refused.get().is_some() || self.aliases.borrow().get(alias) == Some(&id) {
+            return;
+        }
         if let Some(term) = self.term(id) {
+            if let Err(refused) = self.kept.borrow_mut().charge(alias_bytes(alias, &term)) {
+                self.aliases_refused.set(Some(refused));
+                return;
+            }
+            self.aliases.borrow_mut().insert(alias.to_owned(), id);
             self.evaluator.register_alias(alias, term);
         }
     }
@@ -1682,7 +1800,12 @@ impl<'a> Context<'a> {
     /// Fails a cancelled query, and one a read refused memory to: what it read since may
     /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
-        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
+        if let Some(refused) = self
+            .aliases_refused
+            .get()
+            .or(self.reads_refused)
+            .or_else(|| self.snapshot.read_refused())
+        {
             return Err(QueryEvaluationError::MemoryLimit(refused).into());
         }
         Ok(self
@@ -3539,6 +3662,10 @@ impl<'a> Context<'a> {
                 Some((v.clone(), position))
             })
             .collect();
+        // The lists' charge, while they live: the columns decoded for them are charged before
+        // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
+        let mut held = Reservation::new(&*self.budget);
+        // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
         for i in 0..scans.len() {
             // Pairs of patterns: cancelled, the rest is left out, and the orderer that
@@ -3564,18 +3691,26 @@ impl<'a> Context<'a> {
                         let pattern = scans[k].quad_pattern();
                         // A column at a time where the index allows (a few ns a value;
                         // a quad at a time took 50: LUBM-10 q11 0.06 → 0.18 ms).
-                        lists[k] = self
-                            .snapshot
-                            .scan_columns_in(self.model, &pattern, permutation, &[*position])
-                            .and_then(|mut columns| columns.pop())
-                            .or_else(|| {
-                                let quads = self.snapshot.scan_sorted_in(
-                                    self.model,
-                                    &pattern,
-                                    permutation,
-                                )?;
-                                Some(quads.map(|q| q.components()[*position]).collect())
-                            });
+                        let decoded = self.snapshot.scan_columns_in(
+                            self.model,
+                            &pattern,
+                            permutation,
+                            &[*position],
+                            &self.budget,
+                        );
+                        lists[k] = match decoded {
+                            Ok(Some(columns)) => {
+                                let (mut columns, charge) = columns.into_parts();
+                                held.absorb(charge);
+                                columns.pop()
+                            }
+                            Ok(None) => self
+                                .snapshot
+                                .scan_sorted_in(self.model, &pattern, permutation)
+                                .map(|quads| quads.map(|q| q.components()[*position]).collect()),
+                            // Refused: no overlap known for it; the plan goes without.
+                            Err(_) => None,
+                        };
                     }
                 }
                 let (Some(x), Some(y)) = (&lists[i], &lists[j]) else {
@@ -4003,24 +4138,39 @@ impl<'a> Context<'a> {
         // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
         if !merged && !scan.repeats_variable() {
             let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
-            if let Some(columns) =
-                self.snapshot
-                    .scan_columns_in(self.model, &pattern, permutation, &components)
+            // Charged before they are decoded ([`Snapshot::scan_columns_in`]): the table
+            // takes over their charge.
+            if let Some(columns) = self
+                .snapshot
+                .scan_columns_in(self.model, &pattern, permutation, &components, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             {
-                let table = if vars.is_empty() {
+                let sorted = sorted_columns(scan, permutation, &vars);
+                if vars.is_empty() {
                     let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
-                } else {
-                    IdTable::from_columns(columns)
-                };
-                return self.produced(Solutions {
-                    vars: vars.clone(),
-                    table: table.assume_sorted_by(sorted_columns(scan, permutation, &vars)),
-                    ordered: false,
-                });
+                    let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+                    return self.produced(Solutions {
+                        vars: vars.clone(),
+                        table: table.assume_sorted_by(sorted),
+                        ordered: false,
+                    });
+                }
+                let (columns, held) = columns.into_parts();
+                return self.holding(
+                    held,
+                    Solutions {
+                        vars: vars.clone(),
+                        table: IdTable::from_columns(columns).assume_sorted_by(sorted),
+                        ordered: false,
+                    },
+                );
             }
         }
-        let mut table = IdTable::new(vars.len());
+        if vars.is_empty() {
+            return self.scan_without_columns(scan, permutation);
+        }
+        // Rows known only as they are read: each column charged before it grows.
+        let mut columns = scan_columns::Columns::new(&self.budget, vars.len());
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
@@ -4054,14 +4204,80 @@ impl<'a> Context<'a> {
                 }
                 *slot = value;
             }
-            table.push_row(&row);
+            columns
+                .push_row(&row)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
         }
+        let (table, held) = columns
+            .into_table()
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table,
+                ordered: false,
+            },
+        )
+    }
+
+    /// [`Self::scan`] of a pattern without variables, matched quad by quad: its rows hold
+    /// nothing until something makes a column of them, charged as such
+    /// ([`IdTable::memory_bytes`]) once they are counted.
+    fn scan_without_columns(
+        &self,
+        scan: &ScanPattern,
+        permutation: Permutation,
+    ) -> NativeResult<Solutions> {
+        let pattern = scan.quad_pattern();
+        let merged = scan.merged();
+        let mut table = IdTable::new(0);
+        let quads = self
+            .snapshot
+            .scan_sorted_in(self.model, &pattern, permutation)
+            .expect("permutation_for returns a usable permutation");
+        let mut previous: Option<[u64; 3]> = None;
+        for (n, quad) in quads.enumerate() {
+            if n % (1 << 16) == 0 {
+                self.check()?;
+            }
+            if merged {
+                if let Some(graphs) = &self.merge_set
+                    && !graphs.contains(&quad.graph)
+                {
+                    continue;
+                }
+                // Graph-last order: the copies of a statement follow each other.
+                let components = quad.components();
+                let statement = [components[0], components[1], components[2]];
+                if previous == Some(statement) {
+                    continue;
+                }
+                previous = Some(statement);
+            }
+            table.push_row(&[]);
+        }
         self.produced(Solutions {
-            vars,
+            vars: Vec::new(),
             table,
             ordered: false,
         })
+    }
+
+    /// `solutions`, whose table `held` holds the charge of (exactly its bytes, once
+    /// resized): the charge handed on with them, never released and charged again. A
+    /// cancelled query fails here, as at [`Self::produced`].
+    fn holding(
+        &self,
+        mut held: Reservation<&Budget>,
+        solutions: Solutions,
+    ) -> NativeResult<Solutions> {
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
     }
 
     /// Scans `scan` over `ranges` of its object (the first free component of
@@ -4099,21 +4315,27 @@ impl<'a> Context<'a> {
                 solutions
             });
         }
-        // Each range a block and a column at a time where the index can, else quad by quad.
-        let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
+        // Each range a block and a column at a time where the index can, else quad by quad;
+        // what each range decodes and the table it goes into charged before they grow.
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut out = scan_columns::Columns::new(&self.budget, vars.len());
+        let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
             self.check()?;
-            if let Some(decoded) = self.snapshot.scan_range_columns_in(
-                self.model,
-                &pattern,
-                permutation,
-                low,
-                high,
-                &columns,
-            ) {
-                for (column, values) in out.iter_mut().zip(decoded) {
-                    column.extend(values);
-                }
+            if let Some(decoded) = self
+                .snapshot
+                .scan_range_columns_in(
+                    self.model,
+                    &pattern,
+                    permutation,
+                    low,
+                    high,
+                    &columns,
+                    &self.budget,
+                )
+                .map_err(memory)?
+            {
+                out.extend(decoded.columns()).map_err(memory)?;
                 continue;
             }
             let Some(quads) =
@@ -4127,21 +4349,25 @@ impl<'a> Context<'a> {
                     self.check()?;
                 }
                 let components = quad.components();
-                for (column, &c) in out.iter_mut().zip(&columns) {
-                    column.push(components[c]);
+                for (slot, &c) in row.iter_mut().zip(&columns) {
+                    *slot = components[c];
                 }
+                out.push_row(&row).map_err(memory)?;
             }
         }
         let object = vars
             .iter()
             .position(|v| scan.slots[2].is_var(v))
             .expect("ranged object");
-        let table = IdTable::from_columns(out).assume_sorted_by(vec![object]);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let (table, held) = out.into_table().map_err(memory)?;
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table: table.assume_sorted_by(vec![object]),
+                ordered: false,
+            },
+        )
     }
 
     /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the
@@ -5133,6 +5359,29 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The index's count of the quads `triple` matches, where that is its number of
+    /// solutions: `None` in the merged default graph (a statement in several graphs is
+    /// several quads there), with a repeated variable, and where the pattern can't match.
+    fn index_count(&self, triple: &TriplePattern) -> NativeResult<Option<u64>> {
+        match self.scan_pattern(triple) {
+            Some(scan) if !scan.repeats_variable() && !scan.merged() => Ok(Some(exact_count(
+                self.snapshot.count_in(self.model, &scan.quad_pattern()),
+            )?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// One row binding `target` to `count`, charged as the query's.
+    fn count_row(&self, target: &Variable, count: u64) -> NativeResult<Solutions> {
+        let mut table = IdTable::new(1);
+        table.push_row(&[self.id(&integer(count))?]);
+        self.produced(Solutions {
+            vars: vec![target.clone()],
+            table,
+            ordered: false,
+        })
+    }
+
     fn group_direct(
         &self,
         inner: &GraphPattern,
@@ -5148,22 +5397,14 @@ impl<'a> Context<'a> {
             && !search::is_search(triple, patterns)
             && !self.is_spatial(triple)
         {
-            let count = match self.scan_pattern(triple) {
-                // The index counts quads; in the merged default graph a statement in
-                // several graphs is several quads, so there the scan counts.
-                Some(scan) if !scan.repeats_variable() && !scan.merged() => {
-                    exact_count(self.snapshot.count_in(self.model, &scan.quad_pattern()))?
-                }
-                Some(scan) => self.scan(&scan, None)?.table.len() as u64,
-                None => 0,
+            let count = match self.index_count(triple)? {
+                Some(count) => count,
+                None => match self.scan_pattern(triple) {
+                    Some(scan) => self.scan(&scan, None)?.table.len() as u64,
+                    None => 0,
+                },
             };
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))?]);
-            return self.produced(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
         }
         // COUNT(*) of a cyclic BGP: its worst-case-optimal join counts the solutions
         // instead of producing them (4-cycles of a social graph: 19.2 M two-paths
@@ -5173,13 +5414,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let Some(count) = self.cyclic_count(patterns)?
         {
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))?]);
-            return self.produced(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
         }
         // COUNT(*) of an open closure (`?a p* ?b`, `?a p+ ?b`): from the closure's size
         // per node, without building its pairs. Its pairs are distinct, so DISTINCT counts
@@ -5203,13 +5438,7 @@ impl<'a> Context<'a> {
                 let detail = format!("COUNT of {path} from the closure's size per component");
                 self.note("closure", detail, Some(1), 1, begun);
             }
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))?]);
-            return self.produced(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
         }
         // GROUP BY one variable with only row counts, over one triple pattern: the index
         // counts each group by binary search (O(groups · log n)), without reading matches.
@@ -5228,10 +5457,12 @@ impl<'a> Context<'a> {
         {
             let permutation = scan.permutation_for(Some(key));
             let start = std::time::Instant::now();
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
             if scan.first_free(permutation) == Some(component)
-                && let Some(groups) =
-                    self.snapshot
-                        .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+                && let Some(groups) = self
+                    .snapshot
+                    .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                    .map_err(QueryEvaluationError::MemoryLimit)?
             {
                 if self.trace.is_some() {
                     let detail = format!("{key} of {triple}");
@@ -5248,7 +5479,7 @@ impl<'a> Context<'a> {
                     let mut columns = Vec::with_capacity(vars.len());
                     columns.push(groups.iter().map(|(value, _)| value.raw()).collect());
                     let mut counts = Vec::with_capacity(groups.len());
-                    for &(_, n) in &groups {
+                    for &(_, n) in groups.iter() {
                         counts.push(match TermId::inline_integer(n as i64) {
                             Some(id) => id.raw(),
                             None => self.id(&integer(n))?,
@@ -6154,6 +6385,40 @@ fn computed_bytes(term: &Term) -> usize {
     (2 * slot)
         .saturating_add(2 * entry * 8 / 7 + 2)
         .saturating_add(heap.saturating_mul(2))
+}
+
+/// Both alias maps and the one possible canonical child's name-map copy (late.rs);
+/// that child has late expansion disabled and lives within this query. Four slots per
+/// entry and two control words per slot cover growth and the first allocation.
+/// Size without formatting.
+fn alias_bytes(alias: &str, term: &Term) -> usize {
+    fn heap(term: &Term) -> usize {
+        match term {
+            Term::NamedNode(n) => n.as_str().len(),
+            Term::BlankNode(b) => b.as_str().len(),
+            Term::Literal(l) => {
+                l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+            }
+            Term::Triple(t) => {
+                let subject = match &t.subject {
+                    nrese_rdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    nrese_rdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                std::mem::size_of::<nrese_rdf::Triple>()
+                    + subject
+                    + t.predicate.as_str().len()
+                    + heap(&t.object)
+            }
+        }
+    }
+    let slots = 2 * std::mem::size_of::<(String, u64)>()
+        + std::mem::size_of::<(String, Term)>()
+        + 6 * std::mem::size_of::<usize>();
+    alias
+        .len()
+        .saturating_mul(3)
+        .saturating_add(slots * 4)
+        .saturating_add(heap(term))
 }
 
 /// What a number [`Context::numeric_pass`] remembers holds in its map: the id and the

@@ -48,6 +48,7 @@ from .summary import adjudications, summarise
 from .workloads import plans
 
 EXE = ".exe" if os.name == "nt" else ""
+ROOT = Path(__file__).resolve().parents[3]  # the checkout: the containers' namespace (ns.run_args)
 # Systems a default run leaves out: AnzoGraph needs registration beyond 8 GB and takes
 # minutes to start; name it to run it.
 EXPLICIT_ONLY = {"anzograph"}
@@ -426,7 +427,8 @@ class Suite:
             toolchain = toolchain_in(image, tree) if not self.args.dry_run else receipts.unknown("a dry run")
             self.built[nrese.key].update(toolchain=toolchain,
                                          controlled=controlled(tree, None, toolchain, declared_toolchain(tree)))
-            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{tree.as_posix()}:/src:ro",
+            rc = self.host_command([ns.executable(), *ns.run_args(self.root, "suite"), "--rm", "--cpus", cpus,
+                                    "-v", f"{tree.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
                                     "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
@@ -520,6 +522,11 @@ class Suite:
             self.remove_export(tree)
         return rc == 0
 
+    def in_data(self, *command: str):
+        """`command` in a container over the datasets' volume, read-only."""
+        return run_quiet([ns.executable(), *ns.run_args(self.root, "suite"), "--rm", "-v", f"{self.data_volume}:/data:ro",
+                          "alpine", *command])
+
     def data_missing(self, inputs: list[str]) -> list[str]:
         files = [i for i in inputs if i.startswith("/data/")]
         if not files:
@@ -527,9 +534,7 @@ class Suite:
         if self.data_volume:
             if self.args.dry_run:
                 return []
-            script = "; ".join(f"test -s {f} || echo {f}" for f in files)
-            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine", "sh", "-c", script])
-            return out.stdout.split()
+            return self.in_data("sh", "-c", "; ".join(f"test -s {f} || echo {f}" for f in files)).stdout.split()
         return [f for f in files if not (Path(self.data.source) / f[len("/data/"):]).is_file()]
 
     def data_sizes(self, inputs: list[str]) -> dict[str, int]:
@@ -538,8 +543,7 @@ class Suite:
         if not files or self.args.dry_run:
             return {}
         if self.data_volume:
-            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine",
-                             "stat", "-c", "%n %s", *files])
+            out = self.in_data("stat", "-c", "%n %s", *files)
             pairs = (line.rsplit(" ", 1) for line in out.stdout.splitlines() if " " in line)
             return {name: int(size) for name, size in pairs if size.isdigit()}
         sizes = {}
@@ -555,8 +559,7 @@ class Suite:
         if self.args.dry_run:
             return []
         if self.data_volume:
-            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine", "sh", "-c",
-                             "cat /data/real/*.source 2>/dev/null"])
+            out = self.in_data("sh", "-c", "cat /data/real/*.source 2>/dev/null")
             return [line for line in out.stdout.splitlines() if line.strip()]
         real = Path(self.data.source) / "real"
         return [line for f in sorted(real.glob("*.source")) for line in f.read_text().splitlines()
@@ -1436,8 +1439,9 @@ def toolchain_here(directory: Path, env: Mapping[str, str]):
 def toolchain_in(image: str, tree: Path):
     """The toolchain the pinned image `image` runs, in the export mounted as a Docker build mounts it."""
     try:
-        done = subprocess.run(["docker", "run", "--rm", "-v", f"{tree.as_posix()}:/src:ro", "-w", "/src", image,
-                               "sh", "-c", "rustc -vV && cargo -vV"], capture_output=True, text=True, timeout=300)
+        done = subprocess.run([ns.executable(), *ns.run_args(ROOT, "suite"), "--rm", "-v", f"{tree.as_posix()}:/src:ro",
+                               "-w", "/src", image, "sh", "-c", "rustc -vV && cargo -vV"],
+                              capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as error:
         return receipts.unknown(f"docker run {image}: {error}")
     if done.returncode != 0:
