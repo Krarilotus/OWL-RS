@@ -43,11 +43,45 @@ fn main() -> Result<()> {
     // What threads freed goes back to the system after bulk loads and reasoning.
     // SAFETY: mimalloc's `mi_collect` may be called at any time, from any thread.
     nrese_store::set_memory_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("starting the async runtime failed")?
-        .block_on(run())
+        .context("starting the async runtime failed")?;
+    let result = runtime.block_on(run());
+    // After a stop, work a drain cut short (a long query on a blocking thread) isn't waited
+    // for: the process ends as on a kill, and every acknowledged commit is already synced.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+/// How long the requests in flight may finish after a stop signal: well inside the 10 s a
+/// container runtime (`docker stop`) waits before it kills, leaving the rest for the store
+/// to close.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The stop signals, listened for from the call on: SIGTERM (`docker stop`, systemd,
+/// Kubernetes) and SIGINT (ctrl-c). Resolves to the one that came first.
+#[cfg(unix)]
+fn stop_signals() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        }
+    })
+}
+
+/// The stop signal on Windows: ctrl-c in the server's console.
+#[cfg(windows)]
+fn stop_signals() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        ctrl_c.recv().await;
+        "ctrl-c"
+    })
 }
 
 async fn run() -> Result<()> {
@@ -246,6 +280,8 @@ async fn run() -> Result<()> {
     let bound_address = listener
         .local_addr()
         .with_context(|| format!("reading the address bound for {}", config.bind_address))?;
+    // Before the server says it serves: a stop sent from then on is heard.
+    let stop = stop_signals().context("listening for stop signals")?;
     tracing::info!(
         bind_address = %bound_address,
         deployment_posture = config.deployment_posture.as_str(),
@@ -266,12 +302,34 @@ async fn run() -> Result<()> {
             tracing::debug!(%error, "could not set TCP_NODELAY on a connection");
         }
     });
-    // Peer addresses for the mtls mode's trusted proxies.
-    let served = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await;
+    // Peer addresses for the mtls mode's trusted proxies. On a stop signal it accepts no
+    // more connections, closes idle ones, and lets the requests in flight finish, for up to
+    // DRAIN; the store then closes as it does when the server ends.
+    let (stopping, stopped_by) = tokio::sync::oneshot::channel();
+    let serve = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = stopping.send(stop.await);
+        }),
+    );
+    tokio::pin!(serve);
+    let served = tokio::select! {
+        served = &mut serve => served,
+        Ok(signal) = stopped_by => {
+            let started = std::time::Instant::now();
+            let drained = tokio::time::timeout(DRAIN, &mut serve).await;
+            tracing::info!(
+                signal,
+                ms = started.elapsed().as_millis() as u64,
+                requests_cut = drained.is_err(),
+                "nrese-server stopped"
+            );
+            drained.unwrap_or(Ok(()))
+        }
+    };
     if let Some(follower) = follower {
         follower.stop().await;
     }

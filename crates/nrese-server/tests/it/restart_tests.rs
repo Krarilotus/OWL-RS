@@ -132,3 +132,37 @@ async fn a_repository_without_its_own_reasoning_keeps_the_server_s_after_a_resta
     assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }
+
+/// How long a stopped server may take to end: inside the 10 s a container runtime
+/// (`docker stop`) waits before it kills.
+#[cfg(unix)]
+const STOPPED: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// A stop signal (SIGTERM, as `docker stop` sends it to the server, process 1 in its image)
+/// ends the server cleanly: with code 0, within [`STOPPED`], saying so in one line, and a
+/// commit acknowledged before the signal is there after a restart.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_signal_ends_the_server_cleanly_and_keeps_its_commits() -> Outcome {
+    let dir = tempfile::tempdir()?;
+    let config = configured(dir.path(), "off")?;
+    let server = Server::start(&config).await?;
+    server.update("nrese", EMPLOYEE).await?;
+    let (status, output) = server.terminate(STOPPED)?;
+    let mut wrong = Vec::new();
+    if status.code() != Some(0) {
+        wrong.push(format!("ended with {status}, not code 0:\n{output}"));
+    }
+    if !output.contains("nrese-server stopped") {
+        wrong.push(format!("no line saying it stopped:\n{output}"));
+    }
+    let server = Server::start(&config).await?;
+    if !bob(&server
+        .query("nrese", "SELECT ?x WHERE { ?x a <urn:Employee> }")
+        .await?)
+    {
+        wrong.push("after the restart: the commit before the signal is gone".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
