@@ -528,6 +528,56 @@ class Recording(unittest.TestCase):
         self.assertEqual((group["verdict"], group["unchecked"]), ("unchecked", ["nrese"]))
         self.assertIn("unchecked: nrese", answers.table([group]))
 
+    def record(self, directory: Path, query: str, replies: dict, reference="jena") -> answers.Recorder:
+        """replies: (system, run) -> {query text: (code, body)}; captured in that order."""
+        path = directory / "q1.rq"
+        path.write_text(query, encoding="utf-8")
+        recorder = answers.Recorder(directory, reference)
+        for (system, run), by_text in replies.items():
+            def post(url, data, timeout, by_text=by_text):
+                return by_text.get(data["query"].strip(), (500, "error"))
+            recorder.capture(post, "http://x", ("w", "t", "none", "q1.rq"), system, "off", run, path, directory, 10)
+        return recorder
+
+    def test_a_replayed_capture_whose_file_is_gone_fails_even_if_an_equal_one_was_compared(self):
+        """A capture is an answer only while its file can be read as one: a byte-identical
+        capture compared before doesn't stand in for it (Sol review r1 finding 1)."""
+        q = "SELECT ?x { ?x ?p ?o }"
+        one = (200, select(["x"], [iri("a")]))
+        for gone, expected in ((("nrese", 2), {"jena": "reference", "nrese": "incomplete"}),
+                               (("jena", 2), {"jena": "incomplete", "nrese": "incomplete"})):
+            with self.subTest(gone=gone), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                recorder = self.record(directory, q, {(s, r): {q: one} for s in ("jena", "nrese") for r in (1, 2)})
+                written = recorder.write()
+                capture = next(c for c in recorder.captures if (c.system, c.run) == gone)
+                Path(capture.path).unlink()
+                verdicts = {v["system"]: v["verdict"] for v in answers.Recorder.load([written]).verdicts()}
+                self.assertEqual(verdicts, expected)
+
+    def test_a_reference_whose_first_limit_capture_failed_is_no_reference(self):
+        """A reference's unordered LIMIT query timed out in its first repetition, its pool and
+        its second answered: no reference, not a crash (Sol review r1 finding 2)."""
+        q, full = "SELECT ?x { ?x ?p ?o } LIMIT 1", "SELECT ?x { ?x ?p ?o }"
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = self.record(Path(tmp), q, {
+                ("jena", 1): {q: (0, ""), full: (200, select(["x"], [iri("a")]))},
+                ("jena", 2): {q: (200, select(["x"], [iri("a")]))}})
+            self.assertEqual(recorder.verdicts()[0]["verdict"], "incomplete")
+
+    def test_equal_limit_captures_are_each_checked_against_the_pool(self):
+        """Two byte-identical captures of a LIMIT query are still each a legal subset of the
+        reference's pool: equal to each other proves nothing about the pool (Sol review r1
+        finding 3)."""
+        q, full = "SELECT ?x { ?x ?p ?o } LIMIT 1", "SELECT ?x { ?x ?p ?o }"
+        limited = (200, select(["x"], [iri("z")]))
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = self.record(Path(tmp), q, {("jena", 1): {q: limited, full: (200, select(["x"], [iri("a")]))},
+                                                  ("jena", 2): {q: limited}})
+            verdict = recorder.verdicts()[0]
+        self.assertEqual(verdict["verdict"], "incomplete")
+        self.assertIn("differ", verdict["note"])
+
     def test_a_comparison_reused_for_an_equal_answer_carries_nothing_of_its_capture(self):
         """Byte-identical answers (equal SHA-256) compare alike, so one comparison may serve
         both; each system's verdict is still the one it gets alone, never another capture's
