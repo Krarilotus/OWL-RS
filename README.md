@@ -48,11 +48,11 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
   SELECT ?x WHERE { ?x a ex:Animal }'
 ```
 
-The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred; the
-`NRESE-Completeness` header says what the answer promises
-([below](#what-an-answer-promises)). The image's console is at
-`http://localhost:8080/console`.
-Load files with `PUT /dataset/data?graph=<IRI>`, or offline with `nrese-server load` for
+The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. Its
+`NRESE-Completeness` header says `sound-only; regime=owl2-rl`, with the reason: every row
+is entailed, and the rules are complete only for ontologies inside the OWL 2 RL profile,
+which isn't checked per query ([what an answer promises](#what-an-answer-promises)). The
+image's console is at `http://localhost:8080/console`. Load files with `PUT /dataset/data?graph=<IRI>`, or offline with `nrese-server load` for
 large ones ([server setup](docs/ops/server-setup.md)).
 
 From source, with Rust (the version in [rust-toolchain.toml](rust-toolchain.toml)):
@@ -63,10 +63,11 @@ cargo run --release -p nrese-server
 
 With only Rust, you get the server and its API on `127.0.0.1:8080`, from memory (nothing
 is written to disk) and with reasoning off; set `NRESE_STORE_MODE=on-disk` and
-`NRESE_REASONING_MODE` to change that ([configuration](docs/ops/config-reference.md)). The
-operator page `/ops` is built in. The browser console needs Node.js: build it in
-`apps/nrese-console` (`npm ci && npm run build`) before the server, and the server embeds
-it; without it, `/console` says how ([getting started](docs/dev/getting-started.md)).
+`NRESE_REASONING_MODE` to change that ([configuration](docs/ops/config-reference.md)).
+With reasoning off, the example above answers no rows, as `complete`: nothing is inferred;
+start the server with `NRESE_REASONING_MODE=owl2-rl` for the inference. The operator page `/ops` is built in. The browser console needs
+Node.js: build it in `apps/nrese-console` (`npm ci && npm run build`) before the server,
+and the server embeds it; without it, `/console` says how ([getting started](docs/dev/getting-started.md)).
 
 No authentication is on by default. Set `NRESE_AUTH_MODE`, or a deployment posture that
 requires it, before you expose the server ([access control](#access-control-and-operations)).
