@@ -41,8 +41,9 @@ rm -rf ../../../tmp/dlw3c
 
 ## Results so far (3 October 2026, main PC)
 
-- **W3C, direct semantics, species DL** (411 tasks of 311 tests; 20 s per task, the
-  published passes HermiT missed rerun at 120 s; `results/w3c-2026-10-03.tsv`).
+- **W3C, direct semantics, species DL** (411 tasks of 311 tests; 20 s per task, and a
+  rerun at 120 s of the tasks the 2009 results list as passes that ran out of time;
+  `results/w3c-2026-10-03.tsv`).
   - **HermiT** was run on every task; its result on each is in the results file.
   - **Openllet** was run on every task; its result on each is in the results file.
   - **Konclude 0.7.0-1138** was run on every task; its result on each is in the results
@@ -100,7 +101,7 @@ assertion mentions for a fresh element, past a key (1267640).
 **References run** (scope `4,4,4`): HermiT and Openllet, each with the campaign's time
 limit; the cases neither answered are the table's last column.
 
-## Inputs outside OWL 2 DL (13 October 2026, Office-PC, queue jobs)
+## Inputs outside OWL 2 DL (13 October 2026, queue jobs)
 
 [docs/design/owl2-dl.md](../../../docs/design/owl2-dl.md) §16: DL-safe rules decided by
 grounding with certified models, repairs, monotonicity. The tools: `cargo run -p nrese-dl
@@ -123,7 +124,7 @@ ontology but datatype definitions in one (which they decide). Of the 22:
 
 | | Consistency | Classification |
 |---|---|---|
-| 714 (the owner's question) | consistent, a certified model of 5 elements satisfying all 8 rules (the references were run on it) | exact (the TBox names no individual) |
+| 714 (consistency under 8 DL-safe rules) | consistent, a certified model of 5 elements satisfying all 8 rules (the references were run on it) | exact (the TBox names no individual) |
 | 237 and 7 like it (15516, 8280, 5539, 2669, 10906, 5206, 13880) | inconsistent by the DL part alone (the references were run on them); each has a four-axiom justification: `DBNonKeyAttribute(x)`, `DBNonPrimaryKeyAttribute ≡ DBNonKeyAttribute ⊔ …`, `DBNonPrimaryKeyAttribute ⊑ DBKeyAttribute`, `DBKeyAttribute` disjoint from `DBNonKeyAttribute` | exact (inconsistent) |
 | 3726, 7278, 15753 (SQWRL queries among the rules) | consistent, certified (the queries assert nothing) | exact |
 | 15993, 16630, 2526, 6615, 8250, 15063, 7345 | consistent, certified | exact (by the disjoint union, or refined by certified models where the TBox names individuals) |
@@ -137,7 +138,7 @@ are either different or the same individual; one rule gives the situation such a
 in each case. A model must choose a case, which is why it took grounding.
 
 So of the 22: consistency decided for 21 (12 consistent, 9 inconsistent), classification
-exact for 20. Jobs `dl-beyond-runs-1` to `-3` (Office-PC, release, binaries of
+exact for 20. Jobs `dl-beyond-runs-1` to `-3` (release binaries of
 `v15/dl-beyond`).
 
 **The rule campaigns** (`rules_campaign`, 1,000 cases each, 20 s per decision; HermiT and
