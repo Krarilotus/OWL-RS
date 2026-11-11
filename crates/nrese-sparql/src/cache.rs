@@ -366,8 +366,8 @@ pub struct ResultCacheStats {
     pub shared: u64,
     /// Parts admitted.
     pub stored: u64,
-    /// Parts not admitted: too cheap to recompute, too large, or worth less than what
-    /// they would evict.
+    /// Parts computed but not admitted: too cheap to recompute, too large, worth less than
+    /// what they would evict, or with a column their key doesn't name.
     pub rejected: u64,
     pub evicted: u64,
     pub entries: usize,
@@ -523,8 +523,8 @@ impl Computing<'_> {
     }
 
     /// Hands `part` (if it was computed and wanted) to the waiters and offers it to the
-    /// cache. An error if the part is pinned but doesn't fit in the budget beside the
-    /// other pinned ones.
+    /// cache; a part not handed over counts as refused. An error if the part is pinned but
+    /// doesn't fit in the budget beside the other pinned ones.
     pub(crate) fn finish(mut self, part: Option<Part>, cost: Duration) -> Result<(), String> {
         self.finished = true;
         let key = self.key();
@@ -533,7 +533,10 @@ impl Computing<'_> {
             Some(part) => self
                 .cache
                 .store(&key, Payload::Part(Arc::clone(part)), cost),
-            None => Ok(()),
+            None => {
+                self.cache.rejected.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
         };
         self.cache.land(&key, &self.flight, part);
         stored
