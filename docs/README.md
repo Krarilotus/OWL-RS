@@ -1,12 +1,20 @@
 # NRESE documentation
 
+## Using NRESE
+
+| Question | Document |
+|---|---|
+| How do I run it and send a first query? | the [quick start](../README.md#quick-start), then [getting started](dev/getting-started.md) |
+| What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-can-do) |
+| How do I deploy it, load data and configure it? | [server setup](ops/server-setup.md), [every setting](ops/config-reference.md) |
+| Which endpoints are there? | [the HTTP interface](ops/http-api.md) |
+| What does reasoning compute, and what does an answer promise? | [reasoning-semantics.md](spec/reasoning-semantics.md) |
+| Which crates can I use on their own? | the crate table in the [README](../README.md#how-it-is-built) |
+
+## Working on NRESE
+
 Each question has one document that answers it. When two disagree, the one higher in this
 list wins and the lower one is corrected in the same change.
-
-Using NRESE rather than working on it? Read the [README](../README.md), then
-[getting started](dev/getting-started.md), [server setup](ops/server-setup.md), the
-[HTTP interface](ops/http-api.md), the [configuration](ops/config-reference.md) and
-[what reasoning computes](spec/reasoning-semantics.md).
 
 | Question | Document |
 |---|---|

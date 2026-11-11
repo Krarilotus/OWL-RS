@@ -6,11 +6,11 @@ Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
 
 ## 1. Product target
 
-NRESE is an RDF database and ontology platform, hardware-aware on one machine (every core, the memory, CPU features and GPUs it has) and scaling out to clusters where a use case needs it, each derived setting configurable. It combines:
+NRESE is an RDF database with reasoning built in. It runs as one server that uses every core of its machine, each derived setting configurable; read replicas can follow it. It combines:
 
-- **Query performance at scale** — dictionary-encoded, sorted permutation indexes, merge/worst-case-optimal joins, integrated text search, fast parallel bulk loading.
-- **Semantics and data governance** — materialised, incrementally maintained RDFS / OWL 2 RL reasoning with asserted vs inferred separation, built-in SHACL validation on commit, full-text search, transactional writes, access control by graph.
-- **Reasoning beyond the materialisable profiles** — OWL 2 DL (consistency, classification, realisation, explanation, and query answers that state their completeness): reasoning is the centre of the project, built on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
+- **Query execution** — dictionary-encoded, sorted permutation indexes; merge, hash and worst-case-optimal joins; parallel bulk loading; full-text, vector and geospatial search.
+- **Semantics and data governance** — materialised, incrementally maintained reasoning from RDFS to OWL 2 RL, inferred statements kept apart from asserted ones; SHACL validation on commit; transactional writes; access control by graph.
+- **Reasoning beyond the materialisable profiles** — OWL 2 DL: consistency, classification, realisation, explanations, and query answers that state their completeness. Reasoning is the centre of the project, built on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
 - **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it.
 
 Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the benchmark kits in [`benches/`](../benches/README.md) ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
