@@ -221,15 +221,15 @@ Shapes are stored like any graph: `PUT /dataset/data?graph=<the shapes graph>`.
 | `shapes-graph=<IRI>` | `GET` only: shapes stored in another graph |
 | `infer=false` | Validate asserted statements only (the default includes inferred ones) |
 
-The answer is the validation report, with status 200 whether the data conforms or not:
+The answer is the validation report, with status 200 whether the data conforms or not. A validation changes nothing, and a report that doesn't conform rejects no write:
 - `text/turtle` by default, or any other graph format: the `sh:ValidationReport` graph;
 - `application/json`: `conforms`, `revision`, `shapes` (how many were used; 0 means no shapes were found) and `results`, each with `focusNode`, `resultPath`, `value`, `sourceShape`, `sourceConstraintComponent`, `resultSeverity` and `resultMessage`.
 
 Ill-formed shapes are 400, naming the shape and the parameter.
 
 Limits today:
-- SHACL Core and SHACL-SPARQL; SHACL Advanced Features are not supported, nor is `sh:entailment` (a shapes graph that asks for an entailment regime is reported as a failure). Commits are validated too where the SHACL gate is on (`shacl.gate`, off by default: [config-reference.md](config-reference.md)).
-- A `POST` holds the writer while it validates (its shapes live in a transaction that is never committed), so other writes wait.
+- SHACL Core and SHACL-SPARQL; SHACL Advanced Features are not supported, nor is `sh:entailment` (a shapes graph that asks for an entailment regime is reported as a failure). Commits are validated where the SHACL gate is on (`shacl.gate`, off by default: [config-reference.md](config-reference.md)), and rejected only under `enforce`; bulk loads (`nrese-server load`, the import endpoints) skip the gate ([storage](../spec/02-storage-and-transactions.md#bulk-loads)).
+- A `POST`'s shapes live in a transaction of its own that is never committed and takes no writer slot, so other writes go on; they count against the request's memory.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
 ## Draft checks (`/api/v1/draft-check`)
@@ -312,7 +312,7 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 
 | Code | When |
 |---|---|
-| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) |
+| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) or by the SHACL gate under `enforce`. An OWL 2 DL consistency check that isn't decided rejects nothing: the commit goes through, and the status says `unknown` ([consistency](../spec/reasoning-semantics.md#consistency)) |
 | 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
 | 409 | The resource exists already (a repository), or the change would leave a workspace without an owner |
 | 422 | Under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete: type `incomplete-answer`, with the reasons, the bounds and the unresolved candidates |

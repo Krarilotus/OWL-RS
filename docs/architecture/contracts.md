@@ -1,6 +1,6 @@
 # Cross-cutting contracts
 
-This page is a source reference at engine-v2 `a3453435` (7 November 2026). [ARCHITECTURE.md](../ARCHITECTURE.md) owns the layer model and crate
+This page is an inventory of the source at engine-v2 `a3453435` (7 November 2026), not the contract of a release. [ARCHITECTURE.md](../ARCHITECTURE.md) owns the layer model and crate
 boundaries; [ADRs](../adr/README.md) own design decisions. Change a shared contract at its owner, then migrate callers. This inventory does not approve
 API changes or classify the listed bypasses as defects.
 
