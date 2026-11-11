@@ -241,6 +241,21 @@ impl Server {
         Ok(server)
     }
 
+    /// Sends the server SIGTERM, as `docker stop` does, and waits within `limit` for it to
+    /// end: its status and what it wrote.
+    #[cfg(unix)]
+    pub(super) fn terminate(
+        self,
+        limit: Duration,
+    ) -> Result<(std::process::ExitStatus, String), Box<dyn std::error::Error>> {
+        let pid = self.process.child.id().to_string();
+        let sent = Command::new("kill").args(["-TERM", &pid]).status()?;
+        if !sent.success() {
+            return Err(self.failed(&format!("kill -TERM {pid}: {sent}")));
+        }
+        self.process.finish(limit)
+    }
+
     /// `what` failed, with what the server wrote.
     fn failed(&self, what: &str) -> Box<dyn std::error::Error> {
         format!(
