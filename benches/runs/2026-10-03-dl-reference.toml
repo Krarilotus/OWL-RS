@@ -23,5 +23,13 @@ results = "benches/reasoning/dl/results/w3c-2026-10-03.tsv, ore-dev-2026-10-03.t
 publishable = "all"
 
 pairs = [
+  { workload = "w3c-owl2-dl", tier = "-", system = "hermit", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "w3c-owl2-dl", tier = "-", system = "openllet", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "w3c-owl2-dl", tier = "-", system = "konclude", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "w3c-owl2-dl", tier = "-", system = "elk", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "ore-2015", tier = "dev", system = "hermit", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "ore-2015", tier = "dev", system = "openllet", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "ore-2015", tier = "dev", system = "konclude", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
+  { workload = "ore-2015", tier = "dev", system = "elk", regime = "direct", outcome = "restricted", note = "run; results kept locally" },
   { workload = "ore-2015", tier = "dev", system = "nrese", regime = "direct", outcome = "partial", items = "20/80", note = "EL track only (20/20 agree); the DL tasks wait for phase 3" },
 ]

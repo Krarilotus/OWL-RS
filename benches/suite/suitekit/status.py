@@ -24,8 +24,8 @@ MARK = {"ok": "ok", "partial": "part", "wrong": "WRONG", "failed": "FAIL", "time
 LEGEND = ("`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count "
           "differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the "
           "suite skipped it (reason in the record) · `≠?` its answers differ from another system's, "
-          "not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome "
-          "stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit "
+          "not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; its outcome stays "
+          "local (a licensed system's, or results kept locally) · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit "
           "for it")
 
 
