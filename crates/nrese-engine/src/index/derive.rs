@@ -17,9 +17,13 @@ use rayon::prelude::*;
 use super::keys::PackedKeys;
 use crate::quad::{Key, Permutation};
 
-/// Distinct values of the partitioning component beyond which the caller sorts instead:
-/// the counting tables grow with them (millions of named graphs).
-const MAX_BUCKETS: usize = 1 << 16;
+/// Distinct values of the partitioning component beyond which the caller sorts instead.
+/// Each part keeps a count and a start per value and searches the values for every key,
+/// so the partition slows with them: past 256 values, loads of 1.2 to 19.2 million quads
+/// with the lower of two caps (256 or 1,024, 1,024 or 8,192) were as fast or faster
+/// (docs/design/performance.md, 11 Nov). An attempt on a component with more values (most
+/// objects) also gives up early: a part stops once it has seen more than this many.
+const MAX_BUCKETS: usize = 1 << 8;
 
 /// Keys per parallel part, at least.
 const PART: usize = 1 << 15;
@@ -163,6 +167,8 @@ mod tests {
     use super::*;
     use crate::quad::EncodedQuad;
 
+    /// Quads whose subjects, predicates and objects all have few values (within
+    /// [`MAX_BUCKETS`]), so every derivable pair partitions: the pair-and-chain coverage.
     fn quads(n: usize, graphs: u64) -> Vec<EncodedQuad> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = |m: u64| {
@@ -172,7 +178,7 @@ mod tests {
             state % m
         };
         (0..n)
-            .map(|_| EncodedQuad::from_components([next(500), next(7), next(900), next(graphs)]))
+            .map(|_| EncodedQuad::from_components([next(200), next(7), next(250), next(graphs)]))
             .collect()
     }
 
@@ -300,5 +306,50 @@ mod tests {
             positions: None,
         };
         assert!(own.partitioned(Permutation::Gspo).is_none());
+    }
+
+    /// Only a component with at most 256 values (predicates, a few graphs) is partitioned;
+    /// past that its permutation is sorted, which loads as fast or faster (the partition's
+    /// count tables and searches grow with the values). Dense data with thousands of
+    /// objects sorts OSPG and still derives PSOG and POSG by predicate; thousands of
+    /// predicates or graphs sort theirs too. Every permutation holds what a plain sort gives
+    /// either way.
+    #[test]
+    fn many_valued_components_are_sorted_few_valued_ones_derived() {
+        use crate::index::Layout;
+        // (layout, objects, predicates, graphs, full sorts)
+        for (layout, objects, predicates, graphs, sorts) in [
+            // 256 objects: OSPG derived; 257: sorted.
+            (Layout::DefaultGraph, 256, 7, 1, 1),
+            (Layout::DefaultGraph, 257, 7, 1, 2),
+            (Layout::DefaultGraph, 4_000, 7, 1, 2),
+            (Layout::DefaultGraph, 4_000, 2_000, 1, 4),
+            // Few graphs derive the graph-first permutations, many sort them.
+            (Layout::Quads, 4_000, 7, 5, 3),
+            (Layout::Quads, 4_000, 7, 2_000, 6),
+        ] {
+            let quads: Vec<EncodedQuad> = (0..100_000u64)
+                .map(|i| {
+                    let x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    EncodedQuad::from_components([
+                        x % 20_011,
+                        (x >> 16) % predicates,
+                        (x >> 32) % objects,
+                        (x >> 48) % graphs,
+                    ])
+                })
+                .collect();
+            let case =
+                format!("{layout:?}, {objects} objects, {predicates} predicates, {graphs} graphs");
+            let mut builder = crate::index::run::PermutationBuilder::planned(
+                quads.clone(),
+                layout.permutations(),
+            );
+            for &permutation in layout.permutations() {
+                let keys: Vec<Key> = builder.packed(permutation).iter().collect();
+                assert_eq!(keys, sorted(&quads, permutation), "{case}: {permutation:?}");
+            }
+            assert_eq!(builder.sorts(), sorts, "{case}");
+        }
     }
 }
