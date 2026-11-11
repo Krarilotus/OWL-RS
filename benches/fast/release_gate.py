@@ -765,7 +765,8 @@ def load_policy(text: str) -> Policy:
             errors.append(f"absence {i}: missing {', '.join(sorted(missing))}")
         elif error := authority_error(f"absence {i}", e):
             errors.append(error)
-        elif e["side"] not in cases_registry.BASELINES or not (isinstance(e["port"], str) and e["port"].strip()):
+        elif not (isinstance(e["side"], str) and e["side"] in cases_registry.BASELINES
+                  and isinstance(e["port"], str) and e["port"].strip()):
             errors.append(f"absence {i}: a baseline (base, main) and the port planned to compare it")
         elif not (scope in (["cases"], ["pattern"]) and (
                 isinstance(e.get("pattern"), str) and e["pattern"].strip() or
@@ -2889,9 +2890,14 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
             declared = {h.split("|")[1] for h in d["family"] if h.split("|", 1)[0] == side}
             blocked = {h.split("|")[1] for h in not_compared if h.split("|", 1)[0] == side}
             by_owner = {c for s, c in decided if s == side}
-            counts.append(f"{side}: {len(declared - blocked - by_owner)} compared, "
+            # Compared: a round tested one of its hypotheses (a p-value), none left blocking or waived.
+            tested = {h.split("|")[1] for h in d["family"] if h.split("|", 1)[0] == side
+                      and any(p is not None for p in d["rounds"].get(h, []))}
+            compared = tested - blocked - by_owner
+            uncompared = declared - compared - by_owner
+            counts.append(f"{side}: {len(compared)} compared, "
                           f"{sum(s == side for s, _ in absent)} absent by product, {len(by_owner)} absent by the "
-                          f"owner's decision" + (f", {len(blocked)} not compared" if blocked else ""))
+                          f"owner's decision" + (f", {len(uncompared)} not compared" if uncompared else ""))
         lines.append("- cases per baseline: " + "; ".join(counts))
     lines += [f"- {b}" for b in other] + [f"- pass error: {e}" for e in errors]
     covered = {c for t in timed for c in t.get("planned", [])}
