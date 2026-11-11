@@ -470,3 +470,74 @@ fn a_merge_does_no_work_after_a_grant_that_it_counted_before() {
         }
     }
 }
+
+/// An account that refuses nothing and sums what it is asked to count.
+struct Tally(u64);
+
+impl Account for Tally {
+    fn take(&mut self, n: u64) -> bool {
+        self.0 += n;
+        true
+    }
+}
+
+/// Text prefix A (`SignedMerge::new` built at once, counting nothing). Spec
+/// (`SignedMerge::add`, `SignedMerge::step`): a counted merge is charged, for each range it
+/// adds, its first key and the push of its head: nothing over the first `LINEAR_UP_TO`, the
+/// heap's build (`(LINEAR_UP_TO + 1)` pushes onto at most `LINEAR_UP_TO` heads, 2 levels
+/// each) at the next, and a push onto the heads already there after it. So three ranges are
+/// charged 3, and seven `7 + 4 × 2 + 3 × 3` = 24. The merge built uncounted yields the same
+/// keys and signs, and its steps are charged the same as the counted one's: a counted read
+/// stepping it pays what it paid before. The ranges hold inserts, tombstones of some and
+/// reinserts of a few, one of 300 keys (decoded block-wise), and short ones.
+#[test]
+fn an_uncounted_merge_reads_what_a_counted_one_reads_and_charges_its_steps_alike() {
+    let (p, o) = (term(1), term(2));
+    let quads = |s: &mut dyn Iterator<Item = u64>| -> Vec<_> {
+        s.map(|s| EncodedQuad::new(term(s), p, o, TermId::DEFAULT_GRAPH))
+            .collect()
+    };
+    let delta = |inserts: Vec<_>, deletes: Vec<_>| {
+        Run::from_delta(Layout::DefaultGraph, &inserts, &deletes)
+    };
+    let runs = [
+        delta(quads(&mut (0..300)), vec![]),
+        delta(vec![], quads(&mut (0..300).step_by(7))),
+        delta(quads(&mut (0..300).step_by(14)), vec![]),
+        delta(quads(&mut (300..310)), vec![]),
+        delta(quads(&mut (310..320)), vec![]),
+        delta(vec![], quads(&mut (300..305))),
+        delta(quads(&mut std::iter::once(1_000)), vec![]),
+    ];
+    for (ranges, charged) in [(3, 3), (7, 24)] {
+        let parts = || {
+            runs[..ranges].iter().map(|run| {
+                let perm = run.permutation(Permutation::Spog);
+                (perm, 0, perm.keys.len())
+            })
+        };
+        let mut counted = SignedMerge::new(std::iter::empty());
+        let mut made = Tally(0);
+        for part in parts() {
+            assert!(counted.add(part, &mut made));
+        }
+        assert_eq!(made.0, charged, "{ranges} ranges added counted");
+        let mut plain = SignedMerge::new(parts());
+        let (mut a, mut b) = (Tally(0), Tally(0));
+        let mut read = 0;
+        loop {
+            let step = counted.step(&mut a).expect("never stopped");
+            assert_eq!(
+                plain.step(&mut b).expect("never stopped"),
+                step,
+                "{ranges} ranges, key {read}"
+            );
+            assert_eq!(a.0, b.0, "{ranges} ranges: the charge after key {read}");
+            if step.is_none() {
+                break;
+            }
+            read += 1;
+        }
+        assert!(read > 0, "{ranges} ranges read something");
+    }
+}
