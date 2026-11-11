@@ -330,6 +330,65 @@ class Schedule(unittest.TestCase):
             self.assertIn(text, errors)
 
 
+class NothingTimed(unittest.TestCase):
+    """Spec (owner's release, Wed 11 Nov): a timed part that produced nothing must not read as a
+    pass; the release verdict reads each part's report. `release_gate.py report` over no passes
+    wrote PASSED and exited 0, and the verdict over that report passed."""
+
+    def report(self, root: Path, family: list[str] | None = None) -> tuple[int, dict, str]:
+        directory = root / "passes"
+        argv = ["release_gate.py", "report", "--passes", str(directory), "--candidate", "cand",
+                *[a for s in SIDES for a in ("--side", f"{s}={REVS[s]}")], "--require", "base,main",
+                "--harness-revision", HARNESS, "--min-blocks", "2",
+                "--out", str(root / "release-gate.md"), "--json", str(root / "release-gate.json")]
+        if family is not None:
+            plan = {"run": sorted({h.split("|")[1] for h in family}), "not_run": {}, "elsewhere": {},
+                    "family": family}
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            argv += ["--family", str(root / "plan.json")]
+        with patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding="utf-8")):
+            code = gate_module.main()
+        return (code, json.loads((root / "release-gate.json").read_text(encoding="utf-8")),
+                (root / "release-gate.md").read_text(encoding="utf-8"))
+
+    def assert_not_passed(self, code: int, summary: dict, text: str):
+        self.assertFalse(summary["passed"])
+        self.assertNotIn("**PASSED.**", text)
+        self.assertNotEqual(code, 0)
+        self.assertFalse(gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS)[0])
+
+    def test_a_report_over_no_passes_is_not_passed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "passes").mkdir()
+            self.assert_not_passed(*self.report(Path(tmp)))
+
+    def test_a_part_whose_passes_are_all_missing_is_not_passed(self):
+        """The part planned two cases (its family declared); every block was set aside as
+        disturbed (release-gate.sh aside: disturbed-pass-N-SIDE-STAMP.json), so no pass is left."""
+        family = [f"{s}|{c}|time/q01" for s in ("base", "main") for c in ("lab-olympics", "lubm-q1")]
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "passes"
+            directory.mkdir()
+            for n, side in enumerate(SIDES * 2, start=1):
+                (directory / f"disturbed-pass-{n}-{side}-1794390000.json").write_text("{}", encoding="utf-8")
+            (directory / "quiet-block-1-disturbed-1794390000.json").write_text(
+                json.dumps({"verdict": "disturbed"}), encoding="utf-8")
+            self.assert_not_passed(*self.report(Path(tmp), family))
+
+    def test_the_verdict_refuses_a_report_that_timed_nothing_written_before_the_fix(self):
+        """Review release-gate-zero-passes r1 R1: a report written by the earlier `report` over no
+        passes (no planned case, no error, passed) passed the verdict; the verdict reads such reports
+        too. Its shape: every report since 18 Oct carries `planned`, here empty."""
+        earlier = run_gate([])
+        earlier["errors"] = [e for e in earlier["errors"] if not e.startswith("nothing timed")]
+        earlier["passed"] = True
+        self.assertEqual((earlier["planned"], earlier["passes"], earlier["errors"]), ([], [], []))
+        passed, text = gate_module.verdict([earlier], Rounds.W3C, Rounds.GUARDS)
+        self.assertFalse(passed)
+        self.assertIn("nothing timed", text)
+
+
 class Layouts(unittest.TestCase):
     def test_any_k_blocks_in_a_row_run_every_layout(self):
         # Round 8: the old rotation never ran a third of the layouts when 3 divided K.
@@ -2678,6 +2737,37 @@ exec "{Path(sys.executable).as_posix()}" "$@"
         gate = Path(self.gate_env(tmp, "confirm")["NRESE_GATE_DIR"])
         self.assertEqual(Path(value(confirm, "--family")), gate / "plan.json")
         self.assertIn("confirm-not=why", confirm)
+
+    def test_a_report_that_fails_leaves_no_earlier_report_standing(self):
+        """Review release-gate-zero-passes r1 R2: a part rerun in its results directory whose report
+        fails before writing (a pass file truncated: load_passes() raises) left the earlier run's
+        PASSED release-gate.json in place; the step took its existence for a report and the verdict
+        passed it. The earlier report goes before the new one is made: none stands, the step fails."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        head = self.git("rev-parse", "HEAD")
+        env = self.gate_env(tmp, "rerun")
+        gate, out = Path(env["NRESE_GATE_DIR"]), Path(env["FLEET_OUT"])
+        gate.mkdir(parents=True)
+        (out / "passes").mkdir(parents=True)
+        (out / "plan.json").write_text(json.dumps({"run": ["lab-olympics"], "not_run": {}, "elsewhere": {},
+                                                   "family": []}), encoding="utf-8")
+        (out / "inputs.txt").write_text("inputs\n", encoding="utf-8")
+        (out / "passes" / "pass-1-cand.json").write_text("", encoding="utf-8")
+        earlier = run_gate(passes())  # the earlier run's report: it passed
+        self.assertTrue(earlier["passed"])
+        (out / "release-gate.json").write_text(json.dumps(earlier, default=str), encoding="utf-8")
+        (out / "release-gate.md").write_text(gate_module.render(earlier), encoding="utf-8")
+        done = subprocess.run([bash, "scripts/release-gate.sh", "report", head, f"cand={head}", f"base={head}"],
+                              cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertFalse((out / "release-gate.json").exists(), "the earlier PASSED report still stands")
+        self.assertFalse((out / "release-gate.md").exists())
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The rerun's own report failed where the reviewer's did: reading the empty pass file.
+        self.assertIn("JSONDecodeError", (out / "report.log").read_text(encoding="utf-8"))
 
     def test_callers_at_once_share_no_code_checkout(self):
         """Sol, PR #60 fix check 3 (R3): the code checkout, shared under the launching commit's name,
