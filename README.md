@@ -19,21 +19,29 @@ It may suit you if you:
 - want a store you can read and take apart: small crates in clear layers.
 
 Not there yet: parallel writes (one commit at a time), automatic failover (read replicas
-only), named graphs as reasoning boundaries, packages on crates.io. More in
-[State and limits](#state-and-limits).
+only), named graphs as reasoning boundaries, packages on crates.io. Every limit, and when to
+choose another system: [Limits and deviations](docs/limits.md).
 
 ## Quick start
 
 With Docker (the image builds the server and the console; data on a volume; the port
-bound to this machine only, since no authentication is on):
+bound to this machine only, since no authentication is on; reasoning under OWL 2 RL, and
+the SHACL commit gate on, which the example below uses):
 
 ```bash
 docker build -t nrese .
-docker run -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data -e NRESE_REASONING_MODE=owl2-rl nrese
+docker run -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
+  -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce nrese
 ```
 
 The image is built for CPUs from x86-64-v3 (amd64) or Neoverse N1 (arm64) on; for an
-older CPU add `--build-arg NRESE_TARGET_CPU=portable`.
+older CPU add `--build-arg NRESE_TARGET_CPU=portable`. The image's console is at
+`http://localhost:8080/console`.
+
+No authentication is on by default. Set `NRESE_AUTH_MODE`, or a deployment posture that
+requires it, before you expose the server ([access control](#access-control-and-operations)).
+
+### A first example: inference, retraction, validation
 
 Add a class hierarchy and an instance, then ask for the instances of the superclass:
 
@@ -48,14 +56,83 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
   SELECT ?x WHERE { ?x a ex:Animal }'
 ```
 
-The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. Its
-`NRESE-Completeness` header says `sound-only; regime=owl2-rl`, with the reason: every row
-is entailed, and the rules are complete only for ontologies inside the OWL 2 RL profile,
-which isn't checked per query ([what an answer promises](#what-an-answer-promises)). The
-image's console is at `http://localhost:8080/console`. Load files with `PUT /dataset/data?graph=<IRI>`, or offline with `nrese-server load` for
-large ones ([server setup](docs/ops/server-setup.md)).
+```text
+HTTP/1.1 200 OK
+content-type: application/sparql-results+json
+nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the owl2-rl closure: …"
 
-From source, with Rust (the version in [rust-toolchain.toml](rust-toolchain.toml)):
+{"head":{"vars":["x"]},"results":{"bindings":[{"x":{"type":"uri","value":"http://example.org/tom"}}]}}
+```
+
+The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
+`NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
+complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
+([what an answer promises](#what-an-answer-promises)).
+
+Delete the premise, and the inference goes with it, in the same commit:
+
+```bash
+curl http://localhost:8080/dataset/update --data-urlencode 'update=
+  PREFIX ex: <http://example.org/>
+  DELETE DATA { ex:tom a ex:Cat }'
+```
+
+The same query now answers no rows: `{"head":{"vars":["x"]},"results":{"bindings":[]}}`.
+
+Now a shape, stored in the shapes graph: every animal needs a name. A cat without one is
+an animal by inference, so the gate rejects it:
+
+```bash
+curl http://localhost:8080/dataset/update --data-urlencode 'update=
+  PREFIX ex: <http://example.org/>
+  PREFIX sh: <http://www.w3.org/ns/shacl#>
+  INSERT DATA { GRAPH <http://rdf4j.org/schema/rdf4j#SHACLShapeGraph> {
+    ex:AnimalShape a sh:NodeShape ; sh:targetClass ex:Animal ;
+      sh:property [ sh:path ex:name ; sh:minCount 1 ] } }'
+
+curl -i http://localhost:8080/dataset/update --data-urlencode 'update=
+  PREFIX ex: <http://example.org/>
+  INSERT DATA { ex:felix a ex:Cat }'
+```
+
+```text
+HTTP/1.1 400 Bad Request
+content-type: application/problem+json
+
+{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>","reasoner_reject":null,"request_id":"…","status":400,"title":"Reasoner Reject","type":"https://nrese.dev/problems/reasoner-reject"}
+```
+
+Nothing of the rejected commit remains: the query still answers no rows. With a name
+(`INSERT DATA { ex:felix a ex:Cat ; ex:name "Felix" }`) the commit passes, and the query
+answers `ex:felix`. When each part of a commit becomes visible, and what the checks see:
+[What a commit does](#what-a-commit-does).
+
+### Your own data
+
+Five commands from the image to a query on your own file, `my.ttl`, with the data kept
+across a restart (stop the server above first: it holds the port):
+
+```bash
+docker build -t nrese .
+docker run -d --name nrese -p 127.0.0.1:8080:8080 -v my-data:/var/lib/nrese/data nrese
+curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
+curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
+docker restart nrese
+```
+
+The `PUT` answers `204 No Content` and makes your file the default graph. The count is
+its number of statements (for a file of three: `"value":"3"`), and after the restart the
+same query gives the same number. The restart takes about ten seconds: the server doesn't
+act on Docker's stop signal, so Docker stops it at the end of its grace period. Every
+commit is synced to the log before it is acknowledged, and the restart recovers it
+([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)). After
+`docker run` and after the restart, give the server a second to start before the next
+request. Other syntaxes take their media type as `Content-Type`; large files load offline
+with `nrese-server load` ([server setup](docs/ops/server-setup.md)).
+
+### From source
+
+With Rust (the version in [rust-toolchain.toml](rust-toolchain.toml)):
 
 ```bash
 cargo run --release -p nrese-server
@@ -64,13 +141,12 @@ cargo run --release -p nrese-server
 With only Rust, you get the server and its API on `127.0.0.1:8080`, from memory (nothing
 is written to disk) and with reasoning off; set `NRESE_STORE_MODE=on-disk` and
 `NRESE_REASONING_MODE` to change that ([configuration](docs/ops/config-reference.md)).
-With reasoning off, the example above answers no rows, as `complete`: nothing is inferred;
-start the server with `NRESE_REASONING_MODE=owl2-rl` for the inference. The operator page `/ops` is built in. The browser console needs
-Node.js: build it in `apps/nrese-console` (`npm ci && npm run build`) before the server,
-and the server embeds it; without it, `/console` says how ([getting started](docs/dev/getting-started.md)).
-
-No authentication is on by default. Set `NRESE_AUTH_MODE`, or a deployment posture that
-requires it, before you expose the server ([access control](#access-control-and-operations)).
+With reasoning off, the first query of the example above answers no rows, as `complete`:
+nothing is inferred. Start the server with `NRESE_REASONING_MODE=owl2-rl` and
+`NRESE_SHACL_GATE=enforce` for the example. The operator page `/ops` is built in. The
+browser console needs Node.js: build it in `apps/nrese-console` (`npm ci && npm run build`)
+before the server, and the server embeds it; without it, `/console` says how
+([getting started](docs/dev/getting-started.md)).
 
 ## What it can do
 
@@ -174,6 +250,30 @@ rules, no answer is claimed complete.
 | Backups: N-Quads exports with a checksum, image backups, point-in-time restore from the archived log ([server setup](docs/ops/server-setup.md), [drills](docs/ops/backup-restore-drills.md)) | |
 | Read replicas that follow a primary's log ([replication](docs/ops/replication.md)) | No automatic failover; no partitioning across machines |
 | Several repositories per server, each with its own reasoning and rules | |
+
+#### What a commit does
+
+A write (a SPARQL update, a Graph Store write, the commit of a client transaction) is
+one commit, and its operations apply in order, each seeing the ones before it. Before
+anything is visible:
+
+1. the reasoner updates the inferred statements from the change, in the same
+   transaction, and checks consistency (under `owl2-dl` also with the DL engines);
+2. with the SHACL gate on, the shapes validate the focus nodes the change can affect,
+   inferred statements included. Only what the commit introduces counts: data that was
+   invalid before doesn't block it.
+
+If a check fails, or the request times out, nothing of the request is committed: no
+asserted statement, no inference, and the response says why. Otherwise the asserted and
+the inferred changes are written to the log (synced, on disk) and published together as
+one revision, so a query sees all of the commit or none of it. A deleted statement's
+inferences go in the same commit, unless they still follow from what remains. The
+gate's result isn't stored (`report` logs it); `GET /dataset/shacl` validates the current
+data on request. Bulk loads (`nrese-server load`) don't go through these gates: a load
+whose data is inconsistent fails after loading, and the data stays
+([storage contract](docs/spec/02-storage-and-transactions.md#writes),
+[consistency](docs/spec/reasoning-semantics.md#consistency),
+[SHACL gate](docs/ops/config-reference.md)).
 
 ### Access control and operations
 
@@ -299,7 +399,8 @@ untrusted input ([fuzz/](fuzz/README.md)). Benchmarks live in [benches/](benches
 ## State and limits
 
 What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md); the order
-of work: [docs/ROADMAP.md](docs/ROADMAP.md). The main limits today:
+of work: [docs/ROADMAP.md](docs/ROADMAP.md); every limit and deviation, and when to choose
+another system: [docs/limits.md](docs/limits.md). The main limits today:
 
 - One writer at a time; reads never wait for it.
 - Read replicas, but no automatic failover and no partitioning across machines.
