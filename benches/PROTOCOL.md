@@ -225,8 +225,16 @@ check pins the head's answer (then the baseline's time is not compared). A case 
 can't run (an argument or tool it lacks, a wrong answer of its own) is *not compared* against
 it, with that reason: it isn't evidence about the head, and it isn't a pass either: a declared
 hypothesis any round didn't compare keeps the verdict NOT PASSED (`release_gate.py verdict`; `abba.py
-report` exit 5), its reason listed, until the family or the baseline changes. The head failing a
-case blocks; so does the head stopping at its declared limit where a baseline completed.
+report` exit 5), its reason listed, until the family or the baseline changes. Two declarations
+change the family. A case whose baseline's *product* lacks the capability says so in the
+catalogue (`absent = { main = "<capability>" }`): no hypothesis against that baseline, and the
+verdict lists it as "main has no <capability>". A baseline whose product has it but whose
+measurement build can't run it yet is absent only by Johannes's *absence* entry (below), listed
+as "not compared by the owner's decision"; without one it stays not compared and blocks. A timed
+block never runs a side declared absent either way (its record says `absent`), and the verdict
+then counts, per baseline, the cases compared and those absent by product and by decision. The
+head failing a case blocks; so does the head stopping at its declared limit where a baseline
+completed.
 
 **The inference** (`suitekit/gatestats.py`; research round 8, 19 Oct 2026). One question per
 hypothesis, all of them declared before any result, the *family*: does the head lose on this
@@ -397,7 +405,9 @@ the date, `by = "Johannes"`, the reason, his words verbatim and their source. A 
 accepts a loss: it names a case, a dimension, optionally the baseline, the largest ratio the
 loss's interval may reach, and the win that pays for it, which must show as *better* in the same
 report. A covered loss is reported as an *accepted trade-off*; anything beyond its bound, without
-its win, or on another dimension blocks. An *exception* accepts one case's wrong answer: a
+its win, or on another dimension blocks. An *absence* accepts that a baseline isn't compared on
+some cases (`cases`, or a `pattern` of their names) because its measurement build can't run
+them yet: it names the baseline (`side`), the reason and the `port` planned to compare them. An *exception* accepts one case's wrong answer: a
 candidate's `wrong` outcome blocks unless one names that case and outcome, wherever the baselines
 stand, even where the case declares the outcome and every baseline is wrong too; a declared
 `outcome` and `known` issue explain evidence and grant nothing. Only `wrong`, plus confirmed

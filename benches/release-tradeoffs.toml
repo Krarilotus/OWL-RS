@@ -1,8 +1,8 @@
 # The owner-approved policy of the release gate (benches/PROTOCOL.md §5, "The release gate";
 # benches/fast/release_gate.py load_policy): the one place that accepts what the bar forbids. The
 # gate tolerates no loss in time or memory and no wrong answer. A loss is accepted only when a
-# trade-off here covers it; a wrong answer only when an exception here names its case and outcome.
-# Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
+# trade-off here covers it; a wrong answer only when an exception here names its case and outcome;
+# a baseline left uncompared only when an absence here names its cases. Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
 # `known` issue explain evidence, they grant nothing.
 #
 # `release-gate.sh verdict CAND ...` reads this file at the candidate's commit, never from a timed
@@ -38,5 +38,20 @@
 # approved = "2026-11-09"
 # by = "Johannes"
 # reason = "<why it ships>"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
+#
+# An absence accepts that a baseline isn't compared on some cases whose capability its product has
+# but its measurement build can't run yet (a product that lacks it says so in the catalogue: the
+# case's `absent`). Without one, such a case stays not compared and blocks. A timed block doesn't
+# run the side on them; the verdict lists each as "not compared by the owner's decision".
+#
+# [[absence]]
+# cases = ["commits-plain", "commits-readers"]   # or: pattern = "support-*" (one of the two)
+# side = "main"
+# reason = "main's measurement build has no commits mode"
+# port = "<the package planned to compare them>"
+# approved = "2026-11-11"
+# by = "Johannes"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"

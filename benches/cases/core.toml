@@ -410,6 +410,7 @@ systems = ["graphdb:owl2-rl"]
 
 [[case]]
 name = "support-copies-8"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-8"
@@ -433,6 +434,7 @@ systems = []
 
 [[case]]
 name = "support-copies-8-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-8"
@@ -455,6 +457,7 @@ systems = []
 
 [[case]]
 name = "support-copies-16"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-16"
@@ -478,6 +481,7 @@ systems = []
 
 [[case]]
 name = "support-copies-16-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-16"
@@ -500,6 +504,7 @@ systems = []
 
 [[case]]
 name = "support-copies-17"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-17"
@@ -522,6 +527,7 @@ systems = []
 
 [[case]]
 name = "support-copies-17-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-17"
@@ -545,6 +551,7 @@ systems = []
 
 [[case]]
 name = "support-update-committed"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-17"
@@ -567,6 +574,7 @@ systems = []
 
 [[case]]
 name = "support-update-pending"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-17"
@@ -589,6 +597,7 @@ systems = []
 
 [[case]]
 name = "support-pending-read"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-17"
@@ -611,6 +620,7 @@ systems = []
 
 [[case]]
 name = "support-copies-256"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-256"
@@ -633,6 +643,7 @@ systems = []
 
 [[case]]
 name = "support-copies-256-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "copies-256"
@@ -656,6 +667,7 @@ systems = []
 
 [[case]]
 name = "support-product-64"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-64"
@@ -678,6 +690,7 @@ systems = []
 
 [[case]]
 name = "support-product-64-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-64"
@@ -701,6 +714,7 @@ systems = []
 
 [[case]]
 name = "support-product-256"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-256"
@@ -723,6 +737,7 @@ systems = []
 
 [[case]]
 name = "support-product-256-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-256"
@@ -746,6 +761,7 @@ systems = []
 
 [[case]]
 name = "support-product-1024"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-1024"
@@ -768,6 +784,7 @@ systems = []
 
 [[case]]
 name = "support-product-1024-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-1024"
@@ -791,6 +808,7 @@ systems = []
 
 [[case]]
 name = "support-product-4096"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-4096"
@@ -814,6 +832,7 @@ systems = []
 
 [[case]]
 name = "support-product-4096-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-4096"
@@ -838,6 +857,7 @@ systems = []
 
 [[case]]
 name = "support-product-4096-limit"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-4096"
@@ -863,6 +883,7 @@ systems = []
 
 [[case]]
 name = "support-product-4096-limit-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "product-4096"
@@ -886,6 +907,7 @@ systems = []
 
 [[case]]
 name = "support-ladder-16"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "ladder-16"
@@ -909,6 +931,7 @@ systems = []
 
 [[case]]
 name = "support-ladder-16-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "ladder-16"
@@ -931,6 +954,7 @@ systems = []
 
 [[case]]
 name = "support-ladder-256"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "ladder-256"
@@ -955,6 +979,7 @@ systems = []
 
 [[case]]
 name = "support-ladder-256-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "ladder-256"
@@ -978,6 +1003,7 @@ systems = []
 
 [[case]]
 name = "support-ladder-4096"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "ladder-4096"
@@ -1003,6 +1029,7 @@ systems = []
 
 [[case]]
 name = "support-ladder-4096-capped"
+absent = { main = "supported inference" }
 area = "access"
 workload = "support-stress"
 tier = "ladder-4096"
@@ -1029,6 +1056,7 @@ systems = []
 
 [[case]]
 name = "dl-transitive"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "18 definitions C ≡ ∃hasPart.D over a transitive hasPart in a cycle (ore_ont_10212's shape): time grows exponentially with their number"
 semantics = "dl"
@@ -1046,6 +1074,7 @@ guards = ["DL: ∃R.D ⊑ C over a non-simple R read as D ⊑ ∀R⁻.C (Horn), 
 
 [[case]]
 name = "dl-transitive-400"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "the same shape with 400 definitions: Konclude decides it in 0.6 s; NRESE gives up (the frontier)"
 semantics = "dl"
@@ -1064,6 +1093,7 @@ systems = ["konclude:dl", "openllet:dl", "hermit:dl"]
 home_turf = "konclude"
 [[case]]
 name = "dl-number"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "qualified number restrictions met exactly: ≥ 40 R.(B1 ⊔ B2) with ≤ 20 of each, on 200 individuals"
 semantics = "dl"
@@ -1078,6 +1108,7 @@ systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 
 [[case]]
 name = "dl-nominals"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "nominals: a ring of 10,000 nodes coloured from {colour0, colour1, colour2}, neighbours different"
 semantics = "dl"
@@ -1092,6 +1123,7 @@ systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 
 [[case]]
 name = "dl-datatypes"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "at least 256 values of xsd:byte (consistent) and 257 (inconsistent): the datatype theory's clique check"
 semantics = "dl"
@@ -1108,6 +1140,7 @@ guards = ["3.5: the datatype theory's clique check by adjacency sets"]
 
 [[case]]
 name = "dl-roles"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "5,000 universals over the automaton of a transitive role with 200 subroles (ore_ont_1066's shape): about 6 clauses each"
 semantics = "dl"
@@ -1125,6 +1158,7 @@ guards = ["P3: minimal automata, transitions the inclusions imply"]
 # property, so the key equates them, against DifferentIndividuals(a0 a1) (PR #48's timing).
 [[case]]
 name = "dl-keys-100"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "HasKey over one transitive property, 100 named members: inconsistent by the key and one difference"
 semantics = "dl"
@@ -1139,6 +1173,7 @@ cap_gb = 4
 systems = []
 [[case]]
 name = "dl-keys-400"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "the same key, 400 members"
 semantics = "dl"
@@ -1153,6 +1188,7 @@ cap_gb = 4
 systems = []
 [[case]]
 name = "dl-keys-1200"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "the same key, 1,200 members"
 semantics = "dl"
@@ -1167,6 +1203,7 @@ cap_gb = 8
 systems = []
 [[case]]
 name = "dl-keys-2400"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "the same key, 2,400 members"
 semantics = "dl"
@@ -1181,6 +1218,7 @@ cap_gb = 8
 systems = []
 [[case]]
 name = "dl-keys-8x3"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "a key over three transitive properties, 8 members"
 semantics = "dl"
@@ -1195,6 +1233,7 @@ cap_gb = 4
 systems = []
 [[case]]
 name = "dl-keys-128x3"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "a key over three transitive properties, 128 members"
 semantics = "dl"
@@ -1209,6 +1248,7 @@ cap_gb = 8
 systems = []
 [[case]]
 name = "dl-number-fragment"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "the number shortcut's supported fragment: D = {d} with exactly two p-predecessors, each with exactly three q-predecessors (PR #38's timing)"
 semantics = "dl"
@@ -1278,6 +1318,7 @@ reference = "/fast/ref/el-classes20000-roles12-irregular1.elk.tax"
 
 [[case]]
 name = "horn-classify"
+absent = { main = "Horn context classifier (context_classify)" }
 area = "dl"
 what = "classification of 1,500 Horn classes beyond EL (inverse roles, universals) by the context core"
 semantics = "dl"
@@ -1801,6 +1842,7 @@ home_turf = "qlever"
 args = ["--runs", "45"]
 [[case]]
 name = "vector-knn-exact"
+absent = { main = "vector search" }
 area = "service"
 what = "exact k-NN (k = 10, cosine) over 200 k 64-dimensional embeddings, filtered to one kind in ten"
 semantics = "none"
@@ -1815,6 +1857,7 @@ systems = []
 # The exact scan at its chunk boundary (4,096 vectors a chunk): one under, at and one over (W2's timing).
 [[case]]
 name = "vector-exact-4095"
+absent = { main = "vector search" }
 area = "service"
 what = "exact k-NN over 4,095 embeddings, one kind in ten: a corpus one short of a whole chunk"
 semantics = "none"
@@ -1828,6 +1871,7 @@ cap_gb = 6
 systems = []
 [[case]]
 name = "vector-exact-4096"
+absent = { main = "vector search" }
 area = "service"
 what = "exact k-NN over 4,096 embeddings: exactly one chunk"
 semantics = "none"
@@ -1841,6 +1885,7 @@ cap_gb = 6
 systems = []
 [[case]]
 name = "vector-exact-4097"
+absent = { main = "vector search" }
 area = "service"
 what = "exact k-NN over 4,097 embeddings: one vector into a second chunk"
 semantics = "none"
@@ -1855,6 +1900,7 @@ systems = []
 
 [[case]]
 name = "vector-knn-filtered"
+absent = { main = "vector search" }
 area = "service"
 what = "approximate k-NN (k = 10) with the same one-in-ten filter: the index's recall under a filter"
 semantics = "none"
@@ -2079,6 +2125,7 @@ systems = ["graphdb:owl2-rl"]
 
 [[case]]
 name = "dl-pipeline"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "a 60,000-class Horn ontology through the DL pipeline: reading, normalisation and the tableau's phases timed apart"
 semantics = "dl"
@@ -2351,6 +2398,7 @@ guards = ["investigation #8: interning without the global lock; P5"]
 
 [[case]]
 name = "ctx-ore-9724"
+absent = { main = "Horn context classifier (context_classify)" }
 area = "dl"
 what = "the context core's classification of ORE 2015's ore_ont_9724: subsumption checks per generated clause (§5.6)"
 semantics = "dl"
@@ -2367,6 +2415,7 @@ outcome = "unsupported"
 known = "the context core's Horn stage: unsupported equality (6 Oct 2026); the case counts subsumption checks once it classifies"
 [[case]]
 name = "ctx-ore-2738"
+absent = { main = "Horn context classifier (context_classify)" }
 area = "dl"
 what = "the same on ore_ont_2738 (§5.6)"
 semantics = "dl"
@@ -2383,6 +2432,7 @@ outcome = "unsupported"
 known = "unsupported nominals in the Horn stage (6 Oct 2026)"
 [[case]]
 name = "ctx-ore-9835"
+absent = { main = "Horn context classifier (context_classify)" }
 area = "dl"
 what = "the same on ore_ont_9835 (§5.6)"
 semantics = "dl"
@@ -2399,6 +2449,7 @@ outcome = "unsupported"
 known = "not Horn (6 Oct 2026)"
 [[case]]
 name = "ctx-ore-7914"
+absent = { main = "Horn context classifier (context_classify)" }
 area = "dl"
 what = "the same on ore_ont_7914 (§5.6)"
 semantics = "dl"
@@ -2415,6 +2466,7 @@ outcome = "unsupported"
 known = "unsupported equality in the Horn stage (6 Oct 2026)"
 [[case]]
 name = "dl-abox-lubm1"
+absent = { main = "OWL 2 DL tableau (tableau_consistency)" }
 area = "dl"
 what = "LUBM 1's ontology and ABox through the hypertableau: individuals with many edges, each Extend firing over them (§5.8)"
 semantics = "dl"
@@ -2632,6 +2684,7 @@ pinned = "LUBM(1)'s published answers under complete reasoning (expected-lubm-1.
 repeat = 6
 [[case]]
 name = "dlmode-commits"
+absent = { main = "OWL 2 DL reasoning mode" }
 area = "maintenance"
 what = "4,000 commits under owl2-dl: the RL closure maintained and each commit's consistency checked under OWL 2 DL (the gate inline)"
 semantics = "owl2-dl"
@@ -2648,6 +2701,7 @@ guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper
 
 [[case]]
 name = "dlmode-commits-readers"
+absent = { main = "OWL 2 DL reasoning mode" }
 area = "maintenance"
 what = "4,000 owl2-dl commits over a schema outside OWL 2 RL (a union on the right), 8 readers alongside, each read taking the bounds' view of the latest revision: U1's change and install against its reads; the last commit, inconsistent only under OWL 2 DL, is rejected"
 semantics = "owl2-dl"
@@ -2668,6 +2722,7 @@ guards = ["U1's locks are leaves: no read waits for a commit's change of U1, no 
 
 [[case]]
 name = "dlmode-commits-small"
+absent = { main = "OWL 2 DL reasoning mode" }
 area = "maintenance"
 what = "400 commits under owl2-dl on a tenth of dlmode-commits' data: a commit's fixed cost of the DL check (PR #30's and #37's timing)"
 semantics = "owl2-dl"
@@ -2682,6 +2737,7 @@ systems = []
 
 [[case]]
 name = "dlmode-reject"
+absent = { main = "OWL 2 DL reasoning mode" }
 area = "maintenance"
 what = "under owl2-dl, 200 commits and then one that makes a student a professor where the two are disjoint: the OWL 2 RL gate rejects it (cax-dw)"
 semantics = "owl2-dl"
@@ -2697,6 +2753,7 @@ systems = []
 
 [[case]]
 name = "classify-store-horn"
+absent = { main = "Horn or tableau store classification" }
 area = "dl"
 what = "the store's /classification of 3,000 Horn classes in a fresh process each time (the store keeps a classification per revision): the context core must take it"
 semantics = "dl"
@@ -2712,6 +2769,7 @@ repeat = 5
 pinned = "subsumptions: NRESE 6 Oct 2026, after the declared Horn generator"
 [[case]]
 name = "classify-store-tableau"
+absent = { main = "Horn or tableau store classification" }
 area = "dl"
 what = "the store's /classification of qualified number restrictions with a union (beyond the Horn stage), in a fresh process each time: the hypertableau driver must take it"
 semantics = "dl"
@@ -2726,6 +2784,7 @@ systems = ["hermit:dl", "konclude:dl"]
 repeat = 5
 [[case]]
 name = "dlmode-reject-dl"
+absent = { main = "OWL 2 DL reasoning mode" }
 area = "maintenance"
 what = "under owl2-dl, 200 commits and then one that adds a visitor, who must be faculty or a professor and is disjoint from both: inconsistent only under OWL 2 DL, so only the DL gate can reject it"
 semantics = "owl2-dl"
