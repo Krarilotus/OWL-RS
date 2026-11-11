@@ -366,8 +366,8 @@ pub struct ResultCacheStats {
     pub shared: u64,
     /// Parts admitted.
     pub stored: u64,
-    /// Parts not admitted: too cheap to recompute, too large, or worth less than what
-    /// they would evict.
+    /// Parts computed but not admitted: too cheap to recompute, too large, worth less than
+    /// what they would evict, or with a column their key doesn't name.
     pub rejected: u64,
     pub evicted: u64,
     pub entries: usize,
@@ -523,8 +523,8 @@ impl Computing<'_> {
     }
 
     /// Hands `part` (if it was computed and wanted) to the waiters and offers it to the
-    /// cache. An error if the part is pinned but doesn't fit in the budget beside the
-    /// other pinned ones.
+    /// cache; a part not handed over counts as refused. An error if the part is pinned but
+    /// doesn't fit in the budget beside the other pinned ones.
     pub(crate) fn finish(mut self, part: Option<Part>, cost: Duration) -> Result<(), String> {
         self.finished = true;
         let key = self.key();
@@ -533,7 +533,10 @@ impl Computing<'_> {
             Some(part) => self
                 .cache
                 .store(&key, Payload::Part(Arc::clone(part)), cost),
-            None => Ok(()),
+            None => {
+                self.cache.rejected.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
         };
         self.cache.land(&key, &self.flight, part);
         stored
@@ -1197,6 +1200,30 @@ mod tests {
         compute(&cache, &key(&one, "e"), 100, Duration::from_millis(500));
         assert!(cache.stats().evicted > 0);
         assert!(compute(&cache, &key(&one, "e"), 100, SLOW));
+    }
+
+    /// - Input: a part computed on a miss in 1 µs, under [`MIN_COST`]: the computing query
+    ///   isn't wanted to make it ([`Computing::wants`]) and finishes without it.
+    /// - Expected: counted as refused, as `store` counts a cheap part it is given: a part
+    ///   computed on a miss is either admitted or counted in `rejected`.
+    #[test]
+    fn a_part_too_cheap_to_be_wanted_is_counted_as_refused() {
+        let one = published(1);
+        let cache = ResultCache::new(1 << 20);
+        let at = key(&one, "cheap");
+        let cost = Duration::from_micros(1);
+        let before = cache.stats();
+        let Claim::Compute(computing) = claim(&cache, &at, None) else {
+            panic!("no other query runs");
+        };
+        assert!(!computing.wants(part(10).table.memory_bytes(), cost));
+        computing.finish(None, cost).unwrap();
+        let after = cache.stats();
+        assert_eq!(
+            (after.misses, after.stored, after.rejected),
+            (before.misses + 1, before.stored, before.rejected + 1),
+            "{after:?}"
+        );
     }
 
     #[test]

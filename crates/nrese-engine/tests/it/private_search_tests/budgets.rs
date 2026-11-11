@@ -93,7 +93,7 @@ fn a_private_search_without_room_is_refused() {
         private.try_insert(quad.as_ref()).unwrap();
     }
     for quad in removed() {
-        private.remove(quad.as_ref());
+        private.remove(quad.as_ref()).unwrap();
     }
     let pending = private.pending_snapshot().unwrap();
     let truth = oracle().snapshot();

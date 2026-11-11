@@ -487,7 +487,7 @@ fn dedup<T: PartialEq + Copy, B: Deref<Target = Budget>>(items: &mut ChargedVec<
 /// The bytes a hash map holds at `capacity` (hashbrown's table, which `std`'s map is): a
 /// power of two of buckets, at most 7/8 full from eight on, each an entry and a control
 /// byte, a group of control bytes more, and at most a group's alignment between them.
-fn map_bytes<K, V>(capacity: usize) -> usize {
+pub(super) fn map_bytes<K, V>(capacity: usize) -> usize {
     let buckets = match capacity {
         0 => return 0,
         1..4 => 4,

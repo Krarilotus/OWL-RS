@@ -296,17 +296,23 @@ impl crate::StoreService {
         let ids = super::query::Ids::of(&snapshot);
         let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids)
             .map_err(undecided)?;
-        let tx = self.engine().speculative();
+        // The tests' own names, in a private vocabulary charged to the request's envelope
+        // (dictionary lifecycle V1): ids past the snapshot's, which no premise term has. A
+        // refusal is the request's memory limit.
+        let tx = super::source::private_over(
+            self.engine(),
+            &snapshot,
+            std::sync::Arc::new(memory.part()),
+        );
         let replica = self.dl().replica();
         let fresh: Vec<u64> = (0..super::source::FRESH)
             .map(|i| {
-                super::source::resolve(
-                    replica,
-                    &tx,
-                    NamedNodeRef::new_unchecked(&super::source::fresh_iri(i)).into(),
-                )
-                .map(TermId::raw)
+                let iri = super::source::fresh_iri(i);
+                let term = NamedNodeRef::new_unchecked(&iri).into();
+                super::source::resolve(replica, &tx, term).map(|id| id.map(TermId::raw))
             })
+            .collect::<crate::StoreResult<Vec<_>>>()?
+            .into_iter()
             .collect::<Option<_>>()
             .ok_or_else(|| {
                 undecided("the replica hasn't received the entailment tests' terms yet".to_owned())

@@ -5,6 +5,9 @@
 //! them lets it go; what a pending version makes for itself is charged to its reader's budget
 //! before it is made. Measured (`nrese_exec::measure`), so this file is a test binary of its
 //! own.
+// On the old shared speculative transaction until V1b moves these guards to the private kind
+// and removes it (dictionary V1, the workspace `clippy.toml`).
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, Barrier};
 
@@ -56,7 +59,7 @@ fn unlimited() -> Arc<Budget> {
 /// The pending snapshot of a speculative transaction (no writer slot: many at once, as
 /// sessions' reads are) over `engine` adding `named(n)`, charged to `budget`.
 fn pending(engine: &Engine, n: usize, budget: &Arc<Budget>) -> Snapshot {
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     tx.insert(named(n).as_ref());
     tx.pending_snapshot_within(budget).unwrap()
 }
@@ -105,7 +108,7 @@ fn a_pending_version_is_charged_for_what_it_makes() {
     let engine = store(2_000);
     let other = pending(&engine, 0, &unlimited());
     let budget = unlimited();
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     tx.insert(named(1).as_ref());
     let (snapshot, excess) =
         measure::measure_within(&budget, || tx.pending_snapshot_within(&budget).unwrap());
@@ -177,7 +180,7 @@ fn pending_versions_converting_one_base_at_once_share_one_form() {
             .map(|i| {
                 let (engine, budget, start) = (&engine, &budget, &start);
                 scope.spawn(move || {
-                    let mut tx = engine.speculative();
+                    let mut tx = engine.speculative_shared();
                     tx.insert(named(i).as_ref());
                     start.wait();
                     tx.pending_snapshot_within(budget).unwrap()
@@ -208,7 +211,7 @@ fn pending_versions_converting_one_base_at_once_share_one_form() {
 fn an_unchanged_transaction_keeps_its_pending_snapshot_per_budget() {
     let engine = store(10);
     let (a, b) = (unlimited(), unlimited());
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     tx.insert(named(0).as_ref());
     let first = tx.pending_snapshot_within(&a).unwrap().asserted_identity();
     let again = tx.pending_snapshot_within(&a).unwrap().asserted_identity();
@@ -254,7 +257,7 @@ fn a_pending_version_is_charged_for_inferred_statements_asserted_again() {
     }
     let engine = store(1_000);
     let other = pending(&engine, 0, &unlimited());
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     for i in 0..1_000 {
         let quad = Quad::new(
             node(&format!("s{i}")),
@@ -282,7 +285,7 @@ fn a_pending_version_is_charged_for_inferred_statements_asserted_again() {
 fn a_kept_pending_snapshot_is_not_returned_after_an_intern() {
     let engine = store(10);
     let budget = unlimited();
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     tx.insert(named(0).as_ref());
     drop(tx.pending_snapshot_within(&budget).unwrap());
     let fresh = node("fresh");
@@ -303,7 +306,7 @@ fn a_kept_pending_snapshot_is_not_returned_after_an_intern() {
 #[test]
 fn a_stale_kept_pending_snapshot_is_let_go_before_its_replacement_is_charged() {
     let engine = store(10);
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     tx.insert(named(0).as_ref());
     let calibration = unlimited();
     drop(tx.pending_snapshot_within(&calibration).unwrap());
@@ -347,7 +350,7 @@ fn a_refused_pending_snapshot_releases_nothing_before_it_frees_it() {
     };
     let whole = {
         let budget = unlimited();
-        let mut tx = engine.speculative();
+        let mut tx = engine.speculative_shared();
         changes(&mut tx);
         let snapshot = tx.pending_snapshot_within(&budget).unwrap();
         let used = budget.used();
@@ -360,7 +363,7 @@ fn a_refused_pending_snapshot_releases_nothing_before_it_frees_it() {
     for limit in (0..).step_by(step) {
         assert!(refused < 10_000, "still refused at a budget of {limit}");
         let budget = Arc::new(Budget::new(limit));
-        let mut tx = engine.speculative();
+        let mut tx = engine.speculative_shared();
         changes(&mut tx);
         let (made, excess) =
             measure::measure_within(&budget, || tx.pending_snapshot_within(&budget));
@@ -409,7 +412,7 @@ fn a_pending_version_over_a_view_is_charged_for_what_it_makes() {
     let other = pending(&engine, 0, &unlimited());
     let base = engine.snapshot();
     let view = base.with_inferred_subset(nrese_engine::InferredSubset::Without(Vec::new()));
-    let mut tx = engine.speculative();
+    let mut tx = engine.speculative_shared();
     tx.insert(named(1).as_ref());
     for i in 0..50 {
         let quad = Quad::new(

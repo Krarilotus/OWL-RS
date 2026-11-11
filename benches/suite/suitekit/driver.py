@@ -48,6 +48,7 @@ from .summary import adjudications, summarise
 from .workloads import plans
 
 EXE = ".exe" if os.name == "nt" else ""
+ROOT = Path(__file__).resolve().parents[3]  # the checkout: the containers' namespace (ns.run_args)
 # Systems a default run leaves out: AnzoGraph needs registration beyond 8 GB and takes
 # minutes to start; name it to run it.
 EXPLICIT_ONLY = {"anzograph"}

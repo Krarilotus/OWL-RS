@@ -145,7 +145,7 @@ fn pending_states_of_both_kinds_grant_no_token() {
     drop(undone);
 
     assert!(
-        !token(&engine.speculative().pending_snapshot()),
+        !token(&engine.speculative(budget()).pending_snapshot().unwrap()),
         "speculative"
     );
 
@@ -320,14 +320,13 @@ fn a_pending_clone_never_gains_a_token() {
     drop(dropped);
     assert!(!token(&kept), "after its transaction dropped");
 
-    let mut refused = engine.speculative();
-    assert!(refused.insert(quad("h", "nine").as_ref()));
-    let kept = refused.pending_snapshot();
-    assert!(
-        refused.commit().is_err(),
-        "a speculative transaction never commits"
-    );
-    assert!(!token(&kept), "after a refused commit");
+    // A speculative transaction has no commit, by type (`PrivateTransaction`'s doc test):
+    // what it kept stays unpublished once it is gone.
+    let mut speculative = engine.speculative(budget());
+    assert!(speculative.try_insert(quad("h", "nine").as_ref()).unwrap());
+    let kept = speculative.pending_snapshot().unwrap();
+    drop(speculative);
+    assert!(!token(&kept), "after a speculative transaction dropped");
 }
 
 /// Review §5 item 8, 3.0's share: eligibility comes with the version acquired, across a reopen
