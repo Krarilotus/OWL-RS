@@ -1504,6 +1504,9 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - DL44: a reflexive `p2` and a named `a0`: `p2(a0, a0)` (Direct Semantics §2.3.2,
 ///   Table 6). RL's rules make no such loop (it is outside RL, Profiles §4.2.5); QL's do.
 /// - The same with `p2` of domain `D`: `a0 : D`, a consequence of the missing loop.
+/// - D16-492 (seed 700169): `≥ 1 R.(≤ 0 R.D) ⊑ ⊥` with `R(a, a)`: `a` has an anonymous
+///   `R`-successor in `D`. Review r1 F1: `≥ 2 R ⊑ ⊥` with `R(a, b)`, `R(a, c)`, `b : C`:
+///   `b = c`, so `c : C`; `¬{b} ⊑ ⊥` with `a : C`: `a = b`, so `b : C`.
 ///
 /// Answered false, or reported `unsound`: under DL44's schema, `NOT EXISTS` of the loop.
 ///
@@ -1635,6 +1638,37 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                 "{head}:p2 a owl:ReflexiveProperty ; rdfs:domain :D . :a0 a owl:NamedIndividual ."
             ),
             format!("ASK {{ <{E}a0> a <{E}D> }}"),
+        ),
+        // D16-492 (seed 700169, case 53): `≥ 1 R.(≤ 0 R.D) ⊑ ⊥` is `⊤ ⊑ ∀R.∃R.D`, so `a`,
+        // its own `R`-successor, has an `R`-successor in `D`.
+        (
+            format!(
+                "{head}[ a owl:Restriction ; owl:onProperty :R ;
+                     owl:minQualifiedCardinality \"1\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ a owl:Restriction ; owl:onProperty :R ;
+                         owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                         owl:onClass :D ] ] rdfs:subClassOf owl:Nothing .
+                 :a :R :a ."
+            ),
+            format!("ASK {{ <{E}a> <{E}R> ?y . ?y a <{E}D> }}"),
+        ),
+        // D16-492 review r1, F1: `≥ 2 R ⊑ ⊥` makes `R` functional, so `b = c`.
+        (
+            format!(
+                "{head}[ a owl:Restriction ; owl:onProperty :R ; owl:minCardinality 2 ]
+                     rdfs:subClassOf owl:Nothing .
+                 :a :R :b , :c . :b a :C ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}C> }}"),
+        ),
+        // D16-492 review r1, F1: `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`, so `a = b`.
+        (
+            format!(
+                "{head}[ owl:complementOf [ a owl:Class ; owl:oneOf ( :b ) ] ]
+                     rdfs:subClassOf owl:Nothing .
+                 :a a :C . :b a :B ."
+            ),
+            format!("ASK {{ <{E}b> a <{E}C> }}"),
         ),
     ];
     // Not entailed: a missed loop must not certify `true` (sound-only is no cover).
