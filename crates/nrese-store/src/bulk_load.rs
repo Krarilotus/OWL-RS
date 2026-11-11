@@ -365,10 +365,29 @@ fn feed(
     Ok(parsed + batch.len() as u64)
 }
 
+/// The lanes a file is parsed and interned on at least, pool permitting (D16-468). Each lane
+/// is a thread heap, and with transparent huge pages each heap keeps its partly used huge
+/// pages until the load ends: from 8 to 16 lanes the load's peak grew by 19 to 27 MiB a lane
+/// (16 threads, two hosts; loads of 113, 330 and 338 MB). Fewer lanes cost time instead: at
+/// 6 the 338 MB load (1.78 M triples) took 0.370 s against 0.345 on 16 lanes, and at 4 the
+/// 113 MB one (1.2 M quads) 0.300 against 0.240; at 8 the first was faster than on 16
+/// (0.320 s) and the second within 2 % (0.245 s), and the peaks of the measured loads were
+/// 28 to 45 % lower than on 16.
+const MIN_LANES: usize = 8;
+
+/// The input a lane takes past [`MIN_LANES`] before another is added. A lane's cost in peak
+/// is fixed (above); what it saves in time was mixed at about 40 MiB a lane: 16 lanes instead
+/// of 8 were 9 % faster on one 330 MB load and 8 % slower on a 338 MB one. 64 MiB is a step
+/// past that, so a lane is added only where it parses more than was measured; between 338 MB
+/// and 1.1 GB the rule is not measured, and from 1.1 GB up a 16-thread pool keeps its 16.
+const BYTES_PER_LANE: u64 = 64 << 20;
+
 /// The lanes a file of `bytes` is parsed and interned on, with `threads` in the pool: a
-/// chunk of the file and a thread each.
-fn lanes(_bytes: u64, threads: usize) -> usize {
-    threads
+/// chunk of the file and a thread each. [`MIN_LANES`] up to `MIN_LANES` × [`BYTES_PER_LANE`]
+/// (512 MiB), then a lane per `BYTES_PER_LANE`, never more than the pool's threads.
+fn lanes(bytes: u64, threads: usize) -> usize {
+    let by_size = usize::try_from(bytes.div_ceil(BYTES_PER_LANE)).unwrap_or(usize::MAX);
+    threads.min(by_size.max(MIN_LANES))
 }
 
 /// Makes blank-node labels unique to one load by prefixing them. Deterministic per label,
