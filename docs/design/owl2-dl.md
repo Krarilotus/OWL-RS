@@ -822,8 +822,8 @@ inputs, so every OWL 2 DL ontology up to a bound is checked, not a sample of the
   certificate where data values don't enter (§10).
 - **The independent decision:** HermiT on every case, Openllet where HermiT doesn't decide
   or differs from NRESE (`benches/reasoning/dl/scope.py`, the runner's `nrese.dl.Scope`).
-  No vote: where they differ from each other or both from NRESE, the case is settled by
-  the semantics, and NRESE's model certificate refutes a reference outright.
+  No vote: a case where the answers differ is settled by hand from the semantics, with a
+  minimised witness; a claim NRESE shows with a model carries that model as its certificate.
 - **Beyond the bound:** covering arrays (`scope::covering`): ontologies of 3 to 6 axioms of
   up to size 4, chosen greedily until every pair (349 cases) and every triple of the 67
   features (3,354 cases, all 47,905 triples) occurs; a tuple the batches leave gets many

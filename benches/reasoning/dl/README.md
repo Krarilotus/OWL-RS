@@ -86,10 +86,8 @@ on any JDK 21+ (`DL_RUNNER_JAR`, `DL_RUNNER_CLASSES`). Each case is answered wit
 | scope `3,3` (the gate's) | 35,505 | 35,454 | 3 | 48 | 0 |
 | covering array of triples (`cover:3`, 3 to 6 axioms of up to size 4; every one of the 47,905 triples of the 67 features) | 3,354 | 3,312 | 3 | 38 | 0; 1 NRESE gave up at the campaign's 20 s |
 
-**Every case in which NRESE differs from a reference, or the references differ, is settled
-by hand from the semantics with a minimised witness (Adjudication below); NRESE's answer
-agrees with the semantics in every one, and the gate's 51 are in `scope-adjudicated.tsv`,
-one line each.**
+**Every case with differing answers is settled by hand from the semantics with a minimised
+witness (Adjudication below); the gate's 51 are in `scope-adjudicated.tsv`, one line each.**
 
 **What the campaign found in NRESE** (each fixed with a guard, 12 October): operands of a
 disjointness the U rewriting made equal were dropped (cases 623, 677, 732, 786: answered
