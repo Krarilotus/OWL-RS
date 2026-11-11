@@ -20,8 +20,8 @@ The test profile is intended to validate:
 - OCI container with orchestrator or standalone runtime.
 
 ## 3. Runtime Topology
-- One `nrese-server` instance manages one active dataset storage directory.
-- Scale-out is read-heavy first, then sharded or partitioned by dataset at architecture level.
+- One `nrese-server` instance manages one data directory: the default repository, and the repositories created over the API, each under `repositories/<id>/` ([HTTP interface](http-api.md#rdf4j-protocol)).
+- Scale-out: read replicas follow a primary's log ([replication](replication.md)); nothing partitions the data across machines.
 - Place reverse proxy in front of NRESE for TLS termination and edge controls.
 
 ### 3.1 Operator UI Endpoint
@@ -85,7 +85,7 @@ External exposure note:
 
 ### 5.2 Reliability and Storage Variables
 
-There are no scheduled-backup or recovery-mode settings yet. Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. Backups are taken through the admin API (see [backup-restore-drills.md](backup-restore-drills.md)). Checkpoint and WAL settings arrive with roadmap WP E4 and will be documented in [config-reference.md](config-reference.md), the only place config knobs are listed.
+No setting schedules backups: they are taken through the admin API or offline with `nrese-server backup` (above, and [backup-restore-drills.md](backup-restore-drills.md)). Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. The checkpoint and log settings (`store.checkpoint_after_wal`, `store.wal_archive`, `store.wal_damage`, `store.verify_on_open`, `store.map_checkpoints`) are in [config-reference.md](config-reference.md), the only place settings are listed.
 
 ### 5.3 Ontology Preload
 
@@ -228,8 +228,10 @@ docker run -d --name nrese \
   -e NRESE_BIND_ADDR=0.0.0.0:8080 \
   -e NRESE_DATA_DIR=/var/lib/nrese/data \
   -e NRESE_AUTH_MODE=bearer-jwt \
-  ghcr.io/example/nrese-server:latest
+  nrese
 ```
+
+`nrese` is the image built from this repository (`docker build -t nrese .`, as in the [README](../../README.md#quick-start)).
 
 ### 7.3 Kubernetes Notes
 - Use readiness probe `/readyz` and liveness probe `/healthz`.
@@ -287,7 +289,7 @@ server {
 - Recovery procedure:
 1. Stop writer traffic.
 2. Restore latest consistent snapshot to staging path.
-3. Start server in `read-only` validation mode.
+3. Start the server on it with writes disabled (`server.deployment_posture = "read-only-demo"`).
 4. Run integrity checks and smoke queries.
 5. Promote restored dataset and switch traffic.
 
@@ -298,7 +300,7 @@ server {
 - TLS policy validated by security scanner.
 - AuthN/AuthZ tested for reader/writer/admin roles.
 - Metrics and logs collected centrally.
-- Ontology preload path and fallback behavior validated in pre-prod.
+- Ontology preload path validated in pre-prod (there is no fallback: [5.3](#53-ontology-preload)).
 - Alerts configured for:
 - High 5xx rate.
 - Update queue saturation.
