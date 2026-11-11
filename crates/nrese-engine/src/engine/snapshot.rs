@@ -1024,6 +1024,8 @@ impl Snapshot {
     /// The expanded matches of `pattern` in `model`, in the order of its access plan,
     /// merged as they are read: nothing is collected. Every layout keeps the permutation a
     /// pattern's access plan reads (`Layout::supports`, tested over every pattern shape).
+    /// Out of line: only reads under equality build one ([`Self::quads_for_pattern_in`]).
+    #[inline(never)]
     fn expanded<'a>(
         &'a self,
         classes: Arc<EqualityClasses>,
@@ -1463,24 +1465,48 @@ impl Snapshot {
     /// All quads matching `pattern` in `model`: asserted matches first, then inferred ones,
     /// each part in the order of its access permutation. O(r log n + k·r) for k results over
     /// r runs. The iterator borrows only the snapshot, not `pattern`.
+    ///
+    /// Kept small enough to inline where it is called: a caller probing once per binding (a
+    /// text search's object test, a path's step, SHACL's value reads) pays for a call and a
+    /// moved iterator otherwise (docs-prefix-w12 against main, 11 Nov). So the read with no
+    /// equality to apply (the asserted model, or no `owl:sameAs` closure and no canonical
+    /// view) takes the pattern as given from this snapshot's version, and the rest is out of
+    /// line ([`Self::equality_read`], [`Self::expanded`]).
+    #[inline]
     pub fn quads_for_pattern_in<'a>(
         &'a self,
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
-        let pattern = self.read_pattern(model, pattern);
-        let pattern = &*pattern;
-        if let Some(classes) = self.expanding(model, pattern) {
-            return Either::Left(self.expanded(classes, model, pattern));
+        let plain = model == ReadModel::Asserted
+            || (self.equality.is_none() && self.canonical_data.is_none());
+        let (classes, pattern, data) = if plain {
+            (None, *pattern, &self.version)
+        } else {
+            self.equality_read(model, pattern)
+        };
+        if let Some(classes) = classes {
+            return Either::Left(self.expanded(classes, model, &pattern));
         }
-        let pattern = *pattern;
-        let data = self.data(model);
         Either::Right(
             Stack::ALL
                 .into_iter()
                 .filter(move |&stack| model.includes(stack))
                 .flat_map(move |stack| data.stack(stack).scan(&pattern)),
         )
+    }
+
+    /// [`Self::quads_for_pattern_in`]'s setup where equality may apply: the classes the read
+    /// expands by, if any, the pattern as the read takes it ([`Self::read_pattern`]), and the
+    /// version it reads ([`Self::data`]).
+    #[inline(never)]
+    fn equality_read(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+    ) -> (Option<Arc<EqualityClasses>>, QuadPattern, &Arc<Version>) {
+        let pattern = *self.read_pattern(model, pattern);
+        (self.expanding(model, &pattern), pattern, self.data(model))
     }
 
     /// Number of quads matching `pattern`, asserted and inferred ([`Self::count_in`]).
