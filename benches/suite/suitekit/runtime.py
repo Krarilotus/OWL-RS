@@ -213,6 +213,19 @@ def cgroup_dir(listing: Path) -> Path | None:
     return None
 
 
+def cgroup_removed(group: Path) -> bool:
+    """Whether Linux removed a cgroup's directory (it does once the cgroup's processes are gone):
+    only a stat that says it doesn't exist. One that fails otherwise (no access, an I/O error)
+    settles nothing."""
+    try:
+        os.stat(group)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 class ContainerMemory:
     """The peak of a running container's anonymous plus kernel memory: its cgroup's memory.stat,
     read every ANON_KERNEL_S on this host. The cgroup is found from the container's first process
@@ -255,7 +268,7 @@ class ContainerMemory:
                         self.peak, self.why = None, f"no anon field in {stat}"
                         break
                 except OSError as error:
-                    if stat is not None and self.peak is not None and not stat.parent.exists():
+                    if stat is not None and self.peak is not None and cgroup_removed(stat.parent):
                         break  # the container ended: Linux removed its cgroup, its peak stands
                     # Anything else (no access, a stat gone from a cgroup that stands) leaves
                     # readings missing while the container may still run: no peak.
