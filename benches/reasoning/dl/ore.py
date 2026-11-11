@@ -232,6 +232,7 @@ def compare(args):
     print(f"{len(by_task)} tasks: " + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
     print("solved: " + ", ".join(f"{k} {v}" for k, v in sorted(solved.items())))
     if args.out:
+        pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter="\t", lineterminator="\n")
             w.writerow(["task", "reasoner", "status", "ms", "answer", "verdict"])

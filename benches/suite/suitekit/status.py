@@ -95,7 +95,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
     states: dict[str, int] = {}
     for w in workloads.values():
         states[w["state"]] = states.get(w["state"], 0) + 1
-    pairs_total = pairs_run = pairs_ok = 0
+    pairs_total = pairs_run = pairs_ok = pairs_local = 0
     nrese_tiers = nrese_ok = 0
     for name, w in workloads.items():
         for key, s in systems.items():
@@ -106,7 +106,8 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
                 e = evidence.get((name, tier, key))
                 if e and e[1]["outcome"] != "skipped":
                     pairs_run += 1
-                    pairs_ok += e[1]["outcome"] in ("ok", "restricted")
+                    pairs_ok += e[1]["outcome"] == "ok"
+                    pairs_local += e[1]["outcome"] == "restricted"
                 if key == "nrese":
                     nrese_tiers += 1
                     nrese_ok += bool(e and e[1]["outcome"] == "ok")
@@ -115,7 +116,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
             f"- **Systems:** {len(systems)} ({sum(s['publish'] == 'free' for s in systems.values())} free to publish, "
             f"{sum(s['publish'] != 'free' for s in systems.values())} only with the vendor's permission)",
             f"- **Pairs** (standard tier × system that can run it; build variants apart): {pairs_total}; run at least once: {pairs_run}; "
-            f"ok on their newest run: {pairs_ok}",
+            f"ok on their newest run: {pairs_ok}; run, outcome kept locally (`ran*`): {pairs_local}",
             f"- **NRESE:** {nrese_ok} of its {nrese_tiers} standard tiers ok on their newest run",
             f"- **Run records:** {len(records)}, newest {max((str(r.get('started', ''))[:10] for r in records), default='-')}",
             f"- **Before the reset:** {sum(map(pre_reset, records))} of the {len(records)} records, and "

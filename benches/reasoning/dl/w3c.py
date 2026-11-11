@@ -169,6 +169,7 @@ def compare(args):
     for item in unexpected:
         print("UNEXPECTED:", *item, sep="\t")
     if args.out:
+        pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter="\t", lineterminator="\n")
             w.writerow(["test", "status", "task", "expected", "reasoner", "result", "ms",
