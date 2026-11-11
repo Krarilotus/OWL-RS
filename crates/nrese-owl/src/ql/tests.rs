@@ -695,6 +695,31 @@ fn a_missed_conclusion_reaches_an_axiom_through_its_right_side() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// What anonymous individuals may miss reaches an axiom through every term it reads, its
+/// right side's too (D16-492 fix check r2, F1). With `A ⊑ ∃R.C` and `A ⊑ ∀R.B`, an `A`'s
+/// anonymous `R`-successor is a `B`. The rewriting types it `C` only, and under RL's
+/// closure the universal is RL, so only the successor's `R` reaches `B`. Under QL's the
+/// universal is outside the profile and reaches `B` itself. The same holds for `S`'s domain
+/// `∀R.B` with `A ⊑ ∃R.C`: an `A` with an `S` edge has an anonymous `R`-successor in `B`.
+/// A concern on `B` either way.
+#[test]
+fn an_anonymous_individual_reaches_an_axiom_through_its_right_side() {
+    let mut wrong = Vec::new();
+    for axioms in [
+        "SubClassOf(:A ObjectSomeValuesFrom(:R :C)) SubClassOf(:A ObjectAllValuesFrom(:R :B))",
+        "SubClassOf(:A ObjectSomeValuesFrom(:R :C)) \
+         ObjectPropertyDomain(:S ObjectAllValuesFrom(:R :B))",
+    ] {
+        for lists in [false, true] {
+            let found = concerns_over(axioms, "B(?x)", lists);
+            if !found.iter().any(|c| c.starts_with("B: ")) {
+                wrong.push(format!("{axioms} (lists {lists}): {found:?}, expected B"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A bounded restriction makes no successor itself, but it can force an existential on a
 /// successor that exists (fix check r2, F4). With `X = ∃S.D`, each conclusion below gives
 /// an `R`-successor of a `C` an `S`-successor in `D`, or may for some successor (OWL 2

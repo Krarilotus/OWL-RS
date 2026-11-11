@@ -1510,6 +1510,8 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - D16-492 fix check r1 F1: a reflexive `R` and `A ⊑ ∀R.B` with `a : A`: `R(a, a)`, so
 ///   `a : B` (RL misses the loop). `D ⊑ ¬¬B` and `A ⊑ ≤ 1 R.B` with `a : A`, `R(a, b)`,
 ///   `R(a, c)`, `b : D`, `c : D`, `b : E`: `b = c`, so `c : E`.
+/// - D16-492 fix check r2 F1: `A ⊑ ∃R.C` and `A ⊑ ∀R.B` with `a : A`: `a`'s anonymous
+///   `R`-successor is a `B`, so some individual is.
 ///
 /// Answered false, or reported `unsound`: under DL44's schema, `NOT EXISTS` of the loop.
 ///
@@ -1693,6 +1695,16 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                  :a a :A ; :R :b , :c . :b a :D , :E . :c a :D ."
             ),
             format!("ASK {{ <{E}c> a <{E}E> }}"),
+        ),
+        // D16-492 fix check r2, F1: `a`'s anonymous `R`-successor is a `B`.
+        (
+            format!(
+                "{head}:A rdfs:subClassOf
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :C ] ,
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom :B ] .
+                 :a a :A ."
+            ),
+            format!("ASK {{ ?x a <{E}B> }}"),
         ),
     ];
     // Not entailed: a missed loop must not certify `true` (sound-only is no cover).
