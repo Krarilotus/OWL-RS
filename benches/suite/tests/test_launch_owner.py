@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
-from suitekit import adapters, manifest, ns  # noqa: E402
+from suitekit import adapters, driver, manifest, ns  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from test_job_namespace import BASH  # noqa: E402  (Git's bash on Windows, not WSL's launcher)
 
@@ -81,6 +81,15 @@ class LaunchOwner(unittest.TestCase):
                 runtime.start(Spec("other", "sha256:fixture", ["true"], memory="2g"), None)
             self.assertNotIn("other", runtime.containers)
         self.assertEqual(len(docker.runs()), 1)
+
+    def test_the_build_toolchain_probe_is_the_jobs_with_its_memory(self):
+        # The controlled build reads the pinned Rust image's toolchain in a container of its own before every
+        # NRESE build (driver.toolchain_in).
+        docker = Docker()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, DECLARED), patch("subprocess.run", docker):
+            driver.toolchain_in("sha256:builder", Path(tmp))
+        self.assertEqual(len(docker.runs()), 1)
+        self.owned(docker.runs()[0])
 
     def test_the_declared_memory_is_not_held_to_the_steps_slice(self):
         # #132 B2: the fleet takes declared memory out of the slice (job.rs memory_cap): 28 GB declared, ~2.8 GB slice.
