@@ -32,7 +32,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - **What is validated** is a graph selection plus a read model:
   - graphs: the default graph, one named graph, or every graph except the shapes graph (the default for the commit gate);
   - read model: asserted and inferred statements (the default, so `sh:class` sees inferred types), or asserted only.
-- A shapes graph given with a request (validate-only) is put into a graph of a speculative transaction (`Engine::speculative`), never committed, so it shares the repository's dictionary like stored shapes. It takes no writer slot, so commits go on while it validates, and no quad of it is committed; the terms it interned stay in the dictionary, as an aborted transaction's do.
+- A shapes graph given with a request (validate-only) is put into a graph of a private transaction (`Engine::speculative`), never committed. Its terms are its own, charged to the request's memory, and none enters the dictionary; the repository's terms keep their ids in it, so stored data and shapes read as they are. It takes no writer slot, so commits go on while it validates, and nothing of it outlives the request.
 
 ## 4. Compilation
 

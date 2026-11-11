@@ -63,8 +63,8 @@ pub use results::{
     QuerySolution, QuerySolutionIter, QueryTripleIter,
 };
 pub use service::{ServiceCall, ServiceClient, ServiceResults, Services};
-pub use update::{ReadSource, UpdateError, UpdateOptions, apply_update, graph_label};
-pub use view::ReadView;
+pub use update::{ReadSource, UpdateError, UpdateOptions, UpdateTarget, apply_update, graph_label};
+pub use view::{PendingRead, ReadView};
 
 /// The unit tests' allocator: the system's, counting what a measured operation holds live
 /// ([`nrese_exec::measure`]), so that an allocation not charged to its budget fails a test.

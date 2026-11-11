@@ -107,20 +107,25 @@ pub(super) fn decide_until(
             start..tests.len()
         }));
     }
-    let tx = store.engine().speculative();
+    // The tests' own names, in a private vocabulary charged to the request (dictionary
+    // lifecycle V1): ids past the snapshot's, which no premise term has.
+    let tx = source::private_over(store.engine(), snapshot, Arc::new(memory.part()));
     let replica = store.dl().replica();
-    let fresh: Option<Vec<u64>> = (0..source::FRESH)
+    let fresh: Result<Option<Vec<u64>>, _> = (0..source::FRESH)
         .map(|i| {
-            source::resolve(
-                replica,
-                &tx,
-                NamedNodeRef::new_unchecked(&source::fresh_iri(i)).into(),
-            )
-            .map(TermId::raw)
+            let iri = source::fresh_iri(i);
+            let term = NamedNodeRef::new_unchecked(&iri).into();
+            source::resolve(replica, &tx, term).map(|id| id.map(TermId::raw))
         })
-        .collect();
-    let Some(fresh) = fresh else {
-        return unresolved("the entailment tests' terms haven't reached this replica yet");
+        .collect::<Result<Vec<_>, _>>()
+        .map(|ids| ids.into_iter().collect());
+    let fresh = match fresh {
+        Ok(Some(fresh)) => fresh,
+        Ok(None) => {
+            return unresolved("the entailment tests' terms haven't reached this replica yet");
+        }
+        // The request's memory refused the names: as any other refusal here.
+        Err(_) => return unresolved(nrese_dl::memory::EXHAUSTED),
     };
     if cancellation.is_cancelled() {
         return unresolved("cancelled");

@@ -78,7 +78,10 @@ fn a_note_is_called_with_the_published_revision_before_its_record() {
     }
     // Speculative: refused, not called.
     let speculative = noted();
-    let mut tx = engine.speculative();
+    // The shared kind until V1b: only a `Transaction` has a commit to refuse (a private
+    // transaction has none, by type).
+    #[allow(clippy::disallowed_methods)]
+    let mut tx = engine.speculative_shared();
     tx.insert(quad(3).as_ref());
     let n = Arc::clone(&speculative);
     tx.note_commit(Box::new(move |r| {

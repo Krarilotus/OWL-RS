@@ -5,6 +5,7 @@ each kind of mistake a group's author can make is caught.
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -14,6 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+import isolation  # noqa: E402
 from suitekit import cases  # noqa: E402
 
 SUITE = HERE.parent
@@ -31,6 +33,18 @@ class Repository(unittest.TestCase):
         self.assertGreater(len(found), 90)
         self.assertEqual(cases.problems(found, registry("systems.toml"), registry("workloads.toml"), frozen), [])
         self.assertEqual({c["group"] for c in found} >= {"core"}, True)
+
+    def test_the_catalogue_table_is_the_generators_output(self):
+        # CATALOG.md's case table is generated from the registry (fast.py table --write): a case
+        # added or changed without regenerating it leaves the one catalogue wrong. The repository's
+        # table: no caller's NRESE_FAMILY (cases.load would add that family's cases).
+        made = subprocess.run([sys.executable, "-B", str(SUITE.parent / "fast" / "fast.py"), "table"],
+                              capture_output=True, encoding="utf-8", check=True, timeout=120,
+                              env=isolation.environment(PYTHONIOENCODING="utf-8")).stdout
+        catalog = (SUITE.parent / "CATALOG.md").read_text(encoding="utf-8")
+        start, end = "<!-- fast-cases:start (fast.py table --write) -->", "<!-- fast-cases:end -->"
+        committed = catalog[catalog.index(start) + len(start):catalog.index(end)]
+        self.assertEqual(committed.strip(), made.strip(), "run: python benches/fast/fast.py table --write")
 
 
 class Mistakes(unittest.TestCase):

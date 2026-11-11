@@ -132,8 +132,8 @@ fn an_updates_read_source_stops_with_its_cancellation() {
         .read
         .expect("a reader by support reads its view");
     let before = store.support_statistics();
-    let tx = store.engine().speculative();
-    let state = nrese_sparql::ReadSource::state(&*read, &tx);
+    let tx = store.engine().transaction();
+    let state = nrese_sparql::ReadSource::state(&*read, &tx, &Arc::new(Budget::unlimited()));
     assert!(
         matches!(state, Err(nrese_sparql::QueryEvaluationError::Cancelled)),
         "{:?}",
@@ -290,7 +290,7 @@ fn a_pending_read_is_the_gathered_one() {
         )
         .1
         .unwrap();
-        let mut tx = store.engine().speculative();
+        let mut tx = store.engine().transaction();
         let view = reading.committed(tx.base()).unwrap();
         // Dictionary 3.0, sol-loop r1 S1: a view showing facts its published base doesn't
         // infer (asserted out of the reader's reach) is an addition and unpublished; one
@@ -333,7 +333,11 @@ fn a_pending_read_is_the_gathered_one() {
                 data.push(quad);
             }
             assert_eq!(
-                statements(&reading.pending(&tx).unwrap()),
+                statements(
+                    &reading
+                        .pending(&tx, &Arc::new(Budget::unlimited()))
+                        .unwrap()
+                ),
                 statements(&gathered(&reading, &tx)),
                 "seed {seed}, round {round}"
             );

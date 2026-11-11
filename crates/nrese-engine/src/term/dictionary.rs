@@ -708,6 +708,60 @@ impl Dictionary {
         self.lookup_in(&self.inner.read_recursive(), term, limit)
     }
 
+    /// [`Self::lookup_bounded`] of a key already made: `key` as [`encode_key`] (or, for a
+    /// triple term, [`triple_key`]) makes it, its [`key_hash`], and the kind of term it is.
+    /// For a caller that probes the same key elsewhere too (a private vocabulary's own
+    /// entries), so it is encoded and hashed once. The lookup's own body.
+    pub(crate) fn lookup_key_bounded(
+        &self,
+        key: &[u8],
+        hash: u64,
+        kind: TermKind,
+        limit: u64,
+    ) -> Option<TermId> {
+        // Recursive: callers may hold a read lock already (`with_views`).
+        Self::find_key(&self.inner.read_recursive(), key, hash, kind, limit)
+    }
+
+    /// [`Self::lookup_key_bounded`], what its probe allocates charged first through `charge`:
+    /// nothing where the base's keys are plain (the key is probed as it is), and where they are
+    /// compressed, [`key_lookup_bytes`]'s bound for a key of its length (the compressor's
+    /// output and the stored key it is copied into). The bound and the probe read one state of
+    /// the dictionary, under one read guard: a checkpoint can't publish a compressed base
+    /// between them (sol-loop e1 S1: a compressed base's bound charged on a plain one refused
+    /// interns the parent made).
+    pub(crate) fn lookup_key_charged<E>(
+        &self,
+        key: &[u8],
+        hash: u64,
+        kind: TermKind,
+        limit: u64,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        // Recursive: callers may hold a read lock already (`with_views`).
+        let inner = self.inner.read_recursive();
+        let compressed = inner.base.as_ref().is_some_and(|base| base.codec.is_some());
+        charge(match compressed {
+            true => key_lookup_bytes(key.len(), true),
+            false => 0,
+        })?;
+        Ok(Self::find_key(&inner, key, hash, kind, limit))
+    }
+
+    /// `key`'s entry in `inner`, if it is below `limit`, as a `kind` id.
+    fn find_key(
+        inner: &Inner,
+        key: &[u8],
+        hash: u64,
+        kind: TermKind,
+        limit: u64,
+    ) -> Option<TermId> {
+        inner
+            .find(hash, key)
+            .filter(|&index| index < limit)
+            .map(|index| TermId::new(kind, index))
+    }
+
     /// [`Self::lookup_bounded`] in `inner`, a state of the dictionary read under a guard the
     /// caller holds.
     fn lookup_in(&self, inner: &Inner, term: TermRef<'_>, limit: u64) -> Option<TermId> {
@@ -722,18 +776,11 @@ impl Dictionary {
             ];
             let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
             triple_key(ids, &mut key);
-            return inner
-                .find(key_hash(&key), &key)
-                .filter(|&index| index < limit)
-                .map(|index| TermId::new(TermKind::Triple, index));
+            return Self::find_key(inner, &key, key_hash(&key), TermKind::Triple, limit);
         }
         let mut key = Vec::with_capacity(64);
         let kind = encode_key(term, &mut key);
-        let hash = key_hash(&key);
-        inner
-            .find(hash, &key)
-            .filter(|&index| index < limit)
-            .map(|index| TermId::new(kind, index))
+        Self::find_key(inner, &key, key_hash(&key), kind, limit)
     }
 
     /// Returns the id of `term`, adding it to the dictionary if needed. O(len(term)) amortised.
@@ -783,12 +830,7 @@ impl Dictionary {
     pub fn triple_term_bounded(&self, components: [TermId; 3], limit: u64) -> Option<TermId> {
         let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
         triple_key(components, &mut key);
-        // Recursive: callers may hold a read lock already (`with_views`).
-        self.inner
-            .read_recursive()
-            .find(key_hash(&key), &key)
-            .filter(|&index| index < limit)
-            .map(|index| TermId::new(TermKind::Triple, index))
+        self.lookup_key_bounded(&key, key_hash(&key), TermKind::Triple, limit)
     }
 
     /// The subject, predicate and object ids of the triple term `id`, read from its key:

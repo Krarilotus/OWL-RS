@@ -241,7 +241,8 @@ pub(crate) struct View {
     /// Why U1 can't bound the answers (not built, gave up, or axioms it doesn't cover).
     pub unavailable: Option<String>,
     /// Classes U1 has memberships in beyond L, and the other predicates it has facts on
-    /// beyond L (Skolem constants included): the gap's signature.
+    /// beyond L (Skolem constants included): the gap's signature, by member of U1's
+    /// `owl:sameAs` classes, as a query names them ([`parts`]).
     pub gap_classes: HashSet<u64>,
     pub gap_predicates: HashSet<u64>,
     /// Those of them with a fact beyond L that names no Skolem constant (a membership of
@@ -460,6 +461,48 @@ pub(crate) fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
         "http://www.w3.org/2002/07/owl#sameAs" => false,
         _ => reserved(p),
     }
+}
+
+/// A gap signature by representative as one by member: every member of each
+/// representative's class, U1's own terms (never a query's) left out.
+fn by_member(
+    representatives: HashSet<u64>,
+    classes: &nrese_reasoner::representatives::EqualityClasses,
+    internal: impl Fn(u64) -> bool,
+) -> HashSet<u64> {
+    representatives
+        .into_iter()
+        .flat_map(|r| {
+            let class = classes.class_of(r);
+            class
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .chain(class.is_none().then_some(r))
+        })
+        .filter(|&t| !internal(t))
+        .collect()
+}
+
+/// Whether L (`lower`, sorted) holds `fact`, one of U1's facts over representatives, for
+/// every identity it stands for: the expanded reads give it each member of `classes`'
+/// classes. Only then is it certain and no gap; L holding it for the representative alone
+/// leaves the other members' facts to U1. Stops at the first member L lacks; a fact L holds
+/// whole costs one search per expanded fact, each of them in L.
+fn held_by_lower(
+    lower: &[Triple],
+    classes: &nrese_reasoner::representatives::EqualityClasses,
+    [s, p, o]: Triple,
+) -> bool {
+    let (ms, mp, mo) = (
+        classes.class_of(s).unwrap_or(std::slice::from_ref(&s)),
+        classes.class_of(p).unwrap_or(std::slice::from_ref(&p)),
+        classes.class_of(o).unwrap_or(std::slice::from_ref(&o)),
+    );
+    ms.iter().all(|&s| {
+        mp.iter()
+            .all(|&p| mo.iter().all(|&o| lower.binary_search(&[s, p, o]).is_ok()))
+    })
 }
 
 fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
@@ -722,11 +765,16 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, `true`, the RL route's place).
 fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, bool) {
-    let tx = store.engine().speculative();
     let replica = store.dl().replica();
-    if !replica {
-        source::intern_vocabulary(&tx);
+    // U1's names are system vocabulary: the bounds keep them for every later read, so they
+    // take shared ids (dictionary lifecycle V1), never a request's private ones.
+    if !replica && source::intern_system_vocabulary(store.engine()).is_err() {
+        return (
+            Err(GaveUp::refused(source::refused("the vocabulary"))),
+            false,
+        );
     }
+    let latest = store.engine().snapshot();
     let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), false),
@@ -747,7 +795,8 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
                 true
             })
     };
-    let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
+    let engine = store.engine();
+    let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve_system(replica, engine, &latest, t);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Build);
     let kept = store.dl().bounds.kept();
@@ -934,8 +983,24 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
 }
 
 /// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once):
-/// serial, O(U1's facts), nothing waited for (U1-I). Its copies are charged to `kept` as they
-/// grow (SYN-61); `None` where it can't take them.
+/// serial, nothing waited for (U1-I): one pass over U1's facts, each with the searches of
+/// [`held_by_lower`], then one over the members of the gap signature's classes. Its copies
+/// are charged to `kept` as they grow (SYN-61); `None` where it can't take them.
+///
+/// Each structure's form in subject, predicate and class object:
+/// - `lower`, L's memberships beyond the RL closure: as derived, by member.
+/// - U1's stack: by representative in all three, each other member stored as
+///   `member owl:sameAs representative`. The upper view reads it expanded to every member
+///   and looks a query's constants up by their representative (`with_equality`).
+/// - The gap, U1's facts L doesn't hold for every member they stand for
+///   ([`held_by_lower`]): by representative, as the stack.
+/// - `gap_classes`, `gap_predicates` and their named halves: **by member**. The query
+///   analysis looks them up with the query's own class and property (`analysis::closed`,
+///   `closed_for_answers`), which may be any member, a class or property IRI an
+///   individual too (punning). So each representative is closed over its class's members
+///   here, once, U1's own terms left out ([`by_member`]).
+/// - `named`: a representative is named where one of its members is.
+/// - `internal`: by representative, as the stack; nothing looks it up.
 fn parts(
     snapshot: &Snapshot,
     revision: u64,
@@ -1054,7 +1119,7 @@ fn parts(
     let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
     for [s, p, o] in upper.stack.iter() {
         // L's memberships from the taxonomy are certain: no gap.
-        if lower.binary_search(&[s, p, o]).is_ok() {
+        if held_by_lower(lower, classes, [s, p, o]) {
             continue;
         }
         for t in [s, p, o] {
@@ -1065,20 +1130,27 @@ fn parts(
         if p == clash {
             continue;
         }
+        // By representative here; by member once every fact is seen ([`by_member`]).
         if p == rdf_type {
-            if !upper.is_internal(o) {
-                view.gap_classes.insert(o);
-                if named(s) {
-                    view.named_gap_classes.insert(o);
-                }
+            view.gap_classes.insert(o);
+            if named(s) {
+                view.named_gap_classes.insert(o);
             }
-        } else if !upper.is_internal(p) {
+        } else {
             view.gap_predicates.insert(p);
             if named(s) && named(o) {
                 view.named_gap_predicates.insert(p);
             }
         }
         triples.push(encode([s, p, o])).ok()?;
+    }
+    for signature in [
+        &mut view.gap_classes,
+        &mut view.gap_predicates,
+        &mut view.named_gap_classes,
+        &mut view.named_gap_predicates,
+    ] {
+        *signature = by_member(std::mem::take(signature), classes, |t| upper.is_internal(t));
     }
     let same_as = (!classes.is_empty()).then(|| upper.same_as());
     Some(Parts {
@@ -1145,17 +1217,15 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
 /// available. For the differential tests of the maintenance.
 pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[String; 3]>> {
     let snapshot = store.engine().snapshot();
-    let decode = |t: u64| {
-        snapshot
-            .decode(TermId::from_raw(t))
-            .map_or_else(|| format!("#{t}"), |term| term.to_string())
-    };
     let facts: Vec<Triple> = if afresh {
-        let tx = store.engine().speculative();
+        // Shared ids, as `afresh`'s (dictionary lifecycle V1): the decoder below, taken
+        // after the build, reads them.
         let replica = store.dl().replica();
         if !replica {
-            source::intern_vocabulary(&tx);
+            source::intern_system_vocabulary(store.engine()).ok()?;
         }
+        let engine = store.engine();
+        let latest = engine.snapshot();
         let ontology =
             source::read_snapshot(&snapshot, Arc::clone(store.dl().bounds.kept())).ok()?;
         let normalised = nrese_owl::normalise(&ontology);
@@ -1166,7 +1236,7 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
             &ontology,
             &normalised,
             &snapshot,
-            &|t| source::resolve(replica, &tx, t),
+            &|t| source::resolve_system(replica, engine, &latest, t),
             &stop,
             store.dl().bounds.kept(),
         )
@@ -1176,6 +1246,12 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         let _ = view(store);
         let state = lock(&store.dl().bounds.state);
         state.as_ref()?.upper.as_ref().ok()?.stack.iter().collect()
+    };
+    let decoder = store.engine().snapshot();
+    let decode = |t: u64| {
+        decoder
+            .decode(TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
     let mut out: Vec<[String; 3]> = facts.into_iter().map(|t| t.map(decode)).collect();
     out.sort();
