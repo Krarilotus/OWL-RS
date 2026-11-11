@@ -416,14 +416,19 @@ def record_check(catalog: list[dict], record: dict, floor: int = 1, off_route_ok
     """One run's record of a case (a smoke's: `fast.py run --reps 1`) checked as a round checks
     each of its records, from the catalogue: its state (an answer or route that failed, rg.state()),
     every content check its case declares (`check`), and every time series the release family
-    declares for it (rg.family_of()) with at least `floor` samples. Empty: it would count."""
+    declares for it (rg.family_of()) with at least `floor` samples. A run that ends at its case's
+    declared outcome (`outcome`) counts as the release gate counts it, a known issue: checked, not
+    timed, nothing more to prove. Empty: it would count."""
     name = record.get("case")
     case = next((c for c in catalog if c["name"] == name), None)
     if case is None:
         return [f"{name}: no such case in the catalogue"]
     e = rg.evidence([{"n": 1, "report": {"records": [record]}}], name)
     problems = []
-    if rg.state(e, off_route_ok=off_route_ok) != "ok" or e["unchecked"]:
+    state = rg.state(e, off_route_ok=off_route_ok)
+    if state == "known" and not e["unchecked"]:
+        return []
+    if state != "ok" or e["unchecked"]:
         why = e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
         problems.append(f"{name}: {', '.join(map(str, sorted(set(map(str, e['status'])))))}"
                         + (f" ({'; '.join(map(str, why))})" if why else "")
@@ -804,8 +809,8 @@ def main() -> int:
         catalog = cases_registry.load()
         records = json.loads(args.results.read_text(encoding="utf-8"))["records"]
         problems = [p for r in records for p in record_check(catalog, r, args.floor, args.off_route_ok)]
-        print("\n".join(problems) or f"{len(records)} records: every check passed, every declared series "
-                                    f"at {args.floor} samples or more")
+        print("\n".join(problems) or (f"{len(records)} records: every check passed, every declared series "
+                                     f"at {args.floor} samples or more" if records else "no records in the report"))
         return 1 if problems or not records else 0
     try:
         family = load_family(args.family, ROOT, harness=declared_harness(args))
