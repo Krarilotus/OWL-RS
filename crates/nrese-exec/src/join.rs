@@ -431,27 +431,14 @@ fn merge_rows(
     rk: &[usize],
     limit: &Limit,
 ) -> Result<IdTable, JoinStop> {
-    let (left_ids, right_ids) = (RowIds::of(left)?, RowIds::of(right)?);
-    let (mut lefts, mut rights): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut pending = 0;
-    let (mut l, end) = (rows.start, rows.end);
-    // The pairs of the runs `l..l_end` and `r..r_end` (one key value). Each left row's
-    // pairs are charged before they are made, so a join over its limit (or cancelled)
-    // stops within a step instead of after expanding the whole group (the review of
-    // 3 October 2026, P1).
-    let mut pair = |l: usize, l_end: usize, r: usize, r_end: usize| -> Result<(), TooManyRows> {
-        for li in l..l_end {
-            pending += r_end - r;
-            if pending >= LIMIT_STEP {
-                limit.grow(std::mem::take(&mut pending))?;
-            }
-            for ri in r..r_end {
-                lefts.push(left_ids.id(li));
-                rights.push(right_ids.id(ri));
-            }
-        }
-        Ok(())
+    let mut made = Pairs {
+        ids: (RowIds::of(left)?, RowIds::of(right)?),
+        lefts: Vec::new(),
+        rights: Vec::new(),
+        pending: 0,
+        limit,
     };
+    let (mut l, end) = (rows.start, rows.end);
     if let ([lk], [rk]) = (lk, rk) {
         let (a, b) = (left.column(*lk), right.column(*rk));
         while l < end && r < b.len() {
@@ -461,7 +448,7 @@ fn merge_rows(
                 Ordering::Equal => {
                     let l_end = (l + 1..end).find(|&x| a[x] != a[l]).unwrap_or(end);
                     let r_end = (r + 1..b.len()).find(|&x| b[x] != b[r]).unwrap_or(b.len());
-                    pair(l, l_end, r, r_end)?;
+                    made.add(l..l_end, r..r_end)?;
                     l = l_end;
                     r = r_end;
                 }
@@ -479,13 +466,19 @@ fn merge_rows(
                     let r_end = (r + 1..right.len())
                         .find(|&x| !same_key(right, r, x, rk))
                         .unwrap_or(right.len());
-                    pair(l, l_end, r, r_end)?;
+                    made.add(l..l_end, r..r_end)?;
                     l = l_end;
                     r = r_end;
                 }
             }
         }
     }
+    let Pairs {
+        lefts,
+        rights,
+        pending,
+        ..
+    } = made;
     limit.grow(pending)?;
     let payload = right_payload(right.width(), rk);
     if left.width() + payload.len() == 0 {
@@ -502,6 +495,51 @@ fn merge_rows(
         .chain(payload.iter().map(|&c| gather(right.column(c), &rights)))
         .collect();
     Ok(IdTable::from_columns(columns))
+}
+
+/// The pairs of row numbers a [`merge_rows`] has made, and how many of them are not yet
+/// charged to its limit (fewer than a step).
+struct Pairs<'a> {
+    ids: (RowIds, RowIds),
+    lefts: Vec<u32>,
+    rights: Vec<u32>,
+    pending: usize,
+    limit: &'a Limit,
+}
+
+impl Pairs<'_> {
+    /// The pairs of the runs `left` and `right` (one key value). Each left row's pairs are
+    /// counted before they are made, and charged to the limit as soon as a step's worth is
+    /// pending, so a join over its limit (or cancelled) makes fewer than a step's pairs
+    /// beyond the charge that refuses it, instead of expanding the whole group (the review
+    /// of 3 October 2026, P1). A refused charge may count pairs that were never made.
+    ///
+    /// Always inlined: it runs once per key both sides hold, mostly for a pair or two, and
+    /// a call costs about as much as the pairs. Left to the inliner, the per-row charge
+    /// priced it at 345 against a threshold of 325, and a five-pattern star COUNT ran 14%
+    /// more instructions than with it inlined (11 November 2026).
+    #[inline(always)]
+    fn add(&mut self, left: Range<usize>, right: Range<usize>) -> Result<(), TooManyRows> {
+        for li in left {
+            self.pending += right.len();
+            if self.pending >= LIMIT_STEP {
+                self.limit.grow(std::mem::take(&mut self.pending))?;
+            }
+            self.push(li..li + 1, right.clone());
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn push(&mut self, left: Range<usize>, right: Range<usize>) {
+        let (left_ids, right_ids) = self.ids;
+        for li in left {
+            for ri in right.clone() {
+                self.lefts.push(left_ids.id(li));
+                self.rights.push(right_ids.id(ri));
+            }
+        }
+    }
 }
 
 /// Hash table from key to the chain of `build` rows with that key: `heads[key]` is the first
@@ -1490,6 +1528,78 @@ mod tests {
         // Stopped after 2 × POLL_UNITS of the 4 × 1.5 × POLL_UNITS rows to scan.
         assert_eq!(polls.load(AtomicOrdering::Relaxed), 3);
         assert!(out.out.is_empty());
+    }
+
+    /// A merge join charges its limit exactly its output rows, however its runs are charged:
+    /// a run of one pair, one of exactly a step's pairs, one of a pair more, and runs larger
+    /// than a step with one row on either side, between keys only one side holds; each
+    /// alone and all together after a run that leaves a partial step pending. Each answers
+    /// the hash join's rows, passes a limit of its row count and is refused one below it.
+    #[test]
+    fn a_merge_join_charges_exactly_its_rows_at_the_step_edges() {
+        let runs = [(1, 1), (32, 32), (41, 25), (1, 2000), (2000, 1), (3, 5)];
+        // Each run's key is even. Keys on one side only: an odd one after each run on the
+        // left, and one past every left key at the end on the right.
+        let table = |runs: &[(usize, usize)], left: bool| {
+            let mut column = Vec::new();
+            for (key, &(l, r)) in runs.iter().enumerate() {
+                let key = key as u64 * 2;
+                column.extend(std::iter::repeat_n(key, if left { l } else { r }));
+                if left {
+                    column.push(key + 1);
+                }
+            }
+            if !left {
+                column.push(u64::from(u32::MAX));
+            }
+            IdTable::from_columns(vec![column])
+        };
+        let together: Vec<_> = runs.to_vec();
+        let alone = runs.iter().map(|&run| vec![run]);
+        for runs in alone.chain([together]) {
+            let (left, right) = (table(&runs, true), table(&runs, false));
+            let pairs: usize = runs.iter().map(|&(l, r)| l * r).sum();
+            let limit = Limit::new(usize::MAX);
+            let merged = merge_join(&left, &right, &[0], &[0], &limit).unwrap();
+            assert_eq!(merged.len(), pairs, "{runs:?}");
+            assert_eq!(limit.rows.load(AtomicOrdering::Relaxed), pairs, "{runs:?}");
+            let hashed = join(&left, &right, &[0], &[0], usize::MAX).unwrap();
+            assert_eq!(sorted_rows(&merged), sorted_rows(&hashed), "{runs:?}");
+            assert!(merge_join(&left, &right, &[0], &[0], &Limit::new(pairs)).is_ok());
+            assert_eq!(
+                merge_join(&left, &right, &[0], &[0], &Limit::new(pairs - 1)).map(|t| t.len()),
+                Err(JoinStop::Rows(TooManyRows {
+                    max_rows: pairs - 1
+                })),
+                "{runs:?}"
+            );
+        }
+    }
+
+    /// A merge join's left row whose pairs make a step is charged before any of them is
+    /// made: refused, by a set stop flag or by a limit it would pass, it adds no pair, and
+    /// the rows before it keep theirs.
+    #[test]
+    fn a_refused_left_row_makes_none_of_its_pairs() {
+        let left = IdTable::from_columns(vec![vec![7; 3]]);
+        let right = IdTable::from_columns(vec![vec![7; LIMIT_STEP]]);
+        let ids = (RowIds::of(&left).unwrap(), RowIds::of(&right).unwrap());
+        let stopped = Limit::new(RowLimit {
+            max_rows: usize::MAX,
+            stop: Some(Arc::new(AtomicBool::new(true))),
+        });
+        let limited = Limit::new(2 * LIMIT_STEP);
+        for (limit, kept) in [(&stopped, 0), (&limited, 2 * LIMIT_STEP)] {
+            let mut made = Pairs {
+                ids,
+                lefts: Vec::new(),
+                rights: Vec::new(),
+                pending: 0,
+                limit,
+            };
+            assert!(made.add(0..3, 0..LIMIT_STEP).is_err());
+            assert_eq!((made.lefts.len(), made.rights.len()), (kept, kept));
+        }
     }
 
     #[test]
