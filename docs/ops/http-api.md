@@ -19,15 +19,17 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 
 Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
 header `NRESE-Completeness`: `complete; regime=owl2-ql`, or `sound-only; regime=owl2-ql; reasons="ql: …"` when answers
-through anonymous individuals may be missing (an axiom outside OWL 2 QL meets them, a
+may be missing (an axiom outside OWL 2 QL could add an answer the query reads, or a
 pattern reached a bound or runs without the rewriting; at most five reasons, the rest
 counted, non-ASCII characters escaped as `\u{…}`). Each reason starts with its source
 (`ql`); the same header carries the DL bounds' status (`lower=…; upper=…; unresolved=…`).
-`regime` says what `complete` refers to: `owl2-ql`, `owl2-rl` (every answer the closure's
-rules and the rewriting's existentials entail, not every certain answer under OWL 2 DL),
-`owl2-dl` (the certain answers under the Direct Semantics), `rdfs` or `custom`
+`regime` says what `complete` refers to: `owl2-ql`, `owl2-rl` or `owl2-dl` (every certain
+answer under the OWL 2 Direct Semantics; under `owl2-ql` and `owl2-rl` given only where the
+rewriting ran on the query), `rdfs` or `custom`
 ([semantics](../spec/reasoning-semantics.md)).
-The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
+The answers are never changed for it ([design](../design/ql-rewriting.md) §7). Where such a
+pattern sits under `MINUS` or a negated `EXISTS`, an answer it misses can make a row wrong,
+and the status is `unsound`, with the same reasons.
 
 A reader of some graphs with `inferred = "visible"` gets `NRESE-Completeness: not-certified`
 wherever the QL rewriting runs, inside a transaction too: the status would be read from the
@@ -43,7 +45,7 @@ token they don't know; the console's CLI exits 3 under `--require-complete`.
 | `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, `ql`, `completeness`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`), drawing on the query's memory envelope as its run does |
 | `dl-answers` | Under `reasoner.mode = "owl2-dl"`: which answers this query asks for, over `dl.answers`: `certain-where-complete`, `sound` or `exact` (fails with 422 when the answers can't be proven complete, below). Anything else is a 400 |
 
-**Under `owl2-dl`, every answer carries its status** in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are sound, except inside a transaction whose pending operations may delete statements (`unsound`, below). `complete; regime=owl2-dl`, or `sound-only; regime=owl2-dl; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction with nothing pending, answers are as outside it; with operations pending (not reasoned over before the commit) they are `sound-only`, or `unsound` where an operation may delete statements whose inferences remain. A read of the inferred statements alone (`FROM onto:implicit`, or it as `default-graph-uri`) reads the rules' closure without the bounds: `sound-only; regime=owl2-dl`, never `complete`.
+**Under `owl2-dl`, every answer carries its status** in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are sound, except inside a transaction whose pending operations may delete statements (below), and where `OPTIONAL`, `MINUS`, `NOT EXISTS` or another non-monotone operator reads predicates the bounds don't settle: rows may then be wrong as well as missing, and the status is `unsound`. `complete; regime=owl2-dl`, or `sound-only; regime=owl2-dl; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction with nothing pending, answers are as outside it; with operations pending (not reasoned over before the commit) they are `sound-only`, or `unsound` where an operation may delete statements whose inferences remain. A read of the inferred statements alone (`FROM onto:implicit`, or it as `default-graph-uri`) reads the rules' closure without the bounds: `sound-only; regime=owl2-dl`, never `complete`.
 
 Exact answers asked for (`dl-answers=exact`, or `dl.answers = "exact"`) that can't be proven complete answer **422** with a problem document: `type` `https://nrese.dev/problems/incomplete-answer`, `title`, `status`, `detail`, `regime`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `unresolved` (the first 20 candidates neither proved nor refuted, as `?x=<…> ?y=<…>`, `ASK` for a boolean query).
 

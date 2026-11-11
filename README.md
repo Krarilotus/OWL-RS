@@ -113,9 +113,9 @@ default, or only the asserted ones with `infer=false`. The contract for every mo
 | `disabled` (default) | Nothing | |
 | `rdfs` | Six RDFS rules: domain, range, sub-class and sub-property | No axiomatic triples; `rdfs-full` has every RDFS rule and the axioms |
 | `rdfs-plus`, `owl-horst` | RDFS with equality, inverse, symmetric, transitive and functional properties; `owl-horst` adds `hasValue`, `someValuesFrom`, `allValuesFrom` | Named subsets of the OWL 2 RL rules ([rules](docs/spec/reasoning-semantics.md#modes)) |
-| `owl2-ql` | The OWL 2 QL rules, plus answers through existential axioms by query rewriting ([design](docs/design/ql-rewriting.md)); a commit that violates a disjointness, irreflexivity or asymmetry axiom is rejected | Answers say `sound-only` where an axiom outside QL meets an implied individual, or a rewriting bound is reached |
-| `owl2-rl` | The W3C OWL 2 RL/RDF rules; a commit that violates a consistency rule is rejected, naming the rule and its premises | `owl:sameAs` reflexivity isn't stored; datatype rules in part ([omissions](docs/spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)) |
-| `owl2-dl` | `owl2-rl` as a lower bound, plus OWL 2 DL engines (a hypertableau and a consequence-based core): consistency checked on commit (`dl.consistency`, on by default; an undecided check lets the commit through and the status says so), classification, realisation, and certain answers where they can be proven ([design](docs/design/owl2-dl.md)) | Some answers are `sound-only`: a budget ran out, a candidate stayed undecided, or the query uses `OPTIONAL`, `MINUS`, aggregates and the like over uncertain predicates. A reader of only some graphs gets the lower bound |
+| `owl2-ql` | The OWL 2 QL rules, plus answers through existential axioms by query rewriting ([design](docs/design/ql-rewriting.md)); a commit that violates a disjointness, irreflexivity or asymmetry axiom is rejected | Answers say `sound-only` where an axiom outside QL could add an answer the query reads, where a pattern reaches a rewriting bound or runs without the rewriting (a variable predicate or class, a property path, a pattern inside an aggregate), and for queries the rewriting doesn't apply to, such as those with a dataset of their own |
+| `owl2-rl` | The W3C OWL 2 RL/RDF rules; a commit that violates a consistency rule is rejected, naming the rule and its premises | Answers are `sound-only`, since the rules are complete only for ontologies inside the profile, unless `reasoner.ql_rewriting = "on"`, which checks each query as under `owl2-ql`. `owl:sameAs` reflexivity isn't stored; datatype rules in part ([omissions](docs/spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)) |
+| `owl2-dl` | `owl2-rl` as a lower bound, plus OWL 2 DL engines (a hypertableau and a consequence-based core): consistency checked on commit (`dl.consistency`, on by default; an undecided check lets the commit through and the status says so), classification, realisation, and certain answers where they can be proven ([design](docs/design/owl2-dl.md)) | Some answers are `sound-only`, because a budget ran out or a candidate stayed undecided. A query that uses `OPTIONAL`, `MINUS`, `NOT EXISTS` and the like over predicates the bounds don't settle is `unsound`, as rows may be wrong as well as missing. A reader of only some graphs, or a query with a dataset of its own, gets the lower bound as `sound-only` |
 | `custom` | Your rules alone, in Notation3 or the `.pie` rule format; they can also be added to any mode above | No built-ins but `log:equalTo` and `log:notEqualTo`; no new blank nodes in conclusions ([user rules](docs/spec/reasoning-semantics.md#user-rules-notation3)) |
 
 Also:
@@ -145,9 +145,9 @@ downloads (Graph Store, RDF4J `/statements`) carry none.
 
 | Status | Means |
 |---|---|
-| `complete; regime=…` | Every answer the regime entails is there. Under `owl2-dl` that is every certain answer under the OWL 2 Direct Semantics; under `owl2-ql` and `owl2-rl`, every answer the rules and the QL rewriting entail. Without reasoning, or with `infer=false`, the header says `complete` with no regime |
-| `sound-only; regime=…; reasons="…"` | Every row is entailed, but rows may be missing; the reasons say why. Under a ruleset without the QL rewriting this is the usual status: the rules are complete only for ontologies inside their profile, which isn't checked per query |
-| `unsound` | A read inside a transaction whose pending changes delete statements: their inferences stay until the commit |
+| `complete; regime=…` | Every answer the regime entails is there. Under `owl2-dl`, `owl2-ql` and `owl2-rl` that is every certain answer under the OWL 2 Direct Semantics; under `owl2-ql` and `owl2-rl` it is given only where the QL rewriting ran on the query. Without reasoning, or with `infer=false`, the header says `complete` with no regime |
+| `sound-only; regime=…; reasons="…"` | Every row is entailed, but rows may be missing; the reasons say why. Without the QL rewriting, every answer over a ruleset's closure is `sound-only`, because the rules are complete only for ontologies inside their profile. Where the rewriting runs, each query is checked against the schema, and `complete` is withheld when an axiom outside the profile, or an individual the axioms imply, could add an answer the query reads |
+| `unsound` | Rows may be wrong as well as missing: inside a transaction whose pending changes delete statements (their inferences stay until the commit), or where answers that may be missing sit under `MINUS`, `NOT EXISTS` or another operator that can turn a missing row into a wrong one |
 | `not-certified` | No status can be given, so rows may be missing or wrong. This is the case for a reader of only some graphs, with inferred statements visible, where the QL rewriting runs |
 
 Under `owl2-dl` you can ask for exact answers only (`dl-answers=exact`): an answer that
@@ -202,7 +202,8 @@ Schema (`nrese-server config-schema`). The [Dockerfile](Dockerfile) builds image
 ## How it is built
 
 The workspace is split into crates by what they own. Dependencies point down only: a
-crate uses the crates below it, never one above. Each crate's `lib.rs` opens with what
+crate may use a crate in a lower layer, or one placed below it in its own layer, never
+one above. Each crate's `lib.rs` opens with what
 it owns; [ARCHITECTURE.md](docs/ARCHITECTURE.md) has the rules and says at which layer
 each kind of problem is fixed.
 
@@ -319,6 +320,8 @@ Copyright (C) 2026 Krarilotus. Licensed under either of the
 option. The v1 prototype published before October 2026 (`main` up to `8088e9a`) carried
 `Apache-2.0` in its package metadata; that statement stands for those commits.
 Third-party material keeps its own licence: the dependencies (MIT, Apache-2.0, BSD and
-similar), the vendored vocabularies under `benches/nrese-bench-harness/fixtures/catalog-cache/`,
+similar; the accepted licences are in [deny.toml](deny.toml)), the vendored vocabularies
+(sources and terms in [their README](benches/nrese-bench-harness/fixtures/catalog-cache/README.md)),
+the rule file under `benches/reasoning/nemo/sparq/` ([its licence](benches/reasoning/nemo/sparq/LICENSE)),
 and the W3C test suites, which are fetched and not part of this repository.
 Contributions come in under the same terms: [CONTRIBUTING.md](CONTRIBUTING.md).
