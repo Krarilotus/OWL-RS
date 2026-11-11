@@ -9,7 +9,7 @@ terms"). A win counts only where NRESE beats a system at what that system does b
 
 The rules are [PROTOCOL.md](../PROTOCOL.md)'s. The families, their order and the queue are the
 suite's ([suite/workloads.toml](../suite/workloads.toml), [suite/schedule.toml](../suite/schedule.toml),
-[suite/queue.py](../suite/queue.py)); results go through its one schema
+[suite/measurement_queue.py](../suite/measurement_queue.py)); results go through its one schema
 ([suitekit/schema.py](../suite/suitekit/schema.py)) to `suite.py report` and `compare`.
 
 ## The benchmarks, in the owner's order (12 October 2026)
@@ -44,7 +44,7 @@ the backlog.
    system on one host under one memory cap, then `suite.py report` and `compare` and a run
    record in [runs/](../runs/).
 
-> **Superseded (2 Nov 2026):** these job files were written for `suite/queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
+> **Superseded (2 Nov 2026):** these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
 
 Licensed systems (GraphDB, Stardog) run on our machines only; their rows carry
 `publish = permission` and their numbers are never committed ([competitors/README.md](../competitors/README.md)).

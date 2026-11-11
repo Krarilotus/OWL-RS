@@ -7,7 +7,7 @@
 # are timed. Virtuoso as the V3.1 report's virtuoso.ini sets it (ServerThreads 100,
 # ThreadsPerQuery 8, HTTP threads 30) with virtuoso.ini's buffers for 32 GB; NRESE with the same
 # 23 GB for queries as in the Sparqloscope job.
-# Fair share of the quiet slot (benches/suite/queue.py): one chunk per mix, repetition and
+# Fair share of the quiet slot (benches/suite/measurement_queue.py): one chunk per mix, repetition and
 # system (about 25 min), Virtuoso before NRESE in each; the three repetitions in two jobs
 # (phuoc-yu takes timed jobs of at most 240 min). Every chunk writes into one batch directory,
 # which `suite.py standings` and the run record pool (each chunk a repetition of its own).

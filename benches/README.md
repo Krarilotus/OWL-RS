@@ -246,7 +246,7 @@ each file checked against its pin (`sha256`, or `rdfc_sha256` for a file whose m
 blank nodes afresh) before it is kept, and asks for what its makers need (`docker`); only a file
 no maker here makes still needs the verified bench assets (`has = ["owlrs-bench-assets"]`). Answers come before time: compete captures
 every answer, a timed `suite.py run` must ask for them (`--answers full`).
-`suite/queue.py` and the kits' `jobs/*.toml` are the queue that came before the fleet; they
+`suite/measurement_queue.py` and the kits' `jobs/*.toml` are the queue that came before the fleet; they
 aren't used any more.
 
 ## A run, step by step
