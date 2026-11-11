@@ -36,6 +36,9 @@ mod loader;
 mod metadata;
 pub mod mutation;
 pub mod namespaces;
+mod process_settings;
+#[cfg(test)]
+mod process_settings_tests;
 pub mod quarantine;
 pub mod query;
 mod query_executor;
@@ -104,6 +107,7 @@ pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
     SearchScope,
 };
+pub use process_settings::{ProcessSettings, apply_process_settings, process_settings};
 pub use quarantine::{
     EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,
     QuarantinedStatement, Readmission, Repair, Resolution, readmit,
