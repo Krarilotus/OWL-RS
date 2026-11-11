@@ -8,7 +8,7 @@ The long form of the README's quick start: building from source, the console, th
 
 - Rust toolchain
 - Cargo
-- optional: Docker, if you want to run a local Fuseki comparison stack
+- optional: Docker, to build and run the image
 
 ### Build
 
@@ -119,7 +119,7 @@ Optional environment variables:
 - `NRESE_ONTOLOGY_PATH`
   Path to an ontology file to preload.
 - `NRESE_REASONING_MODE`
-  `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl` or `custom`
+  `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl` or `custom`
 - `NRESE_REASONING_RULES`
   A Notation3 file of user rules: added to the mode's ruleset, or the whole program with `custom`
 - `NRESE_DEPLOYMENT_POSTURE`
@@ -139,24 +139,9 @@ Optional environment variables:
 
 The canonical runtime configuration reference is [docs/ops/config-reference.md](../ops/config-reference.md). README only lists the common entry points.
 
-### Run Local Side-By-Side Parity Against A Local Fuseki Install
+### Compare Answers With A Reference Engine
 
-If you have Apache Fuseki unpacked one directory above the repository at `../Apache_Fuseki/apache-jena-fuseki-6.0.0`, you can run the local compare helper:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\fuseki\run-local-pack-matrix.ps1 `
-  -Ontology foaf `
-  -ExecutionMode full `
-  -ReportDir artifacts\local-fuseki-foaf
-```
-
-The helper:
-
-- starts `nrese-server` on an isolated local port
-- starts the external Fuseki install outside the git repo
-- applies `NRESE_SPARQL_PARSE_ERROR_PROFILE=fuseki-plain-text` for syntax-error parity
-- runs the harness `pack-matrix` command
-- writes logs and reports under the chosen artifact directory
+The bench harness's `pack-matrix` command runs workload packs on NRESE and on a reference engine and compares the answers, by hand ([benches/nrese-bench-harness/README.md](../../benches/nrese-bench-harness/README.md)).
 
 ### Run With Durable Storage
 
