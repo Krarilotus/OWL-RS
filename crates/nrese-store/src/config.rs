@@ -137,8 +137,8 @@ pub struct StoreConfig {
     /// with the log up to it, the rest copied aside (see `nrese_engine::WalDamage`).
     pub wal_damage: nrese_engine::WalDamage,
     /// How index blocks are encoded when built (`store.index_encoding`): `Fast`, or
-    /// `Compact` (palettes: a smaller store, scans up to a tenth slower). The process's:
-    /// the first store opened sets it ([`crate::process_settings`]); see
+    /// `Compact` (palettes: a smaller store, scans up to a tenth slower). The process's, set
+    /// once ([`crate::apply_process_settings`]); see
     /// `nrese_engine::IndexEncoding`.
     pub index_encoding: nrese_engine::IndexEncoding,
     /// How checkpoints store the dictionary's keys (`store.vocabulary`): `Plain`, or `Fsst`

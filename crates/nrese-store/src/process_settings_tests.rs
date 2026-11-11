@@ -102,6 +102,12 @@ fn a_draft_check_leaves_the_operators_settings() {
         compact,
         "the operator's compact index after a draft check"
     );
+    // The witness tells the encodings apart: under fast the same data builds a larger index.
+    nrese_engine::set_index_encoding(IndexEncoding::Fast);
+    assert!(
+        index_bytes_after_load(&store, &request) > compact,
+        "the data's index is larger under fast"
+    );
 }
 
 /// A store opened after the first with other values, as the server's system store opens
