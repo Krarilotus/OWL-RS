@@ -6755,9 +6755,12 @@ fn counts_under_a_key_filter_equal_the_reference() {
             let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
             let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
             assert_same_rows(&native, &expected, &text);
-            assert!(
+            // A text test takes the dictionary's route instead (the test after this one).
+            let text_test = filter.starts_with("STRSTARTS");
+            assert_eq!(
                 operators.iter().any(|o| o == "key count"),
-                "{text}: no key count among {operators:?}"
+                !text_test,
+                "{text}: key count among {operators:?}"
             );
         }
     }
@@ -6788,6 +6791,73 @@ fn counts_under_a_key_filter_equal_the_reference() {
         assert!(
             !operators.iter().any(|o| o == "key count"),
             "{text}: a key count among {operators:?}"
+        );
+    }
+}
+
+/// Spec: a count under a text test on its key (`CONTAINS`, `STRSTARTS`) takes the
+/// dictionary's route, as on any pattern large enough for the dictionary pass: the pass
+/// finds the few terms with the text, the scan reads their rows ("dictionary string
+/// test"), and no key's text is tested apart ("key count"). A language test alone, which
+/// most terms pass, keeps the key count, as does a text test the dictionary route can't
+/// take (on the subject). The answers are the reference's.
+#[test]
+fn text_tests_on_a_counted_key_go_to_the_dictionary() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut names: Vec<Literal> = (0..200)
+        .map(|i| {
+            Literal::new_language_tagged_literal_unchecked(format!("user {i} w{}", i % 50), "en")
+        })
+        .collect();
+    names.push(Literal::new_simple_literal("w42 untagged"));
+    names.push(Literal::new_simple_literal("user 7 untagged"));
+    for (i, name) in names.into_iter().enumerate() {
+        let quad = Quad::new(
+            ex(&format!("u{i}")),
+            ex("name"),
+            name,
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    for (filter, route, count) in [
+        ("CONTAINS(?name, \"w42\")", "dictionary string test", 5),
+        ("STRSTARTS(?name, \"user 7\")", "dictionary string test", 12),
+        ("LANG(?name) = \"en\"", "key count", 200),
+        // The subject: no dictionary route for it (`bgp` hints objects only).
+        (
+            "STRSTARTS(STR(?u), \"http://example.com/u1\")",
+            "key count",
+            111,
+        ),
+    ] {
+        let text =
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?u <{EX}name> ?name FILTER({filter}) }}");
+        let query = SparqlParser::new()
+            .parse_query(&text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        let operators: Vec<String> = explain_query(&snapshot, &query, &options)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|step| step.operator)
+            .collect();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_same_rows(&native, &expected, &text);
+        let n = Term::from(Literal::new_typed_literal(count.to_string(), xsd::INTEGER));
+        assert_eq!(native, [n.to_string()], "{text}");
+        let other = ["dictionary string test", "key count"]
+            .into_iter()
+            .find(|o| *o != route);
+        assert!(
+            operators.iter().any(|o| o == route)
+                && !operators.iter().any(|o| Some(o.as_str()) == other),
+            "{text}: {route} expected among {operators:?}"
         );
     }
 }
