@@ -13,7 +13,7 @@
 [[case]]
 name = "sparqloscope-dblp"
 area = "query"
-what = "Sparqloscope on DBLP's knowledge graph (dblp_KG_with_associated_data, release of 11 Oct 2026): 105 queries, one SPARQL feature each; QLever's published geometric mean 0.18 s is the bar"
+what = "Sparqloscope on DBLP's knowledge graph (dblp_KG_with_associated_data, release of 11 Oct 2026): 105 queries, one SPARQL feature each; QLever's published geometric mean 0.18 s is the bar once NRESE loads it (until then checked for its declared outcome, not timed or compared)"
 workload = "sparqloscope"
 tier = "sparqloscope-dblp"
 levels = ["full"]
@@ -27,6 +27,8 @@ home_turf = "qlever"
 scenario = "native"
 needs = ["docker"]
 cap_gb = 28
+outcome = "memory-limit"
+known = "D16-397: the in-memory load of the 77.7 GB input ends at the 28 GiB cap during parsing and term interning (killed at 28,672 MiB, no spill), on every NRESE tree measured since 22 Oct 2026 (ff9b11fd; engine-v2 twice and main a0020134 on 9 Nov; the v1.5 candidate on 11 Nov). It waits for a load that doesn't keep the whole input in memory (v1.6)"
 est_min = 600
 
 [[case]]
