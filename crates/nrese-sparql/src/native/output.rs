@@ -418,6 +418,136 @@ mod tests {
         assert_eq!(writer.bytes, expected.len());
     }
 
+    /// Spec (module doc): each cell's bytes are those the results serialiser writes for its
+    /// term, whatever the term cache does with it. Here, in each of two blocks: ids it keeps
+    /// and hits, more distinct ids than it holds (so later ids, met once or recurring, are
+    /// written each time), unbound cells, computed and inline ids, and every kind of term.
+    #[test]
+    fn blocks_past_the_term_cache_match_the_results_serialiser() {
+        use nrese_rdf::vocab::xsd;
+        use nrese_rdf::{BaseDirection, BlankNode, GraphName, Literal, NamedNode, Quad, Triple};
+        use nrese_sparql_results::QueryResultsSerializer;
+
+        let iri = |s: String| NamedNode::new_unchecked(format!("http://example.com/{s}"));
+        // Columns: one of 16 recurring ids; a computed value; a recurring id or unbound; PAIRED
+        // columns whose ids each recur once, on the next row, more of them than the cache
+        // holds; a column of ids met once; one whose last 128 rows reuse 32 ids met after the
+        // cache is full.
+        const PAIRED: usize = 34;
+        let width = 3 + PAIRED + 2;
+        let paired = BLOCK_ROWS / 2 * PAIRED;
+        let distinct = paired + BLOCK_ROWS;
+        assert!(paired > CACHE_ENTRIES);
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let mut tx = engine.transaction();
+        let terms: Vec<Term> = (0..distinct)
+            .map(|n| match n % 8 {
+                0 => iri(format!("i{n}\"q")).into(),
+                1 => BlankNode::new_unchecked(format!("b{n}")).into(),
+                2 => Literal::new_simple_literal(format!("v{n} \"\\\t\n,é")).into(),
+                3 => {
+                    Literal::new_language_tagged_literal_unchecked(format!("l{n}"), "en-gb").into()
+                }
+                4 => Literal::new_directional_language_tagged_literal_unchecked(
+                    format!("d{n}"),
+                    "ar",
+                    if n % 16 == 4 {
+                        BaseDirection::Rtl
+                    } else {
+                        BaseDirection::Ltr
+                    },
+                )
+                .into(),
+                5 => Literal::new_typed_literal(format!("c{n}"), iri("dt".into())).into(),
+                6 => Triple::new(
+                    iri(format!("s{n}")),
+                    iri("p".into()),
+                    Literal::new_typed_literal(n.to_string(), xsd::INTEGER),
+                )
+                .into(),
+                _ => Literal::new_typed_literal(format!("+{n}"), xsd::INTEGER).into(),
+            })
+            .collect();
+        for term in &terms {
+            let quad = Quad::new(
+                iri("s".into()),
+                iri("o".into()),
+                term.clone(),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let ids: Vec<u64> = terms
+            .iter()
+            .map(|t| snapshot.lookup(t.as_ref()).unwrap().raw())
+            .collect();
+        let computed: Vec<Term> = (0..3)
+            .map(|n| Literal::new_simple_literal(format!("computed \"{n}\"\n")).into())
+            .collect();
+        let rows: Vec<Vec<u64>> = (0..2 * BLOCK_ROWS)
+            .map(|r| {
+                let i = r % BLOCK_ROWS;
+                let mut row = vec![ids[r % 16], nrese_exec::computed_id((r % 3) as u64)];
+                row.push(if r % 5 == 0 { UNDEF } else { ids[r % 7] });
+                row.extend((0..PAIRED).map(|c| ids[i / 2 * PAIRED + c]));
+                row.push(ids[paired + i]);
+                row.push(if i < BLOCK_ROWS - 128 {
+                    ids[0]
+                } else {
+                    ids[distinct - 1 - i % 32]
+                });
+                row
+            })
+            .collect();
+        let vars: Vec<Variable> = (0..width)
+            .map(|c| Variable::new_unchecked(format!("v{c}")))
+            .collect();
+        let workers = nrese_exec::workers::Workers::current();
+        // One block (written into the document's buffer) and two (written in parallel).
+        for blocks in [1, 2] {
+            let rows = &rows[..blocks * BLOCK_ROWS];
+            let table = IdTable::from_rows(width, rows.iter().map(Vec::as_slice));
+            for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
+                let mut direct = Vec::new();
+                DirectResults {
+                    snapshot: &snapshot,
+                    computed: &computed,
+                    format,
+                    version: None,
+                }
+                .write(&vars, &table, &mut direct, &|| Ok(()), &workers)
+                .unwrap();
+                let mut expected = Vec::new();
+                let mut writer = QueryResultsSerializer::from_format(format.results_format())
+                    .serialize_solutions_to_writer(&mut expected, vars.clone())
+                    .unwrap();
+                for row in rows {
+                    let decoded: Vec<Option<Term>> = row
+                        .iter()
+                        .map(|&id| match computed_index(id) {
+                            _ if id == UNDEF => None,
+                            Some(index) => Some(computed[index as usize].clone()),
+                            None => snapshot.decode(TermId::from_raw(id)),
+                        })
+                        .collect();
+                    let row: Vec<Option<TermRef<'_>>> = decoded
+                        .iter()
+                        .map(|t| t.as_ref().map(Term::as_ref))
+                        .collect();
+                    writer.serialize_row(&row).unwrap();
+                }
+                writer.finish().unwrap();
+                assert!(
+                    direct == expected,
+                    "{format:?}, {blocks} blocks: first difference at byte {:?}",
+                    direct.iter().zip(&expected).position(|(a, b)| a != b)
+                );
+            }
+        }
+    }
+
     #[test]
     fn escaping_matches_json_event_parser() {
         let mut out = Vec::new();
