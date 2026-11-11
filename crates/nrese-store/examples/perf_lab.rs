@@ -2,9 +2,10 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example perf_lab -- \
-//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
+//!     [--store DIR] [--load FILE]... [--queries DIR] [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--format tsv|json|xml|csv] [--shapes FILE] [--reason RULESET]
+//!     [--explain] [--format tsv|json|xml|csv] [--shapes FILE] [--shacl-report FILE] [--reason RULESET]
+//!     [--reason-runs 1] [--routes]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -16,14 +17,23 @@
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
 //!   for `benches/baselines/`. `--baseline` adds the ratio against an earlier JSON report.
 //!   `--shapes` loads a SHACL shapes file into the shapes graph and times validating the
-//!   data against it (`--runs` times), before the queries.
+//!   data against it (`--runs` times), before the queries (`shacl` in the JSON: results,
+//!   samples, p50, max); `--shacl-report FILE` writes the last run's validation report there
+//!   as N-Triples, after the timing.
 //!   `--format` serialises SELECT results in another format than TSV (JSON is what most
 //!   clients ask for).
 //!   `--reason` materialises a ruleset (`owl2-rl`, `rdfs`, ...) after the load, timed, and
-//!   the queries read the materialised data (the default read model).
+//!   the queries read the materialised data (the default read model). `--reason-runs N`
+//!   materialises it N times, each replacing the inferred stack, and reports each run's time
+//!   as the store measures it (`reason` in the JSON: samples, p50, max).
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
+//!   `--routes` records, after a query's measured runs, the operators it ran with (from
+//!   EXPLAIN) and, for a one-row result, its first value (`value`, the answer of a count)
+//!   in the JSON report, for the fast suite's content and route checks. The JSON also
+//!   records the quads loaded (`loaded`) and the materialisation's counts (`reason`).
+//!   This perf lab has no query status and no rewrites: those checks find nothing here.
 //!
 //! This is the loop every Phase 2–5 work package is measured with before the Docker
 //! scorecard confirms it against other systems. It runs anywhere the data is; the wrapper
@@ -35,8 +45,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphTarget, PreparedQuery, QueryResultKind,
-    ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest, StoreConfig, StoreService,
+    BulkLoadRequest, CancellationToken, GraphResultFormat, GraphTarget, PreparedQuery,
+    QueryResultKind, ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest,
+    StoreConfig, StoreService,
 };
 
 /// mimalloc, as in the server; `RUSTFLAGS="--cfg system_alloc"` measures the system allocator.
@@ -58,7 +69,10 @@ struct Args {
     explain: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
+    shacl_report: Option<PathBuf>,
     reason: Option<nrese_reasoner::v2::rulesets::Ruleset>,
+    reason_runs: usize,
+    routes: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -76,7 +90,10 @@ fn parse_args() -> Result<Args, String> {
         explain: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
+        shacl_report: None,
         reason: None,
+        reason_runs: 1,
+        routes: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -96,7 +113,14 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--routes" => args.routes = true,
+            "--reason-runs" => {
+                args.reason_runs = value()?
+                    .parse()
+                    .map_err(|e| format!("--reason-runs: {e}"))?
+            }
             "--shapes" => args.shapes = Some(value()?.into()),
+            "--shacl-report" => args.shacl_report = Some(value()?.into()),
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
@@ -116,8 +140,11 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if args.queries.as_os_str().is_empty() || args.runs == 0 {
-        return Err("--queries DIR is required and --runs must be > 0".into());
+    if args.runs == 0 {
+        return Err("--runs must be > 0".into());
+    }
+    if args.reason_runs == 0 {
+        return Err("--reason-runs must be > 0".into());
     }
     Ok(args)
 }
@@ -153,24 +180,14 @@ fn run_once(
     timeout: Duration,
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
-    let canceller = {
-        let token = token.clone();
-        let (done, wait) = std::sync::mpsc::channel::<()>();
-        (
-            std::thread::spawn(move || {
-                if wait.recv_timeout(timeout).is_err() {
-                    token.cancel();
-                }
-            }),
-            done,
-        )
-    };
+    // The process's watchdog cancels at the timeout: armed before the timed window, disarmed
+    // after it, so that no thread starts inside it (benches/fast/patches/perf_lab_watchdog.py).
+    let armed = perf_lab_watchdog::arm(&token, timeout);
     let mut sink = CountingSink::default();
     let started = Instant::now();
     let result = store.run_query(prepared, &token, &mut sink);
     let elapsed = started.elapsed();
-    let _ = canceller.1.send(());
-    let _ = canceller.0.join();
+    drop(armed);
     result.map_err(|e| {
         if elapsed >= timeout {
             format!("timeout after {} s", timeout.as_secs())
@@ -270,6 +287,48 @@ fn explain(store: &StoreService, text: &str) {
     }
 }
 
+/// The first value of a one-row result (a count's answer), as its lexical form (`--routes`,
+/// after the measured runs).
+fn first_value(store: &StoreService, text: &str) -> Option<String> {
+    let mut request = SparqlQueryRequest::all(text);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let prepared = PreparedQuery::parse(&request).ok()?;
+    if prepared.kind() != QueryResultKind::Solutions {
+        return None;
+    }
+    let mut out = Vec::new();
+    store
+        .run_query(&prepared, &CancellationToken::new(), &mut out)
+        .ok()?;
+    let text = String::from_utf8(out).ok()?;
+    let cell = text.lines().nth(1)?.split('\t').next()?;
+    // `"12"^^<…#integer>` or a plain term: the lexical form.
+    Some(
+        cell.strip_prefix('"')
+            .and_then(|c| c.split('"').next())
+            .unwrap_or(cell)
+            .to_owned(),
+    )
+}
+
+/// The distinct operators `text` runs with, in the order EXPLAIN lists them (`--routes`,
+/// after the measured runs).
+fn operators(store: &StoreService, text: &str) -> Vec<String> {
+    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+        return Vec::new();
+    };
+    let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
+        return Vec::new();
+    };
+    let mut seen = Vec::new();
+    for step in explanation.steps {
+        if !seen.contains(&step.operator) {
+            seen.push(step.operator);
+        }
+    }
+    seen
+}
+
 /// Peak and current resident memory in MiB, where the OS reports it (Linux).
 fn memory_mib() -> Option<(u64, u64)> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -350,6 +409,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = StoreService::new(config)?;
     let open_s = started.elapsed().as_secs_f64();
     let mut load_s = 0.0;
+    // The report's own fields (JSON `loaded`, `reason`): counts the run has anyway.
+    let mut sections: Vec<(&str, String)> = Vec::new();
     if !args.load.is_empty() {
         let started = Instant::now();
         let report = store.bulk_load(&BulkLoadRequest {
@@ -360,16 +421,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         load_s = started.elapsed().as_secs_f64();
         eprintln!("loaded {} quads in {load_s:.2} s", report.inserted);
+        sections.push(("loaded", report.inserted.to_string()));
     }
     if let Some(ruleset) = args.reason {
-        let started = Instant::now();
-        let report = store.rematerialise(ruleset)?;
+        // `--reason-runs` times: each run replaces the inferred stack; its time is the one the
+        // store measures for it (`elapsed`), as the head's perf lab reports it.
+        let mut times = Vec::with_capacity(args.reason_runs);
+        let mut last = None;
+        for _ in 0..args.reason_runs {
+            let report = store.rematerialise(ruleset)?;
+            times.push(report.elapsed);
+            last = Some(report);
+        }
+        let report = last.expect("--reason-runs is at least 1");
+        times.sort();
+        let at = |q: f64| ms(times[((times.len() - 1) as f64 * q).round() as usize]);
+        let (p50, max) = (at(0.5), at(1.0));
         eprintln!(
-            "reasoned ({}): {} inferred in {:.2} s",
+            "reasoned ({}): {} inferred, {} rounds, p50 {p50:.1} ms over {} runs",
             ruleset.name(),
             report.inferred,
-            started.elapsed().as_secs_f64()
+            report.rounds,
+            args.reason_runs
         );
+        let samples: Vec<String> = times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+        sections.push((
+            "reason",
+            format!(
+                "{{\"program\": {:?}, \"asserted\": {}, \"inferred\": {}, \"violations\": {}, \"rounds\": {}, \
+                 \"runs\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
+                report.ruleset,
+                report.asserted,
+                report.inferred,
+                report.violations,
+                report.rounds,
+                args.reason_runs,
+                samples.join(", ")
+            ),
+        ));
     }
     if let Some(shapes) = &args.shapes {
         store.bulk_load(&BulkLoadRequest {
@@ -380,7 +469,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let mut times = Vec::new();
         let mut results = 0;
-        for _ in 0..args.runs {
+        let mut last = None;
+        for run in 0..args.runs {
             let started = Instant::now();
             let validation = store.validate_shacl(
                 &nrese_store::ReadScope::All,
@@ -388,13 +478,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             times.push(started.elapsed());
             results = validation.report.results.len();
+            // Only the last run's report is kept, so every earlier one is dropped where it was.
+            last = (run + 1 == args.runs).then_some(validation);
         }
+        if let (Some(path), Some(validation)) = (&args.shacl_report, &last) {
+            std::fs::write(path, validation.serialize(GraphResultFormat::NTriples)?)?;
+        }
+        let samples: Vec<String> = times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
         times.sort();
         eprintln!(
             "shacl: {results} results, p50 {:.2} ms (min {:.2})",
             ms(times[times.len() / 2]),
             ms(times[0])
         );
+        sections.push((
+            "shacl",
+            format!(
+                "{{\"results\": {results}, \"runs\": {}, \"p50_ms\": {:.3}, \"max_ms\": {:.3}, \"samples_ms\": [{}]}}",
+                args.runs,
+                ms(times[times.len() / 2]),
+                ms(times[times.len() - 1]),
+                samples.join(", ")
+            ),
+        ));
     }
     let memory_after_load = memory_mib();
     eprintln!(
@@ -420,7 +526,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mib(stats.dictionary.mapped_bytes),
     );
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&args.queries)?
+    // No `--queries`: a load-only run (load, persist, exit), the harness's setup step.
+    let listed = (!args.queries.as_os_str().is_empty())
+        .then(|| std::fs::read_dir(&args.queries))
+        .transpose()?;
+    let mut files: Vec<PathBuf> = listed
+        .into_iter()
+        .flatten()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "rq"))
         .filter(|p| {
@@ -468,8 +580,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{name:<28} {:>10} {p50:>11.2} {min:>10.2} {max:>10.2} {ratio:>9}",
             m.rows
         );
+        // After the measured runs, outside every timed window (as the head's perf lab).
+        let mut extra = String::new();
+        if args.routes {
+            if m.rows == 1
+                && let Some(value) = first_value(&store, &text)
+            {
+                extra.push_str(&format!(",\n      \"value\": {value:?}"));
+            }
+            extra.push_str(&format!(
+                ",\n      \"operators\": {:?}",
+                operators(&store, &text)
+            ));
+        }
         report.push(format!(
-            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3}\n    }}",
+            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3}{extra}\n    }}",
             m.rows
         ));
     }
@@ -479,8 +604,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("memory: peak {peak} MiB, resident {rss} MiB");
     }
     if let Some(path) = &args.json {
+        let fields: String = sections
+            .iter()
+            .map(|(key, value)| format!("  \"{key}\": {value},\n"))
+            .collect();
         let json = format!(
-            "{{\n  \"label\": {:?},\n  \"open_s\": {open_s:.3},\n  \"load_s\": {load_s:.3},\n  \"peak_mib\": {},\n  \"sum_p50_ms\": {sum_p50:.3},\n  \"queries\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"label\": {:?},\n  \"open_s\": {open_s:.3},\n  \"load_s\": {load_s:.3},\n  \"peak_mib\": {},\n  \"sum_p50_ms\": {sum_p50:.3},\n{fields}  \"queries\": [\n{}\n  ]\n}}\n",
             args.label,
             memory.map_or(0, |(peak, _)| peak),
             report.join(",\n")
@@ -488,4 +617,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(path, json)?;
     }
     Ok(())
+}
+
+/// The timeout of every timed run, by one thread for the whole process (release gate harness:
+/// benches/fast/patches/perf_lab_watchdog.py): started once, before any timing, and running
+/// before it returns; it polls every 10 ms and takes the slot's lock only then, which the timed
+/// call never takes.
+mod perf_lab_watchdog {
+    use super::CancellationToken;
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    type Slot = Mutex<Option<(Instant, CancellationToken)>>;
+    const POLL: Duration = Duration::from_millis(10);
+
+    fn slot() -> &'static Slot {
+        static SLOT: OnceLock<Slot> = OnceLock::new();
+        static STARTED: OnceLock<()> = OnceLock::new();
+        let slot: &'static Slot = SLOT.get_or_init(|| Mutex::new(None));
+        STARTED.get_or_init(|| {
+            let (ready, started) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = ready.send(());
+                loop {
+                    std::thread::sleep(POLL);
+                    let mut armed = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if armed
+                        .as_ref()
+                        .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+                        && let Some((_, token)) = armed.take()
+                    {
+                        token.cancel();
+                    }
+                }
+            });
+            let _ = started.recv();
+        });
+        slot
+    }
+
+    /// Disarms the watchdog when dropped.
+    pub struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Cancels `token` once `timeout` has passed, unless the guard is dropped first.
+    pub fn arm(token: &CancellationToken, timeout: Duration) -> Armed {
+        *slot().lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now() + timeout, token.clone()));
+        Armed
+    }
 }
