@@ -24,10 +24,15 @@ declare -A binary
 for entry in "${targets[@]}"; do
   IFS=: read -r crate target filter <<<"$entry"
   if [ "$target" = lib ]; then kind=(--lib); else kind=(--test "$target"); fi
+  build_log="$out/build-$crate-$target.log"
   path=$(nice scripts/cargo-guarded.sh test --release --locked -p "$crate" "${kind[@]}" --no-run \
-           --message-format=json 2>/dev/null \
+           --message-format=json 2>"$build_log" \
          | grep -o '"executable":"[^"]*"' | tail -1 | cut -d'"' -f4)
-  if [ -z "$path" ]; then echo "no test binary for $crate $target" >&2; exit 1; fi
+  if [ -z "$path" ]; then
+    cat "$build_log" >&2
+    echo "no test binary for $crate $target" >&2
+    exit 1
+  fi
   binary["$crate:$target"]="$path"
 done
 
