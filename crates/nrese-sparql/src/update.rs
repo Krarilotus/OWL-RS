@@ -1,4 +1,5 @@
-//! SPARQL 1.1 Update execution into one engine [`Transaction`].
+//! SPARQL 1.1 Update execution into one engine transaction: a write [`Transaction`], or a
+//! [`PrivateTransaction`] whose new terms never enter the dictionary ([`UpdateTarget`]).
 //!
 //! Every operation of a request is applied to the same transaction, in order, and each
 //! `WHERE` clause reads the transaction's state before its operation (base plus earlier
@@ -18,12 +19,15 @@
 //! [`UpdateOptions::writable`] fails the request ([`UpdateError::Forbidden`]), whether the
 //! quad is there or not: the answer says nothing about graphs the user may not read.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use nrese_engine::{
-    EncodedQuad, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, Transaction,
+    EncodedQuad, GraphSelector, PendingView, PendingWrite, PrivateTransaction, QuadPattern,
+    ReadModel, Snapshot, TermId, Transaction,
 };
+use nrese_exec::Budget;
 use nrese_rdf::{
     BlankNode, GraphName as OxGraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term,
 };
@@ -33,14 +37,59 @@ use nrese_sparql_syntax::{GraphUpdateOperation, TransferOp, Update};
 use thiserror::Error;
 
 use crate::results::{QueryDatasetSpecification, QueryEvaluationError};
+use crate::view::{PendingRead, ReadView, engine_refusal};
 
 /// What an update's `WHERE` clauses read, for its reader: the caller's decision of which
-/// statements that reader sees ([`UpdateOptions::read`]).
+/// statements that reader sees ([`UpdateOptions::read`]). One method per transaction kind,
+/// both required: a private transaction is never read as its base or as a write transaction.
 pub trait ReadSource: Send + Sync {
     /// The data a `WHERE` clause reads: `tx`'s state before its operation (its base, with
-    /// the request's earlier operations), as the update's reader sees it. An error fails the
-    /// operation as the clause's evaluation would.
-    fn state(&self, tx: &Transaction<'_>) -> Result<Snapshot, QueryEvaluationError>;
+    /// the request's earlier operations), as the update's reader sees it, its pending
+    /// snapshots made against `budget`. An error fails the operation as the clause's
+    /// evaluation would.
+    fn state(
+        &self,
+        tx: &Transaction<'_>,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, QueryEvaluationError>;
+
+    /// [`Self::state`] of a private transaction, in its own vocabulary.
+    fn private_state(
+        &self,
+        tx: &PrivateTransaction<'_>,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, QueryEvaluationError>;
+}
+
+/// What an update applies to: either kind of transaction ([`PendingWrite`], sealed in the
+/// engine), read by its own kind's [`ReadSource`] method.
+pub trait UpdateTarget: PendingWrite {
+    /// What `source` gives as this transaction's state for a `WHERE` clause.
+    fn read_from(
+        &self,
+        source: &dyn ReadSource,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, QueryEvaluationError>;
+}
+
+impl UpdateTarget for Transaction<'_> {
+    fn read_from(
+        &self,
+        source: &dyn ReadSource,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, QueryEvaluationError> {
+        source.state(self, budget)
+    }
+}
+
+impl UpdateTarget for PrivateTransaction<'_> {
+    fn read_from(
+        &self,
+        source: &dyn ReadSource,
+        budget: &Arc<Budget>,
+    ) -> Result<Snapshot, QueryEvaluationError> {
+        source.private_state(self, budget)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -87,10 +136,10 @@ impl UpdateOptions {
     }
 
     /// Whether the update sees the graph `id` (its user may read it).
-    fn sees(&self, tx: &Transaction<'_>, id: TermId) -> bool {
+    fn sees(&self, view: &impl ReadView, id: TermId) -> bool {
         self.access
             .as_ref()
-            .is_none_or(|access| access.allows_id(tx, id))
+            .is_none_or(|access| access.allows_id(view, id))
     }
 }
 
@@ -120,32 +169,34 @@ pub fn graph_label(graph: &OxGraphName) -> String {
     }
 }
 
-/// Applies all operations of `update` to `tx`. On error, `tx` may hold part of the request;
-/// the caller must drop it (abort) rather than commit.
-pub fn apply_update(
-    tx: &mut Transaction<'_>,
+/// Applies all operations of `update` to `tx`, a write transaction or a private one. On
+/// error, `tx` may hold part of the request; the caller must drop it (abort) rather than
+/// commit. A refused write or `WHERE` snapshot (a private transaction's charges) fails the
+/// request with [`QueryEvaluationError::MemoryLimit`]; nothing is skipped.
+pub fn apply_update<T: UpdateTarget>(
+    tx: &mut T,
     update: &Update,
     options: &UpdateOptions,
 ) -> Result<(), UpdateError> {
     // What a `WHERE` clause's snapshot of the pending state is charged to: one budget for the
     // request, drawn from its envelope, so an unchanged state's snapshot is the one kept, not
-    // made again (DUR-6's memo is per budget).
-    let reads = Arc::new(options.resources.memory.part());
+    // made again (the pending-snapshot memo is per budget).
+    let budget = Arc::new(options.resources.memory.part());
     for operation in &update.operations {
         if options.resources.check().is_err() {
             return Err(UpdateError::Cancelled);
         }
-        apply_operation(tx, operation, update, options, &reads)?;
+        apply_operation(tx, operation, update, options, &budget)?;
     }
     Ok(())
 }
 
-fn apply_operation(
-    tx: &mut Transaction<'_>,
+fn apply_operation<T: UpdateTarget>(
+    tx: &mut T,
     operation: &GraphUpdateOperation,
     update: &Update,
     options: &UpdateOptions,
-    reads: &Arc<nrese_exec::Budget>,
+    budget: &Arc<Budget>,
 ) -> Result<(), UpdateError> {
     match operation {
         GraphUpdateOperation::InsertData { data } => {
@@ -154,14 +205,14 @@ fn apply_operation(
             for quad in data {
                 let quad = fresh_quad(quad, &mut fresh);
                 options.check_writable(&quad.graph_name)?;
-                tx.try_insert(quad.as_ref()).map_err(pending_error)?;
+                tx.try_insert(quad.as_ref()).map_err(engine_refusal)?;
             }
         }
         GraphUpdateOperation::DeleteData { data } => {
             for quad in data {
                 let quad = ground_quad(quad);
                 options.check_writable(&quad.graph_name)?;
-                tx.try_remove(quad.as_ref()).map_err(pending_error)?;
+                tx.remove(quad.as_ref()).map_err(engine_refusal)?;
             }
         }
         GraphUpdateOperation::DeleteInsert {
@@ -173,21 +224,14 @@ fn apply_operation(
             // On the committed state, or after earlier operations of the request changed
             // something, on a snapshot of the pending state; as the reader's read source
             // gives it, where there is one. The whole WHERE result is computed against the
-            // state before this operation.
-            let read = options
-                .read
-                .as_ref()
-                .map(|read| read.state(tx))
-                .transpose()?;
-            // Charged to the request's envelope by its builder (DUR-6) before it is made, and
-            // for as long as it is held (D16-039); refused, the request's memory error.
-            let pending = match read.is_none()
-                && (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0))
-            {
-                true => Some(tx.pending_snapshot_within(reads).map_err(pending_error)?),
-                false => None,
+            // state before this operation. A pending snapshot is charged to the request's
+            // envelope by its builder before it is made, and for as long as it is held
+            // (D16-039); refused, the operation fails with the request's memory error.
+            let view = PendingRead::new(&*tx, budget);
+            let state: Cow<'_, Snapshot> = match &options.read {
+                Some(read) => Cow::Owned(tx.read_from(read.as_ref(), budget)?),
+                None => view.evaluation_snapshot()?,
             };
-            let state = read.as_ref().or(pending.as_ref()).unwrap_or(tx.base());
             let query_options = crate::query::QueryOptions {
                 resources: options.resources.clone(),
                 union_default_graph: options.union_default_graph,
@@ -201,7 +245,7 @@ fn apply_operation(
             };
             // Charged while they live, dropped once applied (D16-039).
             let changes = crate::native::delete_insert(
-                state,
+                &state,
                 pattern,
                 delete,
                 insert,
@@ -212,13 +256,14 @@ fn apply_operation(
             for quad in changes.deletes.iter().chain(changes.inserts.iter()) {
                 options.check_writable(&quad.graph_name)?;
             }
+            drop(state);
             // Every deletion before any insertion (SPARQL 1.1 Update 3.1.3): a quad one
             // solution deletes and another inserts is present afterwards.
             for quad in changes.deletes.iter() {
-                tx.try_remove(quad.as_ref()).map_err(pending_error)?;
+                tx.remove(quad.as_ref()).map_err(engine_refusal)?;
             }
             for quad in changes.inserts.iter() {
-                tx.try_insert(quad.as_ref()).map_err(pending_error)?;
+                tx.try_insert(quad.as_ref()).map_err(engine_refusal)?;
             }
         }
         GraphUpdateOperation::Load { silent, source, .. } => {
@@ -236,13 +281,15 @@ fn apply_operation(
                     .is_some(),
                 false => tx.contains_named_graph(id),
             };
-            let exists = graph_id(tx, graph).is_some_and(|id| holds(id) && options.sees(tx, id));
+            let view = PendingRead::new(&*tx, budget);
+            let exists =
+                graph_id(&*tx, graph).is_some_and(|id| holds(id) && options.sees(&view, id));
             if exists && !silent {
                 return Err(UpdateError::GraphAlreadyExists(graph.clone()));
             }
         }
         GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
-            clear(tx, graph, options)?;
+            clear(tx, graph, options, budget)?;
         }
         GraphUpdateOperation::Transfer { op, from, to, .. } => {
             // SPARQL 1.1 Update §3.2.3–3.2.5: a transfer between two names of one store graph
@@ -255,11 +302,11 @@ fn apply_operation(
                 GraphName::DefaultGraph => GraphTarget::DefaultGraph,
             };
             if *op != TransferOp::Add {
-                clear(tx, &target(to), options)?;
+                clear(tx, &target(to), options, budget)?;
             }
-            add(tx, from, to, options)?;
+            add(tx, from, to, options, budget)?;
             if *op == TransferOp::Move {
-                clear(tx, &target(from), options)?;
+                clear(tx, &target(from), options, budget)?;
             }
         }
     }
@@ -274,15 +321,17 @@ fn apply_operation(
 ///
 /// Memory (SYN-54 review r1, F1): the source's statements are read into a buffer charged to
 /// the request's envelope, and their room in the pending changes is reserved from the
-/// transaction's budget before it grows ([`Transaction::try_reserve_inserts`], where the
-/// transaction has one: the mutation pipeline's and a pending read's do). A copy past either
-/// is refused with the typed memory error, and the destination's name is interned only once
-/// nothing can be refused.
-fn add(
-    tx: &mut Transaction<'_>,
+/// transaction's budget before it grows ([`PendingWrite::try_reserve_inserts`], where the
+/// transaction has one, [`PendingWrite::charges_pending`]: the mutation pipeline's, a pending
+/// read's and every private one do).
+/// A copy past either is refused with the typed memory error, and the destination's name is
+/// interned only once nothing but that interning can be refused.
+fn add<T: UpdateTarget>(
+    tx: &mut T,
     from: &GraphName,
     to: &GraphName,
     options: &UpdateOptions,
+    budget: &Arc<Budget>,
 ) -> Result<(), UpdateError> {
     let memory = |error| UpdateError::Evaluation(QueryEvaluationError::MemoryLimit(error));
     let cancelled = |_: nrese_exec::Stop| UpdateError::Cancelled;
@@ -291,7 +340,8 @@ fn add(
         OxGraphName::NamedNode(name) => tx.lookup(name.as_ref().into()),
         OxGraphName::BlankNode(_) => None,
     };
-    let Some(source) = source.filter(|&id| options.sees(tx, id)) else {
+    let view = PendingRead::new(&*tx, budget);
+    let Some(source) = source.filter(|&id| options.sees(&view, id)) else {
         return Ok(());
     };
     let ticker = nrese_exec::Ticker::new(options.resources.stop()).map_err(cancelled)?;
@@ -307,19 +357,22 @@ fn add(
     let to = graph_name(to);
     options.check_writable(&to)?;
     if tx.charges_pending() {
-        tx.try_reserve_inserts(quads.len()).map_err(pending_error)?;
+        tx.try_reserve_inserts(quads.len())
+            .map_err(engine_refusal)?;
     }
     let target = match &to {
-        OxGraphName::DefaultGraph => TermId::DEFAULT_GRAPH,
-        OxGraphName::NamedNode(name) => tx.intern(name.as_ref().into()),
-        OxGraphName::BlankNode(node) => tx.intern(node.as_ref().into()),
-    };
+        OxGraphName::DefaultGraph => Ok(TermId::DEFAULT_GRAPH),
+        OxGraphName::NamedNode(name) => tx.try_intern(name.as_ref().into()),
+        OxGraphName::BlankNode(node) => tx.try_intern(node.as_ref().into()),
+    }
+    .map_err(engine_refusal)?;
     for &quad in quads.iter() {
         ticker.tick(1).map_err(cancelled)?;
-        tx.insert_encoded(EncodedQuad {
+        tx.try_insert_encoded(EncodedQuad {
             graph: target,
             ..quad
-        });
+        })
+        .map_err(engine_refusal)?;
     }
     ticker.finish().map_err(cancelled)?;
     Ok(())
@@ -333,23 +386,24 @@ fn add(
 ///
 /// Under access control a graph the user may not read is absent: clearing it does nothing,
 /// and `CLEAR NAMED`/`ALL` clear the readable graphs only, each of which must be writable.
-fn clear(
-    tx: &mut Transaction<'_>,
+fn clear<T: UpdateTarget>(
+    tx: &mut T,
     target: &GraphTarget,
     options: &UpdateOptions,
+    budget: &Arc<Budget>,
 ) -> Result<(), UpdateError> {
     // The retractions are charged as they grow (D16-039).
-    let remove = |tx: &mut Transaction<'_>, graph| {
+    let remove = |tx: &mut T, graph| -> Result<(), UpdateError> {
         tx.remove_matching(&QuadPattern {
             graph,
             ..QuadPattern::all()
         })
         .map(drop)
-        .map_err(pending_error)
+        .map_err(|error| engine_refusal(error).into())
     };
     let restricted = options.access.is_some() || options.writable.is_some();
     let graphs: Vec<TermId> = match target {
-        GraphTarget::NamedNode(name) => match graph_id(tx, name) {
+        GraphTarget::NamedNode(name) => match graph_id(&*tx, name) {
             Some(id) => vec![id],
             None => return Ok(()),
         },
@@ -363,9 +417,10 @@ fn clear(
             graphs
         }
     };
+    let view = PendingRead::new(&*tx, budget);
     let graphs: Vec<TermId> = graphs
         .into_iter()
-        .filter(|&id| options.sees(tx, id))
+        .filter(|&id| options.sees(&view, id))
         .collect();
     for &id in &graphs {
         let empty = tx
@@ -396,17 +451,6 @@ fn clear(
     Ok(())
 }
 
-/// A refused change to the pending changes as the update's error: the typed memory error where
-/// their growth is past the request's envelope, anything else unexpected.
-fn pending_error(error: nrese_engine::EngineError) -> UpdateError {
-    match error {
-        nrese_engine::EngineError::MemoryLimit(error) => {
-            UpdateError::Evaluation(QueryEvaluationError::MemoryLimit(error))
-        }
-        error => UpdateError::Evaluation(QueryEvaluationError::Unexpected(error.to_string())),
-    }
-}
-
 /// The store graph an operation's graph name names ([`crate::compat::graph_named`]).
 fn graph_name(graph: &GraphName) -> OxGraphName {
     match graph {
@@ -417,7 +461,7 @@ fn graph_name(graph: &GraphName) -> OxGraphName {
 
 /// The id of the store graph `name` names ([`crate::compat::graph_named`]), if the store
 /// knows that name.
-fn graph_id(tx: &Transaction<'_>, name: &NamedNode) -> Option<TermId> {
+fn graph_id(tx: &impl PendingView, name: &NamedNode) -> Option<TermId> {
     match crate::compat::graph_named(name) {
         GraphNameRef::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
         GraphNameRef::NamedNode(name) => tx.lookup(name.into()),

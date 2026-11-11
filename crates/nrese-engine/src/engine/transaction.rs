@@ -54,8 +54,8 @@ pub struct CommitSummary {
 /// [`ReadModel::Materialised`]. Dropping the transaction aborts it.
 pub struct Transaction<'e> {
     engine: &'e Inner,
-    /// The writer slot; `None` for a speculative transaction ([`crate::Engine::speculative`]),
-    /// which never commits.
+    /// The writer slot; `None` for the old speculative transaction
+    /// ([`crate::Engine::speculative_shared`], until V1b), which never commits.
     _slot: Option<MutexGuard<'e, ()>>,
     /// The base snapshot and the pending changes over it.
     pending: Pending,
@@ -149,6 +149,9 @@ impl<'e> Transaction<'e> {
         budget: &std::sync::Arc<nrese_exec::Budget>,
     ) -> EngineResult<Snapshot> {
         let generation = self.pending.generation();
+        // Read before the memo's lock, which then holds no other lock's wait: a term interned
+        // after this read leaves the kept snapshot as current as the read it answers.
+        let dictionary_len = self.engine.shared.dictionary.len();
         // Kept only while nothing it shows changed: no write (the generation), no term interned
         // since (its vocabulary ends at the dictionary's length then: sol-loop r1, S2), the
         // same budget. Not current: taken out under the same guard (another reader may have
@@ -159,7 +162,7 @@ impl<'e> Transaction<'e> {
             let mut memo = self.pending.memo().lock();
             if let Some(kept) = memo.as_ref()
                 && kept.generation == generation
-                && kept.snapshot.version().dictionary_len == self.engine.shared.dictionary.len()
+                && kept.snapshot.version().dictionary_len == dictionary_len
                 && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
             {
                 return Ok(kept.snapshot.clone());
@@ -228,11 +231,14 @@ impl<'e> Transaction<'e> {
             inferred_deletes,
         ));
         drop(scratch);
-        *self.pending.memo().lock() = Some(pending::Memo {
+        // Installed in place of what another reader kept meanwhile, which is let go after the
+        // lock (its drop may free a snapshot and release its charge).
+        let displaced = self.pending.memo().lock().replace(pending::Memo {
             generation,
             budget: std::sync::Arc::downgrade(budget),
             snapshot: snapshot.clone(),
         });
+        drop(displaced);
         Ok(snapshot)
     }
 
@@ -247,10 +253,7 @@ impl<'e> Transaction<'e> {
     ) -> EngineResult<Snapshot> {
         let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
         let asserted = self.pending.asserted();
-        let lists = 2
-            * (asserted.inserts.len().max(4) + asserted.deletes.len().max(4))
-            * std::mem::size_of::<EncodedQuad>();
-        scratch.charge(self.pending.over_gone_bound(hidden) + lists)?;
+        scratch.charge(self.pending.over_bound(hidden))?;
         let seen = view.version();
         let gone = self.pending.over_gone(&seen.inferred, hidden);
         let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();

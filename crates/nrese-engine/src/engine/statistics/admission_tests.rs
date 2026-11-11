@@ -141,15 +141,15 @@ fn unpublished(engine: &Engine) -> Vec<(&'static str, Snapshot)> {
     out.push(("writer, INSERT then DELETE", undone.pending_snapshot()));
     drop(undone);
 
-    let mut speculative = engine.speculative();
-    assert!(speculative.remove_encoded(b));
-    out.push(("speculative", speculative.pending_snapshot()));
+    let mut speculative = engine.speculative(Arc::new(Budget::unlimited()));
+    assert!(speculative.try_remove_encoded(b).unwrap());
+    out.push(("speculative", speculative.pending_snapshot().unwrap()));
     drop(speculative);
 
     let mut private = engine
         .speculative_over(&published, Arc::new(Budget::unlimited()))
         .unwrap();
-    assert!(private.remove_encoded(b));
+    assert!(private.try_remove_encoded(b).unwrap());
     out.push(("private", private.pending_snapshot().unwrap()));
     out.push(("private, over", private.pending_over(&view, &[]).unwrap()));
     for (name, snapshot) in &out {

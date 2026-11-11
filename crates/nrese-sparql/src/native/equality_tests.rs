@@ -192,7 +192,7 @@ fn ordinary() -> Engine {
 }
 
 fn ids(engine: &Engine) -> Ids {
-    Ids::interned(&engine.speculative(), SAME_AS)
+    Ids::interned(&engine.transaction(), SAME_AS)
 }
 
 const ORDINARY: [&str; 3] = [
@@ -221,8 +221,9 @@ fn budget() -> Arc<Budget> {
 ///
 /// - Input: closed ordinary data, its published answer warmed; a writer's change of existing
 ///   ids (an insert and a delete) read through `pending_snapshot`, `pending_over` and the
-///   transaction itself; an INSERT then DELETE of the same statement; `Engine::speculative()`
-///   changed the same way; a private transaction's change, from both builders.
+///   transaction itself; an INSERT then DELETE of the same statement; `Engine::speculative`'s
+///   private transaction changed the same way, also read as a view (`PendingRead`); a private
+///   transaction's change, from both builders.
 /// - Expected: each pending query is answered as written, builds its classes, and leaves
 ///   nothing in the process-wide entry for its version, nor any unpublished state; the
 ///   published snapshot is answered as before.
@@ -265,15 +266,27 @@ fn pending_state_of_both_kinds_keeps_no_classes() {
     unpublished(&undone_pending, Some(&undone_pending), "INSERT then DELETE");
     drop(undone);
 
-    let mut speculative = engine.speculative();
-    change(&mut speculative, &i);
-    let speculative_pending = speculative.pending_snapshot();
+    // `change` on the private kind, whose removal is the fallible one.
+    let charged = budget();
+    let mut speculative = engine.speculative(Arc::clone(&charged));
+    assert!(
+        speculative.try_insert_encoded(moved).unwrap(),
+        "existing ids only"
+    );
+    assert!(speculative.insert_inferred(EncodedTriple::new(i.k3, i.p0, i.b)));
+    assert!(
+        speculative
+            .try_remove_encoded(asserted(i.c, i.p1, i.three))
+            .unwrap()
+    );
+    let speculative_pending = speculative.pending_snapshot().unwrap();
     unpublished(
         &speculative_pending,
         Some(&speculative_pending),
         "speculative, pending_snapshot",
     );
-    unpublished(&speculative, None, "speculative, as a view");
+    let as_view = crate::view::PendingRead::new(&speculative, &charged);
+    unpublished(&as_view, None, "speculative, as a view");
     drop(speculative);
 
     let mut private = engine.speculative_over(&published, budget()).unwrap();
@@ -510,7 +523,7 @@ fn classes_kept_for_one_engine_are_not_anothers() {
 
         let second = colliding();
         let snapshot = second.snapshot();
-        let tx = second.speculative();
+        let tx = second.transaction();
         let second_ids = Ids::interned(&tx, &format!("{EX}link"));
         drop(tx);
         assert_eq!(

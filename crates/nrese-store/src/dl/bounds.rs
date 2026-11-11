@@ -765,11 +765,16 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
 
 /// U1 compiled and evaluated afresh over `snapshot` (or, `true`, the RL route's place).
 fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, bool) {
-    let tx = store.engine().speculative();
     let replica = store.dl().replica();
-    if !replica {
-        source::intern_vocabulary(&tx);
+    // U1's names are system vocabulary: the bounds keep them for every later read, so they
+    // take shared ids (dictionary lifecycle V1), never a request's private ones.
+    if !replica && source::intern_system_vocabulary(store.engine()).is_err() {
+        return (
+            Err(GaveUp::refused(source::refused("the vocabulary"))),
+            false,
+        );
     }
+    let latest = store.engine().snapshot();
     let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), false),
@@ -790,7 +795,8 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
                 true
             })
     };
-    let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
+    let engine = store.engine();
+    let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve_system(replica, engine, &latest, t);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Build);
     let kept = store.dl().bounds.kept();
@@ -1211,17 +1217,15 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
 /// available. For the differential tests of the maintenance.
 pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[String; 3]>> {
     let snapshot = store.engine().snapshot();
-    let decode = |t: u64| {
-        snapshot
-            .decode(TermId::from_raw(t))
-            .map_or_else(|| format!("#{t}"), |term| term.to_string())
-    };
     let facts: Vec<Triple> = if afresh {
-        let tx = store.engine().speculative();
+        // Shared ids, as `afresh`'s (dictionary lifecycle V1): the decoder below, taken
+        // after the build, reads them.
         let replica = store.dl().replica();
         if !replica {
-            source::intern_vocabulary(&tx);
+            source::intern_system_vocabulary(store.engine()).ok()?;
         }
+        let engine = store.engine();
+        let latest = engine.snapshot();
         let ontology =
             source::read_snapshot(&snapshot, Arc::clone(store.dl().bounds.kept())).ok()?;
         let normalised = nrese_owl::normalise(&ontology);
@@ -1232,7 +1236,7 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
             &ontology,
             &normalised,
             &snapshot,
-            &|t| source::resolve(replica, &tx, t),
+            &|t| source::resolve_system(replica, engine, &latest, t),
             &stop,
             store.dl().bounds.kept(),
         )
@@ -1242,6 +1246,12 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         let _ = view(store);
         let state = lock(&store.dl().bounds.state);
         state.as_ref()?.upper.as_ref().ok()?.stack.iter().collect()
+    };
+    let decoder = store.engine().snapshot();
+    let decode = |t: u64| {
+        decoder
+            .decode(TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
     let mut out: Vec<[String; 3]> = facts.into_iter().map(|t| t.map(decode)).collect();
     out.sort();

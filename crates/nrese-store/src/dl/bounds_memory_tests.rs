@@ -352,7 +352,7 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     assert!(upper_facts(&store, false).is_none(), "cached read U1");
     // A distinct store ensures prepare cannot just reuse an unavailable read result.
     let store = self::store(1);
-    let tx = store.engine().speculative();
+    let tx = store.engine().transaction();
     let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
     assert!(!prepared.proves_consistency);
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
@@ -383,7 +383,7 @@ fn an_upper_bound_the_process_memory_stopped_is_not_kept() {
         "a read keeps no U1 the process's memory stopped"
     );
     let store = self::store(1);
-    let tx = store.engine().speculative();
+    let tx = store.engine().transaction();
     let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
     assert!(
         matches!(&prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()),
@@ -408,7 +408,7 @@ fn embedded_zero_memory_policy_leaves_bounds_enabled() {
     assert!(!fresh.is_empty());
     assert!(report(&store).unavailable.is_none());
     assert_eq!(upper_facts(&store, false).unwrap(), fresh);
-    let tx = store.engine().speculative();
+    let tx = store.engine().transaction();
     assert!(prepare(&store, &tx, nrese_reasoner::eval::NEVER).proves_consistency);
 }
 
@@ -418,7 +418,8 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
         return;
     }
     let store = store(1);
-    let mut tx = store.engine().speculative();
+    // A writer's ids: the seeded U1 is published state, whose names are shared.
+    let mut tx = store.engine().transaction();
     source::intern_vocabulary(&tx);
     let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
     let normalised = nrese_owl::normalise(&ontology);
@@ -468,7 +469,7 @@ fn a_change_s_deleted_facts_are_looked_up_until_its_stop() {
     use crate::witness::{self, Site};
     let n = 16 * u64::from(nrese_exec::POLL_UNITS);
     let store = pooled(&members(1));
-    let tx = store.engine().speculative();
+    let tx = store.engine().transaction();
     source::intern_vocabulary(&tx);
     let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
     let normalised = nrese_owl::normalise(&ontology);

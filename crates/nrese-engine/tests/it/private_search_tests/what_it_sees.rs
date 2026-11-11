@@ -36,7 +36,7 @@ fn a_private_snapshot_searches_what_it_can_see() {
             assert!(private.try_insert(quad.as_ref()).unwrap(), "{quad}");
         }
         for quad in removed() {
-            assert!(private.remove(quad.as_ref()), "{quad}");
+            assert!(private.remove(quad.as_ref()).unwrap(), "{quad}");
         }
         let pending = private.pending_snapshot().unwrap();
         assert!(pending.is_private());
@@ -76,7 +76,7 @@ fn a_private_snapshots_global_search_is_its_reader_search() {
         private.try_insert(quad.as_ref()).unwrap();
     }
     for quad in removed() {
-        private.remove(quad.as_ref());
+        private.remove(quad.as_ref()).unwrap();
     }
     let pending = private.pending_snapshot().unwrap();
     let mut failed = Vec::new();
@@ -148,7 +148,7 @@ fn a_private_snapshot_over_a_restricted_view_searches_what_it_can_see() {
             private.try_insert(quad.as_ref()).unwrap();
         }
         for quad in removed() {
-            private.remove(quad.as_ref());
+            private.remove(quad.as_ref()).unwrap();
         }
         let over = private.pending_over(&view, &[hidden]).unwrap();
         let context = format!("view first {view_first}");

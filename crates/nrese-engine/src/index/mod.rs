@@ -336,21 +336,67 @@ impl IndexVersion {
         base.with_run(run)
     }
 
-    /// [`Self::with_delta_in`] charged to `budget` (DUR-6): the delta's run built with
-    /// [`Run::from_delta_within_parallel`], and the list of runs made once (with the base's
-    /// runs in the quad layout, shared and counted in `forms`, where the delta needs it, not
-    /// charged: they are the store's). The new version and the reservation of what its run
-    /// keeps; the list ([`Self::runs_bytes`] of one more) and the run's box are the caller's
-    /// to charge first.
+    /// What [`Self::with_change_within`] needs charged before it is called for `inserts` and
+    /// `deletes` (DUR-6 slice 2): below the parallel threshold, the bound of its run's build
+    /// ([`Run::delta_bound`]), working memory included; nothing for an empty delta (nothing is
+    /// built). None at or above the threshold: that build charges exactly as it goes, and no
+    /// bound charged beside it covers its peak (review r1 on slice 2, DUR6B-R1-01).
+    pub(crate) fn change_bound(
+        &self,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+    ) -> Option<usize> {
+        match inserts.len() + deletes.len() {
+            0 => Some(0),
+            n if Run::charged_exactly(n) => None,
+            n => Some(Run::delta_bound(self.layout_with(inserts, deletes), n)),
+        }
+    }
+
+    /// [`Self::with_delta_in`] charged to `held`, a reservation of `budget` (DUR-6): the list
+    /// of runs made once (with the base's runs in the quad layout, shared and counted in
+    /// `forms`, where the delta needs it, not charged: they are the store's). Below the
+    /// parallel threshold, `bounded`, the delta's run is built as [`Run::from_delta`] builds
+    /// it, within the [`Self::change_bound`] the caller has charged to `held` first; not
+    /// `bounded`, with [`Run::from_delta_within`], every array charged to `held` before it is
+    /// made (the reference: refused only where exact charging is). At or above the threshold,
+    /// with [`Run::from_delta_within_parallel`], its charge then taken into `held`. The new
+    /// version and the bytes its run keeps of that bound (0 for a run charged exactly: `held`
+    /// then holds exactly what it keeps), for the caller to release the rest of the bound
+    /// once it is built; the list ([`Self::runs_bytes`] of one more) and the run's box are the
+    /// caller's to charge first. A refusal leaves nothing made.
     pub(crate) fn with_change_within(
         &self,
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
         forms: &Forms,
         budget: &Arc<nrese_exec::Budget>,
-    ) -> Result<(Self, Reservation), BudgetExceeded> {
+        held: &mut Reservation,
+        bounded: bool,
+    ) -> Result<(Self, usize), BudgetExceeded> {
+        let n = inserts.len() + deletes.len();
+        if n == 0 {
+            return Ok((self.clone(), 0));
+        }
         let layout = self.layout_with(inserts, deletes);
-        let (run, held) = Run::from_delta_within_parallel(layout, inserts, deletes, budget)?;
+        let (run, kept) = match Run::charged_exactly(n) {
+            false if !bounded => (Run::from_delta_within(layout, inserts, deletes, held)?, 0),
+            false => {
+                let run = Run::from_delta(layout, inserts, deletes);
+                let kept = run.memory_bytes() as usize;
+                debug_assert!(
+                    kept <= Run::delta_bound(layout, n),
+                    "a run keeps within its bound"
+                );
+                (run, kept)
+            }
+            true => {
+                let (run, exact) =
+                    Run::from_delta_within_parallel(layout, inserts, deletes, budget)?;
+                held.absorb(exact);
+                (run, 0)
+            }
+        };
         let converting = layout != self.layout;
         let extra = (run.entries() > 0).then(|| Arc::new(run));
         let net = extra.as_ref().map_or(0, |run| run.net());
@@ -367,7 +413,7 @@ impl IndexVersion {
             .len
             .checked_add_signed(net)
             .expect("exact delta can't make the quad count negative");
-        Ok((Self { layout, runs, len }, held))
+        Ok((Self { layout, runs, len }, kept))
     }
 
     /// [`Self::with_delta`] for default-graph `inserts` (which fit either layout, so no stack
@@ -1231,6 +1277,8 @@ impl Iterator for CountedScan<'_, '_> {
     }
 }
 
+#[cfg(test)]
+mod bound_tests;
 #[cfg(test)]
 mod count_tests;
 #[cfg(test)]
