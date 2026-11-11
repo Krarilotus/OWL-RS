@@ -331,9 +331,26 @@ pub fn classification(
         report.consistent,
         report.incomplete.len()
     );
+    // The decided answer the harness's checks read (`consistency`). Conservative: consistent
+    // only when no reason says the classification may be incomplete (a hierarchy left
+    // incomplete makes it unknown even where consistency was decided) and, after the
+    // context core, the store's own check agrees (untimed): it is unknown where the reader
+    // left parts of the data out, which that fast path doesn't look at and the tableau's
+    // reasons do. Inconsistent stands.
+    use nrese_store::dl::Verdict;
+    let read_whole =
+        report.engine != "context-core" || store.entails_dl(&[])?.premise == Verdict::Consistent;
+    let consistency = match (
+        report.consistent,
+        report.incomplete.is_empty() && read_whole,
+    ) {
+        (false, _) => "inconsistent",
+        (true, true) => "consistent",
+        (true, false) => "unknown",
+    };
     Ok(format!(
-        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistent\": {}, \"incomplete\": {}, \
-         \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
+        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistent\": {}, \"consistency\": {consistency:?}, \
+         \"incomplete\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
         report.engine,
         report.subsumptions.len(),
         report.unsatisfiable.len(),
