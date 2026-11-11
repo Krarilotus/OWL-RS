@@ -364,10 +364,16 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
             // still empty at the end (§3.2.5). WebOnt-I5.26-010 and I5.5-005 state such
             // expressions in their conclusions and are entailed by their declarations.
             let partial = conclusion.diagnostics.iter().any(|d| {
-                d.is_fatal_in_conclusion()
-                    || (!case.dl && matches!(d, nrese_owl::Diagnostic::Unused { .. }))
+                d.is_fatal() || (!case.dl && matches!(d, nrese_owl::Diagnostic::Unused { .. }))
             });
+            // An anonymous individual in a nominal or `hasValue` is one to prove, which the
+            // roll-up doesn't take: held as a constant, either answer may be wrong.
+            let anonymous = (conclusion.diagnostics.iter())
+                .any(|d| matches!(d, nrese_owl::Diagnostic::AnonymousIndividual { .. }));
             match entailed(&premise, &conclusion, &table, &mut features) {
+                Ok(_) if anonymous => Verdict::Open(
+                    "unsupported: an anonymous individual in the conclusion's expression".into(),
+                ),
                 Ok(true) if partial => {
                     Verdict::Open("unsupported: the conclusion isn't OWL 2 DL as a whole".into())
                 }

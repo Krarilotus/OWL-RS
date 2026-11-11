@@ -354,6 +354,11 @@ pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed 
 
 /// Whether `premise` (consistent) entails every logical axiom of `conclusion` (an
 /// ontology read over the same term ids).
+///
+/// A conclusion's anonymous individual says that *some* individual is so (*OWL 2 Direct
+/// Semantics* §2.3.7–2.4). It is held here as a fresh constant: entailed for every value
+/// it may take is entailed for some, but not entailed for one says nothing of the others,
+/// so then the answer is undecided.
 pub fn entails_ontology(
     premise: &Ontology,
     conclusion: &Ontology,
@@ -384,6 +389,11 @@ pub fn entails_ontology(
         if answer == Entailed::No {
             break;
         }
+    }
+    if answer == Entailed::No && !conclusion.anonymous.is_empty() {
+        return Entailed::Unknown(
+            "not entailed for one value of the conclusion's anonymous individual".into(),
+        );
     }
     answer
 }

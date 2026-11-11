@@ -40,8 +40,8 @@ pub enum Diagnostic {
     /// `hasValue`, which take named ones only (*OWL 2 Structural Specification* §11.2).
     /// The Direct Semantics still reads it (§2.3.7–2.4): in an ontology, one individual,
     /// existential over the whole ontology, which keys skip as they skip every anonymous
-    /// one ([`Diagnostic::is_fatal`]); in a conclusion, one to prove
-    /// ([`Diagnostic::is_fatal_in_conclusion`]).
+    /// one ([`Diagnostic::is_fatal`]); in a conclusion, as every anonymous individual
+    /// there, one to prove.
     AnonymousIndividual { node: Term },
     /// Text the functional-syntax reader can't read (`crate::ofn`), where it is (from 1;
     /// the column in characters): the axiom it is in is left out.
@@ -104,13 +104,6 @@ impl Diagnostic {
                 | Self::RepeatedOperand
                 | Self::AnonymousIndividual { .. }
         )
-    }
-
-    /// Whether a conclusion read with it may be answered wrongly: as [`Self::is_fatal`],
-    /// and an anonymous individual in a nominal or `hasValue`, which in a conclusion says
-    /// that *some* individual is so; held as a constant, it would ask for more.
-    pub fn is_fatal_in_conclusion(&self) -> bool {
-        self.is_fatal() || matches!(self, Self::AnonymousIndividual { .. })
     }
 }
 
