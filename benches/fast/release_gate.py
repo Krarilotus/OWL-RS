@@ -882,6 +882,9 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                                          int(context.get("layouts", 1) or 1))
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
+    # Fail closed: a part that timed nothing (no pass, or none that planned a case) passes nothing.
+    if not planned:
+        summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
     summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
     host_errors, summary["host_notes"] = host_states(passes)
