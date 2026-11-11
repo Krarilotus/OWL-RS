@@ -6,18 +6,25 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nrese_exec::memory::HugePages;
+use nrese_exec::memory::{self, HugePages};
 use nrese_reasoner::rulesets::Ruleset;
 
 use crate::service::hooks;
 use crate::{BulkLoadRequest, GraphTarget, LoadProgress, StoreConfig, StoreError, StoreService};
 
-/// Whether the kernel lets huge pages back this process (`THP_enabled`, Linux 5.0 on).
 fn enabled() -> bool {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("THP_enabled:"));
-    let line = line.expect("the kernel shows the process's huge pages");
-    line.split_whitespace().nth(1) == Some("1")
+    memory::transparent_huge_pages().expect("shown: checked by switchable")
+}
+
+/// Whether this kernel shows the process's switch and lets it be set; where not, the test
+/// says so and checks nothing.
+fn switchable() -> bool {
+    let able =
+        memory::transparent_huge_pages().is_some() && memory::set_transparent_huge_pages(true);
+    if !able {
+        eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
+    }
+    able
 }
 
 /// What `enabled` read while a bulk load ran: at the load's hook, once it holds the writer
@@ -34,7 +41,7 @@ fn during_the_load(then: impl FnOnce() + 'static) -> Arc<AtomicBool> {
 
 #[test]
 fn bulk_has_huge_pages_only_while_a_load_or_a_materialisation_runs() {
-    if !nrese_exec::measure::alone() {
+    if !nrese_exec::measure::alone() || !switchable() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

@@ -103,6 +103,8 @@ impl Program {
 }
 
 /// [`materialise_with`]'s work, the unstorable facts kept where `unstorable` asks for them.
+/// Every full closure is a bulk phase ([`nrese_exec::memory::HugePages::Bulk`]): a store's
+/// rematerialisation and a commit's or first load's rebuild ([`super::maintain`]) alike.
 fn closure_with(
     program: &Program,
     snapshot: &Snapshot,
@@ -110,6 +112,7 @@ fn closure_with(
     memory: &Arc<Budget>,
     mut unstorable: Option<&mut Vec<Triple>>,
 ) -> Result<Closure, delta::Interrupted> {
+    let _huge_pages = nrese_exec::memory::HugePagesPhase::begin();
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
@@ -334,4 +337,65 @@ fn asserted_by_predicate(snapshot: &Snapshot) -> Vec<(u64, Vec<(u64, u64)>)> {
         }
     }
     groups
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use nrese_engine::{Engine, EngineConfig};
+    use nrese_exec::memory::{self, HugePages};
+    use nrese_rdf_io::{RdfFormat, RdfParser};
+
+    use crate::rulesets::Ruleset;
+
+    fn enabled() -> bool {
+        memory::transparent_huge_pages().expect("shown: checked by switchable")
+    }
+
+    /// Under `budgets.huge_pages = "bulk"`, a full closure has huge pages however its
+    /// caller reached it (a commit's rebuild runs no store rematerialisation) and is off
+    /// again once it ends, finished or stopped. In a process of its own: the switch is the
+    /// process's; where the kernel doesn't show or switch it, the test says so.
+    #[test]
+    fn a_closure_has_huge_pages_under_bulk_while_it_runs() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        if memory::transparent_huge_pages().is_none() || !memory::set_transparent_huge_pages(true) {
+            eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
+            return;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let text = "@prefix : <http://example.com/> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            :A rdfs:subClassOf :B . :x a :A .";
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let program = super::super::Program::compile(&Ruleset::Rdfs.into(), &|t| tx.intern(t));
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        memory::set_huge_pages(HugePages::Bulk);
+        assert!(!enabled(), "off before a closure");
+
+        let during = AtomicBool::new(false);
+        let finished = super::materialise_until(&program, &snapshot, &|| {
+            during.fetch_or(enabled(), Ordering::Relaxed);
+            false
+        });
+        assert!(!finished.unwrap().inferred.is_empty());
+        assert!(during.load(Ordering::Relaxed), "on while a closure runs");
+        assert!(!enabled(), "off after a closure");
+
+        let during = AtomicBool::new(false);
+        let stopped = super::materialise_until(&program, &snapshot, &|| {
+            during.store(enabled(), Ordering::Relaxed);
+            true
+        });
+        assert!(stopped.is_err());
+        assert!(during.load(Ordering::Relaxed), "on while a closure runs");
+        assert!(!enabled(), "off after a closure that was stopped");
+    }
 }
