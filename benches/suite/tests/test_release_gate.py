@@ -3212,5 +3212,57 @@ done
         self.assertEqual(done.stdout.split("\n")[:2], ["patched refused", "plain verified"], done.stderr)
 
 
+class AbsentSides(unittest.TestCase):
+    """The master's decision of 11 Nov on IB1347, 2: a side declared absent for a case (the
+    catalogue's product gap, or Johannes's [[absence]] entry in the policy file of the tree the block
+    runs) is never run in the timed blocks."""
+
+    def test_a_declared_absent_side_is_never_run_and_the_block_s_schedule_still_holds(self):
+        # Spec: main lacks the case by the catalogue, base by the policy's entry: only the candidate's
+        # perf lab runs it; the absent sides' passes carry a record that says so, in the palindrome's
+        # place, so the round's schedule check holds; the block exits 0.
+        case = {"name": "lab-olympics", "area": "query", "what": "w", "semantics": "none", "data": "none",
+                "metric": "p50_ms", "cap_gb": 1, "systems": [], "sweep": [["q01"]],
+                "absent": {"main": "supported inference"}}
+        ran = []
+
+        def run_case(case_, label, rep):
+            ran.append(os.environ["NRESE_FAST_REVISION"])
+            return record(case=case_["name"])
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp) / "tree"
+            (tree / "benches").mkdir(parents=True)
+            (tree / "benches/release-tradeoffs.toml").write_text(
+                '[[absence]]\npattern = "lab-*"\nside = "base"\nreason = "its perf lab has no such mode"\n'
+                'port = "after v1.5"\napproved = "2026-11-11"\nby = "Johannes"\nquote = "q"\nsource = "s"\n',
+                encoding="utf-8")
+            args = argparse.Namespace(side=[f"{s}:bin-{s}:{REVS[s]}" for s in SIDES], block=1, layout=1,
+                                      seed=None, measure=None, fresh_copies=None, out=Path(tmp) / "out", batch=False)
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "ROOT", tree), \
+                    patch.object(fast, "load_cases", return_value=[case]), \
+                    patch.object(fast, "select", return_value=[case]), \
+                    patch.object(fast, "prepared_inputs", return_value={"errors": [], "sha256": "p" * 64, "files": {}}), \
+                    patch.object(fast, "pinned_cpus", return_value=None), \
+                    patch.object(fast, "host_state", return_value=None), \
+                    patch.object(fast, "binaries", return_value={"verified": True}), \
+                    patch.object(fast, "case_inputs", return_value={}), \
+                    patch.object(fast, "changed_inputs", return_value=[]), \
+                    patch.object(fast.manifest, "git", return_value={"commit": HARNESS, "dirty": 0}), \
+                    patch.object(fast.manifest, "machine", return_value=MACHINE), \
+                    patch.object(fast, "run_case", side_effect=run_case), contextlib.redirect_stdout(io.StringIO()):
+                code = fast.block(args)
+            written = [json.loads(p.read_text(encoding="utf-8")) for p in sorted((Path(tmp) / "out").glob("pass-*.json"))]
+        self.assertEqual(ran, [REVS["cand"]] * 2, "SPEC only the candidate's perf lab runs the case")
+        self.assertEqual(code, 0)
+        found = {(r["side"], r["run"]): r["records"][0] for r in written}
+        for side, why in (("main", "main has no supported inference"),
+                          ("base", "absent by the owner's decision: its perf lab has no such mode")):
+            for run in (1, 2):
+                self.assertEqual(found[(side, run)]["status"], "absent")
+                self.assertIn(why, found[(side, run)]["notes"][0])
+        passes_ = [{"n": i, "side": r["side"], "path": f"pass-{i}", "report": r} for i, r in enumerate(written, 1)]
+        self.assertEqual(gate_module.schedule_errors(passes_, list(SIDES), 1), [])
+
+
 if __name__ == "__main__":
     unittest.main()

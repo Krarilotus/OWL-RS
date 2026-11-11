@@ -23,6 +23,7 @@ Each subcommand exits 0 only when its part passes; `verdict` only when every par
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import math
@@ -352,6 +353,8 @@ CAPABILITY = re.compile(r"unknown argument (\S+)|unknown ruleset (\S+)|No such f
 def why_not(e: dict, side: str) -> str:
     """A baseline's case that isn't ok, in words: what it lacks, or how it ended."""
     statuses = ", ".join(f"{s} {n}" for s, n in Counter(e["status"]).items())
+    if e["status"] and set(e["status"]) == {"absent"}:
+        return f"{side} not run: {e['notes'][-1] if e['notes'] else 'declared absent'}"
     for note in e["notes"]:
         if match := CAPABILITY.search(note.replace("\\n", "\n")):
             return f"{side} can't run it ({match.group(0).strip()}; {statuses})"
@@ -586,7 +589,8 @@ DL_TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "a
 def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] = ("base", "main")) -> list[str]:
     """The comparison family, declared before any result (research round 8): every planned
     case's series and gated metrics, against each baseline. A case with a declared outcome is
-    checked, not timed: it adds none."""
+    checked, not timed: it adds none; nor does a baseline the case declares `absent` (its product
+    lacks the capability: named in the verdict, never compared)."""
     import fast
     manifest_ = fast.case_manifest(catalog)
     by = {c["name"]: c for c in catalog}
@@ -603,7 +607,20 @@ def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] 
         dims.append("memory/anon_kernel")
         if "--count-allocations" in case.get("args", []):
             dims.append("memory/live")
-        out += [hypothesis(side, name, d) for side in baselines for d in dims]
+        out += [hypothesis(side, name, d) for side in baselines if side not in case.get("absent", {}) for d in dims]
+    return out
+
+
+def declared_absent(catalog: list[dict], policy: "Policy") -> dict[tuple[str, str], str]:
+    """Each (case, baseline) a timed block doesn't run, and why: the case's catalogue entry says the
+    baseline's product lacks the capability, or the owner's [[absence]] entry names it."""
+    out = {}
+    for case in catalog:
+        for side in ("base", "main"):
+            if side in case.get("absent", {}):
+                out[(case["name"], side)] = f"{side} has no {case['absent'][side]}"
+            elif e := absence_of(policy, side, case["name"]):
+                out[(case["name"], side)] = f"absent by the owner's decision: {e['reason']}"
     return out
 
 
@@ -676,6 +693,7 @@ OWNER = "Johannes"
 AUTHORITY_KEYS = {"approved", "by", "reason", "quote", "source"}
 TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
 EXCEPTION_KEYS = {"case", "outcome"} | AUTHORITY_KEYS
+ABSENCE_KEYS = {"side", "port"} | AUTHORITY_KEYS  # and its scope: `cases` or `pattern`, one of them
 # The outcomes the bar forbids, which only an owner exception accepts: a wrong answer. A declared
 # limit (memory-limit, gave-up, timeout, unsupported) blocks where a baseline completes (compare_case)
 # and is named where none does; it is neither a wrong answer nor a loss.
@@ -683,11 +701,12 @@ BAR_OUTCOMES = {"wrong"}
 
 
 class Policy(NamedTuple):
-    """The owner's approved trade-offs and exceptions, and what's wrong with the file (no entry
-    counts while anything is)."""
+    """The owner's approved trade-offs, exceptions and absences, and what's wrong with the file (no
+    entry counts while anything is)."""
     tradeoffs: list[dict]
     exceptions: list[dict]
     errors: list[str]
+    absences: tuple[dict, ...] = ()
 
 
 NO_POLICY = Policy([], [], [])
@@ -706,15 +725,19 @@ def load_policy(text: str) -> Policy:
     """The policy file's entries, each checked. A trade-off names a case, a dimension, optionally
     the baseline (`against`), the largest ratio its loss may reach (the worse end of its interval),
     and the win that pays for it (`pays_with`: case and dimension, which must show as better in
-    the same report). An exception names a case and the outcome it accepts there. Both carry the
-    owner's approval: `approved` (date), `by`, `reason`, `quote` (his words) and `source`."""
+    the same report). An exception names a case and the outcome it accepts there. An absence names
+    the cases (`cases`, or a `pattern` of their names) a baseline (`side`) isn't compared on, why,
+    and the `port` planned to compare them. Each carries the owner's approval: `approved` (date),
+    `by`, `reason`, `quote` (his words) and `source`."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         return Policy([], [], [f"not TOML: {error}"])
-    errors = [f"unknown table {k!r} (tradeoff, exception)" for k in sorted(set(data) - {"tradeoff", "exception"})]
+    tables = {"tradeoff", "exception", "absence"}
+    errors = [f"unknown table {k!r} (tradeoff, exception, absence)" for k in sorted(set(data) - tables)]
     tradeoffs, exceptions = data.get("tradeoff", []), data.get("exception", [])
-    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions)):
+    absences = data.get("absence", [])
+    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences)):
         if not (isinstance(entries, list) and all(isinstance(e, dict) for e in entries)):
             errors.append(f"{key}: an array of tables ([[{key}]]), not {type(entries).__name__}")
     if errors:
@@ -736,7 +759,26 @@ def load_policy(text: str) -> Policy:
         elif e["outcome"] not in BAR_OUTCOMES:
             errors.append(f"exception {i}: outcome {e['outcome']!r}: an exception accepts "
                           f"{', '.join(sorted(BAR_OUTCOMES))} (a declared limit needs none)")
-    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [])
+    for i, e in enumerate(absences, start=1):
+        scope = [k for k in ("cases", "pattern") if k in e]
+        if missing := ABSENCE_KEYS - set(e):
+            errors.append(f"absence {i}: missing {', '.join(sorted(missing))}")
+        elif error := authority_error(f"absence {i}", e):
+            errors.append(error)
+        elif not (isinstance(e["side"], str) and e["side"] in cases_registry.BASELINES
+                  and isinstance(e["port"], str) and e["port"].strip()):
+            errors.append(f"absence {i}: a baseline (base, main) and the port planned to compare it")
+        elif not (scope in (["cases"], ["pattern"]) and (
+                isinstance(e.get("pattern"), str) and e["pattern"].strip() or
+                isinstance(e.get("cases"), list) and e["cases"] and all(isinstance(c, str) for c in e["cases"]))):
+            errors.append(f"absence {i}: its cases: a list (`cases`) or a pattern of their names (`pattern`), one")
+    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences))
+
+
+def absence_of(policy: Policy, side: str, case: str) -> dict | None:
+    """The owner's absence entry naming this case (or a pattern matching it) on this baseline."""
+    return next((e for e in policy.absences if e["side"] == side and
+                 (case in e.get("cases", []) or "pattern" in e and fnmatch.fnmatchcase(case, e["pattern"]))), None)
 
 
 def accepted(tradeoffs: list[dict], side: str, case: str, dimension_: str, r: dict, comparisons: dict) -> dict | None:
@@ -893,6 +935,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
               for c in (catalog or [])}
+    absent = {c["name"]: c.get("absent", {}) for c in (catalog or [])}
     for case in planned:
         cand = evidence(by_side[candidate], case)
         cand_state = state(cand, off_route_ok=baseline_candidate)
@@ -906,6 +949,10 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         if cand["unchecked"] and cand_state != "failed":
             summary["candidate_failures"][case] = f"{cand['unchecked']} checks unchecked on the candidate"
         for side in baselines:
+            if side in absent.get(case, {}):
+                # The baseline's product lacks it (the catalogue): no hypothesis, named (verdict()).
+                summary.setdefault("absent", {}).setdefault(side, {})[case] = absent[case][side]
+                continue
             if cand_state == "failed" or side in aliases:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
@@ -1012,6 +1059,9 @@ def render(summary: dict) -> str:
     if summary["fixed"]:
         lines += ["Declared issues the candidate now passes (update their declaration): " +
                   ", ".join(f"{k} ({v})" for k, v in summary["fixed"].items()), ""]
+    for side, absent in sorted(summary.get("absent", {}).items()):
+        lines += [f"Absent by product against {side} ({len(absent)}, not compared): " +
+                  ", ".join(f"{k} ({side} has no {v})" for k, v in sorted(absent.items())), ""]
     for side, rows in summary["comparisons"].items():
         counts = summary["counts"].get(side, {})
         lines += [f"## Against {side} {summary['baselines'][side]}", "",
@@ -2816,8 +2866,39 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
             blocking_losses.append(text)
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
     lines += [f"- **pending** (a round that could reject it hasn't run): {h}" for h in d["pending"]]
+    # A baseline absent by product (the harness's catalogue, in each report) declared no hypothesis;
+    # one the owner's absence entry names (the candidate's policy) is not compared by his decision;
+    # any other hypothesis not compared blocks.
+    absent = {(side, case): what for rounds in parts for r in rounds
+              for side, cases_ in (r.get("absent") or {}).items() for case, what in cases_.items()}
+    decided, not_compared = {}, {}
+    for h, why in d["not_compared"].items():
+        side, case, _ = h.split("|", 2)
+        if e := absence_of(policy, side, case):
+            decided[(side, case)] = e
+        else:
+            not_compared[h] = why
+    lines += [f"- not compared: {case} against {side}: {side} has no {what}"
+              for (side, case), what in sorted(absent.items())]
+    lines += [f"- not compared by the owner's decision: {case} against {side}: {e['reason']} (port: {e['port']}; "
+              f"approved {e['approved']} by {e['by']}, {e['source']})" for (side, case), e in sorted(decided.items())]
     lines += [f"- **not compared**: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: {why}"
-              for h, why in d["not_compared"].items()]
+              for h, why in not_compared.items()]
+    if absent or decided:
+        counts = []
+        for side in sorted({h.split("|", 1)[0] for h in d["family"]} | {s for s, _ in absent}):
+            declared = {h.split("|")[1] for h in d["family"] if h.split("|", 1)[0] == side}
+            blocked = {h.split("|")[1] for h in not_compared if h.split("|", 1)[0] == side}
+            by_owner = {c for s, c in decided if s == side}
+            # Compared: a round tested one of its hypotheses (a p-value), none left blocking or waived.
+            tested = {h.split("|")[1] for h in d["family"] if h.split("|", 1)[0] == side
+                      and any(p is not None for p in d["rounds"].get(h, []))}
+            compared = tested - blocked - by_owner
+            uncompared = declared - compared - by_owner
+            counts.append(f"{side}: {len(compared)} compared, "
+                          f"{sum(s == side for s, _ in absent)} absent by product, {len(by_owner)} absent by the "
+                          f"owner's decision" + (f", {len(uncompared)} not compared" if uncompared else ""))
+        lines.append("- cases per baseline: " + "; ".join(counts))
     lines += [f"- {b}" for b in other] + [f"- pass error: {e}" for e in errors]
     covered = {c for t in timed for c in t.get("planned", [])}
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
@@ -2832,7 +2913,7 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
                  f"({'; '.join(map(str, w3c.get('errors') or [])) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
                  f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not d["pending"] and not d["not_compared"] and not other and not errors
+    passed = (not blocking_losses and not d["pending"] and not not_compared and not other and not errors
               and not diagnostic and not missing and not empty and w3c_ok and guards_ok
               and not evidence and not policy.errors and not wrong)
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]

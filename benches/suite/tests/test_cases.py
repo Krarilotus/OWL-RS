@@ -60,6 +60,7 @@ class Mistakes(unittest.TestCase):
 
     def test_a_good_case_has_no_problem(self):
         self.assertEqual(self.problems(), [])
+        self.assertEqual(self.problems(absent={"main": "supported inference"}), [])
 
     def test_each_mistake_is_named(self):
         for changes, words in [
@@ -75,6 +76,9 @@ class Mistakes(unittest.TestCase):
             ({"workload": "watdiv"}, "workload 'watdiv'"),
             ({"home_turf": "rdfox"}, "home_turf 'rdfox'"),
             ({"levels": ["nightly"]}, "levels"),
+            # The master's decision of 11 Nov on IB1347, 1a: a baseline (base or main) and the capability it lacks.
+            ({"absent": {"cand": "supported inference"}}, "absent: a baseline (base, main) and the capability"),
+            ({"absent": {"main": ""}}, "absent: a baseline (base, main) and the capability"),
         ]:
             with self.subTest(changes=changes):
                 found = self.problems(**changes)
