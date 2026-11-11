@@ -68,10 +68,11 @@ pub struct StoreConfig {
     /// The server installs its process-wide fallback separately at startup. Disabling
     /// this watch does not bypass a fallback explicitly installed by the process owner.
     pub process_memory_bytes: ProcessMemory,
-    /// Whether the process's memory may be backed by transparent huge pages (Linux;
-    /// `nrese_exec::memory::set_transparent_huge_pages`): faster work over large heaps
-    /// (materialisation, loads), more memory held while serving many small requests.
-    pub huge_pages: bool,
+    /// When transparent huge pages may back the process's memory (Linux;
+    /// [`HugePages`](nrese_exec::memory::HugePages)): faster work over large heaps
+    /// (materialisation, loads), more memory held while serving many small requests;
+    /// `Bulk` has them only while a bulk load or a materialisation runs.
+    pub huge_pages: nrese_exec::memory::HugePages,
     /// Whether a materialisation gives back between its rounds what the last one freed
     /// (`nrese_engine::memory::set_release_between_rounds`): a lower, steadier peak for
     /// more reasoning time.
@@ -247,10 +248,10 @@ impl FederationConfig {
     }
 }
 
-/// Whether transparent huge pages may back the process's memory by default: yes, as
+/// When transparent huge pages may back the process's memory by default: always, as
 /// before the setting (LUBM 100 materialises 26 % faster with them; serving holds less
 /// without them: docs/ops/server-setup.md §12.1).
-pub const DEFAULT_HUGE_PAGES: bool = true;
+pub const DEFAULT_HUGE_PAGES: nrese_exec::memory::HugePages = nrese_exec::memory::HugePages::On;
 
 /// Whether a materialisation releases between its rounds by default: no, reasoning speed
 /// leads (LUBM 100 5.6 % slower with it, its peak 14 % lower: nrese_engine::memory).

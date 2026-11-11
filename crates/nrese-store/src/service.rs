@@ -172,11 +172,10 @@ impl StoreService {
         config.process_memory_bytes = crate::ProcessMemory::Bytes(process_memory);
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
-        // Only switched off: on leaves what the process was started with (an operator's
-        // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
-        if !config.huge_pages {
-            nrese_exec::memory::set_transparent_huge_pages(false);
-        }
+        // On leaves what the process was started with (an operator's `MIMALLOC_ALLOW_THP=0`
+        // switches them off the same way); bulk phases follow `Bulk` (the engine's loads
+        // and rematerialisations hold one).
+        nrese_exec::memory::set_huge_pages(config.huge_pages);
         nrese_engine::memory::set_release_between_rounds(config.reasoning_release);
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
