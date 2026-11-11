@@ -200,11 +200,20 @@ impl Server {
     /// Starts the server with `config` and waits for the address it reports once it
     /// serves, then for it to answer ready there.
     pub(super) async fn start(config: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with(config, &[]).await
+    }
+
+    /// [`Self::start`], with `env` set for the server.
+    pub(super) async fn start_with(
+        config: &Path,
+        env: &[(&str, &str)],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut process = Process::spawn(
             Command::new(env!("CARGO_BIN_EXE_nrese-server"))
                 .arg("--config")
                 .arg(config)
-                .env("RUST_LOG", "warn,nrese_server=info"),
+                .env("RUST_LOG", "warn,nrese_server=info")
+                .envs(env.iter().copied()),
         )?;
         let address = process
             .first_line(START, |line| {
