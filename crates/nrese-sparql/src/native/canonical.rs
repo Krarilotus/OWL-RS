@@ -141,15 +141,24 @@ impl Names {
 }
 
 impl Context<'_> {
+    /// Whether the query asks for canonical answers, given or refused: only then does
+    /// [`Self::canonical_query`] change it or fail, so only then is a pattern given to it.
+    pub(super) fn canonical_answers(&self) -> bool {
+        self.canonical.is_some() || self.canonical_refused.is_some()
+    }
+
     /// The query's pattern and form with its constants put in as their representatives,
     /// the CONSTRUCT template's too, `IRI()` wrapped in the canonical-name function (module
-    /// docs); unchanged without canonical answers. An error for what canonical answers
-    /// refuse.
+    /// docs); unchanged without canonical answers ([`Self::canonical_answers`]). An error
+    /// for what canonical answers refuse.
     pub(super) fn canonical_query<'q>(
         &self,
         pattern: GraphPattern,
         form: super::Form<'q>,
     ) -> Result<(GraphPattern, super::Form<'q>), QueryEvaluationError> {
+        if !self.canonical_answers() {
+            return Ok((pattern, form));
+        }
         if let Some(refused) = &self.canonical_refused {
             return Err(QueryEvaluationError::MemoryLimit(*refused));
         }
