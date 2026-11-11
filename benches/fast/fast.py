@@ -79,6 +79,8 @@ BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "b
 # The full reports, outside git (the same path on the main and the office PC).
 REPORTS = Path(os.environ.get("NRESE_BENCH_REPORTS") or Path.home() / "nrese-bench" / "reports") / "fast"
 CASE_TIMEOUT_S = 900
+# A tool handed the case's limit stopped itself up to 1.7 s past it (the tableau, October 2026).
+TOOL_GRACE_S = 10
 ENV = {**os.environ, "MSYS_NO_PATHCONV": "1"}
 
 
@@ -1000,10 +1002,14 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         envelope = str(int(case["cap_gb"] * 1024))
         command = ["/target/release/examples/tableau_consistency", "--timeout", timeout,
                    "--memory-mib", envelope, *files]
+        # The tool stops itself at its limit and says so (`gave-up`); its clock starts after
+        # reading and normalising, each file's anew. The harness's kill is the backstop,
+        # TOOL_GRACE_S after that limit: a tool that ignores it still ends as `timeout`.
+        backstop = timeout_s and max(timeout_s, int(timeout) + TOOL_GRACE_S)
         # Fresh processes (`processes`), their rows pooled; a failing one ends the case.
         rows, wall = [], 0.0
         for _ in range(int(case.get("processes", 1))):
-            code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
+            code, out, err, w = container(name, case["cap_gb"], command, timeout=backstop)
             rows += parse_tableau(out)
             wall += w
             if code != 0:
