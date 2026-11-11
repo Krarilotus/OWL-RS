@@ -951,6 +951,98 @@ class Authority(Scratch):
         self.assertIn("known issue: lab-olympics: memory-limit", done.stdout)
 
 
+def absent_case(**absent) -> dict:
+    """lab-olympics as a catalogue case of two series (q01, q06: the fixture's records) whose baselines
+    ABSENT lack it (side = the capability it lacks)."""
+    case = {"name": "lab-olympics", "area": "query", "what": "w", "semantics": "none", "data": "none",
+            "metric": "p50_ms", "cap_gb": 1, "systems": [], "sweep": [["q01"], ["q06"]]}
+    return {**case, "absent": absent} if absent else case
+
+
+def refused(*sides):
+    """records_of: SIDES' perf lab refuses the case's arguments (main's measurement build and --commits,
+    11 Nov); every other side answers."""
+    def records_of(side, n):
+        if side in sides:
+            return [{**fixtures.record(status="failed", anon=1000),
+                     "notes": ['Error: "unknown argument --commits\\nsee the usage at the top of perf_lab.rs"']}]
+        return [fixtures.record(anon=1000)]
+    return records_of
+
+
+def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str = "Johannes",
+            extra: str = QUOTE) -> str:
+    return (f'[[absence]]\n{scope}\nside = "{side}"\nreason = "its perf lab has no commits mode"\n'
+            f'port = "the commits port, after v1.5"\napproved = "2026-11-11"\nby = "{by}"\n{extra}')
+
+
+class DeclaredAbsence(Scratch):
+    """A baseline that can't run a case (the release rehearsal of 11 Nov: main's measurement build
+    refuses 105 of the 172 cases, base's 57). The master's decision of 11 Nov on IB1347: a product
+    gap is a fact the catalogue states with the case; a harness gap is accepted only by Johannes's
+    entry in the policy file; an undeclared refusal still blocks; the verdict counts, per baseline,
+    what was compared and what is absent by product and by decision."""
+
+    def rounds(self, candidate: str, records_of, catalog: list[dict]) -> list[dict]:
+        family = gate_module.family_of(catalog, ["lab-olympics"])
+        out = []
+        for k in (0, 1):
+            summary = fixtures.run_gate(fixtures.passes(records_of), catalog=catalog, family=family,
+                                        context={**fixtures.CONTEXT, "round": k})
+            summary["candidate"]["revision"] = candidate
+            out.append(summary)
+        return out
+
+    def test_a_product_gap_the_catalogue_states_is_no_hypothesis_and_is_named(self):
+        # Spec: decision 1a: a case whose catalogue entry says main lacks a capability declares no
+        # hypothesis against main; the verdict names it "not compared: main has no <capability>" and
+        # passes on base's comparison; base is still compared.
+        catalog = [absent_case(main="supported inference")]
+        a = self.repo.commit()
+        done = verdict(self.repo.path, a, self.rounds(a, refused("main"), catalog), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 0, f"SPEC a product gap is no loss and no gap\n{done.stdout}")
+        self.assertIn("- not compared: lab-olympics against main: main has no supported inference", done.stdout)
+        self.assertIn("base: 1 compared, 0 absent by product, 0 absent by the owner's decision", done.stdout)
+        self.assertIn("main: 0 compared, 1 absent by product, 0 absent by the owner's decision", done.stdout)
+
+    def test_a_harness_gap_blocks_unless_johannes_s_entry_names_its_case_and_side(self):
+        # Spec: decisions 1b and 2: main refuses the case's arguments; with no entry the hypothesis stays
+        # not compared and blocks, as before; Johannes's [[absence]] entry naming the case (or a pattern
+        # matching it) and main lists it "not compared by the owner's decision" and passes; an entry for
+        # another side or case leaves main's refusal blocking.
+        catalog = [absent_case()]
+        a = self.repo.commit()
+        done = verdict(self.repo.path, a, self.rounds(a, refused("main"), catalog), *checks(a, self.repo.tree(a)))
+        self.assertEqual(done.returncode, 1, f"SPEC an undeclared refusal blocks\n{done.stdout}")
+        self.assertIn("**not compared**: lab-olympics against main", done.stdout)
+        for scope in ('cases = ["lab-olympics"]', 'pattern = "lab-*"'):
+            b = self.repo.commit(policy=absence(scope=scope))
+            done = verdict(self.repo.path, b, self.rounds(b, refused("main"), catalog), *checks(b, self.repo.tree(b)))
+            self.assertEqual(done.returncode, 0, f"SPEC {scope}: the owner's decision\n{done.stdout}{done.stderr}")
+            self.assertIn("- not compared by the owner's decision: lab-olympics against main: its perf lab has no "
+                          "commits mode (port: the commits port, after v1.5; approved 2026-11-11 by Johannes",
+                          done.stdout)
+            self.assertNotIn("**not compared**", done.stdout)
+            self.assertIn("main: 0 compared, 0 absent by product, 1 absent by the owner's decision", done.stdout)
+        for policy in (absence(side="base"), absence(scope='cases = ["lab-yago-tiny"]')):
+            c = self.repo.commit(policy=policy)
+            done = verdict(self.repo.path, c, self.rounds(c, refused("main"), catalog), *checks(c, self.repo.tree(c)))
+            self.assertEqual(done.returncode, 1, f"SPEC out of scope: {policy}\n{done.stdout}")
+            self.assertIn("**not compared**: lab-olympics against main", done.stdout)
+
+    def test_an_absence_without_johannes_s_word_or_its_port_is_refused(self):
+        # Spec: decision 1b: the entry carries by, approved, quote and source as the file already
+        # demands, and the planned port; without them it is a policy error and the verdict NOT PASSED.
+        catalog = [absent_case()]
+        for policy in (absence(by="the owner"), absence(extra=""), absence().replace('port = "the commits port, '
+                                                                                     'after v1.5"\n', ""),
+                       absence(scope='cases = ["lab-olympics"]\npattern = "lab-*"')):
+            a = self.repo.commit(policy=policy)
+            done = verdict(self.repo.path, a, self.rounds(a, refused("main"), catalog), *checks(a, self.repo.tree(a)))
+            self.assertEqual(done.returncode, 1, f"SPEC {policy}\n{done.stdout}")
+            self.assertIn("**policy**: benches/release-tradeoffs.toml: absence 1", done.stdout)
+
+
 class Tradeoffs(Scratch):
     """Only an owner-approved trade-off accepts a loss (benches/release-tradeoffs.toml at the
     candidate's tree). Moved from test_release_gate.py: the verdict reads its policy from the
