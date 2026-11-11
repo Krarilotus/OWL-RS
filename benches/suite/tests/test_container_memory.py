@@ -81,6 +81,23 @@ class ContainerMemoryPeak(unittest.TestCase):
         self.assertIsNone(sampler.stop())
         self.assertIn("no /proc here", sampler.why)
 
+    def test_a_sampler_that_breaks_mid_run_has_no_peak_and_says_why(self):
+        """Spec: the master's go of Wed 11 Nov, kind `unknown` instead of a quiet fallback. A reading of
+        120 by hand, then a memory.stat the sampler can't parse (kernel `x`): the readings after the
+        first are missing, so 120 is no peak; there is none, and why names the fault."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stat = Path(tmp) / "memory.stat"
+            stat.write_text("anon 100\nkernel 20\n", encoding="utf-8")
+            sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
+            try:
+                self.wait_for(sampler, 1)
+                stat.write_text("anon 300\nkernel x\n", encoding="utf-8")
+                sampler.thread.join(timeout=5)
+            finally:
+                peak = sampler.stop()
+        self.assertIsNone(peak)
+        self.assertIn("ValueError", sampler.why)
+
 
 class DockerRows(unittest.TestCase):
     """What the Docker runtime reports for a container: anon + kernel in MiB as the peak, kind

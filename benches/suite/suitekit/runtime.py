@@ -257,6 +257,9 @@ class ContainerMemory:
                         break  # the container ended: its cgroup is gone, its peak stands
                     self.why = f"memory.stat unreadable: {error}"
                     break
+                except Exception as error:  # e.g. inspect's timeout, a stat it can't parse: readings are missing
+                    self.peak, self.why = None, f"sampler failed: {type(error).__name__}: {error}"
+                    break
                 if value is not None:
                     self.reads += 1
                     self.peak = value if self.peak is None else max(self.peak, value)
