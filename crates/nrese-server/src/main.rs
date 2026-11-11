@@ -54,10 +54,61 @@ fn main() -> Result<()> {
     result
 }
 
-/// How long the requests in flight may finish after a stop signal: well inside the 10 s a
-/// container runtime (`docker stop`) waits before it kills, leaving the rest for the store
-/// to close.
+/// How long the requests in flight may finish after a stop signal, leaving the rest of
+/// [`STOP_DEADLINE`] for the replica's follower and the store to close.
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The whole stop's bound, from the signal: inside the 10 s a container runtime
+/// (`docker stop`) waits before it kills, with room for the process to end.
+const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// What a stop under way waits for: an index into [`STOP_STEPS`], for the line the deadline
+/// logs.
+static STOP_STEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const STOP_STEPS: [&str; 3] = [
+    "the requests in flight",
+    "the replica's follower",
+    "the store's close (a checkpoint or merge in progress)",
+];
+
+fn stop_step(step: usize) {
+    STOP_STEP.store(step, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A close that takes long (a checkpoint of a large store), for the stop deadline's test:
+/// `NRESE_TEST_HOLD_CLOSE_MS` in a debug build. A release build has no such hold.
+fn hold_the_close_for_a_test() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("NRESE_TEST_HOLD_CLOSE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// Ends the process with code 0 at [`STOP_DEADLINE`] after `signal` if the stop hasn't
+/// ended it by then, saying what it still waited for. What is left is abandoned as on a
+/// kill: every acknowledged commit is synced, and the next open recovers from the
+/// checkpoint and the log.
+fn stop_deadline(signal: &'static str) {
+    let spawned = std::thread::Builder::new()
+        .name("nrese-stop-deadline".to_owned())
+        .spawn(move || {
+            std::thread::sleep(STOP_DEADLINE);
+            let step = STOP_STEP.load(std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!(
+                signal,
+                seconds = STOP_DEADLINE.as_secs(),
+                waiting_for = STOP_STEPS[step.min(STOP_STEPS.len() - 1)],
+                "nrese-server stop deadline reached: ending the process"
+            );
+            std::process::exit(0);
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "no stop deadline: the stop waits for the store to close");
+    }
+}
 
 /// The stop signals, listened for from the call on: SIGTERM (`docker stop`, systemd,
 /// Kubernetes) and SIGINT (ctrl-c). Resolves to the one that came first.
@@ -304,9 +355,10 @@ async fn run() -> Result<()> {
     });
     // Peer addresses for the mtls mode's trusted proxies. On a stop signal it accepts no
     // more connections, closes idle ones, and lets the requests in flight finish, for up to
-    // DRAIN; the store then closes as it does when the server ends.
-    let (stopping, stopped_by) = tokio::sync::oneshot::channel();
-    let serve = std::future::IntoFuture::into_future(
+    // DRAIN; then the replica's follower stops and the store closes, all within
+    // STOP_DEADLINE of the signal.
+    let (stopping, mut stopped_by) = tokio::sync::oneshot::channel();
+    let mut serve = Box::pin(std::future::IntoFuture::into_future(
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -314,24 +366,37 @@ async fn run() -> Result<()> {
         .with_graceful_shutdown(async move {
             let _ = stopping.send(stop.await);
         }),
-    );
-    tokio::pin!(serve);
+    ));
+    let mut stopped = None;
     let served = tokio::select! {
-        served = &mut serve => served,
-        Ok(signal) = stopped_by => {
+        // The signal first when both are ready: it is sent before serving ends.
+        biased;
+        Ok(signal) = &mut stopped_by => {
+            stop_deadline(signal);
             let started = std::time::Instant::now();
             let drained = tokio::time::timeout(DRAIN, &mut serve).await;
-            tracing::info!(
-                signal,
-                ms = started.elapsed().as_millis() as u64,
-                requests_cut = drained.is_err(),
-                "nrese-server stopped"
-            );
+            stopped = Some((signal, started, drained.is_err()));
             drained.unwrap_or(Ok(()))
         }
+        served = &mut serve => served,
     };
+    stop_step(1);
     if let Some(follower) = follower {
         follower.stop().await;
+    }
+    // The store closes here (its maintenance ends first) unless a request the drain cut
+    // still holds it; then at the runtime's shutdown.
+    stop_step(2);
+    drop(serve);
+    hold_the_close_for_a_test();
+    drop(store);
+    if let Some((signal, started, requests_cut)) = stopped {
+        tracing::info!(
+            signal,
+            ms = started.elapsed().as_millis() as u64,
+            requests_cut,
+            "nrese-server stopped"
+        );
     }
     served.context("nrese-server terminated unexpectedly")
 }

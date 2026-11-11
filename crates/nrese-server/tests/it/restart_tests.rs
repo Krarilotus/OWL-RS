@@ -133,10 +133,10 @@ async fn a_repository_without_its_own_reasoning_keeps_the_server_s_after_a_resta
     Ok(())
 }
 
-/// How long a stopped server may take to end: inside the 10 s a container runtime
-/// (`docker stop`) waits before it kills.
+/// How long a stopped server may take to end: its 8 s stop deadline and the process's end,
+/// inside the 10 s a container runtime (`docker stop`) waits before it kills.
 #[cfg(unix)]
-const STOPPED: std::time::Duration = std::time::Duration::from_secs(8);
+const STOPPED: std::time::Duration = std::time::Duration::from_secs(9);
 
 /// A stop signal (SIGTERM, as `docker stop` sends it to the server, process 1 in its image)
 /// ends the server cleanly: with code 0, within [`STOPPED`], saying so in one line, and a
@@ -155,6 +155,42 @@ async fn a_stop_signal_ends_the_server_cleanly_and_keeps_its_commits() -> Outcom
     }
     if !output.contains("nrese-server stopped") {
         wrong.push(format!("no line saying it stopped:\n{output}"));
+    }
+    let server = Server::start(&config).await?;
+    if !bob(&server
+        .query("nrese", "SELECT ?x WHERE { ?x a <urn:Employee> }")
+        .await?)
+    {
+        wrong.push("after the restart: the commit before the signal is gone".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
+/// A stop whose store doesn't close in time (a checkpoint of a large store; here a close
+/// held for 30 s, `NRESE_TEST_HOLD_CLOSE_MS`) ends at the stop deadline all the same: with
+/// code 0, within [`STOPPED`], naming the close it gave up on, and a commit acknowledged
+/// before the signal is there after a restart.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_ends_at_its_deadline_when_the_store_does_not_close_in_time() -> Outcome {
+    let dir = tempfile::tempdir()?;
+    let config = configured(dir.path(), "off")?;
+    let server = Server::start_with(&config, &[("NRESE_TEST_HOLD_CLOSE_MS", "30000")]).await?;
+    server.update("nrese", EMPLOYEE).await?;
+    let (status, output) = server.terminate(STOPPED)?;
+    let mut wrong = Vec::new();
+    if status.code() != Some(0) {
+        wrong.push(format!(
+            "ended with {status}, not code 0:
+{output}"
+        ));
+    }
+    if !output.contains("stop deadline reached") || !output.contains("the store's close") {
+        wrong.push(format!(
+            "no line naming the close it gave up on:
+{output}"
+        ));
     }
     let server = Server::start(&config).await?;
     if !bob(&server
