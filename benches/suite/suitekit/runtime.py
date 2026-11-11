@@ -2,8 +2,11 @@
 
 An adapter describes a step as a `Spec` (image, command, mounts, environment, the port a
 server listens on) in container terms; a runtime carries it out and measures it: wall
-time, peak memory (Docker: the stream of `docker stats`, about one reading a second, so a step
-shorter than that may have none; Apptainer and processes: the kernel's peak resident
+time, peak memory (Docker: the container's anonymous plus kernel memory from its cgroup's
+memory.stat, read every 50 ms, kind `anon-kernel`, the owner's kind across systems (13 Oct
+2026: memory in use, never cache); where memory.stat can't be read, kind `unknown` and no peak.
+The `docker stats` peak, about one reading a second and counting active page cache, goes only
+in the row's note; Apptainer and processes: the kernel's peak resident
 memory of the process and the descendants it waited for (wait4), and the process tree
 sampled from /proc), exit code. The process runtime maps
 container paths in the command and environment to the host directories mounted there.
@@ -68,6 +71,8 @@ class Measured:
     peak_mib: int | None
     rc: int
     timed_out: bool = False
+    memory_kind: str = ""  # the peak's kind where the runtime knows it (Docker: anon-kernel or unknown)
+    memory_note: str = ""  # what else the peak needs to be read right (Docker: the docker stats figure)
 
     @property
     def ok(self) -> bool:
@@ -81,6 +86,7 @@ class Server:
     log: Path | None = None
     peak_mib: int | None = None
     sampler: "Sampler | DockerStats | None" = None
+    memory: "ContainerMemory | None" = None  # Docker: the container's anon + kernel
 
 
 def shell(command: list[str]) -> str:
@@ -176,6 +182,107 @@ class DockerStats:
             self.process.wait(timeout=10)
         self.thread.join(timeout=10)
         return self.peak
+
+
+# Memory in use, never cache (the owner's decision, 13 Oct 2026; suitekit/compare.py): a cgroup's
+# anonymous and kernel memory. One definition, read by fast.py's scope sampler and by the Docker
+# runtime's container sampler (ContainerMemory).
+KERNEL_PARTS = ("kernel_stack", "pagetables", "sec_pagetables", "percpu", "sock", "vmalloc", "slab")
+ANON_KERNEL_S = 0.05
+
+
+def anon_kernel_bytes(stat: str) -> int | None:
+    """anon + kernel from a cgroup's memory.stat (kernel: its own field, else the sum of its parts)."""
+    fields = dict(line.split() for line in stat.splitlines() if len(line.split()) == 2)
+    if "anon" not in fields:
+        return None
+    kernel = int(fields["kernel"]) if "kernel" in fields else sum(int(fields.get(k, 0)) for k in KERNEL_PARTS)
+    return int(fields["anon"]) + kernel
+
+
+def cgroup_dir(listing: Path) -> Path | None:
+    """A process's cgroup v2 directory on this host, from its /proc/PID/cgroup: the line `0::PATH`
+    (Linux, Documentation/admin-guide/cgroup-v2.rst). None under cgroup v1, or for a path that
+    would leave the cgroup2 mount."""
+    for line in listing.read_text(encoding="utf-8").splitlines():
+        hierarchy, _, rest = line.partition(":")
+        controllers, _, path = rest.partition(":")
+        if hierarchy == "0" and not controllers and path.startswith("/") and ".." not in path.split("/"):
+            return Path("/sys/fs/cgroup") / path.lstrip("/")
+    return None
+
+
+class ContainerMemory:
+    """The peak of a running container's anonymous plus kernel memory: its cgroup's memory.stat,
+    read every ANON_KERNEL_S on this host. The cgroup is found from the container's first process
+    (`docker inspect`, then /proc/PID/cgroup), so it follows Docker's cgroup driver and any parent
+    a fleet envelope sets. `why` says why there is no peak (cgroup v1, a daemon in another VM, no
+    access); `reads` and `cpu_s` are the sampler's own count and CPU time."""
+
+    def __init__(self, name: str, locate=None, period_s: float = ANON_KERNEL_S):
+        self.name, self.period_s = name, period_s
+        self.locate = locate or self.find
+        self.peak: int | None = None
+        self.why, self.reads, self.cpu_s = "not read before the container stopped", 0, 0.0
+        self.halt = threading.Event()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def find(self) -> Path | None:
+        found = run_quiet(["docker", "inspect", "-f", "{{.State.Pid}}", self.name], 30)
+        pid = found.stdout.strip()
+        if found.returncode or not pid.isdigit():
+            raise OSError(f"docker inspect: {(found.stderr or found.stdout).strip()[:200] or 'no PID'}")
+        if pid == "0":
+            return None  # created, not running yet: asked again at the next reading
+        group = cgroup_dir(Path(f"/proc/{pid}/cgroup"))
+        if group is None:
+            raise OSError("no cgroup v2 directory for the container's process (cgroup v1?)")
+        return group
+
+    def loop(self):
+        started = time.thread_time()
+        stat = None
+        try:
+            while not self.halt.is_set():
+                try:
+                    if stat is None:
+                        group = self.locate()
+                        stat = group / "memory.stat" if group else None
+                    value = anon_kernel_bytes(stat.read_text(encoding="utf-8")) if stat else None
+                    if stat and value is None:
+                        self.why = f"no anon field in {stat}"
+                except OSError as error:
+                    if stat is not None and self.peak is not None:
+                        break  # the container ended: its cgroup is gone, its peak stands
+                    self.why = f"memory.stat unreadable: {error}"
+                    break
+                if value is not None:
+                    self.reads += 1
+                    self.peak = value if self.peak is None else max(self.peak, value)
+                self.halt.wait(self.period_s)
+        finally:
+            self.cpu_s = time.thread_time() - started
+
+    def stop(self) -> int | None:
+        """Its peak in bytes, or None (see `why`)."""
+        self.halt.set()
+        self.thread.join(timeout=10)
+        return self.peak
+
+
+def container_memory(memory: "ContainerMemory | None", sampled_mib: int | None) -> tuple[int | None, str, str]:
+    """A container's peak in MiB, its kind and its note: anon + kernel where memory.stat was read,
+    else no peak, kind `unknown` and why. The `docker stats` peak only in the note, as what it is."""
+    peak = memory.stop() if memory else None
+    sampled = (f"docker stats {sampled_mib} MiB, page cache included, not compared"
+               if sampled_mib is not None else "docker stats: no reading")
+    if peak is None:
+        why = memory.why if memory else "not sampled"
+        return None, "unknown", f"anon-kernel unknown: {why}; {sampled}"
+    cost = (f"; sampler {memory.reads} reads, {memory.cpu_s * 1000:.0f} ms CPU"
+            if isinstance(memory, ContainerMemory) else "")
+    return round(peak / 1048576), "anon-kernel", f"{sampled}{cost}"
 
 
 def reap(process: subprocess.Popen, timeout: float) -> tuple[int | None, int | None]:
@@ -334,6 +441,9 @@ class Runtime:
         self.dry = False
         self.created_stores: list[str] = []
         self.cleanup_errors: list[str] = []
+        # The kind and note of the peak the last `stop` returned, where the runtime knows them
+        # (Docker); the driver writes them on the serve row.
+        self.last_memory: tuple[str, str] = ("", "")
 
     def attempt(self, action, *args) -> bool:
         try:
@@ -471,6 +581,8 @@ class DockerRuntime(Runtime):
         self.attempt(self.save_logs, server)
         if server.sampler:
             server.sampler.stop()
+        if server.memory:
+            server.memory.stop()
         self.remove_resource("container", name)
         self.containers.pop(name)
 
@@ -489,6 +601,9 @@ class DockerRuntime(Runtime):
     def sample(self, name: str) -> DockerStats:
         return DockerStats(name)
 
+    def memory(self, name: str) -> ContainerMemory:
+        return ContainerMemory(name)
+
     def save_logs(self, server):
         if server.log:
             server.log.write_text(self.logs(server), encoding="utf-8", errors="replace")
@@ -502,6 +617,7 @@ class DockerRuntime(Runtime):
         try:
             subprocess.run(argv, check=True, capture_output=True)
             sampler = server.sampler = self.sample(spec.name)
+            server.memory = self.memory(spec.name)
             timed_out = False
             try:
                 waited = subprocess.run(["docker", "wait", spec.name], capture_output=True, text=True,
@@ -511,8 +627,8 @@ class DockerRuntime(Runtime):
                 run_quiet(["docker", "kill", spec.name])
                 timed_out, rc = True, 124
             ms = (time.monotonic() - started) * 1000
-            peak = sampler.stop()
-            return Measured(ms, peak, rc, timed_out)
+            peak, kind, note = container_memory(server.memory, sampler.stop())
+            return Measured(ms, peak, rc, timed_out, kind, note)
         finally:
             self.attempt(self.remove, spec.name)
 
@@ -523,6 +639,7 @@ class DockerRuntime(Runtime):
         server = self.containers[spec.name] = Server(spec, spec.name, log)
         subprocess.run(argv, check=True, capture_output=True)
         server.sampler = self.sample(spec.name)
+        server.memory = self.memory(spec.name)
         return server
 
     def alive(self, server):
@@ -542,6 +659,9 @@ class DockerRuntime(Runtime):
         reading = mib(ANSI.sub("", now.stdout)) if now.returncode == 0 and now.stdout.strip() else None
         if reading:
             peak = max(peak or 0, reading)
+        # The serve peak is the running server's: read before it is stopped.
+        peak, kind, note = container_memory(server.memory, peak)
+        self.last_memory = (kind, note)
         run_quiet(["docker", "stop", "-t", "60", server.spec.name], 120)
         self.remove(server.spec.name)
         return peak

@@ -280,6 +280,16 @@ class Suite:
         self.writer.write(result)
         self.written.append(result)
 
+    def stop_server(self, ctx: Context, system, base: dict, served: bool):
+        """Stops a system's server; a server that served gets its serve row: its peak with the
+        runtime's kind and note (Docker: anon-kernel, or unknown without a peak and why)."""
+        self.runtime.last_memory = ("", "")
+        peak = system.stop(ctx)
+        kind, memory_note = self.runtime.last_memory
+        if served and (peak is not None or kind == "unknown"):
+            self.emit(base, task="serve", peak_mib=peak if peak is not None else "", memory_kind=kind,
+                      note="; ".join(n for n in ("server peak over the run", memory_note) if n))
+
     def publish(self, key: str) -> str:
         return self.systems.get(key, {}).get("publish", "free")
 
@@ -633,8 +643,10 @@ class Suite:
             step = system.load(ctx, store, plan.inputs_of(key), regime)
             m = step.measured
             status = "ok" if m.ok else ("timeout" if m.timed_out else "failed")
+            memory_note = getattr(m, "memory_note", "")
             self.emit(base, task="load", status=status, ms=m.ms, peak_mib=m.peak_mib if m.peak_mib is not None else "",
-                      rows=step.asserted if step.asserted is not None else "", note=step.note)
+                      rows=step.asserted if step.asserted is not None else "",
+                      note="; ".join(n for n in (step.note, memory_note) if n), memory_kind=getattr(m, "memory_kind", ""))
             if status != "ok":
                 return
             in_memory = system.in_memory(regime)
@@ -669,11 +681,8 @@ class Suite:
                         # query's first execution is a miss in every mode.
                         if not system.persistent or in_memory:
                             break
-                        peak = system.stop(ctx)
+                        self.stop_server(ctx, system, {**base, "cache": modes[i - 1]}, served=True)
                         endpoint = None
-                        if peak is not None:
-                            self.emit({**base, "cache": modes[i - 1]}, task="serve", peak_mib=peak,
-                                      note="server peak over the run")
                         ctx.cache = mode
                         endpoint = system.serve(ctx, store, regime)
                     if plan.external:
@@ -685,9 +694,7 @@ class Suite:
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
         finally:
             def stop():
-                peak = system.stop(ctx)
-                if endpoint is not None and peak is not None:
-                    self.emit(base, task="serve", peak_mib=peak, note="server peak over the run")
+                self.stop_server(ctx, system, base, served=endpoint is not None)
 
             self.runtime.attempt(stop)
             # The runtime also owns interrupted loaders and partially started servers.

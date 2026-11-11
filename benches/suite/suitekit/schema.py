@@ -19,6 +19,7 @@
 | cache | the system's result cache while the queries ran: off, on (the system's default), or - (it has none) |
 | order | the query order: fixed (each query's runs back to back), or shuffled:SEED (rounds over all queries, each in a new order; the same seed gives every system the same orders) |
 | recall | approximate search: the share of the true nearest found (recall@k, k = rows), 0 to 1; its times compare only at equal recall (empty: an exact answer) |
+| memory_kind | the kind of peak_mib (suitekit/compare.py, "Memory, by kind"): `anon-kernel` (a container's anonymous plus kernel memory from memory.stat), `unknown` (it couldn't be read: no peak, the note says why); empty in rows written before 11 Nov 2026 and by runtimes that don't say, where readers take the runtime's (docker: `sampled`, `docker stats`) |
 
 The results of systems with publish = permission stay in the result files; `suite.py
 report` leaves them out unless asked (and they may not leave the machine without the
@@ -59,6 +60,7 @@ class Result:
     cache: str = "-"
     order: str = "-"
     recall: float | str = ""
+    memory_kind: str = ""
 
 
 FIELDS = [f.name for f in fields(Result)]
