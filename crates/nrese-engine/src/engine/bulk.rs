@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use nrese_exec::memory::HugePagesPhase;
 use nrese_rdf::Quad;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
@@ -73,6 +74,8 @@ pub struct BulkLoad<'e> {
     added: std::sync::atomic::AtomicU32,
     /// What interning a batch works in, kept for the next ones: one per thread adding.
     scratch: Mutex<Vec<BatchScratch>>,
+    /// A bulk phase for the load's life (`budgets.huge_pages = "bulk"`), however it ends.
+    _huge_pages: HugePagesPhase,
     /// The writer slot. Last, because fields drop in order: a load dropped unfinished joins
     /// its spilling thread and removes the spill directory (`spiller`) before the next load
     /// can start and create its own there (B-303).
@@ -108,6 +111,7 @@ impl<'e> BulkLoad<'e> {
             pending: Pending::default(),
             added: std::sync::atomic::AtomicU32::new(0),
             scratch: Mutex::default(),
+            _huge_pages: HugePagesPhase::begin(),
             _slot: slot,
         }
     }
@@ -209,6 +213,7 @@ impl<'e> BulkLoad<'e> {
             spill_failed,
             pending,
             scratch,
+            _huge_pages,
             ..
         } = self;
         drop(scratch);
@@ -793,6 +798,9 @@ fn release_covered(wal: &mut crate::durability::wal::Wal, root: &std::path::Path
 /// it without `finish` aborts it.
 pub struct Rematerialisation<'e> {
     engine: &'e Inner,
+    /// A bulk phase for the materialisation's life (`budgets.huge_pages = "bulk"`), however
+    /// it ends; before the slot, as fields drop in order.
+    _huge_pages: HugePagesPhase,
     _slot: MutexGuard<'e, ()>,
     base: Snapshot,
 }
@@ -802,6 +810,7 @@ impl<'e> Rematerialisation<'e> {
         let base = engine.shared.snapshot();
         Self {
             engine,
+            _huge_pages: HugePagesPhase::begin(),
             _slot: slot,
             base,
         }
@@ -836,6 +845,7 @@ impl<'e> Rematerialisation<'e> {
     pub fn finish_held(self, inferred: Vec<EncodedTriple>) -> EngineResult<super::Finished<'e>> {
         let Self {
             engine,
+            _huge_pages,
             _slot: slot,
             base,
         } = self;

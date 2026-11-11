@@ -28,6 +28,8 @@ pub mod error;
 pub use nrese_exec::memory;
 pub mod graph_store;
 mod graph_store_executor;
+#[cfg(all(test, target_os = "linux"))]
+mod huge_pages_tests;
 pub mod image_backup;
 pub mod jobs;
 mod loader;
