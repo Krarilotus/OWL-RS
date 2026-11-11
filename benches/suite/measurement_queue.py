@@ -2,10 +2,10 @@
 """The measurement queue: timed jobs batched per measure host, one at a time, in the
 windows the host allows (benches/README.md#the-measurement-queue).
 
-    python benches/suite/queue.py submit JOB.toml          push the job's checkout to its host, queue it
-    python benches/suite/queue.py status [--host HOST]     what is pending, running, done and failed
-    python benches/suite/queue.py cancel ID --host HOST    a pending job back out
-    python benches/suite/queue.py work [--once]            on a host: run its queue (one job at a time)
+    python benches/suite/measurement_queue.py submit JOB.toml          push the job's checkout to its host, queue it
+    python benches/suite/measurement_queue.py status [--host HOST]     what is pending, running, done and failed
+    python benches/suite/measurement_queue.py cancel ID --host HOST    a pending job back out
+    python benches/suite/measurement_queue.py work [--once]            on a host: run its queue (one job at a time)
 
 A job (TOML):
 

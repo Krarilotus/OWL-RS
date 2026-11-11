@@ -1,6 +1,6 @@
 """The suite's entry scripts, run by path (`python benches/suite/suite.py`, `abba.py`), leave the
-standard library's modules first: the directory's `queue.py` (the measurement queue from before
-the fleet) must not shadow `queue`, which every thread pool needs (Virtuoso's loader runs one)."""
+standard library's modules first: no module of theirs may shadow one, `queue` least of all, which
+every thread pool needs (Virtuoso's loader runs one)."""
 import subprocess
 import sys
 import tempfile

@@ -55,7 +55,7 @@ SUITE_SYSTEMS = {"qlever", "oxigraph", "virtuoso", "jena", "rdf4j", "nemo", "owl
                  "graphdb", "rdfox", "anzograph", "stardog"}
 DL_SYSTEMS = {"hermit", "openllet", "konclude", "elk"}
 LICENSED = {"graphdb", "rdfox", "stardog", "anzograph"}
-# A queue job's results directory when it runs as one (benches/suite/queue.py), else here.
+# A queue job's results directory when it runs as one (benches/suite/measurement_queue.py), else here.
 RESULTS = Path(os.environ["QUEUE_RESULTS"]) if os.environ.get("QUEUE_RESULTS") else fast.HERE / "results"
 # The systems whose answers the others are compared with, in order (answers.py): Jena's ARQ
 # (the oracle kit's), then the next that answered; never NRESE.

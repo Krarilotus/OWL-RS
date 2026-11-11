@@ -3,7 +3,7 @@
 # expected to give data for polishing or optimisation. Every workload of workloads.toml is
 # in exactly one list, and so is every catalogued benchmark without a workload yet
 # (`catalogue`), so that nothing gets lost (suite.py --check). The measurement queue starts
-# jobs in this order (suite/queue.py: a job's workload, or its cases' workload), and
+# jobs in this order (suite/measurement_queue.py: a job's workload, or its cases' workload), and
 # benches/STATUS.md shows it.
 
 now = [

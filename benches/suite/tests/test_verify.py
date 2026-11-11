@@ -33,7 +33,7 @@ import isolation
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts/verify"))
-sys.path.append(str(ROOT / "benches/suite"))  # suitekit, after the standard modules (queue.py)
+sys.path.append(str(ROOT / "benches/suite"))  # suitekit, after the standard modules
 spec = importlib.util.spec_from_file_location("verify_runner", ROOT / "scripts/verify/verify.py")
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
