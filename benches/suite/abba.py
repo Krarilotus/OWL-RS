@@ -401,6 +401,46 @@ def missing_checks(record: dict, paths: list[str], per_invocation: bool = True) 
                    if not any(c.get("path") == p and c.get("ok") is True for c in unit)})
 
 
+def record_problems(record: dict, series: list[str], floor: int, checks: list[str],
+                    per_invocation: bool = True) -> tuple[list[str], list[str]]:
+    """One record's content and samples: the declared content checks (`checks`) it has no passing
+    result for (missing_checks()), and each declared series (`series`) with fewer samples than
+    `floor`, in words. completeness() checks every record of a round by it, record_check() one
+    record of a smoke."""
+    short = [f"{n} samples of {s}, {floor} required" for s in series
+             if (n := len((record.get("samples") or {}).get(s) or [])) < floor]
+    return missing_checks(record, checks, per_invocation), short
+
+
+def record_check(catalog: list[dict], record: dict, floor: int = 1, off_route_ok: bool = False) -> list[str]:
+    """One run's record of a case (a smoke's: `fast.py run --reps 1`) checked as a round checks
+    each of its records, from the catalogue: its state (an answer or route that failed, rg.state()),
+    every content check its case declares (`check`), and every time series the release family
+    declares for it (rg.family_of()) with at least `floor` samples. A run that ends at its case's
+    declared outcome (`outcome`) counts as the release gate counts it, a known issue: checked, not
+    timed, nothing more to prove. Empty: it would count."""
+    name = record.get("case")
+    case = next((c for c in catalog if c["name"] == name), None)
+    if case is None:
+        return [f"{name}: no such case in the catalogue"]
+    e = rg.evidence([{"n": 1, "report": {"records": [record]}}], name)
+    problems = []
+    state = rg.state(e, off_route_ok=off_route_ok)
+    if state == "known" and not e["unchecked"]:
+        return []
+    if state != "ok" or e["unchecked"]:
+        why = e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
+        problems.append(f"{name}: {', '.join(map(str, sorted(set(map(str, e['status'])))))}"
+                        + (f" ({'; '.join(map(str, why))})" if why else "")
+                        + (f", {e['unchecked']} checks unchecked" if e["unchecked"] else ""))
+    series = [d[len("time/"):] for d in (h.split("|", 2)[2] for h in rg.family_of(catalog, [name], baselines=("a",)))
+              if d.startswith("time/")]
+    unchecked, short = record_problems(record, series, floor, sorted(case.get("check") or {}),
+                                       case.get("tool", "perf_lab") == "perf_lab")
+    problems += [f"{name}: no passing result for its content check {path}" for path in unchecked]
+    return problems + [f"{name}: {s}" for s in short]
+
+
 def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> list[str]:
     """Why a round's evidence can't be judged (empty: it can): its manifest, every block and slot,
     every process and content check on every side, every declared series' samples."""
@@ -441,12 +481,11 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
                 for r in p["report"].get("records", []):
                     if r.get("case") != case:
                         continue
-                    for path in missing_checks(r, declared[case], per_invocation[case]):
+                    unchecked, short = record_problems(r, series.get(case, []), floors[case], declared[case],
+                                                       per_invocation[case])
+                    for path in unchecked:
                         unproven.setdefault(path, []).append(p["n"])
-                    for s in series.get(case, []):
-                        n = len((r.get("samples") or {}).get(s) or [])
-                        if n < floors[case]:
-                            problems.append(f"{case} on {side}, pass {p['n']}: {n} samples of {s}, {floors[case]} required")
+                    problems += [f"{case} on {side}, pass {p['n']}: {s}" for s in short]
             if unproven:
                 problems.append(f"{case} on {side}: no passing result for its content checks "
                                 + "; ".join(f"{path} (passes {', '.join(map(str, ns))})"
@@ -758,9 +797,21 @@ def main() -> int:
     s.add_argument("results", type=Path, nargs="+", help="each round's results (FLEET_OUT), round 1 first")
     s.add_argument("--json", type=Path)
     s.add_argument("--out", type=Path)
+    s = sub.add_parser("record-check", help="a run's records (fast.py run --out) checked as a round checks "
+                                            "each record, by this checkout's catalogue: exit 1 if any fails")
+    s.add_argument("results", type=Path, help="a fast.py run report: its `records`")
+    s.add_argument("--floor", type=int, default=1, help="samples every declared series needs (default 1)")
+    s.add_argument("--off-route-ok", action="store_true", help="a baseline's record: another route is no failure")
     args = ap.parse_args()
     if args.command == "run":
         return run(args)
+    if args.command == "record-check":
+        catalog = cases_registry.load()
+        records = json.loads(args.results.read_text(encoding="utf-8"))["records"]
+        problems = [p for r in records for p in record_check(catalog, r, args.floor, args.off_route_ok)]
+        print("\n".join(problems) or (f"{len(records)} records: every check passed, every declared series "
+                                     f"at {args.floor} samples or more" if records else "no records in the report"))
+        return 1 if problems or not records else 0
     try:
         family = load_family(args.family, ROOT, harness=declared_harness(args))
     except (Invalid, OSError, tomllib.TOMLDecodeError, subprocess.CalledProcessError) as error:
