@@ -367,7 +367,7 @@ or preemption of schema reading, normalisation and compilation.
 
 ### Process-wide settings
 
-In this build four settings are the process's, not a repository's: `store.index_encoding`, `store.vocabulary`, `budgets.huge_pages` (only `off` changes anything) and `budgets.reasoning_release`. Opening a store (`StoreService::with_runtime`) sets them for the whole process (`nrese-store/src/service.rs`), so the store opened last decides for every store. The server opens every repository with the same values, so its repositories agree; an embedding application that opens stores with different values gets the last one's everywhere.
+In this build four settings are the process's, not a repository's: `store.index_encoding`, `store.vocabulary`, `budgets.huge_pages` and `budgets.reasoning_release`. Opening a store (`StoreService::with_runtime`) sets them for the whole process (`nrese-store/src/service.rs`), so the store opened last decides for every store; for `budgets.huge_pages`, the last store opened with `off` or `bulk` decides, and one opened with `on` (the default) changes nothing. Under `bulk`, the bulk loads and materialisations of every store count together: huge pages stay on while any one runs. Switching them off doesn't take back huge pages the process already holds. The server opens every repository with the same values, so its repositories agree; an embedding application that opens stores with different values gets the last one's everywhere.
 
 One diagnostic is read from the environment outside this configuration: `NRESE_CLASSIFY_TRACE` (set to anything) makes the DL classification write its phases with their start times to stderr (`nrese-dl/src/classify/mod.rs`). It changes no result; it is for the lab, not an operator setting.
 

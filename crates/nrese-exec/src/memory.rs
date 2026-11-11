@@ -853,7 +853,7 @@ fn linux_remaining(fs: &impl cgroup::Fs) -> Option<u64> {
 mod cgroup;
 
 mod huge_pages;
-pub use huge_pages::{HugePages, HugePagesPhase, set_huge_pages};
+pub use huge_pages::{HugePages, HugePagesPhase, set_huge_pages, transparent_huge_pages};
 
 #[cfg(test)]
 mod discovery_tests;

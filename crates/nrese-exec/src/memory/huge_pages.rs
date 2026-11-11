@@ -89,16 +89,38 @@ impl Drop for HugePagesPhase {
     }
 }
 
+/// Whether huge pages may back this process now, as the kernel shows it (`THP_enabled` in
+/// `/proc/self/status`, Linux 5.0 on); `None` where it can't be read: another platform, an
+/// older kernel, or one built without transparent huge pages.
+pub fn transparent_huge_pages() -> Option<bool> {
+    if !cfg!(target_os = "linux")
+        || !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists()
+    {
+        return None;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("THP_enabled:"))?;
+    Some(line.split_whitespace().nth(1)? == "1")
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    /// Whether the kernel lets huge pages back this process (`THP_enabled`, Linux 5.0 on).
     fn enabled() -> bool {
-        let status = std::fs::read_to_string("/proc/self/status").unwrap();
-        let line = status.lines().find(|l| l.starts_with("THP_enabled:"));
-        let line = line.expect("the kernel shows the process's huge pages");
-        line.split_whitespace().nth(1) == Some("1")
+        transparent_huge_pages().expect("shown: checked by switchable")
+    }
+
+    /// Whether this kernel shows the process's switch and lets it be set; where not (an
+    /// older kernel, one without huge pages, a container that refuses the call), the test
+    /// says so and checks nothing.
+    fn switchable() -> bool {
+        let able =
+            transparent_huge_pages().is_some() && super::super::set_transparent_huge_pages(true);
+        if !able {
+            eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
+        }
+        able
     }
 
     /// Under `Bulk`, huge pages are on exactly while a phase lives: off without one, on
@@ -106,7 +128,7 @@ mod tests {
     /// In a process of its own: the switch is the process's.
     #[test]
     fn bulk_holds_huge_pages_on_exactly_while_a_phase_lives() {
-        if !crate::measure::alone() {
+        if !crate::measure::alone() || !switchable() {
             return;
         }
         set_huge_pages(HugePages::Bulk);
@@ -140,12 +162,11 @@ mod tests {
     /// `On` and `Off`, phases change nothing.
     #[test]
     fn on_changes_nothing_and_phases_follow_only_bulk() {
-        if !crate::measure::alone() {
+        if !crate::measure::alone() || !switchable() {
             return;
         }
-        let started = enabled();
         drop(HugePagesPhase::begin());
-        assert_eq!(enabled(), started, "a phase under the default");
+        assert!(enabled(), "a phase under the default leaves the switch on");
         set_huge_pages(HugePages::Off);
         assert!(!enabled());
         let phase = HugePagesPhase::begin();
