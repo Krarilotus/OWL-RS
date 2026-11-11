@@ -229,7 +229,7 @@ Ill-formed shapes are 400, naming the shape and the parameter.
 
 Limits today:
 - SHACL Core and SHACL-SPARQL; SHACL Advanced Features are not supported, nor is `sh:entailment` (a shapes graph that asks for an entailment regime is reported as a failure). Commits are validated where the SHACL gate is on (`shacl.gate`, off by default: [config-reference.md](config-reference.md)), and rejected only under `enforce`; bulk loads (`nrese-server load`, the import endpoints) skip the gate ([storage](../spec/02-storage-and-transactions.md#bulk-loads)).
-- A `POST` holds the writer while it validates (its shapes live in a transaction that is never committed), so other writes wait.
+- A `POST`'s shapes live in a transaction of its own that is never committed and takes no writer slot, so other writes go on; they count against the request's memory.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
 ## Draft checks (`/api/v1/draft-check`)

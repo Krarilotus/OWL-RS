@@ -47,8 +47,8 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
   asserted ([storage](spec/02-storage-and-transactions.md#data-model)).
 - **`rdfs`** is a six-rule subset without axiomatic triples; `rdfs-full` has every RDFS rule
   ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset)).
-- **`owl2-rl`** doesn't store reflexive `owl:sameAs` (`?x owl:sameAs ?x` returns no
-  reflexive pairs), checks the datatype rules in part, and doesn't store axiomatic triples.
+- **`owl2-rl`** doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
+  return one for each; an asserted one is returned), checks the datatype rules in part, and doesn't store axiomatic triples.
   Lists past their limits are reported, not truncated
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
 - **What an answer promises.** Without the OWL 2 QL rewriting, every answer over a
@@ -63,9 +63,11 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
   (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)).
 - **Bulk loads skip the commit gates** ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
-  `nrese-server load` fails when the loaded data is inconsistent, and the data stays
-  loaded; SHACL isn't checked. A store whose data is found inconsistent is quarantined
-  until it is repaired ([consistency](spec/reasoning-semantics.md#consistency)).
+  neither SHACL nor the OWL 2 DL consistency check runs. With reasoning on,
+  `nrese-server load` recomputes the inferences and fails when the rules' consistency
+  checks find a violation (under `owl2-dl`, those of OWL 2 RL); the data stays loaded, and
+  the store is quarantined until it is repaired. With reasoning off, nothing is checked
+  ([consistency](spec/reasoning-semantics.md#consistency)).
 
 ## SHACL
 
@@ -73,7 +75,6 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
   which is reported as a failure ([HTTP interface](ops/http-api.md#shacl-validation)).
 - The commit gate is off by default; when on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)).
-- A validation with shapes sent in the request holds the writer while it runs.
 
 ## Storage and transactions
 

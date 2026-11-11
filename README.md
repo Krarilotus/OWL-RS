@@ -19,8 +19,8 @@ It may suit you if you:
 - want a store you can read and take apart: small crates in clear layers.
 
 Not there yet: parallel writes (one commit at a time), automatic failover (read replicas
-only), named graphs as reasoning boundaries, packages on crates.io. Every limit, and when to
-choose another system: [Limits and deviations](docs/limits.md).
+only), named graphs as reasoning boundaries, packages on crates.io. The main limits and deviations, and
+when to choose another system: [Limits and deviations](docs/limits.md).
 
 ## Quick start
 
@@ -43,9 +43,12 @@ requires it, before you expose the server ([access control](#access-control-and-
 
 ### A first example: inference, retraction, validation
 
-Add a class hierarchy and an instance, then ask for the instances of the superclass:
+Once the server is ready (the first line waits for it, for about a minute), add a class
+hierarchy and an instance, then ask for the instances of the superclass:
 
 ```bash
+curl -sSf --retry 60 --retry-delay 1 --retry-all-errors http://localhost:8080/readyz
+
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
   PREFIX ex: <http://example.org/>
   PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -109,27 +112,32 @@ answers `ex:felix`. When each part of a commit becomes visible, and what the che
 
 ### Your own data
 
-Five commands from the image to a query on your own file, `my.ttl`, with the data kept
-across a restart (stop the server above first: it holds the port):
+From the image to a query on your own file, `my.ttl`, with the data kept across a
+restart (stop the server above first: it holds the port). Each `/readyz` line waits for
+the server to be ready, retrying for about a minute, and fails with an error if it
+isn't:
 
 ```bash
 docker build -t nrese .
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v my-data:/var/lib/nrese/data nrese
+curl -sSf --retry 60 --retry-delay 1 --retry-all-errors http://localhost:8080/readyz
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
 curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 docker restart nrese
+curl -sSf --retry 60 --retry-delay 1 --retry-all-errors http://localhost:8080/readyz
+curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 ```
 
 The `PUT` answers `204 No Content` and makes your file the default graph. The count is
 its number of statements (for a file of three: `"value":"3"`), and after the restart the
 same query gives the same number. On Docker's stop signal the server lets the requests in
-flight finish, closes the store and exits, within 8 s of the signal
-([stopping](docs/ops/server-setup.md#64-stopping)). Every commit is synced to the log
-before it is acknowledged, so not even a kill loses one, and the restart recovers it
-([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)). After
-`docker run` and after the restart, give the server a second to start before the next
-request. Other syntaxes take their media type as `Content-Type`; large files load offline
-with `nrese-server load` ([server setup](docs/ops/server-setup.md)).
+flight finish, closes the store and exits ([stopping](docs/ops/server-setup.md#64-stopping)).
+Every commit is synced to the log before it is acknowledged, so not even a kill loses
+one, and the restart recovers it
+([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)). A large
+store takes longer to start: raise `--retry` to match. Other syntaxes take their media
+type as `Content-Type`; large files load offline with `nrese-server load`
+([server setup](docs/ops/server-setup.md)).
 
 ### From source
 
@@ -253,7 +261,7 @@ rules, no answer is claimed complete.
 | Capability | Limits and notes |
 |---|---|
 | [SHACL Core](https://www.w3.org/TR/shacl/) and SHACL-SPARQL | W3C suite for both, with no known failure listed ([runner](crates/nrese-shacl/tests/w3c_shacl)). Data is validated with its inferred statements unless `infer=false`. Not supported: SHACL Advanced Features (rules), and `sh:entailment`, which is reported as a failure |
-| Validation on request (`/dataset/shacl`), against stored shapes or shapes sent with the request | A validation with sent shapes holds the writer while it runs ([HTTP interface](docs/ops/http-api.md#shacl-validation)) |
+| Validation on request (`/dataset/shacl`), against stored shapes or shapes sent with the request | Sent shapes live in a transaction that is never committed, and count against the request's memory ([HTTP interface](docs/ops/http-api.md#shacl-validation)) |
 | Validation on commit (`shacl.gate`: `report` or `enforce`), only for the focus nodes the commit can affect | Off by default ([configuration](docs/ops/config-reference.md)) |
 
 ### Storage, transactions and durability
@@ -287,8 +295,11 @@ the inferred changes are written to the log (synced, on disk) and published toge
 one revision, so a query sees all of the commit or none of it. A deleted statement's
 inferences go in the same commit, unless they still follow from what remains. The
 gate's result isn't stored (`report` logs it); `GET /dataset/shacl` validates the current
-data on request. Bulk loads (`nrese-server load`) don't go through these gates: a load
-whose data is inconsistent fails after loading, and the data stays
+data on request. Bulk loads (`nrese-server load`) don't go through these gates. With
+reasoning on, a load recomputes the inferences afterwards and fails when the rules'
+consistency checks find a violation (under `owl2-dl`, those of OWL 2 RL: the DL check
+doesn't run); the data stays, and the store is quarantined. With reasoning off, nothing
+is checked
 ([storage contract](docs/spec/02-storage-and-transactions.md#writes),
 [consistency](docs/spec/reasoning-semantics.md#consistency),
 [SHACL gate](docs/ops/config-reference.md)).
@@ -419,7 +430,7 @@ runs recorded there are as of their dates.
 
 What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md) (its counts
 and measurements are as of when each was recorded); the order
-of work: [docs/ROADMAP.md](docs/ROADMAP.md); every limit and deviation, and when to choose
+of work: [docs/ROADMAP.md](docs/ROADMAP.md); the main limits and deviations, and when to choose
 another system: [docs/limits.md](docs/limits.md). The main limits today:
 
 - One writer at a time; reads never wait for it.
@@ -431,8 +442,9 @@ another system: [docs/limits.md](docs/limits.md). The main limits today:
 
 Platforms: the image for `linux/amd64` and `linux/arm64`; the merge checks also build and
 test on Windows ([scripts/check.sh](scripts/check.sh)). A stop signal (SIGTERM, ctrl-c)
-lets the requests in flight finish and closes the store, within 8 s; on Windows only ctrl-c
-in its console does, not a service stop ([stopping](docs/ops/server-setup.md#64-stopping)).
+lets the requests in flight finish and closes the store; a stop not done 8 s after the
+signal ends the process as a kill would. On Windows only ctrl-c in its console stops it
+this way, not a service stop ([stopping](docs/ops/server-setup.md#64-stopping)).
 After a crash or a kill, an on-disk store
 recovers every acknowledged commit; on damage other than a torn last write it refuses to
 open, unless configured otherwise ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)); backups
