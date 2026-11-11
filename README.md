@@ -43,11 +43,11 @@ requires it, before you expose the server ([access control](#access-control-and-
 
 ### A first example: inference, retraction, validation
 
-Once the server is ready (the first line waits for it, for about a minute), add a class
-hierarchy and an instance, then ask for the instances of the superclass:
+Once the server is ready (the first line waits for it, as in [your own data](#your-own-data)),
+add a class hierarchy and an instance, then ask for the instances of the superclass:
 
 ```bash
-curl -sSf --retry 60 --retry-delay 1 --retry-all-errors http://localhost:8080/readyz
+curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
 
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
   PREFIX ex: <http://example.org/>
@@ -114,17 +114,17 @@ answers `ex:felix`. When each part of a commit becomes visible, and what the che
 
 From the image to a query on your own file, `my.ttl`, with the data kept across a
 restart (stop the server above first: it holds the port). Each `/readyz` line waits for
-the server to be ready, retrying for about a minute, and fails with an error if it
-isn't:
+the server to be ready: it retries a second after each failed try (each try at most
+5 s), starts no retry after 60 s, and then fails with an error:
 
 ```bash
 docker build -t nrese .
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v my-data:/var/lib/nrese/data nrese
-curl -sSf --retry 60 --retry-delay 1 --retry-all-errors http://localhost:8080/readyz
+curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
 curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 docker restart nrese
-curl -sSf --retry 60 --retry-delay 1 --retry-all-errors http://localhost:8080/readyz
+curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
 curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 ```
 
@@ -135,7 +135,7 @@ flight finish, closes the store and exits ([stopping](docs/ops/server-setup.md#6
 Every commit is synced to the log before it is acknowledged, so not even a kill loses
 one, and the restart recovers it
 ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)). A large
-store takes longer to start: raise `--retry` to match. Other syntaxes take their media
+store takes longer to start: raise `--retry` and `--retry-max-time` to match. Other syntaxes take their media
 type as `Content-Type`; large files load offline with `nrese-server load`
 ([server setup](docs/ops/server-setup.md)).
 
