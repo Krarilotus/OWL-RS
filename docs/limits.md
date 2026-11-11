@@ -82,6 +82,9 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
   ([storage](spec/02-storage-and-transactions.md#limits)).
 - Client transactions read the latest commit; `SNAPSHOT` and `SERIALIZABLE` isolation are
   refused ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)).
+- A stop signal during start-up acts as a kill, and on Windows a service stop or
+  `taskkill /F` ends the server without letting its requests finish; acknowledged commits
+  are kept either way ([stopping](ops/server-setup.md#64-stopping)).
 
 ## Access control
 

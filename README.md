@@ -122,9 +122,10 @@ docker restart nrese
 
 The `PUT` answers `204 No Content` and makes your file the default graph. The count is
 its number of statements (for a file of three: `"value":"3"`), and after the restart the
-same query gives the same number. The restart takes about ten seconds: the server doesn't
-act on Docker's stop signal, so Docker stops it at the end of its grace period. Every
-commit is synced to the log before it is acknowledged, and the restart recovers it
+same query gives the same number. On Docker's stop signal the server lets the requests in
+flight finish, closes the store and exits, within 8 s of the signal
+([stopping](docs/ops/server-setup.md#64-stopping)). Every commit is synced to the log
+before it is acknowledged, so not even a kill loses one, and the restart recovers it
 ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)). After
 `docker run` and after the restart, give the server a second to start before the next
 request. Other syntaxes take their media type as `Content-Type`; large files load offline
@@ -429,7 +430,10 @@ another system: [docs/limits.md](docs/limits.md). The main limits today:
 - No releases on crates.io.
 
 Platforms: the image for `linux/amd64` and `linux/arm64`; the merge checks also build and
-test on Windows ([scripts/check.sh](scripts/check.sh)). After a crash, an on-disk store
+test on Windows ([scripts/check.sh](scripts/check.sh)). A stop signal (SIGTERM, ctrl-c)
+lets the requests in flight finish and closes the store, within 8 s; on Windows only ctrl-c
+in its console does, not a service stop ([stopping](docs/ops/server-setup.md#64-stopping)).
+After a crash or a kill, an on-disk store
 recovers every acknowledged commit; on damage other than a torn last write it refuses to
 open, unless configured otherwise ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)); backups
 and restores: [server setup](docs/ops/server-setup.md#10-backup-and-recovery-setup),
