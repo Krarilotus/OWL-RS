@@ -6,7 +6,7 @@ Generated 2026-11-11 by `python benches/suite/suite.py status --write` from [sui
 
 - **Workloads:** 42 (13 partial, 15 planned, 14 ready)
 - **Systems:** 33 (28 free to publish, 5 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 619; run at least once: 103; ok on their newest run: 86
+- **Pairs** (standard tier × system that can run it; build variants apart): 619; run at least once: 103; ok on their newest run: 64; run, outcome kept locally (`ran*`): 22
 - **NRESE:** 19 of its 108 standard tiers ok on their newest run
 - **Run records:** 37, newest 2026-10-12
 - **Before the reset:** 37 of the 37 records, and 222 of the 222 newest outcomes: history, not the current engine's (marked †; the v1.6 baseline measures the current engine)
@@ -662,7 +662,7 @@ partial, performance; tasks vector; kit `benches/breadth/vectors` (outside the d
 - fast 6 plain cases on oxigraph: partial (2026-10-06-fast-compete, † pre-reset): 4-cycles timed out
 - fast clients-sweep~plain on virtuoso: partial (2026-10-10-competitors-dc2114a, † pre-reset): incomplete: clients-64 (clients-64: 5 failed of 6)
 - fast dl cases on hermit: partial (2026-10-06-fast-suite, † pre-reset): timeouts at 120 s on most generated ontologies; parse and classify ok on the others
-- fast dl cases on konclude: partial (2026-10-06-fast-suite, † pre-reset): an error on dl-number; timeouts on nominals and Horn classification
+- fast dl cases on konclude: partial (2026-10-06-fast-suite, † pre-reset): timeouts on nominals and Horn classification; no taxonomy on dl-number
 - fast dl cases on openllet: partial (2026-10-06-fast-suite, † pre-reset): timeouts on most
 - fast dl-roles, el-classify on hermit: partial (2026-10-06-fast-compete, † pre-reset): el-classify timed out
 - fast dl-roles, el-classify on openllet: partial (2026-10-06-fast-compete, † pre-reset): el-classify timed out

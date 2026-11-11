@@ -1270,8 +1270,7 @@ check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
 # HermiT and Openllet refuse an irregular hierarchy; ELK and Konclude don't check it. On
-# 6 Oct 2026 ELK's taxonomy equalled NRESE's and Konclude's differed (outside OWL 2 DL,
-# Konclude's answer isn't defined).
+# 6 Oct 2026 ELK's taxonomy equalled NRESE's (outside OWL 2 DL, no answer is defined).
 systems = ["elk:el", "konclude:dl"]
 home_turf = "elk"
 reference = "/fast/ref/el-classes20000-roles12-irregular1.elk.tax"

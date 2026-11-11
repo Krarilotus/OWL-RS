@@ -162,7 +162,7 @@ benches/
 | [fast](fast/README.md) | many small cases: every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services, kernels, layout, plans; checks and route checks before times; home-turf cases per competitor | `fast/fast.py run`, `compare`, `compete` | `~/nrese-bench/reports/fast/` (full reports) | `baselines/fast/*.json` (compact records) |
 | [suite](suite/README.md) | every workload × system pair the cycle can run: load, size, restart, count, queries, answers, memory | `suite.py run`, `batch.sh` | `suite/results/<run>/` | record in `runs/` |
 | [reasoning](reasoning/README.md) | inferred sets fact by fact against a reference closure (precision, recall); the LUBM and OWL2Bench data | `reasoning-scorecard.sh` | `reasoning/results/` | — |
-| [reasoning/dl](reasoning/dl/README.md) | OWL 2 DL correctness and classification speed; the reference reasoners | `reference.py`, `w3c.py`, `ore.py`, `nrese.py` | `reasoning/dl/results/` | the TSVs (free systems only) and a record |
+| [reasoning/dl](reasoning/dl/README.md) | OWL 2 DL correctness and classification speed; the reference reasoners | `reference.py`, `w3c.py`, `ore.py`, `nrese.py` | `reasoning/dl/results/` (kept locally) | a record in `runs/` |
 | [reasoning/el-classification](reasoning/el-classification/README.md) | NRESE's EL classifier against ELK on random ontologies | `run_elk.sh`, `el_check.py` | scratch | — |
 | [competitors](competitors/README.md) | throughput with concurrent clients, writes under read load; the datasets of the basics mix | `scorecard.sh` | `competitors/results/` | the run records in `runs/` |
 | [integration](integration/README.md) | the RG × GS × GND workload | its scripts; the suite's `integration-rg-gs-gnd` | `integration/results/` | — |

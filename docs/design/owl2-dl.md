@@ -1035,9 +1035,9 @@ versions run anew (A, F). It is not a first milestone.
 
 ## 16. Inputs outside OWL 2 DL (as built, 13 October)
 
-**The question** (the owner, on ORE's `ore_ont_714`, which the reader found not OWL 2 DL
-and every reference but Openllet failed on): decide what can be decided soundly, and say
-exactly why where it can't. `nrese_dl::beyond` answers consistency
+**The question** (the owner, on ORE's `ore_ont_714`, which the reader found not OWL 2 DL):
+decide what can be decided soundly, and say exactly why where it can't. `nrese_dl::beyond`
+answers consistency
 (`beyond::consistency`) and classification (`beyond::classify`); every answer is certified by
 a model the independent checker verifies, or follows by monotonicity from part of the
 input, never assumed.
