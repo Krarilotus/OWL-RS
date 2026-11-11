@@ -744,8 +744,12 @@ fn generated_cases_answer_as_the_dl_oracle() {
     assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
 }
 
-/// How often a case is drawn again while owl2-dl finds it inconsistent.
-const REDRAWS: u64 = 3;
+/// How often a case is drawn again while owl2-dl finds it inconsistent. About one draw in
+/// six is (`NRESE_FUZZ_SEED=158`: 19 redraws for 100 cases). With three, a case still
+/// inconsistent came about once in fifteen runs, and in a family of a few cases it was over
+/// the family's fifth, a run inconclusive on a draw (D16-460); with ten, about once in
+/// three million runs, where the family's draws are as often inconsistent.
+const REDRAWS: u64 = 10;
 
 /// A case of the generated run as drawn: its seed, how often it was drawn again, its
 /// N-Triples, family and queries, and the verdicts of its first query.
@@ -759,13 +763,20 @@ struct Drawn {
 }
 
 /// Case `i` of the generated run with seed `base`. An inconsistent case says nothing of
-/// `complete` here, so it is drawn again, up to [`REDRAWS`] times, and the families keep
-/// their share: nearly half the verdicts of `dlorc-g1-measure2-6cc10f32` were inconsistent.
+/// `complete` here, so it is drawn again, up to [`REDRAWS`] times, in the family of its
+/// first draw: the families keep their share (nearly half the verdicts of
+/// `dlorc-g1-measure2-6cc10f32` were inconsistent), and a family owl2-dl finds inconsistent
+/// throughout stays counted, over its fifth (D16-460).
 fn drawn(i: u64, base: u64, expiry: &Expiry) -> Drawn {
-    let mut tries = 0u64;
+    let (mut k, mut tries) = (0u64, 0u64);
+    let mut first_family = None;
     loop {
-        let seed = seed(i, base, tries);
+        let seed = seed(i, base, k);
+        k += 1;
         let (turtle, family, queries) = generated(seed);
+        if *first_family.get_or_insert(family) != family {
+            continue;
+        }
         let case = Case {
             name: family,
             turtle: &turtle,
