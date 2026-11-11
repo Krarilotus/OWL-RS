@@ -99,3 +99,55 @@ fn an_inconsistent_premise_entails_everything() {
     assert!(answer.holds());
     assert_eq!(answer.premise.as_str(), "inconsistent");
 }
+
+/// - Input: a premise with an anonymous `hasValue` filler, `A ⊑ ∃p.{_:b}` and `_:b` a
+///   `B`, which OWL 2 DL forbids (*OWL 2 Structural Specification* §11.2) and the Direct
+///   Semantics reads as one individual, existential over the premise (§2.3.7–2.4).
+/// - Expected: `A ⊑ ∃p.B` entailed; `A ⊑ ∃p.C` not.
+#[test]
+fn a_premises_anonymous_filler_is_one_individual() {
+    let premise = ":p a owl:ObjectProperty . _:b a :B . :A rdfs:subClassOf \
+                   [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue _:b ] .";
+    let some = |c: &str| {
+        format!(
+            ":p a owl:ObjectProperty . :A rdfs:subClassOf \
+             [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom {c} ] ."
+        )
+    };
+    assert_eq!(entailed(premise, &some(":B")), Entailed::Yes);
+    assert_eq!(entailed(premise, &some(":C")), Entailed::No);
+}
+
+/// - Input: the premise `A ⊑ ∃p.{n}` and `x` an `A`; the conclusion `x : ∃p.{_:b}`.
+/// - Expected: undecided. A conclusion's anonymous individual is an existential to prove
+///   (it holds here, `_:b` being `n`); read as an individual of its own, as a premise's
+///   is, it would ask for more than the conclusion says and be answered "not entailed".
+#[test]
+fn a_conclusions_anonymous_filler_leaves_it_undecided() {
+    let premise = ":p a owl:ObjectProperty . :x a :A . :A rdfs:subClassOf \
+                   [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue :n ] .";
+    let conclusion = ":p a owl:ObjectProperty . \
+                      :x a [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue _:b ] .";
+    let answer = entailed(premise, conclusion);
+    assert!(matches!(answer, Entailed::Unknown(_)), "{answer:?}");
+}
+
+/// - Input: conclusions `B(_:c)`, which say that some individual is a `B` (*OWL 2 Direct
+///   Semantics* §2.3.7–2.4), over premises where an individual is one: `B(x)`, and a
+///   premise's own anonymous filler `_:b` asserted `B`; and over `⊤ ⊑ B`.
+/// - Expected: never "not entailed" over the first two (both entail it), "entailed" over
+///   the last (every individual is a `B`).
+#[test]
+fn a_conclusions_anonymous_individual_is_some_individual() {
+    let conclusion = "_:c a :B .";
+    let filler = ":p a owl:ObjectProperty . _:b a :B . :x a :A . :A rdfs:subClassOf \
+                  [ a owl:Restriction ; owl:onProperty :p ; owl:hasValue _:b ] .";
+    for premise in [":x a :B .", filler] {
+        let answer = entailed(premise, conclusion);
+        assert_ne!(answer, Entailed::No, "{premise}");
+    }
+    assert_eq!(
+        entailed("owl:Thing rdfs:subClassOf :B .", conclusion),
+        Entailed::Yes
+    );
+}
