@@ -125,7 +125,7 @@ Optional environment variables:
 - `NRESE_DEPLOYMENT_POSTURE`
   Example: `read-only-demo`, `internal-authenticated`, or `replacement-grade`
 - `NRESE_SPARQL_PARSE_ERROR_PROFILE`
-  Example: `problem-json` or `fuseki-plain-text`
+  Example: `problem-json` or `plain-text`
 - `NRESE_STORE_MODE`
   Example: `in-memory`
 - `NRESE_BIND_ADDR`

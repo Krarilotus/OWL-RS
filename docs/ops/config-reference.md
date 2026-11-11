@@ -45,7 +45,7 @@ deployment_posture = "internal-authenticated"
 [store]
 mode = "in-memory"
 data_dir = "./data"
-ontology_path = "C:/data/rg_ontology.ttl"
+ontology_path = "./ontology.ttl"
 
 [reasoner]
 mode = "owl2-rl"
