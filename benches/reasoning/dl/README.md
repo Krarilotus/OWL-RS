@@ -149,9 +149,9 @@ Openllet by `nrese.dl.Scope`):
 | 4: clean rules (no `=`, `≠`, empty heads), data | 983 | 970 | 8 | 5 |
 | 5: clean rules, no data | 985 | 972 | 12 | 1 |
 
-Every disagreement with a reference was checked against SWRL's semantics, with a minimal
-probe for each kind (`beyond/probes.py`) and samples checked by hand; NRESE answers every
-probe as the semantics does. NRESE's undecided cases (80 of 5,000): 66 models
+`beyond/probes.py` holds a minimal probe for each kind of disagreement with its answer
+under SWRL's semantics; the records that settle disagreements are kept locally. NRESE's
+undecided cases (80 of 5,000): 66 models
 the certificate builder can't fold into a model (counting cases, §10), 14 time budgets.
 
 ## Adjudication
