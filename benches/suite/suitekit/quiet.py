@@ -7,7 +7,7 @@ benches/reasoning/hostguard.py, whose own slot lock had no watcher and no fair s
     gib("28g")           a Docker memory size in GiB
 
 A timed step needs scripts/quiet-slot.sh around the kit's command, as every timed queue job
-has it (benches/suite/queue.py): the slot's watcher pauses other heavy work for the step and
+has it (benches/suite/measurement_queue.py): the slot's watcher pauses other heavy work for the step and
 judges it quiet or disturbed, and the queue's chunks share the slot fairly. The kit itself
 takes no lock: holding the slot per step inside a command that already holds it would wait
 forever, and holding it without the watcher measures beside whatever else runs. Untimed

@@ -1,4 +1,4 @@
-"""The measurement queue (benches/suite/queue.py): when a job may start, what keeps one out,
+"""The measurement queue (benches/suite/measurement_queue.py): when a job may start, what keeps one out,
 and a job's run from its checkout to done, failed or queued again.
 
     python -m unittest discover benches/suite/tests
@@ -20,7 +20,7 @@ from unittest.mock import patch
 import isolation
 
 SUITE =Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("queue_runner", SUITE / "queue.py")
+spec = importlib.util.spec_from_file_location("queue_runner", SUITE / "measurement_queue.py")
 queue = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(queue)
 
