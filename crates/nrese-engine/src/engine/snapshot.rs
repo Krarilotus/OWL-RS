@@ -1788,23 +1788,58 @@ impl Snapshot {
         permutation: Permutation,
         budget: &'b nrese_exec::Budget,
     ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
-        self.group_counts_on(model, pattern, permutation, budget, None)
+        self.group_counts_on(model, pattern, permutation, None, budget, None)
     }
 
-    /// [`Self::group_counts_in`] on the path `in_parts` chose for the whole walk, or, where
-    /// `None`, on the path its budget's room allows.
+    /// [`Self::group_counts_in`] of the matches whose first unbound component, in
+    /// `permutation`'s order, lies in `low..=high` (id order, as
+    /// [`Self::count_range_in`]): per distinct value in that range, the number of matching
+    /// quads in `model`, in id order. The walk reads only the range's keys, never the
+    /// pattern's others. Empty where `low > high`.
+    ///
+    /// Charged as `group_counts_in`: the groups to `budget` as they are found, the result
+    /// holding exactly their charge; refused, nothing is held. `None` where
+    /// `group_counts_in` would be.
+    pub fn group_counts_in_range<'b>(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        low: TermId,
+        high: TermId,
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
+        self.group_counts_on(model, pattern, permutation, Some((low, high)), budget, None)
+    }
+
+    /// [`Self::group_counts_in`], within `range` where one is given (see
+    /// [`Self::group_counts_in_range`]), on the path `in_parts` chose for the whole walk, or,
+    /// where `None`, on the path its budget's room allows.
     fn group_counts_on<'b>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
+        range: Option<(TermId, TermId)>,
         budget: &'b nrese_exec::Budget,
         in_parts: Option<bool>,
     ) -> Result<Option<GroupCounts<'b>>, nrese_exec::BudgetExceeded> {
         let pattern = self.read_pattern(model, pattern);
-        let Some((plan, bound)) = self.group_plan(model, &pattern, permutation) else {
+        let Some((mut plan, bound)) = self.group_plan(model, &pattern, permutation) else {
             return Ok(None);
         };
+        if let Some((low, high)) = range {
+            plan.low[bound] = plan.low[bound].max(low.raw());
+            plan.high[bound] = plan.high[bound].min(high.raw());
+            if plan.low[bound] > plan.high[bound] {
+                let (_, held) =
+                    nrese_exec::ChargedVec::<(TermId, u64), _>::new(budget).into_parts();
+                return Ok(Some(GroupCounts {
+                    counts: Vec::new(),
+                    held,
+                }));
+            }
+        }
         let in_parts = in_parts.unwrap_or_else(|| {
             let (keys, parts) = self.group_walk_size(model, &plan, bound);
             crate::index::walks_in_parts(budget, keys, parts, || {
@@ -2144,6 +2179,7 @@ impl Snapshot {
                 model,
                 &pattern,
                 permutation,
+                None,
                 budget,
                 Some(in_parts),
             ) {
