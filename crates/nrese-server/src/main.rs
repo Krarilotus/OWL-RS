@@ -87,26 +87,63 @@ fn hold_the_close_for_a_test() {
     }
 }
 
-/// Ends the process with code 0 at [`STOP_DEADLINE`] after `signal` if the stop hasn't
-/// ended it by then, saying what it still waited for. What is left is abandoned as on a
-/// kill: every acknowledged commit is synced, and the next open recovers from the
-/// checkpoint and the log.
-fn stop_deadline(signal: &'static str) {
-    let spawned = std::thread::Builder::new()
-        .name("nrese-stop-deadline".to_owned())
-        .spawn(move || {
-            std::thread::sleep(STOP_DEADLINE);
-            let step = STOP_STEP.load(std::sync::atomic::Ordering::SeqCst);
-            tracing::warn!(
-                signal,
-                seconds = STOP_DEADLINE.as_secs(),
-                waiting_for = STOP_STEPS[step.min(STOP_STEPS.len() - 1)],
-                "nrese-server stop deadline reached: ending the process"
-            );
-            std::process::exit(0);
-        });
-    if let Err(error) = spawned {
-        tracing::warn!(%error, "no stop deadline: the stop waits for the store to close");
+/// The stop's deadline: a thread made before the server serves (it doesn't serve without
+/// one), armed by the signal. At [`STOP_DEADLINE`] after it, if the stop hasn't ended the
+/// process, it ends it with code 0, as a kill would, saying what the stop still waited
+/// for. What is left is abandoned: every acknowledged commit is synced, and the next open
+/// recovers from the checkpoint and the log.
+struct StopDeadline(std::sync::mpsc::Sender<&'static str>);
+
+impl StopDeadline {
+    fn start() -> std::io::Result<Self> {
+        let (arm, armed) = std::sync::mpsc::channel::<&'static str>();
+        std::thread::Builder::new()
+            .name("nrese-stop-deadline".to_owned())
+            .spawn(move || {
+                // Never armed: the server ended without a signal.
+                let Ok(signal) = armed.recv() else { return };
+                std::thread::sleep(STOP_DEADLINE);
+                let step = STOP_STEP.load(std::sync::atomic::Ordering::SeqCst);
+                let waiting_for = STOP_STEPS[step.min(STOP_STEPS.len() - 1)];
+                // The line on a thread of its own, given a moment: a log reader that stopped
+                // reading can't hold the end.
+                let _ = std::thread::Builder::new().spawn(move || {
+                    tracing::warn!(
+                        signal,
+                        seconds = STOP_DEADLINE.as_secs(),
+                        waiting_for,
+                        "nrese-server stop deadline reached: ending the process"
+                    );
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                end_now();
+            })?;
+        Ok(Self(arm))
+    }
+
+    /// Starts the deadline: the stop has begun.
+    fn arm(&self, signal: &'static str) {
+        let _ = self.0.send(signal);
+    }
+}
+
+/// Ends the process at once with code 0, as a kill would: no exit handlers, no destructors,
+/// nothing that could wait.
+fn end_now() -> ! {
+    #[cfg(unix)]
+    // SAFETY: `_exit` takes no pointers and only ends the process.
+    unsafe {
+        libc::_exit(0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // SAFETY: the current process's pseudo-handle, which needs no closing.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+        // Not reached: the process ends in `TerminateProcess`.
+        std::process::abort()
     }
 }
 
@@ -331,8 +368,9 @@ async fn run() -> Result<()> {
     let bound_address = listener
         .local_addr()
         .with_context(|| format!("reading the address bound for {}", config.bind_address))?;
-    // Before the server says it serves: a stop sent from then on is heard.
+    // Before the server says it serves: a stop sent from then on is heard, and bounded.
     let stop = stop_signals().context("listening for stop signals")?;
+    let deadline = StopDeadline::start().context("starting the stop's deadline")?;
     tracing::info!(
         bind_address = %bound_address,
         deployment_posture = config.deployment_posture.as_str(),
@@ -364,22 +402,26 @@ async fn run() -> Result<()> {
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            let _ = stopping.send(stop.await);
+            // The deadline runs from here, whichever way serving then ends.
+            let signal = stop.await;
+            deadline.arm(signal);
+            let _ = stopping.send((signal, std::time::Instant::now()));
         }),
     ));
     let mut stopped = None;
     let served = tokio::select! {
-        // The signal first when both are ready: it is sent before serving ends.
-        biased;
-        Ok(signal) = &mut stopped_by => {
-            stop_deadline(signal);
-            let started = std::time::Instant::now();
+        Ok((signal, started)) = &mut stopped_by => {
             let drained = tokio::time::timeout(DRAIN, &mut serve).await;
             stopped = Some((signal, started, drained.is_err()));
             drained.unwrap_or(Ok(()))
         }
         served = &mut serve => served,
     };
+    // Serving can end in the same poll as the signal that ended it.
+    let stopped = stopped.or_else(|| {
+        let (signal, started) = stopped_by.try_recv().ok()?;
+        Some((signal, started, false))
+    });
     stop_step(1);
     if let Some(follower) = follower {
         follower.stop().await;

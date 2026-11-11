@@ -1259,6 +1259,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "jsonwebtoken",
+ "libc",
  "libmimalloc-sys",
  "mimalloc",
  "nrese-exec",
@@ -1284,6 +1285,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "utoipa",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
