@@ -409,10 +409,13 @@ impl Pending {
             + list(self.inferred.deletes.len() + shadowed)
     }
 
-    /// At most what [`Self::over_gone`] allocates for `hidden`: its list, grown by doubling.
-    pub(in crate::engine) fn over_gone_bound(&self, hidden: &[EncodedQuad]) -> usize {
-        let n = self.inferred.deletes.len() + self.asserted.inserts.len() + hidden.len();
-        2 * n.max(4) * std::mem::size_of::<EncodedQuad>()
+    /// At most what a pending snapshot over a view allocates at once for `hidden`, besides
+    /// what [`Snapshot::pending_within`] charges: [`Self::over_gone`]'s list and the asserted
+    /// inserts' and deletes' lists, each grown by doubling.
+    pub(in crate::engine) fn over_bound(&self, hidden: &[EncodedQuad]) -> usize {
+        let list = |n: usize| 2 * n.max(4) * std::mem::size_of::<EncodedQuad>();
+        let gone = self.inferred.deletes.len() + self.asserted.inserts.len() + hidden.len();
+        list(gone) + list(self.asserted.inserts.len()) + list(self.asserted.deletes.len())
     }
 
     pub(in crate::engine) fn asserted(&self) -> &Delta {

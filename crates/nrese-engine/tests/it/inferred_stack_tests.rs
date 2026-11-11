@@ -65,6 +65,52 @@ fn scan(snapshot: &Snapshot, model: ReadModel) -> BTreeSet<EncodedQuad> {
 }
 
 #[test]
+fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
+    // Spec: Engine::set_equality expands the current version's classes. Removing
+    // a sameAs edge while disabled must split the class after re-enabling, just as
+    // reopening does; an older snapshot must retain its original answers.
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
+    intern_terms(&engine);
+    let (a, b, same_as, p, o) = (id(1), id(2), id(3), id(4), id(5));
+    let edge = EncodedTriple::new(a, same_as, b).in_default_graph();
+    let fact = EncodedTriple::new(a, p, o).in_default_graph();
+    engine.set_equality(Some(same_as));
+    let mut tx = engine.transaction();
+    tx.insert_encoded(edge);
+    tx.insert_encoded(fact);
+    tx.commit().unwrap();
+    let held = engine.snapshot();
+    let before = scan(&held, ReadModel::Materialised);
+    assert!(before.contains(&EncodedTriple::new(b, p, o).in_default_graph()));
+    engine.set_equality(None);
+    let mut tx = engine.transaction();
+    tx.remove_encoded(edge);
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let after = scan(&engine.snapshot(), ReadModel::Materialised);
+    assert_eq!(
+        after,
+        BTreeSet::from([fact]),
+        "the removed edge no longer equates a and b"
+    );
+    assert_eq!(
+        scan(&held, ReadModel::Materialised),
+        before,
+        "held snapshot"
+    );
+    drop(held);
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config).unwrap();
+    reopened.set_equality(Some(same_as));
+    assert_eq!(after, scan(&reopened.snapshot(), ReadModel::Materialised));
+}
+
+#[test]
 fn read_models_select_the_stacks() {
     let engine = engine();
     let asserted = triple(1, 2, 3).in_default_graph();
@@ -738,8 +784,12 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
         "expanded count"
     );
     assert_eq!(stored.len_in(model), 4, "held, expanding");
+    let budget = nrese_exec::Budget::unlimited();
     assert_eq!(
-        canonical.group_counts_in(model, &in_g, Permutation::Gspo),
+        canonical
+            .group_counts_in(model, &in_g, Permutation::Gspo, &budget)
+            .expect("an unlimited budget")
+            .map(|groups| groups.to_vec()),
         Some(vec![(rep, 1)]),
         "subjects counted"
     );
@@ -832,12 +882,29 @@ fn merged_columns_keep_the_scan_order_or_are_refused() {
         .map(|q| q.object.raw())
         .collect();
     assert_eq!(scanned, [o100.raw(), o1.raw()]);
-    let columns = snapshot.scan_columns_in(model, &all, Permutation::Spog, &[2]);
+    let budget = nrese_exec::Budget::unlimited();
+    fn columns(
+        scanned: Result<Option<nrese_engine::ScanColumns<'_>>, nrese_exec::BudgetExceeded>,
+    ) -> Option<Vec<Vec<u64>>> {
+        scanned
+            .expect("an unlimited budget")
+            .map(|columns| columns.into_parts().0)
+    }
+    let all_columns =
+        columns(snapshot.scan_columns_in(model, &all, Permutation::Spog, &[2], &budget));
     assert!(
-        columns.as_ref().is_none_or(|c| c[0] == scanned),
-        "columns {columns:?}, scan {scanned:?}"
+        all_columns.as_ref().is_none_or(|c| c[0] == scanned),
+        "columns {all_columns:?}, scan {scanned:?}"
     );
-    let ranged = snapshot.scan_range_columns_in(model, &all, Permutation::Spog, s1, s2, &[2]);
+    let ranged = columns(snapshot.scan_range_columns_in(
+        model,
+        &all,
+        Permutation::Spog,
+        s1,
+        s2,
+        &[2],
+        &budget,
+    ));
     assert!(
         ranged.as_ref().is_none_or(|c| c[0] == scanned),
         "range columns {ranged:?}, scan {scanned:?}"
@@ -849,11 +916,19 @@ fn merged_columns_keep_the_scan_order_or_are_refused() {
     };
     let in_order = vec![vec![o1.raw(), o100.raw()]];
     assert_eq!(
-        snapshot.scan_columns_in(model, &by_predicate, Permutation::Posg, &[2]),
+        columns(snapshot.scan_columns_in(model, &by_predicate, Permutation::Posg, &[2], &budget)),
         Some(in_order.clone())
     );
     assert_eq!(
-        snapshot.scan_range_columns_in(model, &by_predicate, Permutation::Posg, o1, o100, &[2]),
+        columns(snapshot.scan_range_columns_in(
+            model,
+            &by_predicate,
+            Permutation::Posg,
+            o1,
+            o100,
+            &[2],
+            &budget,
+        )),
         Some(in_order)
     );
 }

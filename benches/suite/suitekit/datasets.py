@@ -23,8 +23,9 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from . import ns
 from .ledger import toml_value
-from .runtime import run_quiet
+from .runtime import ROOT, run_quiet
 
 HEADER = """# The frozen benchmark datasets (benches/PROTOCOL.md §6; `suite.py data`). Comparisons run
 # on byte-identical data: every file the standard tiers read, with its size and SHA-256, the
@@ -90,8 +91,8 @@ class Store:
         self.volume, self.directory = volume, directory
 
     def _sh(self, script: str, *args: str) -> str:
-        out = run_quiet(["docker", "run", "--rm", "-v", f"{self.volume}:/data:ro", "alpine", "sh", "-c", script,
-                         "sh", *args])
+        out = run_quiet([ns.executable(), *ns.run_args(ROOT, "suite"), "--rm", "-v", f"{self.volume}:/data:ro", "alpine",
+                         "sh", "-c", script, "sh", *args])
         return out.stdout
 
     def sizes(self, files: list[str]) -> dict[str, int]:

@@ -320,7 +320,11 @@ fn a_private_snapshot_searches_what_it_sees_and_leaves_the_shared_indexes() {
     private
         .try_insert(quad("b", "vector", vector(&[0.0, 1.0])).as_ref())
         .unwrap();
-    assert!(private.remove(quad("a", "label", literal("alpha beta")).as_ref()));
+    assert!(
+        private
+            .remove(quad("a", "label", literal("alpha beta")).as_ref())
+            .unwrap()
+    );
     let pending = private.pending_snapshot().unwrap();
     let own = pending.lookup(literal("alpha private").as_ref()).unwrap();
     let own_vector = pending.lookup(vector(&[0.0, 1.0]).as_ref()).unwrap();
@@ -401,8 +405,8 @@ fn a_private_snapshot_searches_what_it_sees_and_leaves_the_shared_indexes() {
 /// row 24 (lineage only at publication; DUR's condition 2).
 ///
 /// - Input: an engine whose reader-scoped search keeps a corpus. A write transaction's
-///   commit (the control), then a speculative writer's pending snapshot, then a private
-///   transaction's pending snapshot and its pending view.
+///   commit (the control), then a speculative writer's pending snapshot (private, over the
+///   latest), then a private transaction's pending snapshot and its pending view.
 /// - Expected: the commit records a lineage step; neither pending state records one.
 #[test]
 fn a_private_transaction_records_no_corpus_lineage() {
@@ -433,9 +437,11 @@ fn a_private_transaction_records_no_corpus_lineage() {
         "the measure sees a publication's step"
     );
 
-    let mut writer = engine.speculative();
-    writer.insert(quad("b", "label", literal("gamma")).as_ref());
-    let _pending_writer = writer.pending_snapshot();
+    let mut writer = engine.speculative(budget());
+    writer
+        .try_insert(quad("b", "label", literal("gamma")).as_ref())
+        .unwrap();
+    let _pending_writer = writer.pending_snapshot().unwrap();
     assert_eq!(
         steps(),
         after_writer,
@@ -471,8 +477,11 @@ fn private_transactions_at_the_edges() {
     assert_eq!(own.payload(), 0);
     let statement = quad("a", "p", literal("first"));
     assert!(tx.try_insert(statement.as_ref()).unwrap());
-    assert!(tx.remove(statement.as_ref()), "removed once");
-    assert!(!tx.remove(statement.as_ref()), "then nothing to remove");
+    assert!(tx.remove(statement.as_ref()).unwrap(), "removed once");
+    assert!(
+        !tx.remove(statement.as_ref()).unwrap(),
+        "then nothing to remove"
+    );
     assert_eq!(tx.len(), 0);
 }
 
@@ -770,4 +779,73 @@ fn a_pending_view_hiding_an_equality_edge_keeps_its_classes_apart() {
             "{order}: the view keeps its class"
         );
     }
+}
+
+/// The kept pending snapshot after a refused write (V1-engine review r1, F1). A matching
+/// removal refused part way keeps the removals before the refusal (`remove_matching`'s
+/// contract), so they are pending changes, and a pending snapshot must hold them.
+///
+/// - Input: 1,000 committed statements; a private transaction over them with 16 KiB, its
+///   pending snapshot taken (so kept); then the removal of all of them, refused part way.
+/// - Expected: `MemoryLimit`, with some removed; the next pending snapshot has the
+///   transaction's statements (`len`), not the kept snapshot's 1,000.
+#[test]
+fn a_pending_snapshot_after_a_removal_refused_part_way_holds_its_removals() {
+    let engine = engine();
+    let mut load = engine.transaction();
+    for n in 0..1_000 {
+        load.insert(quad("a", "p", literal(&n.to_string())).as_ref());
+    }
+    load.commit().expect("commit");
+    let base = engine.snapshot();
+    let mut tx = engine
+        .speculative_over(&base, Arc::new(Budget::new(16 * 1024)))
+        .unwrap();
+    let reader = budget();
+    assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), 1_000);
+    let refused = tx.remove_matching(&QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "{refused:?}"
+    );
+    assert!(tx.len() < 1_000, "refused part way: {:?}", tx.pending());
+    assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), tx.len());
+}
+
+/// The kept pending snapshot after a write refused before its first change (V1-engine review
+/// r1, R3; the master's decision of 18:12). A matching removal refused before it removed
+/// anything changed nothing, so the kept snapshot still holds.
+///
+/// - Input: ten committed statements; a private transaction over them, its pending snapshot
+///   taken (so kept); its budget then filled, the removal of all of them refused before the
+///   first, and the budget released.
+/// - Expected: `MemoryLimit` with nothing pending; the next pending snapshot for the same
+///   reader budget is the kept one (its identity).
+#[test]
+fn a_pending_snapshot_is_kept_after_a_removal_refused_before_its_first() {
+    let engine = engine();
+    let mut load = engine.transaction();
+    for n in 0..10 {
+        load.insert(quad("a", "p", literal(&n.to_string())).as_ref());
+    }
+    load.commit().expect("commit");
+    let charged = Arc::new(Budget::new(1 << 20));
+    let mut tx = engine
+        .speculative_over(&engine.snapshot(), Arc::clone(&charged))
+        .unwrap();
+    let reader = budget();
+    let kept = tx.pending_snapshot_within(&reader).unwrap().identity();
+    let room = charged.remaining();
+    charged.charge(room).unwrap();
+    let refused = tx.remove_matching(&QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+    charged.release(room);
+    assert!(
+        matches!(refused, Err(EngineError::MemoryLimit(_))),
+        "{refused:?}"
+    );
+    assert_eq!(tx.pending(), (0, 0), "refused before the first removal");
+    assert_eq!(
+        tx.pending_snapshot_within(&reader).unwrap().identity(),
+        kept
+    );
 }
