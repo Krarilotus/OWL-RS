@@ -52,6 +52,8 @@ mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
+mod lone_pattern_tests;
+#[cfg(test)]
 mod optimise_tests;
 pub(crate) mod ql;
 mod ranges;
@@ -122,6 +124,12 @@ use value::Value;
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
+
+/// The count of a lone BGP pattern [`Context::bgp`] doesn't take: never read as empty. Of
+/// the reads of a BGP's counts, only the join order and the worst-case-optimal join's tests
+/// reach a lone pattern's outside EXPLAIN, and neither acts on one (two patterns at least
+/// to order, three to join so).
+const NOT_COUNTED: u64 = u64::MAX;
 
 /// Rows of the first pattern in the first (and smallest) morsel of a basic graph pattern
 /// under LIMIT.
@@ -607,10 +615,10 @@ enum Form<'q> {
     Describe,
 }
 
-/// A query as the executor runs it: its pattern, its form, the rewrites that changed it,
-/// and what the QL rewriting did.
+/// A query as the executor runs it: its pattern (the query's own where nothing rewrote
+/// it), its form, the rewrites that changed it, and what the QL rewriting did.
 type NativePattern<'q> = (
-    GraphPattern,
+    Cow<'q, GraphPattern>,
     Form<'q>,
     Vec<&'static str>,
     Option<crate::ql::QlReport>,
@@ -635,8 +643,7 @@ fn index_answer(
     if options.as_written
         || options.pre_bound.is_some()
         || options.pin.is_some()
-        || ctx.canonical.is_some()
-        || ctx.canonical_refused.is_some()
+        || ctx.canonical_answers()
         || ql_rewriting(query, options).is_some()
     {
         return None;
@@ -715,21 +722,29 @@ fn native_pattern<'q>(
             unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
-    let (pattern, form) = ctx.canonical_query(pattern.into_owned(), form)?;
+    // The query's own pattern is copied only where a step below changes it: a copy and its
+    // drop were about 0.8k of a one-row lookup's instructions (11 November 2026). Canonical
+    // answers rewrite every constant, or refuse ([`Context::canonical_query`]).
+    let (pattern, form) = if ctx.canonical_answers() {
+        let (pattern, form) = ctx.canonical_query(pattern.into_owned(), form)?;
+        (Cow::Owned(pattern), form)
+    } else {
+        (pattern, form)
+    };
     let pattern = if options.as_written {
         pattern
     } else {
-        optimise(pattern, &mut rewrites, ctx)
+        optimised(pattern, &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
         Form::Ask if !options.as_written => {
             rewrites.push("ask-limit");
-            GraphPattern::Slice {
-                inner: Box::new(pattern),
+            Cow::Owned(GraphPattern::Slice {
+                inner: Box::new(pattern.into_owned()),
                 start: 0,
                 length: Some(1),
-            }
+            })
         }
         _ => pattern,
     };
@@ -750,7 +765,7 @@ fn native_pattern<'q>(
                     ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
                 }
             }
-            substitute::Values::new(ctx, values)?.top(&pattern)
+            Cow::Owned(substitute::Values::new(ctx, values)?.top(&pattern))
         }
         None => pattern,
     };
@@ -776,10 +791,19 @@ fn native_pattern<'q>(
 /// preparation (entities COUNT: 1 µs on main, 3–4 µs with the passes, 10 Nov 2026). One
 /// search answers all three, again only after a pass changed the pattern.
 fn optimise(
-    mut pattern: GraphPattern,
+    pattern: GraphPattern,
     fired: &mut Vec<&'static str>,
     ctx: &Context<'_>,
 ) -> GraphPattern {
+    optimised(Cow::Owned(pattern), fired, ctx).into_owned()
+}
+
+/// [`optimise`], copying a borrowed pattern only where a pass changes it.
+fn optimised<'q>(
+    mut pattern: Cow<'q, GraphPattern>,
+    fired: &mut Vec<&'static str>,
+    ctx: &Context<'_>,
+) -> Cow<'q, GraphPattern> {
     use nrese_sparql_syntax::visit::Node;
     let pays = |side: &crate::plan::Plan, keys: &[Variable]| ctx.pre_aggregation_pays(side, keys);
     let eager = |pattern: &GraphPattern| crate::plan::eager_aggregation_where(pattern, &pays);
@@ -812,15 +836,15 @@ fn optimise(
     let mut found = shapes(&pattern);
     for (i, (name, pass)) in passes.into_iter().enumerate() {
         if !found[i] {
-            debug_assert!(pass(&pattern) == pattern, "{name} changes {pattern}");
+            debug_assert!(pass(&pattern) == *pattern, "{name} changes {pattern}");
             continue;
         }
         #[cfg(test)]
         PASSES_RUN.set(PASSES_RUN.get() + 1);
         let rewritten = pass(&pattern);
-        if rewritten != pattern {
+        if rewritten != *pattern {
             fired.push(name);
-            pattern = rewritten;
+            pattern = Cow::Owned(rewritten);
             found = shapes(&pattern);
         }
     }
@@ -831,6 +855,14 @@ fn optimise(
 thread_local! {
     /// The rewrite passes [`optimise`] ran on this thread.
     static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
+    /// The patterns [`Context::bgp`] counted on this thread (exact or within a hint's ranges).
+    static BGP_ESTIMATES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
+#[cfg(test)]
+fn bgp_estimated() {
+    BGP_ESTIMATES.set(BGP_ESTIMATES.get() + 1);
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.
@@ -2940,26 +2972,36 @@ impl<'a> Context<'a> {
         } else {
             // The smallest pattern, with its range hint if it has one: a pattern many times
             // larger is joined by probing from the rows before it, never scanned, and a
-            // dictionary pass for it would be wasted.
-            let smallest = scans
-                .iter()
-                .map(|s| {
-                    let hinted = match &s.slots[2] {
-                        Slot::Var(object) if s.in_default_graph() && !s.repeats_variable() => hints
-                            .iter()
-                            .find(|h| &h.variable == object)
-                            .and_then(|hint| {
-                                let permutation = s.permutation_for(Some(object));
-                                (s.first_free(permutation) == Some(2))
-                                    .then(|| self.count_ranges(s, permutation, &hint.ranges))
-                            }),
-                        _ => None,
-                    };
-                    hinted
-                        .unwrap_or_else(|| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
-                })
-                .min()
-                .unwrap_or(0);
+            // dictionary pass for it would be wasted. Counted only when a string test asks,
+            // and only beside other patterns: a lone pattern is the smallest itself.
+            let mut smallest = None;
+            let count_smallest = || {
+                scans
+                    .iter()
+                    .map(|s| {
+                        #[cfg(test)]
+                        bgp_estimated();
+                        let hinted = match &s.slots[2] {
+                            Slot::Var(object) if s.in_default_graph() && !s.repeats_variable() => {
+                                hints
+                                    .iter()
+                                    .find(|h| &h.variable == object)
+                                    .and_then(|hint| {
+                                        let permutation = s.permutation_for(Some(object));
+                                        (s.first_free(permutation) == Some(2)).then(|| {
+                                            self.count_ranges(s, permutation, &hint.ranges)
+                                        })
+                                    })
+                            }
+                            _ => None,
+                        };
+                        hinted.unwrap_or_else(|| {
+                            self.snapshot.estimate_in(self.model, &s.quad_pattern())
+                        })
+                    })
+                    .min()
+                    .unwrap_or(0)
+            };
             let mut found: Vec<ranges::Hint> = Vec::new();
             for s in &scans {
                 let Slot::Var(object) = &s.slots[2] else {
@@ -2977,9 +3019,15 @@ impl<'a> Context<'a> {
                 ) else {
                     continue;
                 };
+                #[cfg(test)]
+                bgp_estimated();
                 let rows = self.snapshot.estimate_in(self.model, &s.quad_pattern());
                 if !condition.worth_a_pass(&self.snapshot, rows)
-                    || rows > smallest.saturating_mul(PROBE_FACTOR)
+                    || (scans.len() > 1
+                        && rows
+                            > smallest
+                                .get_or_insert_with(count_smallest)
+                                .saturating_mul(PROBE_FACTOR))
                 {
                     continue;
                 }
@@ -3027,16 +3075,28 @@ impl<'a> Context<'a> {
                     .then_some((permutation, hint.ranges.as_slice()))
             })
             .collect();
+        // Exact counts order the joins, decide how each later one joins and give EXPLAIN its
+        // estimates: a lone pattern outside EXPLAIN has none of these to do, and is scanned
+        // uncounted ([`NOT_COUNTED`]). Its two counts were about 4.9k of a one-row lookup's
+        // 25k instructions (11 November 2026).
+        let counted = scans.len() > 1 || self.trace.is_some();
         let counts: Vec<u64> = scans
             .iter()
             .zip(&ranged)
-            .map(|(s, ranged)| match ranged {
-                // One pattern: nothing to order, and the ranges are read once anyway.
-                Some(_) if scans.len() == 1 => {
-                    self.snapshot.estimate_in(self.model, &s.quad_pattern())
+            .map(|(s, ranged)| {
+                if !counted {
+                    return NOT_COUNTED;
                 }
-                Some((permutation, ranges)) => self.count_ranges(s, *permutation, ranges),
-                None => self.snapshot.estimate_in(self.model, &s.quad_pattern()),
+                #[cfg(test)]
+                bgp_estimated();
+                match ranged {
+                    // One pattern: nothing to order, and the ranges are read once anyway.
+                    Some(_) if scans.len() == 1 => {
+                        self.snapshot.estimate_in(self.model, &s.quad_pattern())
+                    }
+                    Some((permutation, ranges)) => self.count_ranges(s, *permutation, ranges),
+                    None => self.snapshot.estimate_in(self.model, &s.quad_pattern()),
+                }
             })
             .collect();
         let cyclic = ranged.iter().all(Option::is_none);
