@@ -330,6 +330,53 @@ class Schedule(unittest.TestCase):
             self.assertIn(text, errors)
 
 
+class NothingTimed(unittest.TestCase):
+    """Spec (owner's release, Wed 11 Nov): a timed part that produced nothing must not read as a
+    pass; the release verdict reads each part's report. `release_gate.py report` over no passes
+    wrote PASSED and exited 0, and the verdict over that report passed."""
+
+    def report(self, root: Path, family: list[str] | None = None) -> tuple[int, dict, str]:
+        directory = root / "passes"
+        argv = ["release_gate.py", "report", "--passes", str(directory), "--candidate", "cand",
+                *[a for s in SIDES for a in ("--side", f"{s}={REVS[s]}")], "--require", "base,main",
+                "--harness-revision", HARNESS, "--min-blocks", "2",
+                "--out", str(root / "release-gate.md"), "--json", str(root / "release-gate.json")]
+        if family is not None:
+            plan = {"run": sorted({h.split("|")[1] for h in family}), "not_run": {}, "elsewhere": {},
+                    "family": family}
+            (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            argv += ["--family", str(root / "plan.json")]
+        with patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding="utf-8")):
+            code = gate_module.main()
+        return (code, json.loads((root / "release-gate.json").read_text(encoding="utf-8")),
+                (root / "release-gate.md").read_text(encoding="utf-8"))
+
+    def assert_not_passed(self, code: int, summary: dict, text: str):
+        self.assertFalse(summary["passed"])
+        self.assertNotIn("**PASSED.**", text)
+        self.assertNotEqual(code, 0)
+        self.assertFalse(gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS)[0])
+
+    def test_a_report_over_no_passes_is_not_passed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "passes").mkdir()
+            self.assert_not_passed(*self.report(Path(tmp)))
+
+    def test_a_part_whose_passes_are_all_missing_is_not_passed(self):
+        """The part planned two cases (its family declared); every block was set aside as
+        disturbed (release-gate.sh aside: disturbed-pass-N-SIDE-STAMP.json), so no pass is left."""
+        family = [f"{s}|{c}|time/q01" for s in ("base", "main") for c in ("lab-olympics", "lubm-q1")]
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "passes"
+            directory.mkdir()
+            for n, side in enumerate(SIDES * 2, start=1):
+                (directory / f"disturbed-pass-{n}-{side}-1794390000.json").write_text("{}", encoding="utf-8")
+            (directory / "quiet-block-1-disturbed-1794390000.json").write_text(
+                json.dumps({"verdict": "disturbed"}), encoding="utf-8")
+            self.assert_not_passed(*self.report(Path(tmp), family))
+
+
 class Layouts(unittest.TestCase):
     def test_any_k_blocks_in_a_row_run_every_layout(self):
         # Round 8: the old rotation never ran a third of the layouts when 3 divided K.
