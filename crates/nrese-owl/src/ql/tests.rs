@@ -850,7 +850,8 @@ fn a_data_existential_on_the_left_needs_rdfs_literal() {
 /// A minimum cardinality on the left (review A-1202):
 /// - `≥ 2 R.⊤ ⊑ A` with `P ⊑ ∃R` makes neither a `P` nor an individual with one `R` edge an
 ///   `A` (`{u, v}`, `P = {u}`, `R = {(u, v)}`, `A = ∅` is a model): neither is an
-///   alternative, and `A` has a hazard;
+///   alternative. It is `⊤ ⊑ ≤ 1 R ⊔ A`: an individual outside `A` has one `R`-successor
+///   at most, so its hazard is global under QL's closure and RL's (D16-492 r1, F1);
 /// - `≥ 1 R.⊤ ⊑ A` is `∃R ⊑ A`: an `R` edge is an alternative;
 /// - `≥ 0 R.C ⊑ A` is `⊤ ⊑ A`: rewritten as `owl:Thing ⊑ A` is, so an anonymous `S`-successor
 ///   is an `A` too. Inside an intersection on the left it isn't read, and `A` has a hazard
@@ -866,9 +867,10 @@ fn a_minimum_cardinality_on_the_left_is_read_as_it_counts() {
     if out.iter().any(|b| b.contains("R(") || b.contains("P(")) {
         wrong.push(format!("≥ 2: {out:?}"));
     }
-    let found = concerns(two, "A(?x)");
-    if found != hazard {
-        wrong.push(format!("≥ 2 hazard: {found:?}"));
+    for lists in [false, true] {
+        if tbox(two, lists).0.global_hazard().is_none() {
+            wrong.push(format!("≥ 2 (lists {lists}): no global hazard"));
+        }
     }
     let one = rewritten(
         "SubClassOf(ObjectMinCardinality(1 :R owl:Thing) :A)",
