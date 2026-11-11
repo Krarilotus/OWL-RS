@@ -597,8 +597,9 @@ fn disjointness_concludes_the_complement_of_its_parts() {
 /// - `¬∃S.D ⊑ C`, `≤ 0 S.D ⊑ C` and `∀S.¬D ⊑ C` each put everything outside `C` in `∃S.D`.
 /// - `C ≡ ≤ 0 S.D`, in its direction from the restriction to `C`.
 ///
-/// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` and
-/// `A ⊓ B ⊑ C` conclude nothing of `S` or `D` from their left side: no concern.
+/// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` concludes
+/// nothing of `S` or `D`, and `A ⊓ B ⊑ C` nothing of `A` or `B` (review r1, F3: each guard
+/// queries the terms of its own left side): no concern.
 #[test]
 fn a_left_side_outside_the_profile_concludes_its_complement() {
     let none = "ObjectMaxCardinality(0 :S :D)";
@@ -619,16 +620,48 @@ fn a_left_side_outside_the_profile_concludes_its_complement() {
                 ));
             }
         }
-        for axioms in [
-            "SubClassOf(ObjectSomeValuesFrom(:S :D) owl:Nothing)",
-            "SubClassOf(ObjectIntersectionOf(:A :B) :C)",
+        for (axioms, atoms) in [
+            (
+                "SubClassOf(ObjectSomeValuesFrom(:S :D) owl:Nothing)",
+                "S(?x ?y), D(?y)",
+            ),
+            ("SubClassOf(ObjectIntersectionOf(:A :B) :C)", "A(?x), B(?x)"),
         ] {
-            let found = concerns_over(axioms, "S(?x ?y), D(?y)", lists);
+            let found = concerns_over(axioms, atoms, lists);
             if !found.is_empty() {
                 wrong.push(format!(
                     "{axioms} (lists {lists}): {found:?}, expected nothing"
                 ));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An axiom outside the profile whose left side, negated, makes individuals equal is a
+/// global hazard, as one whose right side does (review r1 of D16-492, F1):
+/// - `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R`: `R` is functional, so `a R b` and `a R c` make `b = c`.
+/// - `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`: every individual is `b`.
+///
+/// Neither names a term its conclusion adds a positive fact on, so only equality reaches
+/// the answers it changes. Under QL's closure and RL's, both are global. Guard: `∀R.D ⊑ C`
+/// is `⊤ ⊑ ∃R.¬D ⊔ C`, which equates nobody.
+#[test]
+fn an_equating_left_side_outside_the_profile_is_global() {
+    let mut wrong = Vec::new();
+    for lists in [false, true] {
+        for axioms in [
+            "SubClassOf(ObjectMinCardinality(2 :R) owl:Nothing)",
+            "SubClassOf(ObjectComplementOf(ObjectOneOf(:b)) owl:Nothing)",
+        ] {
+            let (tbox, _) = tbox(axioms, lists);
+            if tbox.global_hazard().is_none() {
+                wrong.push(format!("{axioms} (lists {lists}): no global hazard"));
+            }
+        }
+        let guard = "SubClassOf(ObjectAllValuesFrom(:R :D) :C)";
+        if let Some(h) = tbox(guard, lists).0.global_hazard() {
+            wrong.push(format!("{guard} (lists {lists}): global {h:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
