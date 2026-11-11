@@ -350,7 +350,53 @@ mod tests {
     use crate::rulesets::Ruleset;
 
     fn enabled() -> bool {
-        memory::transparent_huge_pages().expect("shown: checked by switchable")
+        memory::transparent_huge_pages().expect("shown: checked before")
+    }
+
+    /// An engine holding `:x a :A` with `:A rdfs:subClassOf :B`, and the RDFS program.
+    fn a_class_and_its_member() -> (Engine, super::super::Program) {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let text = "@prefix : <http://example.com/> .
+            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+            :A rdfs:subClassOf :B . :x a :A .";
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let program = super::super::Program::compile(&Ruleset::Rdfs.into(), &|t| tx.intern(t));
+        tx.commit().unwrap();
+        (engine, program)
+    }
+
+    /// Under the default (`on`), a closure (a commit's rebuild among them) leaves the
+    /// process's switch as the process started with it: the same during and after, finished
+    /// or stopped. Nothing here sets the switch.
+    #[test]
+    fn under_the_default_a_closure_leaves_huge_pages_as_the_process_started() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let Some(started) = memory::transparent_huge_pages() else {
+            eprintln!("not checked: this kernel doesn't show the process's huge pages");
+            return;
+        };
+        let (engine, program) = a_class_and_its_member();
+        let snapshot = engine.snapshot();
+        for stop in [false, true] {
+            let differed = AtomicBool::new(false);
+            let polled = AtomicBool::new(false);
+            let _ = super::materialise_until(&program, &snapshot, &|| {
+                polled.store(true, Ordering::Relaxed);
+                differed.fetch_or(enabled() != started, Ordering::Relaxed);
+                stop
+            });
+            assert!(polled.load(Ordering::Relaxed));
+            assert!(
+                !differed.load(Ordering::Relaxed),
+                "the same during a closure"
+            );
+            assert_eq!(enabled(), started, "the same after a closure");
+        }
     }
 
     /// Under `budgets.huge_pages = "bulk"`, a full closure has huge pages however its
@@ -368,16 +414,7 @@ mod tests {
             eprintln!("not checked: this kernel doesn't show or switch the process's huge pages");
             return;
         }
-        let engine = Engine::new(EngineConfig::default()).unwrap();
-        let mut tx = engine.transaction();
-        let text = "@prefix : <http://example.com/> .
-            @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
-            :A rdfs:subClassOf :B . :x a :A .";
-        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
-            tx.insert(quad.unwrap().as_ref());
-        }
-        let program = super::super::Program::compile(&Ruleset::Rdfs.into(), &|t| tx.intern(t));
-        tx.commit().unwrap();
+        let (engine, program) = a_class_and_its_member();
         let snapshot = engine.snapshot();
         memory::set_huge_pages(HugePages::Bulk);
         assert!(!enabled(), "off before a closure");
