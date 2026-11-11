@@ -72,7 +72,7 @@ fn a_private_snapshot_searches_its_vectors_and_the_bases() {
         private.try_insert(quad.as_ref()).unwrap();
     }
     for quad in removed() {
-        private.remove(quad.as_ref());
+        private.remove(quad.as_ref()).unwrap();
     }
     let pending = private.pending_snapshot().unwrap();
     let own_of = |snapshot: &Snapshot| {

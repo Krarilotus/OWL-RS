@@ -165,7 +165,11 @@ fn a_private_removal_of_a_same_as_written_representative_first_drops_the_alias()
                 .unwrap();
             match inferred {
                 true => assert!(private.remove_inferred(triple)),
-                false => assert!(private.remove_encoded(triple.in_default_graph())),
+                false => assert!(
+                    private
+                        .try_remove_encoded(triple.in_default_graph())
+                        .unwrap()
+                ),
             }
             let got = search(&read(&private.pending_snapshot().unwrap()));
             if got != want || got.is_err() {

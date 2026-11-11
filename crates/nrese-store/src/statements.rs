@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId};
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{GraphName, GraphNameRef, NamedNode, Quad, QuadRef, Term, TermRef};
 use nrese_sparql::ReadView;
@@ -208,13 +208,16 @@ fn check_write(requester: &crate::Requester, graph: GraphNameRef<'_>) -> StoreRe
 }
 
 /// Removes what `pattern` matches in the graphs the requester reads; every graph it would
-/// change must be writable.
-fn remove_matching(
-    tx: &mut Transaction<'_>,
+/// change must be writable. Either transaction kind, read as SPARQL reads it, through
+/// `budget` ([`nrese_sparql::PendingRead`]).
+fn remove_matching<T: nrese_sparql::UpdateTarget>(
+    tx: &mut T,
     pattern: &StatementPattern,
     requester: &crate::Requester,
+    budget: &Arc<nrese_exec::Budget>,
 ) -> StoreResult<()> {
-    let patterns = pattern.patterns(&*tx, &requester.read);
+    let view = nrese_sparql::PendingRead::new(&*tx, budget);
+    let patterns = pattern.patterns(&view, &requester.read);
     if let Some(writable) = requester.write.access() {
         let mut allowed = std::collections::HashSet::new();
         for engine_pattern in &patterns {
@@ -222,8 +225,8 @@ fn remove_matching(
                 if allowed.contains(&quad.graph) {
                     continue;
                 }
-                if !writable.allows_id(&*tx, quad.graph) {
-                    let graph = crate::mutation::command::graph_name(tx, quad.graph);
+                if !writable.allows_id(&view, quad.graph) {
+                    let graph = crate::mutation::command::graph_name(&*tx, quad.graph);
                     return requester.write.check(&graph);
                 }
                 allowed.insert(quad.graph);
@@ -423,19 +426,23 @@ impl StatementsRequest {
 }
 
 /// Applies the operations to `tx` for `requester`, the updates through `update` (the
-/// pipeline's SPARQL update path, with its dataset and cancellation).
-pub(crate) fn apply_statements(
-    tx: &mut Transaction<'_>,
+/// pipeline's SPARQL update path, with its dataset and cancellation). Either transaction kind:
+/// a writer's, or a private one's (a session's read, dictionary lifecycle V1), whose writes
+/// its budget can refuse, as the request's memory limit. The checks read `tx` as SPARQL does,
+/// through `budget`, the request's ([`nrese_sparql::PendingRead`]).
+pub(crate) fn apply_statements<T: nrese_sparql::UpdateTarget>(
+    tx: &mut T,
     request: &StatementsRequest,
     requester: &crate::Requester,
-    update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
+    budget: &Arc<nrese_exec::Budget>,
+    update: &mut dyn FnMut(&mut T, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
     for op in request.ops.iter() {
         // Each statement of a payload as it is read; one that fails part-way fails the
-        // request, whose transaction is then discarded with all it changed. The new terms its
-        // inserts interned stay in the shared dictionary (stated limit L3 for v1.5, dictionary
-        // lifecycle contract). The pending changes' growth is charged before it happens
-        // (D16-039).
+        // request, whose transaction is then discarded with all it changed. The new terms a
+        // writer's inserts interned stay in the shared dictionary (stated limit L3 for v1.5,
+        // dictionary lifecycle contract); a private transaction's are its own. The pending
+        // changes' growth is charged before it happens (D16-039).
         match op {
             StatementOp::Add { data, contexts } => {
                 data.each_quad(contexts, BlankNodes::Fresh, |quad| {
@@ -447,11 +454,13 @@ pub(crate) fn apply_statements(
             StatementOp::RemoveData { data, contexts } => {
                 data.each_quad(contexts, BlankNodes::Fresh, |quad| {
                     check_write(requester, quad.graph_name)?;
-                    tx.try_remove(quad)?;
+                    tx.remove(quad)?;
                     Ok(())
                 })?;
             }
-            StatementOp::RemoveMatching(pattern) => remove_matching(tx, pattern, requester)?,
+            StatementOp::RemoveMatching(pattern) => {
+                remove_matching(tx, pattern, requester, budget)?;
+            }
             StatementOp::RemovePatterns {
                 data,
                 contexts,
@@ -461,7 +470,7 @@ pub(crate) fn apply_statements(
                 // contexts are placed as the store places them (`StatementPattern::patterns`).
                 let blank_nodes = blank_nodes(*preserve_blank_nodes);
                 data.each_as_written(blank_nodes, |quad| {
-                    remove_matching(tx, &removal_pattern(quad, contexts), requester)
+                    remove_matching(tx, &removal_pattern(quad, contexts), requester, budget)
                 })?;
             }
             StatementOp::Update(request) => update(tx, request)?,

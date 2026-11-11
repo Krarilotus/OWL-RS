@@ -239,7 +239,9 @@ fn unpublished_snapshots_are_answered_and_leave_the_cache_as_it_was() {
         unpublished.push(("writer, INSERT then DELETE", tx.pending_snapshot()));
     }
     {
-        let mut tx = engine.speculative();
+        // The old shared speculative kind, one of the unpublished snapshots, until V1b removes it.
+        #[allow(clippy::disallowed_methods)]
+        let mut tx = engine.speculative_shared();
         tx.insert(quad("c", "p", "x").as_ref());
         unpublished.push(("speculative", tx.pending_snapshot()));
     }

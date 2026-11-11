@@ -191,6 +191,29 @@ fn boxed(size: usize) -> usize {
     size + 2 * std::mem::size_of::<usize>()
 }
 
+/// Whether [`Snapshot::pending_within`] takes the reference path whatever the room: only a
+/// test's, on its own thread, to measure what the reference needs (`pending_bound_tests`).
+mod reference {
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn only() -> bool {
+        ONLY.get()
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn only() -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod pending_bound_tests;
+
 /// A charge for memory masks and views keep, shared by every holder of it. The last holder
 /// takes the charge out of its box (freeing the box), drops its parts (the charges of what
 /// it keeps besides: the masks its runs come from, the snapshot it was made from), and
@@ -1160,6 +1183,22 @@ impl Snapshot {
     /// version `make` builds of the two. What it makes is charged to `budget` before it is
     /// made and held by the result until its last holder lets it go: its version, its runs,
     /// their lists, the charge's own box and parts. A refusal leaves nothing made.
+    ///
+    /// One reservation (DUR-6 slice 2): charged once, before anything is made, with the
+    /// fixed part and each delta's bound ([`crate::index::IndexVersion::change_bound`]: the
+    /// build engine-v2's uncharged path runs, its working memory included), where every delta
+    /// is below the parallel threshold; a pair with a delta at or above it is built with exact
+    /// charges throughout. Once built, the bound's rest is released at once, and the
+    /// reservation is the snapshot's.
+    ///
+    /// The bounds only where the budget's room, read once before anything is charged, covers
+    /// them with the fixed part (CR #237's rule, `IndexVersion::group_counts`); otherwise the
+    /// fixed part alone, and every delta charged exactly as it is built, the reference. So,
+    /// against a budget no one else draws from meanwhile, a build is refused only where the
+    /// reference would be, and no refusal is recorded ([`nrese_exec::Budget::refused`]) where
+    /// it answers (F1 of the dictionary's charged-build review: a bound charged up front
+    /// refused builds exact charging answers). A concurrent draw between the read and the
+    /// charge refuses the bounds: the reference then, that refusal recorded.
     pub(super) fn pending_within(
         &self,
         asserted: [&[EncodedQuad]; 2],
@@ -1170,34 +1209,64 @@ impl Snapshot {
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
         use std::mem::size_of;
         let version = &self.version;
+        let fixed = boxed(size_of::<Version>())
+            + version.asserted.runs_bytes(1)
+            + version.inferred.runs_bytes(1)
+            + 2 * boxed(size_of::<crate::index::run::Run>())
+            + Held::overhead(self.held.count());
+        let bounds = [
+            version.asserted.change_bound(asserted[0], asserted[1]),
+            version.inferred.change_bound(inferred[0], inferred[1]),
+        ];
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
-        held.charge(
-            boxed(size_of::<Version>())
-                + version.asserted.runs_bytes(1)
-                + version.inferred.runs_bytes(1)
-                + 2 * boxed(size_of::<crate::index::run::Run>())
-                + Held::overhead(self.held.count()),
-        )?;
-        let (asserted, asserted_held) =
-            version
-                .asserted
-                .with_change_within(asserted[0], asserted[1], forms, budget)?;
-        let (inferred, inferred_held) =
-            match version
-                .inferred
-                .with_change_within(inferred[0], inferred[1], forms, budget)
+        // Bounded only where every delta has a bound: one at or above the parallel threshold
+        // charges exactly as it builds, beside the other's bound, a peak the room read doesn't
+        // cover (review r1, DUR6B-R1-01). Such a pair is built exactly throughout.
+        let (bounded, bounds) = match bounds {
+            [Some(a), Some(i)]
+                if a + i > 0
+                    && !reference::only()
+                    && budget.remaining() >= fixed + a + i
+                    && held.charge(fixed + a + i).is_ok() =>
             {
-                Ok(built) => built,
-                Err(refused) => {
-                    // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
-                    drop(asserted);
-                    drop(asserted_held);
-                    return Err(refused);
-                }
-            };
-        let held = nrese_exec::Reservation::adopt(
-            Arc::clone(budget),
-            held.transfer() + asserted_held.transfer() + inferred_held.transfer(),
+                (true, [a, i])
+            }
+            _ => {
+                held.charge(fixed)?;
+                (false, [0, 0])
+            }
+        };
+        let (asserted, asserted_kept) = version.asserted.with_change_within(
+            asserted[0],
+            asserted[1],
+            forms,
+            budget,
+            &mut held,
+            bounded,
+        )?;
+        let (inferred, inferred_kept) = match version.inferred.with_change_within(
+            inferred[0],
+            inferred[1],
+            forms,
+            budget,
+            &mut held,
+            bounded,
+        ) {
+            Ok(built) => built,
+            Err(refused) => {
+                // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
+                drop(asserted);
+                drop(held);
+                return Err(refused);
+            }
+        };
+        // What the builds held beside what their runs keep: their working memory, freed now.
+        // Sound because a run never keeps more than its bound: `Run::delta_bound` is derived as
+        // an upper bound of what `Run::from_delta` allocates (`with_change_within` asserts it in
+        // debug builds only). The subtraction saturates, but that doesn't make an underestimated
+        // bound safe: the part kept beyond it would go uncharged (review r1, DUR6B-R1-02).
+        held.release(
+            bounds[0].saturating_sub(asserted_kept) + bounds[1].saturating_sub(inferred_kept),
         );
         let held = Held::new(self.held.with(0), held);
         let mut snapshot = self.with_version(make(asserted, inferred));
@@ -1263,6 +1332,13 @@ impl Snapshot {
     /// Whether this snapshot's ids include a private transaction's own terms.
     pub fn is_private(&self) -> bool {
         self.vocabulary.is_private()
+    }
+
+    /// The dictionary lifecycle contract's b(V) (§4.1): a published or shared snapshot's
+    /// dictionary end, a private one's overlay start. Every id below it means the same term
+    /// in every snapshot of this engine whose bound is it or more.
+    pub fn shared_bound(&self) -> u64 {
+        self.vocabulary.shared_bound(self.version.dictionary_len)
     }
 
     /// Dictionary entries visible to this snapshot.
@@ -2506,7 +2582,9 @@ impl Snapshot {
 /// let snapshot = engine.snapshot();
 /// let state = snapshot.shared_state().expect("a published snapshot");
 /// assert!(std::ptr::eq(state.snapshot(), &snapshot));
-/// assert!(engine.speculative().pending_snapshot().shared_state().is_none());
+/// let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+/// let pending = engine.speculative(budget).pending_snapshot().unwrap();
+/// assert!(pending.shared_state().is_none());
 /// ```
 ///
 /// No code outside the engine can make one:

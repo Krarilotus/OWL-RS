@@ -136,7 +136,8 @@ impl MutationCommand {
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Statements(request) => {
-                apply_statements(tx, request, requester, &mut update)?;
+                let budget = Arc::new(context.memory.part());
+                apply_statements(tx, request, requester, &budget, &mut update)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Tell(request) => {
@@ -232,9 +233,10 @@ impl UpdateContext<'_> {
     }
 }
 
-/// Applies a SPARQL update request to `tx` for `requester`.
-pub(crate) fn apply_sparql_update(
-    tx: &mut Transaction<'_>,
+/// Applies a SPARQL update request to `tx` for `requester`: a writer's transaction, or a
+/// private one's (a session's read), whose refused writes are the request's memory limit.
+pub(crate) fn apply_sparql_update<T: nrese_sparql::UpdateTarget>(
+    tx: &mut T,
     request: &SparqlUpdateRequest,
     requester: &crate::Requester,
     context: &UpdateContext<'_>,
@@ -322,9 +324,9 @@ fn require_writable(
     }
 }
 
-/// The graph `id` of `tx` as a name.
+/// The graph `id` of `tx` (either transaction kind) as a name.
 pub(crate) fn graph_name(
-    tx: &nrese_engine::Transaction<'_>,
+    tx: &impl nrese_engine::PendingView,
     id: nrese_engine::TermId,
 ) -> nrese_rdf::GraphName {
     match tx.decode(id) {

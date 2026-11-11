@@ -132,10 +132,10 @@ impl From<nrese_exec::BudgetExceeded> for StoreError {
     }
 }
 
-/// The engine refusing a change for memory (the pending changes' growth past the request's
-/// envelope, D16-039) is the request's memory error, as a query's or an update's is, so every
-/// transport answers it alike ([`StoreError::is_memory_limit`]). Any other engine error is the
-/// store's.
+/// The engine refusing for memory is the request's memory error, as a query's or an update's
+/// is, so every transport answers it alike ([`StoreError::is_memory_limit`]): the pending
+/// changes' growth past the request's envelope (D16-039), and a private transaction's own
+/// terms past its budget (dictionary lifecycle V1). Any other engine error is the store's.
 impl From<EngineError> for StoreError {
     fn from(error: EngineError) -> Self {
         match error {
