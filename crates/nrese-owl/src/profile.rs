@@ -519,10 +519,11 @@ pub fn covered(o: &Ontology, axiom: &Axiom, rl: bool) -> bool {
 }
 
 /// The terms an axiom concludes, where it isn't [`covered`]: those it can add positive
-/// facts on ([`positive_terms`]). They come from the right side of a subclass axiom, each
-/// uncovered direction of an equivalence, the class of a domain or range, every part of a
-/// disjointness (negated), a disjoint union's class and parts, and a characteristic's (not
-/// irreflexivity's or asymmetry's) or chain's property.
+/// facts on ([`positive_terms`]). They come from both sides of a subclass axiom and of each
+/// uncovered direction of an equivalence (the left side negated: `L ⊑ R` is `¬R ⊑ ¬L`, so
+/// `≥ 1 R.(≤ 0 R.C) ⊑ ⊥` concludes `R` and `C`, D16-492), the class of a domain or range,
+/// every part of a disjointness (negated), a disjoint union's class and parts, and a
+/// characteristic's (not irreflexivity's or asymmetry's) or chain's property.
 pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
     let mut out = Vec::new();
     let sub = |e: ExprId| match rl {
@@ -530,11 +531,15 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
         false => ql_sub(o, e),
     };
     match axiom {
-        Axiom::SubClassOf(_, b) => positive_terms(o, *b, true, &mut out),
+        Axiom::SubClassOf(a, b) => {
+            positive_terms(o, *a, false, &mut out);
+            positive_terms(o, *b, true, &mut out);
+        }
         Axiom::EquivalentClasses(v) => {
             for &a in v {
                 for &b in v.iter().filter(|&&b| b != a) {
                     if !(sub(a) && super_covered(o, b, rl)) {
+                        positive_terms(o, a, false, &mut out);
                         positive_terms(o, b, true, &mut out);
                     }
                 }
