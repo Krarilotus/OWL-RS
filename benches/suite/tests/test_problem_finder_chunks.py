@@ -148,6 +148,10 @@ class SeedSweep(unittest.TestCase):
         self.assertEqual(sweep.status_of(chunk.BUDGET_ENDED, ""), "INTERRUPTED")
 
 
+# What cargo prints for a test binary whose filters matched one test that passed.
+PASSED = "print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.50s')"
+
+
 class SweepResume(unittest.TestCase):
     """Defect 4 (audit, 18 Oct 2026): a timeout kill was recorded as ok, and a resumed sweep
     skipped every seed already in its table, its failures vanishing from the summary."""
@@ -162,8 +166,9 @@ class SweepResume(unittest.TestCase):
                                     memory_mib=4000)
 
     def sweep_with(self, commands):
-        """The sweep, each seed's test a capped chunk (budget 1.2 s) of the given command."""
-        dispatch = (f"import os; exec({commands!r}.get(int(os.environ['NRESE_FUZZ_SEED']), 'pass'))")
+        """The sweep, each seed's test a capped chunk (budget 1.2 s) of the given command; by
+        default one test passing, as cargo reports it."""
+        dispatch = (f"import os; exec({commands!r}.get(int(os.environ['NRESE_FUZZ_SEED']), {PASSED!r}))")
 
         def capped(t, extra, default_mib, budget_min):
             return [sys.executable, "-c", NO_SCOPE_CHUNK, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "512",
@@ -190,6 +195,21 @@ class SweepResume(unittest.TestCase):
         # The earlier chunk's failure is still the sweep's.
         self.assertIn("1 failure", out.getvalue())
         self.assertIn("seed 3", out.getvalue())
+
+    def test_a_run_in_which_no_test_ran_is_not_ok_and_each_run_keeps_its_result_line(self):
+        """D16-516 (DL lead's reading of a sweep, 11 Nov 2026): a test filter that matches nothing
+        exits 0, so a renamed or mistyped test gave a pass with no test run. Seed 2 runs none: not
+        ok. Every row keeps cargo's result line, so a pass shows the tests it ran."""
+        nothing = "print('test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s')"
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.sweep_with({2: nothing})
+        rows = {row[0]: row for row in self.rows()}
+        self.assertEqual({seed: row[2] for seed, row in rows.items()},
+                         {"1": "ok", "2": "NO-TESTS", "3": "ok", "4": "ok"})
+        self.assertEqual(rows["1"][5], "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.50s")
+        self.assertIn("seed 2", out.getvalue())
+        self.assertIn("no test", out.getvalue())
 
     def test_a_cap_reached_runs_again_only_under_a_larger_cap(self):
         (self.out / "results.tsv").write_text("1\tc:t\tCAP-REACHED\t3.0\t4000\n2\tc:t\tCAP-REACHED\t3.0\t8192\n"

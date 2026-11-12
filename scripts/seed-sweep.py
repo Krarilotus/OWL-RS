@@ -11,7 +11,9 @@ release speed, the checks a debug build has). Each test run sits under its targe
 cap (`memory_mib` in the targets file, else --memory-mib, 4000) through scripts/capped-chunk.py;
 a run that reaches it is CAP-REACHED, the sweep's setting, never counted as a finding. A chunk's
 own cap must hold the largest target's (`run` says which). `run` writes OUT/results.tsv (seed, target,
-status, seconds, cap) as it goes and a failure's whole output to OUT/failures/. A test the
+status, seconds, cap, cargo's result lines) as it goes and a failure's whole output to OUT/failures/.
+A run that exits 0 having run no test (its filters matched none) is NO-TESTS, never ok: it proves
+nothing, and like a failed build it is the sweep's problem, not a finding, and runs again. A test the
 budget stopped is INTERRUPTED (capped-chunk's exit 75), never ok. On resume a seed whose
 latest row stands is skipped: ok, FAILED, or CAP-REACHED at the target's current cap; an
 INTERRUPTED or BUILD-FAILED run, or a cap reached below a raised memory_mib, runs again. No
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -69,6 +72,16 @@ def status_of(returncode: int, stderr: str) -> str:
     if returncode == CAP_REACHED:
         return "CAP-REACHED"
     return f"FAILED({returncode})"
+
+
+# cargo's line for each test binary it ran: how many tests passed and failed.
+RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed;.*$", re.M)
+
+
+def tests_ran(stdout: str) -> tuple[int, str]:
+    """How many tests a run ran (passed and failed, over cargo's result lines), and those lines."""
+    lines = list(RESULT.finditer(stdout))
+    return sum(int(m[1]) + int(m[2]) for m in lines), " | ".join(m[0].strip() for m in lines)
 
 
 def final(status: str, cap_then: str, cap_now: int) -> bool:
@@ -151,12 +164,16 @@ def run(args) -> int:
                                cwd=Path.cwd(), capture_output=True, text=True, encoding="utf-8", errors="replace")
             seconds = time.monotonic() - started
             status = status_of(r.returncode, r.stderr)
+            ran, lines = tests_ran(r.stdout)
+            if status == "ok" and not ran:
+                status = "NO-TESTS"
             with open(results, "a", encoding="utf-8", newline="\n") as f:
-                f.write(f"{seed}\t{name(t)}\t{status}\t{seconds:.1f}\t{cap}\n")
-            if status in ("BUILD-FAILED", "CAP-REACHED", "INTERRUPTED"):
+                f.write(f"{seed}\t{name(t)}\t{status}\t{seconds:.1f}\t{cap}\t{lines}\n")
+            if status in ("BUILD-FAILED", "CAP-REACHED", "INTERRUPTED", "NO-TESTS"):
                 log = out / "failures" / f"{name(t).replace(':', '-')}-{seed}-{status.lower()}.log"
                 log.write_text(r.stdout + "\n" + r.stderr, encoding="utf-8")
                 why = {"BUILD-FAILED": "the sweep's build",
+                       "NO-TESTS": "no test ran: its filters match none, so this seed proves nothing",
                        "INTERRUPTED": "the budget stopped it; the next chunk runs it again",
                        "CAP-REACHED": f"the target's memory cap ({cap} MiB): raise its memory_mib"}[status]
                 print(f"{status}: {name(t)} at seed {seed} ({log.name}): {why}, not a finding", flush=True)
