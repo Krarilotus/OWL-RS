@@ -1,5 +1,6 @@
 //! Input: the bytes of a document, from a slice or a reader, a line at a time.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
@@ -65,6 +66,8 @@ pub(crate) struct Lines<'a, R> {
     source: Source<'a, R>,
     /// The document's lines before these: an error's line is the document's.
     before: Before<'a>,
+    /// Their number, once counted: every error after the first takes it from here.
+    counted: Cell<Option<u64>>,
     /// The byte offset of the next line, and the number of lines returned so far.
     offset: u64,
     line: u64,
@@ -82,6 +85,7 @@ impl<'a> Lines<'a, io::Empty> {
         Self {
             source: Source::Slice(bytes),
             before: Before::Lines(0),
+            counted: Cell::new(None),
             offset,
             line: 0,
             line_start: offset,
@@ -102,6 +106,7 @@ impl<R: Read> Lines<'static, R> {
                 eof: false,
             },
             before: Before::Lines(0),
+            counted: Cell::new(None),
             offset,
             line: 0,
             line_start: offset,
@@ -122,12 +127,25 @@ impl<'a, R: Read> Lines<'a, R> {
     pub(crate) fn in_document(&self, error: RdfParseError) -> RdfParseError {
         match (error, &self.before) {
             (RdfParseError::Syntax(syntax), Before::Lines(0)) => RdfParseError::Syntax(syntax),
-            (RdfParseError::Syntax(syntax), before) => match before.count() {
+            (RdfParseError::Syntax(syntax), _) => match self.lines_before() {
                 Ok(lines) => RdfParseError::Syntax(syntax.after_lines(lines)),
                 Err(_) => RdfParseError::Syntax(syntax),
             },
             (error, _) => error,
         }
+    }
+
+    /// The document's lines before these, counted at the first error and kept: counting
+    /// reads the document up to the chunk, and a recovering parse can meet an error on every
+    /// line (D16-546: N-Quads named `.nt`, each line counted again, took time quadratic in
+    /// the file).
+    fn lines_before(&self) -> io::Result<u64> {
+        if let Some(lines) = self.counted.get() {
+            return Ok(lines);
+        }
+        let lines = self.before.count()?;
+        self.counted.set(Some(lines));
+        Ok(lines)
     }
 }
 
@@ -261,5 +279,27 @@ mod tests {
         lines.next().unwrap();
         lines.next().unwrap();
         assert_eq!(lines.position(), (1, 104));
+    }
+
+    /// A chunk counts the document's lines before it once, at its first error, not again at
+    /// each error after it (D16-546). The file changes under the chunk after the first error:
+    /// a second count would see other lines.
+    #[test]
+    fn a_chunk_counts_the_lines_before_it_once() {
+        let path =
+            std::env::temp_dir().join(format!("nrese-rdf-io-before-{}.nt", std::process::id()));
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        let lines = Lines::from_reader(io::empty(), 6).after(Before::File(path.clone(), 6));
+        let line = |lines: &Lines<'_, io::Empty>| {
+            let error = crate::RdfSyntaxError::new("bad", Default::default()..Default::default());
+            match lines.in_document(error.into()) {
+                RdfParseError::Syntax(syntax) => syntax.location().start.line,
+                other => panic!("a syntax error, not {other}"),
+            }
+        };
+        assert_eq!(line(&lines), 3);
+        std::fs::write(&path, "\n\n\n\n\n\n").unwrap();
+        assert_eq!(line(&lines), 3, "counted again");
+        std::fs::remove_file(&path).unwrap();
     }
 }
