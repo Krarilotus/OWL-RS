@@ -4,7 +4,7 @@ One list of workloads, one list of systems, one rule for which pair runs, and on
 
 ```sh
 benches/suite/suite.py                     # the matrix, and what NRESE can't run yet
-benches/suite/suite.py graphdb             # one system, with the reason for every skip
+benches/suite/suite.py jena                # one system, with the reason for every skip
 benches/suite/suite.py --check             # validate the two files
 benches/suite/suite.py run --dry-run       # every step of a full run, printed, nothing started
 benches/suite/suite.py run                 # run it: three repetitions per pair
@@ -34,7 +34,7 @@ Where this directory sits among the kits, and the life of a run from plan to rec
 
 For every workload tier and every system that can run it, `--runs` times (default 3), each from a fresh store, the repetitions interleaved across the systems (every system's first run, then every system's second, in a rotated order):
 
-1. **load**, and reasoning where the system reasons at load (NRESE, GraphDB, RDFox, Nemo, owlrl); wall time and peak memory
+1. **load**, and reasoning where the system reasons at load (NRESE, Nemo, owlrl, licensed stores); wall time and peak memory
 2. **size** of the store on disk; **restart**: the server on the loaded store, until it answers
 3. **count** of every statement it answers with; lazy reasoners (Jena's rule reasoners) do their work here
 4. **queries** through the harness's `query-mix`: one warm-up, then `--query-runs` measured runs each (default 3); answer counts checked against the expected ones where the workload has them, and cross-checked between systems within one regime at the end. Each query's first execution on the fresh server is reported apart (`repeat` 0)
@@ -68,7 +68,7 @@ its deadline.
 
 **Systems without SPARQL** (Nemo, the owlrl reference closure) have their closure answered by Oxigraph: their answer counts check the others, their query times aren't theirs and are left empty.
 
-**Licensed systems** run only with their licence files: `graphdb.license` and `RDFox.lic` in the licences directory (`~/nrese-bench/licenses`, outside the repository; `NRESE_LICENSES` elsewhere), or one by one through `GRAPHDB_LICENSE` and `RDFOX_LICENSE`. Their rows carry `publish = permission`; `suite.py report` leaves them out unless `--include-restricted`, and they may not leave the machine without the vendor's written consent ([../competitors/README.md](../competitors/README.md)). The RDFox adapter and GraphDB with a ruleset haven't run yet (no licence): the first licensed run confirms their commands.
+**Licensed systems** run only with their licence files in the licences directory (`~/nrese-bench/licenses`, outside the repository; `NRESE_LICENSES` elsewhere), or one by one through each adapter's licence variable. Their rows carry `publish = permission`; `suite.py report` leaves them out unless `--include-restricted`, and they may not leave the machine without the vendor's written consent ([../competitors/README.md](../competitors/README.md)). An adapter that hasn't run with a licence yet has its commands confirmed by its first licensed run.
 
 ## The result schema
 
@@ -83,7 +83,7 @@ One CSV row per measured step (`suitekit/schema.py`): `date, host, runtime, syst
 | `QUERY_MEMORY_MIB` | NRESE's default | NRESE's per-query memory budget |
 | `JENA_OWL_REASONER` | `OWLMicroFBRuleReasoner` | Jena's rule reasoner for OWL-Horst workloads |
 | `RGGS_REPO`, `ONTOLOGY` | | the integration workload's checkout, and `gndo` for the GND ontology |
-| `*_IMAGE` | see adapters.py | the image of a system (`QLEVER_IMAGE`, `GRAPHDB_IMAGE`, …) |
+| `*_IMAGE` | see adapters.py | the image of a system (`QLEVER_IMAGE`, `JENA_IMAGE`, …) |
 | `NRESE_BIN`, `HARNESS`, `CARGO_TARGET_DIR` | the repository's `target/release` | prebuilt binaries |
 | `NRESE_BENCH_SCRATCH` | `tmp/` | stores and scratch |
 

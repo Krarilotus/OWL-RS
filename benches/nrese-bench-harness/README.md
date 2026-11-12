@@ -19,8 +19,8 @@ cargo run --release --manifest-path benches/nrese-bench-harness/Cargo.toml -- <c
 `cargo run … -- help` prints every option. Reports go where `--report-json` or `--report-dir` say; nothing is
 written into the repository.
 
-`write-scaling` accepts NRESE, a reference endpoint, or both. For GraphDB alone,
-pass `--reference-kind graphdb --reference-base-url <repository-url>`. It checks
+`write-scaling` accepts NRESE, a reference endpoint, or both. For a reference endpoint alone,
+pass `--reference-kind <kind> --reference-base-url <repository-url>`. It checks
 the numeric Person count and every expected probe subject after each step; an HTTP
 200 response alone cannot qualify a result. Requested sizes are rounded down to
 whole four-triple entities. Reports distinguish requested triples, actual entity

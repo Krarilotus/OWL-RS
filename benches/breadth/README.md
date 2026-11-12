@@ -21,9 +21,9 @@ the backlog.
 |---|---|---|---|---|---|
 | Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed**: recall 0.56 → 0.98 on Phuoc-Yu ([record](../runs/2026-10-12-vector-filtered-fix-phuoc.toml)); Office-PC's jobs queued |
 | [ann-benchmarks](vectors/) | Qdrant, pgvector; hnswlib as the library reference | upstream's harness at 2e081ad, NRESE as a module (its server in the container, SPARQL per query); all at M 16; Qdrant 1.19.2, pgvector v0.8.7 | ann-benchmarks.com | HNSW over vector literals, through SPARQL | images and SIFT, GloVe jobs queued |
-| [Geographica 2](geographica2/) | Jena GeoSPARQL, GraphDB (GeoSPARQL plugin), RDF4J; QLever and Virtuoso as far as they go | the suite's adapters, each system's spatial setup when a workload needs `geosparql` | RDF4J 2.4.3, GraphDB 8.6.1, Strabon, uSeekM, Parliament (2019, the paper's Tables 13/14) | GeoSPARQL 1.1 | data pinned; jobs queued |
+| [Geographica 2](geographica2/) | Jena GeoSPARQL, RDF4J; QLever and Virtuoso as far as they go | the suite's adapters, each system's spatial setup when a workload needs `geosparql` | RDF4J 2.4.3, Strabon, uSeekM, Parliament (2019, the paper's Tables 13/14) | GeoSPARQL 1.1 | data pinned; jobs queued |
 | [ERA-SHACL](era-shacl/) | Jena, TopBraid, RDF4J, pySHACL; maplib (the Rust rival) | upstream's engines at fe109c9, their versions, prebuilt; one memory cap and heap for all | per engine in upstream's `results/` | SHACL Core and SHACL-SPARQL, in memory | data pinned; jobs queued |
-| [StarBench](starbench/) | GraphDB, Stardog (RDF-star); Jena, Oxigraph | the suite's adapters; GraphDB and Stardog load RDF-star, the others RDF 1.2 | Jena 4.7.0, Oxigraph 0.3.16, GraphDB 10.0.2, Stardog 8.1 (paper, Table 1) | RDF 1.2, SPARQL 1.2 | backlog: data fetched, workload defined |
+| [StarBench](starbench/) | RDF-star stores; Jena, Oxigraph | the suite's adapters, RDF 1.2 | Jena 4.7.0, Oxigraph 0.3.16 (paper, Table 1) | RDF 1.2, SPARQL 1.2 | backlog: data fetched, workload defined |
 | LUBMft (`fulltext-search`) | Jena text, Virtuoso, QLever | – | ESWC 2009 | `bds:`, `text:query`, `luc:` | backlog: the generator and query template are lost |
 | FedShop | FedX, CostFed, Semagrow, HeFQUIN, FedUP | – | Zenodo `eval-model.zip` | `SERVICE`; **no source selection** | backlog: data fetched |
 | VIBE, big-ann filtered, VectorDBBench | index libraries; filter-aware indexes; the vector databases | – | their sites | as above | backlog |
@@ -46,7 +46,7 @@ the backlog.
 
 > **Superseded (2 Nov 2026):** these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
 
-Licensed systems (GraphDB, Stardog) run on our machines only; their rows carry
+Licensed systems run on our machines only; their rows carry
 `publish = permission` and their numbers are never committed ([competitors/README.md](../competitors/README.md)).
 
 ## Findings so far
