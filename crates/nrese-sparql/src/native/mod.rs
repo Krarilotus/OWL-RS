@@ -130,6 +130,10 @@ use value::Value;
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
 
+/// EXPLAIN's step for a BGP planned without the characteristic sets, its estimate budget
+/// passed ([`Context::with_sets`]).
+const WITHOUT_SETS: &str = "join order";
+
 /// The count of a lone BGP pattern [`Context::bgp`] doesn't take: never read as empty. Of
 /// the reads of a BGP's counts, only the join order and the worst-case-optimal join's tests
 /// reach a lone pattern's outside EXPLAIN, and neither acts on one (two patterns at least
@@ -361,13 +365,28 @@ pub(crate) fn plan(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<PlanParts, QueryEvaluationError> {
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, _, rewrites, ql) = native_pattern(query, options, &ctx)?;
+    // Traced for the BGPs planned without the characteristic sets ([`Context::with_sets`]):
+    // their notes follow the plan's nodes, in the order planned.
+    ctx.trace = Some(RefCell::default());
     let mut steps = Vec::new();
     ctx.estimate_plan(&crate::plan::Plan::of(&pattern), 0, &mut steps);
     // The orderer stops when the query is cancelled, leaving estimates out: a plan cut short
     // is the cancellation, not an answer.
     options.resources.check()?;
+    let noted = ctx.trace.take().unwrap_or_default().into_inner();
+    steps.extend(
+        noted
+            .into_iter()
+            .filter(|s| s.operator == WITHOUT_SETS)
+            .map(|s| crate::query::PlannedStep {
+                depth: 0,
+                operator: s.operator,
+                detail: s.detail,
+                estimated_rows: None,
+            }),
+    );
     Ok((rewrites, steps, ql))
 }
 
@@ -2056,11 +2075,12 @@ impl<'a> Context<'a> {
         let depth = self.depth.get();
         // The plan's estimate of what this operator gives (`estimate`), as `plan_query`
         // shows it before running.
-        // It plans the operator's BGPs as their evaluation will, which notes how
-        // ([`Self::with_sets`]): once, in its place, not again here per enclosing operator.
+        // It plans the operator's BGPs, noting each planned without the characteristic sets
+        // ([`Self::with_sets`]): set aside, as the evaluation that plans one again notes it
+        // in its place; not noted again here per enclosing operator.
         let noted = trace.borrow().len();
         let estimated_rows = self.estimate_rows(pattern);
-        trace.borrow_mut().truncate(noted);
+        let planned = trace.borrow_mut().split_off(noted);
         let index = {
             let mut trace = trace.borrow_mut();
             let (operator, detail) = describe(pattern);
@@ -2080,9 +2100,24 @@ impl<'a> Context<'a> {
         let result = self.eval_cached(pattern, Some(index));
         self.depth.set(depth);
         if let Ok(solutions) = &result {
-            let step = &mut trace.borrow_mut()[index];
+            let mut trace = trace.borrow_mut();
+            let step = &mut trace[index];
             step.rows = solutions.table.len() as u64;
             step.micros = start.elapsed().as_micros() as u64;
+            // A cyclic BGP the operator ran by a worst-case-optimal join isn't planned again:
+            // its estimate's note goes first under the operator, where planning would put it.
+            let joined = trace[index + 1..]
+                .iter()
+                .any(|s| s.depth == depth + 1 && s.operator == "wcoj");
+            if joined {
+                let below = trace.split_off(index + 1);
+                let notes = planned.into_iter().filter(|s| s.operator == WITHOUT_SETS);
+                trace.extend(notes.map(|s| PlanStep {
+                    depth: depth + 1,
+                    ..s
+                }));
+                trace.extend(below);
+            }
         }
         result
     }
@@ -3653,8 +3688,8 @@ impl<'a> Context<'a> {
 
     /// `planning` of `inputs`, with the characteristic sets where an input is part of a star.
     /// Where they would pass the orderer's budget ([`plan::SET_BUDGET`]), planned once more
-    /// without them, as a graph without sets is, and noted for EXPLAIN: which planner a BGP
-    /// got shows. A cancelled planning fails the query, and isn't planned again.
+    /// without them, as a graph without sets is, and noted for EXPLAIN ([`WITHOUT_SETS`]):
+    /// which planner a BGP got shows. A cancelled query fails, and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
@@ -3666,10 +3701,17 @@ impl<'a> Context<'a> {
             .any(|i| i.star.is_some())
             .then(|| self.snapshot.characteristic_sets_in(self.model))
             .flatten();
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // The search asks for the cancellation at its steps, and can pass the budget before
+        // its first (a greedy search's starts): the query's cancellation comes first.
         let work = match planning(sets.as_deref()) {
             Ok(planned) => return Ok(planned),
-            Err(plan::Stopped::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
-            Err(plan::Stopped::Budget { work }) => work,
+            Err(plan::Stopped::Budget { work }) if !cancelled() => work,
+            Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
         };
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
@@ -3686,7 +3728,7 @@ impl<'a> Context<'a> {
                 inputs.len(),
                 plan::set_budget()
             );
-            self.note("join order", detail, None, 0, start);
+            self.note(WITHOUT_SETS, detail, None, 0, start);
         }
         Ok(planned)
     }
