@@ -127,7 +127,13 @@ struct Subject {
 impl State {
     /// Cheaper, or as cheap and starting with fewer rows.
     fn better_than(&self, other: &State) -> bool {
-        (self.cost, self.estimates[0]) < (other.cost, other.estimates[0])
+        Self::beats(self.cost, self.estimates[0], other)
+    }
+
+    /// Whether a state that costs `cost` and starts with `first` rows is
+    /// [`Self::better_than`] `other`: a step's state decided before it is built.
+    fn beats(cost: f64, first: f64, other: &State) -> bool {
+        (cost, first) < (other.cost, other.estimates[0])
     }
 
     /// The predicates of the state's open stars on `subject`, but for pattern `skip`'s.
@@ -231,39 +237,45 @@ fn search(
     // `state` with pattern `j` joined, its `step` estimated already.
     let apply = |mut state: State, j: usize, step: Step| -> State {
         let input = &inputs[j];
-        // A variable's distinct values: the fewest any pattern binding it has, the domain
-        // its values are drawn from. Not cut to the rows: 543 `worksFor` rows hold
-        // values from its 7 k subjects, of which `?x a Chair`'s 189 keep a share, not all.
-        for &(v, d) in &input.vars {
-            let d = (d as f64).max(1.0);
-            let known = &mut state.distinct[v];
-            *known = if *known > 0.0 { known.min(d) } else { d };
-        }
-        if let Some(star) = input.star.filter(open) {
-            let subject = state.stars.entry(star.subject).or_default();
-            subject.rows = sets.map(|sets| match &subject.rows {
-                Some(rows) => {
-                    note_statistics(rows.len(), 0);
-                    sets.star_with(rows, star.predicate)
-                }
-                None => {
-                    let rows = sets.star_of(star.predicate);
-                    note_statistics(rows.len(), 0);
-                    rows
-                }
-            });
-            subject.predicates.push(star.predicate);
-        }
-        if let (Some(object), Some(star)) = (input.edge_object, input.star)
-            && star.subject != object
-        {
-            state.edges_into.entry(object).or_insert(j);
-        }
-        let partner = (input.count as f64).max(1.0);
-        for &(i, both) in &input.overlaps {
-            let share = both as f64 / partner;
-            let kept = state.kept.entry(i).or_insert(share);
-            *kept = kept.min(share);
+        // The step that joins the last input (paths included: they are inputs too) makes a
+        // state nothing is estimated from: only its order, estimates and cost are read, so
+        // what a later step would read (values, stars, edges, shares) isn't built.
+        if state.order.len() + 1 < inputs.len() {
+            // A variable's distinct values: the fewest any pattern binding it has, the
+            // domain its values are drawn from. Not cut to the rows: 543 `worksFor` rows
+            // hold values from its 7 k subjects, of which `?x a Chair`'s 189 keep a share,
+            // not all.
+            for &(v, d) in &input.vars {
+                let d = (d as f64).max(1.0);
+                let known = &mut state.distinct[v];
+                *known = if *known > 0.0 { known.min(d) } else { d };
+            }
+            if let Some(star) = input.star.filter(open) {
+                let subject = state.stars.entry(star.subject).or_default();
+                subject.rows = sets.map(|sets| match &subject.rows {
+                    Some(rows) => {
+                        note_statistics(rows.len(), 0);
+                        sets.star_with(rows, star.predicate)
+                    }
+                    None => {
+                        let rows = sets.star_of(star.predicate);
+                        note_statistics(rows.len(), 0);
+                        rows
+                    }
+                });
+                subject.predicates.push(star.predicate);
+            }
+            if let (Some(object), Some(star)) = (input.edge_object, input.star)
+                && star.subject != object
+            {
+                state.edges_into.entry(object).or_insert(j);
+            }
+            let partner = (input.count as f64).max(1.0);
+            for &(i, both) in &input.overlaps {
+                let share = both as f64 / partner;
+                let kept = state.kept.entry(i).or_insert(share);
+                *kept = kept.min(share);
+            }
         }
         state.order.push(j);
         state.estimates.push(step.rows);
@@ -381,7 +393,6 @@ fn search(
             cost: state.cost + access + rows,
         }
     };
-    let extend = |state: &State, j: usize| apply(state.clone(), j, estimate(state, j));
     // Patterns sharing a bound variable with `state`; all others if none does (a cross
     // product is then unavoidable).
     // `used(j)`: whether pattern j is in `state` already (a bit mask for the exhaustive
@@ -413,7 +424,8 @@ fn search(
     if let Some(order) = fixed {
         let mut state = start(order[0]);
         for &j in &order[1..] {
-            state = extend(&state, j);
+            let step = estimate(&state, j);
+            state = apply(state, j, step);
         }
         return Some(finish(state));
     }
@@ -456,6 +468,8 @@ fn search(
     for j in 0..n {
         best[1 << j] = Some(start(j));
     }
+    // A state's candidates and the steps that beat their slot's state: only those are built.
+    let mut winners: Vec<(usize, Step)> = Vec::with_capacity(n);
     for used in 1u64..(1 << n) {
         if stop() {
             return None;
@@ -463,14 +477,29 @@ fn search(
         let Some(state) = best[used as usize].take() else {
             continue;
         };
+        // Each candidate goes to a slot of its own, so each is decided against the state
+        // as it is, in the candidates' order; one that only ties is not stored.
+        winners.clear();
         for j in candidates(&state, &|j| used & (1 << j) != 0) {
-            let next = extend(&state, j);
-            let slot = &mut best[(used | (1 << j)) as usize];
-            if slot.as_ref().is_none_or(|s| next.better_than(s)) {
-                *slot = Some(next);
+            let step = estimate(&state, j);
+            let slot = &best[(used | (1 << j)) as usize];
+            if slot
+                .as_ref()
+                .is_none_or(|s| State::beats(step.cost, state.estimates[0], s))
+            {
+                winners.push((j, step));
             }
         }
-        best[used as usize] = Some(state);
+        // Later masks are supersets, so this state is read no more: its last winner takes
+        // it, the others a copy. With none (the full mask among them) it stays.
+        let Some((&(last, step), rest)) = winners.split_last() else {
+            best[used as usize] = Some(state);
+            continue;
+        };
+        for &(j, step) in rest {
+            best[(used | (1 << j)) as usize] = Some(apply(state.clone(), j, step));
+        }
+        best[(used | (1 << last)) as usize] = Some(apply(state, last, step));
     }
     Some(finish(
         best[(1 << n) - 1]
