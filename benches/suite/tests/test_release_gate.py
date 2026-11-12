@@ -1250,6 +1250,36 @@ class MainAdapter(unittest.TestCase):
         self.assertIn("one p50 per process", " ".join(row["notes"]))
         self.assertAlmostEqual(row["dimensions"]["time/q06"]["new"], 18.0)  # the process p50, not the pool
 
+    def test_a_series_a_baseline_reports_as_null_is_not_compared_and_the_report_is_written(self):
+        """F 38202f73's report (12 Nov 2026) crashed in quantum(): main's perf lab writes no
+        first_ms, so fast.py's reopen-dbpedia series `cold/<query>/first` were [null] on every main
+        pass. A null is no reading: such a series is treated like one main doesn't report (not
+        compared, unsupported by this baseline), and the series main does report are judged."""
+        def records_of(side, n):
+            if side == "main":
+                return [record(samples={"cold/q01/first": [None], "cold/q01/repeat": [10.0]},
+                               estimator="process-p50")]
+            return [record(samples={"cold/q01/first": [40.0, 41.0, 39.0], "cold/q01/repeat": [10.0, 10.1, 9.9]})]
+        summary = run_gate(passes(records_of))
+        row = summary["comparisons"]["main"]["lab-olympics"]
+        self.assertEqual(row["not_compared"].get("time/cold/q01/first"),
+                         "not on every pass of main (unsupported by this baseline)")
+        self.assertNotIn("time/cold/q01/first", row["dimensions"])
+        self.assertIn("time/cold/q01/repeat", row["dimensions"])
+        self.assertIn("time/cold/q01/first", summary["comparisons"]["base"]["lab-olympics"]["dimensions"])
+
+    def test_a_series_the_candidate_reports_as_null_is_lost_and_blocks(self):
+        """The same null on the candidate, where the baseline reports the series: its evidence is
+        lost, which blocks (compare_case), never a crash and never a pass."""
+        def records_of(side, n):
+            first = [None, None, None] if side == "cand" else [40.0, 41.0, 39.0]
+            return [record(samples={"cold/q01/first": first, "cold/q01/repeat": [10.0, 10.1, 9.9]})]
+        summary = run_gate(passes(records_of, sides=("base", "cand")), sides=("cand", "base"), require=("base",))
+        row = summary["comparisons"]["base"]["lab-olympics"]
+        self.assertEqual(row["not_compared"].get("time/cold/q01/first"), "lost on the candidate (blocks)")
+        self.assertIn("time/cold/q01/first: lost (on base, not on every pass of the candidate)", row["blocks"])
+        self.assertFalse(summary["passed"])
+
     def test_a_prepared_run_generates_nothing(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(fast, "FAST_DATA", Path(tmp)), \
                 patch.object(fast, "RUNTIME", "native"), patch.dict(fast.OPTIONS, {"prepared": True}), \
