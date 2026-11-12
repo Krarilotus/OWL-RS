@@ -18,7 +18,7 @@ across machines where a use case needs it ([vision](spec/00-vision-and-scope.md)
 1. **Finish v2:** the open items of the merge checklist (DL classification and its
    outliers, the store's DL mode, the query items, materialisation memory, OWL 2 QL
    rewriting).
-2. **Benchmark it:** the fast regression suite, the core workloads with the Zebratlas
+2. **Benchmark it:** the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the
    best-configuration track ([benches/PROTOCOL.md](../benches/PROTOCOL.md)).

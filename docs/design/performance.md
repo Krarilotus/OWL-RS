@@ -50,7 +50,7 @@ suite says nothing about those; a change to such code adds the row and its guard
 | Distinct values by a group walk (NOT EXISTS sides, sets) | DBpedia q13 25 → 3.1 ms | `distinct_values_walk_the_index` (`group walk`) | `op-group` (route: `group walk`) |
 | Worst-case-optimal joins for cyclic patterns | LUBM 100 q2 18 → 4.8 ms | `triangles_join_worst_case_optimally` (`wcoj`) | `q-cycles`, `kernel-intersect` (route: `wcoj`) |
 | String filters on the dictionary | Wikidata q06 148 → 0.06 ms | `string_filters_test_the_dictionary` (`dictionary string test`) | `op-strings` (route) |
-| Sideways information passing | Zebratlas Q03 about 1,200× (§3) | `patterns_joined_to_rows_are_evaluated_from_them` (`sideways`, from 2 rows) | `q-sideways` (`values-star`) |
+| Sideways information passing | a provenance query about 1,200× (§3) | `patterns_joined_to_rows_are_evaluated_from_them` (`sideways`, from 2 rows) | `q-sideways` (`values-star`) |
 | LIMIT pushdown | Wikidata q04 3,380 → 21 ms | `limits_stop_the_joins_early` (`limit pushdown`, one morsel of 1,024 rows) | `q-sideways` (`limit-join`) |
 | Closures by components | YAGO q08 11,432 → 24 ms | `closures_run_by_components` (`closure`) | `q-paths` |
 | EXISTS as sets | DBpedia q13 25 → 3.1 ms | `exists_runs_once_as_a_set` (`anti join`, `semi join`) | `q-sideways` (`exists`), `op-negation` |
@@ -161,8 +161,8 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 | **Columnar scans**: a block and a column at a time, merged across the asserted and inferred stacks | scans | DBpedia q12 `SUM` over a 3-way star 206 → 41 ms |
 | **Adaptive morsels and LIMIT pushdown**: morsels grow with observed fan-out; small ones probe the index; LIMIT cuts BGPs and OPTIONAL's left side | executor | Wikidata q04 3-way join, LIMIT 100 k: 3,380 → 21 ms |
 | **Worst-case-optimal joins** for cyclic patterns, chunks sized to the threads | WCOJ | LUBM 100 q2 18 → 4.8 ms |
-| **Sideways information passing**: a pattern joined to rows already computed is evaluated from them (index probes per row where the rows are few) | `native/sideways.rs` | Zebratlas Q03, one edge's provenance: 164 ms, then about 1,200× faster (0c014be, 4 Oct) |
-| **A `VALUES` always seeds** the pattern it joins: its rows are given, and if probing doesn't pay the pattern runs alone as before | `join_sideways` | the same Q03 case; the estimate of a star's smallest pattern (7 statements) had kept it second |
+| **Sideways information passing**: a pattern joined to rows already computed is evaluated from them (index probes per row where the rows are few) | `native/sideways.rs` | A provenance query for one edge: about 1,200× faster |
+| **A `VALUES` always seeds** the pattern it joins: its rows are given, and if probing doesn't pay the pattern runs alone as before | `join_sideways` | the same provenance query; the estimate of a star's smallest pattern (7 statements) had kept it second |
 | **EXISTS as sets**, semi- and anti-joins in place, branch-free and in parallel | exists | DBpedia q13 25 → 3.1 ms |
 | **Paths planned with the patterns**: each property path is an input of the join orderer beside the triple patterns, with its estimate alone (a closure from a constant by a search bounded to 4,096 nodes, exact below) and the distinct values of its ends; a selective path goes first and the patterns are probed from what it reaches. A path bound at both ends still follows from the smaller end | `native/path_joins.rs` | DBpedia, people born under Bavaria with names: 37.9 → 0.15 ms (1.49 M birthPlace rows no longer read) |
 | **Eager aggregation**: a group over a join aggregates the side its aggregates read first (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG` as sums and counts) | `plan.rs` | BSBM 10 M, BI q4's average per feature: 1.43 M join rows → 72.8 k, 214 → 56 ms |
