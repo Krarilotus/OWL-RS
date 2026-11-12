@@ -490,13 +490,20 @@ class OwnTarget(unittest.TestCase):
         self.assertFalse(self.build(repo, "second")["built"], "an isolated build of this tree is built again")
 
 
+# How long a stand-in server may take to answer /readyz: a bound sized for a loaded host (four
+# Windows gates and a clippy job on one host took it past 5 s, 11 Nov 2026), not a speed. A start
+# returns as soon as the server is ready.
+READY_S = 60
+
+
 class Launch(unittest.TestCase):
     def setUp(self):
         self.stand_in = StandIn()
         self.addCleanup(self.stand_in.remove)
 
     def server(self, **env) -> Server:
-        server = Server(self.stand_in.target["command"], {}, env, self.stand_in.dir / "server.log", start_timeout=5)
+        server = Server(self.stand_in.target["command"], {}, env, self.stand_in.dir / "server.log",
+                        start_timeout=READY_S)
         self.addCleanup(server.cleanup)
         return server
 

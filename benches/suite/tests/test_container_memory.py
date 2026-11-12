@@ -184,8 +184,12 @@ class ContainerMemoryPeak(unittest.TestCase):
             sampler = runtime.ContainerMemory("c", locate=lambda: group, period_s=0.001)
             try:
                 self.wait_for(sampler, 1)
-                retrying(shutil.rmtree, group)
+                # Gone at once, as Linux removes it: a removal file by file would let a read find
+                # memory.stat gone while its directory still stands, a cgroup that isn't removed.
+                gone = Path(tmp) / "removed"
+                retrying(group.rename, gone)
                 sampler.thread.join(timeout=5)
+                retrying(shutil.rmtree, gone)
             finally:
                 peak = sampler.stop()
         self.assertEqual(peak, 120)
