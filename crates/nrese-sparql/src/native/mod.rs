@@ -3735,8 +3735,9 @@ impl<'a> Context<'a> {
             }
             _ => false,
         };
-        // Pairs of patterns: cancelled, the rest is left out, and the orderer that reads them
-        // reports the cancellation. Asked per pattern, here and below: the pairs are n²/2.
+        // Pairs of patterns: cancelled, the rest is left out, here or below, so the lists are
+        // complete only for a run that isn't cancelled; the orderer that reads them reports
+        // the cancellation. Asked per pattern: the pairs are n²/2.
         let cancelled = || {
             self.cancellation
                 .as_ref()
