@@ -92,7 +92,9 @@ pub(super) const SET_GATE_ROWS: f64 = 1_000_000.0;
 /// its predicates are in few sets, the sets are read as before the gate. About 7 µs of
 /// lookups. The join-order identity fixtures' graphs are in few sets, so they keep their plans;
 /// WatDiv's S1 reads 98 and keeps the plan its sets give; WatDiv's other queries read 2,625 to
-/// 96,518 (12 November 2026). A constant, as [`SET_BUDGET`] is.
+/// 96,518 (12 November 2026). It bounds the starts only: a search it admits may read long
+/// lists after them (a chain's links), up to its budget, [`SET_BUDGET`] for a query that
+/// expects little, before the BGP keeps its plain plan. A constant, as [`SET_BUDGET`] is.
 pub(super) const SET_START_ALLOWANCE: usize = 1 << 10;
 
 /// Set entries a planning may spend per row its plain plan expects, above [`SET_BUDGET`]
