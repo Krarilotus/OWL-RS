@@ -50,10 +50,16 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
         Taxonomy::complete,
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
-            None => run(store, snapshot, classify::classify, |t, why| {
-                t.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
-                t.incomplete.push(why)
-            }),
+            None => run(
+                store,
+                snapshot,
+                classify::classify,
+                Taxonomy::refused,
+                |t, why| {
+                    t.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
+                    t.incomplete.push(why)
+                },
+            ),
         },
     )
 }
@@ -66,12 +72,18 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
         snapshot.revision(),
         complete,
         || {
-            run(store, snapshot, classify::realise, |r, why| {
-                r.taxonomy.classification.consistency =
-                    nrese_dl::verdict::Verdict::Unknown(why.clone());
-                r.taxonomy.incomplete.push(why.clone());
-                r.incomplete.push(why)
-            })
+            run(
+                store,
+                snapshot,
+                classify::realise,
+                Realisation::refused,
+                |r, why| {
+                    r.taxonomy.classification.consistency =
+                        nrese_dl::verdict::Verdict::Unknown(why.clone());
+                    r.taxonomy.incomplete.push(why.clone());
+                    r.incomplete.push(why)
+                },
+            )
         },
     )
 }
@@ -115,21 +127,16 @@ fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
     engine: fn(&nrese_owl::Ontology, &classify::Options) -> T,
+    refused: fn(String) -> T,
     incomplete: fn(&mut T, String),
 ) -> T {
     let started = Instant::now();
     // The process's limit that can't be found (its memory unread) holds no engine to it:
-    // none runs, and the answer over no axioms says why (never kept: fail closed).
+    // none runs, and the answer says why (never kept: fail closed).
     if let Err(unread) = store.process_memory_bytes() {
-        let mut none = engine(
-            &nrese_owl::Ontology::default(),
-            &classify::Options::default(),
-        );
-        incomplete(
-            &mut none,
-            format!("the process's memory limit couldn't be found ({unread})"),
-        );
-        return none;
+        return refused(format!(
+            "the process's memory limit couldn't be found ({unread})"
+        ));
     }
     let mut options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
@@ -196,6 +203,18 @@ mod tests {
             )
             .unwrap();
         let snapshot = store.engine().snapshot();
+        fn no_engine<T>(_: &nrese_owl::Ontology, _: &classify::Options) -> T {
+            panic!("an engine ran after the limit couldn't be found")
+        }
+        let ignored = |_: &mut Taxonomy, _: String| {};
+        run(&store, &snapshot, no_engine, Taxonomy::refused, ignored);
+        run(
+            &store,
+            &snapshot,
+            no_engine,
+            Realisation::refused,
+            |_, _| {},
+        );
         let taxonomy = taxonomy(&store, &snapshot);
         let realisation = realisation(&store, &snapshot);
         for (consistency, incomplete) in [
