@@ -109,5 +109,5 @@ Before this change, the whole serialised result (here 1 GB) was buffered in memo
 
 **Notes:**
 - For comparison, loading over HTTP through the mutation pipeline reaches about 430 k t/s (table above), and v1 reached 6,790 t/s.
-- **Not yet compared with competitors.** QLever's index builder and GraphDB's ImportRDF still have to run on this machine with the same file. Until then, no claim relative to them is made.
+- **Not yet compared with competitors.** QLever's index builder still has to run on this machine with the same file. Until then, no claim relative to it is made.
 - Restart time is dominated by rebuilding the six permutations and the dictionary hash table from the checkpoint. Persisted run files (Pf2) remove the rebuild.

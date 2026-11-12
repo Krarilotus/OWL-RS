@@ -14,14 +14,12 @@ consent. This repository is public, so **committing results counts as publishing
 | Apache Jena (TDB2, Fuseki's storage) | Apache 2.0 | free |
 | Oxigraph | MIT / Apache 2.0 | free |
 | Virtuoso Open Source 7 | GPL v2 | free |
-| GraphDB Free | Ontotext Free licence | **only with Ontotext's written permission** (Art. 15.3). Reverse engineering, including "underlying ideas or algorithms", is prohibited (Art. 12.7); black-box timing is not reverse engineering |
-| RDFox (evaluation licence) | OST evaluation licence | **only with OST's approval**; apply ≥ 30 days before publishing (§2.2, §2.3). Results used in papers must be reported to OST (§2.4) |
-| AnzoGraph DB / Altair Graph Lakehouse (Free Edition) | Cambridge Semantics EULA | **only with CSI's prior written consent** (§3(h)). Needs their licence key (§3(j)); the Free Edition is limited to 8 GB RAM, or 16 GB if registered |
+| Licensed systems | the vendor's licence | **only with the vendor's written consent**, recorded in this file |
 
 **Therefore:**
 - Raw results go to `benches/competitors/results/`, which is git-ignored.
 - Only numbers for the free-to-publish systems may appear in committed docs.
-- GraphDB and RDFox numbers stay local until written permission exists. Record the permission (who, when, scope) in this file before publishing.
+- Licensed systems' numbers stay local until written permission exists. Record the permission (who, when, scope) in this file before publishing.
 - Our designs come from the published literature cited in `docs/design/`. We never derive them from observing the vendors' products.
 
 Results: one record per run in [../runs/](../runs/README.md).
@@ -34,7 +32,7 @@ Results: one record per run in [../runs/](../runs/README.md).
 | `nt-filter.py` | Drops the few lines strict parsers reject (invalid IRIs or language tags) before any system sees the file, so all systems get identical input. Reports how many lines it drops |
 | `scorecard.sh <dataset> [systems...]` | **Pf0 scorecard** per system: load time, peak load memory, store bytes (per triple), restart time, server memory, query mix (1 warm-up + 5 runs per query, p50), and a cross-check that all systems return the same result counts. `LOAD_ONLY=1` skips the queries. Synthetic data comes from the harness: `generate --triples N` → `entities-N` |
 | `queries/<dataset>/*.rq` | Query mixes: point lookups, star and multi-hop joins, aggregates, numeric/date/text filters, OPTIONAL, negation, property paths, full scans, large streamed results |
-| `graphdb/repo-*.ttl` | GraphDB repository configs: `empty` for load comparisons; `rdfsplus-optimized` and `owl2-rl` for the reasoning comparisons (M3) |
+| `graphdb/repo-*.ttl` | repository configurations for a licensed system's adapter |
 | `jena/Dockerfile` | Apache Jena tools and Fuseki at a pinned version |
 
 ## Systems
@@ -43,20 +41,17 @@ Results: one record per run in [../runs/](../runs/README.md).
 |---|---|---|
 | NRESE | built in `rust:<rust-toolchain.toml version>-bookworm` | `nrese-server load` |
 | QLever (latest of 8 Nov 2026, no release tags) | `adfreiburg/qlever:commit-0998359ab0` | `qlever-index -p true` |
-| GraphDB 11.5.2 Free | `ontotext/graphdb:11.5.2` | `importrdf preload`, ruleset `empty`; queries need `GRAPHDB_LICENSE` |
 | Jena 6.2.0 TDB2 (Fuseki) | `nrese-bench/jena:6.2.0` (`jena/Dockerfile`) | `tdb2.tdbloader --loader=parallel` |
 | Oxigraph 0.5.13 | `ghcr.io/oxigraph/oxigraph:0.5.13` | `oxigraph load` |
 | Virtuoso 7.2.17 Open Source | `openlink/virtuoso-opensource-7:7.2.17` | `ld_dir` + 6 × `rdf_loader_run` + `checkpoint`, excluding server start-up |
-| RDFox 7.6b | `oxfordsemantic/rdfox:7.6b` | sandbox `import`; needs `RDFOX_LICENSE=/path/RDFox.lic` |
-| AnzoGraph DB 3.5.0 Free (Altair Graph Lakehouse) | `cambridgesemantics/anzograph:3.5.0` | `LOAD WITH 'global' <file:...>` into the running in-memory server (start-up excluded); at most 8 GB RAM unregistered. Run explicitly: `scorecard.sh <dataset> anzograph`. Results stay local (EULA §3(h)) |
 
 ## Fairness checklist
 
 The settings below describe the legacy scorecard. New comparisons use the
-[suite protocol](../PROTOCOL.md) and the GraphDB qualification below; a fixed JVM
+[suite protocol](../PROTOCOL.md); a fixed JVM
 heap is not an equal total-memory budget. The current campaigns run on Office-PC,
 with Phuoc-Yu reserved for compatible Office-built native binaries. Never compare
-a GraphDB result from Office with an NRESE result from Phuoc.
+a result from one host with NRESE's from another.
 
 - **Same input and host.** Every system reads the same file from the same Docker volume and writes to a fresh volume.
 - **Each vendor's own bulk loader and tuning guidance:**
@@ -77,21 +72,6 @@ a GraphDB result from Office with an NRESE result from Phuoc.
   full Wikidata remain separate uncompleted scale work; consult the workload
   registry and dated run records instead of this legacy scorecard's scope.
 
-## GraphDB
-
-The comparison uses GraphDB Free 11.5 (one core, two concurrent queries, five
-repositories, 32-bit entity IDs) beside NRESE under the same one-CPU and total-memory
-allocation, one and two clients reported apart; more offered concurrency measures Free's
-queueing, not Enterprise scaling. GraphDB gets its documented native paths: offline
-`importrdf preload` for plain data, parallel `importrdf load` (inference and plugin
-indexes finished before the repository counts as ready) for reasoning, native `sameAs`
-handling kept on, indexes sized for the data, default and tuned variants recorded apart.
-The settings and their defaults are in the `Graphdb` adapter
-([`adapters.py`](../suite/suitekit/adapters.py)); which workloads it covers and what each
-lacks is in the run record [2026-10-09-graphdb-coverage](../runs/2026-10-09-graphdb-coverage.toml).
-Correctness comes first, then load and inference time, latency, throughput, update cost,
-memory and disk; nothing is ranked on only the queries both happened to finish.
-
 ## Cleaning up after a run
 
 The legacy scorecard scripts call `scripts/bench-cleanup.sh --owner scorecard` when they exit, also when they fail or are interrupted. It removes by label only (every container and volume carries its job's namespace, checkout and tool: `scripts/lib/ns.sh`):
@@ -108,13 +88,3 @@ On a host with preserved inputs ([hosts.toml](../hosts.toml)) don't use that cle
 run the suite directly with `NRESE_BENCH_KEEP=1`, the inputs mounted read-only and
 fresh writable stores outside the preservation root, and afterwards remove only the
 run's own containers, stores and scratch by exact identity.
-
-## Getting licences
-
-- **RDFox:** <https://www.oxfordsemantic.tech/free-trial>. It requires an institutional email and acceptance of the [evaluation licence](https://www.oxfordsemantic.tech/rdfox-evaluation-license).
-- **GraphDB Free licence (required since GraphDB 11.0):** request GraphDB Free on the Graphwise download page and the licence arrives by email. Run the scorecard with `GRAPHDB_LICENSE=/path/graphdb.license`. Without it, GraphDB still bulk-loads but answers every query with "No license was set".
-- **GraphDB Enterprise:** a comparison requires an existing valid licence for the
-  measured host and core count. Enterprise also differs in concurrency, connectors,
-  entity-ID capacity and clustering; it is not only a parallel-inference option.
-  Acquiring a licence or requesting publication permission is a separate maintainer
-  decision. The current campaign uses the existing Free key.

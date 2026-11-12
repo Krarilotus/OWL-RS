@@ -261,7 +261,7 @@ semantics it names, and on nothing else:
   go to the other stores, so counts come before times.
 - **Known hangs:** a pair that gave no answer in a past run is recorded in its case
   (`hangs = { "jena:owl-horst" = "why" }`), reported as `hangs` and not run again.
-- **Licensed systems** (GraphDB, RDFox, Stardog, AnzoGraph) only with `--licensed` and their
+- **Licensed systems** only with `--licensed` and their
   licences; their results stay in `results/` (git-ignored).
 
 SPARQL systems go through the suite's driver (`benches/suite`, workload `fast`, tier
