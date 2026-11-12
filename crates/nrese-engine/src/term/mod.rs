@@ -216,6 +216,14 @@ impl TermId {
         inline::date_widened(self, later)
     }
 
+    /// For an inline dateTime, an id two local days earlier (`later == false`) or later, at
+    /// its clock, with the smallest or largest timezone code: widened FILTER range bounds
+    /// that hold every value comparing true whatever either side's timezone (see
+    /// `inline::date_time_widened`). `None` for other ids.
+    pub fn date_time_widened(self, later: bool) -> Option<Self> {
+        inline::date_time_widened(self, later)
+    }
+
     /// The smallest and largest inline ids of `kind` (`Date` or `DateTime`) whose local
     /// year is in `low..=high` (0000-9999): the ids for which `YEAR` gives those years, as
     /// one range, since the year leads the payload. `None` for other kinds or years.
