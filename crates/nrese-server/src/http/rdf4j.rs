@@ -974,7 +974,19 @@ mod tests {
                 .status()
         };
         assert_eq!(status(unread), StatusCode::INTERNAL_SERVER_ERROR);
-        let malformed = nrese_store::StoreError::InvalidGraphIri("not an IRI".to_owned());
+        // What `parse_configuration` returns for configuration RDF that doesn't parse.
+        let malformed = nrese_store::parse_payload(
+            nrese_store::GraphResultFormat::Turtle,
+            None,
+            b"<urn:a> <urn:b> .",
+            &nrese_exec::Envelope::unlimited(),
+        )
+        .map(|_| ())
+        .expect_err("malformed Turtle");
+        assert!(
+            matches!(malformed, nrese_store::StoreError::RdfParse(_)),
+            "{malformed:?}"
+        );
         assert_eq!(status(malformed), StatusCode::BAD_REQUEST);
     }
 
