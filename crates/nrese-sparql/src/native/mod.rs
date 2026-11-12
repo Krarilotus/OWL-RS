@@ -52,6 +52,8 @@ mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
+mod join_order_tests;
+#[cfg(test)]
 mod lone_pattern_tests;
 #[cfg(test)]
 mod optimise_tests;
@@ -3652,12 +3654,15 @@ impl<'a> Context<'a> {
         vars: &mut Vec<Variable>,
     ) -> Vec<plan::Input> {
         let mut index_of = |v: Variable| variable_index(vars, v);
-        let overlaps = self.overlaps(scans, counts);
+        // Each pattern's variables, read once for the overlaps and its input.
+        let own: Vec<Vec<Variable>> = scans.iter().map(ScanPattern::vars).collect();
+        let overlaps = self.overlaps(scans, &own, counts);
         scans
             .iter()
             .zip(counts)
             .zip(overlaps)
-            .map(|((scan, &count), overlaps)| {
+            .zip(own)
+            .map(|(((scan, &count), overlaps), own)| {
                 let star = match &scan.slots[0] {
                     Slot::Var(v) => self.star(scan, count, index_of(v.clone())),
                     _ => None,
@@ -3668,7 +3673,6 @@ impl<'a> Context<'a> {
                     }
                     _ => None,
                 };
-                let own = scan.vars();
                 let linked: Vec<Variable> = links
                     .iter()
                     .filter(|(v, read)| !own.contains(v) && read.iter().all(|r| own.contains(r)))
@@ -3701,48 +3705,75 @@ impl<'a> Context<'a> {
     /// Per pattern of `scans` with one variable, the values it has in common with each
     /// other such pattern on the same variable ([`plan::Input::overlaps`]), where their
     /// `counts` together are at most [`plan::OVERLAP_VALUES`]: both lists are read sorted
-    /// from the index and merged.
-    fn overlaps(&self, scans: &[ScanPattern], counts: &[u64]) -> Vec<Vec<(usize, u64)>> {
+    /// from the index and merged. `vars` are each pattern's variables ([`ScanPattern::vars`]).
+    fn overlaps(
+        &self,
+        scans: &[ScanPattern],
+        vars: &[Vec<Variable>],
+        counts: &[u64],
+    ) -> Vec<Vec<(usize, u64)>> {
         let mut out = vec![Vec::new(); scans.len()];
         // The single-variable patterns: their variable and its position.
-        let single: Vec<Option<(Variable, usize)>> = scans
+        let single: Vec<Option<(&Variable, usize)>> = scans
             .iter()
-            .map(|scan| {
-                let [v] = &scan.vars()[..] else {
+            .zip(vars)
+            .map(|(scan, vars)| {
+                let [v] = &vars[..] else {
                     return None;
                 };
                 if !scan.in_default_graph() || scan.repeats_variable() {
                     return None;
                 }
                 let position = (0..3).find(|&c| scan.slots[c].is_var(v))?;
-                Some((v.clone(), position))
+                Some((v, position))
             })
             .collect();
+        // The pairs whose common values are counted: two of them on one variable, small.
+        let counted = |i: usize, j: usize| match (single[i], single[j]) {
+            (Some((a, _)), Some((b, _))) => {
+                a == b && counts[i].saturating_add(counts[j]) <= plan::OVERLAP_VALUES
+            }
+            _ => false,
+        };
+        // Pairs of patterns: cancelled, the rest is left out, here or below, so the lists are
+        // complete only for a run that isn't cancelled; the orderer that reads them reports
+        // the cancellation. Asked per pattern: the pairs are n²/2.
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // The first pattern with such a pair. None (most BGPs): no list to read, nothing to
+        // charge.
+        let mut first = None;
+        for i in 0..scans.len() {
+            if cancelled() {
+                return out;
+            }
+            if (i + 1..scans.len()).any(|j| counted(i, j)) {
+                first = Some(i);
+                break;
+            }
+        }
+        let Some(first) = first else {
+            return out;
+        };
         // The lists' charge, while they live: the columns decoded for them are charged before
         // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
         let mut held = Reservation::new(&*self.budget);
         // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
-        for i in 0..scans.len() {
-            // Pairs of patterns: cancelled, the rest is left out, and the orderer that
-            // reads them reports the cancellation.
-            if self
-                .cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
+        for i in first..scans.len() {
+            if cancelled() {
                 break;
             }
             for j in i + 1..scans.len() {
-                let (Some((a, _)), Some((b, _))) = (&single[i], &single[j]) else {
-                    continue;
-                };
-                if a != b || counts[i].saturating_add(counts[j]) > plan::OVERLAP_VALUES {
+                if !counted(i, j) {
                     continue;
                 }
                 for k in [i, j] {
                     if lists[k].is_none() {
-                        let (v, position) = single[k].as_ref().expect("single");
+                        let (v, position) = single[k].expect("single");
                         let permutation = scans[k].permutation_for(Some(v));
                         let pattern = scans[k].quad_pattern();
                         // A column at a time where the index allows (a few ns a value;
@@ -3751,7 +3782,7 @@ impl<'a> Context<'a> {
                             self.model,
                             &pattern,
                             permutation,
-                            &[*position],
+                            &[position],
                             &self.budget,
                         );
                         lists[k] = match decoded {
@@ -3763,7 +3794,7 @@ impl<'a> Context<'a> {
                             Ok(None) => self
                                 .snapshot
                                 .scan_sorted_in(self.model, &pattern, permutation)
-                                .map(|quads| quads.map(|q| q.components()[*position]).collect()),
+                                .map(|quads| quads.map(|q| q.components()[position]).collect()),
                             // Refused: no overlap known for it; the plan goes without.
                             Err(_) => None,
                         };
@@ -3822,11 +3853,16 @@ impl<'a> Context<'a> {
         if !scan.in_default_graph() {
             return count;
         }
-        let positions: Vec<usize> = (0..4).filter(|&c| scan.slots[c].is_var(var)).collect();
-        let [position] = positions[..] else {
+        let mut positions = (0..4).filter(|&c| scan.slots[c].is_var(var));
+        let (Some(position), None) = (positions.next(), positions.next()) else {
             return count;
         };
-        if scan.vars().len() == 1 {
+        // `var` alone: each match has a value of its own.
+        if !scan
+            .slots
+            .iter()
+            .any(|s| matches!(s, Slot::Var(v) if v != var))
+        {
             return count;
         }
         let bound = |c: usize| c == 3 || matches!(scan.slots[c], Slot::Const(_));
