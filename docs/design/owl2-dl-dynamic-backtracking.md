@@ -39,7 +39,8 @@ the choosing only (at most about 1.6×).
   of its own.
 - Nadel and Ryvchin, *Chronological backtracking* (SAT 2018), and Möhle and Biere, *Backing
   backtracking* (SAT 2019): CDCL backtracks one level instead of jumping far, with assignments
-  out of level order; the invariants that keep conflict analysis sound. CaDiCaL uses this.
+  out of level order; the invariants that keep conflict analysis sound. CaDiCaL uses this
+  (Biere et al., *CaDiCaL 2.0*, CAV 2024).
 
 The tableau's case is the friendliest one: every fact already carries its dependency set.
 

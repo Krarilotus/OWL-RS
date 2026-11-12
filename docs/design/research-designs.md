@@ -310,10 +310,8 @@ continues on another thread can't be told apart from a stranger.
 `execution.threads > 0`): query A claims a flight and starts a parallel kernel; a worker
 helping that kernel steals query B; B waits for A's flight on that worker's stack; A can't
 publish until its kernel returns, and the kernel can't return until B does. A forced
-two-worker test on host A hung until a watchdog cancelled B (`flight-diagnostic.patch`,
-`-test.log`, `-exit.txt` under the campaign root of [hosts.toml](../../benches/hosts.toml)
-`assets.evidence`, `campaign-20261010-bebada2/`; SHA-256 `8227cf96…`, `89f1fc58…`,
-`39b8dc3f…`). It shows the dependency, not how often it happens. Rayon documents the hazard
+two-worker test on host A hung until a watchdog cancelled B. It shows the dependency, not
+how often it happens. Rayon documents the hazard
 ([join](https://docs.rs/rayon/1.12.0/rayon/fn.join.html)); a timeout or yield doesn't remove it.
 
 **What remains reachable.** Queries now run on their caller, and a caller isn't a Rayon
