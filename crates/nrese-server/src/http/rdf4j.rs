@@ -949,6 +949,18 @@ pub async fn transaction_rollback(
     }
 }
 
+/// A repository configuration's parse error: malformed RDF is the request's (400); anything
+/// else as a query's is (memory refused: 503 or 413; the process's limit unread: 500).
+fn configuration_error(
+    policy: &crate::policy::PolicyConfig,
+    error: nrese_store::StoreError,
+) -> ApiError {
+    match error.is_request_error() {
+        true => ApiError::bad_request(format!("repository configuration: {error}")),
+        false => sparql::map_query_error(policy, error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nrese_rdf::NamedNode;
@@ -1060,17 +1072,5 @@ mod tests {
         let graphs = contexts(&pairs).unwrap();
         assert_eq!(graphs.len(), 2);
         assert_eq!(graphs[0], GraphName::DefaultGraph);
-    }
-}
-
-/// A repository configuration's parse error: malformed RDF is the request's (400); anything
-/// else as a query's is (memory refused: 503 or 413; the process's limit unread: 500).
-fn configuration_error(
-    policy: &crate::policy::PolicyConfig,
-    error: nrese_store::StoreError,
-) -> ApiError {
-    match error.is_request_error() {
-        true => ApiError::bad_request(format!("repository configuration: {error}")),
-        false => sparql::map_query_error(policy, error),
     }
 }
