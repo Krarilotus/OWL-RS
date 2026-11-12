@@ -1398,3 +1398,57 @@ mod own_corpora_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod corpus_walk_tests {
+    use super::*;
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
+
+    /// A corpus walk over a run too small to be walked in parts holds no group walk's slab:
+    /// its scratch is the serial walk's (package review r1 S2). One literal, so one word of
+    /// bits (8 bytes), and one run of one statement: a slice's counts of that run and as many
+    /// again (2,048 bytes), and two parts of a cut, a vector and four counts (192). With a
+    /// query's earlier holds leaving 3,200 bytes, that fits and the walk is answered, the
+    /// literal its one document; nothing is held after but the earlier holds. A slab's block
+    /// counted for each of those parts (4,160 bytes of scratch) would refuse it.
+    #[test]
+    fn a_corpus_walk_over_a_run_too_small_for_parts_fits_the_serial_scratch() {
+        let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let text: Term = Literal::new_simple_literal("red fox").into();
+        let literal = tx.intern(text.as_ref());
+        tx.insert(Quad::new(ex("s"), ex("p"), text, GraphName::DefaultGraph).as_ref());
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        // The shape stated: one word of bits; one run, of fewer entries than a part.
+        assert_eq!(snapshot.version.dictionary_len.div_ceil(64), 1);
+        let runs: Vec<_> = snapshot.version.runs().collect();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].entries() < crate::index::GROUP_PART as u64);
+
+        let limit = 1 << 20;
+        let budget = Arc::new(nrese_exec::Budget::new(limit));
+        let earlier = limit - 3_200;
+        budget.charge(earlier).unwrap();
+        let corpus = snapshot
+            .walk_corpus(
+                Documents::Literals,
+                ReadModel::Asserted,
+                &TextScope::EVERY,
+                &budget,
+            )
+            .expect("the serial walk's scratch fits the room left");
+        assert_eq!(corpus.documents, 1);
+        let at = literal.payload();
+        assert_eq!((corpus.bits[(at / 64) as usize] >> (at % 64)) & 1, 1);
+        drop(corpus);
+        assert!(!budget.refused(), "no refusal recorded on the budget");
+        assert_eq!(budget.used(), earlier);
+        budget.release(earlier);
+    }
+}
