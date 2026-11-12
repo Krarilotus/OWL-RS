@@ -1104,7 +1104,8 @@ impl Snapshot {
     /// they hold besides the bits: per slice its group counts (16 bytes a term, 64 terms a
     /// word of the slice) from each run, and as many again where they are merged or
     /// compared; and the parts a large range's grouping is cut into
-    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and at least four counts).
+    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and the part's block of the
+    /// walk's slab, [`crate::index::PART_BLOCK`] counts).
     /// The slices running at once cover disjoint ranges, so their parts are at most the
     /// runs' entries over a part, and two more a run and slice. As many at once as `room`
     /// holds, at least one, no more than the pool's threads nor than there are slices.
@@ -1117,7 +1118,7 @@ impl Snapshot {
         let parts = entries as usize / crate::index::GROUP_PART + 2 * runs * running;
         let part = std::mem::size_of::<usize>()
             + std::mem::size_of::<Vec<(u64, i64)>>()
-            + 4 * std::mem::size_of::<(u64, i64)>();
+            + crate::index::PART_BLOCK * std::mem::size_of::<(u64, i64)>();
         (running, running * slice + parts * part)
     }
 
