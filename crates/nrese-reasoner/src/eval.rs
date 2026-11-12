@@ -1497,14 +1497,16 @@ impl<'a> OperationStop<'a> {
     }
 
     /// What the operation may still take now: the least of what its own memory limit
-    /// leaves ([`Self::within`]), what the process's leaves, if one is set, and what the
-    /// system leaves the process ([`nrese_exec::memory::remaining_bytes`]). Read when
+    /// leaves ([`Self::within`]) and what the process's leaves, if one is set; without
+    /// either, no bound. Each is a limit read where the process or the store starts, less
+    /// what the process holds now: nothing reads what the system has free on the
+    /// operation's path, so what others take is the limit's to leave room for. Read when
     /// asked, once before allocations whose size is known, which a poll would only see
     /// once they are made. A reading that can't be taken is no room: its cause is
     /// [`MemoryStopCause::Unread`](nrese_exec::memory::MemoryStopCause).
     pub fn room(&self) -> Result<u64, nrese_exec::memory::MemoryStopCause> {
         let own = self.room.map_or(Ok(u64::MAX), |room| room());
-        [own, process_room(), nrese_exec::memory::remaining_bytes()]
+        [own, process_room()]
             .into_iter()
             .try_fold(u64::MAX, |least, room| room.map(|room| least.min(room)))
             .map_err(|_| nrese_exec::memory::MemoryStopCause::Unread)
