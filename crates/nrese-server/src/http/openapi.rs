@@ -22,7 +22,8 @@ pub(crate) struct Problem {
     status: u16,
     detail: String,
     /// For a rejected commit (type `reasoner-reject`, `shacl-reject` or `commit-reject`):
-    /// the violated rule or constraint and the statements it shows, where there are any.
+    /// the violated rule or constraint and the statements it shows, where there are any. The
+    /// name is kept for every kind, so that clients that read it go on working.
     reasoner_reject: Option<serde_json::Value>,
     /// The request's id, as in the `x-request-id` header and the server's log.
     request_id: Option<String>,
