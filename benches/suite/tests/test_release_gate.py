@@ -1626,6 +1626,21 @@ class Memory(unittest.TestCase):
         self.assertEqual(unresolved["status"], "unresolved")
         self.assertGreater(unresolved["p"], 0.045)
 
+    def test_only_a_case_counting_live_bytes_declares_the_live_peak(self):
+        # Spec (master, 12 Nov 10:36): --count-allocations alone counts calls and bytes, as the
+        # baselines' perf labs do, and declares no live peak, so the three counted cases are
+        # compared on time and anon/kernel memory only; a case counting live bytes (--count-live)
+        # declares memory/live against each baseline it isn't absent for.
+        catalog = fast.load_cases()
+        counted = ["alloc-load", "alloc-lubm10", "index-join-keys"]
+        family = gate_module.family_of(catalog, counted)
+        self.assertEqual([h for h in family if h.endswith("|memory/live")], [])
+        self.assertIn("base|alloc-load|time/_", family)
+        self.assertIn("base|alloc-load|memory/anon_kernel", family)
+        live = dict(next(c for c in catalog if c["name"] == "alloc-load"), name="alloc-load-live",
+                    args=["--count-allocations", "--count-live"])
+        self.assertIn("base|alloc-load-live|memory/live", gate_module.family_of([live], ["alloc-load-live"]))
+
 
 class Evidence(unittest.TestCase):
     def test_a_declared_hypothesis_without_candidate_evidence_fails_closed(self):
