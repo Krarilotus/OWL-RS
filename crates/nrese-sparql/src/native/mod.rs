@@ -61,6 +61,8 @@ pub(crate) mod ql;
 mod ranges;
 mod scan_columns;
 mod search;
+#[cfg(test)]
+mod set_budget_tests;
 mod sets;
 mod sideways;
 mod spatial;
@@ -86,6 +88,7 @@ use std::time::Instant;
 use crate::results::{
     CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
 };
+use nrese_engine::engine::characteristic::CharacteristicSets;
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
@@ -859,6 +862,9 @@ thread_local! {
     static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
     /// The patterns [`Context::bgp`] counted on this thread (exact or within a hint's ranges).
     static BGP_ESTIMATES: Cell<usize> = const { Cell::new(0) };
+    /// The plannings planned again without the characteristic sets on this thread
+    /// ([`Context::with_sets`]).
+    static REPLANS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
@@ -2050,7 +2056,11 @@ impl<'a> Context<'a> {
         let depth = self.depth.get();
         // The plan's estimate of what this operator gives (`estimate`), as `plan_query`
         // shows it before running.
+        // It plans the operator's BGPs as their evaluation will, which notes how
+        // ([`Self::with_sets`]): once, in its place, not again here per enclosing operator.
+        let noted = trace.borrow().len();
         let estimated_rows = self.estimate_rows(pattern);
+        trace.borrow_mut().truncate(noted);
         let index = {
             let mut trace = trace.borrow_mut();
             let (operator, detail) = describe(pattern);
@@ -3598,13 +3608,18 @@ impl<'a> Context<'a> {
             return Ok(plan::Plan {
                 order: Vec::new(),
                 rows: Vec::new(),
+                work: 0,
             });
         }
         let mut order: Vec<usize> = (0..scans.len()).collect();
         order.sort_by_key(|&i| counts[i]);
         if scans.len() <= 2 && !estimated {
             let rows = vec![f64::NAN; order.len()];
-            return Ok(plan::Plan { order, rows });
+            return Ok(plan::Plan {
+                order,
+                rows,
+                work: 0,
+            });
         }
         let mut vars: Vec<Variable> = Vec::new();
         let inputs = self.plan_inputs(scans, counts, links, &mut vars);
@@ -3612,33 +3627,68 @@ impl<'a> Context<'a> {
             // The smaller pattern first; the join's rows by the orderer's model (a star's
             // pair by the characteristic sets, an edge and a star on its object by the
             // characteristic pairs, a check bounded by the rows it checks).
-            let sets = inputs
-                .iter()
-                .any(|i| i.star.is_some())
-                .then(|| self.snapshot.characteristic_sets_in(self.model))
-                .flatten();
-            let plan = plan::along(&inputs, vars.len(), PROBE_FACTOR, sets.as_deref(), &order);
-            return Ok(plan);
+            let along = |sets: Option<&CharacteristicSets>| {
+                plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, &order)
+            };
+            return self.with_sets(&inputs, &along);
         }
         self.order_inputs(&inputs, vars.len())
     }
 
     /// The join orderer's order of `inputs` over `variables` variables, with the
-    /// characteristic sets where an input is part of a star. Cancelled with the query: the
-    /// orderer asks at every step, so a large pattern's planning ends at the deadline.
+    /// characteristic sets where an input is part of a star ([`Self::with_sets`]). Cancelled
+    /// with the query: the orderer asks at every step, so a large pattern's planning ends at
+    /// the deadline.
     fn order_inputs(&self, inputs: &[plan::Input], variables: usize) -> NativeResult<plan::Plan> {
-        let sets = inputs
-            .iter()
-            .any(|i| i.star.is_some())
-            .then(|| self.snapshot.characteristic_sets_in(self.model))
-            .flatten();
         let cancelled = || {
             self.cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref(), &cancelled)
-            .ok_or_else(|| QueryEvaluationError::Cancelled.into())
+        let order = |sets: Option<&CharacteristicSets>| {
+            plan::order(inputs, variables, PROBE_FACTOR, sets, &cancelled)
+        };
+        self.with_sets(inputs, &order)
+    }
+
+    /// `planning` of `inputs`, with the characteristic sets where an input is part of a star.
+    /// Where they would pass the orderer's budget ([`plan::SET_BUDGET`]), planned once more
+    /// without them, as a graph without sets is, and noted for EXPLAIN: which planner a BGP
+    /// got shows. A cancelled planning fails the query, and isn't planned again.
+    fn with_sets(
+        &self,
+        inputs: &[plan::Input],
+        planning: &dyn Fn(Option<&CharacteristicSets>) -> Result<plan::Plan, plan::Stopped>,
+    ) -> NativeResult<plan::Plan> {
+        let start = Instant::now();
+        let sets = inputs
+            .iter()
+            .any(|i| i.star.is_some())
+            .then(|| self.snapshot.characteristic_sets_in(self.model))
+            .flatten();
+        let work = match planning(sets.as_deref()) {
+            Ok(planned) => return Ok(planned),
+            Err(plan::Stopped::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
+            Err(plan::Stopped::Budget { work }) => work,
+        };
+        #[cfg(test)]
+        REPLANS.set(REPLANS.get() + 1);
+        let mut planned = match planning(None) {
+            Ok(planned) => planned,
+            Err(plan::Stopped::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
+            Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
+        };
+        planned.work = work;
+        if self.trace.is_some() {
+            let detail = format!(
+                "{} patterns planned without characteristic sets: \
+                 estimate budget of {} passed after {work}",
+                inputs.len(),
+                plan::set_budget()
+            );
+            self.note("join order", detail, None, 0, start);
+        }
+        Ok(planned)
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
