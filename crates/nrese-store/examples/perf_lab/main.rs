@@ -1213,6 +1213,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// An error if `loaded` quarantined statements it couldn't read: a measurement over input
+/// that wasn't read is none. The lab loads as the store does by default (quarantine), and
+/// stops after such a load (D16-546: N-Quads named `.nt` "loaded 0 quads", no error).
+fn all_read(loaded: &nrese_store::BulkLoadReport) -> Result<(), Box<dyn std::error::Error>> {
+    if loaded.quarantined == 0 {
+        return Ok(());
+    }
+    let first: String = loaded
+        .examples
+        .iter()
+        .map(|example| format!("\n  {}:{}: {}", example.file, example.line, example.reason))
+        .collect();
+    Err(format!(
+        "the load quarantined {} statements it could not read (load {}), the first:{first}",
+        loaded.quarantined,
+        loaded.load.as_deref().unwrap_or_default()
+    )
+    .into())
+}
+
 fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(threads) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -1348,10 +1368,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         })?;
         report.load_s = started.elapsed().as_secs_f64();
         heap_profile(nrese_exec::heap::finish());
+        // Read as it is by `benches/breadth/era-shacl/nrese-era.sh`.
         eprintln!("loaded {} quads in {:.2} s", loaded.inserted, report.load_s);
         report
             .sections
             .push(("loaded", loaded.inserted.to_string()));
+        report
+            .sections
+            .push(("quarantined", loaded.quarantined.to_string()));
+        all_read(&loaded)?;
         if let Some(peak) = nrese_exec::memory::window_peak_bytes() {
             report
                 .sections
@@ -1469,12 +1494,12 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         phases.push(("reason", phase.json()));
     }
     if let Some(shapes) = &args.shapes {
-        store.bulk_load(&BulkLoadRequest {
+        all_read(&store.bulk_load(&BulkLoadRequest {
             files: vec![shapes.clone()],
             replace: false,
             graph: GraphTarget::NamedGraph(nrese_store::DEFAULT_SHAPES_GRAPH.to_owned()),
             invalid: None,
-        })?;
+        })?)?;
         let mut times = Vec::new();
         let mut results = 0;
         let mut last = None;
