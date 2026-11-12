@@ -44,7 +44,7 @@ Results: one record per run in [../runs/](../runs/README.md).
 | NRESE | built in `rust:<rust-toolchain.toml version>-bookworm` | `nrese-server load` |
 | QLever (latest of 8 Nov 2026, no release tags) | `adfreiburg/qlever:commit-0998359ab0` | `qlever-index -p true` |
 | GraphDB 11.5.2 Free | `ontotext/graphdb:11.5.2` | `importrdf preload`, ruleset `empty`; queries need `GRAPHDB_LICENSE` |
-| Jena 6.2.0 TDB2 (Fuseki) | `nrese-bench/jena:6.2.0` (`jena/Dockerfile`) | `tdb2.tdbloader --loader=parallel`. `tdb2.xloader` fails on real data in 6.2.0 (Thrift "unknown type 15" while sorting terms; the synthetic data loads) |
+| Jena 6.2.0 TDB2 (Fuseki) | `nrese-bench/jena:6.2.0` (`jena/Dockerfile`) | `tdb2.tdbloader --loader=parallel` |
 | Oxigraph 0.5.13 | `ghcr.io/oxigraph/oxigraph:0.5.13` | `oxigraph load` |
 | Virtuoso 7.2.17 Open Source | `openlink/virtuoso-opensource-7:7.2.17` | `ld_dir` + 6 × `rdf_loader_run` + `checkpoint`, excluding server start-up |
 | RDFox 7.6b | `oxfordsemantic/rdfox:7.6b` | sandbox `import`; needs `RDFOX_LICENSE=/path/RDFox.lic` |
