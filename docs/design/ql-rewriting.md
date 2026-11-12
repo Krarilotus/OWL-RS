@@ -18,8 +18,7 @@ known through a source read; *ours* = measured or tested here).
   are possible, polynomially many without the "mimicking" fragments.
 - Calvanese et al., DL-Lite, JAR 2007 (*cited*): canonical models; a CQ's matches need the
   anonymous part only to the depth of the query.
-- Research round 3, `literature/wiki/research/R3-G4 OWL 2 QL and TBox changes.md`: rewrite
-  only the existential part, since the RL closure is already H-complete.
+- Rewrite only the existential part, since the RL closure is already H-complete.
 
 ## 1. Where it sits
 

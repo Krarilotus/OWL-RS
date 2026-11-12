@@ -85,7 +85,7 @@ lifecycle` step 11 (after the restart: its settings) passed, job verify-run-…,
 ## Afterwards
 
 The runner removes each server's directory itself. The host's cache is swept after every build by
-the rule the gates share (Harness/notes/2026-10-20-host-cache-contract.md): binaries unused for 7
+the rule the gates share: binaries unused for 7
 days, target directories and Python environments for 14, then the least recently used until it
 fits its budget; exact paths only. Cancel your jobs a newer run supersedes (`fleet list --mine`).
 
