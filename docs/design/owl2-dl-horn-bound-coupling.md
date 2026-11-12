@@ -77,11 +77,6 @@ Konclude's saturation has none of this because it isn't complete and doesn't try
 
 ## 3. Prior art
 
-`corpus/dl/tableau`: steigmiller2014coupling, steigmiller2015payasyougo,
-steigmiller2016thesis; `corpus/dl/consequence-based`: simancik2011beyondhorn,
-bate2018sequoia, tenacucala2018nominals, tenacucala2021sroiq. Wiki: *DL gap - Steigmiller
-thesis vs outliers*, *DL-B consequence-based vs hypertableau*.
-
 **Steigmiller and Glimm, coupling tableau and saturation (IJCAR 2014; JAIR 2015, §3–4).**
 - A *saturation graph* reuses one node per concept: `∃R.C` links to `v_C` itself, so there
   are at most as many nodes as concepts and no blocking.

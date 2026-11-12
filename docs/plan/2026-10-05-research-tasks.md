@@ -1,7 +1,6 @@
 # Research tasks after the first coverage-and-performance batch (5 October 2026)
 
-For the owner's paper studies and the research agent, which sorts the results into the
-literature wiki. Each task names what NRESE needs to decide or build with it. Where it
+Each task names what NRESE needs to decide or build with it. Where it
 says "per layer", the layers are those of [design/performance.md](../design/performance.md):
 layout, evaluation, parallelism, incremental maintenance, equality, machine level.
 
