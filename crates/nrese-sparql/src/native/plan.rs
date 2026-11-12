@@ -65,11 +65,13 @@ const GREEDY_EFFORT: usize = 1 << 19;
 /// the sets the exhaustive search copies with its states. Each estimate reads whole lists, so
 /// without a bound a planning grows with the sets per predicate: on WatDiv-10m, with tens of
 /// thousands of sets per predicate, these reads were 93 % of F2-4's 133 M instructions per
-/// query (12 November 2026). 2^14 entries are about 0.1 ms of lookups; provisional, until
-/// measured on this count. Like the planner's other limits ([`GREEDY_EFFORT`],
+/// query (12 November 2026). 2^16 entries are about 0.4 ms of lookups, scaled from the
+/// 0.1 ms estimated for 2^14, not measured. On this count, the
+/// join-order identity fixtures do up to 35,860 (the 12-pattern star) and the fast
+/// catalogue's plans up to 348, so both keep their plans. Like the planner's other limits ([`GREEDY_EFFORT`],
 /// [`OVERLAP_VALUES`], `MAX_SETS`), it is a constant, not a setting with an "unlimited" value
 /// as AGENTS.md asks of every budget; one setting for all four is a follow-up.
-pub(super) const SET_BUDGET: usize = 1 << 14;
+pub(super) const SET_BUDGET: usize = 1 << 16;
 
 #[cfg(test)]
 thread_local! {
