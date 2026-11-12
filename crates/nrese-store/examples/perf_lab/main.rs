@@ -1478,7 +1478,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         let mut times = Vec::new();
         let mut results = 0;
         let mut last = None;
-        for _ in 0..args.runs {
+        for run in 0..args.runs {
             let started = Instant::now();
             let validation = store.validate_shacl(
                 &nrese_store::ReadScope::All,
@@ -1487,7 +1487,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             )?;
             times.push(started.elapsed());
             results = validation.report.results.len();
-            last = Some(validation);
+            // Only the last run's report is kept, so every earlier one is dropped where it was,
+            // as the baselines' perf labs do: no run validates beside an earlier run's report.
+            last = (run + 1 == args.runs).then_some(validation);
         }
         if let (Some(path), Some(validation)) = (&args.shacl_report, &last) {
             std::fs::write(
