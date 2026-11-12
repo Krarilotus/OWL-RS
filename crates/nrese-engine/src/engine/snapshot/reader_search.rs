@@ -1104,35 +1104,21 @@ impl Snapshot {
     /// they hold besides the bits: per slice its group counts (16 bytes a term, 64 terms a
     /// word of the slice) from each run, and as many again where they are merged or
     /// compared; and the parts a large range's grouping is cut into
-    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and at least four counts;
-    /// in a run large enough to be walked in parts, the part's block of the walk's slab,
-    /// [`crate::index::PART_BLOCK`] counts, instead of the four). A smaller run is always
-    /// walked serially and holds no slab.
+    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and at least four counts).
     /// The slices running at once cover disjoint ranges, so their parts are at most the
     /// runs' entries over a part, and two more a run and slice. As many at once as `room`
     /// holds, at least one, no more than the pool's threads nor than there are slices.
     fn walk_scratch(&self, words: usize, per: usize, room: usize) -> (usize, usize) {
-        use crate::index::{GROUP_PART, PART_BLOCK};
         let runs = self.version.runs().count().max(1);
         let slice = per * 64 * 16 * runs * 2;
         let most = words.div_ceil(per).min(rayon::current_num_threads()).max(1);
         let running = (room / slice).clamp(1, most);
         let entries: u64 = self.version.runs().map(|run| run.entries()).sum();
-        let parts = entries as usize / GROUP_PART + 2 * runs * running;
-        let count = std::mem::size_of::<(u64, i64)>();
-        let part = std::mem::size_of::<usize>() + std::mem::size_of::<Vec<(u64, i64)>>();
-        let slabbed: usize = self
-            .version
-            .runs()
-            .map(|run| run.entries() as usize)
-            .filter(|&entries| entries >= 2 * GROUP_PART)
-            .map(|entries| entries / GROUP_PART + 2 * running)
-            .sum();
-        let blocks = slabbed * (PART_BLOCK - 4) * count;
-        (
-            running,
-            running * slice + parts * (part + 4 * count) + blocks,
-        )
+        let parts = entries as usize / crate::index::GROUP_PART + 2 * runs * running;
+        let part = std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<(u64, i64)>>()
+            + 4 * std::mem::size_of::<(u64, i64)>();
+        (running, running * slice + parts * part)
     }
 
     /// Whether a statement this snapshot shows in `scope`'s graphs in `model` has `id` at
