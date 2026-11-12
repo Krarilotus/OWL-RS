@@ -31,17 +31,17 @@ The reference machine is documented in `benches/baselines/README.md`. Every comp
 
 | # | Target | Metric | Goal |
 |---|---|---|---|
-| T1 | Semantic agreement | Inferred-triple sets on LUBM, UOBM and SPB, per ruleset, against the W3C rules and an independent rule reasoner | **Identical sets**, apart from documented, deliberate differences (§6.3) |
+| T1 | Semantic agreement | Inferred-triple sets on LUBM, UOBM and SPB, per ruleset, against the W3C rules and an independent, free-to-publish rule reasoner | **Identical sets**, apart from documented, deliberate differences (§6.3) |
 | T2 | Conformance | W3C OWL 2 test cases tagged for the RL profile, run as entailment and consistency tests | Pass all *approved* RL tests that the `owl2-rl` ruleset can decide |
-| T3 | Bulk materialisation | Load plus materialise, `owl2-rl` and `rdfs-plus`, at LUBM-100 and at the largest SPB size that fits in memory | **≥ 10× an established materialising store** end to end on the same machine; materialisation alone set beside RDFox's published figures, with their hardware |
+| T3 | Bulk materialisation | Load plus materialise, `owl2-rl` and `rdfs-plus`, at LUBM-100 and at the largest SPB size that fits in memory | Explicit statements per second end to end, reported per release beside the free-to-publish rule engines (Nemo, VLog, Jena) on the same machine; materialisation alone beside RDFox's published figures, with their hardware |
 | T4 | Parallel scaling | Materialisation speedup with 1 → 8 → 16 threads | ≥ 6× on 8 cores; results bit-identical for every thread count |
-| T5 | Commit-path reasoning | Reasoning-stage latency of a 1-triple ABox insert or delete at 100 M asserted, `owl2-rl` | p50 ≤ 1 ms, p99 ≤ 10 ms. 1 k-triple batch ≤ 50 ms. An established store's per-write cost measured alongside. |
+| T5 | Commit-path reasoning | Reasoning-stage latency of a 1-triple ABox insert or delete at 100 M asserted, `owl2-rl` | p50 ≤ 1 ms, p99 ≤ 10 ms. 1 k-triple batch ≤ 50 ms. A free-to-publish store's per-write cost measured alongside. |
 | T6 | Maintenance correctness | Random insert/delete sequences | Incremental result equals rematerialisation in **100 %** of runs (property tests in CI) |
 | T7 | TBox changes | Adding or removing a `subClassOf`, `subPropertyOf` or `inverseOf` axiom at 100 M | Cost proportional to the affected extension, reported. Never a silent full rematerialisation. |
 | T8 | Memory | Bytes per inferred fact | ≤ 96 B/fact before Pf1 (half the asserted cost, §4.3); ≤ asserted bytes/fact after Pf1 |
 | T9 | Explanations | One derivation tree of depth ≤ 10 | ≤ 10 ms, in every reject response and on demand |
 
-**Where we go beyond the established materialising stores:**
+**What the design adds:**
 - write-path reasoning latency (T5)
 - parallel scaling (T4)
 - proof-carrying rejects
@@ -174,7 +174,7 @@ OWL RL rules mostly join one small schema relation with one large instance relat
 | `rdfs-plus` | RDFS + `inverseOf`, `SymmetricProperty`, `TransitiveProperty`, `FunctionalProperty`/`InverseFunctionalProperty` equality, `equivalentClass`/`Property`, `sameAs` | A widely used ruleset |
 | `owl-horst` | pD* (ter Horst): RDFS-plus + `hasValue`, `someValuesFrom`/`allValuesFrom` (the pD* forms), `differentFrom` consistency | |
 | `owl2-rl` | The W3C OWL 2 RL/RDF rules, all tables: eq, prp, cls, cax, dt (partial, §6.3), scm | |
-| `owl2-ql` | A materialisable OWL 2 QL variant | Query rewriting is an optional stretch (R8) |
+| `owl2-ql` | The materialisable part of OWL 2 QL ([its rules](../spec/reasoning-semantics.md)) | Query rewriting is an optional stretch (R8) |
 | `custom` | Any `.pie` or IR program | Validated by the analysis (safety, arity) |
 
 Every ruleset has two variants:
@@ -297,7 +297,7 @@ The owlrl oracle doesn't finish within an hour. The equivalence and transitive m
   - `dt-not-type` (partial)
 - **Explanations:** backward proof search over the program, reusing the B/F backward step. It returns one shortest derivation tree down to asserted facts, bounded by depth and time. Explanations are recomputed rather than stored, so they cost no memory.
   - **Reject responses** carry the violation's derivation tree, which replaces v1's heuristic blame.
-  - An **on-demand API** returns the proof for any inferred fact, with a SPARQL form as an extension function.
+  - An **on-demand API** returns the proof for any inferred fact, with a SPARQL form as an extension function, in the proof-query form existing tools use.
 
 ### 6.2 Graph semantics
 
