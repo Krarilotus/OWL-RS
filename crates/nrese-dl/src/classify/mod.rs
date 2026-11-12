@@ -171,6 +171,19 @@ impl Taxonomy {
     pub fn complete(&self) -> bool {
         self.incomplete.is_empty()
     }
+
+    /// A classification no engine ran for, `why`: nothing found, its consistency unknown,
+    /// incomplete (never a complete answer).
+    pub fn refused(why: String) -> Self {
+        Self {
+            classification: Classification::new(
+                Vec::new(),
+                crate::verdict::Verdict::Unknown(why.clone()),
+            ),
+            incomplete: vec![why],
+            profile: Profile::default(),
+        }
+    }
 }
 
 /// The deadline of a run.
