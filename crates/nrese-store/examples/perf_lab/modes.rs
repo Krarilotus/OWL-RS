@@ -273,7 +273,8 @@ pub fn kernel(name: &str, runs: usize) -> Result<String, Box<dyn std::error::Err
 
 /// Parsing and planning a query without running it, `runs` times: the cost of the parser
 /// and the rewrites on large or deeply nested queries. The JSON object of a query in the
-/// report, with the plan's size (steps and rewrites) as its counts.
+/// report, with the plan's size (steps and rewrites) as its counts and no `rows`: no query
+/// runs, so there is no answer to count.
 pub fn parse_and_plan(
     store: &StoreService,
     name: &str,
@@ -297,7 +298,7 @@ pub fn parse_and_plan(
     let (p50, _, max) = percentiles(&mut times);
     println!("{name:<28} parse and plan p50 {p50:.2} ms, {steps} steps, {rewrites} rewrites");
     let json = format!(
-        "    {{\n      \"name\": \"{name}\",\n      \"rows\": {steps},\n      \"p50_ms\": {p50:.3},\n      \"max_ms\": {max:.3},\n      \"steps\": {steps},\n      \"rewrites\": {rewrites},\n      \"samples_ms\": [{}]\n    }}",
+        "    {{\n      \"name\": \"{name}\",\n      \"p50_ms\": {p50:.3},\n      \"max_ms\": {max:.3},\n      \"steps\": {steps},\n      \"rewrites\": {rewrites},\n      \"samples_ms\": [{}]\n    }}",
         samples.join(", ")
     );
     Ok((json, p50))
@@ -331,9 +332,26 @@ pub fn classification(
         report.consistent,
         report.incomplete.len()
     );
+    // The decided answer the harness's checks read (`consistency`). Conservative: consistent
+    // only when no reason says the classification may be incomplete (a hierarchy left
+    // incomplete makes it unknown even where consistency was decided) and, after the
+    // context core, the store's own check agrees (untimed): it is unknown where the reader
+    // left parts of the data out, which that fast path doesn't look at and the tableau's
+    // reasons do. Inconsistent stands.
+    use nrese_store::dl::Verdict;
+    let read_whole =
+        report.engine != "context-core" || store.entails_dl(&[])?.premise == Verdict::Consistent;
+    let consistency = match (
+        report.consistent,
+        report.incomplete.is_empty() && read_whole,
+    ) {
+        (false, _) => "inconsistent",
+        (true, true) => "consistent",
+        (true, false) => "unknown",
+    };
     Ok(format!(
-        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistent\": {}, \"incomplete\": {}, \
-         \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
+        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistent\": {}, \"consistency\": {consistency:?}, \
+         \"incomplete\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
         report.engine,
         report.subsumptions.len(),
         report.unsatisfiable.len(),
