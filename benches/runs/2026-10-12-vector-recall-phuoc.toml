@@ -8,7 +8,7 @@ host = "phuoc-yu"
 scenario = "native"
 candidate = { commit = "aabd47a732c64c12b7721c44c2409dee6523993d", dirty = false, binary_sha256 = "64ffedfd2eb8d423a57b3d668ff7d1f8805cbdcc5b59426c306a3ed18d4a6a9c", note = "binary_sha256: perf_lab, built on office-pc" }
 protocol = { data = "vectors items=200000 dim=64 kinds=10 (the case's), its five query vectors and the generator's true ten nearest of kind k3", runs = "20 per query, k = 10, cosine", variants = "unfiltered exact and approximate (truth: the exact search); filtered by kind with beam 64 (default), 256, 1024 and exact (truth: the generator's)", graph = "prepared before timing (--prepare-vector-graph 64:cosine), and built in the background as the case did until now", host_config = "phuoc-yu since 2026-10-12T13:00" }
-results = { root = "phuoc-yu:/home/krarilotus/owlrs/results/vector-diag-aabd47a", files_sha256 = "5ed9536bbe6732036aeb3fff0ef140530769d352152c5971e5ce17a79b7a868f" }
+results = { root = "phuoc-yu:~/owlrs/results/vector-diag-aabd47a", files_sha256 = "5ed9536bbe6732036aeb3fff0ef140530769d352152c5971e5ce17a79b7a868f" }
 publishable = "all"
 cases = [
   { case = "unfiltered, graph prepared", verdict = "wrong", note = "recall@10 0.48 at beam 64 (0.44 ms for the five queries); the exact scan 1.00 (2.7 ms)" },

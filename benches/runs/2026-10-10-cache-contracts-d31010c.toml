@@ -10,7 +10,7 @@ scenario = "native"
 baseline = { commit = "d31010c95e721c835d02018be322ab2a479fbd1b", dirty = true, patch_sha256 = "c47d2954fecb048470d664b6da0fc0e9fdf971f907ed9d51434b718407baabc5", binary_sha256 = "58a5e70880d5c850b89c242dc139d5e5366cd09fe9282cb3eb9f658fc4c61a7c" }
 candidate = { commit = "d31010c95e721c835d02018be322ab2a479fbd1b", dirty = true, patch_sha256 = "11ed96ffd09622f5ad402b81afd731a7ab6c5fe695eef1489ce2c0c7a1d727a4", binary_sha256 = "e3f660c0aa9d5a7acc782c688b2b49a29b7a89601c761fce16d09af96e458580", committed_as = "0f3155b" }
 protocol = { pairs = 5, order = "BC/CB/BC/CB/BC", probe = "a disposable unit probe over the QL fixture with 4/104/1004 schema statements; 100000 same-view hits, 500 view changes", statistic = "median of five per-process aggregate means", probe_sha256 = "64a99313269ba480afb8562ca064f613bd76ec3432a7b9535042e65c411615c0" }
-results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/cache-contracts-d31010c", measurements_sha256 = "94937e0479f9053835da36e91810117ea6c715035bb617f1f8df36935dd6cbc5" }
+results = { root = "office-pc:~/nrese-prep-20261009-4e8bd38/cache-contracts-d31010c", measurements_sha256 = "94937e0479f9053835da36e91810117ea6c715035bb617f1f8df36935dd6cbc5" }
 publishable = "all"
 cases = [
   { case = "schema refresh, 1004 statements", verdict = "faster", note = "38.230 -> 30.426 us (-20.4%); ranges [36.515, 41.520] and [27.854, 32.020]" },

@@ -17,7 +17,7 @@ commit = "5ccf8dbb2e38ed048f1af2ff69bff89b5555b8b7"
 dirty = 0
 protocol = "3 runs, 3 measured query runs, cache ['off', 'on'], order shuffled (seed 1), load limit 3600 s, query limit 300 s, docker"
 commands = [
-  "suite.py run --keep --results C:/Users/Johannes/Documents/OWL-RS/benches/suite/results/2026-10-03-full --systems nrese,qlever,oxigraph,virtuoso,jena,rdf4j,graphdb --workloads basics-mix,lubm-materialised --tier basics-mix=olympics --tier basics-mix=yago-tiny --tier basics-mix=entities-10000000 --tier basics-mix=dbpedia-core --tier basics-mix=wikidata-lexemes-60m --tier lubm-materialised=1 --tier lubm-materialised=10 --tier lubm-materialised=100",
+  "suite.py run --keep --results benches/suite/results/2026-10-03-full --systems nrese,qlever,oxigraph,virtuoso,jena,rdf4j,graphdb --workloads basics-mix,lubm-materialised --tier basics-mix=olympics --tier basics-mix=yago-tiny --tier basics-mix=entities-10000000 --tier basics-mix=dbpedia-core --tier basics-mix=wikidata-lexemes-60m --tier lubm-materialised=1 --tier lubm-materialised=10 --tier lubm-materialised=100",
 ]
 results = "benches/suite/results/2026-10-03-full (local, git-ignored)"
 publishable = "free systems only"

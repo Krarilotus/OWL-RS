@@ -11,7 +11,7 @@ baseline = { commit = "0f465633d33374bc56ab9ec33157cfa10ebf2d40", dirty = false,
 candidate = { commit = "dc2114a0f0f5379441722a212a492ef2fd3c8e24", dirty = true, patch_sha256 = "392e314c31f0c1c15436cefa6e4234d38f191b2f064ad1e83246da6c7a44f2a2", binary_sha256 = "154d4ff9d47721c03515a88868cf603dfc971a36ae2e184eea2bd0309543f90e", note = "K; committed in 119c191" }
 protocol = { pairs = 3, invocations = 18, order = "alternating per scenario", scenarios = "16-thread and serial saturation (standalone, --task-memory-mib 4096), store classification (default 4 GiB)", second_cohort = "27 invocations, original/K/M rotated", memory = "GNU time lifetime RSS standalone; 10 ms samples in the store" }
 inputs = [ { name = "horn-classes3000.nt", sha256 = "0b156b9241392633b258b2188f1857d2ad2893a7f4a7c85d66f8c000881c3d9e", taxonomy_sha256 = "f4cd5c2eaea7839d9c6f3a24429a60bd1badc740ae1d5b246478cd8509186d29" } ]
-results = { root = "phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/horn-repair-20261011", attempts = "attempt-k, attempt-m; rejected E, I, L, M patches and binaries kept" }
+results = { root = "phuoc-yu:~/nrese-prep-20261009-4e8bd38/horn-repair-20261011", attempts = "attempt-k, attempt-m; rejected E, I, L, M patches and binaries kept" }
 publishable = "all"
 cases = [
   { case = "horn3000 saturation, 16 threads", verdict = "slower", note = "790.2 -> 841.5 ms (+6.49%); second cohort 792.5 -> 813.7 ms" },

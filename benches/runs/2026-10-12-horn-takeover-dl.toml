@@ -12,7 +12,7 @@ original_dl_classify_sha256 = "a113d3f61209e4246e52f5a859e434dd4f0b1523bd449c499
 k_dl_classify_sha256 = "154d4ff9d47721c03515a88868cf603dfc971a36ae2e184eea2bd0309543f90e"
 toolchain = "Rust 1.98.1 (rust-toolchain.toml), release (fat LTO, one codegen unit), Office native CPU, as the original and K binaries"
 publishable = "all"
-results = "Phuoc-Yu:/home/krarilotus/nrese-takeover-dl-20261011 (8b2dee9-t1, 8b2dee9-t16 and the earlier cohorts)"
+results = "Phuoc-Yu:~/nrese-takeover-dl-20261011 (8b2dee9-t1, 8b2dee9-t16 and the earlier cohorts)"
 
 [input]
 name = "horn-classes3000.nt"
