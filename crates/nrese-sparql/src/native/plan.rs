@@ -84,9 +84,11 @@ pub(super) const SET_BUDGET: usize = 1 << 16;
 /// (12 November 2026), the one query whose set plan beats main's, watdiv-100m C3-1 (106 ms
 /// against 394), expects 3.1 M rows; the others whose set plan differs from main's expect at
 /// most 210 k (S2-8, slower with its sets: 5.04 ms against 4.19 without), and every F, S and
-/// L query at most 210 k. A tuning signal, not a bound on execution; like [`SET_BUDGET`], a
-/// constant.
-pub(super) const SET_GATE_ROWS: f64 = 1_000_000.0;
+/// L query at most 210 k. Between them, watdiv-100m C1-1 expects 1.53 M and keeps main's plan
+/// whatever its budget, after 7.5 ms of set search at half an entry per row: the threshold
+/// sits between it and C3-1, two points only. A tuning signal, not a bound on execution; like
+/// [`SET_BUDGET`], a constant.
+pub(super) const SET_GATE_ROWS: f64 = 2_000_000.0;
 
 /// Set entries any planning may read at its starts, whatever it expects ([`admits`]): where
 /// its predicates are in few sets, the sets are read as before the gate. About 7 µs of
