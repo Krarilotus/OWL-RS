@@ -66,7 +66,12 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
         }
         MutationError::Rejected(reject) => {
             let reject = *reject;
-            ApiError::reasoner_reject(reject.detail, reject.explanation, reject.attribution)
+            ApiError::rejected(
+                reject.kind,
+                reject.detail,
+                reject.explanation,
+                reject.attribution,
+            )
         }
         MutationError::Cancelled => ApiError::timeout(timeout_message.to_owned()),
         error @ MutationError::Retired => ApiError::busy(error.to_string()),

@@ -20,7 +20,7 @@ pub use attribution::{RejectAttribution, RejectAttributionCandidate};
 pub use command::{
     DeltaPlanner, MutationCommand, MutationCommitReport, MutationKind, UpdateContext,
 };
-pub use error::{MutationError, MutationReject};
+pub use error::{MutationError, MutationReject, RejectKind};
 pub use pipeline::MutationPipeline;
 pub use record::ReasoningRunRecord;
 pub use ticket::MutationTicket;

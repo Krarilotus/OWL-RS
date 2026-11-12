@@ -4,7 +4,7 @@ use nrese_reasoner::ReasonerService;
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
-use super::error::MutationError;
+use super::error::{MutationError, RejectKind};
 use super::evidence;
 use super::record::ReasoningRunRecord;
 use super::ticket::MutationTicket;
@@ -336,6 +336,7 @@ impl MutationPipeline {
                     }
                     detail.push_str(&evidence::trigger(attribution.as_ref()));
                     evidence::Draft {
+                        kind: RejectKind::Inconsistent,
                         detail,
                         explanation,
                         attribution,
@@ -521,6 +522,7 @@ impl MutationPipeline {
                         .any(|result| severity(result.severity.as_str()) >= least) =>
             {
                 let full = || evidence::Draft {
+                    kind: RejectKind::ShapesViolated,
                     detail,
                     explanation: None,
                     attribution: None,

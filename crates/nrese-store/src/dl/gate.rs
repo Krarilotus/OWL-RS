@@ -30,8 +30,8 @@ use nrese_engine::Transaction;
 
 use super::consistency::{self, Budget, Checked, Verdict};
 use super::{DlConsistency, DlStatus, source};
-use crate::StoreService;
 use crate::mutation::evidence::{Draft, EvidenceView};
+use crate::{RejectKind, StoreService};
 
 /// What the gate decided: the commit's status, and why it is rejected if it is, for the
 /// committer ([`rejection`]).
@@ -315,6 +315,7 @@ fn rejection(
             .map(|justification| axiom_evidence(view.tx(), ontology, &justification))
             .unwrap_or_default();
         Draft {
+            kind: RejectKind::Inconsistent,
             explanation: Some(nrese_reasoner::RejectExplanation {
                 summary: detail.clone(),
                 violated_constraint: CONSTRAINT.to_owned(),
@@ -483,6 +484,7 @@ fn view_reason(
         })
         .collect();
     Some(crate::mutation::evidence::shown(
+        RejectKind::Inconsistent,
         reason,
         CONSTRAINT,
         String::new(),
