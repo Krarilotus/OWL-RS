@@ -10,11 +10,11 @@ use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, NamedNode, Quad};
 
 /// A plan's order, and each step's rows as `f64::to_bits`.
-type Steps = (Vec<usize>, Vec<u64>);
+pub(super) type Steps = (Vec<usize>, Vec<u64>);
 
 type Table = [(&'static str, &'static [usize], &'static [u64])];
 
-fn steps(plan: &plan::Plan) -> Steps {
+pub(super) fn steps(plan: &plan::Plan) -> Steps {
     let rows = plan.rows.iter().map(|r| r.to_bits()).collect();
     (plan.order.clone(), rows)
 }
@@ -224,7 +224,7 @@ fn hand_built_inputs_plan_as_before() {
         .iter()
         .map(|(name, inputs, variables, fixed)| {
             let plan = match fixed {
-                Some(order) => plan::along(inputs, *variables, PROBE_FACTOR, None, order),
+                Some(order) => plan::along(inputs, *variables, PROBE_FACTOR, None, order).unwrap(),
                 None => plan::order(inputs, *variables, PROBE_FACTOR, None, &|| false).unwrap(),
             };
             (*name, steps(&plan))
@@ -236,7 +236,7 @@ fn hand_built_inputs_plan_as_before() {
 /// People `n0`..`n59` who know one or two others, with labels, types, some cities and
 /// ages, and up to 13 predicates `p0`..`p12` each; five cities, three with a country; and
 /// `a anchor n0`. All IRIs `http://e/…`, in the default graph.
-fn people() -> Engine {
+pub(super) fn people() -> Engine {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let e = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
     let mut tx = engine.transaction();
@@ -280,7 +280,7 @@ fn people() -> Engine {
 
 /// `text`, `s p o` with `?name` for a variable and `name` for `<http://e/name>`, as a
 /// default-graph pattern of `snapshot`.
-fn scan(snapshot: &Snapshot, text: &str) -> ScanPattern {
+pub(super) fn scan(snapshot: &Snapshot, text: &str) -> ScanPattern {
     let slot = |term: &str| match term.strip_prefix('?') {
         Some(name) => Slot::Var(Variable::new_unchecked(name)),
         None => {

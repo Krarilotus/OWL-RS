@@ -34,6 +34,7 @@
 //! the running rows. Exponential backoff over several variables' divisors (SQL Server's
 //! rule) was measured and rejected: LUBM-100 p90 27.8 against 1.24 for their product.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use nrese_engine::engine::characteristic::{CharacteristicSets, StarRows};
@@ -52,6 +53,37 @@ const GREEDY_STARTS: usize = 16;
 /// 1,000 patterns took 16 starts of 500,000 estimates each, twice per query (4.9 s in the
 /// test profile, 12 October 2026).
 const GREEDY_EFFORT: usize = 1 << 19;
+
+/// The characteristic-set work one planning may do, in entries: the sets its star estimates
+/// read (a predicate's sets for a star's first pattern, then the sets the star still
+/// matches), the links its chain estimates read times the predicates looked up per link, and
+/// the sets the exhaustive search copies with its states. Each estimate reads whole lists, so
+/// without a bound a planning grows with the sets per predicate: on WatDiv-10m, with tens of
+/// thousands of sets per predicate, these reads were 93 % of F2-4's 133 M instructions per
+/// query (12 November 2026). 2^14 entries are about 0.1 ms of lookups; provisional, until
+/// measured on this count. Like the planner's other limits ([`GREEDY_EFFORT`],
+/// [`OVERLAP_VALUES`], `MAX_SETS`), it is a constant, not a setting with an "unlimited" value
+/// as AGENTS.md asks of every budget; one setting for all four is a follow-up.
+pub(super) const SET_BUDGET: usize = 1 << 14;
+
+#[cfg(test)]
+thread_local! {
+    /// The budget the orderer keeps to: [`SET_BUDGET`], unless a test sets another to pass it
+    /// on a small graph, or `usize::MAX` to plan without it.
+    pub(super) static BUDGET: Cell<usize> = const { Cell::new(SET_BUDGET) };
+}
+
+/// The characteristic-set work a planning may do ([`SET_BUDGET`]).
+#[cfg(not(test))]
+pub(super) fn set_budget() -> usize {
+    SET_BUDGET
+}
+
+/// The characteristic-set work a planning may do: [`SET_BUDGET`], or a test's ([`BUDGET`]).
+#[cfg(test)]
+pub(super) fn set_budget() -> usize {
+    BUDGET.with(Cell::get)
+}
 
 /// Cost of one index probe relative to reading one scanned row.
 const PROBE_COST: f64 = 4.0;
@@ -96,6 +128,20 @@ pub(super) struct Star {
 pub(super) struct Plan {
     pub order: Vec<usize>,
     pub rows: Vec<f64>,
+    /// The characteristic-set work its planning counted ([`SET_BUDGET`]): all of it for a plan
+    /// made within the budget; for one planned again without the sets, what was done before
+    /// the next read or copy would have passed it.
+    pub(super) work: usize,
+}
+
+/// Why the orderer gave no plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stopped {
+    /// The query was cancelled (`stop`): it fails, and isn't planned again.
+    Cancelled,
+    /// The next read or copy of the characteristic sets would have passed the budget
+    /// ([`SET_BUDGET`]), after `work` of it: planned again without the sets.
+    Budget { work: usize },
 }
 
 #[derive(Clone)]
@@ -182,14 +228,15 @@ fn note_statistics(_reads: usize, _steps: usize) {
 
 /// The cheapest order for `inputs`; `probe_factor` is the executor's threshold for index
 /// nested loops (the pattern is at least this many times larger than the running result).
-/// `None` once `stop` says so (the query's cancellation, asked at every step).
+/// Stopped once `stop` says so (the query's cancellation, asked at every step), or where the
+/// characteristic sets would pass [`SET_BUDGET`].
 pub(super) fn order(
     inputs: &[Input],
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
     stop: &dyn Fn() -> bool,
-) -> Option<Plan> {
+) -> Result<Plan, Stopped> {
     #[cfg(test)]
     let stop = &|| {
         STEP.with(|hook| {
@@ -203,18 +250,18 @@ pub(super) fn order(
 }
 
 /// The estimates of joining `inputs` in the given `order` (all of them, each once), by the
-/// same model as [`order`]: for BGPs whose order the executor fixes itself.
+/// same model as [`order`]: for BGPs whose order the executor fixes itself. Stopped only
+/// where the characteristic sets would pass [`SET_BUDGET`].
 pub(super) fn along(
     inputs: &[Input],
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
     order: &[usize],
-) -> Plan {
+) -> Result<Plan, Stopped> {
     search(inputs, variables, probe_factor, sets, Some(order), &|| {
         false
     })
-    .expect("never stopped")
 }
 
 /// O(starts · n² · s) for n patterns and s characteristic sets a star still matches: each
@@ -226,7 +273,7 @@ fn search(
     sets: Option<&CharacteristicSets>,
     fixed: Option<&[usize]>,
     stop: &dyn Fn() -> bool,
-) -> Option<Plan> {
+) -> Result<Plan, Stopped> {
     // The characteristic sets know which predicates subjects have, not their objects.
     // A constant object (`?x a C`) is estimated by containment below, not as a share
     // of the predicate's statements independent of the subject's other predicates
@@ -414,11 +461,13 @@ fn search(
     let finish = |state: State| Plan {
         order: state.order,
         rows: state.estimates,
+        work: 0,
     };
     if n == 0 {
-        return Some(Plan {
+        return Ok(Plan {
             order: Vec::new(),
             rows: Vec::new(),
+            work: 0,
         });
     }
     if let Some(order) = fixed {
@@ -427,7 +476,7 @@ fn search(
             let step = estimate(&state, j);
             state = apply(state, j, step);
         }
-        return Some(finish(state));
+        return Ok(finish(state));
     }
     if n > DP_PATTERNS {
         // Greedy: the cheapest start, then the cheapest extension each time.
@@ -447,7 +496,7 @@ fn search(
             used[state.order[0]] = true;
             while state.order.len() < n {
                 if stop() {
-                    return None;
+                    return Err(Stopped::Cancelled);
                 }
                 // The cheapest candidate, the first of equally cheap ones.
                 let (j, step) = candidates(&state, &|j| used[j])
@@ -462,7 +511,7 @@ fn search(
                 best = Some(state);
             }
         }
-        return Some(finish(best.expect("inputs are not empty")));
+        return Ok(finish(best.expect("inputs are not empty")));
     }
     let mut best: Vec<Option<State>> = vec![None; 1 << n];
     for j in 0..n {
@@ -472,7 +521,7 @@ fn search(
     let mut winners: Vec<(usize, Step)> = Vec::with_capacity(n);
     for used in 1u64..(1 << n) {
         if stop() {
-            return None;
+            return Err(Stopped::Cancelled);
         }
         let Some(state) = best[used as usize].take() else {
             continue;
@@ -501,7 +550,7 @@ fn search(
         }
         best[(used | (1 << last)) as usize] = Some(apply(state, last, step));
     }
-    Some(finish(
+    Ok(finish(
         best[(1 << n) - 1]
             .take()
             .expect("every pattern is reachable"),
@@ -539,20 +588,20 @@ mod tests {
     fn checks_keep_at_most_their_input_and_steps_at_least_a_row() {
         // ?x p <c> (40) . ?x a C (100k, every x distinct): a check of 40 rows.
         let inputs = [input(40, &[(0, 40)]), input(100_000, &[(0, 100_000)])];
-        let plan = along(&inputs, 1, 32, None, &[0, 1]);
+        let plan = along(&inputs, 1, 32, None, &[0, 1]).unwrap();
         assert!(plan.rows[1] <= 40.0, "{:?}", plan.rows);
         // ?x p ?y (10) . ?y q ?z (5, 5 distinct ?y among 1M): 0.00005 rows, shown as one.
         let inputs = [
             input(10, &[(0, 10), (1, 10)]),
             input(5, &[(1, 1_000_000), (2, 5)]),
         ];
-        let plan = along(&inputs, 3, 32, None, &[0, 1]);
+        let plan = along(&inputs, 3, 32, None, &[0, 1]).unwrap();
         assert_eq!(plan.rows[1], 1.0);
         // Two single-variable patterns sharing 15 of the first's 189 values.
         let mut inputs = [input(189, &[(0, 189)]), input(239, &[(0, 239)])];
         inputs[0].overlaps = vec![(1, 15)];
         inputs[1].overlaps = vec![(0, 15)];
-        let plan = along(&inputs, 1, 32, None, &[0, 1]);
+        let plan = along(&inputs, 1, 32, None, &[0, 1]).unwrap();
         assert!((plan.rows[1] - 15.0).abs() < 1e-9, "{:?}", plan.rows);
     }
 
@@ -608,6 +657,8 @@ mod tests {
                 overlaps: Vec::new(),
             })
             .collect();
+        // The reads of the whole search, not as many as the budget allows.
+        BUDGET.set(usize::MAX);
         STATISTICS.with(|c| c.set((0, 0)));
         let plan = order(&inputs, 251, 32, Some(&sets), &|| false).unwrap();
         assert_eq!(plan.order.len(), 250);
@@ -621,7 +672,10 @@ mod tests {
             asked.set(asked.get() + 1);
             asked.get() > 3
         };
-        assert!(order(&inputs, 251, 32, Some(&sets), &stop).is_none());
+        assert!(matches!(
+            order(&inputs, 251, 32, Some(&sets), &stop),
+            Err(Stopped::Cancelled)
+        ));
         assert_eq!(asked.get(), 4, "stopped at the first step after");
     }
 
