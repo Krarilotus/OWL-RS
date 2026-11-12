@@ -1478,6 +1478,9 @@ struct Context<'a> {
     aliases: RefCell<HashMap<String, u64>>,
     /// An alias reservation refused; checked before any answer is delivered.
     aliases_refused: Cell<Option<nrese_exec::BudgetExceeded>>,
+    /// A room question ([`Self::max_rows`]) found the process's limit unread: a join its
+    /// row limit stopped is refused for that, whatever a later reading finds.
+    room_unread: Cell<bool>,
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
@@ -1721,6 +1724,7 @@ impl<'a> Context<'a> {
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
             aliases_refused: Cell::new(None),
+            room_unread: Cell::new(false),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             // One thread fills it, with no sibling grant: the whole spare.
@@ -1876,7 +1880,11 @@ impl<'a> Context<'a> {
     /// Half of what the bytes would hold: a table that grows reallocates, and a join's
     /// parallel parts are copied into one table, so for a moment the rows exist twice.
     fn max_rows(&self, width: usize) -> usize {
-        self.budget.remaining() / (width.max(1) * 8 * 2)
+        let Ok(room) = self.budget.room() else {
+            self.room_unread.set(true);
+            return 0;
+        };
+        room / (width.max(1) * 8 * 2)
     }
 
     /// Charges a join's hash table over `rows` build rows (a key, a row number and the
@@ -1906,12 +1914,26 @@ impl<'a> Context<'a> {
             return cancelled;
         }
         let requested = rows.saturating_mul(width.max(1) * 8);
+        // No room because the process's limit can't be read: that, not a full budget, even
+        // where a reading since has found it.
+        let room = self.budget.room().ok().filter(|_| !self.room_unread.get());
+        let Some(room) = room else {
+            return QueryEvaluationError::MemoryLimit(BudgetExceeded {
+                limit: 0,
+                requested,
+                used: self.budget.used(),
+                shared: true,
+                unread: true,
+            })
+            .into();
+        };
         QueryEvaluationError::MemoryLimit(BudgetExceeded {
-            limit: self.budget.used().saturating_add(self.budget.remaining()),
+            limit: self.budget.used().saturating_add(room),
             // A table may grow to half of what is left (`max_rows`).
             requested: requested.saturating_mul(2),
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
+            unread: false,
         })
         .into()
     }

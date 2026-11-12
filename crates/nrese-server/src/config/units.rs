@@ -110,9 +110,10 @@ pub(super) fn parse_memory_limit(text: &str, machine: Reading, name: &str) -> Re
 }
 
 /// The memory this process may use: the container's limit if there is one, else the
-/// machine's (`nrese_store::memory::available_bytes`, on Linux and Windows).
+/// machine's (`nrese_store::memory::available_bytes`, on Linux and Windows), read once per
+/// process (`nrese_store::memory::capacity`), so the stores' limits read it no more.
 pub fn machine_memory_bytes() -> Reading {
-    nrese_store::memory::available_bytes()
+    nrese_store::memory::capacity()
 }
 
 /// A size for people: `4 GiB`, `512 MiB`, `1536 B`.

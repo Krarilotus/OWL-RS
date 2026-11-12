@@ -59,9 +59,12 @@ pub struct StoreConfig {
     /// The memory the process may hold before a long operation (a materialisation, the
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
-    /// process may use ([`ProcessMemory::Default`]), read when the store opens; opening
-    /// fails where it can't be read, and where this target can't read memory a limit is
-    /// refused ([`ProcessMemory::resolve`]).
+    /// process may use ([`ProcessMemory::Default`]); a limit set by hand is never more than
+    /// that capacity. The capacity is read once per process, at the limit's first need,
+    /// never when a store opens ([`nrese_exec::memory::capacity`]); where it can't be read,
+    /// a limit set by hand stands and what needed the default is refused; where this target
+    /// can't read memory a limit is refused when the store opens
+    /// ([`ProcessMemory::supported`]).
     /// It is also the limit of the process's budget ([`Runtime::memory`](crate::Runtime::memory)),
     /// which what queries and maintenance charge draws on, the queries' budget within it.
     /// This is the store's watch policy, not a write to the global process limit.
@@ -274,52 +277,73 @@ impl Default for StoreConfig {
     }
 }
 
-/// [`StoreConfig::process_memory_bytes`]: the default, read when the store opens, or a
-/// number of bytes (0: no limit).
+/// [`StoreConfig::process_memory_bytes`]: the default, or a number of bytes (0: no limit);
+/// either found at its first need ([`Self::bytes_with`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessMemory {
     /// Three quarters of the memory the process may use (the container's limit, else the
     /// machine's: [`nrese_exec::memory::available_bytes`]).
     Default,
-    /// This many bytes; 0 is no limit.
+    /// This many bytes, never more than the memory the process may use; 0 is no limit.
     Bytes(u64),
 }
 
 impl ProcessMemory {
-    /// The limit in bytes (0: none), refused where it can't be enforced: a limit where this
-    /// target doesn't read memory ([`nrese_exec::memory::READS_MEMORY`]), or the default
-    /// where the memory it is a share of can't be read.
+    /// The limit in bytes (0: none) now, read where not yet ([`nrese_exec::memory::capacity`]),
+    /// refused where it can't be enforced: a limit where this target doesn't read memory
+    /// ([`Self::supported`]), or where the memory the process may use can't be read. For a
+    /// process's owner at its start (the server); a store asks at the limit's first need.
     pub fn resolve(self) -> StoreResult<u64> {
         self.resolve_with(
             nrese_exec::memory::READS_MEMORY,
-            nrese_exec::memory::available_bytes,
+            nrese_exec::memory::capacity,
         )
     }
 
-    /// [`Self::resolve`] on a target that reads memory or not, `available` reading the memory
+    /// [`Self::resolve`] on a target that reads memory or not, `capacity` reading the memory
     /// the process may use: the resolution itself, for a caller that must show what it does
     /// where memory isn't read.
     pub fn resolve_with(
         self,
         reads_memory: bool,
-        available: impl FnOnce() -> nrese_exec::memory::Reading,
+        capacity: impl FnOnce() -> nrese_exec::memory::Reading,
     ) -> StoreResult<u64> {
-        match self {
-            Self::Bytes(0) => Ok(0),
-            Self::Bytes(_) if !reads_memory => Err(StoreError::Configuration(
-                "process_memory_bytes: this platform doesn't read the process's memory, so \
-                 the limit can't be enforced; set it to 0 to run without one"
-                    .to_owned(),
-            )),
-            Self::Bytes(bytes) => Ok(bytes),
-            Self::Default => available().map(|bytes| bytes / 4 * 3).map_err(|unread| {
-                StoreError::Configuration(format!(
-                    "process_memory_bytes: its default, three quarters of the memory the \
-                     process may use, needs that memory read ({unread}); set it by hand, in \
-                     bytes, or 0 to run without a limit"
-                ))
-            }),
+        self.supported(reads_memory)?;
+        self.bytes_with(capacity).map_err(|unread| {
+            StoreError::Configuration(format!(
+                "process_memory_bytes: its default, three quarters of the memory the \
+                 process may use, needs that memory read ({unread}); set it by hand, in \
+                 bytes, or 0 to run without a limit"
+            ))
+        })
+    }
+
+    /// Refuses, reading nothing, a limit this target can't enforce: any but none (0) where
+    /// it doesn't read memory ([`nrese_exec::memory::READS_MEMORY`]).
+    pub fn supported(self, reads_memory: bool) -> StoreResult<()> {
+        if reads_memory || self == Self::Bytes(0) {
+            return Ok(());
         }
+        Err(StoreError::Configuration(
+            "process_memory_bytes: this platform doesn't read the process's memory, so the \
+             limit can't be enforced; set it to 0 to run without one"
+                .to_owned(),
+        ))
+    }
+
+    /// The limit in bytes (0: none, read nothing), of the memory `capacity` reads the
+    /// process may use ([`nrese_exec::memory::limit_within`]): a limit set by hand stands
+    /// where that can't be read; the default is then unread.
+    pub fn bytes_with(
+        self,
+        capacity: impl FnOnce() -> nrese_exec::memory::Reading,
+    ) -> nrese_exec::memory::Reading {
+        let explicit = match self {
+            Self::Bytes(0) => return Ok(0),
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Default => None,
+        };
+        nrese_exec::memory::limit_within(explicit, capacity())
     }
 }
 
@@ -468,30 +492,40 @@ mod tests {
         }
     }
 
-    /// DC-07: where memory isn't read, a limit set by hand can't be enforced and is refused,
-    /// naming the setting and the way out; no limit (0) stays allowed.
+    /// DC-07: where memory isn't read, a limit (set by hand or the default) can't be enforced
+    /// and is refused without reading, naming the setting and the way out; no limit (0)
+    /// stays allowed and never reads.
     #[test]
     fn a_limit_is_refused_where_memory_isnt_read() {
-        let message = refusal(ProcessMemory::Bytes(G).resolve_with(false, unused));
-        assert!(message.contains('0'), "says 0 runs without one: {message}");
+        for limit in [ProcessMemory::Bytes(G), ProcessMemory::Default] {
+            let message = refusal(limit.resolve_with(false, unused));
+            assert!(message.contains('0'), "says 0 runs without one: {message}");
+        }
         assert_eq!(
             ProcessMemory::Bytes(0).resolve_with(false, unused).ok(),
             Some(0)
         );
-        assert_eq!(
-            ProcessMemory::Bytes(G).resolve_with(true, unused).ok(),
-            Some(G)
-        );
+        assert_eq!(ProcessMemory::Bytes(0).bytes_with(unused), Ok(0));
     }
 
-    /// DC-07: the default is three quarters of what the process may use; where that can't
-    /// be read (the reading failed, or no reader here) opening refuses it, naming the setting
-    /// to set by hand, instead of running without a limit.
+    /// DC-07, D2: the default is three quarters of what the process may use; a limit set by
+    /// hand is never more than that memory. Where it can't be read the default is refused
+    /// (never "no limit"), naming the setting to set by hand; a limit set by hand stands,
+    /// the operator's fallback.
     #[test]
-    fn the_default_limit_needs_its_reading() {
+    fn a_limit_is_found_within_the_memory_the_process_may_use() {
+        let capacity = || Ok(4 * G);
+        let unread = || Err(Unread::Failed);
         let default = ProcessMemory::Default;
-        assert_eq!(default.resolve_with(true, || Ok(4 * G)).ok(), Some(3 * G));
-        refusal(default.resolve_with(true, || Err(Unread::Failed)));
-        refusal(default.resolve_with(false, || Err(Unread::Unsupported)));
+        assert_eq!(default.resolve_with(true, capacity).ok(), Some(3 * G));
+        assert_eq!(ProcessMemory::Bytes(G).bytes_with(capacity), Ok(G));
+        assert_eq!(ProcessMemory::Bytes(8 * G).bytes_with(capacity), Ok(4 * G));
+        assert_eq!(default.bytes_with(unread), Err(Unread::Failed));
+        refusal(default.resolve_with(true, unread));
+        assert_eq!(ProcessMemory::Bytes(8 * G).bytes_with(unread), Ok(8 * G));
+        assert_eq!(
+            ProcessMemory::Bytes(8 * G).resolve_with(true, unread).ok(),
+            Some(8 * G)
+        );
     }
 }

@@ -39,7 +39,9 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
         replication: Default::default(),
     };
     // A nondefault ceiling, and then explicit disable. Neither may be replaced by a
-    // default policy while AppState opens the system/access store.
+    // default policy while AppState opens the system/access store. A ceiling set by hand is
+    // held within the memory the process may use where that is read, and stands where not.
+    let within = |limit: u64| nrese_exec::memory::capacity().map_or(limit, |cap| limit.min(cap));
     for limit in [u64::MAX, 0] {
         config.store.process_memory_bytes = ProcessMemory::Bytes(limit);
         let installed = config.install_process_memory_policy();
@@ -50,7 +52,7 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
             continue;
         }
         installed.unwrap();
-        let expected = (limit != 0).then_some(limit);
+        let expected = (limit != 0).then(|| within(limit));
         let store = StoreService::new(config.store.clone()).unwrap();
         assert_eq!(process_limit(), expected);
         let _unrelated = StoreService::new(StoreConfig::in_memory()).unwrap();

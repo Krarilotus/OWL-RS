@@ -157,6 +157,16 @@ impl StoreError {
     /// of some graphs: a scan of graphs it may not read can size them); any other as it is.
     pub(crate) fn without_amounts(self) -> Self {
         let refused = match self.evaluation() {
+            // Its cause, without the amounts.
+            Some(QueryEvaluationError::MemoryLimit(exceeded)) if exceeded.unread => {
+                return QueryEvaluationError::MemoryLimit(nrese_exec::BudgetExceeded {
+                    limit: 0,
+                    requested: 0,
+                    used: 0,
+                    ..*exceeded
+                })
+                .into();
+            }
             Some(QueryEvaluationError::MemoryLimit(exceeded)) => {
                 Some((exceeded.limit, exceeded.shared))
             }
@@ -179,12 +189,14 @@ impl StoreError {
     }
 
     /// The query needed more memory than its limit
-    /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)).
+    /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)). Not
+    /// a refusal because the process's limit couldn't be read
+    /// ([`nrese_exec::BudgetExceeded::unread`]): that is the server's, not the request's.
     pub fn is_memory_limit(&self) -> bool {
         matches!(self, Self::MemoryLimitWithoutAmounts { .. })
             || matches!(
                 self.evaluation(),
-                Some(QueryEvaluationError::MemoryLimit(_))
+                Some(QueryEvaluationError::MemoryLimit(exceeded)) if !exceeded.unread
             )
     }
 
@@ -195,7 +207,8 @@ impl StoreError {
         matches!(self, Self::MemoryLimitWithoutAmounts { shared: true, .. })
             || matches!(
                 self.evaluation(),
-                Some(QueryEvaluationError::MemoryLimit(exceeded)) if exceeded.shared
+                Some(QueryEvaluationError::MemoryLimit(exceeded))
+                    if exceeded.shared && !exceeded.unread
             )
     }
 
@@ -273,5 +286,37 @@ mod tests {
             assert_eq!(query.is_memory_limit(), update.is_memory_limit());
         }
         assert!(!StoreError::SparqlUpdate(UpdateError::Cancelled).is_request_error());
+    }
+}
+
+#[cfg(test)]
+mod unread_tests {
+    use super::*;
+
+    /// D2, A-902: a refusal because the process's limit couldn't be read is the server's,
+    /// neither the request's memory limit nor contention for the queries' budget; a reader
+    /// of some graphs is told that cause, without amounts.
+    #[test]
+    fn an_unread_limit_is_no_memory_limit_and_keeps_its_cause_unsized() {
+        let unread = StoreError::from(nrese_exec::BudgetExceeded {
+            limit: 0,
+            requested: 4096,
+            used: 1 << 20,
+            shared: true,
+            unread: true,
+        });
+        assert!(!unread.is_memory_limit());
+        assert!(!unread.is_server_memory_limit());
+        assert!(!unread.is_request_error());
+        let told = unread.without_amounts();
+        assert!(
+            matches!(
+                told.evaluation(),
+                Some(QueryEvaluationError::MemoryLimit(exceeded))
+                    if exceeded.unread && exceeded.requested == 0 && exceeded.used == 0
+            ),
+            "{told:?}"
+        );
+        assert!(told.to_string().contains("couldn't be read"), "{told}");
     }
 }
