@@ -219,10 +219,8 @@ sets and pairs (RDF-3X lineage) estimate star and chain cardinalities far better
 independence; sampling covers the rest. Factorised representations keep `A × B` as its two
 inputs, and aggregates over them need no enumeration (`COUNT(A × B) = |A|·|B|`, sums
 scaled by multiplicities). EXISTS and subqueries decorrelate into semi- and anti-joins.
-Sparqloscope (ISWC 2025; geometric mean over its queries, failures penalised by a factor
-of 2): Wikidata truthy (about 8 B triples) QLever 2.43 s, Virtuoso 11.36 s, MillenniumDB
-22.78 s; DBLP QLever 0.18 s, Virtuoso 0.53 s, MillenniumDB 1.25 s, Jena 15.29 s
-(corrected 3 October against the paper; the earlier figures came from a research report).
+Sparqloscope (ISWC 2025) measures these features over Wikidata truthy (about 8 B triples)
+and DBLP.
 MillenniumDB plans property paths with the rest of the query; reachability indexes and
 path-cardinality statistics help `P31/P279*`.
 
@@ -312,10 +310,8 @@ continues on another thread can't be told apart from a stranger.
 `execution.threads > 0`): query A claims a flight and starts a parallel kernel; a worker
 helping that kernel steals query B; B waits for A's flight on that worker's stack; A can't
 publish until its kernel returns, and the kernel can't return until B does. A forced
-two-worker test on office-pc hung until a watchdog cancelled B (`flight-diagnostic.patch`,
-`-test.log`, `-exit.txt` under the campaign root of [hosts.toml](../../benches/hosts.toml)
-`assets.evidence`, `campaign-20261010-bebada2/`; SHA-256 `8227cf96…`, `89f1fc58…`,
-`39b8dc3f…`). It shows the dependency, not how often it happens. Rayon documents the hazard
+two-worker test on host A hung until a watchdog cancelled B. It shows the dependency, not
+how often it happens. Rayon documents the hazard
 ([join](https://docs.rs/rayon/1.12.0/rayon/fn.join.html)); a timeout or yield doesn't remove it.
 
 **What remains reachable.** Queries now run on their caller, and a caller isn't a Rayon

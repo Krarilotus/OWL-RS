@@ -26,7 +26,7 @@ So the search throws away and rebuilds the same independent work after nearly ev
 Phase saving changes nothing (the choices already repeat), and replaying the trail would save
 the choosing only (at most about 1.6×).
 
-## 2. Prior art (`corpus/solvers/sat`: ginsberg1993dynamic, nadel2018chrono, mohle2019backing; wiki: *Backtracking that keeps independent work*)
+## 2. Prior art
 
 - Ginsberg, *Dynamic backtracking* (JAIR 1993): on a conflict, retract only the culprit
   decision and what depends on it; keep the rest, with an eliminating explanation per
@@ -40,7 +40,7 @@ the choosing only (at most about 1.6×).
 - Nadel and Ryvchin, *Chronological backtracking* (SAT 2018), and Möhle and Biere, *Backing
   backtracking* (SAT 2019): CDCL backtracks one level instead of jumping far, with assignments
   out of level order; the invariants that keep conflict analysis sound. CaDiCaL uses this
-  (cited in `corpus/solvers/sat/biere2024cadical`).
+  (Biere et al., *CaDiCaL 2.0*, CAV 2024).
 
 The tableau's case is the friendliest one: every fact already carries its dependency set.
 
