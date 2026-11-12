@@ -376,7 +376,8 @@ pub fn split_turtle(
 
 /// Parsing and planning a query without running it, `runs` times: the cost of the parser
 /// and the rewrites on large or deeply nested queries. The JSON object of a query in the
-/// report, with the plan's size (steps and rewrites) as its counts.
+/// report, with the plan's size (steps and rewrites) as its counts and no `rows`: no query
+/// runs, so there is no answer to count.
 pub fn parse_and_plan(
     store: &StoreService,
     name: &str,
@@ -400,7 +401,7 @@ pub fn parse_and_plan(
     let (p50, _, max) = percentiles(&mut times);
     println!("{name:<28} parse and plan p50 {p50:.2} ms, {steps} steps, {rewrites} rewrites");
     let json = format!(
-        "    {{\n      \"name\": \"{name}\",\n      \"rows\": {steps},\n      \"p50_ms\": {p50:.3},\n      \"max_ms\": {max:.3},\n      \"steps\": {steps},\n      \"rewrites\": {rewrites},\n      \"samples_ms\": [{}]\n    }}",
+        "    {{\n      \"name\": \"{name}\",\n      \"p50_ms\": {p50:.3},\n      \"max_ms\": {max:.3},\n      \"steps\": {steps},\n      \"rewrites\": {rewrites},\n      \"samples_ms\": [{}]\n    }}",
         samples.join(", ")
     );
     Ok((json, p50))
@@ -786,4 +787,21 @@ pub fn upload(
         "{{\"p50_ms\": {p50:.3}, \"min_ms\": {min:.3}, \"max_ms\": {max:.3}, \"runs\": {runs}, \"statements\": {statements}, \"bytes\": {}, \"memory\": {peak}}}",
         payload.len()
     ))
+}
+
+/// `parse_and_plan`'s query object: the plan's counts and no `rows`, since no query runs (the
+/// gate would compare rows as an answer).
+#[cfg(test)]
+mod parse_only_tests {
+    use nrese_store::{StoreConfig, StoreService};
+
+    #[test]
+    fn a_parse_only_query_reports_its_plan_s_counts_and_no_rows() {
+        let store = StoreService::new(StoreConfig::in_memory()).expect("an in-memory store");
+        let (json, _) = super::parse_and_plan(&store, "all", "SELECT * WHERE { ?s ?p ?o }", 1)
+            .expect("planned");
+        let query: serde_json::Value = serde_json::from_str(&json).expect("a JSON object");
+        assert_eq!(query.get("rows"), None, "rows of a query that never ran");
+        assert!(query["steps"].as_u64().is_some(), "the plan's steps");
+    }
 }
