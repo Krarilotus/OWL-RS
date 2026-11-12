@@ -102,7 +102,7 @@ curl -i http://localhost:8080/dataset/update --data-urlencode 'update=
 HTTP/1.1 400 Bad Request
 content-type: application/problem+json
 
-{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>","reasoner_reject":null,"request_id":"…","status":400,"title":"Reasoner Reject","type":"https://nrese.dev/problems/reasoner-reject"}
+{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>","reasoner_reject":null,"request_id":"…","status":400,"title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
 ```
 
 Nothing of the rejected commit remains: the query still answers no rows. With a name

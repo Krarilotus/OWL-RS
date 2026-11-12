@@ -21,8 +21,8 @@ pub(crate) struct Problem {
     title: String,
     status: u16,
     detail: String,
-    /// For a commit a consistency check rejected: the violated rule and the statements
-    /// that clash.
+    /// For a rejected commit (type `reasoner-reject`, `shacl-reject` or `commit-reject`):
+    /// the violated rule or constraint and the statements it shows, where there are any.
     reasoner_reject: Option<serde_json::Value>,
     /// The request's id, as in the `x-request-id` header and the server's log.
     request_id: Option<String>,

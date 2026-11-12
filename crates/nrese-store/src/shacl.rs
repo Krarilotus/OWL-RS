@@ -368,6 +368,7 @@ pub(crate) fn view_reason(
         first.component
     );
     Some(crate::mutation::evidence::shown(
+        crate::RejectKind::ShapesViolated,
         reason,
         first.component.as_str(),
         first.focus_node.to_string(),
