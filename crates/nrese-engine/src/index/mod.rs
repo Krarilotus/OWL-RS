@@ -156,7 +156,7 @@ pub(crate) const GROUP_PART: usize = 1 << 16;
 /// about 1,178 for their growths, in parallel, and 238 for their releases, serially in the
 /// merge; by those counts at most 11 of its 119 parts hold more than 64 groups (12 Nov).
 /// The slab is 1 KiB a part.
-pub(crate) const PART_BLOCK: usize = 64;
+const PART_BLOCK: usize = 64;
 
 /// The most bytes a group walk over `keys` keys charges, into an output that starts without
 /// capacity, its runs walked in `parts` parallel parts in all (or serially), bounded by the
