@@ -3700,8 +3700,8 @@ impl<'a> Context<'a> {
     /// within a budget that follows that work ([`plan::budget_for`]; one policy for every path
     /// that plans: scans, and scans with paths). A BGP the gate keeps from the sets, or whose
     /// set search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
-    /// which planner a BGP got shows. A cancelled query fails, at either planning or between
-    /// them (a fixed order's planning doesn't ask), and isn't planned again.
+    /// which planner a BGP got shows. A query cancelled in or between its plannings fails (a
+    /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
@@ -3742,10 +3742,11 @@ impl<'a> Context<'a> {
         let budget = plan::budget_for(expected);
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.
+        // A fixed order's planning doesn't ask: a query cancelled while it planned fails too.
         let work = match planning(Some(&*sets), budget) {
-            Ok(planned) => return Ok(planned),
+            Ok(planned) if !cancelled() => return Ok(planned),
             Err(plan::Stopped::Budget { work }) if !cancelled() => work,
-            Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
+            Ok(_) | Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
         };
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);

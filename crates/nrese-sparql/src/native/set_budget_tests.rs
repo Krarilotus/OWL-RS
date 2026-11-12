@@ -757,3 +757,78 @@ fn a_query_cancelled_in_its_plain_planning_reads_no_sets() {
     );
     assert_eq!(asked, vec![false]);
 }
+
+/// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`], under the planner's own gate
+/// (no test's decision): a BGP that expects few rows, and whose star's predicate is in more
+/// sets than [`plan::SET_START_ALLOWANCE`], reads none of them and plans once; given the
+/// sets anyway, it is planned with them. Red where the gate counts no reads at its starts.
+#[test]
+fn a_bgp_whose_starts_read_many_sets_and_that_expects_little_reads_none() {
+    let many = plan::SET_START_ALLOWANCE + 1;
+    let names: Vec<[String; 3]> = (0..many)
+        .flat_map(|i| {
+            [
+                [format!("s{i}"), "p".into(), format!("o{i}")],
+                [format!("s{i}"), format!("u{i}"), "v".into()],
+            ]
+        })
+        .chain([["s0".into(), "q".into(), "w".into()]])
+        .collect();
+    let triples: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|[s, p, o]| (s.as_str(), p.as_str(), o.as_str()))
+        .collect();
+    let engine = graph(&triples);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let patterns = ["?x p ?y", "?x q ?z"];
+    STATISTICS.with(|c| c.set((0, 0)));
+    let (kept, asked) = plannings(&ctx, &patterns);
+    let (read, _) = STATISTICS.with(|c| c.get());
+    assert_eq!(
+        (kept.unwrap().work, read, asked),
+        (0, 0, vec![false]),
+        "kept from the sets: work, sets read, plannings"
+    );
+    plan::ADMIT.set(Some(true));
+    let (_, admitted) = plannings(&ctx, &patterns);
+    plan::ADMIT.set(None);
+    assert_eq!(admitted, vec![false, true], "admitted, the sets are read");
+}
+
+/// Spec: the budget's cancellation rule, and the gate's second doubt review (12 November): a
+/// query cancelled while its set search runs fails as cancelled, though the search (as a fixed
+/// order's, which doesn't ask) returned a plan. Red without the check after it.
+#[test]
+fn a_query_cancelled_in_its_set_search_gets_no_plan() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    let options = QueryOptions {
+        resources: Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (scans, counts) = bgp(&ctx, &STAR);
+    let mut vars = Vec::new();
+    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let order = |sets: Option<&CharacteristicSets>, budget: usize| {
+        let planned = plan::order(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &|| false);
+        if sets.is_some() {
+            token.cancel();
+        }
+        planned
+    };
+    let planned = ctx
+        .with_sets(&inputs, &order)
+        .map_err(QueryEvaluationError::from);
+    assert!(
+        matches!(planned, Err(QueryEvaluationError::Cancelled)),
+        "{:?}",
+        planned.ok().map(|p| steps(&p))
+    );
+}
