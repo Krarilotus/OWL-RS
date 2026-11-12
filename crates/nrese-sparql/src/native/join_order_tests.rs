@@ -341,14 +341,17 @@ const FROM_THE_STORE: &Table = &[
     ("star-12", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[0x4042000000000000, 0x4028000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000]),
     // [36.0, 12.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0]
     ("star-13", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], &[0x4042000000000000, 0x4028000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000]),
+    // [15.0, 22.5, 1662.375]
+    ("path", &[0, 1, 2], &[0x402e000000000000, 0x4036800000000000, 0x4099f98000000000]),
 ];
 
 /// Spec: as for [`hand_built_inputs_plan_as_before`], through the planner's inputs from a
 /// store (counts, distinct values, stars, edges, counted common values, a link's
 /// variable) and the store's characteristic sets and pairs: q02's shape, one and two
 /// patterns, a star, a chain, an edge after a star on its object, two small patterns on
-/// one variable, a cycle (EXPLAIN plans it), constant objects, and stars of 12
-/// (exhaustive) and 13 (greedy) patterns.
+/// one variable, a cycle (EXPLAIN plans it), constant objects, stars of 12 (exhaustive)
+/// and 13 (greedy) patterns, and two patterns with a path after them, the path the last
+/// input: its estimate needs what the second pattern binds.
 #[test]
 fn store_patterns_plan_as_before() {
     let engine = people();
@@ -426,11 +429,59 @@ fn store_patterns_plan_as_before() {
         ("star-12", star12.iter().map(String::as_str).collect(), none),
         ("star-13", star13.iter().map(String::as_str).collect(), none),
     ];
-    let actual: Vec<(&str, Steps)> = cases
+    let mut actual: Vec<(&str, Steps)> = cases
         .iter()
         .map(|(name, patterns, links)| (*name, planned(&ctx, patterns, links)))
         .collect();
+    // Two triple patterns, then a path from the second one's object: ordered as one join,
+    // the path an input after the patterns' ([`Context::path_join_order`]).
+    let text = "SELECT * WHERE { ?x <http://e/type> <http://e/Student> . \
+                ?x <http://e/knows> ?y . ?y <http://e/knows>+ ?z }";
+    let query = Query::parse(text, None).unwrap();
+    let join = path_join(pattern_and_form(&query).0).expect("triple patterns and a path");
+    let plan = ctx.path_join_order(&join);
+    let plan = plan.map_err(QueryEvaluationError::from).unwrap();
+    actual.push(("path", steps(&plan.expect("its terms are in the store"))));
     assert_table(FROM_THE_STORE, &actual);
+}
+
+/// The join of triple patterns and paths that `pattern` is, under its projection.
+fn path_join(pattern: &GraphPattern) -> Option<super::path_joins::PathJoin<'_>> {
+    match pattern {
+        GraphPattern::Project { inner, .. } => path_join(inner),
+        other => super::path_joins::PathJoin::of(other),
+    }
+}
+
+/// Spec: `Context::distinct`: a variable's distinct values from the statistics where an
+/// index order puts it right after the pattern's constants, else the pattern's matches,
+/// as the caller counts them. From the statistics: a predicate variable beside others
+/// (the store's 21 predicates). The matches: a variable alone, a variable at two
+/// positions beside another, a pattern in the named graphs. Green before and after the
+/// allocation cleanup of `distinct` by design.
+#[test]
+fn distinct_values_come_from_the_statistics_where_an_order_fits() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let var = Variable::new_unchecked;
+    let mut named = scan(&snapshot, "?x knows ?y");
+    named.slots[3] = Slot::Var(var("g"));
+    for (what, pattern, variable, expected) in [
+        ("a predicate variable", scan(&snapshot, "?x ?p ?o"), "p", 21),
+        (
+            "a variable alone",
+            scan(&snapshot, "?x type Person"),
+            "x",
+            1_234,
+        ),
+        ("at two positions", scan(&snapshot, "?x ?p ?x"), "x", 1_234),
+        ("in the named graphs", named, "x", 1_234),
+    ] {
+        let distinct = ctx.distinct(&pattern, &var(variable), 1_234);
+        assert_eq!(distinct, expected, "{what}");
+    }
 }
 
 /// Spec: the q02 design review (12 Nov 2026, BLOCK 1) and the lead's reconciliation:
