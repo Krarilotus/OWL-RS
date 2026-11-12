@@ -14,8 +14,9 @@
 //!   side, at the bound's clock (the value and the bound can each be ±14 h off UTC, so a
 //!   value that passes can lie 28 h of local time beyond the bound), plus every dictionary
 //!   typed literal (non-canonical forms, `24:00:00`, years past 9999). Beside a bound of
-//!   another kind on the same variable it gives way: that bound's hint stays as it was
-//!   before dateTimes had one
+//!   another kind or a string test (`strings`) on the same variable it gives way: that
+//!   bound's hint, or the string test's route, stays as it was before dateTimes had hints;
+//!   path joins take none ([`hints_without_date_times`])
 //!
 //! - a bound on `YEAR(?v)` covers the inline dates and dateTimes of those years exactly
 //!   (an inline id's payload starts with the local year, which is what `YEAR` returns),
@@ -30,6 +31,8 @@ use nrese_engine::{Snapshot, TermId, TermKind};
 use nrese_rdf::Variable;
 use nrese_rdf::vocab::xsd;
 use nrese_sparql_syntax::algebra::{Expression, Function};
+
+use super::{pushdown, strings};
 
 pub(crate) struct Hint {
     pub(crate) variable: Variable,
@@ -69,14 +72,36 @@ impl Bounds {
 
 /// The range hints implied by the conjuncts of `expr`.
 pub(crate) fn hints(expr: &Expression, snapshot: &Snapshot) -> Vec<Hint> {
+    hints_of(expr, snapshot, true)
+}
+
+/// [`hints`] with no hint from dateTime bounds, as before they had one: a path join takes
+/// each conjunct's hints apart, the first on a variable winning, and its plans stay as they
+/// were.
+pub(crate) fn hints_without_date_times(expr: &Expression, snapshot: &Snapshot) -> Vec<Hint> {
+    hints_of(expr, snapshot, false)
+}
+
+fn hints_of(expr: &Expression, snapshot: &Snapshot, date_times: bool) -> Vec<Hint> {
     let mut bounds: Vec<(Variable, Option<Bounds>)> = Vec::new();
     collect(expr, snapshot, &mut bounds);
+    let mut conjuncts = Vec::new();
+    pushdown::conjuncts_of(expr, &mut conjuncts);
     bounds
         .into_iter()
         .filter_map(|(variable, bounds)| {
+            let bounds = bounds?;
+            // A dateTime bound gives way to a string test on its variable: the dictionary's
+            // route for the test (`strings`) and the key count's refusal stay as they were.
+            if bounds.domain == Domain::DateTime
+                && (!date_times
+                    || strings::combined(conjuncts.iter().copied(), &variable).is_some())
+            {
+                return None;
+            }
             Some(Hint {
+                ranges: ranges(bounds)?,
                 variable,
-                ranges: ranges(bounds?)?,
             })
         })
         .collect()
