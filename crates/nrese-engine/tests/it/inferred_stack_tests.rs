@@ -470,7 +470,8 @@ fn assert_snapshot(snapshot: &Snapshot, model: &Model, context: &str) {
                 if position == 4 {
                     continue;
                 }
-                let (low, high) = (id(3), id(10));
+                // Inside the generated terms (`TERMS`): some quads match, `id(0)` is excluded.
+                let (low, high) = (id(1), id(2));
                 let in_range: Vec<_> = sorted
                     .iter()
                     .filter(|q| (low..=high).contains(&key(permutation, q)[position]))
@@ -508,6 +509,9 @@ fn assert_transaction(tx: &Transaction<'_>, model: &Model, context: &str) {
         |m, p| tx.quads_for_pattern_in(m, p).collect(),
         context,
     );
+    // The pending snapshot reads the transaction's changes in its own stacks: its sorted
+    // and range scans see the same quads, whichever stacks hold them now.
+    assert_snapshot(&tx.pending_snapshot(), model, &format!("{context} pending"));
 }
 
 /// Runs `steps` random transactions against `engine`, committing most and aborting some.
