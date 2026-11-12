@@ -135,8 +135,19 @@ pub fn resident_bytes() -> Reading {
 /// limits it runs under (on Linux its cgroup's and every ancestor's, so a container, a
 /// Kubernetes pod or a systemd scope counts; on Windows its job object's).
 pub fn available_bytes() -> Reading {
+    SYSTEM_READINGS.fetch_add(1, Ordering::Relaxed);
     reading(imp::available_bytes())
 }
+
+/// How many times the process has read the system's memory ([`available_bytes`],
+/// [`remaining_bytes`]: on Linux each a discovery of its cgroups), so a check can show that
+/// none is taken where none belongs, on an operation's path. Not the process's own counter
+/// ([`process_bytes`]).
+pub fn system_readings() -> u64 {
+    SYSTEM_READINGS.load(Ordering::Relaxed)
+}
+
+static SYSTEM_READINGS: AtomicU64 = AtomicU64::new(0);
 
 /// The memory the process could still take now, as the system reports it: on Linux the
 /// least of the machine's available memory (`MemAvailable`) and what its cgroups leave
@@ -148,6 +159,7 @@ pub fn available_bytes() -> Reading {
 /// admitting an operation as it starts, never a reservation: what it reports is taken by
 /// whoever allocates first.
 pub fn remaining_bytes() -> Reading {
+    SYSTEM_READINGS.fetch_add(1, Ordering::Relaxed);
     reading(imp::remaining_bytes())
 }
 
