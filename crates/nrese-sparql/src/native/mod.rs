@@ -134,6 +134,11 @@ const PROBE_FACTOR: u64 = 32;
 /// passed ([`Context::with_sets`]).
 const WITHOUT_SETS: &str = "join order";
 
+/// A planning of a BGP's inputs, with the characteristic sets or without, within a budget
+/// ([`Context::with_sets`]).
+type Planning<'p> =
+    dyn Fn(Option<&CharacteristicSets>, usize) -> Result<plan::Plan, plan::Stopped> + 'p;
+
 /// The count of a lone BGP pattern [`Context::bgp`] doesn't take: never read as empty. Of
 /// the reads of a BGP's counts, only the join order and the worst-case-optimal join's tests
 /// reach a lone pattern's outside EXPLAIN, and neither acts on one (two patterns at least
@@ -3665,8 +3670,8 @@ impl<'a> Context<'a> {
             // The smaller pattern first; the join's rows by the orderer's model (a star's
             // pair by the characteristic sets, an edge and a star on its object by the
             // characteristic pairs, a check bounded by the rows it checks).
-            let along = |sets: Option<&CharacteristicSets>| {
-                plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, &order)
+            let along = |sets: Option<&CharacteristicSets>, budget: usize| {
+                plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &order)
             };
             return self.with_sets(&inputs, &along);
         }
@@ -3683,22 +3688,24 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        let order = |sets: Option<&CharacteristicSets>| {
-            plan::order(inputs, variables, PROBE_FACTOR, sets, &cancelled)
+        let order = |sets: Option<&CharacteristicSets>, budget: usize| {
+            plan::order(inputs, variables, PROBE_FACTOR, sets, budget, &cancelled)
         };
         self.with_sets(inputs, &order)
     }
 
     /// `planning` of `inputs`, with the characteristic sets where an input is part of a star.
-    /// Where they would pass the orderer's budget ([`plan::SET_BUDGET`]), planned once more
-    /// without them, as a graph without sets is, and noted for EXPLAIN ([`WITHOUT_SETS`]):
-    /// which planner a BGP got shows. A cancelled query fails, and isn't planned again.
+    /// Where they would pass the BGP's budget ([`plan::budget_for`], one for every path that
+    /// plans: scans, and scans with paths), planned once more without them, as a graph
+    /// without sets is, and noted for EXPLAIN ([`WITHOUT_SETS`]) with that budget: which
+    /// planner a BGP got shows. A cancelled query fails, and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
-        planning: &dyn Fn(Option<&CharacteristicSets>) -> Result<plan::Plan, plan::Stopped>,
+        planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
         let start = Instant::now();
+        let budget = plan::budget_for(inputs);
         let sets = inputs
             .iter()
             .any(|i| i.star.is_some())
@@ -3711,14 +3718,14 @@ impl<'a> Context<'a> {
         };
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.
-        let work = match planning(sets.as_deref()) {
+        let work = match planning(sets.as_deref(), budget) {
             Ok(planned) => return Ok(planned),
             Err(plan::Stopped::Budget { work }) if !cancelled() => work,
             Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
         };
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
-        let mut planned = match planning(None) {
+        let mut planned = match planning(None, budget) {
             Ok(planned) => planned,
             Err(plan::Stopped::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
@@ -3727,9 +3734,8 @@ impl<'a> Context<'a> {
         if self.trace.is_some() {
             let detail = format!(
                 "{} patterns planned without characteristic sets: \
-                 estimate budget of {} passed after {work}",
+                 estimate budget of {budget} passed after {work}",
                 inputs.len(),
-                plan::set_budget()
             );
             self.note(WITHOUT_SETS, detail, None, 0, start);
         }
