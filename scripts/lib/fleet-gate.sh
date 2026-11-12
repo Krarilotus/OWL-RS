@@ -15,6 +15,8 @@
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
 # scripts/lib/gate-key.sh) and left no tracked file changed; for windows also only when the suite
 # ran with the Python runtime COMMIT declares (gate_runtime), as the record states it.
+# NRESE_GATE_REPAIR: what was repaired since this gate failed for a cause outside the tree, and the
+# evidence. The fleet refuses a failed job's rerun without it, and escalates the same failure again.
 #
 # The merge check's jobs are the fleet's merge gates (`priority_class = "merge-gate"`, a class its
 # config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
@@ -102,6 +104,12 @@ gate() {
   {
     echo "id = $(q "gate-$mode-${tree:0:10}-$(date +%s)")"
     echo 'group = "gate"'
+    # The fleet refuses the same job again after a failure it diagnosed as the job's own. A rerun
+    # for a cause outside the tree says what was repaired, with its evidence (NRESE_GATE_REPAIR).
+    if [ -n "${NRESE_GATE_REPAIR:-}" ]; then
+      echo 'spec = 12'
+      echo "repair = $(q "$NRESE_GATE_REPAIR")"
+    fi
     echo "kind = $(q "$kind")"
     # 600 by default; a gate someone waits for may say so (NRESE_GATE_PRIORITY with its reason).
     echo "priority = $priority"
