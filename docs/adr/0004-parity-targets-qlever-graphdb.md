@@ -1,19 +1,19 @@
-# ADR-0004: Parity targets are QLever (performance) and GraphDB (semantics), not Fuseki
+# ADR-0004: What NRESE learns from for performance and for semantics
 
-Status: accepted (2026-09-25)
+Status: accepted (2026-09-25); framing revised 2026-11: other systems are named as inspiration, not as targets.
 
 ## Context
 
-v1 measured itself against Fuseki. The product goal is now a store that reads like QLever and governs data like GraphDB.
+v1 measured itself against Fuseki. Since then the store takes its performance ideas from QLever's design and its semantics and governance features from the RDFS/OWL 2 RL materialising stores.
 
 ## Decision
 
-- **QLever parity (performance):**
+- **Performance, after QLever's design:**
   - load throughput and index size per triple
   - latency on WDQS/WDBench-style query mixes
   - integrated text search
   - streaming of very large results
-- **GraphDB parity (semantics and governance):**
+- **Semantics and governance:**
   - queryable RDFS/OWL 2 RL materialisation with incremental maintenance
   - SHACL on commit
   - full-text search
@@ -25,4 +25,4 @@ v1 measured itself against Fuseki. The product goal is now a store that reads li
 ## Consequences
 
 - Specs and the gap tracker are rewritten against these targets.
-- Benchmarks must run on shared hardware with published datasets, so the numbers are comparable to the QLever/GraphDB literature.
+- Benchmarks run on shared hardware with published datasets, so others can repeat them.
