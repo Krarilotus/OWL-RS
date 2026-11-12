@@ -13,7 +13,7 @@ inputs = [
   { name = "ORE 9881, 16542", source = "assets: snapshots/windows/original-cache-ore2015" },
   { name = "choice-real-32/300, horn-real-3000/30000, nominal-classify-300", source = "dl_classify generators, deterministic; contents hashed under results" },
 ]
-results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/dl-reuse-pair-be5c3d7", files = "measurements-no-copy.json, fresh-controls.json, SHA256SUMS-no-copy", tableau_consistency_sha256 = "56b6b6783708d9ab0eecf57e51a3ff690c4c021f8bb53bc547cff43d9f91214f" }
+results = { root = "office-pc:~/nrese-prep-20261009-4e8bd38/dl-reuse-pair-be5c3d7", files = "measurements-no-copy.json, fresh-controls.json, SHA256SUMS-no-copy", tableau_consistency_sha256 = "56b6b6783708d9ab0eecf57e51a3ff690c4c021f8bb53bc547cff43d9f91214f" }
 publishable = "all"
 cases = [
   { case = "ore-9881", verdict = "faster", note = "width 1: 543.8 -> 398.2 ms; width 4: 432.0 -> 288.6 ms" },

@@ -9,9 +9,9 @@ host = "office-pc"
 candidate = { commit = "6f22e85da5cf643ced099e2262681066922e8e55", dirty = true, note = "Rust, config and lock equal to a6331c7a25c083982e5819cbcbf398389e3ac342; 3 tracked non-Rust edits" }
 protocol = { tests = 22, filters = "none; NRESE_W3C_REQUIRED=1", threads = 1, limits = "MemoryMax 8G, no swap, CPUQuota 400%" }
 inputs = [
-  { name = "W3C and conformance corpora, 7 trees, 9548 files", source = "/home/krarilotus/nrese-data-prep-20261009/conformance", manifest_sha256 = "a1221af0929d1667f7aa574ef208c9eb27809a481e2bb924642260a594f947d1" },
+  { name = "W3C and conformance corpora, 7 trees, 9548 files", source = "~/nrese-data-prep-20261009/conformance", manifest_sha256 = "a1221af0929d1667f7aa574ef208c9eb27809a481e2bb924642260a594f947d1" },
 ]
-results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/conformance-a633-corpus", preflight_sha256 = "e95ac08b63bca9461f10a7d143de393ee238a70d2d2a2fe88a82bb905289e5e5", report_sha256 = "3d24ba4926396251e884c690c9b74120721e1e5d92af7dec88c6345f5cc71e06", tableau_w3c_sha256 = "d1f31d41210a08dc1d805bd91d771a9aaa2e77c9d1292035923fc9f3823200f0" }
+results = { root = "office-pc:~/nrese-prep-20261009-4e8bd38/conformance-a633-corpus", preflight_sha256 = "e95ac08b63bca9461f10a7d143de393ee238a70d2d2a2fe88a82bb905289e5e5", report_sha256 = "3d24ba4926396251e884c690c9b74120721e1e5d92af7dec88c6345f5cc71e06", tableau_w3c_sha256 = "d1f31d41210a08dc1d805bd91d771a9aaa2e77c9d1292035923fc9f3823200f0" }
 publishable = "all"
 cases = [
   { case = "w3c-owl2-dl", verdict = "pass", note = "410 pass, DL-909 disputed (witness verified), 0 wrong" },

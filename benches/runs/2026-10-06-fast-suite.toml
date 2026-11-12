@@ -17,7 +17,7 @@ findings = [
   "Canonicalisation time grows with the square of the twins (2,000: 0.6 s, 8,000: 12.7 s)",
   "Memory frontiers: a 20 M load in 2 GiB (the bulk-load budget bounds quads, not terms), LUBM 100 reasoning in 2 GiB, a join on triple-term patterns (past 6 GiB); filtered vector search recall 0.42-0.6 at k = 10",
   "Comparisons (main PC): NRESE ahead of HermiT, Openllet and Konclude on number restrictions, nominals, datatypes, the DL pipeline, LUBM 1's ABox and Horn classification; Konclude ahead on transitive definitions; QLever and Oxigraph on NRESE's exported closure of rl-hierarchy: slower queries and loads",
-  "Not completed: Nemo pairs were skipped (workload fast needed `query`; fixed in 24bcc6b), Jena's rules on rl-chain didn't answer in 16 min and the run was stopped; the SPARQL stores' plain cases, the client sweep and the cache replay are still to run",
+  "Not completed: Nemo pairs were skipped (workload fast needed `query`; fixed in 24bcc6b); the SPARQL stores' plain cases, the client sweep and the cache replay are still to run",
 ]
 started = "2026-10-06"
 host = "Kraris-GPTler"

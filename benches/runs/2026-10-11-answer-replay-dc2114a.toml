@@ -7,7 +7,7 @@ started = "2026-10-11"
 host = "office-pc"
 candidate = { commit = "133ac6d", dirty = false, note = "suitekit/answers.py; the captures come from the dc2114a competitor queue" }
 protocol = { groups = 49, distinct_queries = 37, systems = ["nrese", "jena", "oxigraph", "qlever", "virtuoso"], references = ["jena", "oxigraph"], note = "the campaign captured no unlimited answer, so the one unordered LIMIT can't be decided from these captures" }
-results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/finish-20261010-dc2114a/competitors", captures = "*-audit.json, each capture with its SHA-256" }
+results = { root = "office-pc:~/nrese-prep-20261009-4e8bd38/finish-20261010-dc2114a/competitors", captures = "*-audit.json, each capture with its SHA-256" }
 publishable = "all"
 cases = [
   { case = "nrese against jena", verdict = "match", note = "43 of 49 strict matches; 5 incomplete (reference or every system timed out or missing); 1 undecided (limit-join)" },
