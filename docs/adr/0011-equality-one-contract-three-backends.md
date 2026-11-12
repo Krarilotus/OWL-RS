@@ -18,16 +18,10 @@ The store's version is stage B of [research-designs §1](../design/research-desi
 - a deletion that splits a class costs 66 s on a 500-member class, where rematerialising
   everything costs 0.15 s.
 
-Two research rounds agree on the design:
-
-- the 2 October reports, §1;
-- the 6 October report, *Equality as a shared service*: Motik et al. 2015, B/F≈,
-  Nieuwenhuis–Oliveras proof-producing union-find, Flatt et al., egglog, HermiT.
-
-The 6 October report was checked against the papers. The architecture holds; five attributions
-were corrected, among them: the counting hybrid is Hu, Motik & Horrocks (AAAI 2018); the
-cost of rich provenance rests on Flatt et al.'s Table I; no paper fixes the smallest member
-as the representative, which is our policy.
+The design rests on Motik et al. 2015 (B/F≈), Nieuwenhuis–Oliveras proof-producing
+union-find, Flatt et al., egglog and HermiT. The counting hybrid is Hu, Motik & Horrocks
+(AAAI 2018); the cost of rich provenance rests on Flatt et al.'s Table I; no paper fixes the
+smallest member as the representative, which is our policy.
 
 The 6 October report adds what §1 left open: why one shared data structure is wrong.
 
