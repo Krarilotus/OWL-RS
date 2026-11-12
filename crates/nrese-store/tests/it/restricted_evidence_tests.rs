@@ -10,7 +10,8 @@ use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     GateSeverity, MutationCommand, MutationError, MutationPipeline, MutationReject, MutationTicket,
-    ReadScope, Requester, ShaclGate, SparqlUpdateRequest, StoreConfig, StoreService, WriteScope,
+    ReadScope, RejectKind, Requester, ShaclGate, SparqlUpdateRequest, StoreConfig, StoreService,
+    WriteScope,
 };
 
 const P: &str = "PREFIX : <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
@@ -267,6 +268,31 @@ fn shacl_result_of_the_readable_graphs_is_explained() {
     assert!(reject.detail.contains("MinCount"), "{}", reject.detail);
 }
 
+/// The kind of reason a rejection names is the kind of the reason shown, not the gate's: a
+/// reader of every graph is told the rejecting gate's kind; a restricted committer the kind
+/// of the reason its graphs show, or the same kind whichever gate rejected when they show
+/// none (D16-503).
+#[test]
+fn a_rejection_names_the_kind_of_reason_shown() {
+    let all = Requester::all();
+    assert_eq!(rl(&all).kind, RejectKind::Inconsistent);
+    assert_eq!(dl_count(&all).kind, RejectKind::Inconsistent);
+    assert_eq!(shacl(&all).kind, RejectKind::ShapesViolated);
+    let view_dl = rejection(
+        StoreConfig::in_memory(),
+        ReasoningMode::Owl2Dl,
+        "GRAPH :open { :A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
+         :B owl:disjointWith :D . :C owl:disjointWith :D }",
+        DL_COUNT_COMMIT,
+        &open_reader(),
+    );
+    assert_eq!(view_dl.kind, RejectKind::Inconsistent);
+    let view_shacl = shacl_with("", "GRAPH :open { :b a :B }", &shapes_reader());
+    assert_eq!(view_shacl.kind, RejectKind::ShapesViolated);
+    assert_eq!(rl(&open_reader()).kind, RejectKind::NotShown);
+    assert_eq!(shacl(&open_reader()).kind, RejectKind::NotShown);
+}
+
 // Noninterference (Q07's invariant): two states whose statements in the committer's
 // graphs are the same, both rejected, give it the same rejection, whichever gate rejected
 // and whatever the other graphs hold.
@@ -276,6 +302,7 @@ fn shacl_result_of_the_readable_graphs_is_explained() {
 /// fixed labels ([`Trig`]): SPARQL `INSERT DATA` labels each fresh, so two stores would
 /// differ by construction.
 fn same_for_both(a: MutationReject, b: MutationReject) {
+    assert_eq!(a.kind, b.kind);
     assert_eq!(a.detail, b.detail);
     assert_eq!(a.explanation, b.explanation);
     assert_eq!(a.attribution, b.attribution);

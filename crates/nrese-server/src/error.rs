@@ -8,7 +8,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::reject_view::RejectExplanationView;
-use nrese_store::RejectAttribution;
+use nrese_store::{RejectAttribution, RejectKind};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -16,8 +16,10 @@ pub enum ApiError {
     BadRequest(String),
     #[error("bad request: {0}")]
     BadRequestPlainText(String),
-    #[error("reasoner reject: {detail}")]
-    ReasonerReject {
+    /// A commit a gate rejected, labelled by the kind of reason the committer is shown.
+    #[error("rejected: {detail}")]
+    Rejected {
+        kind: RejectKind,
         detail: String,
         reject: Box<Option<RejectExplanationView>>,
     },
@@ -67,12 +69,14 @@ impl ApiError {
         Self::Unauthorized(message.into())
     }
 
-    pub fn reasoner_reject(
+    pub fn rejected(
+        kind: RejectKind,
         message: impl Into<String>,
         reject: Option<RejectExplanation>,
         commit_attribution: Option<RejectAttribution>,
     ) -> Self {
-        Self::ReasonerReject {
+        Self::Rejected {
+            kind,
             detail: message.into(),
             reject: Box::new(reject.as_ref().map(|reject| {
                 crate::reject_view::reject_view(reject, commit_attribution.as_ref())
@@ -141,7 +145,10 @@ impl IntoResponse for ApiError {
         if let Self::Internal(detail) = &self {
             tracing::error!(%detail, "request failed on the server side");
         }
-        let rejected = matches!(self, Self::ReasonerReject { .. });
+        let rejected = match &self {
+            Self::Rejected { kind, .. } => Some(*kind),
+            _ => None,
+        };
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
@@ -162,7 +169,7 @@ impl IntoResponse for ApiError {
                 response.extensions_mut().insert(Verbatim);
                 return response;
             }
-            Self::ReasonerReject { detail, reject } => (StatusCode::BAD_REQUEST, detail, *reject),
+            Self::Rejected { detail, reject, .. } => (StatusCode::BAD_REQUEST, detail, *reject),
             Self::Unauthorized(detail) => (StatusCode::UNAUTHORIZED, detail, None),
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
@@ -179,13 +186,15 @@ impl IntoResponse for ApiError {
             Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
             Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
-        let (problem_type, title) = if rejected {
-            (
-                Cow::Borrowed("https://nrese.dev/problems/reasoner-reject"),
-                Cow::Borrowed("Reasoner Reject"),
-            )
-        } else {
-            kind(status)
+        let (problem_type, title) = match rejected {
+            Some(reject) => {
+                let (slug, title) = reject_label(reject);
+                (
+                    Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+                    Cow::Borrowed(title),
+                )
+            }
+            None => kind(status),
         };
         problem(
             status,
@@ -197,6 +206,17 @@ impl IntoResponse for ApiError {
                 reasoner_reject,
             },
         )
+    }
+}
+
+/// A rejected commit's problem type (its slug) and title, by the kind of reason the committer
+/// is shown. One whose graphs show no reason gets a label that names no gate: which gate
+/// rejected depends on graphs it may not read.
+fn reject_label(kind: RejectKind) -> (&'static str, &'static str) {
+    match kind {
+        RejectKind::Inconsistent => ("reasoner-reject", "Reasoner Reject"),
+        RejectKind::ShapesViolated => ("shacl-reject", "SHACL Reject"),
+        RejectKind::NotShown => ("commit-reject", "Commit Reject"),
     }
 }
 
@@ -310,5 +330,20 @@ mod tests {
         );
         let plain = ApiError::unavailable("down").into_response();
         assert!(plain.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    /// A rejection whose committer's graphs show no reason names no gate: its type is the
+    /// same whichever gate rejected (D16-503).
+    #[tokio::test]
+    async fn a_rejection_with_no_reason_shown_names_no_gate() {
+        let response =
+            ApiError::rejected(RejectKind::NotShown, "rejected", None, None).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(problem["type"], "https://nrese.dev/problems/commit-reject");
+        assert_eq!(problem["title"], "Commit Reject");
     }
 }

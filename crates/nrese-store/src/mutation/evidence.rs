@@ -21,8 +21,8 @@ use nrese_reasoner::{RejectEvidence, RejectExplanation};
 use nrese_sparql::{GraphAccess, QueryEvaluationError, ReadView};
 use std::borrow::Cow;
 
-use super::MutationReject;
 use super::attribution::RejectAttribution;
+use super::{MutationReject, RejectKind};
 use crate::error::StoreError;
 
 /// Proof that a [`MutationReject`] was made by [`EvidenceView::reject`].
@@ -31,6 +31,7 @@ pub struct Projected(());
 
 /// A rejection's parts, before [`EvidenceView::reject`] makes them one.
 pub(crate) struct Draft {
+    pub kind: RejectKind,
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
@@ -109,6 +110,7 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
         view: impl FnOnce(&Self) -> Draft,
     ) -> MutationReject {
         let Draft {
+            kind,
             detail,
             explanation,
             attribution,
@@ -117,6 +119,7 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
             true => view(self),
         };
         MutationReject {
+            kind,
             detail,
             explanation,
             attribution,
@@ -129,6 +132,7 @@ impl<'v, 'e> EvidenceView<'v, 'e> {
 /// operation's budget): the same for every such view, whichever gate rejected.
 pub(crate) fn nothing_shown() -> Draft {
     Draft {
+        kind: RejectKind::NotShown,
         detail: format!(
             "the mutation was rejected; the graphs you can read show no reason by themselves \
              (within the operation's budget). {ONLY_READABLE}"
@@ -138,15 +142,17 @@ pub(crate) fn nothing_shown() -> Draft {
     }
 }
 
-/// A restricted rejection that shows `reason`, found in the committer's view by itself,
-/// with its `evidence` (statements of graphs it may read).
+/// A restricted rejection that shows `reason`, of `kind`, found in the committer's view by
+/// itself, with its `evidence` (statements of graphs it may read).
 pub(crate) fn shown(
+    kind: RejectKind,
     reason: String,
     constraint: &str,
     focus: String,
     evidence: Vec<RejectEvidence>,
 ) -> Draft {
     Draft {
+        kind,
         detail: format!(
             "the mutation was rejected; in the graphs you can read, {reason}. {ONLY_READABLE}"
         ),

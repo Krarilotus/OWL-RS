@@ -39,8 +39,25 @@ pub enum MutationError {
 /// ([`super::evidence`], the one place that makes a rejection).
 #[derive(Debug, Clone)]
 pub struct MutationReject {
+    /// What kind of reason the committer is shown: a restricted committer is shown its own
+    /// view's first reason, whichever gate rejected ([`super::evidence`]).
+    pub kind: RejectKind,
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
     pub(super) _projected: super::evidence::Projected,
+}
+
+/// The kind of reason a rejected committer is shown, for a transport to label it. It is the
+/// kind of the reason shown, not of the gate that rejected: a restricted committer's own
+/// graphs can be inconsistent where the SHACL gate rejected the whole data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectKind {
+    /// The data shown is inconsistent (an OWL 2 RL consistency rule, or OWL 2 DL): the
+    /// whole data for a reader of every graph, else the committer's own graphs.
+    Inconsistent,
+    /// The data shown has SHACL results the gate rejects for, as above.
+    ShapesViolated,
+    /// The committer's graphs show no reason by themselves: the same for every gate.
+    NotShown,
 }
