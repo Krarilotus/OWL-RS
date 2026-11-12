@@ -51,7 +51,7 @@ struct Resolve {
 
 impl Resolve {
     fn limit(&self) -> Result<usize, Unread> {
-        let bytes = crate::memory::limit_within(self.explicit, (self.capacity)()?);
+        let bytes = crate::memory::limit_within(self.explicit, (self.capacity)())?;
         Ok(usize::try_from(bytes).map_or(UNRESOLVED - 1, |bytes| bytes.min(UNRESOLVED - 1)))
     }
 }
@@ -79,10 +79,11 @@ impl SharedBudget {
     /// The process's budget, its limit found at its first need, never before: the first
     /// charge, refill, or question of its room or limit. Then `capacity` is read (the
     /// process's: [`crate::memory::capacity`], once per process), and the limit is
-    /// `explicit` bytes but no more than the capacity, else three quarters of it
-    /// ([`crate::memory::limit_within`]). A capacity that can't be read refuses the charge
-    /// that needed it (the limit can't be enforced: fail closed, [`BudgetExceeded::unread`])
-    /// and leaves no room, and is read again at the next need.
+    /// `explicit` bytes but no more than the capacity (themselves where it can't be read),
+    /// else three quarters of it ([`crate::memory::limit_within`]). The default whose
+    /// capacity can't be read refuses the charge that needed it (the limit can't be
+    /// enforced: fail closed, [`BudgetExceeded::unread`]) and leaves no room, and is read
+    /// again at the next need.
     pub fn lazy(explicit: Option<u64>, capacity: fn() -> Reading) -> Arc<Self> {
         Arc::new(Self {
             limit: AtomicUsize::new(UNRESOLVED),
@@ -2534,9 +2535,9 @@ mod tests {
         assert_eq!(SharedBudget::lazy(Some(50), capacity).limit(), 50);
     }
 
-    /// A capacity that can't be read refuses the charge that needed the limit, as unread
-    /// and with nothing left charged at any level, leaves no room and no refill, and is read
-    /// again at the next need (never "no limit").
+    /// The default whose capacity can't be read refuses the charge that needed the limit, as
+    /// unread and with nothing left charged at any level, leaves no room and no refill, and
+    /// is read again at the next need (never "no limit").
     #[test]
     fn an_unread_lazy_limit_refuses_and_is_read_again() {
         static READS: AtomicUsize = AtomicUsize::new(0);
@@ -2546,7 +2547,7 @@ mod tests {
                 _ => Ok(400),
             }
         }
-        let process = SharedBudget::lazy(Some(100), capacity);
+        let process = SharedBudget::lazy(None, capacity);
         let queries = SharedBudget::within(1000, Arc::clone(&process));
         let query = Budget::new(usize::MAX).within(Some(Arc::clone(&queries)));
         let err = query.charge(1).unwrap_err();
@@ -2557,7 +2558,22 @@ mod tests {
         assert_eq!(process.take_up_to(10), 0);
         assert_eq!(READS.load(Ordering::Relaxed), 3, "each need read again");
         query.charge(60).unwrap();
-        assert_eq!((process.used(), process.limit()), (60, 100));
+        assert_eq!((process.used(), process.limit()), (60, 300));
+    }
+
+    /// A limit set by hand whose capacity can't be read stands as set (the operator's size is
+    /// the fallback where the system's can't be read), and is exact from the first byte.
+    #[test]
+    fn an_explicit_lazy_limit_stands_where_the_capacity_is_unread() {
+        fn capacity() -> Reading {
+            Err(Unread::Failed)
+        }
+        let process = SharedBudget::lazy(Some(100), capacity);
+        let query = Budget::new(usize::MAX).within(Some(Arc::clone(&process)));
+        query.charge(100).unwrap();
+        let err = query.charge(1).unwrap_err();
+        assert_eq!((err.limit, err.used, err.unread), (100, 100, false));
+        assert_eq!((process.limit(), process.remaining()), (100, 0));
     }
 
     #[test]
