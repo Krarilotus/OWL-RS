@@ -4323,3 +4323,40 @@ mod chunk_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod room_tests {
+    use super::*;
+
+    /// Without a limit (no store limit, no process limit: the operator's choice), the room
+    /// the equality copies are charged to has no bound, and nothing puts one back: no
+    /// reading of the system, no ceiling.
+    #[test]
+    fn without_a_limit_the_copies_room_is_unbounded() {
+        assert_eq!(
+            nrese_exec::memory::process_limit(),
+            None,
+            "none is set here"
+        );
+        let operation = OperationStop::new(NEVER);
+        assert_eq!(operation.room(), Ok(u64::MAX));
+        let room = room_budget(&operation).expect("no room to read");
+        assert!(!room.is_bounded(), "a limit of {} bytes", room.limit());
+    }
+
+    /// Without a limit, a fact's copies past what any vector holds are still refused before
+    /// they are made, by the checked count of their bytes, not allocated.
+    #[test]
+    fn without_a_limit_an_impossible_number_of_copies_is_refused() {
+        let room = room_budget(&OperationStop::new(NEVER)).expect("room");
+        let class: Vec<u64> = (0..1 << 20).collect();
+        let bound = copies_at_most([&class, &class, &class]);
+        assert_eq!(bound, 1 << 60);
+        let (mut copies, mut scratch) = (ChargedVec::new(&room), ChargedVec::new(&room));
+        let made = append_copies(&mut copies, &mut scratch, bound, |_| {
+            panic!("no copy is made")
+        });
+        assert!(made.is_err(), "admitted");
+        assert_eq!(room.used(), 0, "nothing charged");
+    }
+}
