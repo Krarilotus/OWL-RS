@@ -23,7 +23,7 @@ union-find, Flatt et al., egglog and HermiT. The counting hybrid is Hu, Motik & 
 (AAAI 2018); the cost of rich provenance rests on Flatt et al.'s Table I; no paper fixes the
 smallest member as the representative, which is our policy.
 
-The 6 October report adds what §1 left open: why one shared data structure is wrong.
+Why one shared data structure is wrong:
 
 - Path compression, rollback and split want contradictory structures.
 - An explanation means a rule proof in one owner and a dependency set in another.
