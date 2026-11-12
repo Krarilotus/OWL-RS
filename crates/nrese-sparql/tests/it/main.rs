@@ -3,6 +3,7 @@
 
 mod access_tests;
 mod calendar_tests;
+mod date_time_range_tests;
 mod depth_tests;
 mod differential_tests;
 mod equality_answer_tests;
