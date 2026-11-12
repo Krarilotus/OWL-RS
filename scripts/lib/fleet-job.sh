@@ -26,7 +26,15 @@ fleet_say() { echo "$fleet_label${fleet_id:+ $fleet_id}: $*" >&2; }
 fleet_cancel() { [ -z "$fleet_id" ] || timeout --kill-after=10 60 "$fleet_bin" cancel "$fleet_id" > /dev/null 2>&1; }
 trap 'fleet_say interrupted; fleet_cancel; exit 130' INT TERM
 
-q() { local s=${1//\\/\\\\}; printf '"%s"' "${s//\"/\\\"}"; }
+# A TOML basic string: backslashes and quotes escaped, and the line breaks and tabs a pasted
+# statement may hold (a literal one is invalid TOML). No other control character is passed here.
+q() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '"%s"' "${s//$'\t'/\\t}"
+}
 
 fleet_ready() {
   [ -n "${FLEET_OWNER:-}" ] || { fleet_say "no FLEET_OWNER (your own thread: fleet-scheduler/skills/fleet-jobs)"; return 1; }

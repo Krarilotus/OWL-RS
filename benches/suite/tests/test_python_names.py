@@ -53,13 +53,14 @@ class Checker(unittest.TestCase):
 
 
 # Stand-ins, each call one line in $FAKE/calls: cargo (metadata: no package), the W3C data fetch, the
-# name lint and the checker itself.
+# name lint and the checker itself, which finds a name while $FAKE/undefined exists.
 CARGO = '#!/bin/sh\necho "cargo $*" >> "$FAKE/calls"\n[ "$1" != metadata ] || echo \'{"packages":[]}\'\nexit 0\n'
 STUBS = {
     "scripts/fetch-w3c-tests.sh": '#!/bin/sh\nexit 0\n',
     "scripts/check-names.sh": '#!/bin/sh\nexit 0\n',
     "scripts/check-python-names.py": 'import os, sys\nopen(os.environ["FAKE"] + "/calls", "a")'
-                                     '.write("names " + " ".join(sys.argv[1:]) + "\\n")\n',
+                                     '.write("names " + " ".join(sys.argv[1:]) + "\\n")\n'
+                                     'sys.exit(os.path.exists(os.environ["FAKE"] + "/undefined"))\n',
 }
 
 
@@ -94,15 +95,26 @@ class PushTier(unittest.TestCase):
                      ["update-ref", "refs/remotes/origin/refactor/engine-v2", "HEAD"]):
             subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, env=self.env)
 
-    def test_the_changed_python_under_benches_and_scripts_is_checked(self):
+    def test_the_changed_python_is_checked_and_a_name_found_fails_the_tier(self):
         self.files.write_text("benches/fast/fast.py\nscripts/seed-sweep.py\napps/x/tool.py\nbenches/fast/CATALOG.md\n",
                               newline="\n")
-        done = subprocess.run([BASH, "scripts/check.sh", "push"], cwd=self.repo, capture_output=True, text=True,
-                              env=self.env, timeout=120, stdin=subprocess.DEVNULL)
-        calls = (self.fake / "calls").read_text().splitlines() if (self.fake / "calls").exists() else []
-        self.assertEqual([c for c in calls if c.startswith("names")], ["names benches/fast/fast.py scripts/seed-sweep.py"],
-                         f"SPEC python-names-push-tier: the changed Python under benches/ and scripts/, once:\n"
-                         f"{done.stdout}{done.stderr}")
+        for undefined, code in ((False, 0), (True, 1)):
+            with self.subTest(undefined=undefined):
+                (self.fake / "calls").unlink(missing_ok=True)
+                (self.fake / "undefined").unlink(missing_ok=True)
+                if undefined:
+                    (self.fake / "undefined").write_text("")
+                done = subprocess.run([BASH, "scripts/check.sh", "push"], cwd=self.repo, capture_output=True,
+                                      text=True, env=self.env, timeout=120, stdin=subprocess.DEVNULL)
+                out = done.stdout + done.stderr
+                self.assertEqual(done.returncode, code, f"SPEC python-names-push-tier: a name found fails the tier:\n{out}")
+                calls = (self.fake / "calls").read_text().splitlines() if (self.fake / "calls").exists() else []
+                self.assertEqual([c for c in calls if c.startswith("names")],
+                                 ["names benches/fast/fast.py scripts/seed-sweep.py"],
+                                 f"SPEC python-names-push-tier: the changed Python under benches/ and scripts/, once:\n{out}")
+                if undefined:
+                    self.assertRegex(done.stdout, r"(?m)^  1  python names \(",
+                                     f"SPEC python-names-push-tier: the summary names the step:\n{out}")
 
 
 if __name__ == "__main__":

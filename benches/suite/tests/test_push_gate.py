@@ -453,7 +453,9 @@ esac
         statement, in the job as given; without it the job says nothing of a repair."""
         import tomllib
         statement = 'host load, four gates at once; evidence: "gate-windows-0d54ed893f-1794406264" C:\\fleet'
-        for repair in (None, statement):
+        # Pasted, over lines and with a tab (review r1: a literal line break made the job invalid TOML).
+        pasted = "host load, four gates at once\r\nevidence:\tgate.log\n"
+        for repair in (None, statement, pasted):
             self.reset()
             (self.fake / "status-gate-1").write_text(json.dumps({"state": "pending", "host": "-"}))
             self.env.pop("NRESE_GATE_REPAIR", None)
