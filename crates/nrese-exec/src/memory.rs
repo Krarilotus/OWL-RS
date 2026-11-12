@@ -166,30 +166,71 @@ pub fn remaining_bytes() -> Reading {
 /// [`available_bytes`], read once per process, at its first need: a total, which doesn't
 /// change while the process runs (its container's or job's limit, the machine's memory), so
 /// every limit that is a share of it or capped by it asks here, and a store's open asks
-/// nothing. Concurrent first asks read once, the others waiting for that reading. A failed
-/// reading isn't kept: the asker gets it, and the next ask reads again (on a host where it
-/// keeps failing, each operation that needs the limit reads and is refused).
+/// nothing. Concurrent first asks read once, the others waiting for that reading and
+/// sharing its answer, a failure too. A failed reading isn't kept: an ask after it reads
+/// again (on a host where it keeps failing, each operation that needs the limit reads and is
+/// refused).
 pub fn capacity() -> Reading {
-    let known = CAPACITY.load(Ordering::Relaxed);
-    if known != 0 {
-        return Ok(known);
-    }
-    let _reading = CAPACITY_READING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let known = CAPACITY.load(Ordering::Relaxed);
-    if known != 0 {
-        return Ok(known);
-    }
-    let read = available_bytes()?;
-    CAPACITY.store(read, Ordering::Relaxed);
-    Ok(read)
+    CAPACITY.get(available_bytes)
 }
 
-/// [`capacity`]'s reading once taken; 0 before.
-static CAPACITY: AtomicU64 = AtomicU64::new(0);
-/// Held while [`capacity`] is read, so that concurrent first asks read once.
-static CAPACITY_READING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// [`capacity`]'s reading.
+static CAPACITY: ReadOnce = ReadOnce::new();
+
+/// A reading taken once and kept, shared by the asks that wait for it: one reads, the
+/// others wait for its answer and take it, a failure included; a failure isn't kept, so
+/// an ask that comes after it reads again.
+struct ReadOnce {
+    /// The reading once taken; 0 before.
+    known: AtomicU64,
+    /// How many readings have failed: an ask that saw fewer before it waited joined a
+    /// reading that failed meanwhile.
+    failed: AtomicU64,
+    /// Held while reading; the latest failure.
+    reading: std::sync::Mutex<Option<Unread>>,
+}
+
+impl ReadOnce {
+    const fn new() -> Self {
+        Self {
+            known: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            reading: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get(&self, read: impl FnOnce() -> Reading) -> Reading {
+        let known = self.known.load(Ordering::Acquire);
+        if known != 0 {
+            return Ok(known);
+        }
+        let failed = self.failed.load(Ordering::Acquire);
+        let mut latest = self
+            .reading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let known = self.known.load(Ordering::Acquire);
+        if known != 0 {
+            return Ok(known);
+        }
+        if let Some(unread) = *latest
+            && self.failed.load(Ordering::Acquire) != failed
+        {
+            return Err(unread);
+        }
+        match read() {
+            Ok(bytes) => {
+                self.known.store(bytes, Ordering::Release);
+                Ok(bytes)
+            }
+            Err(unread) => {
+                *latest = Some(unread);
+                self.failed.fetch_add(1, Ordering::Release);
+                Err(unread)
+            }
+        }
+    }
+}
 
 /// The process's memory limit a setting means, given the memory the process may use as
 /// read ([`capacity`]): `explicit` bytes, no more than a capacity that reads (a limit the
@@ -912,6 +953,46 @@ mod discovery_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The memory the process may use, read once: asks that wait for a reading share its
+    /// answer, a failure too (one reading for all of them); an ask after a failure reads
+    /// again, and a reading taken is kept.
+    #[test]
+    fn concurrent_first_asks_share_one_reading_a_failed_one_too() {
+        use std::sync::atomic::AtomicUsize;
+        static ONCE: super::ReadOnce = super::ReadOnce::new();
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn failing() -> super::Reading {
+            READS.fetch_add(1, Ordering::Relaxed);
+            // Long enough for every asker to be waiting for this reading.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Err(super::Unread::Failed)
+        }
+        let start = std::sync::Barrier::new(8);
+        let answers: Vec<_> = std::thread::scope(|scope| {
+            let asks: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        ONCE.get(failing)
+                    })
+                })
+                .collect();
+            asks.into_iter().map(|ask| ask.join().unwrap()).collect()
+        });
+        assert_eq!(READS.load(Ordering::Relaxed), 1, "one reading for all");
+        assert!(
+            answers
+                .iter()
+                .all(|answer| *answer == Err(super::Unread::Failed))
+        );
+        assert_eq!(
+            ONCE.get(|| Ok(4096)),
+            Ok(4096),
+            "read again after a failure"
+        );
+        assert_eq!(ONCE.get(|| panic!("kept: not read")), Ok(4096));
+    }
+
     use super::*;
 
     /// The process limit is read as set, holds past it, and doesn't latch: under a limit

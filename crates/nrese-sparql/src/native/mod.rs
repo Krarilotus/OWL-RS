@@ -1906,8 +1906,19 @@ impl<'a> Context<'a> {
             return cancelled;
         }
         let requested = rows.saturating_mul(width.max(1) * 8);
+        // No room because the process's limit can't be read: that, not a full budget.
+        let Ok(room) = self.budget.room() else {
+            return QueryEvaluationError::MemoryLimit(BudgetExceeded {
+                limit: 0,
+                requested,
+                used: self.budget.used(),
+                shared: true,
+                unread: true,
+            })
+            .into();
+        };
         QueryEvaluationError::MemoryLimit(BudgetExceeded {
-            limit: self.budget.used().saturating_add(self.budget.remaining()),
+            limit: self.budget.used().saturating_add(room),
             // A table may grow to half of what is left (`max_rows`).
             requested: requested.saturating_mul(2),
             used: self.budget.used(),

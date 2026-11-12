@@ -109,10 +109,17 @@ impl SharedBudget {
     /// Bytes that may still be charged here: the own rest, and no more than the levels
     /// above have left.
     pub fn remaining(&self) -> usize {
-        let own = self.limit().saturating_sub(self.used());
-        self.parent
-            .as_ref()
-            .map_or(own, |parent| own.min(parent.remaining()))
+        self.room().unwrap_or(0)
+    }
+
+    /// [`Self::remaining`], or why it can't be known: a lazy limit here or above that can't
+    /// be read ([`Self::lazy`]).
+    pub fn room(&self) -> Result<usize, Unread> {
+        let own = self.known_limit()?.saturating_sub(self.used());
+        match &self.parent {
+            Some(parent) => Ok(own.min(parent.room()?)),
+            None => Ok(own),
+        }
     }
 
     /// The limit in bytes; a lazy budget's found now if not yet ([`Self::lazy`]), 0 while
@@ -350,11 +357,9 @@ pub struct BudgetExceeded {
 impl std::fmt::Display for BudgetExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.unread {
-            return write!(
-                f,
-                "the process's memory couldn't be read to find its memory limit, so {} MiB \
-                 more can't be admitted; set the limit by hand, in bytes, or 0 for none",
-                self.requested >> 20
+            return f.write_str(
+                "the process's memory couldn't be read to find its memory limit, so nothing \
+                 more can be admitted; set the limit by hand, in bytes, or 0 for none",
             );
         }
         let what = if self.shared {
@@ -619,11 +624,17 @@ impl Budget {
     /// Bytes that may still be charged: the own rest, and no more than the levels above
     /// have left.
     pub fn remaining(&self) -> usize {
+        self.room().unwrap_or(0)
+    }
+
+    /// [`Self::remaining`], or why it can't be known: the process's lazy limit above can't
+    /// be read ([`SharedBudget::lazy`]); then nothing may be charged.
+    pub fn room(&self) -> Result<usize, Unread> {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => own.min(shared.remaining()),
-            Some(Parent::Envelope(envelope)) => own.min(envelope.remaining()),
-            None => own,
+            Some(Parent::Server(shared)) => Ok(own.min(shared.room()?)),
+            Some(Parent::Envelope(envelope)) => Ok(own.min(envelope.room()?)),
+            None => Ok(own),
         }
     }
 
@@ -2543,7 +2554,7 @@ mod tests {
         static READS: AtomicUsize = AtomicUsize::new(0);
         fn capacity() -> Reading {
             match READS.fetch_add(1, Ordering::Relaxed) {
-                0..=2 => Err(Unread::Failed),
+                0..=3 => Err(Unread::Failed),
                 _ => Ok(400),
             }
         }
@@ -2554,9 +2565,10 @@ mod tests {
         assert!(err.unread && err.shared, "{err:?}");
         assert!(err.to_string().contains("couldn't be read"), "{err}");
         assert_eq!((query.used(), queries.used(), process.used()), (0, 0, 0));
+        assert_eq!(query.room(), Err(Unread::Failed));
         assert_eq!(process.remaining(), 0);
         assert_eq!(process.take_up_to(10), 0);
-        assert_eq!(READS.load(Ordering::Relaxed), 3, "each need read again");
+        assert_eq!(READS.load(Ordering::Relaxed), 4, "each need read again");
         query.charge(60).unwrap();
         assert_eq!((process.used(), process.limit()), (60, 300));
     }
