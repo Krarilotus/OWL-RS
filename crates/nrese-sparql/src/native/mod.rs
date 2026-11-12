@@ -3735,23 +3735,35 @@ impl<'a> Context<'a> {
             }
             _ => false,
         };
-        // None (most BGPs): no list to read, nothing to charge or cancel.
-        if !(0..scans.len()).any(|i| (i + 1..scans.len()).any(|j| counted(i, j))) {
-            return out;
+        // Pairs of patterns: cancelled, the rest is left out, and the orderer that reads them
+        // reports the cancellation. Asked per pattern, here and below: the pairs are n²/2.
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // The first pattern with such a pair. None (most BGPs): no list to read, nothing to
+        // charge.
+        let mut first = None;
+        for i in 0..scans.len() {
+            if cancelled() {
+                return out;
+            }
+            if (i + 1..scans.len()).any(|j| counted(i, j)) {
+                first = Some(i);
+                break;
+            }
         }
+        let Some(first) = first else {
+            return out;
+        };
         // The lists' charge, while they live: the columns decoded for them are charged before
         // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
         let mut held = Reservation::new(&*self.budget);
         // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
-        for i in 0..scans.len() {
-            // Pairs of patterns: cancelled, the rest is left out, and the orderer that
-            // reads them reports the cancellation.
-            if self
-                .cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
+        for i in first..scans.len() {
+            if cancelled() {
                 break;
             }
             for j in i + 1..scans.len() {
