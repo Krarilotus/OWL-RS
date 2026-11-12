@@ -290,11 +290,14 @@ def evidence(passes: list[dict], case: str) -> dict:
         # on this pass, which compare_case() then treats as any series a side doesn't report.
         out["samples"].append({s: v for s, v in (record.get("samples") or {}).items() if None not in (v or [])})
         process: dict[str, list[float]] = {}
+        unreported = set()  # a null in any observation: the series isn't read on this pass at all
         for o in observations:
             for series, values in (o.get("samples") or {}).items():
-                if values and None not in values:
+                if values and None in values:
+                    unreported.add(series)
+                elif values:
                     process.setdefault(series, []).append(p50(values))
-        out["process"].append(process)
+        out["process"].append({s: v for s, v in process.items() if s not in unreported})
         peaks = [o.get("peak_mib") for o in observations if o.get("peak_mib")] or \
             ([record["peak_mib"]] if record.get("peak_mib") else [])
         out["lifetime"].append(max(peaks) if peaks else None)
