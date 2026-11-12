@@ -188,6 +188,9 @@ struct ReadOnce {
     failed: AtomicU64,
     /// Held while reading; the latest failure.
     reading: std::sync::Mutex<Option<Unread>>,
+    /// Asks that have taken their flight and wait for it (a test's handshake).
+    #[cfg(test)]
+    joined: std::sync::atomic::AtomicUsize,
 }
 
 impl ReadOnce {
@@ -196,6 +199,8 @@ impl ReadOnce {
             known: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             reading: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            joined: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -205,6 +210,8 @@ impl ReadOnce {
             return Ok(known);
         }
         let failed = self.failed.load(Ordering::Acquire);
+        #[cfg(test)]
+        self.joined.fetch_add(1, Ordering::AcqRel);
         let mut latest = self
             .reading
             .lock()
@@ -961,26 +968,16 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         static ONCE: super::ReadOnce = super::ReadOnce::new();
         static READS: AtomicUsize = AtomicUsize::new(0);
-        static ASKING: AtomicUsize = AtomicUsize::new(0);
         fn failing() -> super::Reading {
             READS.fetch_add(1, Ordering::Relaxed);
-            // The reading lasts until every asker has asked, and a while beyond, for each to
-            // be waiting for it.
-            while ASKING.load(Ordering::Relaxed) < 8 {
+            // The reading lasts until every asker has taken this flight.
+            while ONCE.joined.load(Ordering::Acquire) < 8 {
                 std::thread::yield_now();
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
             Err(super::Unread::Failed)
         }
         let answers: Vec<_> = std::thread::scope(|scope| {
-            let asks: Vec<_> = (0..8)
-                .map(|_| {
-                    scope.spawn(|| {
-                        ASKING.fetch_add(1, Ordering::Relaxed);
-                        ONCE.get(failing)
-                    })
-                })
-                .collect();
+            let asks: Vec<_> = (0..8).map(|_| scope.spawn(|| ONCE.get(failing))).collect();
             asks.into_iter().map(|ask| ask.join().unwrap()).collect()
         });
         assert_eq!(READS.load(Ordering::Relaxed), 1, "one reading for all");
