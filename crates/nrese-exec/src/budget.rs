@@ -22,28 +22,71 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::memory::{Reading, Unread};
+
 /// The memory a group of operations may hold together: all running queries, or the
 /// process's for everything it charges.
 #[derive(Debug)]
 pub struct SharedBudget {
-    limit: usize,
+    /// The limit in bytes; [`UNRESOLVED`] until a lazy budget's first need finds it.
+    limit: AtomicUsize,
+    /// How a lazy budget finds its limit ([`Self::lazy`]); `None`: it was given.
+    resolve: Option<Resolve>,
     used: AtomicUsize,
     peak: AtomicUsize,
     /// The budget this one lies within, charged first.
     parent: Option<Arc<SharedBudget>>,
 }
 
-/// A shared budget's refusal: the limit of the level that refused, and its use then.
+/// A lazy [`SharedBudget`]'s limit before its first need.
+const UNRESOLVED: usize = usize::MAX;
+
+/// A lazy [`SharedBudget`]'s limit: `explicit` bytes or the default share, of the capacity
+/// `capacity` reads ([`crate::memory::limit_within`]).
+#[derive(Debug)]
+struct Resolve {
+    explicit: Option<u64>,
+    capacity: fn() -> Reading,
+}
+
+impl Resolve {
+    fn limit(&self) -> Result<usize, Unread> {
+        let bytes = crate::memory::limit_within(self.explicit, (self.capacity)()?);
+        Ok(usize::try_from(bytes).map_or(UNRESOLVED - 1, |bytes| bytes.min(UNRESOLVED - 1)))
+    }
+}
+
+/// A shared budget's refusal: the limit of the level that refused, and its use then; or
+/// its limit unread ([`BudgetExceeded::unread`]).
 #[derive(Debug, Clone, Copy)]
 struct Refused {
     limit: usize,
     used: usize,
+    unread: bool,
 }
 
 impl SharedBudget {
     pub fn new(limit_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
-            limit: limit_bytes,
+            limit: AtomicUsize::new(limit_bytes),
+            resolve: None,
+            used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            parent: None,
+        })
+    }
+
+    /// The process's budget, its limit found at its first need, never before: the first
+    /// charge, refill, or question of its room or limit. Then `capacity` is read (the
+    /// process's: [`crate::memory::capacity`], once per process), and the limit is
+    /// `explicit` bytes but no more than the capacity, else three quarters of it
+    /// ([`crate::memory::limit_within`]). A capacity that can't be read refuses the charge
+    /// that needed it (the limit can't be enforced: fail closed, [`BudgetExceeded::unread`])
+    /// and leaves no room, and is read again at the next need.
+    pub fn lazy(explicit: Option<u64>, capacity: fn() -> Reading) -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(UNRESOLVED),
+            resolve: Some(Resolve { explicit, capacity }),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             parent: None,
@@ -54,7 +97,8 @@ impl SharedBudget {
     /// refused where either refuses.
     pub fn within(limit_bytes: usize, parent: Arc<SharedBudget>) -> Arc<Self> {
         Arc::new(Self {
-            limit: limit_bytes,
+            limit: AtomicUsize::new(limit_bytes),
+            resolve: None,
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             parent: Some(parent),
@@ -64,14 +108,29 @@ impl SharedBudget {
     /// Bytes that may still be charged here: the own rest, and no more than the levels
     /// above have left.
     pub fn remaining(&self) -> usize {
-        let own = self.limit.saturating_sub(self.used());
+        let own = self.limit().saturating_sub(self.used());
         self.parent
             .as_ref()
             .map_or(own, |parent| own.min(parent.remaining()))
     }
 
+    /// The limit in bytes; a lazy budget's found now if not yet ([`Self::lazy`]), 0 while
+    /// it can't be read.
     pub fn limit(&self) -> usize {
-        self.limit
+        self.known_limit().unwrap_or(0)
+    }
+
+    /// The limit, a lazy budget's found at this first need: one load of an atomic once known.
+    fn known_limit(&self) -> Result<usize, Unread> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        match &self.resolve {
+            Some(resolve) if limit == UNRESOLVED => {
+                let limit = resolve.limit()?;
+                self.limit.store(limit, Ordering::Relaxed);
+                Ok(limit)
+            }
+            _ => Ok(limit),
+        }
     }
 
     pub fn used(&self) -> usize {
@@ -88,16 +147,23 @@ impl SharedBudget {
         if let Some(parent) = &self.parent {
             parent.charge(bytes)?;
         }
+        let refused = |limit, used, unread| {
+            if let Some(parent) = &self.parent {
+                parent.release(bytes);
+            }
+            Err(Refused {
+                limit,
+                used,
+                unread,
+            })
+        };
+        let Ok(limit) = self.known_limit() else {
+            return refused(0, self.used(), true);
+        };
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
-            let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
-                if let Some(parent) = &self.parent {
-                    parent.release(bytes);
-                }
-                return Err(Refused {
-                    limit: self.limit,
-                    used,
-                });
+            let Some(next) = used.checked_add(bytes).filter(|&next| next <= limit) else {
+                return refused(limit, used, false);
             };
             match self
                 .used
@@ -128,7 +194,10 @@ impl SharedBudget {
     /// Up to `wanted` bytes charged here and above, never more than half of the room left
     /// at a level, never refused: what was taken (0 where there is no room).
     fn take_up_to(&self, wanted: usize) -> usize {
-        let take = take_half_of_room(&self.used, &self.peak, self.limit, wanted);
+        let Ok(limit) = self.known_limit() else {
+            return 0;
+        };
+        let take = take_half_of_room(&self.used, &self.peak, limit, wanted);
         if take == 0 {
             return 0;
         }
@@ -271,10 +340,22 @@ pub struct BudgetExceeded {
     /// The limit is the server's, for all queries together: this query would fit if
     /// others held less.
     pub shared: bool,
+    /// The process's limit couldn't be found where this charge first needed it (its memory
+    /// unread, [`SharedBudget::lazy`]): refused because the limit can't be enforced, not
+    /// because memory is in use.
+    pub unread: bool,
 }
 
 impl std::fmt::Display for BudgetExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.unread {
+            return write!(
+                f,
+                "the process's memory couldn't be read to find its memory limit, so {} MiB \
+                 more can't be admitted; set the limit by hand, in bytes, or 0 for none",
+                self.requested >> 20
+            );
+        }
         let what = if self.shared {
             "the server's query memory is in use"
         } else {
@@ -380,6 +461,7 @@ impl Budget {
                     requested: bytes,
                     used: refused.used,
                     shared: true,
+                    unread: refused.unread,
                 })
             }
             Some(Parent::Envelope(envelope)) => envelope.take(bytes),
@@ -480,6 +562,7 @@ impl Budget {
             requested: bytes,
             used,
             shared: false,
+            unread: false,
         }
     }
 
@@ -2423,6 +2506,58 @@ mod tests {
         drop(query);
         assert_eq!((queries.used(), process.used()), (0, 0));
         assert_eq!((queries.peak(), process.peak()), (70, 95));
+    }
+
+    /// The process's limit found lazily: nothing is read until the first need, that need
+    /// reads once, and the limit is then exact: three quarters of the capacity by default,
+    /// a limit set by hand no more than the capacity.
+    #[test]
+    fn a_lazy_limit_is_read_once_at_its_first_need() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn capacity() -> Reading {
+            READS.fetch_add(1, Ordering::Relaxed);
+            Ok(400)
+        }
+        let process = SharedBudget::lazy(None, capacity);
+        let queries = SharedBudget::within(1000, Arc::clone(&process));
+        let query = Budget::new(usize::MAX).within(Some(Arc::clone(&queries)));
+        assert_eq!(READS.load(Ordering::Relaxed), 0, "made, nothing read");
+        query.charge(100).unwrap();
+        assert_eq!(READS.load(Ordering::Relaxed), 1, "the first charge reads");
+        let err = query.charge(201).unwrap_err();
+        assert_eq!((err.limit, err.used, err.unread), (300, 100, false));
+        assert_eq!((process.remaining(), process.limit()), (200, 300));
+        assert_eq!(READS.load(Ordering::Relaxed), 1, "read once");
+        // A limit set by hand above the capacity is the capacity; below it, itself; its
+        // first need may be a question of room.
+        assert_eq!(SharedBudget::lazy(Some(10_000), capacity).remaining(), 400);
+        assert_eq!(SharedBudget::lazy(Some(50), capacity).limit(), 50);
+    }
+
+    /// A capacity that can't be read refuses the charge that needed the limit, as unread
+    /// and with nothing left charged at any level, leaves no room and no refill, and is read
+    /// again at the next need (never "no limit").
+    #[test]
+    fn an_unread_lazy_limit_refuses_and_is_read_again() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn capacity() -> Reading {
+            match READS.fetch_add(1, Ordering::Relaxed) {
+                0..=2 => Err(Unread::Failed),
+                _ => Ok(400),
+            }
+        }
+        let process = SharedBudget::lazy(Some(100), capacity);
+        let queries = SharedBudget::within(1000, Arc::clone(&process));
+        let query = Budget::new(usize::MAX).within(Some(Arc::clone(&queries)));
+        let err = query.charge(1).unwrap_err();
+        assert!(err.unread && err.shared, "{err:?}");
+        assert!(err.to_string().contains("couldn't be read"), "{err}");
+        assert_eq!((query.used(), queries.used(), process.used()), (0, 0, 0));
+        assert_eq!(process.remaining(), 0);
+        assert_eq!(process.take_up_to(10), 0);
+        assert_eq!(READS.load(Ordering::Relaxed), 3, "each need read again");
+        query.charge(60).unwrap();
+        assert_eq!((process.used(), process.limit()), (60, 100));
     }
 
     #[test]

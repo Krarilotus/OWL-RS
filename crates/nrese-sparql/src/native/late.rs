@@ -273,6 +273,7 @@ impl super::Context<'_> {
                 requested: bytes::<T>(len),
                 used: self.budget.used(),
                 shared: false,
+                unread: false,
             };
             return Err(crate::QueryEvaluationError::MemoryLimit(refused).into());
         }

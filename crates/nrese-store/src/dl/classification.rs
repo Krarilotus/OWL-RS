@@ -34,7 +34,9 @@ pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
     let workers = nrese_exec::workers::Workers::current().limited(config.threads);
     let mut options = config.classification_options(workers, Some(store.envelope(None)));
-    options.max_memory = Some(store.process_memory_bytes());
+    // A limit that can't be found leaves no memory to run in: the engines stop at their
+    // first check, their answer incomplete and never kept (fail closed).
+    options.max_memory = Some(store.process_memory_bytes().unwrap_or(1));
     options
 }
 

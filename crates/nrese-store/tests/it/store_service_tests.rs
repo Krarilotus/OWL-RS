@@ -437,11 +437,13 @@ fn a_materialisation_stops_at_the_process_memory_limit() -> Result<(), Box<dyn s
     );
     assert!(!error.is_request_error());
     assert!(store.reasoning_state().is_none(), "nothing was applied");
-    // By default the limit is three quarters of what the process may use, read at open.
+    // By default the limit is three quarters of what the process may use, read at its
+    // first need.
     assert_eq!(
         StoreConfig::in_memory().process_memory_bytes,
         nrese_store::ProcessMemory::Default
     );
-    assert!(StoreService::new(StoreConfig::in_memory())?.process_memory_bytes() > 0);
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    assert!(store.process_memory_bytes().expect("the limit reads here") > 0);
     Ok(())
 }
