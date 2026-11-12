@@ -34,10 +34,10 @@ fn under(
     budget: usize,
 ) -> Result<(plan::Plan, usize), QueryEvaluationError> {
     let (scans, counts) = bgp(ctx, patterns);
-    BUDGET.set(budget);
+    BUDGET.set(Some(budget));
     REPLANS.set(0);
     let plan = ctx.join_order(&scans, &counts, &[], true);
-    BUDGET.set(plan::SET_BUDGET);
+    BUDGET.set(None);
     let plan = plan.map_err(QueryEvaluationError::from)?;
     Ok((plan, REPLANS.get()))
 }
@@ -49,8 +49,22 @@ fn without_sets(ctx: &Context<'_>, patterns: &[&str], order: Option<&[usize]>) -
     let mut vars = Vec::new();
     let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
     let plan = match order {
-        Some(order) => plan::along(&inputs, vars.len(), PROBE_FACTOR, None, order),
-        None => plan::order(&inputs, vars.len(), PROBE_FACTOR, None, &|| false),
+        Some(order) => plan::along(
+            &inputs,
+            vars.len(),
+            PROBE_FACTOR,
+            None,
+            plan::SET_BUDGET,
+            order,
+        ),
+        None => plan::order(
+            &inputs,
+            vars.len(),
+            PROBE_FACTOR,
+            None,
+            plan::SET_BUDGET,
+            &|| false,
+        ),
     };
     steps(&plan.unwrap())
 }
@@ -300,10 +314,10 @@ fn a_query_cancelled_before_its_planning_is_not_planned_again() {
     assert_eq!(REPLANS.get(), 0, "planned again");
 }
 
-/// Spec: the design review's round 2 (R2-P1): the planning without the sets after the budget
-/// is passed still asks for the query's cancellation at every step. Its first read passes
-/// the budget before the search's first step, so the first step asked is the second
-/// planning's; cancelled there, the query fails as cancelled after one planning again.
+/// Spec: the design review's round 2 (R2-P1): the planning without the sets still asks for
+/// the query's cancellation at every step. It now comes first (plain first, 12 November
+/// 13:53): cancelled at its first step, the query fails as cancelled, the set search never
+/// runs, and nothing falls back.
 #[test]
 fn the_planning_without_the_sets_stops_when_cancelled() {
     let engine = people();
@@ -332,7 +346,7 @@ fn the_planning_without_the_sets_stops_when_cancelled() {
         "{:?}",
         planned.err()
     );
-    assert_eq!((REPLANS.get(), asked.get()), (1, 1), "planned again, steps");
+    assert_eq!((REPLANS.get(), asked.get()), (0, 1), "fallbacks, steps");
 }
 
 /// Spec: the design (12 Nov 2026), "the fallback is visible", as the budget brief words
@@ -352,9 +366,9 @@ fn explain_shows_a_bgp_planned_without_the_sets() {
                 ?x <http://e/p3> ?c . ?x <http://e/city> ?d }";
     let query = Query::parse(text, None).unwrap();
     let explained = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let explained = explain(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         explained.unwrap().1
     };
     let budget = with.work.saturating_sub(1);
@@ -392,9 +406,9 @@ fn the_plan_without_running_shows_a_bgp_planned_without_the_sets() {
                 ?x <http://e/p3> ?c . ?x <http://e/city> ?d }";
     let query = Query::parse(text, None).unwrap();
     let planned = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let planned = super::plan(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         planned.unwrap().1
     };
     let budget = with.work.saturating_sub(1);
@@ -430,9 +444,9 @@ fn explain_shows_a_cyclic_bgp_planned_without_the_sets() {
     let text = "SELECT * WHERE { ?a <http://e/p> ?b . ?b <http://e/q> ?c . ?c <http://e/r> ?a }";
     let query = Query::parse(text, None).unwrap();
     let explained = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let explained = explain(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         explained.unwrap().1
     };
     let budget = with.work.saturating_sub(1);
@@ -478,9 +492,9 @@ fn explain_notes_a_cyclic_bgp_planned_with_a_path_once() {
                 ?c <http://e/r> ?a . ?x <http://e/s>+ ?y }";
     let query = Query::parse(text, None).unwrap();
     let explained = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let explained = explain(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         explained.unwrap().1
     };
     let trace = explained(0);
@@ -500,5 +514,321 @@ fn explain_notes_a_cyclic_bgp_planned_with_a_path_once() {
     assert!(
         trace.iter().all(|s| s.operator != "join order"),
         "{trace:#?}"
+    );
+}
+
+/// The sets every start of `patterns` (open stars on `?x`, as [`STAR`]) reads: each
+/// predicate's, by the sets' index.
+fn start_reads(snapshot: &Snapshot, sets: &CharacteristicSets, predicates: &[&str]) -> Vec<usize> {
+    predicates
+        .iter()
+        .map(|p| sets.sets_having(id(snapshot, p)))
+        .collect()
+}
+
+/// Spec: the master's order of 12 November (A), "give up before spending", and its doubt
+/// review: every start of a star reads its predicate's sets before the search first checks
+/// its work. Where the first two starts' reads would pass the budget, the planning reads none
+/// of them, is planned again once without the sets, and says it passed after the first
+/// start's reads, as it said when it made them. For the exhaustive search (4 patterns) and
+/// the greedy one (13). Red on the parent, which reads `p0`'s sets first.
+#[test]
+fn past_the_budget_at_its_starts_a_planning_reads_no_sets() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let sets = snapshot.characteristic_sets_in(ctx.model).expect("sets");
+    let greedy: Vec<String> = (0..13).map(|i| format!("?x p{i} ?o{i}")).collect();
+    let greedy: Vec<&str> = greedy.iter().map(String::as_str).collect();
+    for patterns in [&STAR[..], &greedy[..]] {
+        let reads = start_reads(&snapshot, &sets, &["p0", "p1"]);
+        assert!(reads.iter().all(|&n| n > 0), "{reads:?}");
+        let budget = reads[0] + reads[1] - 1;
+        let none = without_sets(&ctx, patterns, None);
+        STATISTICS.with(|c| c.set((0, 0)));
+        let (past, replans) = under(&ctx, patterns, budget).unwrap();
+        let (read, _) = STATISTICS.with(|c| c.get());
+        assert_eq!(
+            (steps(&past), replans, past.work, read),
+            (none, 1, reads[0], 0),
+            "{} patterns, a budget of {budget}: plan, planned again, work, sets read",
+            patterns.len()
+        );
+    }
+}
+
+/// Spec: as [`past_the_budget_at_its_starts_a_planning_reads_no_sets`], the other side: where
+/// the starts' reads fit the budget, the search makes them and stops only at the read or copy
+/// that passes it, as before.
+#[test]
+fn within_the_budget_at_its_starts_a_planning_reads_their_sets() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let sets = snapshot.characteristic_sets_in(ctx.model).expect("sets");
+    let starts: usize = start_reads(&snapshot, &sets, &["p0", "p1", "p3", "city"])
+        .iter()
+        .sum();
+    let (with, _) = under(&ctx, &STAR, usize::MAX).unwrap();
+    assert!(
+        starts < with.work,
+        "{starts} at the starts, {} in all",
+        with.work
+    );
+    let none = without_sets(&ctx, &STAR, None);
+    STATISTICS.with(|c| c.set((0, 0)));
+    let (past, replans) = under(&ctx, &STAR, starts).unwrap();
+    let (read, _) = STATISTICS.with(|c| c.get());
+    assert_eq!((steps(&past), replans), (none, 1), "a budget of {starts}");
+    assert!(
+        past.work >= starts && read >= starts,
+        "{} counted, {read} read, {starts} at the starts",
+        past.work
+    );
+}
+
+/// The plannings `with_sets` asks for, in order: with the sets (`true`) or without (`false`).
+fn plannings(
+    ctx: &Context<'_>,
+    patterns: &[&str],
+) -> (Result<plan::Plan, QueryEvaluationError>, Vec<bool>) {
+    let (scans, counts) = bgp(ctx, patterns);
+    let mut vars = Vec::new();
+    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let cancelled = || {
+        ctx.cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    };
+    let order = |sets: Option<&CharacteristicSets>, budget: usize| {
+        asked.borrow_mut().push(sets.is_some());
+        plan::order(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &cancelled)
+    };
+    let planned = ctx
+        .with_sets(&inputs, &order)
+        .map_err(QueryEvaluationError::from);
+    (planned, asked.into_inner())
+}
+
+/// Spec: the master's order of 12 November 13:53, "plan with the plain counts first, and
+/// enter the set search only when that plan's own estimate says the query is expensive
+/// enough", and "a query that main plans in 78 k instructions is planned by us in about
+/// that": a BGP the gate keeps from the sets ([`plan::admits`]) gets the plain plan, reads no
+/// set and plans once; EXPLAIN says so, once, under the BGP, with its starts' reads and the
+/// rows expected. Admitted, the same BGP is planned with the sets as before. Under the
+/// planner's own gate, the people graph's few sets are read. Red without the gate (every BGP
+/// read with the sets).
+#[test]
+fn a_bgp_the_gate_keeps_from_the_sets_reads_none() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (with, _) = under(&ctx, &STAR, usize::MAX).unwrap();
+    let none = without_sets(&ctx, &STAR, None);
+    assert_ne!(steps(&with), none, "the sets change this plan");
+    let (own, asked_own) = plannings(&ctx, &STAR);
+    plan::ADMIT.set(Some(false));
+    STATISTICS.with(|c| c.set((0, 0)));
+    let (kept, asked) = plannings(&ctx, &STAR);
+    let (read, _) = STATISTICS.with(|c| c.get());
+    let text = "SELECT * WHERE { ?x <http://e/p0> ?a . ?x <http://e/p1> ?b . \
+                ?x <http://e/p3> ?c . ?x <http://e/city> ?d }";
+    let query = Query::parse(text, None).unwrap();
+    let trace = explain(&snapshot, &query, &options).unwrap().1;
+    plan::ADMIT.set(None);
+    let kept = kept.unwrap();
+    assert_eq!(
+        (steps(&kept), kept.work, read, asked),
+        (none, 0, 0, vec![false]),
+        "kept from the sets: plan, work, sets read, plannings"
+    );
+    let notes: Vec<usize> = (0..trace.len())
+        .filter(|&i| trace[i].operator == "join order")
+        .collect();
+    assert_eq!(notes.len(), 1, "{trace:#?}");
+    let (above, note) = (&trace[notes[0].saturating_sub(1)], &trace[notes[0]]);
+    assert_eq!(
+        ("bgp", note.depth),
+        (above.operator.as_str(), above.depth + 1)
+    );
+    assert!(
+        note.detail
+            .starts_with("4 patterns planned without characteristic sets: ")
+            && note.detail.contains(" set entries at its starts against "),
+        "{}",
+        note.detail
+    );
+    assert_eq!(
+        (steps(&own.unwrap()), asked_own),
+        (steps(&with), vec![false, true]),
+        "the planner's own gate"
+    );
+}
+
+/// Spec: the budget's cancellation rule, and the doubt review of the gate (12 November): a
+/// fixed order's planning (two patterns) doesn't ask for the cancellation, so a query cancelled
+/// before it fails as cancelled between the plannings, whether the gate would keep it from the
+/// sets or not, and never gets a plan. Red without the check after the plain plan.
+#[test]
+fn a_cancelled_query_with_a_fixed_order_gets_no_plan() {
+    let engine = graph(&[("a1", "p", "b1"), ("a2", "p", "b2"), ("b1", "q", "c")]);
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    token.cancel();
+    let options = QueryOptions {
+        resources: Resources {
+            cancellation: Some(token),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (scans, counts) = bgp(&ctx, &["?x p ?y", "?y q ?z"]);
+    for admit in [Some(false), None] {
+        plan::ADMIT.set(admit);
+        let planned = ctx.join_order(&scans, &counts, &[], true);
+        plan::ADMIT.set(None);
+        assert!(
+            matches!(
+                planned.map_err(QueryEvaluationError::from),
+                Err(QueryEvaluationError::Cancelled)
+            ),
+            "admit {admit:?}"
+        );
+    }
+}
+
+/// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`], "plain first": a BGP
+/// whose set search passes its budget keeps the plain plan made before it, and isn't planned
+/// again; its work is the set search's. Red on the parent, which plans with the sets first
+/// and then again without them.
+#[test]
+fn past_its_budget_a_bgp_keeps_its_plain_plan_without_planning_again() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (with, _) = under(&ctx, &STAR, usize::MAX).unwrap();
+    let none = without_sets(&ctx, &STAR, None);
+    let budget = with.work - 1;
+    BUDGET.set(Some(budget));
+    REPLANS.set(0);
+    let (past, asked) = plannings(&ctx, &STAR);
+    BUDGET.set(None);
+    let past = past.unwrap();
+    assert_eq!(
+        (steps(&past), asked, REPLANS.get()),
+        (none, vec![false, true], 1),
+        "plan, plannings, fallbacks"
+    );
+    assert!(
+        past.work > 0 && past.work <= budget,
+        "{} of {budget}",
+        past.work
+    );
+}
+
+/// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`] and the budget's
+/// cancellation rule: a query cancelled in its plain planning fails as cancelled, and its set
+/// search never runs.
+#[test]
+fn a_query_cancelled_in_its_plain_planning_reads_no_sets() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    token.cancel();
+    let options = QueryOptions {
+        resources: Resources {
+            cancellation: Some(token),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (planned, asked) = plannings(&ctx, &STAR);
+    assert!(
+        matches!(planned, Err(QueryEvaluationError::Cancelled)),
+        "{:?}",
+        planned.err()
+    );
+    assert_eq!(asked, vec![false]);
+}
+
+/// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`], under the planner's own gate
+/// (no test's decision): a BGP that expects few rows, and whose star's predicate is in more
+/// sets than [`plan::SET_START_ALLOWANCE`], reads none of them and plans once; given the
+/// sets anyway, it is planned with them. Red where the gate counts no reads at its starts.
+#[test]
+fn a_bgp_whose_starts_read_many_sets_and_that_expects_little_reads_none() {
+    let many = plan::SET_START_ALLOWANCE + 1;
+    let names: Vec<[String; 3]> = (0..many)
+        .flat_map(|i| {
+            [
+                [format!("s{i}"), "p".into(), format!("o{i}")],
+                [format!("s{i}"), format!("u{i}"), "v".into()],
+            ]
+        })
+        .chain([["s0".into(), "q".into(), "w".into()]])
+        .collect();
+    let triples: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|[s, p, o]| (s.as_str(), p.as_str(), o.as_str()))
+        .collect();
+    let engine = graph(&triples);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let patterns = ["?x p ?y", "?x q ?z"];
+    STATISTICS.with(|c| c.set((0, 0)));
+    let (kept, asked) = plannings(&ctx, &patterns);
+    let (read, _) = STATISTICS.with(|c| c.get());
+    assert_eq!(
+        (kept.unwrap().work, read, asked),
+        (0, 0, vec![false]),
+        "kept from the sets: work, sets read, plannings"
+    );
+    plan::ADMIT.set(Some(true));
+    let (_, admitted) = plannings(&ctx, &patterns);
+    plan::ADMIT.set(None);
+    assert_eq!(admitted, vec![false, true], "admitted, the sets are read");
+}
+
+/// Spec: the budget's cancellation rule, and the gate's second doubt review (12 November): a
+/// query cancelled while its set search runs fails as cancelled, though the search (as a fixed
+/// order's, which doesn't ask) returned a plan. Red without the check after it.
+#[test]
+fn a_query_cancelled_in_its_set_search_gets_no_plan() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    let options = QueryOptions {
+        resources: Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (scans, counts) = bgp(&ctx, &STAR);
+    let mut vars = Vec::new();
+    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let order = |sets: Option<&CharacteristicSets>, budget: usize| {
+        let planned = plan::order(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &|| false);
+        if sets.is_some() {
+            token.cancel();
+        }
+        planned
+    };
+    let planned = ctx
+        .with_sets(&inputs, &order)
+        .map_err(QueryEvaluationError::from);
+    assert!(
+        matches!(planned, Err(QueryEvaluationError::Cancelled)),
+        "{:?}",
+        planned.ok().map(|p| steps(&p))
     );
 }
