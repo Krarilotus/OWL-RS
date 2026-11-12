@@ -27,9 +27,13 @@
 //! instead of assuming every object of `p` might.
 //!
 //! Both read whole lists of sets or links per estimate, so one planning's reads and copies of
-//! them are counted, each before it is made, against [`SET_BUDGET`]. A planning that would
-//! pass it stops ([`Stopped::Budget`]) and is planned again without the sets; one within it
-//! plans as it would without the bound.
+//! them are counted, each before it is made, against a budget ([`budget_for`]: [`SET_BUDGET`],
+//! or more for a BGP whose plain plan expects much work). They are read at all only where
+//! the reads the search makes at its starts are few, or that plain plan expects much work
+//! ([`admits`]). A planning that would pass its budget stops ([`Stopped::Budget`]) and the
+//! BGP keeps the plain plan; one within it plans as it would without the bound. Where the
+//! reads every start makes would pass it on their own, the search stops before making any of
+//! them.
 //!
 //! Bounds (degree constraints, as in AGM/PANDA): a pattern whose variables are all bound
 //! keeps at most the rows it checks, and a step estimated above 0 is at least one row. Patterns with a constant object are estimated by containment, not by the
@@ -73,23 +77,96 @@ const GREEDY_EFFORT: usize = 1 << 19;
 /// as AGENTS.md asks of every budget; one setting for all four is a follow-up.
 pub(super) const SET_BUDGET: usize = 1 << 16;
 
+/// The rows a BGP's plain plan (planned without the characteristic sets) must expect for the
+/// sets to be read where its predicates are in many ([`admits`]). Planning effort follows the
+/// work the query expects: a set search on WatDiv's long lists costs about 0.5 ms whether or
+/// not it pays, so only a query that expects millions of rows can repay it. On WatDiv
+/// (12 November 2026), the one query whose set plan beats main's, watdiv-100m C3-1 (106 ms
+/// against 394), expects 3.1 M rows; the others whose set plan differs from main's expect at
+/// most 210 k (S2-8, slower with its sets: 5.04 ms against 4.19 without), and every F, S and
+/// L query at most 210 k. Between them, watdiv-100m C1-1 expects 1.53 M and keeps main's plan
+/// whatever its budget, after 7.5 ms of set search at half an entry per row: the threshold
+/// sits between it and C3-1, two points only. A tuning signal, not a bound on execution; like
+/// [`SET_BUDGET`], a constant.
+pub(super) const SET_GATE_ROWS: f64 = 2_000_000.0;
+
+/// Set entries any planning may read at its starts, whatever it expects ([`admits`]): where
+/// its predicates are in few sets, the sets are read as before the gate. About 7 µs of
+/// lookups. The join-order identity fixtures' graphs are in few sets, so they keep their plans;
+/// WatDiv's S1 reads 98 and keeps the plan its sets give; WatDiv's other queries read 2,625 to
+/// 96,518 (12 November 2026). It bounds the starts only: a search it admits may read long
+/// lists after them (a chain's links), up to its budget, [`SET_BUDGET`] for a query that
+/// expects little, before the BGP keeps its plain plan. A constant, as [`SET_BUDGET`] is.
+pub(super) const SET_START_ALLOWANCE: usize = 1 << 10;
+
+/// Set entries a planning may spend per row its plain plan expects, above [`SET_BUDGET`]
+/// ([`budget_for`]): a query that expects much work may plan longer. watdiv-100m C3-1's set
+/// search reads 1.16 M entries and its plain plan expects 3.12 M rows (12 November 2026).
+/// Half an entry is about 35 instructions per expected row. A tuning signal, a constant.
+pub(super) const SET_ENTRIES_PER_ROW: f64 = 0.5;
+
 #[cfg(test)]
 thread_local! {
-    /// The budget the orderer keeps to: [`SET_BUDGET`], unless a test sets another to pass it
-    /// on a small graph, or `usize::MAX` to plan without it.
-    pub(super) static BUDGET: Cell<usize> = const { Cell::new(SET_BUDGET) };
+    /// A test's budget for every planning, in place of [`budget_for`]'s: one that passes it on
+    /// a small graph, or `usize::MAX` to plan without it. `None` for the planner's own.
+    pub(super) static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+    /// [`budget_for`]'s least budget, [`SET_BUDGET`] unless a test lowers it to its graph.
+    pub(super) static FLOOR: Cell<usize> = const { Cell::new(SET_BUDGET) };
+    /// A test's decision for [`admits`], in place of the planner's: `None` for the planner's
+    /// own, which every other test plans with.
+    pub(super) static ADMIT: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// The characteristic-set work a planning may do ([`SET_BUDGET`]).
-#[cfg(not(test))]
-pub(super) fn set_budget() -> usize {
-    SET_BUDGET
+/// The work a plan expects: the rows its steps produce, summed. An estimate that is no number
+/// (a two-pattern plan's join has none) is left out; one that overflowed to infinity makes the
+/// sum infinite.
+pub(super) fn expected_work(plan: &Plan) -> f64 {
+    plan.rows.iter().filter(|rows| !rows.is_nan()).sum()
 }
 
-/// The characteristic-set work a planning may do: [`SET_BUDGET`], or a test's ([`BUDGET`]).
-#[cfg(test)]
-pub(super) fn set_budget() -> usize {
-    BUDGET.with(Cell::get)
+/// The sets a search reads at its starts: each open star input's predicate's ([`search`]'s
+/// starts, by the sets' index), saturating.
+pub(super) fn start_reads(inputs: &[Input], sets: &CharacteristicSets) -> usize {
+    inputs
+        .iter()
+        .filter_map(|input| input.star)
+        .filter(|star| star.selectivity >= 1.0)
+        .fold(0usize, |reads, star| {
+            reads.saturating_add(sets.sets_having(star.predicate))
+        })
+}
+
+/// Whether a BGP whose plain plan expects `expected` rows, and whose set search would read
+/// `reads` entries at its starts, is planned with the sets too: where those reads are within
+/// [`SET_START_ALLOWANCE`], or it expects at least [`SET_GATE_ROWS`] rows (NaN doesn't). A
+/// test's decision ([`ADMIT`]) instead.
+pub(super) fn admits(expected: f64, reads: usize) -> bool {
+    #[cfg(test)]
+    if let Some(admit) = ADMIT.with(Cell::get) {
+        return admit;
+    }
+    reads <= SET_START_ALLOWANCE || expected >= SET_GATE_ROWS
+}
+
+/// [`SET_ENTRIES_PER_ROW`] per expected row, in entries: a float cast saturates, NaN to 0 and
+/// beyond the range (infinity included) to `usize::MAX`.
+fn per_row(expected: f64) -> usize {
+    (expected * SET_ENTRIES_PER_ROW) as usize
+}
+
+/// The characteristic-set work the planning of a BGP whose plain plan expects `expected` rows
+/// may do: [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`] per expected row where that is more. A
+/// test's ([`BUDGET`]) instead.
+pub(super) fn budget_for(expected: f64) -> usize {
+    #[cfg(test)]
+    if let Some(budget) = BUDGET.with(Cell::get) {
+        return budget;
+    }
+    #[cfg(test)]
+    let floor = FLOOR.with(Cell::get);
+    #[cfg(not(test))]
+    let floor = SET_BUDGET;
+    floor.max(per_row(expected))
 }
 
 /// Cost of one index probe relative to reading one scanned row.
@@ -285,12 +362,13 @@ fn note_statistics(_reads: usize, _steps: usize) {
 /// The cheapest order for `inputs`; `probe_factor` is the executor's threshold for index
 /// nested loops (the pattern is at least this many times larger than the running result).
 /// Stopped once `stop` says so (the query's cancellation, asked at every step), or where the
-/// characteristic sets would pass [`SET_BUDGET`].
+/// characteristic sets would pass `budget` ([`budget_for`]).
 pub(super) fn order(
     inputs: &[Input],
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
+    budget: usize,
     stop: &dyn Fn() -> bool,
 ) -> Result<Plan, Stopped> {
     #[cfg(test)]
@@ -302,22 +380,29 @@ pub(super) fn order(
         });
         stop()
     };
-    search(inputs, variables, probe_factor, sets, None, stop)
+    search(inputs, variables, probe_factor, sets, budget, None, stop)
 }
 
 /// The estimates of joining `inputs` in the given `order` (all of them, each once), by the
 /// same model as [`order`]: for BGPs whose order the executor fixes itself. Stopped only
-/// where the characteristic sets would pass [`SET_BUDGET`].
+/// where the characteristic sets would pass `budget` ([`budget_for`]).
 pub(super) fn along(
     inputs: &[Input],
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
+    budget: usize,
     order: &[usize],
 ) -> Result<Plan, Stopped> {
-    search(inputs, variables, probe_factor, sets, Some(order), &|| {
-        false
-    })
+    search(
+        inputs,
+        variables,
+        probe_factor,
+        sets,
+        budget,
+        Some(order),
+        &|| false,
+    )
 }
 
 /// O(starts · n² · s) for n patterns and s characteristic sets a star still matches: each
@@ -327,12 +412,13 @@ fn search(
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
+    budget: usize,
     fixed: Option<&[usize]>,
     stop: &dyn Fn() -> bool,
 ) -> Result<Plan, Stopped> {
     let work = Work {
         done: Cell::new(0),
-        budget: set_budget(),
+        budget,
         passed: Cell::new(false),
     };
     // `p`'s links read for a chain, each looking up the predicates of `from` and `to`.
@@ -539,6 +625,27 @@ fn search(
             work: 0,
         });
     }
+    // Every start state of an open star reads its predicate's sets (`star_of`) before the
+    // search first checks its work: the exhaustive and greedy searches
+    // build all their starts in input order, a fixed order its first (a start reads only where
+    // another input follows it, as `apply` decides). Where those reads would pass the budget,
+    // the search stops as it would after making them, with the work counted before the one
+    // that passes, having made none: their lengths come from the sets' index.
+    if let Some(sets) = sets
+        && n >= 2
+    {
+        let first = fixed.map(|order| order[0]);
+        let mut done = 0usize;
+        for j in (0..n).filter(|&j| first.is_none_or(|f| f == j)) {
+            if let Some(star) = inputs[j].star.filter(open) {
+                let next = done.saturating_add(sets.sets_having(star.predicate));
+                if next > budget {
+                    return Err(Stopped::Budget { work: done });
+                }
+                done = next;
+            }
+        }
+    }
     // Every read and copy of the sets is counted before it is made; past the budget none is
     // made, and the search stops after the estimate or step that would have made it.
     if let Some(order) = fixed {
@@ -652,6 +759,50 @@ mod tests {
         }
     }
 
+    /// Spec: the master's order of 12 November 13:53, "enter the set search only when that
+    /// plan's own estimate says the query is expensive enough", with "effort follows expected
+    /// work", and its doubt review: a plan's expected work is its steps' estimates summed, NaN
+    /// left out and infinity kept; a BGP is planned with the sets where its starts' reads are
+    /// within [`SET_START_ALLOWANCE`] or it expects at least [`SET_GATE_ROWS`] rows, not else;
+    /// its budget is [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`] per expected row where that is
+    /// more, saturating (NaN to the floor); a test's budget and decision replace the planner's.
+    #[test]
+    fn the_sets_are_read_only_where_their_lists_are_short_or_the_query_expects_much_work() {
+        let plan = |rows: Vec<f64>| Plan {
+            order: (0..rows.len()).collect(),
+            rows,
+            work: 0,
+        };
+        assert_eq!(expected_work(&plan(vec![f64::NAN, 10.0, 5.5])), 15.5);
+        assert_eq!(
+            expected_work(&plan(vec![1.0, f64::INFINITY])),
+            f64::INFINITY
+        );
+        let many = SET_START_ALLOWANCE + 1;
+        assert_eq!(
+            [
+                admits(0.0, SET_START_ALLOWANCE),
+                admits(SET_GATE_ROWS - 1.0, many),
+                admits(SET_GATE_ROWS, many),
+                admits(f64::NAN, many),
+                admits(f64::INFINITY, usize::MAX),
+            ],
+            [true, false, true, false, true]
+        );
+        let large = SET_BUDGET as f64 / SET_ENTRIES_PER_ROW;
+        assert_eq!(budget_for(0.0), SET_BUDGET);
+        assert_eq!(budget_for(f64::NAN), SET_BUDGET);
+        assert_eq!(budget_for(large / 2.0), SET_BUDGET);
+        assert_eq!(budget_for(4.0 * large), 4 * SET_BUDGET);
+        assert_eq!(budget_for(f64::INFINITY), usize::MAX);
+        BUDGET.set(Some(2));
+        ADMIT.set(Some(false));
+        let (budget, admit) = (budget_for(4.0 * large), admits(0.0, 0));
+        BUDGET.set(None);
+        ADMIT.set(None);
+        assert_eq!((budget, admit), (2, false));
+    }
+
     #[test]
     fn a_selective_filter_joins_before_a_fan_out() {
         // ?x memberOf <d> (50) . ?x takesCourse ?c (300k, 3 per x) . ?x a Grad (5k)
@@ -660,7 +811,7 @@ mod tests {
             input(300_000, &[(0, 100_000), (1, 2_000)]),
             input(5_000, &[(0, 5_000)]),
         ];
-        let plan = order(&inputs, 2, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 2, 32, None, SET_BUDGET, &|| false).unwrap();
         assert_eq!(plan.order, vec![0, 2, 1]);
         assert_eq!(plan.rows.len(), 3);
     }
@@ -669,27 +820,27 @@ mod tests {
     fn checks_keep_at_most_their_input_and_steps_at_least_a_row() {
         // ?x p <c> (40) . ?x a C (100k, every x distinct): a check of 40 rows.
         let inputs = [input(40, &[(0, 40)]), input(100_000, &[(0, 100_000)])];
-        let plan = along(&inputs, 1, 32, None, &[0, 1]).unwrap();
+        let plan = along(&inputs, 1, 32, None, SET_BUDGET, &[0, 1]).unwrap();
         assert!(plan.rows[1] <= 40.0, "{:?}", plan.rows);
         // ?x p ?y (10) . ?y q ?z (5, 5 distinct ?y among 1M): 0.00005 rows, shown as one.
         let inputs = [
             input(10, &[(0, 10), (1, 10)]),
             input(5, &[(1, 1_000_000), (2, 5)]),
         ];
-        let plan = along(&inputs, 3, 32, None, &[0, 1]).unwrap();
+        let plan = along(&inputs, 3, 32, None, SET_BUDGET, &[0, 1]).unwrap();
         assert_eq!(plan.rows[1], 1.0);
         // Two single-variable patterns sharing 15 of the first's 189 values.
         let mut inputs = [input(189, &[(0, 189)]), input(239, &[(0, 239)])];
         inputs[0].overlaps = vec![(1, 15)];
         inputs[1].overlaps = vec![(0, 15)];
-        let plan = along(&inputs, 1, 32, None, &[0, 1]).unwrap();
+        let plan = along(&inputs, 1, 32, None, SET_BUDGET, &[0, 1]).unwrap();
         assert!((plan.rows[1] - 15.0).abs() < 1e-9, "{:?}", plan.rows);
     }
 
     #[test]
     fn disconnected_patterns_still_get_an_order() {
         let inputs = [input(10, &[(0, 10)]), input(3, &[(1, 3)])];
-        let plan = order(&inputs, 2, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 2, 32, None, SET_BUDGET, &|| false).unwrap();
         assert_eq!(plan.order.len(), 2);
         assert!((plan.rows[1] - 30.0).abs() < 1e-9);
     }
@@ -739,9 +890,8 @@ mod tests {
             })
             .collect();
         // The reads of the whole search, not as many as the budget allows.
-        BUDGET.set(usize::MAX);
         STATISTICS.with(|c| c.set((0, 0)));
-        let plan = order(&inputs, 251, 32, Some(&sets), &|| false).unwrap();
+        let plan = order(&inputs, 251, 32, Some(&sets), usize::MAX, &|| false).unwrap();
         assert_eq!(plan.order.len(), 250);
         let (reads, steps) = STATISTICS.with(|c| c.get());
         assert!(
@@ -754,7 +904,7 @@ mod tests {
             asked.get() > 3
         };
         assert!(matches!(
-            order(&inputs, 251, 32, Some(&sets), &stop),
+            order(&inputs, 251, 32, Some(&sets), usize::MAX, &stop),
             Err(Stopped::Cancelled)
         ));
         assert_eq!(asked.get(), 4, "stopped at the first step after");
@@ -770,7 +920,7 @@ mod tests {
                 .map(|i| input(1_000 + i as u64, &[(0, 900), (i + 1, 500)]))
                 .collect();
             STATISTICS.with(|c| c.set((0, 0)));
-            let plan = order(&inputs, n + 1, 32, None, &|| false).unwrap();
+            let plan = order(&inputs, n + 1, 32, None, SET_BUDGET, &|| false).unwrap();
             assert_eq!(plan.order.len(), n);
             let (_, steps) = STATISTICS.with(|c| c.get());
             assert!(
@@ -788,7 +938,7 @@ mod tests {
         let inputs: Vec<Input> = (0..14)
             .map(|i| input(100 + i, &[(0, 100), (i as usize + 1, 50)]))
             .collect();
-        let plan = order(&inputs, 15, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 15, 32, None, SET_BUDGET, &|| false).unwrap();
         let mut sorted = plan.order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..14).collect::<Vec<_>>());
@@ -796,7 +946,7 @@ mod tests {
             let inputs: Vec<Input> = (0..n)
                 .map(|i| input(1_000 + i as u64, &[(i, 500), (i + 1, 500)]))
                 .collect();
-            let plan = order(&inputs, n + 1, 32, None, &|| false).unwrap();
+            let plan = order(&inputs, n + 1, 32, None, SET_BUDGET, &|| false).unwrap();
             let mut sorted = plan.order.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, (0..n).collect::<Vec<_>>());
