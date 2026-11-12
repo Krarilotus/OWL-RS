@@ -4,11 +4,12 @@
 # builds and times that commit for the side and refuses any other (release_gate.py measured_at); the
 # jobs take it as an input (measurement_inputs). Each commit is pushed as its ref, named for the
 # side it carries and what it adds (main3sus, v15cus: main3s and v15c with the open printed in
-# microseconds; v15cus's parse-only queries also give no rows, as the candidate's do).
+# microseconds; v15cus's parse-only queries also give no rows, as the candidate's do; main3sfirst:
+# main3sus with each query's first execution reported, as the candidate's and v1.5's are).
 
 [side.a0020134c20a33eabe8ead0402f814585b9c7fd0]  # main
-commit = "9b22da610ea55a7a57288af68abb88c1a0cd9cd3"
-ref = "refs/measure/main3sus-a0020134"
+commit = "e7eaee4e7a9dd0f99afcb8bec742ea24471ce0d3"
+ref = "refs/measure/main3sfirst-a0020134"
 
 [side.d348a8a1a9e40cd23381df1faa726d3ffa44948c]  # v1.5, the release gate's base
 commit = "147f5c724ef5dc5263700ee34bf3cd1f187805bd"
