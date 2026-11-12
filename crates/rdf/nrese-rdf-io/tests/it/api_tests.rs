@@ -223,6 +223,65 @@ fn chunks_name_the_documents_line() {
     std::fs::remove_file(&path).unwrap();
 }
 
+/// Recovering, a parse in chunks names every error's line in the document, however many
+/// errors a chunk holds, and the statement it skips starts on that line (the quarantine's
+/// line). D16-546: N-Quads named `.nt`, every line an error.
+#[test]
+fn recovering_chunks_name_each_errors_line() {
+    let good = "<http://e/s> <http://e/p> <http://e/o> .\n";
+    let quad = "<http://e/s> <http://e/p> <http://e/o> <http://e/g> .\n";
+    let iri = "<http://e/s> <http://e/p> <http://e/a%&b> .\n";
+    let text = [
+        good.repeat(30),
+        quad.repeat(2),
+        good.repeat(10),
+        iri.to_owned(),
+        // \r and \n each end a line: three lines here.
+        "# a comment\r\n\n".to_owned(),
+        good.repeat(20),
+        quad.repeat(25),
+        good.repeat(5),
+        iri.to_owned(),
+    ]
+    .concat();
+    // The document's lines (from 1) of the bad ones.
+    let mut expected = vec![31, 32, 43];
+    expected.extend(67..=91);
+    expected.push(97);
+    fn error_lines<R: std::io::Read>(chunks: Vec<nrese_rdf_io::QuadParser<'_, R>>) -> Vec<u64> {
+        let errors = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.filter_map(Result::err));
+        errors
+            .map(|error| match error {
+                nrese_rdf_io::RdfParseError::Syntax(syntax) => {
+                    let line = syntax.location().start.line;
+                    let skipped = syntax.statement().expect("a line's statement is skipped");
+                    assert_eq!(skipped.span.start.line, line, "{syntax}");
+                    line + 1
+                }
+                other => panic!("a syntax error, not {other}"),
+            })
+            .collect()
+    }
+    let parser = || RdfParser::from_format(RdfFormat::NTriples).recovering();
+    for parts in [1, 2, 3, 7, 64] {
+        let chunks = parser()
+            .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+            .unwrap();
+        assert_eq!(error_lines(chunks), expected, "{parts} parts");
+    }
+    let path = std::env::temp_dir().join(format!("nrese-rdf-io-errors-{}.nt", std::process::id()));
+    std::fs::write(&path, &text).unwrap();
+    for parts in [1, 4, 13] {
+        let chunks = parser()
+            .split_file_for_parallel_parsing(&path, parts)
+            .unwrap();
+        assert_eq!(error_lines(chunks), expected, "{parts} file parts");
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
 #[test]
 fn errors_say_where() {
     let text = "<http://e/s> <http://e/p> <http://e/o> .\n# a comment\n<http://e/s> <http://e/p> \"open .\n";
