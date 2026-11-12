@@ -893,13 +893,16 @@ impl IndexVersion {
             let blocks = (cuts.len() - 1).saturating_mul(PART_BLOCK);
             let mut slab = ChargedVec::<(u64, i64), _>::with_capacity(budget, blocks)?;
             slab.resize(blocks, (0, 0))?;
-            // A refusal is kept beside the parts, as rayon's own collection of results keeps
-            // one: each part collected is no larger than its vector was ([`Part`]).
-            let refused = std::sync::OnceLock::new();
+            // The refusal of the first part in cut order that was refused is kept beside the
+            // parts, so each part collected is no larger than its vector was ([`Part`]). Which
+            // one is returned doesn't hang on the order the refused parts end in: its `shared`
+            // tells a request's limit from the server's.
+            let refused = std::sync::Mutex::new(None::<(usize, BudgetExceeded)>);
             let mut parts = Vec::new();
             cuts.par_windows(2)
                 .zip(slab.par_chunks_mut(PART_BLOCK))
-                .map(|(cut, block)| {
+                .enumerate()
+                .map(|(at, (cut, block))| {
                     let (mut len, mut own, mut refusal) = (0, ChargedVec::new(budget), None);
                     perm.keys.groups(cut[0], cut[1], position, |value, i, j| {
                         let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
@@ -911,7 +914,10 @@ impl IndexVersion {
                         }
                     });
                     if let Some(error) = refusal {
-                        let _ = refused.set(error);
+                        let mut first = refused.lock().unwrap_or_else(|p| p.into_inner());
+                        if first.as_ref().is_none_or(|&(before, _)| at < before) {
+                            *first = Some((at, error));
+                        }
                     }
                     match own.is_empty() {
                         true => Part::Inline(len),
@@ -919,9 +925,9 @@ impl IndexVersion {
                     }
                 })
                 .collect_into_vec(&mut parts);
-            // A part's refusal, once every part has ended; the slab and the parts' own
-            // vectors are released as they drop.
-            if let Some(error) = refused.into_inner() {
+            // That refusal, once every part has ended; the slab and the parts' own vectors are
+            // released as they drop.
+            if let Some((_, error)) = refused.into_inner().unwrap_or_else(|p| p.into_inner()) {
                 return Err(error);
             }
             // A part's groups: its block's first `len`, or its own vector, never an unused
