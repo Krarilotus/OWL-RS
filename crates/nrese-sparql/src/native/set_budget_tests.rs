@@ -7,7 +7,7 @@
 //! commit before them, and the chain's count on an orderer that doesn't count links.
 
 use super::join_order_tests::{Steps, people, scan, steps};
-use super::plan::{self, BUDGET, STATISTICS, STEP};
+use super::plan::{self, BUDGET, FLOOR, STATISTICS, STEP};
 use super::*;
 use crate::Resources;
 use nrese_engine::{Engine, EngineConfig};
@@ -34,10 +34,10 @@ fn under(
     budget: usize,
 ) -> Result<(plan::Plan, usize), QueryEvaluationError> {
     let (scans, counts) = bgp(ctx, patterns);
-    BUDGET.set(budget);
+    BUDGET.set(Some(budget));
     REPLANS.set(0);
     let plan = ctx.join_order(&scans, &counts, &[], true);
-    BUDGET.set(plan::SET_BUDGET);
+    BUDGET.set(None);
     let plan = plan.map_err(QueryEvaluationError::from)?;
     Ok((plan, REPLANS.get()))
 }
@@ -49,8 +49,22 @@ fn without_sets(ctx: &Context<'_>, patterns: &[&str], order: Option<&[usize]>) -
     let mut vars = Vec::new();
     let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
     let plan = match order {
-        Some(order) => plan::along(&inputs, vars.len(), PROBE_FACTOR, None, order),
-        None => plan::order(&inputs, vars.len(), PROBE_FACTOR, None, &|| false),
+        Some(order) => plan::along(
+            &inputs,
+            vars.len(),
+            PROBE_FACTOR,
+            None,
+            plan::SET_BUDGET,
+            order,
+        ),
+        None => plan::order(
+            &inputs,
+            vars.len(),
+            PROBE_FACTOR,
+            None,
+            plan::SET_BUDGET,
+            &|| false,
+        ),
     };
     steps(&plan.unwrap())
 }
@@ -352,9 +366,9 @@ fn explain_shows_a_bgp_planned_without_the_sets() {
                 ?x <http://e/p3> ?c . ?x <http://e/city> ?d }";
     let query = Query::parse(text, None).unwrap();
     let explained = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let explained = explain(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         explained.unwrap().1
     };
     let budget = with.work.saturating_sub(1);
@@ -392,9 +406,9 @@ fn the_plan_without_running_shows_a_bgp_planned_without_the_sets() {
                 ?x <http://e/p3> ?c . ?x <http://e/city> ?d }";
     let query = Query::parse(text, None).unwrap();
     let planned = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let planned = super::plan(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         planned.unwrap().1
     };
     let budget = with.work.saturating_sub(1);
@@ -430,9 +444,9 @@ fn explain_shows_a_cyclic_bgp_planned_without_the_sets() {
     let text = "SELECT * WHERE { ?a <http://e/p> ?b . ?b <http://e/q> ?c . ?c <http://e/r> ?a }";
     let query = Query::parse(text, None).unwrap();
     let explained = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let explained = explain(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         explained.unwrap().1
     };
     let budget = with.work.saturating_sub(1);
@@ -478,9 +492,9 @@ fn explain_notes_a_cyclic_bgp_planned_with_a_path_once() {
                 ?c <http://e/r> ?a . ?x <http://e/s>+ ?y }";
     let query = Query::parse(text, None).unwrap();
     let explained = |budget: usize| {
-        BUDGET.set(budget);
+        BUDGET.set(Some(budget));
         let explained = explain(&snapshot, &query, &options);
-        BUDGET.set(plan::SET_BUDGET);
+        BUDGET.set(None);
         explained.unwrap().1
     };
     let trace = explained(0);
@@ -500,5 +514,109 @@ fn explain_notes_a_cyclic_bgp_planned_with_a_path_once() {
     assert!(
         trace.iter().all(|s| s.operator != "join order"),
         "{trace:#?}"
+    );
+}
+
+/// The sets every start of `patterns` (open stars on `?x`, as [`STAR`]) reads: each
+/// predicate's, by the sets' index.
+fn start_reads(snapshot: &Snapshot, sets: &CharacteristicSets, predicates: &[&str]) -> Vec<usize> {
+    predicates
+        .iter()
+        .map(|p| sets.sets_having(id(snapshot, p)))
+        .collect()
+}
+
+/// Spec: the master's order of 12 November (A), "give up before spending", and its doubt
+/// review: every start of a star reads its predicate's sets before the search first checks
+/// its work. Where the first two starts' reads would pass the budget, the planning reads none
+/// of them, is planned again once without the sets, and says it passed after the first
+/// start's reads, as it said when it made them. For the exhaustive search (4 patterns) and
+/// the greedy one (13). Red on the parent, which reads `p0`'s sets first.
+#[test]
+fn past_the_budget_at_its_starts_a_planning_reads_no_sets() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let sets = snapshot.characteristic_sets_in(ctx.model).expect("sets");
+    let greedy: Vec<String> = (0..13).map(|i| format!("?x p{i} ?o{i}")).collect();
+    let greedy: Vec<&str> = greedy.iter().map(String::as_str).collect();
+    for patterns in [&STAR[..], &greedy[..]] {
+        let reads = start_reads(&snapshot, &sets, &["p0", "p1"]);
+        assert!(reads.iter().all(|&n| n > 0), "{reads:?}");
+        let budget = reads[0] + reads[1] - 1;
+        let none = without_sets(&ctx, patterns, None);
+        STATISTICS.with(|c| c.set((0, 0)));
+        let (past, replans) = under(&ctx, patterns, budget).unwrap();
+        let (read, _) = STATISTICS.with(|c| c.get());
+        assert_eq!(
+            (steps(&past), replans, past.work, read),
+            (none, 1, reads[0], 0),
+            "{} patterns, a budget of {budget}: plan, planned again, work, sets read",
+            patterns.len()
+        );
+    }
+}
+
+/// Spec: as [`past_the_budget_at_its_starts_a_planning_reads_no_sets`], the other side: where
+/// the starts' reads fit the budget, the search makes them and stops only at the read or copy
+/// that passes it, as before.
+#[test]
+fn within_the_budget_at_its_starts_a_planning_reads_their_sets() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let sets = snapshot.characteristic_sets_in(ctx.model).expect("sets");
+    let starts: usize = start_reads(&snapshot, &sets, &["p0", "p1", "p3", "city"])
+        .iter()
+        .sum();
+    let (with, _) = under(&ctx, &STAR, usize::MAX).unwrap();
+    assert!(
+        starts < with.work,
+        "{starts} at the starts, {} in all",
+        with.work
+    );
+    let none = without_sets(&ctx, &STAR, None);
+    STATISTICS.with(|c| c.set((0, 0)));
+    let (past, replans) = under(&ctx, &STAR, starts).unwrap();
+    let (read, _) = STATISTICS.with(|c| c.get());
+    assert_eq!((steps(&past), replans), (none, 1), "a budget of {starts}");
+    assert!(
+        past.work >= starts && read >= starts,
+        "{} counted, {read} read, {starts} at the starts",
+        past.work
+    );
+}
+
+/// Spec: the master's order of 12 November (B) and its doubt review: without a test's budget,
+/// a BGP's is 4 set entries per match of its smallest input where that is more than the least
+/// one ([`plan::budget_for`]). The chain of [`a_chain_counts_the_links_it_reads`] (smallest
+/// input 2 matches, work 3) keeps the plan the pairs give under a least budget of 2, which on
+/// its own it passes.
+#[test]
+fn a_bgp_whose_smallest_input_is_large_may_plan_longer() {
+    let engine = graph(&[
+        ("a1", "p", "b1"),
+        ("a2", "p", "b1"),
+        ("a3", "p", "b2"),
+        ("a4", "p", "d"),
+        ("b1", "q", "c"),
+        ("b2", "q", "c"),
+    ]);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let chain = ["?x p ?y", "?y q ?z"];
+    let (scans, counts) = bgp(&ctx, &chain);
+    assert_eq!(counts.iter().min(), Some(&2));
+    FLOOR.set(2);
+    REPLANS.set(0);
+    let planned = ctx.join_order(&scans, &counts, &[], true);
+    FLOOR.set(plan::SET_BUDGET);
+    let planned = planned.map_err(QueryEvaluationError::from).unwrap();
+    assert_eq!(
+        (planned.order.as_slice(), planned.work, REPLANS.get()),
+        (&[1, 0][..], 3, 0)
     );
 }

@@ -224,8 +224,24 @@ fn hand_built_inputs_plan_as_before() {
         .iter()
         .map(|(name, inputs, variables, fixed)| {
             let plan = match fixed {
-                Some(order) => plan::along(inputs, *variables, PROBE_FACTOR, None, order).unwrap(),
-                None => plan::order(inputs, *variables, PROBE_FACTOR, None, &|| false).unwrap(),
+                Some(order) => plan::along(
+                    inputs,
+                    *variables,
+                    PROBE_FACTOR,
+                    None,
+                    plan::SET_BUDGET,
+                    order,
+                )
+                .unwrap(),
+                None => plan::order(
+                    inputs,
+                    *variables,
+                    PROBE_FACTOR,
+                    None,
+                    plan::SET_BUDGET,
+                    &|| false,
+                )
+                .unwrap(),
             };
             (*name, steps(&plan))
         })
