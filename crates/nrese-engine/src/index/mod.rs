@@ -149,16 +149,28 @@ impl Layout {
 /// the block size.
 pub(crate) const GROUP_PART: usize = 1 << 16;
 
+/// The groups each parallel part of a group walk writes into its block of the run's one
+/// slab, charged once before the parts start: a part that finds no more makes no budget
+/// call, and only one past its block grows a vector of its own, charged as it grows. On
+/// DBpedia's q10 the parts' own growths and releases were about 1,400 of a walk's 1,450
+/// budget calls, made in parallel; by those counts at most 11 of its 119 parts hold more
+/// than 64 groups (12 Nov). The slab is 1 KiB a part.
+pub(crate) const PART_BLOCK: usize = 64;
+
 /// The most bytes a group walk over `keys` keys charges, into an output that starts without
 /// capacity, its runs walked in `parts` parallel parts in all (or serially), bounded by the
 /// keys alone: a group has at least one. Let `S` be the keys walked before a run of `k` keys
-/// in `p` parts. The output then holds at most `2S + 4` groups; the run's parts grow to at
-/// most `2k + 4p` beside it, `3k + 4p` while one reallocates. While the output reallocates,
-/// its old capacity is under `S + k`, its new one at most `2(S + k) + 4`, the finished parts
-/// at most `2k + 4p`. That is `3S + 5k + 4p + 4` groups, at most `5·keys + 4·parts + 4`.
+/// in `p` parts, and `C` [`PART_BLOCK`]. The output then holds at most `2S + 4` groups; the
+/// run's slab `pC` beside it; a part of `g > C` groups starts its own vector at `2C < 2g`
+/// and doubles from there, so the parts' own vectors grow to at most `2k`, `3k` while they
+/// reallocate. While the output reallocates, its old capacity is under `S + k`, its new one
+/// at most `2(S + k) + 4`, the slab and the finished parts at most `pC + 2k`. That is
+/// `3S + 5k + pC + 4` groups, within `5·keys + (4 + C)·parts + 4`, as each run's slab and
+/// parts are dropped before the next run is walked (its `4·parts`, the parts' first vectors
+/// before the slab, is now a margin).
 pub(crate) fn group_walk_peak(keys: usize, parts: usize) -> usize {
     keys.saturating_mul(5)
-        .saturating_add(parts.saturating_mul(4))
+        .saturating_add(parts.saturating_mul(4 + PART_BLOCK))
         .saturating_add(4)
         .saturating_mul(size_of::<(u64, i64)>())
 }
@@ -201,6 +213,31 @@ fn grow_then_push(
             debug_assert!(pushed.is_ok(), "room after a growth");
         }
         Err(error) => *refused = Some(error),
+    }
+}
+
+/// A parallel part's `group` past its full `block` of the slab, out of the hot loop: the
+/// part's own vector made with room for twice the block, charged exactly, the block's
+/// groups copied into it and `group` pushed; once it has room, grown as
+/// [`grow_then_push`] grows a vector.
+#[cold]
+#[inline(never)]
+fn overflow_then_push(
+    own: &mut ChargedVec<(u64, i64), &Budget>,
+    block: &[(u64, i64)],
+    group: (u64, i64),
+    refused: &mut Option<BudgetExceeded>,
+) {
+    if own.capacity() > 0 || refused.is_some() {
+        grow_then_push(own, group, refused);
+        return;
+    }
+    let made = own
+        .reserve_exact(2 * block.len())
+        .and_then(|()| own.extend_from_slice(block))
+        .and_then(|()| own.push(group));
+    if let Err(error) = made {
+        *refused = Some(error);
     }
 }
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
@@ -755,9 +792,10 @@ impl IndexVersion {
     /// it. Each run's range is walked group by group ([`PackedKeys::groups`]): no search per
     /// group, so many small groups cost a scan of the column, few large ones a search each.
     ///
-    /// `out` and each part walked in parallel grow charged to `budget` (`out`'s), one
-    /// charge a growth, before they allocate: a reader's walk can't outgrow its budget
-    /// (D16-039 F7). Refused, the walk ends with what it charged released.
+    /// `out`, the parts' slab and each part past its block of it ([`PART_BLOCK`]) are
+    /// charged to `budget` (`out`'s), one charge a growth, before they allocate: a reader's
+    /// walk can't outgrow its budget (D16-039 F7). Refused, the walk ends with what it
+    /// charged released.
     ///
     /// Its large runs are walked in parallel parts only where the budget's room, read once
     /// before anything grows, covers the whole walk's peak ([`group_walk_peak`]); otherwise
@@ -837,19 +875,48 @@ impl IndexVersion {
                 .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
                 .chain(std::iter::once(end))
                 .collect();
-            let parts = cuts
-                .par_windows(2)
-                .map(|cut| {
-                    let mut part = ChargedVec::new(budget);
-                    walk(cut[0], cut[1], &mut part)?;
-                    Ok(part)
+            // Each part writes its groups into its block of one slab, charged here, serially;
+            // only a part past its block grows a vector of its own ([`PART_BLOCK`]). A count
+            // of blocks no vector can hold saturates, and the slab is refused, typed.
+            let blocks = (cuts.len() - 1).saturating_mul(PART_BLOCK);
+            let mut slab = ChargedVec::<(u64, i64), _>::with_capacity(budget, blocks)?;
+            slab.resize(blocks, (0, 0))?;
+            let mut parts = Vec::new();
+            cuts.par_windows(2)
+                .zip(slab.par_chunks_mut(PART_BLOCK))
+                .map(|(cut, block)| {
+                    let (mut len, mut own, mut refused) = (0, ChargedVec::new(budget), None);
+                    perm.keys.groups(cut[0], cut[1], position, |value, i, j| {
+                        let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                        if let Some(slot) = block.get_mut(len) {
+                            *slot = (value, count);
+                            len += 1;
+                        } else if let Err(group) = own.push_within((value, count)) {
+                            overflow_then_push(&mut own, block, group, &mut refused);
+                        }
+                    });
+                    refused.map_or(Ok((len, own)), Err)
                 })
-                .collect::<Result<Vec<_>, BudgetExceeded>>()?;
+                .collect_into_vec(&mut parts);
+            // The first refusal in cut order, once every part has ended; the slab and the
+            // parts' own vectors are released as they drop.
+            let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
+            // A part's groups: its block's first `len`, or its own vector, never an unused
+            // slot.
+            let each_part = || {
+                parts
+                    .iter()
+                    .zip(slab.chunks(PART_BLOCK))
+                    .map(|((len, own), block)| match own.is_empty() {
+                        true => &block[..*len],
+                        false => &own[..],
+                    })
+            };
             // The merge's room at once, for exactly the groups it appends: a group spanning
             // a cut is added to the one before it, not appended (sol-loop S2-2).
             let mut last = None;
             let mut appended = 0;
-            for part in &parts {
+            for part in each_part() {
                 if let (Some(&(value, _)), Some(&(end, _))) = (part.first(), part.last()) {
                     appended += part.len() - usize::from(last == Some(value));
                     last = Some(end);
@@ -857,7 +924,7 @@ impl IndexVersion {
             }
             out.reserve(appended)?;
             let first = out.len();
-            for part in parts {
+            for part in each_part() {
                 let Some((&(value, count), rest)) = part.split_first() else {
                     continue;
                 };
