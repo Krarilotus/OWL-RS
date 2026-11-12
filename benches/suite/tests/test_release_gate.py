@@ -1218,6 +1218,28 @@ class Verdicts(unittest.TestCase):
         pinned = run_gate(passes(records_of), catalog=[{"name": "lab-olympics", "check": {"q.q06.rows": 1033}}])
         self.assertTrue(pinned["passed"])
 
+    def test_a_parse_only_query_is_compared_by_its_time_not_by_its_plan_s_size(self):
+        """A `--parse-only` run parses and plans each query and runs none, so its report gives no
+        `rows` (the perf lab's parse_and_plan, crates/nrese-store/examples/perf_lab/modes.rs);
+        fast.py records none and the gate compares the parse-and-plan time. The pair: union-500
+        of parse-large as a timed part recorded it, 1002 plan steps here and 1500 on base."""
+        case = {"name": "parse-large", "args": ["--parse-only", "--runs", "100"], "metric": "sum_p50_ms"}
+        recorded = {"cand": (1002, [0.998, 0.851, 0.836]), "base": (1500, [1.692, 1.107, 1.099])}
+
+        def records_of(side, n):
+            steps, ms = recorded[side]
+            query = {"name": "union-500", "p50_ms": sorted(ms)[1], "max_ms": max(ms), "steps": steps,
+                     "rewrites": 0, "samples_ms": ms}  # parse_and_plan's object, field for field
+            o = fast.invocation_observation(case, {"queries": [query], "sum_p50_ms": query["p50_ms"]}, "",
+                                            {"sweep": 0, "repeat": 0, "cache": "warm"})
+            o.update(exit=0, checks=[], routes=[])
+            return [{**record(case="parse-large", samples=o["samples"]), "observations": [o], "counters": o["counters"]}]
+        summary = run_gate(passes(records_of, sides=("base", "cand")), sides=("cand", "base"), require=("base",))
+        self.assertEqual(summary["blocking"], [])
+        time = summary["comparisons"]["base"]["parse-large"]["dimensions"]["time/union-500"]
+        self.assertAlmostEqual(time["ratio"], 0.851 / 1.107)  # the medians of the recorded samples
+        self.assertTrue(summary["passed"])
+
 
 class MainAdapter(unittest.TestCase):
     """main f9b515e8's perf lab emits no samples_ms."""
