@@ -5608,7 +5608,7 @@ impl<'a> Context<'a> {
             for (_, n) in passed {
                 total = total
                     .checked_add(n)
-                    .ok_or(QueryEvaluationError::CountBeyondRange { at_least: u64::MAX })?;
+                    .ok_or_else(|| QueryEvaluationError::CountBeyondRange { at_least: u64::MAX })?;
             }
             let row = vec![count_id(total)?; aggregates.len()];
             let mut table = IdTable::new(row.len());
