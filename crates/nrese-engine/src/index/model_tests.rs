@@ -726,8 +726,8 @@ fn mixed_subject(i: u64) -> u64 {
 /// independent count (`group_counts`' contract): each run's groups in value order, a value
 /// once per run however many cuts its group spans, its count the run's quads less its
 /// deletions (signed). Over a run of [`MIXED_GROUPS`] and a later run of deletions and
-/// inserts, in parts and serially; no refusal under room for the walk, nothing held once
-/// dropped.
+/// inserts whose range is not aligned to the cuts, its first and last parts a key each, in
+/// parts and serially; no refusal under room for the walk, nothing held once dropped.
 #[test]
 fn group_counts_in_parts_past_their_blocks_equal_the_reference() {
     const PART: u64 = super::GROUP_PART as u64;
@@ -745,10 +745,16 @@ fn group_counts_in_parts_past_their_blocks_equal_the_reference() {
     let base: Vec<EncodedQuad> = (0..MIXED_ROWS)
         .map(|i| EncodedQuad::new(term(mixed_subject(i)), term(1), term(10_000 + i), graph(0)))
         .collect();
-    // Every third quad deleted; 64 new quads a subject, on the base's subjects and past them.
+    // Every third quad deleted; 32 new quads a subject, on the base's subjects and past them,
+    // as many as make the later run's range of the predicate two parts and two keys. After
+    // `PART - 1` quads of a predicate before it, that range starts a key before a cut and
+    // ends a key past one: its first and last parts hold one key each.
     let deletes: Vec<EncodedQuad> = base.iter().step_by(3).copied().collect();
-    let inserts: Vec<EncodedQuad> = (0..PART + 5_000)
-        .map(|i| EncodedQuad::new(term(1000 + i / 64), term(1), term(1_000_000 + i), graph(0)))
+    let inserts: Vec<EncodedQuad> = (0..2 * PART + 2 - deletes.len() as u64)
+        .map(|i| EncodedQuad::new(term(1000 + i / 32), term(1), term(1_000_000 + i), graph(0)))
+        .collect();
+    let before: Vec<EncodedQuad> = (0..PART - 1)
+        .map(|i| EncodedQuad::new(term(1000 + i), term(0), term(10_000 + i), graph(0)))
         .collect();
     let mut first = std::collections::BTreeMap::new();
     for quad in &base {
@@ -763,8 +769,8 @@ fn group_counts_in_parts_past_their_blocks_equal_the_reference() {
     }
     assert!(second.values().any(|&count| count < 0), "a signed count");
     let expected: Vec<(u64, i64)> = first.into_iter().chain(second).collect();
-    let version =
-        IndexVersion::from_quads(Layout::DefaultGraph, base).with_delta(&inserts, &deletes);
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, base)
+        .with_delta(&[before, inserts.clone()].concat(), &deletes);
     let pattern = QuadPattern {
         subject: None,
         predicate: Some(term(1)),
@@ -772,13 +778,15 @@ fn group_counts_in_parts_past_their_blocks_equal_the_reference() {
         graph: GraphSelector::Any,
     };
     let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    // The later run's range, two parts and two keys from `PART - 1` on, is walked in four
+    // parts: one key, two whole parts, one key.
     let delta = (inserts.len() + deletes.len()) as u64;
-    assert!(delta >= 2 * PART, "the second run is walked in parts too");
+    assert_eq!(delta, 2 * PART + 2);
     assert_eq!(
         version.group_walk_size(&plan, 1),
         (
             (MIXED_ROWS + delta) as usize,
-            (MIXED_ROWS.div_ceil(PART) + delta.div_ceil(PART)) as usize
+            (MIXED_ROWS.div_ceil(PART) + 4) as usize
         )
     );
     for in_parts in [true, false] {
