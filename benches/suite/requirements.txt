@@ -1,10 +1,10 @@
-# The Python packages the suite contracts and scripts/check-doc-paths.py import (scripts/check.sh
-# runs them), at the versions the main PC has. A gate on a fleet host installs them into its own
+# The Python packages the suite contracts, scripts/check-doc-paths.py and
+# scripts/check-python-names.py import (scripts/check.sh runs them), at the versions the main PC has. A gate on a fleet host installs them into its own
 # environment (scripts/lib/suite-python.sh), never into the host's Python, and only these files:
 # each pin lists the sha256 of every file PyPI holds for it (pip's hash-checking mode; the form
 # `pip-compile --generate-hashes` writes, from https://pypi.org/pypi/<name>/<version>/json).
 # These pins are part of the Python runtime the Windows tier declares (scripts/lib/gate-key.sh
-# gate_runtime). markdown-it-py and its mdurl: MIT.
+# gate_runtime). markdown-it-py and its mdurl: MIT; pyflakes (the gate's undefined-name check): MIT.
 markdown-it-py==4.2.0 \
     --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
     --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
@@ -84,6 +84,9 @@ numpy==2.4.6 \
     --hash=sha256:f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda \
     --hash=sha256:f407cb6b8e9d6d8c626bc73c945db1706035af8fd632295547bf1c9e46d092d6 \
     --hash=sha256:f74a575920ab21fe304421a3fc28793d82e299cae9eccb37084e9fc7f3617c20
+pyflakes==4.0.3 \
+    --hash=sha256:330ba92b8c1db2eb0b8f4068f6c58674e2649a99e334769aa50e3e9c5b11c23a \
+    --hash=sha256:94762a3a5a343a79b28754f96c554bce057a592a4896907d73f0369fe824e053
 scipy==1.17.1 \
     --hash=sha256:010f4333c96c9bb1a4516269e33cb5917b08ef2166d5556ca2fd9f082a9e6ea0 \
     --hash=sha256:02ae3b274fde71c5e92ac4d54bc06c42d80e399fec704383dcd99b301df37458 \

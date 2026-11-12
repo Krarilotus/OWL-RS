@@ -447,6 +447,25 @@ esac
         self.assertIn("cores = 8", job)
         self.assertIn(f'rev = "{self.tip}"', job, "the job isn't for the commit")
 
+    def test_a_rerun_after_a_failure_outside_the_tree_says_what_was_repaired(self):
+        """The fleet refuses a failed job's rerun unless the job says what was repaired, with its
+        evidence (its spec 12; #272's Windows gate, 11 Nov 2026). NRESE_GATE_REPAIR is that
+        statement, in the job as given; without it the job says nothing of a repair."""
+        import tomllib
+        statement = 'host load, four gates at once; evidence: "gate-windows-0d54ed893f-1794406264" C:\\fleet'
+        # Pasted, over lines and with a tab (review r1: a literal line break made the job invalid TOML).
+        pasted = "host load, four gates at once\r\nevidence:\tgate.log\n"
+        for repair in (None, statement, pasted):
+            self.reset()
+            (self.fake / "status-gate-1").write_text(json.dumps({"state": "pending", "host": "-"}))
+            self.env.pop("NRESE_GATE_REPAIR", None)
+            if repair:
+                self.env["NRESE_GATE_REPAIR"] = repair
+            self.gate()
+            job = tomllib.loads((self.fake / "job-1.toml").read_text())
+            self.assertEqual((job.get("spec"), job.get("repair")), (12, repair) if repair else (None, None),
+                             f"SPEC gate-repair: {repair!r}")
+
     def test_the_merge_checks_jobs_are_merge_gates(self):
         """The orchestrator, 31 Oct 2026: the merge check's jobs go ahead as the fleet's merge gates, either
         tier's for a commit that goes to refactor/engine-v2, as its caller states (NRESE_PUSH_REF). Sol,
