@@ -1416,8 +1416,17 @@ impl Relation {
         }
     }
 
+    /// Whether a run holds `(s, o)`. The larger of the base and the recent run is asked
+    /// first: a large delta (an equality's copies, a closure's burst) makes the recent run
+    /// the larger until the next fold, and a hit there then paid a base search first (87 %
+    /// of rl-sameas-replicate's 220 M probes, about 25 ns each).
     pub(crate) fn contains(&self, s: u64, o: u64) -> bool {
-        self.base.contains(s, o) || self.recent.contains(s, o) || self.input.contains(s, o)
+        let (first, second) = if self.recent.len() > self.base.len() {
+            (&self.recent, &self.base)
+        } else {
+            (&self.base, &self.recent)
+        };
+        first.contains(s, o) || second.contains(s, o) || self.input.contains(s, o)
     }
 
     /// [`Self::contains`] with a finger per run it reads, for pairs probed in ascending
@@ -4106,6 +4115,8 @@ mod chunk_tests {
         split.closed_by = Some(1);
         let (mut written, mut plain) = (0, 0);
         let mut known = std::collections::BTreeSet::new();
+        // Whether a round left the recent run larger than the base: membership asks it first.
+        let mut recent_larger = false;
         let sorted = |mut pairs: Vec<Pair>| {
             pairs.sort_unstable();
             pairs
@@ -4176,12 +4187,14 @@ mod chunk_tests {
                 assert_eq!(read(&split, Seg::DeltaNotBy(1)), own, "round {round}");
                 assert_eq!(sliced(&split, Seg::DeltaNotBy(1)), own, "round {round}");
             }
+            recent_larger |= split.recent.len() > split.base.len();
             for s in 0..61 {
                 for o in 0..53 {
                     assert_eq!(split.contains(s, o), known.contains(&(s, o)));
                 }
             }
         }
+        assert!(recent_larger, "no round asked the recent run first");
         assert_eq!(
             written, plain,
             "pairs the merges wrote, with a closed part and without"
