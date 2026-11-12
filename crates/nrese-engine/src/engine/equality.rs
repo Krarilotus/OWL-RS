@@ -990,9 +990,47 @@ impl<S: Step> Ahead<S> {
     }
 }
 
+/// A plain part read as the iterator it is: no account, no `Result`. Through [`Step`] with
+/// [`Free`], each quad of a plain sorted read cost about 40 instructions more than the merge
+/// over `Peekable` it replaced (graphs4's all-graph scans, 12 Nov).
+impl<I: Iterator<Item = EncodedQuad>> Ahead<Plain<I>> {
+    /// [`Self::peek`] of a plain part.
+    #[inline]
+    fn peek_plain(&mut self) -> Option<&EncodedQuad> {
+        let input = &mut self.step.0;
+        self.head.get_or_insert_with(|| input.next()).as_ref()
+    }
+
+    /// [`Self::next`] of a plain part: a cached end is taken as the end.
+    #[inline]
+    fn next_plain(&mut self) -> Option<EncodedQuad> {
+        match self.head.take() {
+            Some(head) => head,
+            None => self.step.0.next(),
+        }
+    }
+}
+
+/// Whether `right` goes before `left` in `permutation`'s order: only where its key is
+/// smaller (equal keys take the left first), or where the left has ended. Keys are made only
+/// where both sides have a quad (`p2-reas3-abl6`: made for one side alone, they cost a plain
+/// load 0.6 % of its instructions).
+#[inline]
+fn right_first(
+    left: Option<&EncodedQuad>,
+    right: Option<&EncodedQuad>,
+    permutation: Permutation,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => permutation.to_key(right) < permutation.to_key(left),
+        (left, _) => left.is_none(),
+    }
+}
+
 /// Two steps, each sorted by `permutation`, merged in that order, the left first where their
-/// keys are equal: the snapshot's one merge of two sorted streams. A counted read's parts share
-/// its one account; a plain read's are [`Plain`] iterators (fix check r3 S1).
+/// keys are equal: the snapshot's one merge of two sorted streams ([`right_first`]). A counted
+/// read's parts share its one account; a plain read's are [`Plain`] iterators (fix check r3
+/// S1), read directly.
 pub(crate) struct Merged<L, R> {
     left: Ahead<L>,
     right: Ahead<R>,
@@ -1013,13 +1051,11 @@ impl<L: Step, R: Step> Step for Merged<L, R> {
     #[inline]
     fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
         let permutation = self.permutation;
-        // Keys are made only where both sides have a quad (`p2-reas3-abl6`: made for one
-        // side alone, they cost a plain load 0.6 % of its instructions).
-        let right_first = match (self.left.peek(account)?, self.right.peek(account)?) {
-            (Some(left), Some(right)) => permutation.to_key(right) < permutation.to_key(left),
-            (left, _) => left.is_none(),
-        };
-        match right_first {
+        match right_first(
+            self.left.peek(account)?,
+            self.right.peek(account)?,
+            permutation,
+        ) {
             true => self.right.next(account),
             false => self.left.next(account),
         }
@@ -1035,7 +1071,14 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<EncodedQuad> {
-        self.step(&mut Free).unwrap_or(None)
+        match right_first(
+            self.left.peek_plain(),
+            self.right.peek_plain(),
+            self.permutation,
+        ) {
+            true => self.right.next_plain(),
+            false => self.left.next_plain(),
+        }
     }
 }
 
