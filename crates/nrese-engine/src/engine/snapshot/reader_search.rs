@@ -1104,22 +1104,35 @@ impl Snapshot {
     /// they hold besides the bits: per slice its group counts (16 bytes a term, 64 terms a
     /// word of the slice) from each run, and as many again where they are merged or
     /// compared; and the parts a large range's grouping is cut into
-    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and the part's block of the
-    /// walk's slab, [`crate::index::PART_BLOCK`] counts).
+    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and at least four counts;
+    /// in a run large enough to be walked in parts, the part's block of the walk's slab,
+    /// [`crate::index::PART_BLOCK`] counts, instead of the four). A smaller run is always
+    /// walked serially and holds no slab.
     /// The slices running at once cover disjoint ranges, so their parts are at most the
     /// runs' entries over a part, and two more a run and slice. As many at once as `room`
     /// holds, at least one, no more than the pool's threads nor than there are slices.
     fn walk_scratch(&self, words: usize, per: usize, room: usize) -> (usize, usize) {
+        use crate::index::{GROUP_PART, PART_BLOCK};
         let runs = self.version.runs().count().max(1);
         let slice = per * 64 * 16 * runs * 2;
         let most = words.div_ceil(per).min(rayon::current_num_threads()).max(1);
         let running = (room / slice).clamp(1, most);
         let entries: u64 = self.version.runs().map(|run| run.entries()).sum();
-        let parts = entries as usize / crate::index::GROUP_PART + 2 * runs * running;
-        let part = std::mem::size_of::<usize>()
-            + std::mem::size_of::<Vec<(u64, i64)>>()
-            + crate::index::PART_BLOCK * std::mem::size_of::<(u64, i64)>();
-        (running, running * slice + parts * part)
+        let parts = entries as usize / GROUP_PART + 2 * runs * running;
+        let count = std::mem::size_of::<(u64, i64)>();
+        let part = std::mem::size_of::<usize>() + std::mem::size_of::<Vec<(u64, i64)>>();
+        let slabbed: usize = self
+            .version
+            .runs()
+            .map(|run| run.entries() as usize)
+            .filter(|&entries| entries >= 2 * GROUP_PART)
+            .map(|entries| entries / GROUP_PART + 2 * running)
+            .sum();
+        let blocks = slabbed * (PART_BLOCK - 4) * count;
+        (
+            running,
+            running * slice + parts * (part + 4 * count) + blocks,
+        )
     }
 
     /// Whether a statement this snapshot shows in `scope`'s graphs in `model` has `id` at
@@ -1397,5 +1410,59 @@ mod own_corpora_tests {
             before - one_local,
             "the losing index and its entry's charge are released"
         );
+    }
+}
+
+#[cfg(test)]
+mod corpus_walk_tests {
+    use super::*;
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
+
+    /// A corpus walk over a run too small to be walked in parts holds no group walk's slab:
+    /// its scratch is the serial walk's (package review r1 S2). One literal, so one word of
+    /// bits (8 bytes), and one run of one statement: a slice's counts of that run and as many
+    /// again (2,048 bytes), and two parts of a cut, a vector and four counts (192). With a
+    /// query's earlier holds leaving 3,200 bytes, that fits and the walk is answered, the
+    /// literal its one document; nothing is held after but the earlier holds. A slab's block
+    /// counted for each of those parts (4,160 bytes of scratch) would refuse it.
+    #[test]
+    fn a_corpus_walk_over_a_run_too_small_for_parts_fits_the_serial_scratch() {
+        let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        let engine = crate::Engine::new(crate::EngineConfig {
+            background_maintenance: false,
+            ..crate::EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let text: Term = Literal::new_simple_literal("red fox").into();
+        let literal = tx.intern(text.as_ref());
+        tx.insert(Quad::new(ex("s"), ex("p"), text, GraphName::DefaultGraph).as_ref());
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        // The shape stated: one word of bits; one run, of fewer entries than a part.
+        assert_eq!(snapshot.version.dictionary_len.div_ceil(64), 1);
+        let runs: Vec<_> = snapshot.version.runs().collect();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].entries() < crate::index::GROUP_PART as u64);
+
+        let limit = 1 << 20;
+        let budget = Arc::new(nrese_exec::Budget::new(limit));
+        let earlier = limit - 3_200;
+        budget.charge(earlier).unwrap();
+        let corpus = snapshot
+            .walk_corpus(
+                Documents::Literals,
+                ReadModel::Asserted,
+                &TextScope::EVERY,
+                &budget,
+            )
+            .expect("the serial walk's scratch fits the room left");
+        assert_eq!(corpus.documents, 1);
+        let at = literal.payload();
+        assert_eq!((corpus.bits[(at / 64) as usize] >> (at % 64)) & 1, 1);
+        drop(corpus);
+        assert!(!budget.refused(), "no refusal recorded on the budget");
+        assert_eq!(budget.used(), earlier);
+        budget.release(earlier);
     }
 }
