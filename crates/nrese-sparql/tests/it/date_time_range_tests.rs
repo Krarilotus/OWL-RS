@@ -1,7 +1,8 @@
 //! FILTER comparisons of a variable with an `xsd:dateTime` constant narrow the scan that
 //! binds it, and a count's walk of its keys (`native/ranges.rs`): to the inline dateTimes
 //! within two local days of the constants, and the dictionary's typed literals. A narrowing
-//! only prunes, so every value that passes must survive it, whatever the timezones.
+//! only prunes, so every value that passes must survive it, whatever the timezones. Beside a
+//! string test on its variable the bound gives way, and path joins take none.
 //!
 //! Expected answers come from the oracle in this file, on each value's fields as read here
 //! from its lexical form, never from the engine. Each test says which order it uses:
@@ -23,13 +24,15 @@ use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 
-/// A dateTime's value: its local date and time in milliseconds on one count, and its
+/// Units of a second the oracle counts in: the engine keeps 18 fraction digits.
+const SCALE: i128 = 1_000_000_000_000_000_000;
+
+/// A dateTime's value: its local date and time in units of [`SCALE`] on one count, and its
 /// timezone in minutes.
-type Value = (i64, Option<i64>);
+type Value = (i128, Option<i64>);
 
 /// The value of the dateTime lexical form `YYYY…-MM-DDThh:mm:ss[.f…][Z|±hh:mm]`, read here.
-/// `24:00:00` is the next day's midnight. Digits past the milliseconds are dropped: no value
-/// here is within a millisecond of a constant.
+/// `24:00:00` is the next day's midnight. Every fraction digit counts.
 fn value(lexical: &str) -> Value {
     let number = |digits: &str| -> i64 { digits.parse().expect(lexical) };
     let bytes = lexical.as_bytes();
@@ -52,11 +55,16 @@ fn value(lexical: &str) -> Value {
     };
     let (date, time) = rest.split_once('T').expect(lexical);
     let date: Vec<i64> = date.rsplitn(3, '-').map(number).collect();
-    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, "0"));
+    assert!(
+        fraction.len() <= 18,
+        "{lexical}: more fraction digits than the engine keeps"
+    );
     let clock: Vec<i64> = clock.split(':').map(number).collect();
-    let millis = number(&format!("{fraction:0<3}")[..3]);
-    let seconds = days(date[2], date[1], date[0]) * 86_400 + clock[0] * 3_600 + clock[1] * 60;
-    ((seconds + clock[2]) * 1_000 + millis, zone)
+    let fraction: i128 = format!("{fraction:0<18}").parse().expect(lexical);
+    let seconds =
+        days(date[2], date[1], date[0]) * 86_400 + clock[0] * 3_600 + clock[1] * 60 + clock[2];
+    (i128::from(seconds) * SCALE + fraction, zone)
 }
 
 /// Days from 0000-03-01 to `year-month-day` in the proleptic Gregorian calendar, as XSD
@@ -78,7 +86,9 @@ enum Order {
 
 /// `a` against `b` under `order`; `None` where it gives no order.
 fn compare(order: Order, a: Value, b: Value) -> Option<Ordering> {
-    let instant = |(local, zone): Value, implicit: i64| local - zone.unwrap_or(implicit) * 60_000;
+    let instant = |(local, zone): Value, implicit: i64| {
+        local - i128::from(zone.unwrap_or(implicit)) * 60 * SCALE
+    };
     match (order, a.1.is_some(), b.1.is_some()) {
         (Order::XPath(implicit), _, _) => Some(instant(a, implicit).cmp(&instant(b, implicit))),
         (Order::Engine, true, true) => Some(instant(a, 0).cmp(&instant(b, 0))),
@@ -92,11 +102,13 @@ fn compare(order: Order, a: Value, b: Value) -> Option<Ordering> {
     }
 }
 
-/// Whether `value <op> constant` is true; no order (an error) is false.
+/// Whether `value <op> constant` is true; no order (an error) is false, but for `!=`: two
+/// values with no order are not equal.
 fn passes(order: Order, value: Value, op: &str, constant: Value) -> bool {
     let ordering = compare(order, value, constant);
     match op {
         "=" => ordering == Some(Equal),
+        "!=" => ordering != Some(Equal),
         "<" => ordering == Some(Less),
         "<=" => matches!(ordering, Some(Less | Equal)),
         ">" => ordering == Some(Greater),
@@ -108,13 +120,18 @@ fn passes(order: Order, value: Value, op: &str, constant: Value) -> bool {
 /// A conjunction of bounds on `?d`, each `(op, constant)`: `?d <op> constant`.
 type Conjunction = [(&'static str, &'static str)];
 
-/// Whether `object` passes every conjunct `?d <op> constant`: a literal of another datatype
-/// never does (comparing it with a dateTime is an error).
+/// Whether `object` passes every conjunct `?d <op> constant`. A literal of another datatype
+/// the engine knows (a date, an integer, a string) is a value no dateTime equals (SPARQL 1.1
+/// §17.3.1 lets an implementation say so): it passes `!=` and, comparing it with a dateTime
+/// being an error, nothing else.
 fn passes_all(order: Order, object: &Literal, conjuncts: &[(&str, &str)]) -> bool {
-    object.datatype() == xsd::DATE_TIME
-        && conjuncts
-            .iter()
-            .all(|&(op, constant)| passes(order, value(object.value()), op, value(constant)))
+    conjuncts.iter().all(|&(op, constant)| {
+        if object.datatype() == xsd::DATE_TIME {
+            passes(order, value(object.value()), op, value(constant))
+        } else {
+            op == "!="
+        }
+    })
 }
 
 /// The FILTER of `conjuncts`, each `?d <op> constant`, or with `mirrored` `constant <op'> ?d`.
@@ -160,10 +177,22 @@ fn engine(triples: impl IntoIterator<Item = (String, String, Literal)>) -> Engin
     engine
 }
 
-/// What `SELECT ?p WHERE { ?p e:<predicate> ?d FILTER(<filter>) }` returns (its subjects,
-/// sorted), and EXPLAIN's step that read the pattern (`range scan` or `scan`) with its rows.
-fn select(snapshot: &Snapshot, predicate: &str, filter: &str) -> (Vec<String>, String, u64) {
-    let text = format!("SELECT ?p WHERE {{ ?p <{EX}{predicate}> ?d FILTER({filter}) }}");
+/// Adds `e:<from> e:next e:<to>` to `engine` for each pair.
+fn link(engine: &Engine, pairs: impl IntoIterator<Item = (String, String)>) {
+    let mut tx = engine.transaction();
+    for (from, to) in pairs {
+        let quad = Quad::new(ex(&from), ex("next"), ex(&to), GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+}
+
+/// A query run's EXPLAIN steps, each operator with the rows it gave.
+type Steps = Vec<(String, u64)>;
+
+/// What `SELECT ?p WHERE { <body> }` returns (its subjects, sorted), and its EXPLAIN steps.
+fn query(snapshot: &Snapshot, body: &str) -> (Vec<String>, Steps) {
+    let text = format!("SELECT ?p WHERE {{ {body} }}");
     let query = SparqlParser::new()
         .parse_query(&text)
         .unwrap_or_else(|e| panic!("{e}: {text}"));
@@ -177,11 +206,26 @@ fn select(snapshot: &Snapshot, predicate: &str, filter: &str) -> (Vec<String>, S
         .collect();
     subjects.sort();
     let steps = explain_query(snapshot, &query, &options).unwrap().steps;
-    let scan = steps
+    let steps = steps.into_iter().map(|s| (s.operator, s.rows)).collect();
+    (subjects, steps)
+}
+
+/// The step among `steps` (of `what`) that read the pattern, `range scan` or `scan`.
+fn scan(steps: &[(String, u64)], what: &str) -> (String, u64) {
+    steps
         .iter()
-        .find(|s| s.operator == "range scan" || s.operator == "scan")
-        .unwrap_or_else(|| panic!("{text}: no scan among {steps:#?}"));
-    (subjects, scan.operator.clone(), scan.rows)
+        .find(|(operator, _)| operator == "range scan" || operator == "scan")
+        .cloned()
+        .unwrap_or_else(|| panic!("{what}: no scan among {steps:?}"))
+}
+
+/// What `SELECT ?p WHERE { ?p e:<predicate> ?d FILTER(<filter>) }` returns (its subjects,
+/// sorted), and EXPLAIN's step that read the pattern with its rows.
+fn select(snapshot: &Snapshot, predicate: &str, filter: &str) -> (Vec<String>, String, u64) {
+    let body = format!("?p <{EX}{predicate}> ?d FILTER({filter})");
+    let (subjects, steps) = query(snapshot, &body);
+    let (operator, rows) = scan(&steps, &body);
+    (subjects, operator, rows)
 }
 
 /// `SELECT (COUNT(*) AS ?n) WHERE { ?p e:at ?d FILTER(<filter>) }`'s count, and the keys its
@@ -315,7 +359,8 @@ fn years_passing(objects: &[Literal], conjuncts: &[(&str, &str)]) -> Vec<String>
 /// keys, to the inline dateTimes within two local days of the bounds plus the dictionary's
 /// typed literals: created-2023's query reads about one year of six. The same bounds in
 /// forms that aren't inline (`24:00:00`, a non-canonical fraction) give no hint: the whole
-/// pattern is read. Answers: [`Order::Engine`]; without timezones it is XPath's too.
+/// pattern is read. Checked by the answers, then by the rows read and the keys walked.
+/// Answers: [`Order::Engine`]; without timezones it is XPath's too.
 #[test]
 fn date_time_bounds_narrow_the_scan_and_the_key_count() {
     let (engine, objects, inline) = years();
@@ -338,9 +383,8 @@ fn date_time_bounds_narrow_the_scan_and_the_key_count() {
     let expected = years_passing(&objects, &created_2023);
     assert_eq!(years_passing(&objects, &not_inline), expected);
     let filter_2023 = filter(&created_2023, false);
-    let (answer, scan, rows) = select(&snapshot, "at", &filter_2023);
+    let (answer, _, rows) = select(&snapshot, "at", &filter_2023);
     assert_eq!(answer, expected, "{filter_2023}");
-    assert_eq!(scan, "range scan", "{filter_2023}");
     assert!(
         rows <= 2 * envelope_keys,
         "{filter_2023}: {rows} rows read, at most {} in two days",
@@ -353,14 +397,10 @@ fn date_time_bounds_narrow_the_scan_and_the_key_count() {
         "{filter_2023}: {walked:?} keys walked, at most {envelope_keys} in two days"
     );
     let filter_not_inline = filter(&not_inline, false);
-    let (answer, scan, rows) = select(&snapshot, "at", &filter_not_inline);
+    let (answer, _, rows) = select(&snapshot, "at", &filter_not_inline);
     assert_eq!(answer, expected, "{filter_not_inline}");
     let all = objects.len() as u64;
-    assert_eq!(
-        (scan.as_str(), rows),
-        ("scan", 2 * all),
-        "{filter_not_inline}"
-    );
+    assert_eq!(rows, 2 * all, "{filter_not_inline}: rows read");
     assert_eq!(
         count(&snapshot, &filter_not_inline),
         (expected.len() as u64, Some(all)),
@@ -368,10 +408,33 @@ fn date_time_bounds_narrow_the_scan_and_the_key_count() {
     );
 }
 
+/// Spec: design note 12 Nov, "After the doubt review": the typed literals' range is always
+/// kept. Bounds further apart than two days, the lower above the upper, leave no inline
+/// dateTime to read, and the scan and the key count still read the typed literals
+/// ([`TYPED`]): no value passes, so the empty answer alone can't tell. Answers:
+/// [`Order::Engine`].
+#[test]
+fn contradictory_date_time_bounds_still_read_the_typed_literals() {
+    let (engine, objects, _) = years();
+    let snapshot = engine.snapshot();
+    let contradictory = [(">=", "2024-06-01T00:00:00"), ("<", "2023-01-01T00:00:00")];
+    let expected = years_passing(&objects, &contradictory);
+    let filter = filter(&contradictory, false);
+    let typed = TYPED.len() as u64;
+    let (answer, _, rows) = select(&snapshot, "at", &filter);
+    assert_eq!((answer, rows), (expected.clone(), 2 * typed), "{filter}");
+    assert_eq!(
+        count(&snapshot, &filter),
+        (expected.len() as u64, Some(typed)),
+        "{filter}"
+    );
+}
+
 /// dateTimes at and around the constants of [`BOUNDS`]: inline ones with and without
-/// timezones, at month ends, leap days and the inline years' ends, and ones the dictionary
-/// holds (`24:00:00`, non-canonical fractions and offsets, a year past 9999).
-const DATE_TIMES: [&str; 32] = [
+/// timezones, at month ends, leap days and the inline years' ends, within a millisecond of
+/// a constant, and ones the dictionary holds (`24:00:00`, non-canonical fractions and
+/// offsets, fractions past the millisecond, a year past 9999).
+const DATE_TIMES: [&str; 34] = [
     "2022-12-29T23:59:59",
     "2022-12-30T19:59:59.999-14:00",
     "2022-12-30T20:00:00-14:00",
@@ -379,8 +442,10 @@ const DATE_TIMES: [&str; 32] = [
     "2022-12-31T10:00:00Z",
     "2022-12-31T24:00:00",
     "2023-01-01T00:00:00",
+    "2023-01-01T00:00:00.4999",
     "2023-01-01T00:00:00.5",
     "2023-01-01T00:00:00.500",
+    "2023-01-01T00:00:00.5001",
     "2023-01-01T14:00:00.001Z",
     "2023-01-02T00:00:00-14:00",
     "2023-02-27T19:00:00-14:00",
@@ -407,7 +472,7 @@ const DATE_TIMES: [&str; 32] = [
 ];
 
 /// Conjunctions on `?d`.
-const BOUNDS: [&Conjunction; 20] = [
+const BOUNDS: [&Conjunction; 22] = [
     // The two zoned counterexamples (CRD-01), and equality at the first's instant.
     &[(">=", "2023-01-01T00:00:00+14:00")],
     &[("<", "2024-01-01T23:00:00-14:00")],
@@ -418,11 +483,16 @@ const BOUNDS: [&Conjunction; 20] = [
     &[(">", "2023-01-01T00:00:00")],
     &[("<", "2023-01-01T00:00:00Z")],
     &[("<=", "2024-01-01T23:00:00-14:00")],
+    // Equal, under XPath, to values with a timezone at an implicit timezone between the
+    // ends only (+05:20, +12:00).
+    &[("=", "2023-06-01T12:00:00")],
     // Fractions, and equal values in other forms.
     &[(">", "2023-01-01T00:00:00.5")],
     &[("<=", "2023-01-01T00:00:00.5")],
     &[("=", "2023-01-01T00:00:00.5")],
     &[("=", "2023-01-01T00:00:00")],
+    // Not equal: no hint, and values far off and of other kinds pass.
+    &[("!=", "2023-01-01T00:00:00")],
     // Constants that aren't inline: no hint.
     &[(">=", "2022-12-31T24:00:00")],
     &[("<", "2023-01-01T00:00:00.000")],
@@ -439,11 +509,12 @@ const BOUNDS: [&Conjunction; 20] = [
 
 /// Spec: design note 12 Nov, "After the doubt review": the narrowing keeps every value that
 /// passes, whatever the timezones on either side, across month ends, leap days and the
-/// inline years' ends; dateTimes that aren't inline (`24:00:00`, non-canonical fractions and
-/// offsets, years past 9999) stay in the typed literals' range; a constant that isn't
-/// inline narrows nothing; a dateTime bound never matches a date, an integer or a string.
-/// Answers: [`Order::Engine`], by the scan and by the key count, each bound written either
-/// way round.
+/// inline years' ends, within a millisecond of a bound; dateTimes that aren't inline
+/// (`24:00:00`, non-canonical fractions and offsets, fractions past the millisecond, years
+/// past 9999) stay in the typed literals' range; a constant that isn't inline narrows
+/// nothing; a dateTime bound never matches a date, an integer or a string, and `!=` narrows
+/// nothing. Answers: [`Order::Engine`], by the scan and by the key count, each bound written
+/// either way round.
 #[test]
 fn date_time_bounds_keep_every_value_that_passes() {
     let objects: Vec<Literal> = DATE_TIMES
@@ -481,38 +552,39 @@ fn date_time_bounds_keep_every_value_that_passes() {
 }
 
 /// Spec: design note 12 Nov, "After the doubt review" (CRD-07): the two-day envelope also
-/// covers XPath's comparison, where a value without a timezone takes the implicit one,
-/// though the engine compares with XSD's partial order and its FILTER rejects some of those
-/// values. Order: [`Order::XPath`], with the implicit timezones -14:00, Z and +14:00. Every
-/// value one of them passes survives the narrowing: alone under a predicate of its own, the
-/// scan of its pattern reads its row.
+/// holds every value XPath's comparison passes, where a value without a timezone takes the
+/// implicit one. The engine compares by XSD's partial order instead, and its FILTER rejects
+/// some of those values, so this checks what the narrowing keeps, not answers: alone under
+/// a predicate of its own, each such value's row is read by the scan of its pattern. Order:
+/// [`Order::XPath`], at every implicit timezone from -14:00 to +14:00 by the minute (an
+/// equality across a timezone on one side only holds at one implicit timezone).
 #[test]
-fn every_value_xpath_passes_survives_the_narrowing() {
+fn every_value_xpath_passes_is_kept_by_the_envelope() {
     let engine = engine(DATE_TIMES.iter().enumerate().map(|(i, lexical)| {
         let object = Literal::new_typed_literal(*lexical, xsd::DATE_TIME);
         (format!("v{i}"), format!("at{i}"), object)
     }));
     let snapshot = engine.snapshot();
-    // Values checked, and those among them the engine's order rejects.
-    let (mut checked, mut xpath_only) = (0, 0);
+    // Values checked, those among them the engine's order rejects, and those XPath passes
+    // only at an implicit timezone other than -14:00, Z and +14:00.
+    let (mut checked, mut xpath_only, mut between) = (0, 0, 0);
     for &(op, constant) in BOUNDS.iter().flat_map(|conjuncts| conjuncts.iter()) {
         let filter = filter(&[(op, constant)], false);
         for (i, lexical) in DATE_TIMES.iter().enumerate() {
             let (v, c) = (value(lexical), value(constant));
-            let xpath = [-14 * 60, 0, 14 * 60]
-                .into_iter()
-                .any(|zone| passes(Order::XPath(zone), v, op, c));
-            if xpath {
+            let passes_at = |zone: i64| passes(Order::XPath(zone), v, op, c);
+            if (-14 * 60..=14 * 60).any(passes_at) {
                 let (_, scan, rows) = select(&snapshot, &format!("at{i}"), &filter);
                 assert_eq!(rows, 1, "{lexical}: {filter}: its {scan} read nothing");
                 checked += 1;
                 xpath_only += usize::from(!passes(Order::Engine, v, op, c));
+                between += usize::from(![-14 * 60, 0, 14 * 60].into_iter().any(passes_at));
             }
         }
     }
     assert!(
-        checked > 100 && xpath_only > 10,
-        "{checked} checked, {xpath_only} XPath's only"
+        checked > 100 && xpath_only > 10 && between >= 2,
+        "{checked} checked, {xpath_only} XPath's only, {between} between the ends only"
     );
 }
 
@@ -558,7 +630,7 @@ fn a_date_time_bound_beside_a_year_or_integer_bound_keeps_that_hint() {
     for (alone, mixed, expected) in cases {
         let (_, scan, rows) = select(&snapshot, "at", alone);
         let (_, walked) = count(&snapshot, alone);
-        assert_eq!(scan, "range scan", "{alone}");
+        assert!(rows < 2 * objects.len() as u64, "{alone}: {rows} rows read");
         for filter in mixed {
             assert_eq!(
                 select(&snapshot, "at", &filter),
@@ -571,5 +643,119 @@ fn a_date_time_bound_beside_a_year_or_integer_bound_keeps_that_hint() {
                 "{filter}"
             );
         }
+    }
+}
+
+/// Spec: review round of 12 Nov (SHOULD 1): a dateTime bound gives way to a string test on
+/// its variable. `STRSTARTS(STR(?d), …)` is answered from the dictionary first (`strings`),
+/// and a count with it skips the key count; a broad dateTime bound beside it, in either
+/// order, changes neither the route nor the rows read. Here half the dateTimes are typed
+/// literals (non-canonical fractions), every one of which a dateTime hint would read.
+/// Answers: the values whose text has the prefix, all of them past the bound
+/// ([`Order::Engine`]).
+#[test]
+fn a_date_time_bound_beside_a_string_test_keeps_its_route() {
+    let objects: Vec<Literal> = (1..=12)
+        .flat_map(|month| (1..=10).map(move |day| (month, day)))
+        .flat_map(|(month, day)| {
+            ["", ".50"].map(|fraction| {
+                let lexical = format!("2023-{month:02}-{day:02}T10:00:00{fraction}");
+                Literal::new_typed_literal(lexical, xsd::DATE_TIME)
+            })
+        })
+        .collect();
+    let engine = engine(
+        objects
+            .iter()
+            .enumerate()
+            .map(|(i, object)| (format!("v{i}"), "at".to_owned(), object.clone())),
+    );
+    let snapshot = engine.snapshot();
+    let text = "STRSTARTS(STR(?d), \"2023-01-01T\")";
+    let broad = [(">=", "2000-01-01T00:00:00")];
+    let expected = subjects(
+        (0..objects.len())
+            .filter(|&i| {
+                objects[i].value().starts_with("2023-01-01T")
+                    && passes_all(Order::Engine, &objects[i], &broad)
+            })
+            .map(|i| format!("v{i}")),
+    );
+    let (answer, scan, rows) = select(&snapshot, "at", text);
+    let (n, walked) = count(&snapshot, text);
+    assert_eq!(
+        (answer, n),
+        (expected.clone(), expected.len() as u64),
+        "{text}"
+    );
+    // The dictionary's route: fewer rows than the pattern's, no key count.
+    assert!(
+        rows < objects.len() as u64 && walked.is_none(),
+        "{text}: {rows} rows read, {walked:?} keys walked"
+    );
+    let broad = filter(&broad, false);
+    for filter in [format!("{text} && {broad}"), format!("{broad} && {text}")] {
+        assert_eq!(
+            select(&snapshot, "at", &filter),
+            (expected.clone(), scan.clone(), rows),
+            "{filter}"
+        );
+        assert_eq!(count(&snapshot, &filter), (n, walked), "{filter}");
+    }
+}
+
+/// Spec: review round of 12 Nov (SHOULD 2): a path join takes no dateTime hint, so its plans
+/// stay as they were. It takes each filter conjunct's hints apart, the first on a variable
+/// winning, so a broad dateTime bound before `YEAR(?d) = 2023` would replace the YEAR hint.
+/// Here the triple pattern runs first (the path is the larger input), narrowed by the YEAR
+/// hint, and with a broad dateTime bound beside it, in either order, the plan (but for the
+/// bound's own `filter` step: each conjunct has one) and the rows read are the same.
+/// Answers: [`Order::Engine`], with YEAR read from the lexical form.
+#[test]
+fn a_path_join_keeps_its_year_hint_beside_a_date_time_bound() {
+    let (engine, objects, _) = years();
+    // Each `e:v<i>a` links to `e:v<i>b`; a chain of 2000 more links makes the path larger
+    // than the triple pattern.
+    let chain = (0..2000).map(|j| (format!("c{j}"), format!("c{}", j + 1)));
+    link(
+        &engine,
+        (0..objects.len())
+            .map(|i| (format!("v{i}a"), format!("v{i}b")))
+            .chain(chain),
+    );
+    let snapshot = engine.snapshot();
+    let join = |filter: &str| {
+        let body = format!("{{ ?p <{EX}at> ?d FILTER({filter}) }} ?p <{EX}next>+ ?q");
+        let (answer, steps) = query(&snapshot, &body);
+        let operators: Vec<String> = steps
+            .iter()
+            .filter(|(operator, _)| operator != "filter")
+            .map(|(operator, _)| operator.clone())
+            .collect();
+        (answer, operators, scan(&steps, &body).1)
+    };
+    let year = "YEAR(?d) = 2023";
+    let broad = [(">=", "2000-01-01T00:00:00")];
+    let expected = subjects(
+        (0..objects.len())
+            .filter(|&i| {
+                objects[i].value().starts_with("2023-")
+                    && passes_all(Order::Engine, &objects[i], &broad)
+            })
+            .map(|i| format!("v{i}a")),
+    );
+    let (_, operators, rows) = join(year);
+    assert!(
+        operators.iter().any(|o| o == "paths ordered with patterns")
+            && rows < 2 * objects.len() as u64,
+        "{year}: a path join whose first run its hint narrows: {rows} rows read, {operators:?}"
+    );
+    let broad = filter(&broad, false);
+    for filter in [format!("{broad} && {year}"), format!("{year} && {broad}")] {
+        assert_eq!(
+            join(&filter),
+            (expected.clone(), operators.clone(), rows),
+            "{filter}"
+        );
     }
 }
