@@ -285,13 +285,19 @@ def evidence(passes: list[dict], case: str) -> dict:
         out["unchecked"] += sum(c.get("ok") is None for c in checks + routes)
         out["notes"] += [n for n in record.get("notes", []) if n not in out["notes"]]
         out["estimator"] |= {o.get("estimator", "samples") for o in observations} or {"samples"}
-        out["samples"].append(record.get("samples") or {})
+        # A sample the perf lab didn't report is null (fast.py asks each run for the series the case
+        # declares: an older perf lab writes no first_ms): such a list is no reading of its series
+        # on this pass, which compare_case() then treats as any series a side doesn't report.
+        out["samples"].append({s: v for s, v in (record.get("samples") or {}).items() if None not in (v or [])})
         process: dict[str, list[float]] = {}
+        unreported = set()  # a null in any observation: the series isn't read on this pass at all
         for o in observations:
             for series, values in (o.get("samples") or {}).items():
-                if values:
+                if values and None in values:
+                    unreported.add(series)
+                elif values:
                     process.setdefault(series, []).append(p50(values))
-        out["process"].append(process)
+        out["process"].append({s: v for s, v in process.items() if s not in unreported})
         peaks = [o.get("peak_mib") for o in observations if o.get("peak_mib")] or \
             ([record["peak_mib"]] if record.get("peak_mib") else [])
         out["lifetime"].append(max(peaks) if peaks else None)
@@ -1564,7 +1570,7 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_bl
             entry["measured"] = r.get("measurement") or entry["measured"]
             if r.get("status") == "ok":
                 for s, values in (r.get("samples") or {}).items():
-                    if values:
+                    if values and None not in values:  # a null sample: not reported (evidence())
                         entry["series"].setdefault((rev, s), []).append(statistics.median(values))
                         entry["quanta"].setdefault((rev, s), []).append(values)
     per_side = sides if len(revs) == 1 else 1
