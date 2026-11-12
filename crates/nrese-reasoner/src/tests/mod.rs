@@ -1396,6 +1396,84 @@ fn representatives_expand_to_the_replicated_closure() {
     assert!(covered(classes_seen, merges), "{classes_seen} {merges}");
 }
 
+/// The facts an equality merge makes stale are collected one of two ways (batch.rs,
+/// `Representatives::rewrites`): looked up term by term and probed one by one, or, for a
+/// merge of many terms, by one scan of the store, then sorted and kept in one forward pass.
+/// Spec: the way changes no answer. On random ontologies with equalities (in the input
+/// and derived later through a functional property; equal properties and classes, so
+/// predicates and rule constants lose their place), each listing's facts, the classes, the
+/// violations and the merges are the same both ways, and no listing holds a fact twice (a
+/// held fact let into a round's new facts is listed again). Varied by `NRESE_FUZZ_SEED`.
+#[test]
+fn a_merge_s_rewrites_answer_the_same_scanned_or_looked_up() {
+    use super::eval::NEVER;
+    let mut next = rng(0x5ca7_7e57_2026_1112);
+    let mut merges = 0;
+    for case in 0..150 {
+        let mut lines = random_ontology(&mut next);
+        lines.push("ex:f rdf:type owl:FunctionalProperty".to_owned());
+        for _ in 0..next(6) {
+            lines.push(format!("ex:i{} owl:sameAs ex:i{}", next(6), next(6)));
+        }
+        for _ in 0..next(4) {
+            lines.push(format!("ex:i{} ex:f ex:i{}", next(6), next(6)));
+        }
+        for _ in 0..next(10) {
+            lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
+        }
+        if next(3) == 0 {
+            lines.push(format!("ex:p{} owl:sameAs ex:p{}", next(4), next(4)));
+        }
+        if next(4) == 0 {
+            lines.push(format!("ex:C{} owl:sameAs ex:C{}", next(5), next(5)));
+        }
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, &lines.join("\n"));
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let schema = Schema::owl(&mut vocabulary);
+        for listing in [
+            batch::Listing::Representatives,
+            batch::Listing::Stored,
+            batch::Listing::Expanded,
+        ] {
+            let [scanned, looked_up] = [true, false].map(|scan| {
+                let result = batch::collecting_by_scan(scan, || {
+                    batch::materialise_representatives_until(
+                        batch::Input::Facts(input.clone()),
+                        &rules,
+                        None,
+                        &schema,
+                        listing,
+                        NEVER,
+                    )
+                    .expect("never stopped")
+                });
+                let mut classes: Vec<(u64, Vec<u64>)> = result
+                    .classes
+                    .classes()
+                    .map(|(r, members)| (r, members.to_vec()))
+                    .collect();
+                classes.sort_unstable();
+                let mut violations = result.violations.to_vec();
+                violations.sort_unstable_by_key(|v| format!("{v:?}"));
+                (result.derived, classes, violations, result.merges)
+            });
+            let context = || format!("case {case}, {listing:?}\n{}", lines.join("\n"));
+            assert!(
+                scanned.0.windows(2).all(|pair| pair[0] != pair[1]),
+                "a fact listed twice: {}",
+                context()
+            );
+            assert_eq!(scanned, looked_up, "{}", context());
+            merges += looked_up.3;
+        }
+    }
+    assert!(
+        merges > 150,
+        "{merges} merges: too few to tell the ways apart"
+    );
+}
+
 /// Equality by representatives ends when a rule head names a constant that isn't its
 /// class's representative, and the rewritten fact feeds a rule joining on the
 /// representative. Found by the DL bounds (U1's Skolem constants, 4 October 2026): the

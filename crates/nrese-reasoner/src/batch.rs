@@ -1898,6 +1898,49 @@ impl Store {
         Ok(parts.concat())
     }
 
+    /// [`Self::mentioning`] by reading every stored fact once (each once, in no particular
+    /// order), for many `terms`: a task per relation, each position counted on the task's own
+    /// poller. [`Stopped`] if `stop` (latched) fired; a stopped task fails the pass.
+    fn scan_mentioning(
+        &self,
+        terms: &TermSet,
+        stop: super::eval::Stop<'_>,
+    ) -> Result<Vec<Triple>, Stopped> {
+        let parts: Vec<Vec<Triple>> = self
+            .relations
+            .par_iter()
+            .zip(self.predicates.par_iter())
+            .map(|(relation, &p)| -> Result<Vec<Triple>, Stopped> {
+                let poll = Poller::new(stop).ok_or(Stopped)?;
+                let whole = terms.contains(p);
+                let mut out = Vec::new();
+                for run in [&relation.input, &relation.base, &relation.recent] {
+                    for chunk in &run.so.chunks {
+                        out.extend(
+                            poll.counted(chunk)
+                                .filter(|&&(s, o)| whole || terms.contains(s) || terms.contains(o))
+                                .map(|&(s, o)| [s, p, o]),
+                        );
+                        poll.ended()?;
+                    }
+                }
+                Ok(out)
+            })
+            .collect::<Result<_, _>>()?;
+        if stop() {
+            return Err(Stopped);
+        }
+        Ok(parts.concat())
+    }
+
+    /// The facts the runs hold: input, base and recent (the delta is part of recent).
+    fn stored(&self) -> usize {
+        self.relations
+            .iter()
+            .map(|relation| relation.input.len() + relation.base.len() + relation.recent.len())
+            .sum()
+    }
+
     /// Makes `news` (per relation: the open part, the closed part) the relations' deltas.
     fn install(&mut self, news: Vec<New>) {
         self.merged += self
@@ -2476,20 +2519,64 @@ impl Representatives {
         lost
     }
 
-    /// The facts the merge that took the places of `lost` makes stale, rewritten;
-    /// [`Stopped`] if `stop` (latched) fired ([`Store::mentioning`]).
+    /// The facts the merge that took the places of `lost` makes stale, and `extra`, rewritten
+    /// to representatives, without those `store` holds; [`Stopped`] if `stop` (latched) fired.
+    ///
+    /// A merge of few terms (a commit's) looks their facts up ([`Store::mentioning`]) and
+    /// probes each rewrite. One whose lookups would outnumber the stored facts (an input's
+    /// equalities: 180,000 lost terms against 600,032 facts on `rl-sameas`, where looking
+    /// them up and probing 700,000 rewrites one at a time was most of the closure) reads
+    /// every fact once ([`Store::scan_mentioning`]), sorts and deduplicates the rewrites, and
+    /// keeps the new ones in one forward pass ([`Store::retain_new`]).
     fn rewrites(
         &self,
         store: &Store,
         lost: &HashSet<u64>,
+        mut extra: Vec<Triple>,
         stop: super::eval::Stop<'_>,
-    ) -> Result<Vec<Triple>, Stopped> {
-        let mut facts = store.mentioning(lost, stop)?;
+    ) -> Result<Segments, Stopped> {
+        // A lost term costs a search in two orders of every relation; a scan, each fact once.
+        let lookups = lost.len().saturating_mul(2 * store.relations.len());
+        let scan = lookups >= store.stored();
+        #[cfg(test)]
+        let scan = COLLECT_BY_SCAN.get().unwrap_or(scan);
+        if !scan {
+            extra.extend(store.mentioning(lost, stop)?);
+            extra
+                .par_iter_mut()
+                .for_each(|fact| *fact = self.classes.rewrite(*fact));
+            keep_unheld(store, &mut extra, &Poller::new(stop).ok_or(Stopped)?)?;
+            return Ok(segments(extra));
+        }
+        let mut terms = TermSet::default();
+        lost.iter().for_each(|&term| terms.insert(term));
+        let mut facts = store.scan_mentioning(&terms, stop)?;
+        facts.append(&mut extra);
         facts
             .par_iter_mut()
             .for_each(|fact| *fact = self.classes.rewrite(*fact));
-        Ok(facts)
+        facts.par_sort_unstable_by_key(|&[s, p, o]| (p, s, o));
+        facts.dedup();
+        store.retain_new(&mut facts, &Poller::new(stop).ok_or(Stopped)?)?;
+        Ok(split(facts))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: how [`Representatives::rewrites`] collects on this thread (`Some(true)`: by
+    /// the scan), whatever the merge's size.
+    static COLLECT_BY_SCAN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: `run`, with every merge's rewrites on this thread collected by the scan (`true`)
+/// or by lookups.
+#[cfg(test)]
+pub(crate) fn collecting_by_scan<R>(scan: bool, run: impl FnOnce() -> R) -> R {
+    COLLECT_BY_SCAN.set(Some(scan));
+    let result = run();
+    COLLECT_BY_SCAN.set(None);
+    result
 }
 
 /// `rule` with every constant replaced by its representative.
@@ -3050,9 +3137,9 @@ fn run_body(
     let mut guard_classes: Option<SharedClasses> = None;
     let mut guarded = Guarded::default();
     let mut reevaluate = false;
-    // Facts to add in the first round, checked against the store: the input's stale
+    // Facts to add in the first round, already checked against the store: the input's stale
     // facts rewritten, where the input asserts equalities.
-    let mut pending: Vec<Triple> = Vec::new();
+    let mut pending: Segments = Vec::new();
     if let Some(reps) = &mut representatives {
         // The input's equalities, read as the rounds' sequential stages read: on a poller
         // of the operation's stop, its result checked before use.
@@ -3074,7 +3161,7 @@ fn run_body(
         let lost = reps.merge(&pairs);
         if !lost.is_empty() {
             pending = reps
-                .rewrites(&store, &lost, stop)
+                .rewrites(&store, &lost, Vec::new(), stop)
                 .map_err(|Stopped| Interrupted::default())?;
             if rules.iter().any(|rule| names_any(rule, &lost)) {
                 rules = rules
@@ -3088,7 +3175,7 @@ fn run_body(
     loop {
         check_stop()?;
         // The round's sequential reads (the object orders' estimate, the bodiless facts'
-        // and pending facts' probes, job construction) count on this; each stage checks the
+        // probes, job construction) count on this; each stage checks the
         // latched stop before its output is used.
         let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
         result.rounds += 1;
@@ -3173,8 +3260,7 @@ fn run_body(
         }
         keep_unheld(&store, &mut facts, &stage).map_err(|Stopped| Interrupted::default())?;
         let mut candidates: Vec<Candidates> = vec![(None, segments(facts))];
-        keep_unheld(&store, &mut pending, &stage).map_err(|Stopped| Interrupted::default())?;
-        candidates.push((None, segments(std::mem::take(&mut pending))));
+        candidates.push((None, std::mem::take(&mut pending)));
         // Each job with the closed family its rule belongs to, if any: a variant of such
         // a rule reads the delta without what the family produced, and what a job of the
         // family derives goes to the family's part of the delta.
@@ -3307,17 +3393,11 @@ fn run_body(
                         }
                     }
                 }
-                moved.extend(
-                    reps.rewrites(&store, &lost, stop)
-                        .map_err(|Stopped| Interrupted::default())?,
-                );
-                moved
-                    .par_iter_mut()
-                    .for_each(|fact| *fact = reps.classes.rewrite(*fact));
-                keep_unheld(&store, &mut moved, &stage)
+                let moved = reps
+                    .rewrites(&store, &lost, moved, stop)
                     .map_err(|Stopped| Interrupted::default())?;
                 // Rewritten: no longer what a family produced.
-                candidates.push((None, segments(moved)));
+                candidates.push((None, moved));
                 merged = true;
                 if let Some(classes) = &guard_classes {
                     classes.set(&reps.classes);
@@ -3836,6 +3916,48 @@ mod counted_tests {
             "{asks} asks of the stop for {n} pairs read: more than {interval} plus one run of \
              {run} read between two of them"
         );
+    }
+
+    /// The scan for a merge's stale facts ([`Store::scan_mentioning`]) reads every pair as it
+    /// is counted: over 8 × `POLL_UNITS` pairs, none mentioning the term, it asks the stop at
+    /// least once every `POLL_UNITS` plus one run. And a stop that fires while it reads
+    /// fails the whole pass, never a part of the facts handed on as all: with matches found
+    /// before the stop and with none.
+    #[test]
+    fn a_scan_for_mentions_is_counted_and_ends_at_its_stop() {
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let n = 8 * interval as u64;
+        let store = Store::new((0..n).map(|i| [i, 5, 1_000_000 + i]).collect());
+        let mut terms = TermSet::default();
+        terms.insert(5_000_000);
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let found = store.scan_mentioning(&terms, &stop).expect("never stopped");
+        assert!(found.is_empty(), "no fact mentions the term");
+        let asks = asks.into_inner();
+        assert!(
+            asks >= n as usize / (2 * interval),
+            "{asks} asks of the stop for {n} pairs read: more than {interval} plus one run of \
+             {interval} read between two of them"
+        );
+        // Every other subject mentioned, then none: the stop fires at its second ask (the
+        // first is the poller's making) and stays fired.
+        let matching: [fn(u64) -> bool; 2] = [|i| i % 2 == 0, |_| false];
+        for matching in matching {
+            let mut terms = TermSet::default();
+            (0..n)
+                .filter(|&i| matching(i))
+                .for_each(|i| terms.insert(i));
+            let asked = std::sync::atomic::AtomicUsize::new(0);
+            let stop = || asked.fetch_add(1, Ordering::Relaxed) >= 1;
+            assert!(
+                matches!(store.scan_mentioning(&terms, &stop), Err(Stopped)),
+                "a stopped scan says so"
+            );
+        }
     }
 
     /// REAS-2 (orchestrator, 8 Nov 15:54): a closed family's read of a marked delta
