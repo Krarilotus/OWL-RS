@@ -171,14 +171,28 @@ impl Counting {
     fn live(delta: i64) {
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
             let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
-            PEAK_LIVE.fetch_max(now, Ordering::Relaxed);
-            LIVE_PEAK_RUN.fetch_max(now, Ordering::Relaxed);
+            raise(&PEAK_LIVE, now);
+            raise(&LIVE_PEAK_RUN, now);
             let _ = HERE.try_with(|here| {
                 if let Some(bytes) = here.get() {
                     here.set(Some(bytes + delta));
                 }
             });
         }
+    }
+}
+
+/// Raises the high-water mark `peak` to `now` when `now` is a new high, and writes only then.
+/// The peak is exact as before: it only falls when a phase starts (`Phase::start`), so a read
+/// at or above `now` means `fetch_max` would change nothing (a call racing that reset could
+/// land on either side of it, with or without the read). Every thread writing both peaks on
+/// every allocation and free was two of the three shared writes per call: a 10 M-statement
+/// load with 16 threads took 3.3 times as long counted as not, where counting calls and bytes
+/// alone (what base's perf lab counts) costs about a tenth.
+#[cfg(not(any(system_alloc, alloc_profile)))]
+fn raise(peak: &AtomicI64, now: i64) {
+    if now > peak.load(Ordering::Relaxed) {
+        peak.fetch_max(now, Ordering::Relaxed);
     }
 }
 
@@ -294,6 +308,23 @@ mod freed_tests {
         });
         drop(other.join().expect("the other thread"));
         assert_eq!(freed, Some(4096));
+    }
+}
+
+/// `raise`: the high-water mark of the live counts it is given, though it writes only on a
+/// new high. (A local mark: the process's own counts move with every test thread.)
+#[cfg(all(test, not(any(system_alloc, alloc_profile))))]
+mod peak_tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    #[test]
+    fn the_peak_is_the_most_held_at_once_and_what_falls_after_it_does_not_lower_it() {
+        let peak = AtomicI64::new(0);
+        // Live bytes after each call: 1 MiB and 2 MiB held at once, both freed, then 512 KiB.
+        for now in [1 << 20, 3 << 20, 2 << 20, 0, 1 << 19] {
+            super::raise(&peak, now);
+        }
+        assert_eq!(peak.load(Ordering::Relaxed), 3 << 20, "the peak");
     }
 }
 
