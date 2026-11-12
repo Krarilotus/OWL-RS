@@ -4,9 +4,12 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
+use nrese_reasoner::ReasonerConfig;
+use nrese_server::policy::PolicyConfig;
+use nrese_store::{GateSeverity, ShaclGate, StoreConfig};
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, query_text, test_app};
+use crate::support::{body_text, query_text, test_app, test_app_with_store_config};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -371,5 +374,39 @@ async fn shapes_are_checked_before_they_are_stored() -> TestResult {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let response = send(&app, Method::DELETE, shapes_uri, &[], Body::empty()).await?;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    Ok(())
+}
+
+/// A commit the SHACL gate rejects is answered as a SHACL rejection, not as the reasoner's:
+/// a client that branches on the problem's type tells it from an inconsistency.
+#[tokio::test]
+async fn a_commit_the_shacl_gate_rejects_is_a_shacl_reject() -> TestResult {
+    let config = StoreConfig {
+        shacl_gate: ShaclGate::Enforce(GateSeverity::Violation),
+        ..StoreConfig::default()
+    };
+    let app =
+        test_app_with_store_config(config, PolicyConfig::default(), ReasonerConfig::default())?;
+    let shapes = format!("{PREFIXES}{SHAPES}");
+    let shapes_uri = "/api/v1/repositories/nrese/shapes";
+    let turtle = [("content-type", "text/turtle")];
+    let response = send(&app, Method::PUT, shapes_uri, &turtle, shapes).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        &[("content-type", "application/sparql-update")],
+        "INSERT DATA { <http://example.com/bob> a <http://example.com/Person> }",
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(
+        problem["type"], "https://nrese.dev/problems/shacl-reject",
+        "{problem}"
+    );
+    assert_eq!(problem["title"], "SHACL Reject", "{problem}");
     Ok(())
 }

@@ -522,6 +522,12 @@ async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
     );
     let update_body = axum::body::to_bytes(update_response.into_body(), usize::MAX).await?;
     let update_text = String::from_utf8(update_body.to_vec())?;
+    let problem: serde_json::Value = serde_json::from_str(&update_text)?;
+    assert_eq!(
+        problem["type"],
+        "https://nrese.dev/problems/reasoner-reject"
+    );
+    assert_eq!(problem["title"], "Reasoner Reject");
     assert!(update_text.contains("cax-dw"));
     assert!(update_text.contains("reasoner_reject"));
     assert!(update_text.contains("likely_commit_trigger"));
