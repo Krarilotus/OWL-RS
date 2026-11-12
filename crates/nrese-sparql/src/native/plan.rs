@@ -145,7 +145,8 @@ pub(super) enum Stopped {
     /// The query was cancelled (`stop`): it fails, and isn't planned again.
     Cancelled,
     /// The next read or copy of the characteristic sets would have passed the budget
-    /// ([`SET_BUDGET`]), after `work` of it: planned again without the sets.
+    /// ([`SET_BUDGET`]), after `work` of it: planned again without the sets. The search asks
+    /// for the cancellation at its steps only, so its caller asks before planning again.
     Budget { work: usize },
 }
 
