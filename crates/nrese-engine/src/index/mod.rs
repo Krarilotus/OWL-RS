@@ -152,9 +152,10 @@ pub(crate) const GROUP_PART: usize = 1 << 16;
 /// The groups each parallel part of a group walk writes into its block of the run's one
 /// slab, charged once before the parts start: a part that finds no more makes no budget
 /// call, and only one past its block grows a vector of its own, charged as it grows. On
-/// DBpedia's q10 the parts' own growths and releases were about 1,400 of a walk's 1,450
-/// budget calls, made in parallel; by those counts at most 11 of its 119 parts hold more
-/// than 64 groups (12 Nov). The slab is 1 KiB a part.
+/// DBpedia's q10 the parts' own vectors made about 1,416 of a walk's 1,450 budget calls:
+/// about 1,178 for their growths, in parallel, and 238 for their releases, serially in the
+/// merge; by those counts at most 11 of its 119 parts hold more than 64 groups (12 Nov).
+/// The slab is 1 KiB a part.
 pub(crate) const PART_BLOCK: usize = 64;
 
 /// The most bytes a group walk over `keys` keys charges, into an output that starts without
@@ -240,7 +241,18 @@ fn overflow_then_push(
         *refused = Some(error);
     }
 }
+
+/// A parallel part's groups, as the walk collects them: the first `len` of its block of the
+/// slab, or its own vector once it passed the block. No larger than the part's vector the
+/// walk collected before the slab, so the uncharged collection of the parts does not grow.
+enum Part<'b> {
+    Inline(usize),
+    Owned(ChargedVec<(u64, i64), &'b Budget>),
+}
+
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
+const _: () =
+    assert!(size_of::<Part<'static>>() <= size_of::<ChargedVec<(u64, i64), &'static Budget>>());
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
@@ -881,35 +893,46 @@ impl IndexVersion {
             let blocks = (cuts.len() - 1).saturating_mul(PART_BLOCK);
             let mut slab = ChargedVec::<(u64, i64), _>::with_capacity(budget, blocks)?;
             slab.resize(blocks, (0, 0))?;
+            // A refusal is kept beside the parts, as rayon's own collection of results keeps
+            // one: each part collected is no larger than its vector was ([`Part`]).
+            let refused = std::sync::OnceLock::new();
             let mut parts = Vec::new();
             cuts.par_windows(2)
                 .zip(slab.par_chunks_mut(PART_BLOCK))
                 .map(|(cut, block)| {
-                    let (mut len, mut own, mut refused) = (0, ChargedVec::new(budget), None);
+                    let (mut len, mut own, mut refusal) = (0, ChargedVec::new(budget), None);
                     perm.keys.groups(cut[0], cut[1], position, |value, i, j| {
                         let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
                         if let Some(slot) = block.get_mut(len) {
                             *slot = (value, count);
                             len += 1;
                         } else if let Err(group) = own.push_within((value, count)) {
-                            overflow_then_push(&mut own, block, group, &mut refused);
+                            overflow_then_push(&mut own, block, group, &mut refusal);
                         }
                     });
-                    refused.map_or(Ok((len, own)), Err)
+                    if let Some(error) = refusal {
+                        let _ = refused.set(error);
+                    }
+                    match own.is_empty() {
+                        true => Part::Inline(len),
+                        false => Part::Owned(own),
+                    }
                 })
                 .collect_into_vec(&mut parts);
-            // The first refusal in cut order, once every part has ended; the slab and the
-            // parts' own vectors are released as they drop.
-            let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
+            // A part's refusal, once every part has ended; the slab and the parts' own
+            // vectors are released as they drop.
+            if let Some(error) = refused.into_inner() {
+                return Err(error);
+            }
             // A part's groups: its block's first `len`, or its own vector, never an unused
             // slot.
             let each_part = || {
                 parts
                     .iter()
                     .zip(slab.chunks(PART_BLOCK))
-                    .map(|((len, own), block)| match own.is_empty() {
-                        true => &block[..*len],
-                        false => &own[..],
+                    .map(|(part, block)| match part {
+                        Part::Inline(len) => &block[..*len],
+                        Part::Owned(own) => &own[..],
                     })
             };
             // The merge's room at once, for exactly the groups it appends: a group spanning
