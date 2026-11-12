@@ -27,8 +27,9 @@ use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 #[derive(Clone)]
 pub struct StoreService {
     config: StoreConfig,
-    /// [`StoreConfig::process_memory_bytes`] as resolved at open (0: no limit).
-    process_memory: u64,
+    /// [`StoreConfig::process_memory_bytes`], found at its first need
+    /// ([`Self::process_memory_bytes`]).
+    process_memory: crate::ProcessMemory,
     engine: Engine,
     preloaded_ontology: Option<PathBuf>,
     /// Whether the reasoning state file may exist (see [`Self::reasoning_state`]); saves a
@@ -86,6 +87,21 @@ impl Drop for CertificateTransition<'_> {
 pub(crate) struct MemoryStop(Option<nrese_exec::memory::MemoryWatch>);
 
 impl MemoryStop {
+    /// The stop for a process memory limit as found ([`StoreService::process_memory_bytes`]):
+    /// none for 0; one that reads as unread where the limit couldn't be found, so the
+    /// operation has no room ([`Self::room`]) and stops ([`Self::exceeded`]): fail closed.
+    fn of(limit: nrese_exec::memory::Reading) -> Self {
+        use nrese_exec::memory::{MemoryWatch, Reading, Unread};
+        fn unread() -> Reading {
+            Err(Unread::Failed)
+        }
+        Self(match limit {
+            Ok(0) => None,
+            Ok(limit) => Some(MemoryWatch::new(limit)),
+            Err(_) => Some(MemoryWatch::with_reader(0, unread)),
+        })
+    }
+
     pub(crate) fn exceeded(&self) -> bool {
         self.0
             .as_ref()
@@ -149,11 +165,12 @@ impl fmt::Debug for StoreService {
 }
 
 impl StoreService {
-    pub fn new(mut config: StoreConfig) -> StoreResult<Self> {
-        let process_memory = config.process_memory_bytes.resolve()?;
-        config.process_memory_bytes = crate::ProcessMemory::Bytes(process_memory);
-        let runtime = std::sync::Arc::new(crate::Runtime::new(
-            process_memory,
+    pub fn new(config: StoreConfig) -> StoreResult<Self> {
+        config
+            .process_memory_bytes
+            .supported(nrese_exec::memory::READS_MEMORY)?;
+        let runtime = std::sync::Arc::new(crate::Runtime::for_process(
+            config.process_memory_bytes,
             config.total_query_memory_bytes,
         ));
         Self::with_runtime(config, runtime)
@@ -164,12 +181,12 @@ impl StoreService {
     /// The runtime's budgets apply, not `config.total_query_memory_bytes` or, for what is
     /// charged, `config.process_memory_bytes` (which stays this store's watch).
     pub fn with_runtime(
-        mut config: StoreConfig,
+        config: StoreConfig,
         runtime: std::sync::Arc<crate::Runtime>,
     ) -> StoreResult<Self> {
         config.validate()?;
-        let process_memory = config.process_memory_bytes.resolve()?;
-        config.process_memory_bytes = crate::ProcessMemory::Bytes(process_memory);
+        let process_memory = config.process_memory_bytes;
+        process_memory.supported(nrese_exec::memory::READS_MEMORY)?;
         // The process's settings, set once (D16-489): a later store's differ and are left.
         crate::process_settings::apply_process_settings(&config);
         let engine = match config.mode {
@@ -610,10 +627,13 @@ impl StoreService {
         &self.config
     }
 
-    /// The process memory limit this store watches ([`StoreConfig::process_memory_bytes`]
-    /// as resolved when it opened); 0: none.
-    pub fn process_memory_bytes(&self) -> u64 {
-        self.process_memory
+    /// The process memory limit this store watches ([`StoreConfig::process_memory_bytes`]);
+    /// 0: none, read nothing. Else found at this first need, from the memory the process may
+    /// use, read once per process ([`nrese_exec::memory::capacity`]; a later ask, or another
+    /// store's, reads nothing). Unread where that memory can't be read: what asked can't be
+    /// held to the limit, and stops (fail closed).
+    pub fn process_memory_bytes(&self) -> nrese_exec::memory::Reading {
+        self.process_memory.bytes_with(nrese_exec::memory::capacity)
     }
 
     pub fn preloaded_ontology_path(&self) -> Option<&Path> {
@@ -2013,9 +2033,11 @@ impl StoreService {
 
     /// An operation's stop under this store's process-memory policy; zero disables it.
     /// Opening a store never changes the process owner's global safety fallback.
+    /// The limit is found here, at the operation's start ([`Self::process_memory_bytes`]);
+    /// where it can't be, the watch reads as unread: the operation has no room and stops
+    /// ([`nrese_exec::memory::MemoryStopCause::Unread`]).
     pub(crate) fn memory_stop(&self) -> MemoryStop {
-        let limit = self.process_memory;
-        MemoryStop((limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit)))
+        MemoryStop::of(self.process_memory_bytes())
     }
 
     /// A part of the process's budget ([`crate::Runtime::memory`]) of its own, for what
@@ -2882,5 +2904,22 @@ mod memory_stop_tests {
             Some(StoreError::ProcessMemoryLimit { .. })
         ));
         assert!(error(None).is_none());
+    }
+
+    /// D2, A-902: a process limit that couldn't be found (its memory unread at the limit's
+    /// first need) leaves the operation no room and stops it as unread, never as "no
+    /// limit"; none (0) watches nothing.
+    #[test]
+    fn a_limit_that_couldnt_be_found_stops_the_operation() {
+        let stop = MemoryStop::of(Err(Unread::Failed));
+        assert_eq!(stop.room(), Err(Unread::Failed));
+        assert!(stop.exceeded());
+        assert!(matches!(
+            stop.error(Interrupted::default()),
+            Some(StoreError::MemoryUnreadable { .. })
+        ));
+        let none = MemoryStop::of(Ok(0));
+        assert!(!none.exceeded());
+        assert_eq!(none.room(), Ok(u64::MAX));
     }
 }

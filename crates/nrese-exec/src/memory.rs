@@ -135,8 +135,19 @@ pub fn resident_bytes() -> Reading {
 /// limits it runs under (on Linux its cgroup's and every ancestor's, so a container, a
 /// Kubernetes pod or a systemd scope counts; on Windows its job object's).
 pub fn available_bytes() -> Reading {
+    SYSTEM_READINGS.fetch_add(1, Ordering::Relaxed);
     reading(imp::available_bytes())
 }
+
+/// How many times the process has read the system's memory ([`available_bytes`],
+/// [`remaining_bytes`]: on Linux each a discovery of its cgroups), so a check can show that
+/// none is taken where none belongs, on an operation's path. Not the process's own counter
+/// ([`process_bytes`]).
+pub fn system_readings() -> u64 {
+    SYSTEM_READINGS.load(Ordering::Relaxed)
+}
+
+static SYSTEM_READINGS: AtomicU64 = AtomicU64::new(0);
 
 /// The memory the process could still take now, as the system reports it: on Linux the
 /// least of the machine's available memory (`MemAvailable`) and what its cgroups leave
@@ -148,7 +159,43 @@ pub fn available_bytes() -> Reading {
 /// admitting an operation as it starts, never a reservation: what it reports is taken by
 /// whoever allocates first.
 pub fn remaining_bytes() -> Reading {
+    SYSTEM_READINGS.fetch_add(1, Ordering::Relaxed);
     reading(imp::remaining_bytes())
+}
+
+/// [`available_bytes`], read once per process, at its first need: a total, which doesn't
+/// change while the process runs (its container's or job's limit, the machine's memory), so
+/// every limit that is a share of it or capped by it asks here, and a store's open asks
+/// nothing. Concurrent first asks read once, the others waiting for that reading. A failed
+/// reading isn't kept: the asker gets it, and the next ask reads again (on a host where it
+/// keeps failing, each operation that needs the limit reads and is refused).
+pub fn capacity() -> Reading {
+    let known = CAPACITY.load(Ordering::Relaxed);
+    if known != 0 {
+        return Ok(known);
+    }
+    let _reading = CAPACITY_READING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known = CAPACITY.load(Ordering::Relaxed);
+    if known != 0 {
+        return Ok(known);
+    }
+    let read = available_bytes()?;
+    CAPACITY.store(read, Ordering::Relaxed);
+    Ok(read)
+}
+
+/// [`capacity`]'s reading once taken; 0 before.
+static CAPACITY: AtomicU64 = AtomicU64::new(0);
+/// Held while [`capacity`] is read, so that concurrent first asks read once.
+static CAPACITY_READING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The process's memory limit a setting means, in a process that may use `capacity` bytes
+/// ([`capacity`]): `explicit` bytes, never more than the capacity (a limit the system would
+/// never let the process reach is no limit), else three quarters of the capacity.
+pub fn limit_within(explicit: Option<u64>, capacity: u64) -> u64 {
+    explicit.map_or(capacity / 4 * 3, |bytes| bytes.min(capacity))
 }
 
 /// Why a memory limit stopped the work ([`MemoryWatch::cause`], [`process_limit_stop`]).

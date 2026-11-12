@@ -97,6 +97,7 @@ fn an_engine_memory_refusal_is_the_store_memory_limit() {
         requested: 1,
         used: 0,
         shared: false,
+        unread: false,
     };
     let refused = StoreError::from(nrese_engine::EngineError::MemoryLimit(exceeded));
     assert!(refused.is_memory_limit(), "{refused:?}");

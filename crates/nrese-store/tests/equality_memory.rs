@@ -81,7 +81,7 @@ fn a_rematerialisation_is_refused_by_the_stores_own_limit_before_the_copies() {
             Arc::new(ReasonerService::new(ReasonerConfig::default())),
         );
         writer.execute_update_str(&data()).expect("the data loads");
-        let limit = store.process_memory_bytes();
+        let limit = store.process_memory_bytes().expect("the limit reads here");
         let (result, peak) = peak(|| store.rematerialise(Ruleset::Owl2Rl));
         let error = result.expect_err("the copies were made");
         assert!(
@@ -112,7 +112,7 @@ fn a_commits_maintenance_is_refused_by_the_stores_own_limit_before_the_copies() 
                 ReasoningMode::Owl2Rl,
             ))),
         );
-        let limit = store.process_memory_bytes();
+        let limit = store.process_memory_bytes().expect("the limit reads here");
         let (result, peak) = peak(|| {
             pipeline.apply(
                 MutationCommand::Update(SparqlUpdateRequest::new(data())),

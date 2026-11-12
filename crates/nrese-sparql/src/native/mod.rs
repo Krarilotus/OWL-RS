@@ -1912,6 +1912,7 @@ impl<'a> Context<'a> {
             requested: requested.saturating_mul(2),
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
+            unread: false,
         })
         .into()
     }

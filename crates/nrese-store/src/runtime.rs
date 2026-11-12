@@ -21,6 +21,23 @@ impl Runtime {
         let memory = (process_memory_bytes > 0).then(|| {
             SharedBudget::new(usize::try_from(process_memory_bytes).unwrap_or(usize::MAX))
         });
+        Self::within(memory, query_memory_bytes)
+    }
+
+    /// [`Self::new`] for the process's memory as a store's setting gives it: none (0), or a
+    /// limit found at its first need ([`SharedBudget::lazy`], from
+    /// [`nrese_exec::memory::capacity`]), so that making the runtime reads nothing.
+    pub fn for_process(memory: crate::ProcessMemory, query_memory_bytes: usize) -> Self {
+        let memory = match memory {
+            crate::ProcessMemory::Bytes(0) => None,
+            crate::ProcessMemory::Bytes(bytes) => Some(Some(bytes)),
+            crate::ProcessMemory::Default => Some(None),
+        }
+        .map(|explicit| SharedBudget::lazy(explicit, nrese_exec::memory::capacity));
+        Self::within(memory, query_memory_bytes)
+    }
+
+    fn within(memory: Option<Arc<SharedBudget>>, query_memory_bytes: usize) -> Self {
         let query_memory = (query_memory_bytes > 0).then(|| match &memory {
             Some(memory) => SharedBudget::within(query_memory_bytes, Arc::clone(memory)),
             None => SharedBudget::new(query_memory_bytes),
