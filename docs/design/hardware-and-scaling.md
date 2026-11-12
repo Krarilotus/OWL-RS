@@ -156,7 +156,7 @@ the stored data alone does not bound a load's, query's or materialisation's memo
 available: candidates are vector similarity search (V1), very large hash joins and
 aggregations, and semi-naive rule materialisation over huge closures. Each one only after
 the perf lab shows the CPU version is the bottleneck on that workload; the GPU's transfer
-cost decides as much as its speed. The research so far (wiki: *R3-S6 GPU*): a recursive
+cost decides as much as its speed. The research so far: a recursive
 stratum stays resident on the GPU (joins and merging both, GDlog's profile is about 40 %
 each); dispatch by bytes moved and reuse, not by rows; dense recursive closures (transitive
 closure, same generation) gain most (FVLog, SRDatalog), LUBM-style closures may not pay. Open

@@ -67,7 +67,7 @@ Three causes:
 `depth_tests::stack_per_level` (`nrese-sparql`, ignored, a measurement) finds the smallest
 stack, to 1 KiB, that each shape answers on through parse, plan, EXPLAIN and evaluation
 with the result cache, one process per run. It measures each nested shape at the deepest
-the parser accepts (n) and at 4 n with the limit lifted. Measured on office-pc on
+the parser accepts (n) and at 4 n with the limit lifted. Measured on host A on
 12 October; release, with the test profile in brackets:
 
 | Shape | n at the limit | KiB at n | Bytes per step |

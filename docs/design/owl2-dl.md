@@ -458,7 +458,6 @@ functional forward roles. 906 is (20, 30, 600), 907 (200, 300, 60,000), consiste
 need exponential resolution proofs and have polynomial cutting-plane ones (paper says,
 Buresh-Oppenheim et al. 2003 citing Haken 1985 and Cook et al. 1987). The search gives up
 on 906 from `n = 3, m = 4`, and 907's 60,000 pairwise-unequal successors exceed memory.
-(Wiki: *Cardinality reasoning and pigeonhole cases*, with the review of 7 October.)
 
 **Four layers, the trust boundary in the types:**
 1. **Extraction** to a `NumberProblem`, within a syntactic fragment: singleton nominals,
