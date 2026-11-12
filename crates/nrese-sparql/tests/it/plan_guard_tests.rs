@@ -235,7 +235,7 @@ fn string_filters_scan_a_bulk_load_in_one_loop() {
 }
 
 /// Sideways information passing: a pattern joined to rows already computed is evaluated
-/// from them, probing the index per row (Zebratlas Q03: about 1,200x).
+/// from them, probing the index per row (a provenance query: about 1,200x).
 #[test]
 fn patterns_joined_to_rows_are_evaluated_from_them() {
     let steps = steps(
