@@ -74,7 +74,7 @@ The suite's Apptainer path was run in WSL (Ubuntu 24.04, Apptainer 1.5.4) with S
 
 ## Before a number is published
 
-- Licensed systems (GraphDB, RDFox, Stardog, AnzoGraph): written permission from the vendor, recorded in [../competitors/README.md](../competitors/README.md). Their licence files stay outside the repository.
+- Licensed systems: written permission from the vendor, recorded in [../competitors/README.md](../competitors/README.md). Their licence files stay outside the repository.
 - The workload: the agreement of its authors, and a licence or citation for the queries.
 - At least three jobs per system and tier, on the same node type; report the median and the spread.
 - Ask the computing centre whether and how the cluster is to be acknowledged in a publication.

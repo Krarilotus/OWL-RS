@@ -2,7 +2,7 @@
 
 This kit is the headline evidence for NRESE: ontology reasoning measured against the systems that reason today, with every result checked for correctness. The plan and task definitions (RT1–RT7) are in [docs/design/reasoning-benchmark.md](../../docs/design/reasoning-benchmark.md). The load and query basics are measured separately, in [../competitors](../competitors/README.md).
 
-The licence rules in [../competitors/README.md](../competitors/README.md) apply unchanged: GraphDB, RDFox, AnzoGraph and Stardog results stay in the git-ignored `results/` unless the vendor gives written permission.
+The licence rules in [../competitors/README.md](../competitors/README.md) apply unchanged: licensed systems' results stay in the git-ignored `results/` unless the vendor gives written permission.
 
 ## Quick start
 
