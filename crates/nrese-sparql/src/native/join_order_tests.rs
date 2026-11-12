@@ -457,17 +457,25 @@ fn path_join(pattern: &GraphPattern) -> Option<super::path_joins::PathJoin<'_>> 
 /// index order puts it right after the pattern's constants, else the pattern's matches,
 /// as the caller counts them. From the statistics: a predicate variable beside others
 /// (the store's 21 predicates). The matches: a variable alone, a variable at two
-/// positions beside another, a pattern in the named graphs. Green before and after the
-/// allocation cleanup of `distinct` by design.
+/// positions beside another, a pattern in a named graph (whose statistics would give 2,
+/// its two `knows` subjects). Green before and after the allocation cleanup of
+/// `distinct` by design.
 #[test]
 fn distinct_values_come_from_the_statistics_where_an_order_fits() {
     let engine = people();
+    let e = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+    let mut tx = engine.transaction();
+    for (s, o) in [("n0", "n1"), ("n0", "n2"), ("n1", "n2")] {
+        let graph = GraphName::NamedNode(e("g"));
+        tx.insert(Quad::new(e(s), e("knows"), e(o), graph).as_ref());
+    }
+    tx.commit().unwrap();
     let snapshot = engine.snapshot();
     let options = QueryOptions::default();
     let ctx = Context::new(&snapshot, &options, None, None);
     let var = Variable::new_unchecked;
     let mut named = scan(&snapshot, "?x knows ?y");
-    named.slots[3] = Slot::Var(var("g"));
+    named.slots[3] = Slot::Const(snapshot.lookup(e("g").as_ref().into()).expect("g"));
     for (what, pattern, variable, expected) in [
         ("a predicate variable", scan(&snapshot, "?x ?p ?o"), "p", 21),
         (
@@ -477,7 +485,7 @@ fn distinct_values_come_from_the_statistics_where_an_order_fits() {
             1_234,
         ),
         ("at two positions", scan(&snapshot, "?x ?p ?x"), "x", 1_234),
-        ("in the named graphs", named, "x", 1_234),
+        ("in a named graph", named, "x", 1_234),
     ] {
         let distinct = ctx.distinct(&pattern, &var(variable), 1_234);
         assert_eq!(distinct, expected, "{what}");
