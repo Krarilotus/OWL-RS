@@ -611,7 +611,9 @@ def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] 
         dims = [f"time/{s}" for s in series]
         dims += [f"qps/{n}" for n in manifest_["clients"].get(name, [])]
         dims.append("memory/anon_kernel")
-        if "--count-allocations" in case.get("args", []):
+        # The perf lab's peak live bytes exist only where the case counts them (--count-live);
+        # --count-allocations alone counts calls and bytes, as the baselines' perf labs do.
+        if "--count-live" in case.get("args", []):
             dims.append("memory/live")
         out += [hypothesis(side, name, d) for side in baselines if side not in case.get("absent", {}) for d in dims]
     return out

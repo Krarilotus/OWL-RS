@@ -422,8 +422,9 @@ every exception the candidate didn't need. The list starts empty.
 anonymous and kernel memory at its peak (Linux: `anon` + `kernel` of the case's cgroup
 `memory.stat`, sampled every 50 ms by fast.py outside the measured process; the file cache the
 case's reads were charged is left out, it depends on what the host had cached: rl-lubm100 2.3 GB
-of 4.7) and, with `--count-allocations`, the perf lab's peak live requested bytes (allocated
-and not yet freed; `requested_mib` is the cumulative total, never a peak). Reported, never
+of 4.7) and, with `--count-live`, the perf lab's peak live requested bytes (allocated and not
+yet freed; `requested_mib`, counted with `--count-allocations`, is the cumulative total, never a
+peak; `--count-allocations` alone counts calls and bytes, as the baselines' perf labs do). Reported, never
 tested: the process's own peak by its kind (`peak_kind`: VmHWM on Linux; on Windows
 `peak_private_commit`, PeakPagefileUsage, beside `peak_working_set_bytes`), each phase's peak
 (its own window: none where the platform can't start one, never the lifetime's under the
