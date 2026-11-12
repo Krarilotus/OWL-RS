@@ -135,11 +135,16 @@ static GLOBAL: nrese_exec::heap::Counting<mimalloc::MiMalloc> =
     nrese_exec::heap::Counting(mimalloc::MiMalloc);
 
 /// Whether allocations are counted (`--count-allocations`), and the counts: allocations and
-/// the bytes they requested in all (cumulative, never lowered by a free), and the bytes
-/// requested and not yet freed (`LIVE`, from when counting began: frees of earlier allocations
-/// can take it below zero) with its high-water mark (`PEAK_LIVE`, reset to `LIVE` when a phase
-/// starts: the peak live requested bytes of that phase).
+/// the bytes they requested in all (cumulative, never lowered by a free). Whether live bytes
+/// are counted (`--count-live`): the bytes requested and not yet freed (`LIVE`, from when
+/// counting began: frees of earlier allocations can take it below zero) with its high-water
+/// mark (`PEAK_LIVE`, reset to `LIVE` when a phase starts: the peak live requested bytes of
+/// that phase). Live counting has its own switch because every allocation and free then adds
+/// to one count all threads share: a 10 M-statement load with 16 threads took 2.7 times as
+/// long as uncounted, where calls and bytes alone (what base's perf lab counts) cost 1.2 times.
+/// A case timed against a baseline counts calls and bytes only, as the baseline does.
 static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+static COUNT_LIVE: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicI64 = AtomicI64::new(0);
@@ -169,7 +174,7 @@ impl Counting {
     /// `delta` live bytes more (a successful allocation's size, a free's negated, a successful
     /// reallocation's difference); the high-water mark follows, without allocating.
     fn live(delta: i64) {
-        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+        if COUNT_LIVE.load(Ordering::Relaxed) {
             let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
             raise(&PEAK_LIVE, now);
             raise(&LIVE_PEAK_RUN, now);
@@ -249,18 +254,19 @@ fn allocations() -> (u64, u64) {
 /// frees), counted at the allocator for this thread's own allocations and frees while `f`
 /// runs: other threads' count nothing, whatever they do meanwhile. What `f` lets go of that
 /// another thread still holds, and frees later there, isn't counted: a lower bound of what
-/// `f` releases. One measurement at a time in the process (counting is switched on for it).
-/// `None` under another allocator (`system_alloc`, `alloc_profile`): nothing is counted there.
+/// `f` releases. One measurement at a time in the process (live counting is switched on for
+/// it). `None` under another allocator (`system_alloc`, `alloc_profile`): nothing is counted
+/// there.
 pub(crate) fn bytes_freed_by(f: impl FnOnce()) -> Option<i64> {
     if cfg!(any(system_alloc, alloc_profile)) {
         f();
         return None;
     }
-    let counting = COUNT_ALLOCATIONS.swap(true, Ordering::SeqCst);
+    let counting = COUNT_LIVE.swap(true, Ordering::SeqCst);
     HERE.set(Some(0));
     f();
     let changed = HERE.replace(None).unwrap_or(0);
-    COUNT_ALLOCATIONS.store(counting, Ordering::SeqCst);
+    COUNT_LIVE.store(counting, Ordering::SeqCst);
     Some(-changed)
 }
 
@@ -309,6 +315,61 @@ mod freed_tests {
         drop(other.join().expect("the other thread"));
         assert_eq!(freed, Some(4096));
     }
+
+    /// `--count-allocations` alone counts calls and bytes, as base's perf lab does: the live
+    /// count (and so its peaks) stays where it was, however much is held. (Holding `ONE`: no
+    /// `bytes_freed_by` switches live counting on meanwhile.)
+    #[test]
+    fn counting_allocations_alone_leaves_the_live_count_alone() {
+        use std::sync::atomic::Ordering;
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let (counting, live) = (
+            super::COUNT_ALLOCATIONS.swap(true, Ordering::SeqCst),
+            super::COUNT_LIVE.swap(false, Ordering::SeqCst),
+        );
+        let (before, calls) = (super::LIVE.load(Ordering::Relaxed), super::allocations().0);
+        let held = black_box(vec![5u8; 1 << 20]);
+        let (after, counted) = (super::LIVE.load(Ordering::Relaxed), super::allocations().0);
+        drop(held);
+        super::COUNT_ALLOCATIONS.store(counting, Ordering::SeqCst);
+        super::COUNT_LIVE.store(live, Ordering::SeqCst);
+        assert_eq!(after - before, 0, "live bytes counted without --count-live");
+        assert!(counted > calls, "the allocation was not counted");
+    }
+
+    /// A phase's JSON under each switch: `--count-allocations` alone gives its allocations and
+    /// no live peak; with `--count-live` also the live peak. (Which fields, not their values:
+    /// other test threads allocate meanwhile; the peak's arithmetic is `peak_tests`'.)
+    #[test]
+    fn a_phase_gives_its_live_peak_only_when_live_bytes_are_counted() {
+        use std::sync::atomic::Ordering;
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let (counting, live) = (
+            super::COUNT_ALLOCATIONS.swap(true, Ordering::SeqCst),
+            super::COUNT_LIVE.load(Ordering::SeqCst),
+        );
+        let phase_with = |count_live: bool| {
+            super::COUNT_LIVE.store(count_live, Ordering::SeqCst);
+            let phase = super::Phase::start();
+            let held = black_box(vec![6u8; 1 << 20]);
+            let json = phase.json();
+            drop(held);
+            serde_json::from_str::<serde_json::Value>(&json).expect("a JSON object")
+        };
+        let (alone, both) = (phase_with(false), phase_with(true));
+        super::COUNT_ALLOCATIONS.store(counting, Ordering::SeqCst);
+        super::COUNT_LIVE.store(live, Ordering::SeqCst);
+        let field = |json: &serde_json::Value| json.get("peak_live_requested_bytes").cloned();
+        assert_eq!(field(&alone), None, "a live peak without --count-live");
+        assert!(
+            field(&both).is_some_and(|peak| peak.is_i64()),
+            "no live peak with --count-live"
+        );
+        assert!(
+            alone["allocations"].as_u64() >= Some(1),
+            "the phase's allocations"
+        );
+    }
 }
 
 /// `raise`: the high-water mark of the live counts it is given, though it writes only on a
@@ -345,17 +406,22 @@ impl Phase {
     }
 
     /// `{"peak_mib": .., "allocations": .., "requested_mib": .., "peak_live_requested_bytes": ..}`
-    /// since `start`.
+    /// since `start` (the counts with `--count-allocations`, the live peak with `--count-live`).
     fn json(&self) -> String {
         let (count, bytes) = allocations();
         let peak = nrese_exec::memory::window_peak_bytes()
             .map_or("null".to_owned(), |peak| (peak / 1048576).to_string());
+        let live = if COUNT_LIVE.load(Ordering::Relaxed) {
+            let peak_live = PEAK_LIVE.load(Ordering::Relaxed).max(0);
+            format!(", \"peak_live_requested_bytes\": {peak_live}")
+        } else {
+            String::new()
+        };
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
             format!(
-                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"requested_mib\": {}, \"peak_live_requested_bytes\": {}}}",
+                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"requested_mib\": {}{live}}}",
                 count - self.allocations.0,
                 (bytes - self.allocations.1) / 1048576,
-                PEAK_LIVE.load(Ordering::Relaxed).max(0)
             )
         } else {
             format!("{{\"peak_mib\": {peak}}}")
@@ -398,6 +464,7 @@ struct Args {
     export: Option<PathBuf>,
     canonicalize: Vec<PathBuf>,
     count_allocations: bool,
+    count_live: bool,
     parse_only: bool,
     kernel: Option<String>,
     parse_turtle: Option<PathBuf>,
@@ -455,6 +522,7 @@ fn parse_args() -> Result<Args, String> {
         export: None,
         canonicalize: Vec::new(),
         count_allocations: false,
+        count_live: false,
         parse_only: false,
         kernel: None,
         parse_turtle: None,
@@ -551,6 +619,7 @@ fn parse_args() -> Result<Args, String> {
             "--export" => args.export = Some(value()?.into()),
             "--canonicalize" => args.canonicalize.push(value()?.into()),
             "--count-allocations" => args.count_allocations = true,
+            "--count-live" => (args.count_allocations, args.count_live) = (true, true),
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
             "--parse-turtle" => args.parse_turtle = Some(value()?.into()),
@@ -1158,7 +1227,7 @@ impl Report {
             .map(|(key, value)| format!("\n  \"{key}\": {value},"))
             .collect();
         // What `peak_mib` measures, by name, and the working set's peak where the platform
-        // keeps one (Windows); with counted allocations, the run's peak live requested bytes.
+        // keeps one (Windows); with counted live bytes, the run's peak live requested bytes.
         sections.push_str(&format!(
             "\n  \"peak_kind\": {:?},",
             nrese_exec::memory::peak_kind()
@@ -1166,7 +1235,7 @@ impl Report {
         if let Ok(peak) = nrese_exec::memory::peak_working_set_bytes() {
             sections.push_str(&format!("\n  \"peak_working_set_bytes\": {peak},"));
         }
-        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+        if COUNT_LIVE.load(Ordering::Relaxed) {
             sections.push_str(&format!(
                 "\n  \"peak_live_requested_bytes\": {},",
                 LIVE_PEAK_RUN.load(Ordering::Relaxed).max(0)
@@ -1306,6 +1375,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
+    COUNT_LIVE.store(args.count_live, Ordering::Relaxed);
     if let Some(kernel) = &args.kernel {
         report
             .sections
