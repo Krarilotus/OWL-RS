@@ -205,7 +205,7 @@ impl Context<'_> {
         let hints: Vec<ranges::Hint> = join
             .conjuncts
             .iter()
-            .flat_map(|c| ranges::hints(c, &self.snapshot))
+            .flat_map(|c| ranges::hints_without_date_times(c, &self.snapshot))
             .collect();
         let mut result: Option<Solutions> = None;
         let mut at = 0;

@@ -311,17 +311,16 @@ fn digits(s: &str, range: std::ops::Range<usize>) -> Option<u32> {
         .then(|| field.parse().ok())?
 }
 
-/// `YYYY-MM-DD` with a year 0000–9999 and a real calendar day; returns the date bits.
-/// A `Date` id bound one local day before (`later == false`) or after `id`, for FILTER range
-/// scans: a date with a timezone and one without compare indeterminately when their local
-/// dates are less than a day (±14 h) apart, so a range over dates is widened by a day and
-/// its edges are checked by the full comparison. The bound needn't be a real date; it only
-/// has to order correctly (fields are compared as year, month, day, timezone).
 /// The timezone field of a date or dateTime payload (the lowest bits of both).
 pub(crate) fn timezone_code(payload: u64) -> u64 {
     payload & ((1 << TIMEZONE_BITS) - 1)
 }
 
+/// A `Date` id bound one local day before (`later == false`) or after `id`, for FILTER range
+/// scans: a date with a timezone and one without compare indeterminately when their local
+/// dates are less than a day (±14 h) apart, so a range over dates is widened by a day and
+/// its edges are checked by the full comparison. The bound needn't be a real date; it only
+/// has to order correctly (fields are compared as year, month, day, timezone).
 pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
     if id.kind() != TermKind::Date {
         return None;
@@ -356,6 +355,34 @@ pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
     ))
 }
 
+/// A `DateTime` id bound two local days before (`later == false`) or after `id`, at its
+/// clock and fraction, with the smallest or largest timezone code, for FILTER range scans.
+/// Inline dateTimes sort by local date and time, then timezone code, but compare by instant
+/// (with a timezone on one side only, within ±14 h of it). Both sides can be ±14 h off UTC,
+/// so a value that passes can lie up to 28 h of local time beyond the bound: under the
+/// engine's order and under XPath's implicit timezone alike. Two days cover that, and the
+/// full comparison decides the edges. The days step as [`date_widened`]'s, across months,
+/// leap days and years; past the inline years its bound is below 0000-01-01 or in year
+/// 10000, beyond every inline dateTime.
+pub(crate) fn date_time_widened(id: TermId, later: bool) -> Option<TermId> {
+    if id.kind() != TermKind::DateTime {
+        return None;
+    }
+    let bits = id.payload() >> TIMEZONE_BITS;
+    let (date, time) = (bits >> 27, bits & ((1 << 27) - 1));
+    // The date as a `Date` id, moved a day at a time by the date code.
+    let mut day = TermId::new(TermKind::Date, date << TIMEZONE_BITS);
+    for _ in 0..2 {
+        day = date_widened(day, later)?;
+    }
+    let date = day.payload() >> TIMEZONE_BITS;
+    let timezone = if later { (1 << TIMEZONE_BITS) - 1 } else { 0 };
+    Some(TermId::new(
+        TermKind::DateTime,
+        (((date << 27) | time) << TIMEZONE_BITS) | timezone,
+    ))
+}
+
 /// Bits below the year in a date payload (month, day, timezone) and in a dateTime payload
 /// (month, day, time of day, timezone).
 const DATE_YEAR_SHIFT: u32 = 9 + TIMEZONE_BITS;
@@ -377,6 +404,7 @@ pub(crate) fn year_range(kind: TermKind, low: u32, high: u32) -> Option<(TermId,
     ))
 }
 
+/// `YYYY-MM-DD` with a year 0000–9999 and a real calendar day; returns the date bits.
 fn parse_date_part(s: &str) -> Option<u64> {
     if s.len() != 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
         return None;
