@@ -459,3 +459,46 @@ fn explain_shows_a_cyclic_bgp_planned_without_the_sets() {
         "{trace:#?}"
     );
 }
+
+/// Spec: the code review's round 3 re-check (a note per BGP, once): a cyclic BGP joined with
+/// a property path it shares no variable with is planned with the path (3 patterns and 1
+/// path), which notes that planning; its patterns then run as a worst-case-optimal join.
+/// Past the budget, executed EXPLAIN shows that planning once, not also the estimate's.
+#[test]
+fn explain_notes_a_cyclic_bgp_planned_with_a_path_once() {
+    let nodes: Vec<String> = (0..=10).map(|i| format!("x{i}")).collect();
+    let mut triples = vec![("a", "p", "b"), ("b", "q", "c"), ("c", "r", "a")];
+    for edge in nodes.windows(2) {
+        triples.push((edge[0].as_str(), "s", edge[1].as_str()));
+    }
+    let engine = graph(&triples);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let text = "SELECT * WHERE { ?a <http://e/p> ?b . ?b <http://e/q> ?c . \
+                ?c <http://e/r> ?a . ?x <http://e/s>+ ?y }";
+    let query = Query::parse(text, None).unwrap();
+    let explained = |budget: usize| {
+        BUDGET.set(budget);
+        let explained = explain(&snapshot, &query, &options);
+        BUDGET.set(plan::SET_BUDGET);
+        explained.unwrap().1
+    };
+    let trace = explained(0);
+    for operator in ["paths ordered with patterns", "wcoj"] {
+        assert!(
+            trace.iter().any(|s| s.operator == operator),
+            "{operator}: {trace:#?}"
+        );
+    }
+    let notes: Vec<_> = trace
+        .iter()
+        .filter(|s| s.operator == "join order")
+        .collect();
+    assert_eq!(notes.len(), 1, "{trace:#?}");
+    assert_eq!(noted_work(&notes[0].detail, 4, 0), 0);
+    let trace = explained(plan::SET_BUDGET);
+    assert!(
+        trace.iter().all(|s| s.operator != "join order"),
+        "{trace:#?}"
+    );
+}

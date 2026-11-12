@@ -2104,12 +2104,15 @@ impl<'a> Context<'a> {
             let step = &mut trace[index];
             step.rows = solutions.table.len() as u64;
             step.micros = start.elapsed().as_micros() as u64;
-            // A cyclic BGP the operator ran by a worst-case-optimal join isn't planned again:
-            // its estimate's note goes first under the operator, where planning would put it.
-            let joined = trace[index + 1..]
-                .iter()
-                .any(|s| s.depth == depth + 1 && s.operator == "wcoj");
-            if joined {
+            // A cyclic BGP the operator ran by a worst-case-optimal join without planning it
+            // again (a join with paths plans it with them, and notes that): its estimate's
+            // note goes first under the operator, where planning would put it.
+            let ran = |operator: &str| {
+                trace[index + 1..]
+                    .iter()
+                    .any(|s| s.depth == depth + 1 && s.operator == operator)
+            };
+            if ran("wcoj") && !ran(WITHOUT_SETS) {
                 let below = trace.split_off(index + 1);
                 let notes = planned.into_iter().filter(|s| s.operator == WITHOUT_SETS);
                 trace.extend(notes.map(|s| PlanStep {
