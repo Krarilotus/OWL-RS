@@ -444,9 +444,10 @@ fn walk_by_subject_on(
 }
 
 /// A walk that fits its budget is answered, however its parts start: two parallel parts of
-/// one group each, whose merge appends that one group, need a few hundred bytes, and under
-/// 32 KiB they are answered with the group's whole count. The room a part asks for ahead is
-/// optional (D16-039, package review r1 SC-R1-01): none of it may refuse the merge.
+/// one group each, whose merge appends that one group, need about 2 KiB with their slab,
+/// and under 32 KiB they are answered with the group's whole count. The room a part asks
+/// for ahead is optional (D16-039, package review r1 SC-R1-01): none of it may refuse the
+/// merge.
 #[test]
 fn a_walk_in_parts_that_fits_its_budget_is_answered() {
     let rows = 2 * super::GROUP_PART as u64;
@@ -456,9 +457,10 @@ fn a_walk_in_parts_that_fits_its_budget_is_answered() {
 }
 
 /// Parts of uneven size, as the parts of a real walk are: one of a single group, one of 513.
-/// Grown as the groups come, they peak near 24.7 KiB with their merge, and under 32 KiB the
-/// walk is answered: no part's room asked ahead and left unfilled may take the merge's
-/// (package fix check r2: a part held 16 KiB for one group, and the merge of 514 was refused).
+/// Grown as the groups come, they peak near 26 KiB with their merge and slab, and under
+/// 32 KiB the walk is answered: no part's room asked ahead and left unfilled may take the
+/// merge's (package fix check r2: a part held 16 KiB for one group, and the merge of 514 was
+/// refused).
 #[test]
 fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
     let part = super::GROUP_PART as u64;
@@ -666,11 +668,12 @@ fn a_walk_charges_at_most_its_bound() {
     const PART: u64 = super::GROUP_PART as u64;
     // Rows, each row's subject, and whether the range is walked in parts.
     type Shape = (u64, fn(u64) -> u64, bool);
-    let shapes: [Shape; 4] = [
+    let shapes: [Shape; 5] = [
         (2 * PART, |_| 1000, true),
         (2 * PART, |i| 1000 + i, true),
         (2 * PART, |i| 1000 + i * 16_385 / PART, true),
         (2 * PART - 1, |i| 1000 + i, false),
+        (MIXED_ROWS, mixed_subject, true),
     ];
     for (rows, subject, in_parts) in shapes {
         let (version, plan) = subject_walk(rows, subject);
@@ -691,6 +694,191 @@ fn a_walk_charges_at_most_its_bound() {
                 super::group_walk_peak(keys, parts)
             );
         }
+    }
+}
+
+/// The subject of key `i` of `rows` keys in parts of `GROUP_PART` keys, as a walk in parts
+/// cuts them: part `p` holds `groups[p]` groups of about equal size, the first of them the
+/// last of part `p - 1` where `spans[p - 1]`.
+fn subject_in_parts(i: u64, rows: u64, groups: &[u64], spans: &[bool]) -> u64 {
+    const PART: u64 = super::GROUP_PART as u64;
+    let part = (i / PART) as usize;
+    let first = (0..part).fold(1000, |first, p| first + groups[p] - u64::from(spans[p]));
+    let len = PART.min(rows - part as u64 * PART);
+    first + (i % PART) * groups[part] / len
+}
+
+/// The groups of a part's block of the slab (`PART_BLOCK`).
+const C: u64 = super::PART_BLOCK as u64;
+/// Parts of a full block, one group past it, one past twice it (its own vector grown once
+/// more), a single group and many: a block's every state, beside one another.
+const MIXED_GROUPS: [u64; 5] = [C, C + 1, 2 * C + 1, 1, 5 * C + 1];
+/// The groups across cuts: part 0's last into part 1, and one group from part 2 through
+/// part 3 into part 4, across two cuts.
+const MIXED_SPANS: [bool; 4] = [true, false, true, true];
+const MIXED_ROWS: u64 = 4 * super::GROUP_PART as u64 + 40_000;
+
+fn mixed_subject(i: u64) -> u64 {
+    subject_in_parts(i, MIXED_ROWS, &MIXED_GROUPS, &MIXED_SPANS)
+}
+
+/// Group counts of large runs walked in parts, past their blocks of the slab or not, equal an
+/// independent count (`group_counts`' contract): each run's groups in value order, a value
+/// once per run however many cuts its group spans, its count the run's quads less its
+/// deletions (signed). Over a run of [`MIXED_GROUPS`] and a later run of deletions and
+/// inserts, in parts and serially; no refusal under room for the walk, nothing held once
+/// dropped.
+#[test]
+fn group_counts_in_parts_past_their_blocks_equal_the_reference() {
+    const PART: u64 = super::GROUP_PART as u64;
+    // The shape's own check: each part holds the groups it is built to.
+    let per_part: Vec<u64> = (0..MIXED_ROWS.div_ceil(PART))
+        .map(|p| {
+            let mut subjects: Vec<u64> = (p * PART..MIXED_ROWS.min((p + 1) * PART))
+                .map(mixed_subject)
+                .collect();
+            subjects.dedup();
+            subjects.len() as u64
+        })
+        .collect();
+    assert_eq!(per_part, MIXED_GROUPS);
+    let base: Vec<EncodedQuad> = (0..MIXED_ROWS)
+        .map(|i| EncodedQuad::new(term(mixed_subject(i)), term(1), term(10_000 + i), graph(0)))
+        .collect();
+    // Every third quad deleted; 64 new quads a subject, on the base's subjects and past them.
+    let deletes: Vec<EncodedQuad> = base.iter().step_by(3).copied().collect();
+    let inserts: Vec<EncodedQuad> = (0..PART + 5_000)
+        .map(|i| EncodedQuad::new(term(1000 + i / 64), term(1), term(1_000_000 + i), graph(0)))
+        .collect();
+    let mut first = std::collections::BTreeMap::new();
+    for quad in &base {
+        *first.entry(quad.subject.raw()).or_insert(0i64) += 1;
+    }
+    let mut second = std::collections::BTreeMap::new();
+    for quad in &inserts {
+        *second.entry(quad.subject.raw()).or_insert(0i64) += 1;
+    }
+    for quad in &deletes {
+        *second.entry(quad.subject.raw()).or_insert(0i64) -= 1;
+    }
+    assert!(second.values().any(|&count| count < 0), "a signed count");
+    let expected: Vec<(u64, i64)> = first.into_iter().chain(second).collect();
+    let version =
+        IndexVersion::from_quads(Layout::DefaultGraph, base).with_delta(&inserts, &deletes);
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(term(1)),
+        object: None,
+        graph: GraphSelector::Any,
+    };
+    let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    let delta = (inserts.len() + deletes.len()) as u64;
+    assert!(delta >= 2 * PART, "the second run is walked in parts too");
+    assert_eq!(
+        version.group_walk_size(&plan, 1),
+        (
+            (MIXED_ROWS + delta) as usize,
+            (MIXED_ROWS.div_ceil(PART) + delta.div_ceil(PART)) as usize
+        )
+    );
+    for in_parts in [true, false] {
+        let budget = nrese_exec::Budget::new(64 << 20);
+        let answer = {
+            let mut counts = ChargedVec::new(&budget);
+            version
+                .group_counts_on(&plan, 1, &mut counts, &budget, in_parts)
+                .map(|()| counts.to_vec())
+        };
+        assert_eq!(
+            answer.expect("64 MiB fits"),
+            expected,
+            "in parts {in_parts}"
+        );
+        assert!(!budget.refused(), "in parts {in_parts}");
+        assert_eq!(budget.used(), 0, "in parts {in_parts}");
+    }
+}
+
+/// A walk in parts refused after some of its parts were answered holds nothing once dropped:
+/// the slab and the answered parts' own vectors are released with the refusal, which is
+/// typed and recorded (`group_counts`). Under 7 KiB, three parts of 1, C + 1 and 2C + 1
+/// groups: the 3 KiB slab and the two later parts' 2 KiB own vectors fit exactly, whichever
+/// part asks first, and the third part's growth past twice its block, 2,064 bytes more, has
+/// no room whatever the order.
+#[test]
+fn a_walk_in_parts_refused_after_parts_were_answered_holds_nothing() {
+    const PART: u64 = super::GROUP_PART as u64;
+    let groups = [1, C + 1, 2 * C + 1];
+    let subject = |i| subject_in_parts(i, 3 * PART, &groups, &[false, false]);
+    let (answer, held, refused) = walk_by_subject_on(3 * PART, subject, 7 << 10, Some(true));
+    assert_eq!(answer.expect_err("the third part's growth").limit, 7 << 10);
+    assert!(refused, "the refusal recorded");
+    assert_eq!(held, 0);
+}
+
+/// A walk in parts whose part is refused room for its groups is answered in full or refused,
+/// typed and recorded, never answered short (`group_counts`), and holds nothing once dropped.
+/// Two parts of 1 and C + 1 groups under 3.5 KiB: the 2 KiB slab fits, and the second part's
+/// first own vector (2C groups, 2 KiB) doesn't, where a merge of the groups found by then
+/// (1 KiB) would.
+#[test]
+fn a_walk_in_parts_is_never_answered_short() {
+    const PART: u64 = super::GROUP_PART as u64;
+    let groups = [1, C + 1];
+    let subject = |i| subject_in_parts(i, 2 * PART, &groups, &[false]);
+    let (answer, held, refused) = walk_by_subject_on(2 * PART, subject, 3584, Some(true));
+    let mut expected = std::collections::BTreeMap::new();
+    for i in 0..2 * PART {
+        *expected.entry(term(subject(i)).raw()).or_insert(0i64) += 1;
+    }
+    match answer {
+        Ok(counts) => assert_eq!(counts, expected.into_iter().collect::<Vec<_>>()),
+        Err(error) => assert!(refused && error.limit == 3584, "{error:?}"),
+    }
+    assert_eq!(held, 0);
+}
+
+/// A walk in parts is refused, typed and recorded, never answered short, and holds nothing
+/// once dropped where its slab's charge or a part's first own vector has no room (2C groups,
+/// asked exactly): forced into parts under less than the slab; or admitted to parts, the
+/// room covering its peak, before another consumer takes the room the slab or a vector needs
+/// (`group_counts`' concurrent-consumer exception).
+#[test]
+fn a_walk_in_parts_without_room_for_its_slab_or_a_vector_is_refused() {
+    const PAIR: usize = size_of::<(u64, i64)>();
+    let (version, plan) = subject_walk(MIXED_ROWS, mixed_subject);
+    let (keys, parts) = version.group_walk_size(&plan, 1);
+    let slab = parts * super::PART_BLOCK * PAIR;
+    let (answer, held, refused) =
+        walk_by_subject_on(MIXED_ROWS, mixed_subject, slab - 1, Some(true));
+    assert!(answer.is_err(), "forced into parts under its slab");
+    assert!(refused);
+    assert_eq!(held, 0);
+    let peak = super::group_walk_peak(keys, parts);
+    // The room another consumer leaves: one pair short of the slab, then of the slab and
+    // one part's first own vector.
+    for left in [slab - PAIR, slab + 2 * super::PART_BLOCK * PAIR - PAIR] {
+        let budget = nrese_exec::Budget::new(peak);
+        let groups = || version.parted_groups(&plan, 1);
+        assert!(super::walks_in_parts(&budget, keys, parts, groups));
+        budget
+            .charge(peak - left)
+            .expect("the other consumer's charge");
+        let answer = {
+            let mut counts = ChargedVec::new(&budget);
+            version
+                .group_counts_on(&plan, 1, &mut counts, &budget, true)
+                .map(|()| counts.to_vec())
+        };
+        assert!(answer.is_err(), "{left} bytes left");
+        assert!(budget.refused());
+        assert_eq!(
+            budget.used(),
+            peak - left,
+            "only the other consumer's charge"
+        );
+        budget.release(peak - left);
+        assert_eq!(budget.used(), 0);
     }
 }
 
