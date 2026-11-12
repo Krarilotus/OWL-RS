@@ -26,6 +26,11 @@
 //! on `?x` and `?y`): the share of `p`'s links from such subjects whose object has `q`,
 //! instead of assuming every object of `p` might.
 //!
+//! Both read whole lists of sets or links per estimate, so one planning's reads and copies of
+//! them are counted, each before it is made, against [`SET_BUDGET`]. A planning that would
+//! pass it stops ([`Stopped::Budget`]) and is planned again without the sets; one within it
+//! plans as it would without the bound.
+//!
 //! Bounds (degree constraints, as in AGM/PANDA): a pattern whose variables are all bound
 //! keeps at most the rows it checks, and a step estimated above 0 is at least one row. Patterns with a constant object are estimated by containment, not by the
 //! characteristic sets, which know no objects; two single-variable patterns on one
@@ -144,6 +149,45 @@ pub(super) enum Stopped {
     Budget { work: usize },
 }
 
+/// One planning's characteristic-set work, each read or copy counted before it is made. Once
+/// one would pass the budget, none is made any more, and the search stops at its next check.
+struct Work {
+    done: Cell<usize>,
+    budget: usize,
+    passed: Cell<bool>,
+}
+
+impl Work {
+    /// Whether `n` more is within the budget; counted if it is.
+    fn take(&self, n: usize) -> bool {
+        let done = self.done.get().saturating_add(n);
+        if self.passed.get() || done > self.budget {
+            self.passed.set(true);
+            return false;
+        }
+        self.done.set(done);
+        true
+    }
+
+    /// `n` more, before it is copied: counted, or the search's stop.
+    fn charge(&self, n: usize) -> Result<(), Stopped> {
+        match self.take(n) {
+            true => Ok(()),
+            false => self.check(),
+        }
+    }
+
+    /// The search's stop once a read or copy would have passed the budget.
+    fn check(&self) -> Result<(), Stopped> {
+        match self.passed.get() {
+            true => Err(Stopped::Budget {
+                work: self.done.get(),
+            }),
+            false => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct State {
     cost: f64,
@@ -180,6 +224,15 @@ impl State {
     /// [`Self::better_than`] `other`: a step's state decided before it is built.
     fn beats(cost: f64, first: f64, other: &State) -> bool {
         (cost, first) < (other.cost, other.estimates[0])
+    }
+
+    /// The set entries a copy of the state copies: its stars' sets ([`StarRows::len`]).
+    fn copied(&self) -> usize {
+        self.stars
+            .values()
+            .filter_map(|s| s.rows.as_ref())
+            .map(StarRows::len)
+            .sum()
     }
 
     /// The predicates of the state's open stars on `subject`, but for pattern `skip`'s.
@@ -274,6 +327,16 @@ fn search(
     fixed: Option<&[usize]>,
     stop: &dyn Fn() -> bool,
 ) -> Result<Plan, Stopped> {
+    let work = Work {
+        done: Cell::new(0),
+        budget: set_budget(),
+        passed: Cell::new(false),
+    };
+    // `p`'s links read for a chain, each looking up the predicates of `from` and `to`.
+    let pair = |sets: &CharacteristicSets, from: &[u64], p: u64, to: &[u64]| {
+        let reads = sets.links_of(p) * (from.len() + to.len()).max(1);
+        work.take(reads).then(|| sets.pair(from, p, to)).flatten()
+    };
     // The characteristic sets know which predicates subjects have, not their objects.
     // A constant object (`?x a C`) is estimated by containment below, not as a share
     // of the predicate's statements independent of the subject's other predicates
@@ -299,16 +362,16 @@ fn search(
             }
             if let Some(star) = input.star.filter(open) {
                 let subject = state.stars.entry(star.subject).or_default();
-                subject.rows = sets.map(|sets| match &subject.rows {
-                    Some(rows) => {
+                subject.rows = sets.and_then(|sets| match &subject.rows {
+                    Some(rows) => work.take(rows.len()).then(|| {
                         note_statistics(rows.len(), 0);
                         sets.star_with(rows, star.predicate)
-                    }
-                    None => {
+                    }),
+                    None => work.take(sets.sets_having(star.predicate)).then(|| {
                         let rows = sets.star_of(star.predicate);
                         note_statistics(rows.len(), 0);
                         rows
-                    }
+                    }),
                 });
                 subject.predicates.push(star.predicate);
             }
@@ -363,9 +426,9 @@ fn search(
             let edge_star = inputs[edge].star?;
             let from = state.on(edge_star.subject, Some(&edge_star));
             let mut to = state.on(star.subject, None);
-            let before = sets.pair(&from, edge_star.predicate, &to)?;
+            let before = pair(sets, &from, edge_star.predicate, &to)?;
             to.push(star.predicate);
-            let after = sets.pair(&from, edge_star.predicate, &to)?;
+            let after = pair(sets, &from, edge_star.predicate, &to)?;
             let factor = if before > 0.0 { after / before } else { 0.0 };
             Some((star.subject, factor * star.selectivity))
         });
@@ -382,7 +445,7 @@ fn search(
             }
             let star = state.stars.get(&object)?;
             let before = star.rows.as_ref()?.rows();
-            let after = sets.pair(&[], edge.predicate, &star.predicates)?;
+            let after = pair(sets, &[], edge.predicate, &star.predicates)?;
             let factor = if before > 0.0 { after / before } else { 0.0 };
             Some((object, factor))
         };
@@ -393,6 +456,9 @@ fn search(
                 return None;
             }
             let (sets, rows) = sets.zip(state.stars.get(&star.subject)?.rows.as_ref())?;
+            if !work.take(rows.len()) {
+                return None;
+            }
             note_statistics(rows.len(), 0);
             let (before, after) = (rows.rows(), sets.star_rows_with(rows, star.predicate));
             let factor = if before > 0.0 { after / before } else { 0.0 };
@@ -461,7 +527,7 @@ fn search(
     let finish = |state: State| Plan {
         order: state.order,
         rows: state.estimates,
-        work: 0,
+        work: work.done.get(),
     };
     if n == 0 {
         return Ok(Plan {
@@ -470,17 +536,22 @@ fn search(
             work: 0,
         });
     }
+    // Every read and copy of the sets is counted before it is made; past the budget none is
+    // made, and the search stops after the estimate or step that would have made it.
     if let Some(order) = fixed {
         let mut state = start(order[0]);
+        work.check()?;
         for &j in &order[1..] {
             let step = estimate(&state, j);
             state = apply(state, j, step);
+            work.check()?;
         }
         return Ok(finish(state));
     }
     if n > DP_PATTERNS {
         // Greedy: the cheapest start, then the cheapest extension each time.
         let mut starts: Vec<State> = (0..n).map(start).collect();
+        work.check()?;
         let kept = match n > GREEDY_ALL_STARTS {
             true => GREEDY_STARTS,
             false => n,
@@ -506,6 +577,7 @@ fn search(
                     .expect("a pattern is left");
                 used[j] = true;
                 state = apply(state, j, step);
+                work.check()?;
             }
             if best.as_ref().is_none_or(|b| state.better_than(b)) {
                 best = Some(state);
@@ -517,6 +589,7 @@ fn search(
     for j in 0..n {
         best[1 << j] = Some(start(j));
     }
+    work.check()?;
     // A state's candidates and the steps that beat their slot's state: only those are built.
     let mut winners: Vec<(usize, Step)> = Vec::with_capacity(n);
     for used in 1u64..(1 << n) {
@@ -539,6 +612,7 @@ fn search(
                 winners.push((j, step));
             }
         }
+        work.check()?;
         // Later masks are supersets, so this state is read no more: its last winner takes
         // it, the others a copy. With none (the full mask among them) it stays.
         let Some((&(last, step), rest)) = winners.split_last() else {
@@ -546,9 +620,13 @@ fn search(
             continue;
         };
         for &(j, step) in rest {
+            // A copy copies the state's stars' sets too.
+            work.charge(state.copied())?;
             best[(used | (1 << j)) as usize] = Some(apply(state.clone(), j, step));
+            work.check()?;
         }
         best[(used | (1 << last)) as usize] = Some(apply(state, last, step));
+        work.check()?;
     }
     Ok(finish(
         best[(1 << n) - 1]
