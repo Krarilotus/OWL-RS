@@ -431,6 +431,20 @@ impl CharacteristicSets {
         self.pairs.is_some()
     }
 
+    /// The number of sets that have `predicate`: what [`Self::star_of`] reads. O(log P) for
+    /// P predicates; reads no list.
+    pub fn sets_having(&self, predicate: u64) -> usize {
+        entries(&self.by_predicate, &self.having, predicate).len()
+    }
+
+    /// The number of links `predicate` has among the characteristic pairs (none without
+    /// pairs): what [`Self::pair`] reads. O(log P) for P predicates; reads no list.
+    pub fn links_of(&self, predicate: u64) -> usize {
+        self.pairs
+            .as_ref()
+            .map_or(0, |(index, links)| entries(index, links, predicate).len())
+    }
+
     /// The estimated solutions of the chain `?x p ?y` with `?x` also having the
     /// predicates `from` and `?y` having `to` (every other object free): over the links
     /// `p` makes from a set with `from` to a set with `to`, the links times each other
