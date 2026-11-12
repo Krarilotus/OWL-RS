@@ -62,8 +62,9 @@ pub struct StoreConfig {
     /// process may use ([`ProcessMemory::Default`]); a limit set by hand is never more than
     /// that capacity. The capacity is read once per process, at the limit's first need,
     /// never when a store opens ([`nrese_exec::memory::capacity`]); where it can't be read,
-    /// what needed the limit is refused, and where this target can't read memory a limit is
-    /// refused when the store opens ([`ProcessMemory::supported`]).
+    /// a limit set by hand stands and what needed the default is refused; where this target
+    /// can't read memory a limit is refused when the store opens
+    /// ([`ProcessMemory::supported`]).
     /// It is also the limit of the process's budget ([`Runtime::memory`](crate::Runtime::memory)),
     /// which what queries and maintenance charge draws on, the queries' budget within it.
     /// This is the store's watch policy, not a write to the global process limit.
@@ -310,9 +311,9 @@ impl ProcessMemory {
         self.supported(reads_memory)?;
         self.bytes_with(capacity).map_err(|unread| {
             StoreError::Configuration(format!(
-                "process_memory_bytes: the memory the process may use, which gives its \
-                 default and caps a limit set by hand, couldn't be read ({unread}); set it \
-                 to 0 to run without a limit"
+                "process_memory_bytes: its default, three quarters of the memory the \
+                 process may use, needs that memory read ({unread}); set it by hand, in \
+                 bytes, or 0 to run without a limit"
             ))
         })
     }
@@ -331,7 +332,8 @@ impl ProcessMemory {
     }
 
     /// The limit in bytes (0: none, read nothing), of the memory `capacity` reads the
-    /// process may use ([`nrese_exec::memory::limit_within`]); unread where that can't be.
+    /// process may use ([`nrese_exec::memory::limit_within`]): a limit set by hand stands
+    /// where that can't be read; the default is then unread.
     pub fn bytes_with(
         self,
         capacity: impl FnOnce() -> nrese_exec::memory::Reading,
@@ -341,7 +343,7 @@ impl ProcessMemory {
             Self::Bytes(bytes) => Some(bytes),
             Self::Default => None,
         };
-        capacity().map(|capacity| nrese_exec::memory::limit_within(explicit, capacity))
+        nrese_exec::memory::limit_within(explicit, capacity())
     }
 }
 
@@ -507,21 +509,23 @@ mod tests {
     }
 
     /// DC-07, D2: the default is three quarters of what the process may use; a limit set by
-    /// hand is never more than that memory; where it can't be read either is refused (never
-    /// "no limit"), naming the setting.
+    /// hand is never more than that memory. Where it can't be read the default is refused
+    /// (never "no limit"), naming the setting to set by hand; a limit set by hand stands,
+    /// the operator's fallback.
     #[test]
     fn a_limit_is_found_within_the_memory_the_process_may_use() {
         let capacity = || Ok(4 * G);
+        let unread = || Err(Unread::Failed);
         let default = ProcessMemory::Default;
         assert_eq!(default.resolve_with(true, capacity).ok(), Some(3 * G));
         assert_eq!(ProcessMemory::Bytes(G).bytes_with(capacity), Ok(G));
         assert_eq!(ProcessMemory::Bytes(8 * G).bytes_with(capacity), Ok(4 * G));
-        for limit in [default, ProcessMemory::Bytes(G)] {
-            assert_eq!(
-                limit.bytes_with(|| Err(Unread::Failed)),
-                Err(Unread::Failed)
-            );
-            refusal(limit.resolve_with(true, || Err(Unread::Failed)));
-        }
+        assert_eq!(default.bytes_with(unread), Err(Unread::Failed));
+        refusal(default.resolve_with(true, unread));
+        assert_eq!(ProcessMemory::Bytes(8 * G).bytes_with(unread), Ok(8 * G));
+        assert_eq!(
+            ProcessMemory::Bytes(8 * G).resolve_with(true, unread).ok(),
+            Some(8 * G)
+        );
     }
 }

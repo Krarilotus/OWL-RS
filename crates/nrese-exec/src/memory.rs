@@ -191,11 +191,16 @@ static CAPACITY: AtomicU64 = AtomicU64::new(0);
 /// Held while [`capacity`] is read, so that concurrent first asks read once.
 static CAPACITY_READING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The process's memory limit a setting means, in a process that may use `capacity` bytes
-/// ([`capacity`]): `explicit` bytes, never more than the capacity (a limit the system would
-/// never let the process reach is no limit), else three quarters of the capacity.
-pub fn limit_within(explicit: Option<u64>, capacity: u64) -> u64 {
-    explicit.map_or(capacity / 4 * 3, |bytes| bytes.min(capacity))
+/// The process's memory limit a setting means, given the memory the process may use as
+/// read ([`capacity`]): `explicit` bytes, no more than a capacity that reads (a limit the
+/// system would never let the process reach is no limit), and themselves where it doesn't
+/// (the operator's size is the configured fallback: nothing unknown is taken as measured);
+/// else three quarters of the capacity, unread where it doesn't read.
+pub fn limit_within(explicit: Option<u64>, capacity: Reading) -> Reading {
+    match explicit {
+        Some(bytes) => Ok(capacity.map_or(bytes, |capacity| bytes.min(capacity))),
+        None => capacity.map(|capacity| capacity / 4 * 3),
+    }
 }
 
 /// Why a memory limit stopped the work ([`MemoryWatch::cause`], [`process_limit_stop`]).
