@@ -4,7 +4,7 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason MODE]
+//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--shacl-report FILE] [--reason MODE]
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]...
@@ -20,7 +20,8 @@
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
 //!   for `benches/baselines/`. `--baseline` adds the ratio against an earlier JSON report.
 //!   `--shapes` loads a SHACL shapes file into the shapes graph and times validating the
-//!   data against it (`--runs` times), before the queries.
+//!   data against it (`--runs` times), before the queries; `--shacl-report FILE` writes
+//!   the last run's validation report there as N-Triples, after the timing.
 //!   `--format` serialises SELECT results in another format than TSV (JSON is what most
 //!   clients ask for).
 //!   `--reason` materialises a ruleset (`owl2-rl`, `rdfs`, ...) after the load, timed, and
@@ -190,6 +191,7 @@ struct Args {
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
+    shacl_report: Option<PathBuf>,
     reason: Option<ReasoningMode>,
     rules: Option<PathBuf>,
     reason_runs: usize,
@@ -226,6 +228,7 @@ fn parse_args() -> Result<Args, String> {
         qerror: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
+        shacl_report: None,
         reason: None,
         rules: None,
         reason_runs: 1,
@@ -266,6 +269,7 @@ fn parse_args() -> Result<Args, String> {
             "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
+            "--shacl-report" => args.shacl_report = Some(value()?.into()),
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
@@ -364,24 +368,14 @@ fn run_once(
     timeout: Duration,
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
-    let canceller = {
-        let token = token.clone();
-        let (done, wait) = std::sync::mpsc::channel::<()>();
-        (
-            std::thread::spawn(move || {
-                if wait.recv_timeout(timeout).is_err() {
-                    token.cancel();
-                }
-            }),
-            done,
-        )
-    };
+    // The process's watchdog cancels at the timeout: armed before the timed window, disarmed
+    // after it, so that no thread starts inside it (benches/fast/patches/perf_lab_watchdog.py).
+    let armed = perf_lab_watchdog::arm(&token, timeout);
     let mut sink = CountingSink::default();
     let started = Instant::now();
     let result = store.run_query(prepared, &token, &mut sink);
     let elapsed = started.elapsed();
-    let _ = canceller.1.send(());
-    let _ = canceller.0.join();
+    drop(armed);
     result.map_err(|e| {
         if elapsed >= timeout {
             format!("timeout after {} s", timeout.as_secs())
@@ -842,7 +836,7 @@ impl Report {
             .map(|(key, value)| format!("\n  \"{key}\": {value},"))
             .collect();
         format!(
-            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.3},\n  \"load_s\": {:.3},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.6},\n  \"load_s\": {:.3},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
             self.open_s,
             self.load_s,
             memory.map_or(0, |(peak, _)| peak),
@@ -1076,7 +1070,8 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         })?;
         let mut times = Vec::new();
         let mut results = 0;
-        for _ in 0..args.runs {
+        let mut last = None;
+        for run in 0..args.runs {
             let started = Instant::now();
             let validation = store.validate_shacl(
                 &nrese_store::ReadScope::All,
@@ -1084,6 +1079,14 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             )?;
             times.push(started.elapsed());
             results = validation.report.results.len();
+            // Only the last run's report is kept, so every earlier one is dropped where it was.
+            last = (run + 1 == args.runs).then_some(validation);
+        }
+        if let (Some(path), Some(validation)) = (&args.shacl_report, &last) {
+            std::fs::write(
+                path,
+                validation.serialize(nrese_store::GraphResultFormat::NTriples)?,
+            )?;
         }
         let samples: Vec<String> = times
             .iter()
@@ -1361,4 +1364,58 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         println!("memory: peak {peak} MiB, resident {rss} MiB");
     }
     Ok(())
+}
+
+/// The timeout of every timed run, by one thread for the whole process (release gate harness:
+/// benches/fast/patches/perf_lab_watchdog.py): started once, before any timing, and running
+/// before it returns; it polls every 10 ms and takes the slot's lock only then, which the timed
+/// call never takes.
+mod perf_lab_watchdog {
+    use super::CancellationToken;
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    type Slot = Mutex<Option<(Instant, CancellationToken)>>;
+    const POLL: Duration = Duration::from_millis(10);
+
+    fn slot() -> &'static Slot {
+        static SLOT: OnceLock<Slot> = OnceLock::new();
+        static STARTED: OnceLock<()> = OnceLock::new();
+        let slot: &'static Slot = SLOT.get_or_init(|| Mutex::new(None));
+        STARTED.get_or_init(|| {
+            let (ready, started) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = ready.send(());
+                loop {
+                    std::thread::sleep(POLL);
+                    let mut armed = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if armed
+                        .as_ref()
+                        .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+                        && let Some((_, token)) = armed.take()
+                    {
+                        token.cancel();
+                    }
+                }
+            });
+            let _ = started.recv();
+        });
+        slot
+    }
+
+    /// Disarms the watchdog when dropped.
+    pub struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Cancels `token` once `timeout` has passed, unless the guard is dropped first.
+    pub fn arm(token: &CancellationToken, timeout: Duration) -> Armed {
+        *slot().lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now() + timeout, token.clone()));
+        Armed
+    }
 }
