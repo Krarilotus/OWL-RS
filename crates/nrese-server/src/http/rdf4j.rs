@@ -362,11 +362,7 @@ pub async fn repository_put(
             let quads = state
                 .repositories()
                 .parse_configuration(format, &body)
-                .map_err(|error| match error.is_memory_limit() {
-                    // Memory refused as a query's is (the server's budget in use: 503).
-                    true => sparql::map_query_error(&state.policy(), error),
-                    false => ApiError::bad_request(format!("repository configuration: {error}")),
-                })?;
+                .map_err(|error| configuration_error(&state.policy(), error))?;
             crate::repository_config::from_config(&id, &quads).map_err(ApiError::bad_request)?
         }
     };
@@ -957,6 +953,31 @@ pub async fn transaction_rollback(
 mod tests {
     use nrese_rdf::NamedNode;
 
+    /// A repository configuration that doesn't parse is the request's (400); a refusal
+    /// because the process's memory limit couldn't be read is the server's (500), never
+    /// blamed on the configuration.
+    #[test]
+    fn a_configuration_refused_for_an_unread_limit_is_the_servers_error() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let policy = crate::policy::PolicyConfig::default();
+        let unread = nrese_store::StoreError::from(nrese_exec::BudgetExceeded {
+            limit: 0,
+            requested: 4096,
+            used: 0,
+            shared: true,
+            unread: true,
+        });
+        let status = |error| {
+            super::configuration_error(&policy, error)
+                .into_response()
+                .status()
+        };
+        assert_eq!(status(unread), StatusCode::INTERNAL_SERVER_ERROR);
+        let malformed = nrese_store::StoreError::InvalidGraphIri("not an IRI".to_owned());
+        assert_eq!(status(malformed), StatusCode::BAD_REQUEST);
+    }
+
     use super::*;
 
     #[test]
@@ -1027,5 +1048,17 @@ mod tests {
         let graphs = contexts(&pairs).unwrap();
         assert_eq!(graphs.len(), 2);
         assert_eq!(graphs[0], GraphName::DefaultGraph);
+    }
+}
+
+/// A repository configuration's parse error: malformed RDF is the request's (400); anything
+/// else as a query's is (memory refused: 503 or 413; the process's limit unread: 500).
+fn configuration_error(
+    policy: &crate::policy::PolicyConfig,
+    error: nrese_store::StoreError,
+) -> ApiError {
+    match error.is_request_error() {
+        true => ApiError::bad_request(format!("repository configuration: {error}")),
+        false => sparql::map_query_error(policy, error),
     }
 }

@@ -114,6 +114,7 @@ impl super::Context<'_> {
             model: self.model,
             aliases: RefCell::new(self.aliases.borrow().clone()),
             aliases_refused: Cell::new(self.aliases_refused.get()),
+            room_unread: Cell::new(false),
             evaluator: super::Evaluator::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),

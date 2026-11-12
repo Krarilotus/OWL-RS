@@ -41,6 +41,20 @@ pub struct Realisation {
     pub profile: Profile,
 }
 
+impl Realisation {
+    /// A realisation no engine ran for, `why`: no types, its taxonomy refused alike
+    /// ([`Taxonomy::refused`]), incomplete.
+    pub fn refused(why: String) -> Self {
+        Self {
+            taxonomy: Taxonomy::refused(why.clone()),
+            individuals: Vec::new(),
+            types: Vec::new(),
+            incomplete: vec![why],
+            profile: Profile::default(),
+        }
+    }
+}
+
 /// The named individuals of an ontology: declared or used (blank nodes left out).
 pub fn individuals(ontology: &Ontology) -> Vec<Term> {
     ontology.named_individuals()

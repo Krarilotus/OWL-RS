@@ -961,18 +961,22 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         static ONCE: super::ReadOnce = super::ReadOnce::new();
         static READS: AtomicUsize = AtomicUsize::new(0);
+        static ASKING: AtomicUsize = AtomicUsize::new(0);
         fn failing() -> super::Reading {
             READS.fetch_add(1, Ordering::Relaxed);
-            // Long enough for every asker to be waiting for this reading.
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // The reading lasts until every asker has asked, and a while beyond, for each to
+            // be waiting for it.
+            while ASKING.load(Ordering::Relaxed) < 8 {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
             Err(super::Unread::Failed)
         }
-        let start = std::sync::Barrier::new(8);
         let answers: Vec<_> = std::thread::scope(|scope| {
             let asks: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
-                        start.wait();
+                        ASKING.fetch_add(1, Ordering::Relaxed);
                         ONCE.get(failing)
                     })
                 })
