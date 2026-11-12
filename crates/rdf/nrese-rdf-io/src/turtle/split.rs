@@ -1008,8 +1008,8 @@ mod tests {
     }
 
     /// RDF 1.2's version directives are directives: `VERSION "1.2"` ends with its string
-    /// and doesn't swallow the directive after it (a release declaring `prov:` on its
-    /// second line failed to load in parallel, 4 October 2026).
+    /// and doesn't swallow the directive after it (a file declaring `prov:` on its
+    /// second line failed to load in parallel).
     #[test]
     fn version_directives_are_directives() {
         let text = "VERSION \"1.2\"\n@prefix prov: <http://www.w3.org/ns/prov#> .\n@version '1.2' .\nversion\"1.2\"\nPREFIX ex: <http://e/>\nex:a prov:wasGeneratedBy ex:b .\n";
