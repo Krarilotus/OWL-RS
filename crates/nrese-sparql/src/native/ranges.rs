@@ -85,19 +85,27 @@ pub(crate) fn hints_without_date_times(expr: &Expression, snapshot: &Snapshot) -
 fn hints_of(expr: &Expression, snapshot: &Snapshot, date_times: bool) -> Vec<Hint> {
     let mut bounds: Vec<(Variable, Option<Bounds>)> = Vec::new();
     collect(expr, snapshot, &mut bounds);
-    let mut conjuncts = Vec::new();
-    pushdown::conjuncts_of(expr, &mut conjuncts);
+    // The conjuncts are listed only when a dateTime bound needs them, so other hints cost
+    // what they did.
+    let mut conjuncts: Option<Vec<&Expression>> = None;
     bounds
         .into_iter()
         .filter_map(|(variable, bounds)| {
             let bounds = bounds?;
             // A dateTime bound gives way to a string test on its variable: the dictionary's
             // route for the test (`strings`) and the key count's refusal stay as they were.
-            if bounds.domain == Domain::DateTime
-                && (!date_times
-                    || strings::combined(conjuncts.iter().copied(), &variable).is_some())
-            {
-                return None;
+            if bounds.domain == Domain::DateTime {
+                if !date_times {
+                    return None;
+                }
+                let conjuncts = conjuncts.get_or_insert_with(|| {
+                    let mut list = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut list);
+                    list
+                });
+                if strings::combined(conjuncts.iter().copied(), &variable).is_some() {
+                    return None;
+                }
             }
             Some(Hint {
                 ranges: ranges(bounds)?,
