@@ -34,8 +34,7 @@ pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
     let workers = nrese_exec::workers::Workers::current().limited(config.threads);
     let mut options = config.classification_options(workers, Some(store.envelope(None)));
-    // A limit that can't be found leaves no memory to run in: the engines stop at their
-    // first check, their answer incomplete and never kept (fail closed).
+    // A limit that can't be found runs no engine ([`run`]); here it leaves none room.
     options.max_memory = Some(store.process_memory_bytes().unwrap_or(1));
     options
 }
@@ -119,6 +118,19 @@ fn run<T>(
     incomplete: fn(&mut T, String),
 ) -> T {
     let started = Instant::now();
+    // The process's limit that can't be found (its memory unread) holds no engine to it:
+    // none runs, and the answer over no axioms says why (never kept: fail closed).
+    if let Err(unread) = store.process_memory_bytes() {
+        let mut none = engine(
+            &nrese_owl::Ontology::default(),
+            &classify::Options::default(),
+        );
+        incomplete(
+            &mut none,
+            format!("the process's memory limit couldn't be found ({unread})"),
+        );
+        return none;
+    }
     let mut options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
     let read = source::read_snapshot(snapshot, memory);
@@ -161,6 +173,50 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// D2, A-902: where the process's limit can't be found (its memory unread), no engine
+    /// runs, even on a runtime of no limit supplied by the caller: the taxonomy and the
+    /// realisation say why and leave consistency unknown, and neither is kept.
+    #[test]
+    fn a_classification_whose_limit_cant_be_found_runs_no_engine() {
+        fn unread() -> nrese_exec::memory::Reading {
+            Err(nrese_exec::memory::Unread::Failed)
+        }
+        let store = StoreService::with_runtime(
+            StoreConfig::in_memory(),
+            Arc::new(crate::Runtime::new(0, 0)),
+        )
+        .unwrap()
+        .with_capacity(unread);
+        store
+            .update_str_ungated(
+                "PREFIX : <urn:cache:> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                 INSERT DATA { :A rdfs:subClassOf :B . :a a :A . }",
+            )
+            .unwrap();
+        let snapshot = store.engine().snapshot();
+        let taxonomy = taxonomy(&store, &snapshot);
+        let realisation = realisation(&store, &snapshot);
+        for (consistency, incomplete) in [
+            (&taxonomy.classification.consistency, &taxonomy.incomplete),
+            (
+                &realisation.taxonomy.classification.consistency,
+                &realisation.incomplete,
+            ),
+        ] {
+            assert!(
+                matches!(consistency, nrese_dl::verdict::Verdict::Unknown(_)),
+                "{consistency:?}"
+            );
+            assert!(
+                incomplete.iter().any(|why| why.contains("memory limit")),
+                "{incomplete:?}"
+            );
+        }
+        let cache = &store.dl().classification;
+        assert!(latest(&cache.taxonomy, snapshot.revision()).is_none());
+        assert!(latest(&cache.realisation, snapshot.revision()).is_none());
     }
 
     /// A classification whose ontology the run's memory can't read reports its consistency

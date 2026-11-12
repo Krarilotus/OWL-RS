@@ -30,6 +30,9 @@ pub struct StoreService {
     /// [`StoreConfig::process_memory_bytes`], found at its first need
     /// ([`Self::process_memory_bytes`]).
     process_memory: crate::ProcessMemory,
+    /// What reads the memory the process may use: [`nrese_exec::memory::capacity`], or a
+    /// test's.
+    capacity: fn() -> nrese_exec::memory::Reading,
     engine: Engine,
     preloaded_ontology: Option<PathBuf>,
     /// Whether the reasoning state file may exist (see [`Self::reasoning_state`]); saves a
@@ -268,6 +271,7 @@ impl StoreService {
         );
         let service = Self {
             process_memory,
+            capacity: nrese_exec::memory::capacity,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
@@ -630,10 +634,18 @@ impl StoreService {
     /// The process memory limit this store watches ([`StoreConfig::process_memory_bytes`]);
     /// 0: none, read nothing. Else found at this first need, from the memory the process may
     /// use, read once per process ([`nrese_exec::memory::capacity`]; a later ask, or another
-    /// store's, reads nothing). Unread where that memory can't be read: what asked can't be
+    /// store's, reads nothing). Opening a store needs it only where the open evaluates
+    /// queries ([`StoreConfig::pinned_queries`]), which charge the process's budget. Unread where that memory can't be read: what asked can't be
     /// held to the limit, and stops (fail closed).
     pub fn process_memory_bytes(&self) -> nrese_exec::memory::Reading {
-        self.process_memory.bytes_with(nrese_exec::memory::capacity)
+        self.process_memory.bytes_with(self.capacity)
+    }
+
+    /// This store reading the memory the process may use with `capacity`.
+    #[cfg(test)]
+    pub(crate) fn with_capacity(mut self, capacity: fn() -> nrese_exec::memory::Reading) -> Self {
+        self.capacity = capacity;
+        self
     }
 
     pub fn preloaded_ontology_path(&self) -> Option<&Path> {
