@@ -95,8 +95,8 @@ own and each measured against the systems above:
      - **Corpora:** fetched by hash and never committed.
    - **Gates, staged:**
      1. the W3C OWL 2 conformance suite (direct semantics);
-     2. parity with HermiT on ORE 2015 (1,751 classifications, 1,881 consistency checks in Lam et al. 2023);
-     3. Konclude's 1,862 of 1,920 classifications, as the final bar.
+     2. the ORE 2015 corpus at the level the literature reports for established reasoners (1,751 classifications, 1,881 consistency checks; Lam et al. 2023);
+     3. the best published result on that corpus (1,862 of 1,920 classifications) as the final bar.
    - **Query answering:** instance queries on LUBM and UOBM against PAGOdA; OWL2Bench DL.
    - **The full corpus** runs on the Draco cluster.
    - **Testing the engine:** grammar-based SROIQ(D) fuzzing, with metamorphic tests.
