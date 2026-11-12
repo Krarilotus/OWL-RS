@@ -2,12 +2,14 @@
 # a timed window"): the side's revision → its measurement commit, which changes nothing but its perf
 # lab (crates/nrese-store/examples/) and has the revision as its only parent. release-gate.sh build
 # builds and times that commit for the side and refuses any other (release_gate.py measured_at); the
-# jobs take it as an input (measurement_inputs). Each commit is pushed as its ref.
+# jobs take it as an input (measurement_inputs). Each commit is pushed as its ref, named for the
+# side it carries and what it adds (main3sus, v15cus: main3s and v15c with the open printed in
+# microseconds; v15cus's parse-only queries also give no rows, as the candidate's do).
 
 [side.a0020134c20a33eabe8ead0402f814585b9c7fd0]  # main
-commit = "feb0bcb857dbbcc8236db5d73180950fb8854e64"
-ref = "refs/measure/main3s-a0020134"
+commit = "9b22da610ea55a7a57288af68abb88c1a0cd9cd3"
+ref = "refs/measure/main3sus-a0020134"
 
 [side.d348a8a1a9e40cd23381df1faa726d3ffa44948c]  # v1.5, the release gate's base
-commit = "974f35bf83874ee6678d6dc64af5157e109ea233"
-ref = "refs/measure/v15c-d348a8a1"
+commit = "147f5c724ef5dc5263700ee34bf3cd1f187805bd"
+ref = "refs/measure/v15cus-d348a8a1"
