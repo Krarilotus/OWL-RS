@@ -222,6 +222,13 @@ side_steps() {
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
   fi
+  # Names the changed Python can't resolve, which a test replacing a whole function never runs
+  # (scripts/check-python-names.py).
+  local py
+  mapfile -t py < <(printf '%s\n' "${files[@]}" | grep -E '^(benches|scripts)/.*\.py$')
+  if [ ${#py[@]} -gt 0 ]; then
+    step "python names" python scripts/check-python-names.py "${py[@]}"
+  fi
   # Docker names only from the job namespace (scripts/check-names.sh).
   if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
     step names bash scripts/check-names.sh
