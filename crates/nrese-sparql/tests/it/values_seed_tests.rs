@@ -1,8 +1,7 @@
 //! A small `VALUES` seeds the pattern it is joined to: the pattern is evaluated from the
-//! values (index probes per row), not alone and joined afterwards. Found on the
-//! Zebratlas release (4 October 2026): one edge's provenance chain, a one-row `VALUES` and
-//! a 12-pattern star, evaluated all 673,884 chains before joining the one edge (164 ms;
-//! 0.85 s on the readiness check's machine, against 2.2 ms for Oxigraph).
+//! values (index probes per row), not alone and joined afterwards. Found on a
+//! provenance-rich graph: one edge's provenance chain, a one-row `VALUES` and
+//! a star, evaluated all of its chains before joining the one edge.
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};

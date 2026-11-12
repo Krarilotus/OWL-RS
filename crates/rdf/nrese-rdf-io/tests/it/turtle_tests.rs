@@ -315,8 +315,8 @@ fn parallel_parsing_is_exact() {
 
 /// A document that starts with RDF 1.2's `VERSION "1.2"` parses in parallel: each chunk
 /// gets the prefixes declared after it (the skim took the version for a statement and
-/// lost the next directive, so later chunks didn't know `prov:`; found loading the
-/// Zebratlas release, 4 October 2026).
+/// lost the next directive, so later chunks didn't know `prov:`; found loading a
+/// provenance-rich RDF 1.2 graph).
 #[test]
 fn a_versioned_document_parses_in_parallel() {
     let mut text = String::from(

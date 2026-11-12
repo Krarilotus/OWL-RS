@@ -108,8 +108,8 @@ impl Context<'_> {
     /// side is evaluated alone as it would have been. A BGP's estimate is its smallest
     /// pattern's count, which says nothing of what its joins expand to: a one-row
     /// `VALUES` against a star whose smallest pattern had 7 statements stayed second, and
-    /// the star was evaluated for all 673,884 provenance chains of the Zebratlas release
-    /// before the one edge was joined (4 October 2026).
+    /// the star was evaluated for all of a provenance-rich graph's chains before the one
+    /// edge was joined.
     /// The join of `inputs` (an n-ary join of the algebra, ADR-0012), in a loop. Each
     /// input after the first is evaluated from the rows so far: a path followed from the
     /// values they bind, a pattern probed from them where that pays ([`Self::eval_from`]).

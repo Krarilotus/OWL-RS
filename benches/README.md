@@ -25,7 +25,7 @@ as its risk needs; a level's evidence never stands in for a lower one's.
 | 1. Unit | Does each function keep its contract and its work bound? | seconds per crate | `cargo test`; the guards of [performance.md §0](../docs/design/performance.md#0-wins-to-keep-check-these-before-a-rewrite-and-guard-them) (exact counts, plan shapes) | every commit (the gate, [CONTRIBUTING.md](../CONTRIBUTING.md)) |
 | 2. Focused | Did this change make its area faster, slower or wrong? | minutes to an hour: the cases of one area, chainable | `fast.py run --cases …` / `--areas …`, then `compare` against the same host's baseline | a `measure` host |
 | 3. Full | Where does a build stand, against its base and against the competitors? | everything, up to a day, in checkpointed chunks | every fast case, every suite workload × system, the DL corpora | a `measure` host, one comparison per host |
-| 4. Cluster | How does it scale past one machine? | later: the Draco cluster with the Zebratlas graph | the suite under Apptainer (`cluster/`) | `draco` |
+| 4. Cluster | How does it scale past one machine? | later: the Draco cluster with a large real graph | the suite under Apptainer (`cluster/`) | `draco` |
 
 A level-2 case is cut to one bottleneck (an operator, a ruleset, a kernel) and checks its
 answers and route before its time counts; level 3 runs the same cases and the realistic
@@ -98,7 +98,7 @@ captured runs again, without running.
 | `fast/compete.py` folds into the suite, the suite running comparators on any case | next |
 | Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
 | The result row's answer and memory-kind fields | next |
-| Level 4: `runtime = "apptainer"` on `draco`, Zebratlas as a workload | later |
+| Level 4: `runtime = "apptainer"` on `draco`, a large real graph as a workload | later |
 
 ## Hosts
 

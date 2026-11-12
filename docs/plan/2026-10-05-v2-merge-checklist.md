@@ -27,7 +27,7 @@ State as of 5 October, evening:
 | Tiered gate: commit, push, milestone; benchmarks never in a gate; slow suites declared by their crate | `v2/gate` | **done** | `scripts/check.sh` with the tiers commit, push and all: nextest; slow suites per crate; merge commits test only what differs from both sides; the push tier runs every random test of the changed crates on three seeds drawn from the commit, in one run per seed, and names the failing tests (`scripts/lib/fuzz-targets.txt`, DL and OWL included); build slots and the quiet slot; rust-lld; all tests 462 → 116 s | – |
 | Fast regression suite (for §4's gate) | `bench/catalog-and-fast-suite` | in progress | the catalogue (`d9e580a`) | about 35 cases, NRESE in every profile, home-turf cases |
 
-Paused until v2 is merged: the Zebratlas workstreams and every other side thread.
+Paused until v2 is merged: the example deployment's workstreams and every other side thread.
 
 ### Performance phase (after v2's goals; owner, 7 October)
 
@@ -68,7 +68,7 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 ## 3. Benchmark (benches/PROTOCOL.md)
 
 - [ ] A core workload set for the paper (the full list of research round 3 later), with
-      the Zebratlas reasoning workload when it arrives.
+      a real reasoning workload when it arrives.
 - [ ] The headline track with equal resources and the best-configuration track; a 2–32-core
       curve; outcome classes; confidence intervals.
 - [ ] DL: the reference comparison re-run on equal resources (the 3 October references ran

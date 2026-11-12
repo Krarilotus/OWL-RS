@@ -70,7 +70,7 @@ materialisation about 100 B per final statement at peak.
 | GraphRAG, text-to-SPARQL | | GraphRAG-Bench; data.world chat-with-data; QALD-10 | none |
 | KG construction | | Text2KGBench; GTFS-Madrid-Bench / KGCW challenge | none |
 | Concurrency and soak | commit latency under readers (as above); the client sweep (1-64 clients, Sparqloscope DBLP and BSBM explore) | SPB's concurrent mode; BSBM multi-client | scorecard, `soak.py`; fast cases `clients-sweep`, `writes-under-readers` |
-| Larger than memory | the memory-budget series (16 to 2 GB) on LUBM 1000 | WDBench under a cap | `image-cap-check.sh`, bulk-load budget |
+| Larger than memory | the memory-budget series (16 to 2 GB) on LUBM 1000 | WDBench under a cap | bulk-load budget |
 | Distribution | | LUBM 8000 and WatDiv 1 B on Draco | none (G6 not built) |
 
 The fast suite (§6) takes one small, generated case per bottleneck from this table; it
