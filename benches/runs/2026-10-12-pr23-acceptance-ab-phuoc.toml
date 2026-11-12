@@ -15,7 +15,7 @@ inputs = [
   { name = "datasets", source = "phuoc-yu verified inputs, assets.root/snapshots/docker-volumes/nrese-bench-data (read-only)" },
   { name = "fast data", source = "phuoc-yu verified inputs, assets.root/snapshots/docker-volumes/nrese-fast-data, copied into ~/owlrs/ab/fast-data before use" },
 ]
-results = { root = "phuoc-yu:/home/krarilotus/owlrs/ab/results", sha256sums_sha256 = "dcf101c41b85b9f67827af2cd85d55032fe2993c7174b55364882897fdcdffe5", pooled_base_sha256 = "c796e3025560293887b28e1437606ed83df646dca640754dffe31b21c7a85a75", pooled_candidate_sha256 = "5c5ca86d1edabe4e269972b8ae8bf7d66f0f34dfaa17529b084f9d3b8dbd85c5", compact = "benches/baselines/fast/2026-10-12-ab-pooled-*.json" }
+results = { root = "phuoc-yu:~/owlrs/ab/results", sha256sums_sha256 = "dcf101c41b85b9f67827af2cd85d55032fe2993c7174b55364882897fdcdffe5", pooled_base_sha256 = "c796e3025560293887b28e1437606ed83df646dca640754dffe31b21c7a85a75", pooled_candidate_sha256 = "5c5ca86d1edabe4e269972b8ae8bf7d66f0f34dfaa17529b084f9d3b8dbd85c5", compact = "benches/baselines/fast/2026-10-12-ab-pooled-*.json" }
 publishable = "all"
 cases = [
   { case = "alloc-load", verdict = "same", note = "1,154 -> 1,145 ms (0.99x, 95% CI [0.98, 1.01], threshold 10%); peak (cgroup) 1647 -> 1627 MiB" },

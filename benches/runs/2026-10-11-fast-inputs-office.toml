@@ -17,7 +17,7 @@ inputs = [
   { name = "ore/ore_ont_9724.nt", sha256 = "36b0b916c16e98085fcf315963597d7d14569f12e0205177201fe7116dc13358" },
   { name = "ore/ore_ont_9835.nt", sha256 = "8b5a496ce11ffaf160ceec43c6d28c6f5dbfa3deb9132db5dd3b4be59ebe5fb2" },
 ]
-results = { root = "office-pc:/home/krarilotus/owlrs/results/reports-docs/fast/2026-10-11-docs-inputs.json", ab = "office-pc:/home/krarilotus/owlrs/results/ab-fast-20261011" }
+results = { root = "office-pc:~/owlrs/results/reports-docs/fast/2026-10-11-docs-inputs.json", ab = "office-pc:~/owlrs/results/ab-fast-20261011" }
 publishable = "all"
 cases = [
   { case = "el-classify, el-classify-irregular", verdict = "pass", note = "were wrong (taxonomy_equal None): the fresh data volume lacked ELK's reference taxonomy; now seeded from the verified inputs, taxonomies equal" },

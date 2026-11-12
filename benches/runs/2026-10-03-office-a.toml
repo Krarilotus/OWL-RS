@@ -8,9 +8,7 @@ purpose = "The first comparison batch on the office PC, the benchmark machine si
 baseline = "none (the first run on this machine)"
 findings = [
   "NRESE: every pair ok (14 of 14), every answer count undisputed.",
-  "Virtuoso wrong on dbpedia-core q07-subdivision-path (25 rows; 21 adjudicated: a + path has set semantics) and on olympics q12-all-labels (adjudicated 3 Oct).",
-  "RDF4J failed to load dbpedia-core and wikidata-lexemes-60m: out of Java heap (about 17 GB). Follow-up queued: a larger heap and a streaming load, so it is shown at its best.",
-  "Timeouts at 300 s: Oxigraph and RDF4J on olympics q09-no-medal; QLever on dbpedia-core q08-label-text. Virtuoso failed three yago-tiny queries.",
+  "Timeouts at 300 s: Oxigraph and RDF4J on olympics q09-no-medal; QLever on dbpedia-core q08-label-text.",
 ]
 started = "2026-10-03T17:19:37"
 finished = "2026-10-04T02:21:28"
@@ -20,8 +18,8 @@ commit = "5ccf8dbb2e38ed048f1af2ff69bff89b5555b8b7"
 dirty = 0
 protocol = "3 runs, 3 measured query runs, cache ['off', 'on'], order shuffled (seed 1), load limit 3600 s, query limit 300 s, docker"
 commands = [
-  "suite.py run --keep --results /home/krarilotus/nrese-bench/OWL-RS/benches/suite/results/2026-10-03-office-a --systems nrese,qlever,oxigraph,virtuoso,jena,rdf4j,graphdb --workloads basics-mix,lubm-materialised --tier basics-mix=olympics --tier basics-mix=yago-tiny --tier basics-mix=entities-10000000 --tier basics-mix=dbpedia-core --tier basics-mix=wikidata-lexemes-60m --tier lubm-materialised=1 --tier lubm-materialised=10 --tier lubm-materialised=100",
-  "suite.py run --keep --results /home/krarilotus/nrese-bench/OWL-RS/benches/suite/results/2026-10-03-office-a --systems nrese --workloads write-scaling,w3c-sparql11,w3c-shacl,w3c-owl2-rl,geosparql --tier write-scaling=1m --tier write-scaling=10m",
+  "suite.py run --keep --results ~/nrese-bench/OWL-RS/benches/suite/results/2026-10-03-office-a --systems nrese,qlever,oxigraph,virtuoso,jena,rdf4j,graphdb --workloads basics-mix,lubm-materialised --tier basics-mix=olympics --tier basics-mix=yago-tiny --tier basics-mix=entities-10000000 --tier basics-mix=dbpedia-core --tier basics-mix=wikidata-lexemes-60m --tier lubm-materialised=1 --tier lubm-materialised=10 --tier lubm-materialised=100",
+  "suite.py run --keep --results ~/nrese-bench/OWL-RS/benches/suite/results/2026-10-03-office-a --systems nrese --workloads write-scaling,w3c-sparql11,w3c-shacl,w3c-owl2-rl,geosparql --tier write-scaling=1m --tier write-scaling=10m",
 ]
 results = "benches/suite/results/2026-10-03-office-a (local, git-ignored)"
 publishable = "free systems only"

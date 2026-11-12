@@ -13,7 +13,7 @@ baseline = "2026-10-03-office-b (the answers of every system there)"
 commit = "16c3bfb2 (the build host's snapshot 5b7a994 of it, untracked bench files only; nrese-server SHA-256 2372c248091b03ddd1639251f4f0fecb9dfcd6ebad1c90045ae3d8dbf143e5ab)"
 dirty = 0
 protocol = "1 runs, 1 measured query runs, cache ['off'], order shuffled (seed 1), load limit 3600 s, query limit 300 s, process"
-commands = ["suite.py run --runtime process --skip-build --port 19350 --data /home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-data --systems nrese --workloads owl2bench --tier owl2bench=ql-1 --tier owl2bench=rl-1 --runs 1 --query-runs 1 --cache off --results /home/krarilotus/nrese-reasoning-suite/results/ql1-16c3bfb"]
+commands = ["suite.py run --runtime process --skip-build --port 19350 --data ~/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-data --systems nrese --workloads owl2bench --tier owl2bench=ql-1 --tier owl2bench=rl-1 --runs 1 --query-runs 1 --cache off --results ~/nrese-reasoning-suite/results/ql1-16c3bfb"]
 results = "office-pc:~/nrese-reasoning-suite/results/ql1-16c3bfb (local)"
 publishable = "all"
 findings = [
