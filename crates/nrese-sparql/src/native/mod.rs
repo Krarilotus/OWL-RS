@@ -3694,43 +3694,62 @@ impl<'a> Context<'a> {
         self.with_sets(inputs, &order)
     }
 
-    /// `planning` of `inputs`, with the characteristic sets where an input is part of a star.
-    /// Where they would pass the BGP's budget ([`plan::budget_for`], one for every path that
-    /// plans: scans, and scans with paths), planned once more without them, as a graph
-    /// without sets is, and noted for EXPLAIN ([`WITHOUT_SETS`]) with that budget: which
-    /// planner a BGP got shows. A cancelled query fails, and isn't planned again.
+    /// `planning` of `inputs`: first without the characteristic sets (the plain plan), then,
+    /// where an input is part of a star and the reads the set search would make at its starts
+    /// cost little against the work the plain plan expects ([`plan::admits`]), with them,
+    /// within a budget that follows that work ([`plan::budget_for`]; one policy for every path
+    /// that plans: scans, and scans with paths). A BGP the gate keeps from the sets, or whose
+    /// set search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
+    /// which planner a BGP got shows. A cancelled query fails, at either planning or between
+    /// them (a fixed order's planning doesn't ask), and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
         planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
         let start = Instant::now();
-        let budget = plan::budget_for(inputs);
-        let sets = inputs
-            .iter()
-            .any(|i| i.star.is_some())
-            .then(|| self.snapshot.characteristic_sets_in(self.model))
-            .flatten();
         let cancelled = || {
             self.cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
+        let mut plain = match planning(None, 0) {
+            Ok(planned) if !cancelled() => planned,
+            Ok(_) | Err(plan::Stopped::Cancelled) => {
+                return Err(QueryEvaluationError::Cancelled.into());
+            }
+            Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
+        };
+        if !inputs.iter().any(|i| i.star.is_some()) {
+            return Ok(plain);
+        }
+        let Some(sets) = self.snapshot.characteristic_sets_in(self.model) else {
+            return Ok(plain);
+        };
+        let expected = plan::expected_work(&plain);
+        let reads = plan::start_reads(inputs, &sets);
+        if !plan::admits(expected, reads) {
+            if self.trace.is_some() {
+                let detail = format!(
+                    "{} patterns planned without characteristic sets: {reads} set entries at \
+                     its starts against {expected:.0} rows expected",
+                    inputs.len(),
+                );
+                self.note(WITHOUT_SETS, detail, None, 0, start);
+            }
+            return Ok(plain);
+        }
+        let budget = plan::budget_for(expected);
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.
-        let work = match planning(sets.as_deref(), budget) {
+        let work = match planning(Some(&*sets), budget) {
             Ok(planned) => return Ok(planned),
             Err(plan::Stopped::Budget { work }) if !cancelled() => work,
             Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
         };
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
-        let mut planned = match planning(None, budget) {
-            Ok(planned) => planned,
-            Err(plan::Stopped::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
-            Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
-        };
-        planned.work = work;
+        plain.work = work;
         if self.trace.is_some() {
             let detail = format!(
                 "{} patterns planned without characteristic sets: \
@@ -3739,7 +3758,7 @@ impl<'a> Context<'a> {
             );
             self.note(WITHOUT_SETS, detail, None, 0, start);
         }
-        Ok(planned)
+        Ok(plain)
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
