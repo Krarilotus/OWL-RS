@@ -52,6 +52,8 @@ mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
+mod join_order_tests;
+#[cfg(test)]
 mod lone_pattern_tests;
 #[cfg(test)]
 mod optimise_tests;
