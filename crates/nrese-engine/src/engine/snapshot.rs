@@ -1663,18 +1663,37 @@ impl Snapshot {
         if !supported {
             return None;
         }
+        Some(Either::Right(self.sorted_stacks(model, &plan, permutation)))
+    }
+
+    /// `plan`'s matches in `model`'s stacks, in `permutation`'s key order. Two stacks with
+    /// visible quads are merged; otherwise the one that has them (or none) is read alone,
+    /// with no merge: a stack the model leaves out, or one with no visible quad (`len`
+    /// counts what reads see, deltas and masks included), would add nothing to it,
+    /// and a merge costs a store without inferences about 40 instructions per quad.
+    fn sorted_stacks<'a>(
+        &'a self,
+        model: ReadModel,
+        plan: &AccessPlan,
+        permutation: Permutation,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let data = self.data(model);
+        let holds = |stack: Stack| model.includes(stack) && data.stack(stack).len() > 0;
         let scan = |stack: Stack| {
-            model
-                .includes(stack)
-                .then(|| self.data(model).stack(stack).scan_plan(&plan))
+            holds(stack)
+                .then(|| data.stack(stack).scan_plan(plan))
                 .into_iter()
                 .flatten()
         };
-        Some(Either::Right(Merged::new(
-            Plain(scan(Stack::Asserted)),
-            Plain(scan(Stack::Inferred)),
-            permutation,
-        )))
+        match (holds(Stack::Asserted), holds(Stack::Inferred)) {
+            (true, true) => Either::Right(Merged::new(
+                Plain(scan(Stack::Asserted)),
+                Plain(scan(Stack::Inferred)),
+                permutation,
+            )),
+            (false, true) => Either::Left(scan(Stack::Inferred)),
+            (_, false) => Either::Left(scan(Stack::Asserted)),
+        }
     }
 
     /// Like [`scan_sorted_in`](Self::scan_sorted_in), with the first unbound component of the
@@ -1689,18 +1708,7 @@ impl Snapshot {
         high: TermId,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
         let plan = self.range_plan(model, pattern, permutation, low, high)?;
-        let scan = move |stack: Stack| {
-            model
-                .includes(stack)
-                .then(|| self.data(model).stack(stack).scan_plan(&plan))
-                .into_iter()
-                .flatten()
-        };
-        Some(Merged::new(
-            Plain(scan(Stack::Asserted)),
-            Plain(scan(Stack::Inferred)),
-            permutation,
-        ))
+        Some(self.sorted_stacks(model, &plan, permutation))
     }
 
     /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
