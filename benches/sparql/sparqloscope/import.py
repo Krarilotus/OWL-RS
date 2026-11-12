@@ -14,7 +14,8 @@ of the ISWC 2025 paper (`results/iswc-25/dblp.ENGINE.results.yaml`, plus Oxigrap
   in a comment;
 - benches/sparql/sparqloscope/dblp-published.tsv: per query, the published answer (the
   value of a one-row answer, else the row count), how many engines published that same
-  answer, and each engine's published time in seconds (`fail` where it failed or timed out);
+  answer, and each engine's published time in seconds (`fail` where it failed or timed out),
+  except a licensed engine's (TIMED);
 - benches/sparql/sparqloscope/dblp-checks.toml: the known answers as a case's `check`
   table (an answer every engine that answered published alike, at least two), for benches/cases/sparql.toml.
 
@@ -34,6 +35,9 @@ import yaml
 PINNED = "61ad92f"
 TIMEOUT_S = 180.0
 ENGINES = ["qlever", "virtuoso", "mdb", "graphdb", "blazegraph", "jena", "oxigraph"]
+# The engines whose published times are written: a licensed engine's figures aren't committed
+# (benches/competitors/README.md). Its answers still count towards the known answers.
+TIMED = [e for e in ENGINES if e != "graphdb"]
 REPO = Path(__file__).resolve().parents[3]
 QUERIES = REPO / "benches/competitors/queries/sparqloscope-dblp"
 HERE = Path(__file__).resolve().parent
@@ -87,7 +91,7 @@ def main(argv: list[str]) -> int:
              "that answered published alike (value= one value, rows= a row count; else the distinct answers, "
              "disputed), how many published it, and their times in seconds (fail: failed or timed out at 180 s). "
              "Written by import.py.",
-             "\t".join(["query", "answer", "agree", *ENGINES])]
+             "\t".join(["query", "answer", "agree", *TIMED])]
     checks = ["# Known answers of the Sparqloscope DBLP queries: published alike by every engine of the",
               "# ISWC 2025 paper that answered, at least two (dblp-published.tsv). Written by import.py.",
               "[check]"]
@@ -106,7 +110,7 @@ def main(argv: list[str]) -> int:
         reference = given[0] if len(given) >= 2 and len(set(given)) == 1 else None
         shown = reference or ("disputed: " + " | ".join(sorted(set(given))) if given else "-")
         table.append("\t".join([stem, shown[:200], str(len(given) if reference else 0),
-                                *(seconds(results[e].get(name)) for e in ENGINES)]))
+                                *(seconds(results[e].get(name)) for e in TIMED)]))
         if reference:
             kind, _, value = reference.partition("=")
             key = f'"q.{stem}.{"value" if kind == "value" else "rows"}"'
@@ -114,7 +118,7 @@ def main(argv: list[str]) -> int:
     (HERE / "dblp-published.tsv").write_text("\n".join(table) + "\n", encoding="utf-8")
     (HERE / "dblp-checks.toml").write_text("\n".join(checks) + "\n", encoding="utf-8")
     print(f"{len(lines)} queries into {QUERIES.relative_to(REPO)}")
-    for engine in ENGINES:
+    for engine in TIMED:
         times = []
         for name_line in lines:
             name = name_line.split("\t", 1)[0].partition(" [")[0].strip()

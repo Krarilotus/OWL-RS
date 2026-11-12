@@ -1,7 +1,7 @@
 # Datalog programs on the rule engines' home turf
 
 The same Datalog program on the same facts, on NRESE and on the engines whose strength it
-is: Soufflé, Nemo, VLog and GLog (RDFox when a licence exists). Every engine runs in its own
+is: Soufflé, Nemo, VLog and GLog. Every engine runs in its own
 language and its own documented configuration; every answer is checked before a time
 counts.
 

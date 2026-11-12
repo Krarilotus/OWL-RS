@@ -41,7 +41,7 @@ No containers: the systems run as processes, so the same script works on a works
 | `fuseki-owl` | Fuseki with the project's `fuseki-config.ttl`: Jena's `OWLFBRuleReasoner` over an in-memory model. The reasoner works at the first query, which the script times | runs |
 | Fuseki with the project's `sameAs` rules (`fuseki-config-lightweight.ttl`) | | not runnable: the configuration names `rules/sameas.rules`, which is not in the repository |
 | QLever, Oxigraph, Virtuoso (no reasoning: the plain baseline) | | to add, with the [basics kit's](../competitors/README.md) settings |
-| GraphDB, RDFox, Stardog, AnzoGraph | | to add once licensed; their results stay in the git-ignored `results/` until the vendors permit publishing ([licence rules](../competitors/README.md)) |
+| Licensed systems | | to add once licensed; their results stay in the git-ignored `results/` until the vendors permit publishing ([licence rules](../competitors/README.md)) |
 
 ## What is measured
 
@@ -63,7 +63,7 @@ The answers depend on how much of `owl:sameAs` a system derives:
 
 | Regime | What it derives | Who |
 |---|---|---|
-| Full equality (OWL 2 RL `eq-*` rules) | The identity closure, and every statement about a resource for each of its identities | NRESE `owl2-rl`, Jena's OWL rule reasoner; GraphDB and RDFox under OWL 2 RL, to be confirmed when they run |
+| Full equality (OWL 2 RL `eq-*` rules) | The identity closure, and every statement about a resource for each of its identities | NRESE `owl2-rl`, Jena's OWL rule reasoner |
 | Identity closure only | `owl:sameAs` symmetric and transitive; statements are not replicated | The project's lightweight rules |
 | None | | QLever, Oxigraph, Virtuoso as plain stores; `nrese-plain` |
 

@@ -97,7 +97,7 @@ Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
   native means each as its documentation tunes it, matched the same CPUs and memory.
 - **Home turf.** A competitor's case is its own benchmark, its own data and queries, at its
   published scale, with its recommended configuration; NRESE runs the same.
-- **Licences.** Results of GraphDB, RDFox, Stardog and AnzoGraph never leave the machine
+- **Licences.** Results of licensed systems never leave the machine
   without the vendor's written consent ([../competitors/README.md](../competitors/README.md)).
 - **Known issues stay visible.** An expected outcome fails no gate but every run's verdict
   says it; a case is never weakened to pass.
