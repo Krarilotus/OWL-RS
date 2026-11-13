@@ -42,6 +42,13 @@ and nothing here is a promise about it.
 - GeoSPARQL measures in metres only in CRS84 and a listed set of projected systems, and reads
   no GML arcs or 3D solids: such a measure or literal gives no value. Convert coordinates and
   approximate arcs before loading; for solids, none known ([GeoSPARQL](ops/http-api.md#sparql)).
+- Full-text query strings drop Lucene's `OR`, `+`, field names and boosts
+  ([full-text search](ops/http-api.md#sparql)). Words without `AND` match as any of them, as
+  `OR` would; to require words, join them with `AND` (every word is then needed); to search one
+  property, name it in `text:query`'s list; for boosts, none known.
+- A named graph without statements doesn't exist: `CREATE GRAPH` stores nothing, and an
+  emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
+  Read that 404 as an empty graph; to keep an empty graph listed, none known.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
 - Directional strings in the data alone don't make a result announce RDF 1.2; a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
