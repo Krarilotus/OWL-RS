@@ -859,3 +859,39 @@ fn a_search_without_the_sets_keeps_no_star_or_edge_state() {
     assert_eq!(kept(None), 0, "without the sets");
     assert!(kept(Some(&*sets)) > 0, "with them");
 }
+
+/// Spec: as [`a_search_without_the_sets_keeps_no_star_or_edge_state`], "plain planning pays
+/// only for what it uses": a BGP whose stars all have a constant object that keeps a share of
+/// its predicate's statements (no open star, [`plan::Star::open`]) is planned once, without
+/// the sets, which would give it the same plan. Red where any star admits the set search.
+#[test]
+fn a_bgp_without_an_open_star_is_planned_once() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let patterns = ["?x type Student", "?x type Person", "a anchor ?x"];
+    let (scans, counts) = bgp(&ctx, &patterns);
+    let mut vars = Vec::new();
+    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    assert!(
+        inputs.iter().any(|i| i.star.is_some())
+            && !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())),
+        "stars, none open"
+    );
+    let sets = snapshot.characteristic_sets_in(ctx.model).unwrap();
+    let with = plan::order(
+        &inputs,
+        vars.len(),
+        PROBE_FACTOR,
+        Some(&*sets),
+        usize::MAX,
+        &|| false,
+    );
+    let (planned, asked) = plannings(&ctx, &patterns);
+    assert_eq!(
+        (steps(&planned.unwrap()), asked),
+        (steps(&with.unwrap()), vec![false]),
+        "the plan the sets give, planned once"
+    );
+}

@@ -130,7 +130,7 @@ pub(super) fn start_reads(inputs: &[Input], sets: &CharacteristicSets) -> usize 
     inputs
         .iter()
         .filter_map(|input| input.star)
-        .filter(|star| star.selectivity >= 1.0)
+        .filter(Star::open)
         .fold(0usize, |reads, star| {
             reads.saturating_add(sets.sets_having(star.predicate))
         })
@@ -205,6 +205,19 @@ pub(super) struct Star {
     pub predicate: u64,
     /// The share of `p`'s statements the pattern's object keeps (1 for a variable).
     pub selectivity: f64,
+}
+
+impl Star {
+    /// Whether the characteristic sets estimate the pattern: its object keeps all of `p`'s
+    /// statements (a variable). The sets know which predicates subjects have, not their
+    /// objects. A constant object (`?x a C`) is estimated by containment, not as a share of
+    /// the predicate's statements independent of the subject's other predicates (on
+    /// materialised data a type follows from them: LUBM-10 q4 estimated 2 for 34), and
+    /// doesn't stand for "has the predicate" in a later star either: its subjects have it,
+    /// but read so (any subject with a type) LUBM-10's p90 was 30.
+    pub(super) fn open(&self) -> bool {
+        self.selectivity >= 1.0
+    }
 }
 
 /// A join order with the estimated rows after each step.
@@ -439,13 +452,7 @@ fn search(
         let reads = sets.links_of(p) * (from.len() + to.len()).max(1);
         work.take(reads).then(|| sets.pair(from, p, to)).flatten()
     };
-    // The characteristic sets know which predicates subjects have, not their objects.
-    // A constant object (`?x a C`) is estimated by containment below, not as a share
-    // of the predicate's statements independent of the subject's other predicates
-    // (on materialised data a type follows from them: LUBM-10 q4 estimated 2 for
-    // 34), and doesn't stand for "has the predicate" in a later star either: its
-    // subjects have it, but read so (any subject with a type) LUBM-10's p90 was 30.
-    let open = |star: &Star| star.selectivity >= 1.0;
+    let open = Star::open;
     // `state` with pattern `j` joined, its `step` estimated already.
     let apply = |mut state: State, j: usize, step: Step| -> State {
         let input = &inputs[j];
