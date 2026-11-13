@@ -1,6 +1,6 @@
 # HTTP interface
 
-What the server answers on which URL, as implemented on 30 September 2026. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)); a disabled surface answers 404.
+What the server answers on which URL, for the code of the commit this page is in. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)); a disabled surface answers 404.
 
 ## SPARQL
 
