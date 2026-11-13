@@ -946,3 +946,60 @@ fn a_fixed_order_is_admitted_by_its_first_start_alone() {
         "searched from every start: kept from them"
     );
 }
+
+/// Spec: the master's order of 12 November 13:53, "effort follows expected work", and the
+/// gate's code review (F3, catalogue D16-559): a BGP's set search may do
+/// [`plan::SET_ENTRIES_PER_ROW`] per row its plain plan expects where that is more than the
+/// least budget. With the least budget ([`plan::FLOOR`]) below the work its set plan takes, a
+/// BGP that expects enough rows keeps that plan, planned once; given only that least budget,
+/// it falls back to the plain plan. No test's budget or decision: the planner's own gate and
+/// budget. Red where the planning's budget doesn't follow the rows it expects.
+#[test]
+fn a_bgp_that_expects_much_work_plans_past_the_least_budget() {
+    // Ten subjects with `a`, `b` and `c`, twenty of each; ninety with one `a` alone: the sets
+    // say `b` follows `a` on few subjects, with many objects.
+    let names: Vec<[String; 3]> = (0..10)
+        .flat_map(|s| {
+            (0..20).flat_map(move |k| {
+                ["a", "b", "c"].map(|p| [format!("s{s}"), p.into(), format!("{p}{k}")])
+            })
+        })
+        .chain((10..100).map(|s| [format!("s{s}"), "a".into(), "a0".into()]))
+        .collect();
+    let triples: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|[s, p, o]| (s.as_str(), p.as_str(), o.as_str()))
+        .collect();
+    let engine = graph(&triples);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let patterns = ["?x a ?y", "?x b ?z", "?x c ?w"];
+    let (with, _) = under(&ctx, &patterns, usize::MAX).unwrap();
+    let none = without_sets(&ctx, &patterns, None);
+    assert!(
+        with.work > 0 && steps(&with) != none,
+        "the sets change the plan"
+    );
+    let least = with.work - 1;
+    let (scans, counts) = bgp(&ctx, &patterns);
+    plan::FLOOR.set(least);
+    REPLANS.set(0);
+    let planned = ctx.join_order(&scans, &counts, &[], false);
+    let replans = REPLANS.get();
+    plan::FLOOR.set(plan::SET_BUDGET);
+    assert_eq!(
+        (
+            steps(&planned.map_err(QueryEvaluationError::from).unwrap()),
+            replans
+        ),
+        (steps(&with), 0),
+        "the least budget {least} below its work, the rows it expects allow it"
+    );
+    let (floor, replans) = under(&ctx, &patterns, least).unwrap();
+    assert_eq!(
+        (steps(&floor), replans),
+        (none, 1),
+        "given the least budget only, the plain plan"
+    );
+}
