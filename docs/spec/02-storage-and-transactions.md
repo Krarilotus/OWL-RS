@@ -10,7 +10,7 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
   - Graph patterns match terms. `FILTER` comparisons compare values.
 - **Named graphs exist iff they contain at least one quad.**
   - `CREATE GRAPH` stores nothing.
-  - `CLEAR`/`DROP` of an empty named graph fails unless `SILENT` is given.
+  - `CLEAR`/`DROP` of an empty named graph succeeds and changes nothing.
 - **Asserted and inferred statements are stored separately** (ADR-0003, roadmap E6).
   - The *asserted* stack holds what clients wrote, in any graph.
   - The *inferred* stack holds what the reasoner derived, always in the default graph.
@@ -28,7 +28,7 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
   - `Asserted`: explicit statements only
   - `Inferred`: implicit statements only
 
-  A request-level switch and GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs come with R4.
+  A query picks `Asserted` with `infer=false` ([HTTP interface](../ops/http-api.md#query-parameters)). Naming GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs in `FROM` picks `Asserted` or `Inferred`, and naming both picks `Materialised`.
 - **Pattern cost.** Every triple pattern is a contiguous range in one of a stack's index permutations: O(r·log n + k) for k results over r runs, with r = O(log n). A stack has one of two layouts (`index::Layout`):
   - **Quads:** SPOG, POSG, OSPG, GSPO, GPOS, GOSP and GPSO, seven permutations for quads in any graph.
   - **Default graph:** SPOG, POSG, OSPG and PSOG, four permutations. A graph-first order over one constant graph sorts like the matching graph-last one, so the graph-first ones would be copies. The inferred stack always has it; the asserted stack has it until it holds a quad in a named graph (checkpoint format 9 and later).
