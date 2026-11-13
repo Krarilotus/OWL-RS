@@ -43,14 +43,16 @@ You need:
 - port 8080 free on this machine.
 
 Rust and Node.js aren't needed: the image builds the server and its console. The commands
-below fetch the code, build the image `nrese` and start it as the container `nrese`:
+below fetch the code, build the [image](docs/glossary.md#image-container-volume) `nrese`
+and start it as the container `nrese`:
 
 - its data on the volume `nrese-data`;
 - its port bound to this machine only, since no authentication is on (set
   `NRESE_AUTH_MODE` before you expose it: [access control](#access-control-and-operations));
-- reasoning under OWL 2 RL, and the SHACL commit gate on, which the example below uses.
+- reasoning under OWL 2 RL, and the [SHACL commit gate](docs/glossary.md#shape-shapes-graph-shacl-gate)
+  on, which the example below uses.
 
-Words these pages use: [glossary](docs/glossary.md).
+Other words these pages use: [glossary](docs/glossary.md).
 
 ```bash
 git clone https://github.com/Krarilotus/OWL-RS.git
@@ -86,6 +88,9 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
   PREFIX ex: <http://example.org/>
   SELECT ?x WHERE { ?x a ex:Animal }'
 ```
+
+The answer: the [HTTP](docs/glossary.md#http-request-response-status) status and headers,
+then the rows as [JSON](docs/glossary.md#json):
 
 ```text
 HTTP/1.1 200 OK
@@ -496,8 +501,8 @@ runs recorded there are as of their dates.
 
 ## State and limits
 
-These pages describe the code of the commit they are in. A running server names its build
-at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
+These pages describe the code of the commit they are in, package version 0.1.0, which is
+not a release. A running server names its build at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
 the ruleset with its semantics version and a fingerprint of what it derives
 ([reasoning-semantics.md](docs/spec/reasoning-semantics.md)).
 

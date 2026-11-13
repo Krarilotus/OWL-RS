@@ -73,6 +73,20 @@ the one `/dataset/…` serves ([repositories](ops/http-api.md#engine-api-apiv1))
 A text syntax for RDF statements ([Turtle](https://www.w3.org/TR/turtle/)), the `.ttl`
 files of these pages. Other syntaxes: [RDF syntaxes](../README.md#rdf-syntaxes).
 
+### HTTP request, response, status
+
+Each `curl` command sends an HTTP request to a URL of the server. The server answers with a
+status line (`200 OK`; `204 No Content` when there is nothing to return; `400` when the
+request is wrong: [status codes](ops/http-api.md#status-codes)), headers such as
+`content-type`, and a body. `curl -i` prints all three.
+
+### JSON
+
+A text format for data: objects in `{…}` with named fields, lists in `[…]`. A SPARQL answer
+comes as JSON unless asked otherwise: `head.vars` names the columns, `results.bindings` holds
+one object per row, and each value has a `type` (`uri`, `literal`, `bnode`) and a `value`
+([SPARQL results in JSON](https://www.w3.org/TR/sparql11-results-json/)).
+
 ### Image, container, volume
 
 Docker's words: the image is the built program, a container runs it, and a volume keeps its
