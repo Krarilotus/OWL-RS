@@ -28,6 +28,7 @@ Run an existing scenario before you write a new one. Each file's `description` s
 | RDF4J transactions and their isolation levels | `scenarios/rdf4j-isolation.toml` |
 | The `NRESE-Completeness` header under `owl2-dl` | `scenarios/owl2-dl-completeness.toml` |
 | Graph Store Protocol CRUD on a named graph | `scenarios/gsp-named-graph.toml` |
+| The README's first example: inference, retraction, the SHACL gate | `scenarios/readme-first-example.toml` |
 
 ## Scenario files
 
