@@ -370,7 +370,7 @@ is checked
 | `/console`, `/ops` | A browser console for queries, updates and graphs, and one for operators ([apps/nrese-console](apps/nrese-console)) |
 | `nrese-server` | The server, and the commands `load`, `query`, `convert`, `backup`, `restore`, `prune-archive`, `check-config`, `config-schema` and `print-query` ([server setup](docs/ops/server-setup.md)) |
 | Console CLI | A small TypeScript command-line client of the same API ([getting started](docs/dev/getting-started.md#frontend-cli)) |
-| Errors | Every HTTP error is a problem document (RFC 9457) with the request id the server's log also carries ([status codes](docs/ops/http-api.md#status-codes)) |
+| Errors | Every HTTP error is a problem document (RFC 9457) with the request id the server's log also carries ([status codes](docs/ops/http-api.md#status-codes), [a worked example](docs/ops/http-api.md#example-a-sparql-syntax-error)); a server that doesn't start says why on standard error ([startup errors](docs/ops/server-setup.md#startup-errors)) |
 
 Configuration comes from a TOML file, environment variables or `--set`, with a JSON
 Schema (`nrese-server config-schema`). The [Dockerfile](Dockerfile) builds images for

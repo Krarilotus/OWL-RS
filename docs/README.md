@@ -7,8 +7,12 @@
 | How do I run it and send a first query? | the [quick start](../README.md#quick-start), then [getting started](dev/getting-started.md) |
 | What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-can-do) |
 | What doesn't it do, and when should I choose another system? | [Limits and deviations](limits.md) |
-| How do I deploy it, load data and configure it? | [server setup](ops/server-setup.md), [every setting](ops/config-reference.md) |
+| How do I load my own data? | [your own data](../README.md#your-own-data); large files: [bulk loading](ops/server-setup.md#54-bulk-loading) |
+| How do I change a setting, or switch reasoning? | [change a setting](../README.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
+| How do I run it as a service? | [server setup](ops/server-setup.md), its [commands](ops/server-setup.md#commands) |
 | Which endpoints are there? | [the HTTP interface](ops/http-api.md) |
+| What does an error mean, and what do I do? | [status codes](ops/http-api.md#status-codes), [startup errors](ops/server-setup.md#startup-errors) |
+| How do I back up and restore? | [a complete drill](ops/backup-restore-drills.md) |
 | What does reasoning compute, and what does an answer promise? | [reasoning-semantics.md](spec/reasoning-semantics.md) |
 | Which crates can I use on their own? | the crate table in the [README](../README.md#how-it-is-built) |
 
