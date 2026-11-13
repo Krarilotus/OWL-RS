@@ -29,7 +29,7 @@ The test profile is intended to validate:
 - `GET /ui` remains as a compatibility alias.
 - `GET /console` serves the user-facing console from the same server process.
 - `GET /` redirects to `/console` for ergonomic access.
-- `/console` calls same-origin endpoints such as `/dataset/query`, `/dataset/tell`, `/dataset/update`, `/dataset/data`, `/api/ai/status`, and `/api/ai/query-suggestions`.
+- `/console` calls same-origin endpoints such as `/dataset/query`, `/dataset/tell`, `/dataset/update`, `/dataset/data`, `/api/v1/ai/status`, and `/api/v1/ai/query-suggestions`.
 - `/ops` remains the operator-facing surface for diagnostics and operational workflows.
 
 ## 4. Filesystem Layout
@@ -69,11 +69,11 @@ Durable storage note:
 - `NRESE_STORE_MODE=on-disk` stores a write-ahead log and checkpoints under `NRESE_DATA_DIR`.
   - It needs no build feature and no native toolchain.
   - Every commit is synced before it is acknowledged.
-- The data directory is locked. A second server on the same directory fails at startup with a clear error.
+- The data directory is locked: one process at a time. A second server or offline command on the same directory fails at startup ([what to do](#err-data-directory-locked)).
 - Checkpoints run in the background and delete the WAL segments they cover.
 - Backups:
-  - **Image backups** (physical): `POST /ops/api/admin/dataset/image` (admins; `?repository=ID` for another repository than the default, into `backups/<ID>-<seconds>/`) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline: `nrese-server backup DIR`. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target: it checks the image against its manifest and places it in the data directory, which must hold no store; the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
-  - **N-Quads export**: `GET /ops/api/admin/dataset/backup` and `POST /ops/api/admin/dataset/restore`: asserted statements only, portable to other stores, inferences derived again after a restore.
+  - **Image backups** (physical): `POST /api/v1/repositories/{id}/image` (admins; the earlier `POST /ops/api/admin/dataset/image`, with `?repository=ID` for another repository than the default, still answers, into `backups/<ID>-<seconds>/`) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline: `nrese-server backup DIR`. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target: it checks the image against its manifest and places it in the data directory, which must hold no store; the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
+  - **N-Quads export**: `GET /api/v1/repositories/{id}/backup` and `POST …/restore` (earlier: `/ops/api/admin/dataset/backup`, `/restore`): asserted statements only, portable to other stores, inferences derived again after a restore.
   - **Point-in-time restore**: with `store.wal_archive` on, checkpoints move the WAL segments they cover into `wal-archive/` instead of deleting them. `nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N` restores the image and replays the log up to revision `N` (every commit is one revision: `/api/v1/repositories/{id}/info` gives it to whole-dataset readers or administrators, and the logs record it), or with `--until-time 2026-10-02T14:05:00Z` (RFC 3339 with a zone, read by the `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's midnight, digits past the microsecond cut off) the commits made up to that time (logged since WAL version 6), cutting it there; without `--until-revision` as far as the log goes. A restore by time refuses an image whose last commit was made after the time (take an older image), or one with no commit time; restore by revision instead. Images without a commit time: those written before 7 Nov 2026 (checkpoint format 11), and every image, a bulk replacement's included, of a store that was upgraded from such a checkpoint, of a store created before 2 Oct 2026 (it keeps integer literals in its dictionary, and its log keeps no times), or of a replica of one of these. To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export into a new, empty data directory; that store's images have commit times. After a refusal the target directory holds the placed image, so clear it before trying again. The target data directory must hold no store. `nrese-server prune-archive R` removes the archived segments whose records all come before revision `R` (after an image backup at `R - 1` or later they are not needed; safe while the server runs).
   - Or copy the directory while the server is stopped.
 
@@ -120,7 +120,7 @@ nrese-server convert data.ttl data.nt
 nrese-server print-query [--config .\config.toml] [--form paths|values] [--schema ontology.ttl]... "SELECT ..."
 ```
 
-- `query` answers one query from the configured store as it is (no reasoning first; the inferred stack is what the last load or start materialised) and writes the results to standard output: SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
+- `query` answers one query from the configured store and writes the results to standard output. First it brings the inferred stack up to date, as the server's start does (it rematerialises if the rules changed since the last load or start): SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
 - `print-query` prints the query as standard SPARQL 1.1 for a store without reasoning that holds the same statements: it answers as NRESE does under `owl2-rl` with the QL rewriting on (`docs/design/ql-rewriting.md` §8). `--form paths` (the default) reaches the hierarchy with property paths over the schema, `values` enumerates it. Against the configured store, or with `--schema` against those files alone. The first line, `# NRESE completeness: …`, is NRESE's status for the answers; a query that can't be written exactly (equality, recursive rules, …) gets its reasons on standard error and exit status 2.
 - `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept; a named graph is an error for a format without graphs. The output appears only when complete.
 
@@ -136,6 +136,45 @@ graphs kept), load it with `nrese-server load`, then check before switching clie
 
 Keep the old store until the comparison passes; switching back is changing the client's
 endpoint.
+
+### Commands
+
+`nrese-server [COMMAND] [OPTIONS]`. Every command takes `--config FILE` (also `-c FILE`, `--config=FILE`) and `--set KEY=VALUE` (repeatable; [precedence](config-reference.md#precedence)); `convert`, `config-schema` and `print-query --schema` read no configuration. An unknown option is an error. Commands log to standard error; the server logs to standard output.
+
+Exit status: `0` on success; `1` on any error, with `Error: <message>` and its causes on standard error; `2` from `print-query` when the query can't be written exactly. A binary built for a CPU feature this machine lacks exits `1` before anything runs, naming the feature.
+
+Commands marked *store* open the configured store and lock its data directory: they fail while another process has it open ([locked](#err-data-directory-locked)).
+
+| Command | Arguments and options (defaults) | What it does and changes | Fails when |
+|---|---|---|---|
+| (none) | | *store*. Serves HTTP on `server.bind_address`: opens the store, brings the inferred stack up to date, then serves until SIGTERM or SIGINT ([stopping](#64-stopping), exit `0`) | the configuration is invalid; the directory is locked; the address can't be bound (`failed to bind ADDR`); startup reasoning fails |
+| `load` | `FILE...` (at least one; format by extension); `--replace` (default: add); `--graph IRI` (default: the default graph; triple formats only); `--strict` or `--quarantine` (older `--skip-errors`; default `store.invalid_statements`) | *store*. Commits the files' statements, then rematerialises the inferences and prepares the planner's statistics ([bulk loading](#54-bulk-loading)) | no file; a file can't be read or parsed (under `--strict`: any bad statement); the loaded data is inconsistent under the ruleset: exit `1` with the violation count, the data stays loaded and the server starts in quarantine |
+| `query` | `QUERY` or `--file FILE` (one of them); `--format F` (`json`, `xml`, `csv`, `tsv`, or for CONSTRUCT and DESCRIBE `nt`, `ttl`, `nq`, `trig`, `rdf`, `jsonld`; default JSON, N-Triples) | *store*. Brings the inferred stack up to date (it may rematerialise and write it), then writes the answers to standard output, reading every graph ([one-off queries](#541-one-off-queries-and-conversions)) | both or neither of `QUERY` and `--file`; an unknown format; `parsing the query failed`; `the query failed` |
+| `print-query` | `QUERY` or `--file FILE`; `--form paths\|values` (default `paths`); `--schema FILE` (repeatable; default: the configured store) | *store* without `--schema`. Prints the query as standard SPARQL 1.1 after a `# NRESE completeness:` line; changes nothing | exit `2`: not expressible, the reasons on standard error; exit `1`: other errors |
+| `convert` | `INPUT OUTPUT` (formats by extension) | Writes `OUTPUT` from `INPUT`, statement by statement, without a store; the output appears only when complete | not exactly two files; an unknown extension; a named graph in a format without graphs |
+| `check-config` | | Loads and validates the configuration, prints the main effective settings, a `cpu:` line and `configuration is valid` ([what it prints](config-reference.md#validation)); changes nothing | the configuration is invalid: exit `1` with the setting and the reason |
+| `config-schema` | | Prints the JSON Schema of the configuration file; changes nothing | |
+| `backup` | `DIR` | *store*. Writes an image backup of the store into `DIR` (for a running server: `POST /api/v1/repositories/{id}/image`) | no `DIR`; the directory is locked; writing fails |
+| `restore` | `DIR`; `--wal LOGDIR` (repeatable; default: no replay); `--until-revision N`, `--until-time T` (RFC 3339; default: as far as the log goes) | Places the image in `DIR` into the configured data directory, then replays the log ([point-in-time restore](#5-configuration-surface)) | no `DIR`; the data directory holds a store; the image fails its manifest check; `--until-time` before the image's last commit, or an image without commit times |
+| `prune-archive` | `REVISION` (required) | Removes the segments in `wal-archive/` of the data directory whose records all come before `REVISION`; safe while the server runs | no or a non-numeric revision |
+
+### Startup errors
+
+A server that fails to start writes `Error: <message>` and its causes to standard error (the journal, `docker logs`) and exits `1`. Configuration errors name the setting; run `nrese-server check-config` with the same configuration to see them without starting.
+
+<a id="err-data-directory-locked"></a>
+**Data directory locked.**
+
+```text
+Error: storage engine error: data directory ./data is locked by another process
+
+Caused by:
+    data directory ./data is locked by another process
+```
+
+- **Cause:** another process has the store in `store.data_dir` (the path shown) open: a running server, or an offline command (`load`, `query`, `print-query`, `backup`) on the same directory. The lock is that process's hold on the directory's `LOCK` file, released when it closes the store.
+- **Fix:** stop the other process (`systemctl stop nrese`, `docker stop nrese`), or wait for the offline command to end; or give this one another data directory. On Linux, `fuser DATA_DIR/LOCK` names the process. Don't delete `LOCK`: the file isn't the lock, the other process's hold on it is.
+- **Check:** start the server again; once it reports ready, `curl -fsS http://127.0.0.1:8080/readyz` answers `{"status":"ready"}`.
 
 ## 5.5 Local Test-Server Startup Example (PowerShell)
 
