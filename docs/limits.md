@@ -1,8 +1,9 @@
 # Limits and deviations
 
 What NRESE doesn't do, and where it departs from a standard on purpose, as of 11 November
-2026. Each item is stated in the document it links to; this page only gathers them. What
-is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about it.
+2026. Each item is stated in the document it links to; this page only gathers them, each
+with what to do instead, or "none known" where there is nothing. What is planned is in
+[ROADMAP.md](ROADMAP.md), and nothing here is a promise about it.
 
 ## Choose another system when
 
@@ -30,16 +31,25 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
   Protocol or with `nrese-server load` ([server setup](ops/server-setup.md)).
 - `SERVICE` calls only the endpoints `federation.allow` names
   ([configuration](ops/config-reference.md)).
-- Two deliberate deviations: `HAVING` may name a `SELECT` alias, and a default graph merged
-  from several graphs keeps a blank node they share as one ([why](ops/http-api.md#sparql)).
-- A reader of only some graphs gets no plan steps in `EXPLAIN`.
+- `HAVING` may name a `SELECT` alias, an extension ([why](ops/http-api.md#sparql)). For
+  a query that runs the same on other stores, repeat the aggregate:
+  `HAVING (COUNT(?x) > 1)`.
+- A default graph merged from several graphs keeps a blank node they share as one node,
+  where SPARQL's RDF merge keeps them apart ([why](ops/http-api.md#sparql)). No setting
+  gives the standard merge; where it matters, read with `GRAPH ?g { … }` and keep `?g` in
+  the answer.
+- A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
 
 ## RDF syntaxes
 
-- JSON-LD remote contexts aren't fetched; a library caller supplies a document loader.
-- Notation3 is read in the library only (not over HTTP), and only what RDF can hold.
+- JSON-LD remote contexts aren't fetched. Over HTTP, send the context inline; a library
+  caller supplies a document loader.
+- Notation3 is read in the library only (not over HTTP), and only what RDF can hold. N3
+  rules go to the reasoner through `reasoner.rules`
+  ([configuration](ops/config-reference.md#reasoner)).
 - Blank nodes are scoped to one write: every request gets fresh ones
-  ([storage](spec/02-storage-and-transactions.md#data-model)).
+  ([storage](spec/02-storage-and-transactions.md#data-model)). Give a node an IRI where a
+  later write must name it.
 
 ## Reasoning
 
@@ -50,31 +60,39 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
 - **`owl2-rl`** doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
   return one for each; an asserted one is returned), checks the datatype rules in part, and doesn't store axiomatic triples.
   Lists past their limits are reported, not truncated
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)). Literals aren't
+  equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
+  values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
 - **What an answer promises.** Without the OWL 2 QL rewriting, every answer over a
-  ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only.
-  Under `owl2-dl`, budgets and undecided candidates give `sound-only`, and an operator
-  that isn't monotone over answers that may be missing gives `unsound`
+  ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
+  under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
+  Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
+  budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
+  monotone over answers that may be missing gives `unsound`
   ([what an answer promises](../README.md#what-an-answer-promises)).
 - **User rules** (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
-  complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
+  complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
 - **Undecided consistency.** Under `owl2-dl`, a commit whose consistency check isn't decided
   (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
-  complete ([consistency](spec/reasoning-semantics.md#consistency)).
+  complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
+  and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
 - **Bulk loads skip the commit gates** ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
   neither SHACL nor the OWL 2 DL consistency check runs. With reasoning on,
   `nrese-server load` recomputes the inferences and fails when the rules' consistency
   checks find a violation (under `owl2-dl`, those of OWL 2 RL); the data stays loaded, and
   the store is quarantined until it is repaired. With reasoning off, nothing is checked
-  ([consistency](spec/reasoning-semantics.md#consistency)).
+  ([consistency](spec/reasoning-semantics.md#consistency)). For the gates, load over HTTP
+  (Graph Store), or validate after the load with `GET /dataset/shacl`.
 
 ## SHACL
 
 - SHACL Core and SHACL-SPARQL. Not supported: SHACL Advanced Features, and `sh:entailment`,
   which is reported as a failure ([HTTP interface](ops/http-api.md#shacl-validation)).
+  None known.
 - The commit gate is off by default; when on, it checks only what a commit introduces
-  ([configuration](ops/config-reference.md)).
+  ([configuration](ops/config-reference.md)). To check data already stored, validate it
+  with `GET /dataset/shacl`.
 
 ## Storage and transactions
 
@@ -82,15 +100,18 @@ is planned is in [ROADMAP.md](ROADMAP.md), and nothing here is a promise about i
   larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).
 - Client transactions read the latest commit; `SNAPSHOT` and `SERIALIZABLE` isolation are
-  refused ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)).
+  refused ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)). A read, then a write
+  that depends on it, fits in one SPARQL update (`DELETE … INSERT … WHERE`), which is one
+  commit.
 - A stop signal during start-up acts as a kill, and on Windows a service stop or
   `taskkill /F` ends the server without letting its requests finish; acknowledged commits
-  are kept either way ([stopping](ops/server-setup.md#64-stopping)).
+  are kept either way ([stopping](ops/server-setup.md#64-stopping)). On Windows, stop it
+  with ctrl-c in its console.
 
 ## Access control
 
-- No authentication by default (`auth.mode = none`)
-  ([configuration](ops/config-reference.md#auth-modes)).
+- No authentication by default (`auth.mode = none`): set one before the server is reachable
+  from other machines ([configuration](ops/config-reference.md#auth-modes)).
 - Endpoints over the whole dataset (classification, SHACL validation, autocomplete) are
   only for readers of every graph
-  ([access control](ops/http-api.md#graph-level-access-control)).
+  ([access control](ops/http-api.md#graph-level-access-control)). None known.
