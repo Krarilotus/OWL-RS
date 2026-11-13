@@ -23,6 +23,8 @@ pub(crate) mod codec;
 #[cfg(test)]
 pub(crate) mod fault;
 #[cfg(test)]
+mod first_use_tests;
+#[cfg(test)]
 mod link_tests;
 mod lock;
 #[cfg(test)]

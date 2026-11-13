@@ -44,6 +44,20 @@ thread_local! {
     /// Reads a durable bulk load's checkpoint image before the checkpoint is written, as a
     /// reader of it would (the own-state slots' 3.0c item 5).
     pub(crate) static IMAGE_READER: RefCell<Option<Reader>> = const { RefCell::new(None) };
+    /// How many name resolutions `durability::place` began on this thread (a path's walk, or a
+    /// file's links read).
+    pub(crate) static RESOLUTIONS: Cell<usize> = const { Cell::new(0) };
+    /// A name resolution through `durability::place` fails before it reads anything.
+    pub(crate) static FAIL_RESOLUTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Counts a name resolution, and fails it where [`FAIL_RESOLUTION`] is set.
+pub(crate) fn resolution() -> std::io::Result<()> {
+    RESOLUTIONS.set(RESOLUTIONS.get() + 1);
+    match FAIL_RESOLUTION.get() {
+        true => Err(std::io::Error::other("injected: a name's resolution")),
+        false => Ok(()),
+    }
 }
 
 /// What [`ON_DIR_SYNC`] calls.

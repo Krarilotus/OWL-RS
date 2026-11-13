@@ -260,6 +260,8 @@ fn walk(
     path: &Path,
 ) -> std::io::Result<Resolution> {
     use std::io::{Error, ErrorKind};
+    #[cfg(test)]
+    super::fault::resolution()?;
     let Resolution {
         mut holders,
         mut keys,
@@ -494,6 +496,8 @@ pub fn name_existing_file(path: &Path) -> std::io::Result<()> {
 /// more than [`MAX_LINKS`] file links (a loop), a target that isn't a file.
 pub(crate) fn file_holders(path: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
     use std::io::{Error, ErrorKind};
+    #[cfg(test)]
+    super::fault::resolution()?;
     let mut holders = Vec::new();
     let mut keys = Vec::new();
     let mut current = path.to_path_buf();
