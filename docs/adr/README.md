@@ -4,8 +4,8 @@ One file per decision that is expensive to reverse. Format: context → decision
 
 | ADR | Title | Status |
 |---|---|---|
-| [0001](0001-own-engine-reuse-oxigraph-parsers.md) | Own storage engine; reuse Oxigraph's parsers and SPARQL evaluator | accepted |
-| [0002](0002-engine-storage-lsm-permutations.md) | Dictionary encoding + LSM runs over six quad permutations + WAL | accepted |
+| [0001](0001-own-engine-reuse-oxigraph-parsers.md) | Own storage engine; reuse Oxigraph's parsers and SPARQL evaluator | accepted; amended: since 2 October no Oxigraph library is used |
+| [0002](0002-engine-storage-lsm-permutations.md) | Dictionary encoding + LSM runs over six quad permutations + WAL | accepted; amended: a seventh permutation |
 | [0003](0003-materialised-reasoning.md) | Materialised, incrementally maintained reasoning with asserted/inferred separation | accepted |
 | [0004](0004-parity-targets-qlever-graphdb.md) | What NRESE learns from for performance and for semantics | accepted |
 | [0005](0005-builtin-shacl.md) | SHACL validation is built in and runs as a commit gate | accepted |

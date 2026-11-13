@@ -2,7 +2,7 @@
 
 This is the canonical architecture document. It says which layer owns which concern, which way dependencies may point, and — most importantly for day-to-day work — **at which layer a given kind of problem must be fixed**. Specs under `docs/spec/` refine individual concerns; if they contradict this file, this file wins and the spec is updated.
 
-Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
+Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the code of the commit it is in; what NRESE covers today is listed in the [README](../README.md#what-it-covers), what is planned in [ROADMAP.md](ROADMAP.md).
 
 ## 1. Product target
 
@@ -64,17 +64,41 @@ handle. Resource lifetimes, reservations and the kernel boundary are in
 
 ### 2.2 Data flow
 
-**Read:** `server` parses and authorises → `store::query` takes a snapshot (an `Arc` clone of the latest version, read under a lock held only while a commit publishes; nothing waits for a commit, compaction or checkpoint to finish) → `sparql` evaluates against the snapshot with a cancellation token → results are serialised → `server` sends the response.
+**Read:** `server` parses and authorises → `store::query` takes a snapshot (an `Arc` clone of the latest version, read under a lock held only while a commit publishes; nothing waits for a commit, compaction or checkpoint to finish) → `sparql` evaluates against the snapshot with a cancellation token, charging what it holds to the request's memory envelope (`budgets.query_memory`; past it `413`), which draws on all queries' budget (`budgets.total_query_memory`) inside the process's (`budgets.process_memory`; no room in either: `503`) → results are serialised → `server` sends the response.
 
 **Write (mutation pipeline, owned by `nrese-store`):** every public write enters here: the protocols' commands, and `MutationCommand::Delta` with a `DeltaPlanner` for any other front-end (a GQL or Cypher update), which plans its delta into the transaction and is gated like the rest. The store has no public method that commits around the pipeline (`write_path_tests`): its own writes to its system graphs and scratch stores are crate-private (`*_ungated`); bulk loads, rematerialisation and a replica's log are explicit operations of their own.
 1. Acquire the single writer slot and a snapshot of the latest revision.
 2. **Plan:** turn the request into a `Delta` (exact inserts and deletes relative to the snapshot). For SPARQL Update this evaluates `WHERE` clauses against *snapshot + pending delta*, so later operations in a request see earlier ones. Nothing is written.
-3. **Validate:** gates run against `(snapshot, delta)`: the reasoner first derives the inferred delta and checks consistency, then SHACL validates (where its gate is on). Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.
+3. **Validate:** gates run against `(snapshot, delta)`: the reasoner first derives the inferred delta and checks consistency, then SHACL validates (where its gate is on). Reasoning that would take the process past `budgets.process_memory` stops with an error (`500`), and nothing is committed. Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.
 4. **Deadline check:** if the request's deadline has passed or it was cancelled, abort. **Nothing is committed after a timeout.**
 5. **Commit:** the engine writes the asserted and inferred deltas to the WAL (durable mode), appends it as a new immutable run, and publishes the new version atomically. Revisions are persistent and monotonic.
 6. **Post-commit:** background compaction and checkpoints. Reasoning is *not* post-commit: inferences are committed with the write that causes them, under the same revision ([design/reasoner-v2.md](design/reasoner-v2.md) §2.1).
 
 Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any change that reintroduces work proportional to the dataset on the write path must be justified in an ADR.
+
+**Bulk load:** `nrese-server load` bypasses the pipeline: the engine writes the quads,
+then the reasoner recomputes the inferences and runs the rules' consistency checks
+([what a commit does](../README.md#what-a-commit-does)).
+
+### 2.3 Concepts: where each is explained and where its code is
+
+| Concept | Explained in | Code |
+|---|---|---|
+| Storage, snapshots, durability | [storage contract](spec/02-storage-and-transactions.md), §4 | `crates/nrese-engine/src/lib.rs`, `crates/nrese-engine/src/durability/mod.rs` |
+| A commit and its gates | [what a commit does](../README.md#what-a-commit-does), §2.2 | `crates/nrese-store/src/mutation/mod.rs` |
+| SPARQL query and update | [HTTP interface](ops/http-api.md#sparql), §5 | `crates/nrese-sparql/src/lib.rs` |
+| What an answer promises | [the README](../README.md#what-an-answer-promises) | `crates/nrese-sparql/src/completeness.rs` |
+| Reasoning modes and rules | [reasoning semantics](spec/reasoning-semantics.md) | `crates/nrese-reasoner/src/lib.rs`; when it runs: `crates/nrese-store/src/reasoning.rs` |
+| OWL 2 DL | [design](design/owl2-dl.md) | `crates/nrese-dl/src/lib.rs`, `crates/nrese-owl/src/lib.rs`, `crates/nrese-store/src/dl/mod.rs` |
+| SHACL | [design](design/shacl.md), [HTTP interface](ops/http-api.md#shacl-validation) | `crates/nrese-shacl/src/lib.rs`, `crates/nrese-store/src/shacl.rs` |
+| Access control | [HTTP interface](ops/http-api.md#graph-level-access-control), [ADR-0008](adr/0008-users-workspaces-policies.md) | `crates/nrese-store/src/access/mod.rs` |
+| Memory limits | [budgets](ops/config-reference.md#budgets) | `crates/nrese-store/src/runtime.rs`, `crates/nrese-exec/src/budget.rs` |
+| Bulk load, quarantine | [server setup](ops/server-setup.md), [quarantine](design/quarantine.md) | `crates/nrese-store/src/bulk_load.rs`, `crates/nrese-store/src/quarantine.rs` |
+| Backups | [backup and recovery](ops/server-setup.md#10-backup-and-recovery-setup) | `crates/nrese-store/src/backup.rs` |
+| Read replicas | [replication](ops/replication.md) | `crates/nrese-server/src/replication.rs` |
+| Configuration | [configuration reference](ops/config-reference.md) | `crates/nrese-server/src/config.rs` |
+| HTTP endpoints and errors | [HTTP interface](ops/http-api.md) | `crates/nrese-server/src/http/mod.rs` |
+| RDF syntaxes | [the README](../README.md#rdf-syntaxes) | `crates/rdf/nrese-rdf-io/src/lib.rs` |
 
 ## 3. Where to fix what
 
