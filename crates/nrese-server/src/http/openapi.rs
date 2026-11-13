@@ -29,6 +29,82 @@ pub(crate) struct Problem {
     request_id: Option<String>,
 }
 
+/// Describes every response whose body is a [`Problem`] with the media type the server
+/// sends it as, `application/problem+json`, instead of utoipa's default `application/json`.
+struct ProblemMedia;
+
+impl utoipa::Modify for ProblemMedia {
+    fn modify(&self, doc: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::RefOr;
+        let is_problem = |content: &RefOr<utoipa::openapi::Content>| {
+            matches!(content, RefOr::T(content)
+                if matches!(&content.schema, Some(RefOr::Ref(schema))
+                    if schema.ref_location == "#/components/schemas/Problem"))
+        };
+        for item in doc.paths.paths.values_mut() {
+            let operations = [&mut item.get, &mut item.head, &mut item.put, &mut item.post];
+            let operations = operations
+                .into_iter()
+                .chain([&mut item.patch, &mut item.delete]);
+            for operation in operations.flatten() {
+                for response in operation.responses.responses.values_mut() {
+                    let RefOr::T(response) = response else {
+                        continue;
+                    };
+                    response.content = std::mem::take(&mut response.content)
+                        .into_iter()
+                        .map(|(media, content)| match media == "application/json" {
+                            true if is_problem(&content) => {
+                                (crate::error::PROBLEM_JSON.to_owned(), content)
+                            }
+                            _ => (media, content),
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+}
+
+/// A query sent as a form (`application/x-www-form-urlencoded`): every parameter in the
+/// body, none in the URL.
+#[derive(utoipa::ToSchema)]
+#[expect(dead_code)]
+struct QueryForm {
+    /// The query, once.
+    query: String,
+    #[schema(rename = "default-graph-uri")]
+    default_graph_uri: Option<Vec<String>>,
+    #[schema(rename = "named-graph-uri")]
+    named_graph_uri: Option<Vec<String>>,
+    infer: Option<bool>,
+    explain: Option<String>,
+    #[schema(rename = "dl-answers")]
+    dl_answers: Option<String>,
+}
+
+/// An update sent as a form: every parameter in the body, none in the URL.
+#[derive(utoipa::ToSchema)]
+#[expect(dead_code)]
+struct UpdateForm {
+    /// The update, once.
+    update: String,
+    #[schema(rename = "using-graph-uri")]
+    using_graph_uri: Option<Vec<String>>,
+    #[schema(rename = "using-named-graph-uri")]
+    using_named_graph_uri: Option<Vec<String>>,
+}
+
+/// A query or an update sent as a form to the combined endpoint: exactly one of `query`
+/// (with [`QueryForm`]'s parameters) or `update` (with [`UpdateForm`]'s); both, or neither,
+/// is a 400.
+#[derive(utoipa::ToSchema)]
+#[expect(dead_code)]
+struct SparqlForm {
+    query: Option<String>,
+    update: Option<String>,
+}
+
 const ID: &str = "The repository's id (`nrese` is the default one)";
 
 macro_rules! protocol {
@@ -231,34 +307,142 @@ protocol!(
         body = String
     ))
 );
-protocol!(query, method(get, post), path = "/api/v1/repositories/{id}/query", tag = "sparql",
-    params(("id" = String, Path, description = ID),
-        ("query" = Option<String>, Query, description = "The query (`GET`, or a form `POST`)"),
+// The SPARQL Protocol's operations, as their handlers take them (`requests.rs`): the query or
+// update once, in the URL (`GET`) or in the body (`POST`), never both; the failures are those
+// of docs/ops/http-api.md, "Endpoint contracts".
+const RESULTS: &str = "SPARQL results (JSON, XML, CSV, TSV, binary) or RDF, as `Accept` asks";
+const QUERY_400: &str = "A syntax error; an empty or repeated query, or one in both the URL and \
+    the body; a parameter value it doesn't take";
+const UPDATE_400: &str = "A syntax error; an empty or repeated update, or one in both the URL \
+    and the body; a commit a consistency check or the SHACL gate rejects";
+const DENIED: &str =
+    "Not allowed: the requester may not do this, or read or write a graph it names";
+const QUERY_408: &str = "Timed out (`budgets.query_timeout`), or an operator cancelled it";
+const QUERY_413: &str =
+    "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`";
+const QUERY_422: &str = "`dl-answers=exact`, and the answers can't be proven complete";
+const UNAVAILABLE: &str =
+    "Not ready or unavailable, or `budgets.total_query_memory` taken; try again";
+const AFTER_BODY: &str = "With a SPARQL body; a form carries it in the body instead";
+protocol!(query_get, get, path = "/api/v1/repositories/{id}/query", tag = "sparql",
+    params(("id" = String, Path, description = ID), ("query" = String, Query, description = "The query, once"),
         ("default-graph-uri" = Option<Vec<String>>, Query), ("named-graph-uri" = Option<Vec<String>>, Query),
-        ("infer" = Option<bool>, Query, description = "Whether inferred statements are read (default true)")),
-    request_body(content = String, content_type = "application/sparql-query",
-        description = "The query; or `application/x-www-form-urlencoded` with `query=`"),
-    responses((status = 200, description = "SPARQL results (JSON, XML, CSV, TSV, binary) or RDF, as `Accept` asks"),
-        (status = 400, description = "A syntax error", body = Problem),
-        (status = 408, description = "The query timed out", body = Problem),
-        (status = 413, description = "Larger than the policy allows", body = Problem)));
+        ("infer" = Option<bool>, Query, description = "Whether inferred statements are read (default true)"),
+        ("explain" = Option<String>, Query, description = "`true`, `false` or `plan`"),
+        ("dl-answers" = Option<String>, Query, description = "`certain-where-complete`, `sound` or `exact`")),
+    responses((status = 200, description = RESULTS), (status = 400, description = QUERY_400, body = Problem),
+        (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
+        (status = 404, description = "No such repository", body = Problem),
+        (status = 406, description = "No format the `Accept` header takes", body = Problem),
+        (status = 408, description = QUERY_408, body = Problem), (status = 413, description = QUERY_413, body = Problem),
+        (status = 422, description = QUERY_422, body = Problem), (status = 429, description = "Rate limited", body = Problem),
+        (status = 503, description = UNAVAILABLE, body = Problem)));
+protocol!(query_post, post, path = "/api/v1/repositories/{id}/query", tag = "sparql",
+    params(("id" = String, Path, description = ID),
+        ("default-graph-uri" = Option<Vec<String>>, Query, description = AFTER_BODY),
+        ("named-graph-uri" = Option<Vec<String>>, Query, description = AFTER_BODY),
+        ("infer" = Option<bool>, Query, description = AFTER_BODY), ("explain" = Option<String>, Query, description = AFTER_BODY),
+        ("dl-answers" = Option<String>, Query, description = AFTER_BODY)),
+    request_body(description = "The query, as a form, or as the body (read as the query whatever its media type)",
+        content((String = "application/sparql-query"), (QueryForm = "application/x-www-form-urlencoded"))),
+    responses((status = 200, description = RESULTS), (status = 400, description = QUERY_400, body = Problem),
+        (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
+        (status = 404, description = "No such repository", body = Problem),
+        (status = 406, description = "No format the `Accept` header takes", body = Problem),
+        (status = 408, description = QUERY_408, body = Problem), (status = 413, description = QUERY_413, body = Problem),
+        (status = 422, description = QUERY_422, body = Problem), (status = 429, description = "Rate limited", body = Problem),
+        (status = 503, description = UNAVAILABLE, body = Problem)));
 protocol!(update, post, path = "/api/v1/repositories/{id}/update", tag = "sparql",
     params(("id" = String, Path, description = ID),
-        ("using-graph-uri" = Option<Vec<String>>, Query), ("using-named-graph-uri" = Option<Vec<String>>, Query)),
-    request_body(content = String, content_type = "application/sparql-update",
-        description = "The update; or `application/x-www-form-urlencoded` with `update=`"),
-    responses((status = 204, description = "Committed"),
-        (status = 400, description = "A syntax error, or rejected by a consistency or SHACL gate", body = Problem),
-        (status = 403, description = "Writes a graph the requester may not write", body = Problem)));
+        ("using-graph-uri" = Option<Vec<String>>, Query, description = AFTER_BODY),
+        ("using-named-graph-uri" = Option<Vec<String>>, Query, description = AFTER_BODY)),
+    request_body(description = "The update, as the body (`text/plain` or no `Content-Type` read the same) or a form",
+        content((String = "application/sparql-update"), (String = "text/plain"),
+            (UpdateForm = "application/x-www-form-urlencoded"))),
+    responses((status = 204, description = "Committed and synced"), (status = 400, description = UPDATE_400, body = Problem),
+        (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
+        (status = 404, description = "No such repository, or updates are off in this deployment", body = Problem),
+        (status = 408, description = "Timed out (`budgets.update_timeout`); nothing committed", body = Problem),
+        (status = 413, description = "Past `budgets.update_size`", body = Problem),
+        (status = 415, description = "Another `Content-Type`", body = Problem),
+        (status = 429, description = "Rate limited", body = Problem), (status = 503, description = UNAVAILABLE, body = Problem)));
+protocol!(sparql_get, get, path = "/api/v1/repositories/{id}/sparql", tag = "sparql",
+    params(("id" = String, Path, description = ID),
+        ("query" = Option<String>, Query, description = "The query, once; without it, the service description"),
+        ("default-graph-uri" = Option<Vec<String>>, Query), ("named-graph-uri" = Option<Vec<String>>, Query),
+        ("infer" = Option<bool>, Query), ("explain" = Option<String>, Query), ("dl-answers" = Option<String>, Query)),
+    responses((status = 200, description = "With `query`, as `GET …/query`; without, the service description (Turtle)"),
+        (status = 400, description = QUERY_400, body = Problem),
+        (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
+        (status = 404, description = "No such repository", body = Problem),
+        (status = 406, description = "No format the `Accept` header takes", body = Problem),
+        (status = 408, description = QUERY_408, body = Problem), (status = 413, description = QUERY_413, body = Problem),
+        (status = 422, description = QUERY_422, body = Problem), (status = 429, description = "Rate limited", body = Problem),
+        (status = 503, description = UNAVAILABLE, body = Problem)));
 protocol!(
-    sparql,
-    method(get, post),
+    sparql_post,
+    post,
     path = "/api/v1/repositories/{id}/sparql",
     tag = "sparql",
     params(("id" = String, Path, description = ID)),
+    request_body(
+        description = "A query or an update, by the body's media type or the form's field; \
+        with a SPARQL body, the other parameters in the URL, as for `…/query` and `…/update`",
+        content(
+            (String = "application/sparql-query"),
+            (String = "application/sparql-update"),
+            (SparqlForm = "application/x-www-form-urlencoded")
+        )
+    ),
     responses(
-        (status = 200, description = "A query's results"),
-        (status = 204, description = "An update committed")
+        (
+            status = 200,
+            description = "A query's results, as `POST …/query`"
+        ),
+        (
+            status = 204,
+            description = "An update committed, as `POST …/update`"
+        ),
+        (
+            status = 400,
+            description =
+                "As `…/query` or `…/update`; a form with both `query` and `update`, or neither",
+            body = Problem
+        ),
+        (
+            status = 401,
+            description = "Not authenticated",
+            body = Problem
+        ),
+        (status = 403, description = DENIED, body = Problem),
+        (
+            status = 404,
+            description = "No such repository; for an update, updates off in this deployment",
+            body = Problem
+        ),
+        (
+            status = 406,
+            description = "No format the `Accept` header takes",
+            body = Problem
+        ),
+        (
+            status = 408,
+            description = "Timed out, or an operator cancelled the query",
+            body = Problem
+        ),
+        (
+            status = 413,
+            description = "Past the query's or the update's budgets",
+            body = Problem
+        ),
+        (
+            status = 415,
+            description = "Another `Content-Type`, none included",
+            body = Problem
+        ),
+        (status = 422, description = QUERY_422, body = Problem),
+        (status = 429, description = "Rate limited", body = Problem),
+        (status = 503, description = UNAVAILABLE, body = Problem)
     )
 );
 protocol!(
@@ -355,6 +539,7 @@ protocol!(
 
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&ProblemMedia),
     info(
         title = "NRESE engine API",
         description = "Every capability of the engine, the same for every repository \
@@ -373,9 +558,11 @@ protocol!(
         summary,
         reasoning,
         service_description,
-        query,
+        query_get,
+        query_post,
         update,
-        sparql,
+        sparql_get,
+        sparql_post,
         tell,
         data,
         shacl,
