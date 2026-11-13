@@ -161,6 +161,18 @@ pub(super) fn admits(expected: f64, reads: usize) -> bool {
     reads <= SET_START_ALLOWANCE || expected >= SET_GATE_ROWS
 }
 
+/// Whether a BGP whose set search would read `reads` entries at its starts is admitted by
+/// them alone ([`SET_START_ALLOWANCE`]), whatever its plain plan expects: such a BGP is
+/// searched with the sets before it is planned without them. Not where a test keeps every
+/// BGP from the sets ([`ADMIT`]).
+pub(super) fn short_starts(reads: usize) -> bool {
+    #[cfg(test)]
+    if ADMIT.with(Cell::get) == Some(false) {
+        return false;
+    }
+    reads <= SET_START_ALLOWANCE
+}
+
 /// [`SET_ENTRIES_PER_ROW`] per expected row, in entries: a float cast saturates, NaN to 0 and
 /// beyond the range (infinity included) to `usize::MAX`.
 fn per_row(expected: f64) -> usize {

@@ -315,9 +315,9 @@ fn a_query_cancelled_before_its_planning_is_not_planned_again() {
 }
 
 /// Spec: the design review's round 2 (R2-P1): the planning without the sets still asks for
-/// the query's cancellation at every step. It now comes first (plain first, 12 November
-/// 13:53): cancelled at its first step, the query fails as cancelled, the set search never
-/// runs, and nothing falls back.
+/// the query's cancellation at every step. Here it comes after a set search that passes its
+/// budget at its starts, before its first step: cancelled at the plain planning's first step,
+/// the query fails as cancelled, and nothing falls back.
 #[test]
 fn the_planning_without_the_sets_stops_when_cancelled() {
     let engine = people();
@@ -619,8 +619,9 @@ fn plannings(
 /// that": a BGP the gate keeps from the sets ([`plan::admits`]) gets the plain plan, reads no
 /// set and plans once; EXPLAIN says so, once, under the BGP, with its starts' reads and the
 /// rows expected. Admitted, the same BGP is planned with the sets as before. Under the
-/// planner's own gate, the people graph's few sets are read. Red without the gate (every BGP
-/// read with the sets).
+/// planner's own gate, the people graph's few sets are read, and they alone admit them: the
+/// set search comes first and is all it plans (the master's answer of 13 November 21:12).
+/// Red without the gate (every BGP read with the sets).
 #[test]
 fn a_bgp_the_gate_keeps_from_the_sets_reads_none() {
     let engine = people();
@@ -664,7 +665,7 @@ fn a_bgp_the_gate_keeps_from_the_sets_reads_none() {
     );
     assert_eq!(
         (steps(&own.unwrap()), asked_own),
-        (steps(&with), vec![false, true]),
+        (steps(&with), vec![true]),
         "the planner's own gate"
     );
 }
@@ -702,18 +703,27 @@ fn a_cancelled_query_with_a_fixed_order_gets_no_plan() {
     }
 }
 
-/// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`], "plain first": a BGP
-/// whose set search passes its budget keeps the plain plan made before it, and isn't planned
-/// again; its work is the set search's. Red on the parent, which plans with the sets first
-/// and then again without them.
+/// Spec: the master's answer of 13 November 21:12, "a group that the short-start allowance
+/// admits tries its set search first and makes the plain plan only if that search gives up",
+/// with the plans and notes plain first gave: a BGP whose starts read few sets
+/// ([`plan::short_starts`]) is planned once, with the sets, where that search completes;
+/// where it passes its budget, the BGP is planned once more, without the sets, keeps that
+/// plain plan and isn't planned again; its work is the set search's. Red with the plain plan
+/// first.
 #[test]
-fn past_its_budget_a_bgp_keeps_its_plain_plan_without_planning_again() {
+fn a_bgp_with_short_starts_is_searched_with_the_sets_first() {
     let engine = people();
     let snapshot = engine.snapshot();
     let options = QueryOptions::default();
     let ctx = Context::new(&snapshot, &options, None, None);
     let (with, _) = under(&ctx, &STAR, usize::MAX).unwrap();
     let none = without_sets(&ctx, &STAR, None);
+    let (within, asked) = plannings(&ctx, &STAR);
+    assert_eq!(
+        (steps(&within.unwrap()), asked),
+        (steps(&with), vec![true]),
+        "within its budget: plan, plannings"
+    );
     let budget = with.work - 1;
     BUDGET.set(Some(budget));
     REPLANS.set(0);
@@ -722,8 +732,8 @@ fn past_its_budget_a_bgp_keeps_its_plain_plan_without_planning_again() {
     let past = past.unwrap();
     assert_eq!(
         (steps(&past), asked, REPLANS.get()),
-        (none, vec![false, true], 1),
-        "plan, plannings, fallbacks"
+        (none, vec![true, false], 1),
+        "past its budget: plan, plannings, fallbacks"
     );
     assert!(
         past.work > 0 && past.work <= budget,
@@ -732,11 +742,60 @@ fn past_its_budget_a_bgp_keeps_its_plain_plan_without_planning_again() {
     );
 }
 
+/// A store whose predicate `p` is in more sets than [`plan::SET_START_ALLOWANCE`] (each
+/// subject of `p` has a predicate of its own), and whose `q` is on one subject of `p`.
+fn long_starts() -> Engine {
+    let many = plan::SET_START_ALLOWANCE + 1;
+    let names: Vec<[String; 3]> = (0..many)
+        .flat_map(|i| {
+            [
+                [format!("s{i}"), "p".into(), format!("o{i}")],
+                [format!("s{i}"), format!("u{i}"), "v".into()],
+            ]
+        })
+        .chain([["s0".into(), "q".into(), "w".into()]])
+        .collect();
+    let triples: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|[s, p, o]| (s.as_str(), p.as_str(), o.as_str()))
+        .collect();
+    graph(&triples)
+}
+
 /// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`] and the budget's
-/// cancellation rule: a query cancelled in its plain planning fails as cancelled, and its set
-/// search never runs.
+/// cancellation rule: a query cancelled in its plain planning (planned first: its starts read
+/// many sets) fails as cancelled, and its set search never runs.
 #[test]
 fn a_query_cancelled_in_its_plain_planning_reads_no_sets() {
+    let engine = long_starts();
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    let options = QueryOptions {
+        resources: Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let ctx = Context::new(&snapshot, &options, None, None);
+    // Cancelled at the plain planning's first step.
+    STEP.set(Some(Box::new(move || token.cancel())));
+    let (planned, asked) = plannings(&ctx, &["?x p ?y", "?x q ?z"]);
+    STEP.set(None);
+    assert!(
+        matches!(planned, Err(QueryEvaluationError::Cancelled)),
+        "{:?}",
+        planned.err()
+    );
+    assert_eq!(asked, vec![false]);
+}
+
+/// Spec: the budget's cancellation rule and the code review of 13 November (F1): a query
+/// cancelled before its BGP is planned fails as cancelled and plans nothing, with the sets
+/// or without, also where its starts read few sets and would be searched with the sets first.
+/// Red without the check before the statistics are asked for.
+#[test]
+fn a_query_cancelled_before_its_planning_plans_nothing() {
     let engine = people();
     let snapshot = engine.snapshot();
     let token = CancellationToken::new();
@@ -755,7 +814,7 @@ fn a_query_cancelled_in_its_plain_planning_reads_no_sets() {
         "{:?}",
         planned.err()
     );
-    assert_eq!(asked, vec![false]);
+    assert_eq!(asked, Vec::<bool>::new(), "plannings");
 }
 
 /// Spec: as [`a_bgp_the_gate_keeps_from_the_sets_reads_none`], under the planner's own gate
@@ -764,21 +823,7 @@ fn a_query_cancelled_in_its_plain_planning_reads_no_sets() {
 /// sets anyway, it is planned with them. Red where the gate counts no reads at its starts.
 #[test]
 fn a_bgp_whose_starts_read_many_sets_and_that_expects_little_reads_none() {
-    let many = plan::SET_START_ALLOWANCE + 1;
-    let names: Vec<[String; 3]> = (0..many)
-        .flat_map(|i| {
-            [
-                [format!("s{i}"), "p".into(), format!("o{i}")],
-                [format!("s{i}"), format!("u{i}"), "v".into()],
-            ]
-        })
-        .chain([["s0".into(), "q".into(), "w".into()]])
-        .collect();
-    let triples: Vec<(&str, &str, &str)> = names
-        .iter()
-        .map(|[s, p, o]| (s.as_str(), p.as_str(), o.as_str()))
-        .collect();
-    let engine = graph(&triples);
+    let engine = long_starts();
     let snapshot = engine.snapshot();
     let options = QueryOptions::default();
     let ctx = Context::new(&snapshot, &options, None, None);
@@ -951,9 +996,9 @@ fn a_fixed_order_is_admitted_by_its_first_start_alone() {
 /// gate's code review (F3, catalogue D16-559): a BGP's set search may do
 /// [`plan::SET_ENTRIES_PER_ROW`] per row its plain plan expects where that is more than the
 /// least budget. With the least budget ([`plan::FLOOR`]) below the work its set plan takes, a
-/// BGP that expects enough rows keeps that plan, planned once; given only that least budget,
-/// it falls back to the plain plan. No test's budget or decision: the planner's own gate and
-/// budget. Red where the planning's budget doesn't follow the rows it expects.
+/// BGP that expects enough rows keeps that plan, without falling back; given only that least
+/// budget, it falls back to the plain plan. No test's budget or decision: the planner's own
+/// gate and budget. Red where the planning's budget doesn't follow the rows it expects.
 #[test]
 fn a_bgp_that_expects_much_work_plans_past_the_least_budget() {
     // Ten subjects with `a`, `b` and `c`, twenty of each; ninety with one `a` alone: the sets
