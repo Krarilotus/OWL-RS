@@ -145,9 +145,10 @@ answers `ex:felix`. When each part of a commit becomes visible, and what the che
 [What a commit does](#what-a-commit-does). The shape stays in the store: to run the example
 again, [start over](#change-a-setting-start-over) first.
 
-This example is also a test:
+Optional: this example is also a test.
 [readme-first-example.toml](scripts/verify/scenarios/readme-first-example.toml) sends each step
-above and checks its answer. Run it against a fresh server started as above:
+above and checks its answer. To run it you also need [Python](https://www.python.org/downloads/) 3.11
+or later; start a fresh server as above, then:
 `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/readme-first-example.toml`.
 Last run: 13 November 2026, on commit `78b4a49b7`, all 9 steps passed.
 
@@ -259,7 +260,7 @@ deviation from a standard: [limits](docs/limits.md). What is planned:
 
 | Capability | Limits and notes |
 |---|---|
-| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) Query, Update and federated `SERVICE` | Update's `LOAD` is refused (`LOAD SILENT` does nothing); load data over HTTP or with `nrese-server load` instead. The W3C suites run in the checks and in CI, with no known failure listed ([evaluation](crates/nrese-sparql/tests/w3c_sparql11), [syntax](crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)). `SERVICE` calls only the endpoints `federation.allow` names |
+| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) Query, Update and federated `SERVICE` | The W3C suites run in the checks and in CI, with no known failure listed ([evaluation](crates/nrese-sparql/tests/w3c_sparql11), [syntax](crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)). Deviations (`LOAD`, `SERVICE`, `HAVING` aliases, merged blank nodes), each with what to do: [limits](docs/limits.md#sparql) |
 | SPARQL 1.2 and RDF 1.2 drafts: triple terms, directional strings | Results announce `version 1.2` when they may use them ([HTTP interface](docs/ops/http-api.md#sparql)) |
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), service description | [HTTP interface](docs/ops/http-api.md) |
 | Results in JSON, XML, CSV and TSV; graphs in every RDF syntax below | Chosen by `Accept` ([formats](docs/ops/http-api.md#sparql)) |
@@ -267,7 +268,6 @@ deviation from a standard: [limits](docs/limits.md). What is planned:
 | Full-text search (BM25) through the `bds:` and Jena `text:query` vocabularies, with phrases, prefixes, fuzzy words and stemming in 18 languages | One index over every string literal, built at the first search; an on-disk store keeps it across restarts ([full-text](docs/ops/http-api.md#sparql)) |
 | Vector search: vectors as literals (`"[…]"^^nrv:vector`), `SERVICE nrv:search` with cosine, dot product or Euclidean distance, exact or through HNSW, filtered by the rest of the query | You bring the vectors; the store computes no embeddings. Approximate search trades recall for speed through `nrv:searchBudget` ([vector search](docs/ops/http-api.md#sparql)) |
 | [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html), in part: functions and relations over WKT, GeoJSON and simple GML, with an R-tree | Measures in metres only in CRS84 and a listed set of projected systems; no GML arcs or 3D solids ([GeoSPARQL](docs/ops/http-api.md#sparql), [compliance runner](crates/nrese-sparql/tests/geosparql_compliance)) |
-| Two deliberate deviations | `HAVING` may name a `SELECT` alias; a default graph merged from several graphs keeps shared blank nodes as one ([why](docs/ops/http-api.md#sparql)) |
 
 ### RDF syntaxes
 
@@ -509,7 +509,8 @@ runs recorded there are as of their dates.
 ## State and limits
 
 These pages describe the code of the commit they are in, package version 0.1.0, which is
-not a release. A running server names its build at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
+not a release. Which commit that is: `git log -1` in your clone, or the commit GitHub shows
+beside the file. A running server names its build at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
 the ruleset with its semantics version and a fingerprint of what it derives
 ([reasoning-semantics.md](docs/spec/reasoning-semantics.md)).
 
