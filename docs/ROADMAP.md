@@ -16,7 +16,7 @@ below; across machines, only read replicas are built so far.
 
 1. **Finish v2:** the open items of the merge checklist (DL classification and its
    outliers, the store's DL mode, the query items, materialisation memory, OWL 2 QL
-   rewriting).
+   rewriting, which is done: [STATUS](STATUS.md)).
 2. **Benchmark it:** the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the

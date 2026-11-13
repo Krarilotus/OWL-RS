@@ -150,7 +150,8 @@ Optional: this example is also a test.
 above and checks its answer. To run it you also need [Python](https://www.python.org/downloads/) 3.11
 or later; start a fresh server as above, then:
 `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/readme-first-example.toml`.
-Last run: 13 November 2026, on commit `78b4a49b7`, all 9 steps passed.
+Last run: 13 November 2026, on commit `78b4a49b7`, all 9 steps passed; what each step sends,
+expects and got: [the record](docs/dev/readme-example-record.md).
 
 ### Your own data
 
@@ -513,6 +514,16 @@ not a release. Which commit that is: `git log -1` in your clone, or the commit G
 beside the file. A running server names its build at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
 the ruleset with its semantics version and a fingerprint of what it derives
 ([reasoning-semantics.md](docs/spec/reasoning-semantics.md)).
+
+Changes that affect stored data, answers or clients, with their dates and what to do:
+- Upgrading a store written by an earlier version: what changes on purpose, and rolling back
+  ([upgrade](docs/ops/server-setup.md#131-upgrading-a-store-from-main-to-v2)).
+- Reasoning semantics versions 4 (7 November 2026) and 3 (28 October 2026): which stored
+  verdicts and closures are rebuilt once ([reasoning semantics](docs/spec/reasoning-semantics.md)).
+- Crash recovery of the write-ahead log (2 November 2026) and durable renames on Windows
+  (7 November 2026): what each changed ([ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)).
+- Routes of the earlier release, deprecated since 3 October 2026 and answering until the next
+  release ([HTTP interface](docs/ops/http-api.md#service-and-operations)).
 
 What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md) (its counts
 and measurements are as of when each was recorded); the order

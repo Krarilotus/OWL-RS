@@ -4,7 +4,7 @@
 
 | Question | Document |
 |---|---|
-| How do I run it and send a first query? | the [quick start](../README.md#quick-start), then [getting started](dev/getting-started.md) |
+| How do I run it and send a first query? | the [quick start](../README.md#quick-start), then [getting started](dev/getting-started.md); the first example's test and last run: [record](dev/readme-example-record.md) |
 | What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-covers) |
 | What doesn't it do, and when should I choose another system? | [Limits and deviations](limits.md) |
 | How do I load my own data? | [your own data](../README.md#your-own-data); large files: [bulk loading](ops/server-setup.md#54-bulk-loading) |
