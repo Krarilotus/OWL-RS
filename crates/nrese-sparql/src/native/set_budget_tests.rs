@@ -7,7 +7,7 @@
 //! commit before them, and the chain's count on an orderer that doesn't count links.
 
 use super::join_order_tests::{Steps, people, scan, steps};
-use super::plan::{self, BUDGET, STATISTICS, STEP};
+use super::plan::{self, BUDGET, STAR_STATE, STATISTICS, STEP};
 use super::*;
 use crate::Resources;
 use nrese_engine::{Engine, EngineConfig};
@@ -831,4 +831,31 @@ fn a_query_cancelled_in_its_set_search_gets_no_plan() {
         "{:?}",
         planned.ok().map(|p| steps(&p))
     );
+}
+
+/// Spec: the master's order of 13 November, "plain planning pays only for what it uses: no
+/// search state built when the gate keeps a group from the sets": a search without the
+/// characteristic sets keeps no star predicates or edges in its states (only the estimates
+/// from the sets read them); the same patterns searched with the sets keep them. Red with
+/// that state built whatever the search.
+#[test]
+fn a_search_without_the_sets_keeps_no_star_or_edge_state() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (scans, counts) = bgp(&ctx, &STAR);
+    let mut vars = Vec::new();
+    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let sets = snapshot.characteristic_sets_in(ctx.model).unwrap();
+    let kept = |sets: Option<&CharacteristicSets>| {
+        STAR_STATE.set(0);
+        plan::order(&inputs, vars.len(), PROBE_FACTOR, sets, usize::MAX, &|| {
+            false
+        })
+        .unwrap();
+        STAR_STATE.get()
+    };
+    assert_eq!(kept(None), 0, "without the sets");
+    assert!(kept(Some(&*sets)) > 0, "with them");
 }
