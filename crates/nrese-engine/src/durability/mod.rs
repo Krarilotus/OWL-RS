@@ -157,6 +157,56 @@ impl Default for DurabilityConfig {
     }
 }
 
+/// What a store's open leaves to resolve of its names (D16-548): the root as opened, the
+/// store's internal directories found in it, and its authoritative files. Resolved at the open
+/// where the open changes the store; else at the first durable write that relies on them, or
+/// the log served ([`wal::PendingNames::resolve`]). Not covered, as in DUR-4: a link or
+/// directory renamed or replaced by someone else while the store is open.
+pub(crate) struct NamesToResolve {
+    root: PathBuf,
+    /// Whether the open found the root (else it made every level of it, synced).
+    found: bool,
+    /// The internal directories (`wal`, an enabled `wal-archive`) found in a found root.
+    found_inside: Vec<std::ffi::OsString>,
+    wal_dir: PathBuf,
+    /// The checkpoint loaded, each segment replayed, and the newest, each once.
+    files: Vec<PathBuf>,
+}
+
+impl NamesToResolve {
+    /// The names to sync, resolved now: a found root's holders (its chain walked once, each
+    /// found internal directory resolved from where it ended, review r1 R1-L1), each file's
+    /// link chain (DUR-5: a regular file adds nothing), and the store's own directories keyed
+    /// as the holders are (one directory, one key).
+    pub(crate) fn resolve(&self) -> std::io::Result<wal::PendingNames> {
+        let (mut holders, own) = match self.found {
+            true => {
+                let mut named = place::Named::resolve(&self.root)?;
+                for name in &self.found_inside {
+                    named.beyond(name)?;
+                }
+                let own = vec![
+                    (self.wal_dir.clone(), named.key(self.wal_dir.file_name())),
+                    (self.root.clone(), named.key(None)),
+                ];
+                (named.into_holders(), own)
+            }
+            // A made root has no holders to meet.
+            false => (
+                Vec::new(),
+                vec![
+                    (self.wal_dir.clone(), self.wal_dir.clone()),
+                    (self.root.clone(), self.root.clone()),
+                ],
+            ),
+        };
+        for file in &self.files {
+            holders.extend(place::file_holders(file)?);
+        }
+        Ok(wal::PendingNames::new(holders, own))
+    }
+}
+
 /// The durable side of an open engine.
 pub(crate) struct Durable {
     root: PathBuf,
@@ -190,15 +240,13 @@ impl Durable {
         // not lose the directory that holds them. A root found: its holders' syncs are left to
         // the first durable write that relies on them (`Wal::settle_names`), as the first sync
         // an open does costs it a journal commit and a device flush (timing of 8 Nov,
-        // deferred-sync design note). A root made: every level now, as a new store pays once.
+        // deferred-sync design note), and so is their resolution where the open changes nothing
+        // (D16-548: an open that never writes reads none of its names). A root made: every
+        // level now, as a new store pays once.
         let found = root.is_dir();
-        let mut named = match found {
-            true => Some(place::Named::resolve(root)?),
-            false => {
-                place::create_dir_all(root)?;
-                None
-            }
-        };
+        if !found {
+            place::create_dir_all(root)?;
+        }
         // Whether the open changes the store on disk: then what it changed, and the names
         // with it, are synced before it returns, as before.
         let mut changed = !found;
@@ -274,13 +322,14 @@ impl Durable {
         // R1-L1): the names its resolution reads (the link's holder, its target's chain) join
         // the holders, under the same found-level rule, as the store's records live there.
         // Resolved from where the root's resolution ended (one walk of their common chain).
+        let mut found_inside = Vec::new();
         let mut internal = |dir: &Path| -> EngineResult<bool> {
             let made = place::create_store_dir(dir)?;
-            if !made && let Some(named) = &mut named {
+            if !made && found {
                 let name = dir
                     .file_name()
                     .expect("a store's internal directory has a name");
-                named.beyond(name)?;
+                found_inside.push(name.to_owned());
             }
             Ok(made)
         };
@@ -496,45 +545,41 @@ impl Durable {
         // checkpoint renamed just before the crash, and segments removed or cut, likewise. The
         // root's sync also names the WAL's directory and the archive, found in it above.
         // - What was replayed is synced now: no reader sees content a power loss could undo.
-        // - The names (the root's holders, the WAL's directory, the root) are synced now if the
-        //   open changed the store; otherwise before the first durable write that relies on
+        // - The names (the root's holders, the WAL's directory, the root) are resolved and
+        //   synced now if the open changed the store; otherwise before the first durable write
+        //   that relies on
         //   them: a commit's record, a checkpoint, a bulk publication, the log served to a
         //   follower (`Wal::settle_names`). Nothing is acknowledged before they are durable.
         for path in &replayed {
             place::sync_file(path)?;
         }
-        // The store's own directories keyed as the holders are (one directory, one key); a
-        // made root has no holders to meet.
-        let (mut holders, own) = match named {
-            Some(named) => {
-                let own = vec![
-                    (wal_dir.clone(), named.key(wal_dir.file_name())),
-                    (root.to_path_buf(), named.key(None)),
-                ];
-                (named.into_holders(), own)
-            }
-            None => (
-                Vec::new(),
-                vec![
-                    (wal_dir.clone(), wal_dir.clone()),
-                    (root.to_path_buf(), root.to_path_buf()),
-                ],
-            ),
-        };
         // The authoritative files reached through links (DUR-5, fix check r2 on DUR-4, R2-F1):
         // the checkpoint loaded, each segment replayed, and the newest segment, which
         // `Wal::open` appends to (a covered one included), once: it is often the last replayed.
-        // A file that is a link has its target's chain named with the found levels; a regular
-        // file adds nothing.
         let newest = newest.filter(|path| replayed.last() != Some(path));
-        let replayed_files = replayed.iter().map(|path| &**path);
-        for file in checkpoint_path.iter().chain(replayed_files).chain(newest) {
-            holders.extend(place::file_holders(file)?);
-        }
-        let mut pending = wal::PendingNames::new(holders, own);
-        if changed {
-            pending.settle()?;
-        }
+        let files = checkpoint_path
+            .iter()
+            .chain(replayed.iter().copied())
+            .chain(newest)
+            .cloned()
+            .collect();
+        let names = NamesToResolve {
+            root: root.to_path_buf(),
+            found,
+            found_inside,
+            wal_dir: wal_dir.clone(),
+            files,
+        };
+        // Where the open changed the store, they are resolved and synced now, as before; where
+        // it found the store and changed nothing, both wait for their first use (D16-548).
+        let pending = match changed {
+            true => {
+                let mut pending = names.resolve()?;
+                pending.settle()?;
+                pending
+            }
+            false => wal::PendingNames::deferred(names),
+        };
         let integers_in_dictionary = integers_in_dictionary.unwrap_or(false);
         dictionary.set_integers_in_dictionary(integers_in_dictionary);
         let wal = Wal::open(

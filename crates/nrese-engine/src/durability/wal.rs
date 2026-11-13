@@ -184,6 +184,9 @@ pub(crate) struct Wal {
 pub(crate) struct PendingNames {
     /// In the order synced (outermost first), each with whether `PermissionDenied` leaves it.
     dirs: Vec<(PathBuf, bool)>,
+    /// What the store's open left to resolve (D16-548): resolved at the first use
+    /// ([`Self::resolve`]), its directories then synced as these are.
+    unresolved: Option<Box<super::NamesToResolve>>,
 }
 
 impl PendingNames {
@@ -210,13 +213,35 @@ impl PendingNames {
                 }
             }
         }
-        Self { dirs }
+        Self {
+            dirs,
+            unresolved: None,
+        }
     }
 
-    /// Syncs each, removing it once synced; the first failure is returned, leaving it and the
-    /// rest for the next call.
+    /// The names a found store's open, which changed nothing, leaves unresolved.
+    pub(crate) fn deferred(names: super::NamesToResolve) -> Self {
+        Self {
+            dirs: Vec::new(),
+            unresolved: Some(Box::new(names)),
+        }
+    }
+
+    /// Resolves what the open left unresolved, all of it or nothing: a failure keeps it, for
+    /// the next call to try again.
+    pub(crate) fn resolve(&mut self) -> std::io::Result<()> {
+        if let Some(names) = &self.unresolved {
+            self.dirs = names.resolve()?.dirs;
+            self.unresolved = None;
+        }
+        Ok(())
+    }
+
+    /// Resolves them ([`Self::resolve`]), then syncs each, removing it once synced; the first
+    /// failure is returned, leaving it and the rest for the next call.
     pub(crate) fn settle(&mut self) -> std::io::Result<()> {
         use std::io::ErrorKind::PermissionDenied;
+        self.resolve()?;
         while let Some((dir, tolerant)) = self.dirs.first() {
             match super::place::sync_dir(dir) {
                 Ok(()) => {}
@@ -328,6 +353,10 @@ impl Wal {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
         }
+        // The names the open left unresolved are resolved before anything of this commit is
+        // done (D16-548): a failure refuses it with the log as it was, not poisoned. They are
+        // synced after the record, as the names pending are (below).
+        self.pending_names.resolve()?;
         if self.active_bytes >= self.segment_bytes {
             self.rotate(record.revision)?;
         }
