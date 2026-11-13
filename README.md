@@ -1,16 +1,18 @@
 # NRESE
 
 An RDF store with built-in OWL reasoning, written in Rust. A hobby project, developed in
-the open.
+the open; not yet for parallel writers, failover or data split across machines
+([limits, and when to choose another system](docs/limits.md)).
 
 NRESE stores [RDF](https://www.w3.org/TR/rdf11-primer/) datasets (statements: subject,
 predicate, object) and answers [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/) queries
-and updates. Given an ontology, it derives the statements that follow from the stored
-(asserted) ones and keeps these inferred statements up to date on every commit (a write,
-applied whole or not at all), so you query them like asserted ones. Reasoning goes from
-[RDFS](https://www.w3.org/TR/rdf11-schema/) to [OWL 2](https://www.w3.org/TR/owl2-primer/)
-DL; in the OWL 2 QL, RL and DL modes a commit that would make the data inconsistent is
-rejected, with the reason. Every SPARQL answer carries a status that says what it promises
+and updates. Given an [ontology](docs/glossary.md#ontology), it derives the statements that
+follow from the stored (asserted) ones and keeps these inferred statements up to date on
+every commit (a write, applied whole or not at all), so you query them like asserted ones.
+Reasoning goes from [RDFS](https://www.w3.org/TR/rdf11-schema/) to
+[OWL 2](https://www.w3.org/TR/owl2-primer/) DL; in the OWL 2 QL, RL and DL
+[profiles](docs/glossary.md#reasoning-mode-profile) a commit that would make the data
+inconsistent is rejected, with the reason. Every SPARQL answer carries a status that says what it promises
 (complete, or sound with rows possibly missing, and why) and warns where it can promise
 neither. [SHACL](https://www.w3.org/TR/shacl/) validation, full-text and vector search,
 graph-level access control and the SPARQL, Graph Store and RDF4J protocols are built in.
@@ -22,15 +24,33 @@ It may suit you if you:
 - need to know when an answer under OWL reasoning may be missing rows;
 - want a store you can read and take apart: small crates in clear layers.
 
-Not there yet: parallel writes (one commit at a time), automatic failover (read replicas
-only), named graphs as reasoning boundaries, packages on crates.io. The main limits and deviations, and
-when to choose another system: [Limits and deviations](docs/limits.md).
+What it does today: [What it covers](#what-it-covers); what it leaves out, and when to
+choose another system: [limits](docs/limits.md); what is planned:
+[ROADMAP](docs/ROADMAP.md); how it works: [How it is built](#how-it-is-built).
 
 ## Quick start
 
-You need git, Docker Engine 23 or later or Docker Desktop (the build needs BuildKit, their
-default builder), and curl 7.71 or later. Rust and Node.js aren't needed: the image builds
-the server and its console.
+You need:
+
+- git ([install](https://git-scm.com/downloads));
+- Docker Engine 23 or later ([install](https://docs.docker.com/engine/install/)) or Docker
+  Desktop ([install](https://docs.docker.com/desktop/)): the build needs BuildKit, their
+  default builder;
+- curl 7.71 or later (`curl --version`; [download](https://curl.se/download.html));
+- for the build: a CPU from x86-64-v3 (amd64) or Neoverse N1 (arm64) on (for an older one,
+  add `--build-arg NRESE_TARGET_CPU=portable` to `docker build`), and about 3 GB of free
+  memory and 3 GB of free disk, besides the base images Docker downloads;
+- port 8080 free on this machine.
+
+Rust and Node.js aren't needed: the image builds the server and its console. The commands
+below fetch the code, build the image `nrese` and start it as the container `nrese`:
+
+- its data on the volume `nrese-data`;
+- its port bound to this machine only, since no authentication is on (set
+  `NRESE_AUTH_MODE` before you expose it: [access control](#access-control-and-operations));
+- reasoning under OWL 2 RL, and the SHACL commit gate on, which the example below uses.
+
+Words these pages use: [glossary](docs/glossary.md).
 
 ```bash
 git clone https://github.com/Krarilotus/OWL-RS.git
@@ -41,25 +61,20 @@ docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/d
 curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
 ```
 
-- The build compiles the server: about 7 minutes on 12 cores, longer on fewer. The image
-  is built for CPUs from x86-64-v3 (amd64) or Neoverse N1 (arm64) on; for an older CPU add
-  `--build-arg NRESE_TARGET_CPU=portable`.
-- `docker run` starts the server in the background as the container `nrese`, with:
-  - its data on the volume `nrese-data`;
-  - its port bound to this machine only, since no authentication is on (set
-    `NRESE_AUTH_MODE` before you expose it: [access control](#access-control-and-operations));
-  - reasoning under OWL 2 RL, and the SHACL commit gate on, which the example below uses.
+- The build compiles the server: about 5 minutes on 16 cores, 7 on 12, longer on fewer.
 - The `curl` line waits for the server and prints `{"status":"ready"}`. It tries every
   second, each try at most 5 s, and gives up with an error after 60 s. A `curl:` error
   line before it is a try made before the server was up. A large store takes longer to
   start: raise `--retry` and `--retry-max-time` to match.
+- If it never gets ready, `docker logs nrese` shows why ([startup errors](docs/ops/server-setup.md#startup-errors)).
+  If `docker run` says the port is already allocated, something else holds port 8080.
 
-The browser console is at `http://localhost:8080/console`. `docker logs nrese` shows the
-server's log.
+The browser console is at `http://localhost:8080/console`.
 
 ### A first example: inference, retraction, validation
 
-Add a class hierarchy and an instance, then ask for the instances of the superclass:
+Add a [class hierarchy and an instance](docs/glossary.md#class-instance-subclass), then ask
+for the instances of the superclass:
 
 ```bash
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
@@ -95,7 +110,7 @@ curl http://localhost:8080/dataset/update --data-urlencode 'update=
 
 The same query now answers no rows: `{"head":{"vars":["x"]},"results":{"bindings":[]}}`.
 
-Now a shape, stored in the shapes graph: every animal needs a name. A cat without one is
+Now a [shape, stored in the shapes graph](docs/glossary.md#shape-shapes-graph-shacl-gate): every animal needs a name. A cat without one is
 an animal by inference, so the gate rejects it:
 
 ```bash
@@ -139,7 +154,7 @@ curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 ```
 
-- The `PUT` answers `204 No Content` and replaces the default graph with your file.
+- The `PUT` answers `204 No Content` and replaces the [default graph](docs/glossary.md#graph) with your file.
 - `infer=false` reads the asserted statements only, so the count is your file's number of
   statements (for a file of three: `"value":"3"`). Without it, the inferred ones count too.
 - After the restart the count is the same. On Docker's stop signal the server lets the
@@ -149,8 +164,9 @@ curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)).
 - Other syntaxes take their media type as `Content-Type`. Large files load offline with
   `nrese-server load` ([server setup](docs/ops/server-setup.md)).
-- Queries are standard SPARQL: patterns, `FILTER`, `ORDER BY` and the rest are in the
-  [SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns).
+- Queries are standard SPARQL ([SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns)).
+  The names of the animals older than 5, in order, sent as `query=` like the count:
+  `PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?a a ex:Animal ; ex:age ?age ; ex:name ?name . FILTER(?age > 5) } ORDER BY ?name`.
 
 ### Change a setting, start over
 
@@ -171,7 +187,7 @@ curl http://localhost:8080/version
 `/version` shows the settings in force, here `"total_query_memory":2147483648` under
 `budgets`. Which memory limit bounds what: [budgets](docs/ops/config-reference.md#budgets).
 
-A repository's reasoning changes while the server runs, without a restart:
+A [repository](docs/glossary.md#repository)'s reasoning changes while the server runs, without a restart:
 
 ```bash
 curl -X PATCH -H 'Content-Type: application/json' --data '{"reasoning":"rdfs"}' \
@@ -220,10 +236,12 @@ before the server, and the server embeds it; without it, `/console` says how
 [offline commands](docs/ops/server-setup.md#54-bulk-loading)). The console CLI is
 `npm run cli -- …` in `apps/nrese-console` ([console CLI](docs/dev/getting-started.md#frontend-cli)).
 
-## What it can do
+## What it covers
 
-Each item links to the specification, document or test that backs it. Limits stand next
-to the item.
+What is in today. Each item links to the specification, document or test that backs it,
+with its limits beside it; nothing here is a plan. What is left out on purpose, and every
+deviation from a standard: [limits](docs/limits.md). What is planned:
+[ROADMAP](docs/ROADMAP.md).
 
 ### SPARQL
 
@@ -236,7 +254,7 @@ to the item.
 | `EXPLAIN`: the plan with estimated rows, or the run with actual rows and times | A reader of only some graphs gets no plan steps (they would reveal statistics of the others) |
 | Full-text search (BM25) through the `bds:` and Jena `text:query` vocabularies, with phrases, prefixes, fuzzy words and stemming in 18 languages | One index over every string literal, built at the first search; an on-disk store keeps it across restarts ([full-text](docs/ops/http-api.md#sparql)) |
 | Vector search: vectors as literals (`"[…]"^^nrv:vector`), `SERVICE nrv:search` with cosine, dot product or Euclidean distance, exact or through HNSW, filtered by the rest of the query | You bring the vectors; the store computes no embeddings. Approximate search trades recall for speed through `nrv:searchBudget` ([vector search](docs/ops/http-api.md#sparql)) |
-| [GeoSPARQL](https://docs.ogc.org/is/22-047r1/22-047r1.html) functions and relations over WKT, GeoJSON and simple GML, with an R-tree | Measures in metres only in CRS84 and a listed set of projected systems; no GML arcs or 3D solids ([GeoSPARQL](docs/ops/http-api.md#sparql), [compliance runner](crates/nrese-sparql/tests/geosparql_compliance)) |
+| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html), in part: functions and relations over WKT, GeoJSON and simple GML, with an R-tree | Measures in metres only in CRS84 and a listed set of projected systems; no GML arcs or 3D solids ([GeoSPARQL](docs/ops/http-api.md#sparql), [compliance runner](crates/nrese-sparql/tests/geosparql_compliance)) |
 | Two deliberate deviations | `HAVING` may name a `SELECT` alias; a default graph merged from several graphs keeps shared blank nodes as one ([why](docs/ops/http-api.md#sparql)) |
 
 ### RDF syntaxes
@@ -246,7 +264,7 @@ to the item.
 | Read and write [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | W3C RDF 1.1 and 1.2 suites, each document also read one byte at a time and written back ([runner](crates/rdf/nrese-rdf-io/tests/w3c_rdf)) |
 | Read and write [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Remote contexts aren't fetched: a library caller supplies a document loader. W3C `toRdf`, `expand`, `fromRdf` suites; tests for JSON-LD 1.0 processors only and for generalised RDF are not run ([runner](crates/rdf/nrese-rdf-io/tests/w3c_jsonld)) |
 | Read [Notation3](https://w3c.github.io/N3/spec/) data, in the library | Only what RDF can hold; rules are read by the reasoner. Not offered over HTTP. W3C N3 group's parser tests, one known failure listed ([runner](crates/rdf/nrese-rdf-io/tests/w3c_n3)) |
-| RDF4J Binary RDF | As a payload and a result format |
+| RDF4J Binary RDF, versions 1 and 2 | Read in both versions, written as version 2; as a payload and a result format |
 | [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | W3C suite ([runner](crates/rdf/nrese-rdf-io/tests/w3c_rdfc)) |
 | Bulk loading, N-Triples and N-Quads on all cores ([server setup](docs/ops/server-setup.md)); statements that don't parse are quarantined, not fatal | Strict mode stops at the first error instead ([quarantine](docs/design/quarantine.md)) |
 
@@ -307,7 +325,7 @@ rules, no answer is claimed complete.
 
 | Capability | Limits and notes |
 |---|---|
-| [SHACL Core](https://www.w3.org/TR/shacl/) and SHACL-SPARQL | W3C suite for both, with no known failure listed ([runner](crates/nrese-shacl/tests/w3c_shacl)). Data is validated with its inferred statements unless `infer=false`. Not supported: SHACL Advanced Features (rules), and `sh:entailment`, which is reported as a failure |
+| [SHACL](https://www.w3.org/TR/shacl/) (W3C Recommendation, 2017): Core and SHACL-SPARQL | W3C suite for both, with no known failure listed ([runner](crates/nrese-shacl/tests/w3c_shacl)). Data is validated with its inferred statements unless `infer=false`. Not supported: SHACL Advanced Features (rules), and `sh:entailment`, which is reported as a failure |
 | Validation on request (`/dataset/shacl`), against stored shapes or shapes sent with the request | Sent shapes live in a transaction that is never committed, and count against the request's memory ([HTTP interface](docs/ops/http-api.md#shacl-validation)) |
 | Validation on commit (`shacl.gate`: `report` or `enforce`), only for the focus nodes the commit can affect | Off by default ([configuration](docs/ops/config-reference.md)) |
 
@@ -365,7 +383,7 @@ is checked
 | Interface | What |
 |---|---|
 | `/dataset/…` | SPARQL Protocol and Graph Store Protocol for the default repository |
-| `/repositories/…` | The [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/), for RDF4J's `HTTPRepository` and the tools built on it ([HTTP interface](docs/ops/http-api.md#rdf4j-protocol)) |
+| `/repositories/…` | The [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/), version 12 (`GET /protocol`), for RDF4J's `HTTPRepository` and the tools built on it ([HTTP interface](docs/ops/http-api.md#rdf4j-protocol)) |
 | `/api/v1/…` | One API for every capability, described as OpenAPI 3.1 at `/api/v1/openapi.json` ([HTTP interface](docs/ops/http-api.md#engine-api-apiv1)) |
 | `/console`, `/ops` | A browser console for queries, updates and graphs, and one for operators ([apps/nrese-console](apps/nrese-console)) |
 | `nrese-server` | The server, and the commands `load`, `query`, `convert`, `backup`, `restore`, `prune-archive`, `check-config`, `config-schema` and `print-query` ([server setup](docs/ops/server-setup.md)) |
@@ -381,8 +399,10 @@ Schema (`nrese-server config-schema`). The [Dockerfile](Dockerfile) builds image
 The workspace is split into crates by what they own. Dependencies point down only: a
 crate may use a crate in a lower layer, or one placed below it in its own layer, never
 one above. Each crate's `lib.rs` opens with what
-it owns; [ARCHITECTURE.md](docs/ARCHITECTURE.md) has the rules and says at which layer
-each kind of problem is fixed.
+it owns. [ARCHITECTURE.md](docs/ARCHITECTURE.md) follows a write and a query from
+request to answer, names for each concept its page and its code, and says at which layer
+each kind of problem is fixed; the decisions behind it, with their reasons, are in
+[adr/](docs/adr/README.md).
 
 ```mermaid
 flowchart TB
@@ -434,7 +454,8 @@ The picture leaves out edges that a longer path already implies; the table lists
 direct dependency (test-only ones left out). None of the crates is on crates.io
 (`publish = false`), and none promises a stable API yet. "On its own" says whether a
 crate's job stands without the rest of the stack; to use one, take it as a git dependency
-pinned to a commit.
+pinned to a commit. Their API reference isn't published: `cargo doc -p CRATE --open` builds
+it from a checkout, and each crate's `lib.rs` opens with what the crate owns.
 
 | Crate | Owns | Uses | On its own |
 |---|---|---|---|
@@ -483,14 +504,7 @@ the ruleset with its semantics version and a fingerprint of what it derives
 What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md) (its counts
 and measurements are as of when each was recorded); the order
 of work: [docs/ROADMAP.md](docs/ROADMAP.md); the main limits and deviations, and when to choose
-another system: [docs/limits.md](docs/limits.md). The main limits today:
-
-- One writer at a time; reads never wait for it.
-- Read replicas, but no automatic failover and no partitioning across machines.
-- A named graph isn't a reasoning boundary: rules read every graph.
-- Under OWL 2 DL some answers are `sound-only`, and say so.
-- No SHACL Advanced Features; no embeddings computed in the store.
-- No releases on crates.io.
+another system: [docs/limits.md](docs/limits.md).
 
 Platforms: the image for `linux/amd64` and `linux/arm64`; the merge checks also build and
 test on Windows ([scripts/check.sh](scripts/check.sh)). A stop signal (SIGTERM, ctrl-c)

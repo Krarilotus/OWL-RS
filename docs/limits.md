@@ -2,8 +2,9 @@
 
 What NRESE doesn't do, and where it departs from a standard on purpose, as of 11 November
 2026. Each item is stated in the document it links to; this page only gathers them, each
-with what to do instead, or "none known" where there is nothing. What is planned is in
-[ROADMAP.md](ROADMAP.md), and nothing here is a promise about it.
+with what to do instead, or "none known" where there is nothing. What is in:
+[What it covers](../README.md#what-it-covers); what is planned: [ROADMAP.md](ROADMAP.md),
+and nothing here is a promise about it.
 
 ## Choose another system when
 
