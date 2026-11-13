@@ -1621,6 +1621,88 @@ fn open_closures_and_their_counts_equal_the_reference() {
     }
 }
 
+/// A path over the merge of graphs answers as it does over one graph that holds their
+/// statements once. SPARQL 1.1 §13.1 makes the default graph of several `FROM` their RDF
+/// merge, and §18.4 evaluates paths on that graph.
+///
+/// The test puts the same statements in two stores:
+/// - in the first, all of them in the store's default graph;
+/// - in the second, spread over two named graphs, with some in both.
+///
+/// It then compares the rows over the second store's merge, through several `FROM` and
+/// through the union default graph, with the rows over the first store's default graph.
+/// The two are read by separate probes (the arms of the evaluator's index probe). The
+/// paths cover a bound start, a reverse search from a bound end, both ends bound, a
+/// sequence, an alternative with an inverse, a negated set, and an open closure with its
+/// zero-length pairs.
+#[test]
+fn paths_over_a_merge_of_graphs_answer_as_over_one_graph() {
+    let answer = |snapshot: &nrese_engine::Snapshot, text: &str, union: bool| {
+        let query = SparqlParser::new()
+            .parse_query(text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert!(runs_natively(&query), "{text}");
+        let options = QueryOptions {
+            union_default_graph: union,
+            ..QueryOptions::default()
+        };
+        rows(evaluate_query(snapshot, &query, &options).unwrap(), false)
+    };
+    let mut rng = Rng::seeded(20_261_113);
+    for round in 0..8 {
+        let nodes = 5 + rng.below(25);
+        let (one, split) = (
+            Engine::new(EngineConfig::default()).unwrap(),
+            Engine::new(EngineConfig::default()).unwrap(),
+        );
+        let (mut into_one, mut into_split) = (one.transaction(), split.transaction());
+        for _ in 0..nodes + rng.below(3 * nodes) {
+            let (a, b) = (rng.below(nodes), rng.below(nodes));
+            let p = if rng.below(4) == 0 { "other" } else { "next" };
+            let quad = |graph: GraphName| {
+                Quad::new(ex(&format!("n{a}")), ex(p), ex(&format!("n{b}")), graph)
+            };
+            into_one.insert(quad(GraphName::DefaultGraph).as_ref());
+            // In g1, in g2, or in both: the merge has it once.
+            let graphs: &[&str] = match rng.below(3) {
+                0 => &["g1"],
+                1 => &["g2"],
+                _ => &["g1", "g2"],
+            };
+            for graph in graphs {
+                into_split.insert(quad(GraphName::NamedNode(ex(graph))).as_ref());
+            }
+        }
+        into_one.commit().unwrap();
+        into_split.commit().unwrap();
+        let (one_graph, merged) = (one.snapshot(), split.snapshot());
+        let start = format!("<{EX}n{}>", rng.below(nodes));
+        let end = format!("<{EX}n{}>", rng.below(nodes));
+        for pattern in [
+            format!("{start} <{EX}next>* ?b"),
+            format!("?a <{EX}next>* {end}"),
+            format!("{start} <{EX}next>+ {end}"),
+            format!("{start} <{EX}next>/<{EX}next> ?b"),
+            format!("{start} (<{EX}next>|^<{EX}other>)+ ?b"),
+            format!("?a !(<{EX}other>) ?b"),
+            format!("?a <{EX}next>* ?b"),
+        ] {
+            let in_default = format!("SELECT * WHERE {{ {pattern} }}");
+            let expected = answer(&one_graph, &in_default, false);
+            for (text, union) in [
+                (
+                    format!("SELECT * FROM <{EX}g1> FROM <{EX}g2> WHERE {{ {pattern} }}"),
+                    false,
+                ),
+                (in_default.clone(), true),
+            ] {
+                let context = format!("round {round}, union {union}: {text}");
+                assert_same_rows(&answer(&merged, &text, union), &expected, &context);
+            }
+        }
+    }
+}
+
 /// A query over values the query computes itself: grouping, aggregating, ordering,
 /// deduplicating, joining and filtering on the results of `BIND` and `SELECT` expressions
 /// and of aggregates in subqueries. The patterns are single statements and joins on `?a`,

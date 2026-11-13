@@ -408,6 +408,36 @@ pub(crate) enum PathGraph<'a> {
     Merged(Option<&'a crate::dataset::GraphSet>),
 }
 
+/// The statements of one index probe ([`PathEvaluator::quads`]): the default or one named
+/// graph's scan, or the merge of graphs. The merge is boxed because a search probes once
+/// per node it reaches, and every probe moves its iterator several times, so the common
+/// arm must not carry the rare one's size. Before 13 Nov, the two arms were chained, so
+/// every probe carried both arms: tag-descendants ran +173 K instructions per query in
+/// moves.
+enum Probe<O, M> {
+    Own(O),
+    Merged(Box<M>),
+}
+
+impl<T, O: Iterator<Item = T>, M: Iterator<Item = T>> Iterator for Probe<O, M> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        match self {
+            Probe::Own(own) => own.next(),
+            Probe::Merged(merged) => merged.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Probe::Own(own) => own.size_hint(),
+            Probe::Merged(merged) => merged.size_hint(),
+        }
+    }
+}
+
 pub(crate) struct PathEvaluator<'a> {
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) model: ReadModel,
@@ -703,32 +733,35 @@ impl PathEvaluator<'_> {
             object: object.map(TermId::from_raw),
             graph: selector,
         };
-        let own = merged
-            .is_none()
-            .then(|| self.snapshot.quads_for_pattern_in(self.model, &pattern));
-        // Merged: the graph-last order whose prefix the bound positions are.
-        let merged = merged.map(|graphs| {
-            let permutation = match (subject.is_some(), predicate.is_some(), object.is_some()) {
-                (true, _, false) | (false, false, false) | (true, true, true) => Permutation::Spog,
-                (false, true, _) => Permutation::Posg,
-                (_, false, true) => Permutation::Ospg,
-            };
-            let mut previous = None;
-            self.snapshot
-                .scan_sorted_in(self.model, &pattern, permutation)
-                .expect("the bound positions are a prefix of the order")
-                .filter(move |quad| graphs.is_none_or(|graphs| graphs.contains(&quad.graph)))
-                .filter(move |quad| {
-                    let statement = (quad.subject, quad.predicate, quad.object);
-                    let first = previous != Some(statement);
-                    previous = Some(statement);
-                    first
-                })
-        });
-        own.into_iter()
-            .flatten()
-            .chain(merged.into_iter().flatten())
-            .map(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()))
+        let probe = match merged {
+            None => Probe::Own(self.snapshot.quads_for_pattern_in(self.model, &pattern)),
+            // Merged: the graph-last order whose prefix the bound positions are.
+            Some(graphs) => {
+                let permutation = match (subject.is_some(), predicate.is_some(), object.is_some()) {
+                    (true, _, false) | (false, false, false) | (true, true, true) => {
+                        Permutation::Spog
+                    }
+                    (false, true, _) => Permutation::Posg,
+                    (_, false, true) => Permutation::Ospg,
+                };
+                let mut previous = None;
+                Probe::Merged(Box::new(
+                    self.snapshot
+                        .scan_sorted_in(self.model, &pattern, permutation)
+                        .expect("the bound positions are a prefix of the order")
+                        .filter(move |quad| {
+                            graphs.is_none_or(|graphs| graphs.contains(&quad.graph))
+                        })
+                        .filter(move |quad| {
+                            let statement = (quad.subject, quad.predicate, quad.object);
+                            let first = previous != Some(statement);
+                            previous = Some(statement);
+                            first
+                        }),
+                ))
+            }
+        };
+        probe.map(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()))
     }
 
     /// True if `node` is a subject or object in the default graph (or the path pattern's
