@@ -145,6 +145,12 @@ answers `ex:felix`. When each part of a commit becomes visible, and what the che
 [What a commit does](#what-a-commit-does). The shape stays in the store: to run the example
 again, [start over](#change-a-setting-start-over) first.
 
+This example is also a test:
+[readme-first-example.toml](scripts/verify/scenarios/readme-first-example.toml) sends each step
+above and checks its answer. Run it against a fresh server started as above:
+`python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/readme-first-example.toml`.
+Last run: 13 November 2026, on commit `78b4a49b7`, all 9 steps passed.
+
 ### Your own data
 
 Your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
