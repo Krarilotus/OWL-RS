@@ -16,7 +16,8 @@ GraphDB validates SHACL on commit. The main downstream user, the datamodel workf
   - `sh:closed`, `sh:in`, `sh:hasValue`
   - severities
 
-  SHACL-SPARQL constraints come later, evaluated through `nrese-sparql`.
+  SHACL-SPARQL constraints come later, evaluated through `nrese-sparql` (amended: they are
+  supported now, the same way).
 - **Incremental validation.** On commit the gate validates only the focus nodes the delta affects: nodes in the delta, and nodes that reach them through the compiled shape paths. Full validation is available on demand and for restores.
 - **Blocking and reports.** Results with severity `sh:Violation` block the commit by default; the blocking severity is configurable. Reports are standard `sh:ValidationReport` graphs plus a JSON projection.
 
