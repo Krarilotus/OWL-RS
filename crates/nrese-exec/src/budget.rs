@@ -355,6 +355,18 @@ impl Envelope {
         Self(Arc::new(budget))
     }
 
+    /// As [`Self::new`], without a credit: every charge and release here writes `server`'s
+    /// budget, which then holds exactly what this envelope holds. For budgets that live as
+    /// long as their store (what it keeps, its statistics): they charge rarely, and a credit
+    /// would stay reserved for their whole life.
+    pub fn exact(limit: Option<usize>, server: Option<Arc<SharedBudget>>) -> Self {
+        Self(Arc::new(
+            limit
+                .map_or_else(Budget::unlimited, Budget::new)
+                .within(server),
+        ))
+    }
+
     pub fn unlimited() -> Self {
         Self::new(None, None)
     }
@@ -3301,5 +3313,27 @@ mod tests {
         let request = Envelope::new(None, Some(Arc::clone(&small)));
         request.charge(200).unwrap();
         assert_eq!(small.used(), 200, "exact under 256 MiB");
+    }
+
+    /// An exact envelope (one that lives as long as its store) takes no credit: the server
+    /// holds exactly what it holds after every charge and release, each of which writes the
+    /// server's budget.
+    #[test]
+    fn an_exact_envelope_writes_the_server_per_charge() {
+        let server = SharedBudget::new(GIB);
+        let kept = Envelope::exact(None, Some(Arc::clone(&server)));
+        let before = writes::made();
+        for n in 1..=10 {
+            kept.charge(200).unwrap();
+            assert_eq!(server.used(), 200, "exact after charge {n}");
+            kept.release(200);
+            assert_eq!(server.used(), 0, "exact after release {n}");
+        }
+        assert_eq!(
+            writes::made() - before,
+            20,
+            "one write per charge and release"
+        );
+        assert_eq!(kept.credit(), 0);
     }
 }
