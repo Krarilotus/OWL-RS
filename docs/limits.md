@@ -39,6 +39,9 @@ and nothing here is a promise about it.
   where SPARQL's RDF merge keeps them apart ([why](ops/http-api.md#sparql)). No setting
   gives the standard merge; where it matters, read with `GRAPH ?g { … }` and keep `?g` in
   the answer.
+- GeoSPARQL measures in metres only in CRS84 and a listed set of projected systems, and reads
+  no GML arcs or 3D solids: such a measure or literal gives no value. Convert coordinates and
+  approximate arcs before loading; for solids, none known ([GeoSPARQL](ops/http-api.md#sparql)).
 - A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
 - Directional strings in the data alone don't make a result announce RDF 1.2; a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).

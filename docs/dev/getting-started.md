@@ -96,23 +96,34 @@ cargo run -p nrese-server -- --config .\config.toml
 
 ### Frontend CLI
 
-The frontend package also ships a small CLI on top of the same TypeScript client boundary:
+The frontend package also ships a small CLI on top of the same TypeScript client boundary
+(`npm run cli -- help` prints its commands and options):
 
 ```powershell
 Set-Location .\apps\nrese-console
 npm install
-npm run cli -- runtime
 npm run cli -- capabilities
 npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
 ```
 
-Useful options:
+| Command | What it sends ([HTTP interface](../ops/http-api.md)) |
+|---|---|
+| `runtime`, `capabilities`, `reasoning` | `GET /api/v1/health`, `/api/v1/capabilities`, `/api/v1/repositories/nrese/reasoning`; prints the JSON |
+| `query` | the query to `/dataset/query`, asking for `--accept` (default `application/sparql-results+json`) |
+| `update` | the update to `/dataset/update` |
+| `tell` | the RDF to `/dataset/tell`, into `--graph-iri` or the default graph |
+| `graph-read` | `GET /dataset/data` ([Graph Store Protocol](../ops/http-api.md#graph-store-protocol)) of `--graph-iri` or the default graph |
+| `graph-write` | the RDF to `/dataset/data`, `--method PUT` (the default; needs `--graph default` or `--graph-iri`) or `POST` |
+| `graph-delete` | `DELETE /dataset/data`; needs `--graph default` or `--graph-iri` |
 
-- `--base-url <url>` or `NRESE_API_BASE_URL`
-- `--token <token>` or `NRESE_API_TOKEN`
-- repeated `--header name:value`
-- `--file <path>` for query/update/tell/graph payloads
-- `--graph default|named` and `--graph-iri <iri>` for graph operations
+- The text a command sends: `--text <text>` or `--file <path>`.
+- Every command: `--base-url <url>` (else `NRESE_API_BASE_URL`, else `http://127.0.0.1:8080`),
+  `--token <token>` (a bearer token; else `NRESE_API_TOKEN`), repeated `--header name:value`.
+- Output of the commands that send text or graphs: `status=<code>`, then the body, or for an
+  error one line `error: title: detail (request <id>)`.
+- Exit status: 0; 1 for an error status or a wrong argument (refused before any request);
+  3 with `--require-complete` when the answer isn't shown complete
+  (`NRESE-Completeness`; without the option, a warning on stderr).
 
 Optional environment variables:
 

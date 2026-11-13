@@ -1,16 +1,17 @@
 # NRESE
 
-An RDF store with built-in OWL reasoning, written in Rust. A hobby project, developed in
+An [RDF](https://www.w3.org/TR/rdf11-primer/) store with built-in
+[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust. A hobby project, developed in
 the open; not yet for parallel writers, failover or data split across machines
 ([limits, and when to choose another system](docs/limits.md)).
 
-NRESE stores [RDF](https://www.w3.org/TR/rdf11-primer/) datasets (statements: subject,
+NRESE stores RDF datasets (statements: subject,
 predicate, object) and answers [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/) queries
 and updates. Given an [ontology](docs/glossary.md#ontology), it derives the statements that
 follow from the stored (asserted) ones and keeps these inferred statements up to date on
 every commit (a write, applied whole or not at all), so you query them like asserted ones.
 Reasoning goes from [RDFS](https://www.w3.org/TR/rdf11-schema/) to
-[OWL 2](https://www.w3.org/TR/owl2-primer/) DL; in the OWL 2 QL, RL and DL
+OWL 2 DL; in the OWL 2 QL, RL and DL
 [profiles](docs/glossary.md#reasoning-mode-profile) a commit that would make the data
 inconsistent is rejected, with the reason. Every SPARQL answer carries a status that says what it promises
 (complete, or sound with rows possibly missing, and why) and warns where it can promise
