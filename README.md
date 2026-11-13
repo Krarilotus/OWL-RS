@@ -3,12 +3,16 @@
 An RDF store with built-in OWL reasoning, written in Rust. A hobby project, developed in
 the open.
 
-NRESE stores RDF datasets and answers SPARQL 1.1 queries and updates. It keeps inferred
-statements up to date on every commit, so you query them like asserted ones. Reasoning
-goes from RDFS to OWL 2 DL; in the OWL 2 QL, RL and DL modes a commit that would make
-the data inconsistent is rejected, with the reason. Every SPARQL answer carries a status
-that says what it promises (complete, or sound with rows possibly missing, and why) and
-warns where it can promise neither. SHACL validation, full-text and vector search,
+NRESE stores [RDF](https://www.w3.org/TR/rdf11-primer/) datasets (statements: subject,
+predicate, object) and answers [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/) queries
+and updates. Given an ontology, it derives the statements that follow from the stored
+(asserted) ones and keeps these inferred statements up to date on every commit (a write,
+applied whole or not at all), so you query them like asserted ones. Reasoning goes from
+[RDFS](https://www.w3.org/TR/rdf11-schema/) to [OWL 2](https://www.w3.org/TR/owl2-primer/)
+DL; in the OWL 2 QL, RL and DL modes a commit that would make the data inconsistent is
+rejected, with the reason. Every SPARQL answer carries a status that says what it promises
+(complete, or sound with rows possibly missing, and why) and warns where it can promise
+neither. [SHACL](https://www.w3.org/TR/shacl/) validation, full-text and vector search,
 graph-level access control and the SPARQL, Graph Store and RDF4J protocols are built in.
 It runs as one server binary with a browser console, or as a set of Rust crates.
 
@@ -24,31 +28,40 @@ when to choose another system: [Limits and deviations](docs/limits.md).
 
 ## Quick start
 
-With Docker (the image builds the server and the console; data on a volume; the port
-bound to this machine only, since no authentication is on; reasoning under OWL 2 RL, and
-the SHACL commit gate on, which the example below uses):
+You need git, Docker Engine 23 or later or Docker Desktop (the build needs BuildKit, their
+default builder), and curl 7.71 or later. Rust and Node.js aren't needed: the image builds
+the server and its console.
 
 ```bash
+git clone https://github.com/Krarilotus/OWL-RS.git
+cd OWL-RS
 docker build -t nrese .
-docker run -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
+docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
   -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce nrese
+curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
 ```
 
-The image is built for CPUs from x86-64-v3 (amd64) or Neoverse N1 (arm64) on; for an
-older CPU add `--build-arg NRESE_TARGET_CPU=portable`. The image's console is at
-`http://localhost:8080/console`.
+- The build compiles the server: about 7 minutes on 12 cores, longer on fewer. The image
+  is built for CPUs from x86-64-v3 (amd64) or Neoverse N1 (arm64) on; for an older CPU add
+  `--build-arg NRESE_TARGET_CPU=portable`.
+- `docker run` starts the server in the background as the container `nrese`, with:
+  - its data on the volume `nrese-data`;
+  - its port bound to this machine only, since no authentication is on (set
+    `NRESE_AUTH_MODE` before you expose it: [access control](#access-control-and-operations));
+  - reasoning under OWL 2 RL, and the SHACL commit gate on, which the example below uses.
+- The `curl` line waits for the server and prints `{"status":"ready"}`. It tries every
+  second, each try at most 5 s, and gives up with an error after 60 s. A `curl:` error
+  line before it is a try made before the server was up. A large store takes longer to
+  start: raise `--retry` and `--retry-max-time` to match.
 
-No authentication is on by default. Set `NRESE_AUTH_MODE`, or a deployment posture that
-requires it, before you expose the server ([access control](#access-control-and-operations)).
+The browser console is at `http://localhost:8080/console`. `docker logs nrese` shows the
+server's log.
 
 ### A first example: inference, retraction, validation
 
-Once the server is ready (the first line waits for it, as in [your own data](#your-own-data)),
-add a class hierarchy and an instance, then ask for the instances of the superclass:
+Add a class hierarchy and an instance, then ask for the instances of the superclass:
 
 ```bash
-curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
-
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
   PREFIX ex: <http://example.org/>
   PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -112,32 +125,65 @@ answers `ex:felix`. When each part of a commit becomes visible, and what the che
 
 ### Your own data
 
-From the image to a query on your own file, `my.ttl`, with the data kept across a
-restart (stop the server above first: it holds the port). Each `/readyz` line waits for
-the server to be ready: it retries a second after each failed try (each try at most
-5 s), starts no retry after 60 s, and then fails with an error:
+Your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
+server, counted, and still there after a restart:
 
 ```bash
-docker build -t nrese .
-docker run -d --name nrese -p 127.0.0.1:8080:8080 -v my-data:/var/lib/nrese/data nrese
-curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
-curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
+curl http://localhost:8080/dataset/query --data-urlencode infer=false \
+  --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 docker restart nrese
 curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
-curl http://localhost:8080/dataset/query --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
+curl http://localhost:8080/dataset/query --data-urlencode infer=false \
+  --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 ```
 
-The `PUT` answers `204 No Content` and makes your file the default graph. The count is
-its number of statements (for a file of three: `"value":"3"`), and after the restart the
-same query gives the same number. On Docker's stop signal the server lets the requests in
-flight finish, closes the store and exits ([stopping](docs/ops/server-setup.md#64-stopping)).
-Every commit is synced to the log before it is acknowledged, so not even a kill loses
-one, and the restart recovers it
-([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)). A large
-store takes longer to start: raise `--retry` and `--retry-max-time` to match. Other syntaxes take their media
-type as `Content-Type`; large files load offline with `nrese-server load`
-([server setup](docs/ops/server-setup.md)).
+- The `PUT` answers `204 No Content` and replaces the default graph with your file.
+- `infer=false` reads the asserted statements only, so the count is your file's number of
+  statements (for a file of three: `"value":"3"`). Without it, the inferred ones count too.
+- After the restart the count is the same. On Docker's stop signal the server lets the
+  requests in flight finish, closes the store and exits
+  ([stopping](docs/ops/server-setup.md#64-stopping)). Every commit is synced to the log
+  before it is acknowledged, so not even a kill loses one
+  ([durability](docs/spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+- Other syntaxes take their media type as `Content-Type`. Large files load offline with
+  `nrese-server load` ([server setup](docs/ops/server-setup.md)).
+- Queries are standard SPARQL: patterns, `FILTER`, `ORDER BY` and the rest are in the
+  [SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns).
+
+### Change a setting, start over
+
+Settings come from environment variables (or a file) when the server starts
+([every setting](docs/ops/config-reference.md)). To change one, recreate the container
+with the same volume: the data stays. For example, to cap the memory that running queries
+and updates may take together at 2 GiB:
+
+```bash
+docker rm -f nrese
+docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
+  -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce \
+  -e NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES=2GiB nrese
+curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
+curl http://localhost:8080/version
+```
+
+`/version` shows the settings in force, here `"total_query_memory":2147483648` under
+`budgets`. Which memory limit bounds what: [budgets](docs/ops/config-reference.md#budgets).
+
+A repository's reasoning changes while the server runs, without a restart:
+
+```bash
+curl -X PATCH -H 'Content-Type: application/json' --data '{"reasoning":"rdfs"}' \
+  http://localhost:8080/api/v1/repositories/nrese
+```
+
+`nrese` is the default repository. The inferences are recomputed at once. The change is
+kept in the data directory and holds after a restart, over `NRESE_REASONING_MODE`;
+`{"reasoning":null}` goes back to the configured mode
+([repositories](docs/ops/http-api.md#engine-api-apiv1)).
+
+To start over with no data: `docker rm -f nrese && docker volume rm nrese-data`, then
+`docker run` as above.
 
 ### From source
 
