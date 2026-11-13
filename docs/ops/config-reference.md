@@ -307,7 +307,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Memor
 **Which memory limit.** Three settings bound memory; none of them bounds the store's own data and indexes.
 - `budgets.query_memory`: what one query's evaluation may hold. Past it the query gets `413`.
 - `budgets.total_query_memory`: what all running queries and updates hold together. A request that finds no room gets `503` and may succeed later.
-- `budgets.process_memory`: what the whole process may hold before a long operation (a load's or a commit's reasoning) stops with an error instead of taking the machine. It doesn't stop queries.
+- `budgets.process_memory`: what the whole process may hold before a long operation (a load's or a commit's reasoning) stops with an error instead of taking the machine. Queries count toward it too: one that finds no room left in it gets the same `503`.
 
 To give the server's request work 2 GiB, set `budgets.total_query_memory = "2GiB"` (Docker: `-e NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES=2GiB`), and lower `budgets.query_memory` too if one query may not take all of it. To cap the process as a whole, reasoning included, set `budgets.process_memory` (`-e NRESE_PROCESS_MEMORY_BYTES=2GiB`); in a container with a memory limit its default is already 75 % of that limit. To see them in force: `GET /version` reports `query_memory` and `total_query_memory` under `budgets`, in bytes (`0` = unlimited); `nrese-server check-config` prints both; `/metrics` shows the total as `nrese_query_memory_limit_bytes`. `budgets.process_memory` is reported by none of these in this build: it shows only in the error of an operation it stops (`stopped at the process's memory limit (N MiB); nothing was applied`), so check that it is set where you set it.
 
