@@ -298,6 +298,32 @@ pub struct Budget {
     ahead: AtomicUsize,
     /// A refusal above is recorded here only ([`Envelope::optional_part`]).
     optional: bool,
+    /// An envelope's credit at the server's budget ([`Envelope::new`]): bytes charged there,
+    /// for this budget's next charges, not yet charged here. Reserved when taken, so what
+    /// all budgets hold at the server never exceeds its limit; returned when this budget
+    /// ends, however it ends.
+    credit: AtomicUsize,
+    /// The most credit this budget keeps ([`credit_cap`]), found at its first charge at the
+    /// server; [`CREDIT_UNSET`] before, and for a budget without credit ([`Self::credits`]).
+    credit_cap: AtomicUsize,
+    /// Whether its charges at the server's budget go through [`Self::credit`]: an envelope's.
+    credits: bool,
+}
+
+/// [`Budget::credit_cap`] before it is found.
+const CREDIT_UNSET: usize = usize::MAX;
+
+/// The most credit an envelope keeps at the server's budget `shared`: 64 KiB, and no more
+/// than a 65,536th of that budget's limit; none under 4 KiB (a limit under 256 MiB), where
+/// every charge stays exact. The credit is reserved, so the limit holds exactly; what it
+/// can cost is an earlier refusal close to the limit, by what other running requests hold
+/// as credit unused: under a thousandth of the limit with up to 64 requests at once. A
+/// request that is refused returns its credit at once and charges exactly from then on.
+fn credit_cap(shared: &SharedBudget) -> usize {
+    const MOST: usize = 64 << 10;
+    const LEAST: usize = 4 << 10;
+    let cap = MOST.min(shared.limit() >> 16);
+    if cap < LEAST { 0 } else { cap }
 }
 
 /// What a budget charges besides itself.
@@ -317,13 +343,16 @@ enum Parent {
 pub struct Envelope(Arc<Budget>);
 
 impl Envelope {
-    /// `limit` bytes (`None`: unlimited) within `server`'s budget.
+    /// `limit` bytes (`None`: unlimited) within `server`'s budget. Its charges there draw on
+    /// a credit of its own ([`credit_cap`]), so that a request's charges and releases stay
+    /// on its own counter, and the server's is written only when a credit is taken or
+    /// returned: one cache line all running requests share.
     pub fn new(limit: Option<usize>, server: Option<Arc<SharedBudget>>) -> Self {
-        Self(Arc::new(
-            limit
-                .map_or_else(Budget::unlimited, Budget::new)
-                .within(server),
-        ))
+        let mut budget = limit
+            .map_or_else(Budget::unlimited, Budget::new)
+            .within(server);
+        budget.credits = true;
+        Self(Arc::new(budget))
     }
 
     pub fn unlimited() -> Self {
@@ -430,6 +459,9 @@ impl Budget {
             parent: None,
             ahead: AtomicUsize::new(0),
             optional: false,
+            credit: AtomicUsize::new(0),
+            credit_cap: AtomicUsize::new(CREDIT_UNSET),
+            credits: false,
         }
     }
 
@@ -492,6 +524,7 @@ impl Budget {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
                 if record {
                     self.refused.store(true, Ordering::Relaxed);
+                    self.return_credit();
                 }
                 return Err(self.exceeded(bytes, used));
             };
@@ -514,19 +547,21 @@ impl Budget {
     fn take_above(&self, bytes: usize, record: bool) -> Result<(), BudgetExceeded> {
         let above = match &self.parent {
             Some(Parent::Server(shared)) => {
-                shared.charge(bytes).map_err(|refused| BudgetExceeded {
-                    limit: refused.limit,
-                    requested: bytes,
-                    used: refused.used,
-                    shared: true,
-                    unread: refused.unread,
-                })
+                self.charge_server(shared, bytes)
+                    .map_err(|refused| BudgetExceeded {
+                        limit: refused.limit,
+                        requested: bytes,
+                        used: refused.used,
+                        shared: true,
+                        unread: refused.unread,
+                    })
             }
             Some(Parent::Envelope(envelope)) => envelope.take_as(bytes, record && !self.optional),
             None => Ok(()),
         };
         if record && above.is_err() {
             self.refused.store(true, Ordering::Relaxed);
+            self.return_credit();
         }
         above
     }
@@ -536,7 +571,10 @@ impl Budget {
     /// above a root).
     fn take_above_up_to(&self, wanted: usize) -> usize {
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.take_up_to(wanted),
+            Some(Parent::Server(shared)) => match self.take_credit(wanted) {
+                from_credit if from_credit == wanted => wanted,
+                from_credit => from_credit + shared.take_up_to(wanted - from_credit),
+            },
             Some(Parent::Envelope(envelope)) => envelope.take_up_to(wanted),
             None => 0,
         }
@@ -565,7 +603,7 @@ impl Budget {
             }
         }
         let above = match &self.parent {
-            Some(Parent::Server(shared)) => shared.charge(bytes).is_ok(),
+            Some(Parent::Server(shared)) => self.charge_server(shared, bytes).is_ok(),
             Some(Parent::Envelope(envelope)) => envelope.try_take(bytes),
             None => true,
         };
@@ -615,6 +653,7 @@ impl Budget {
     /// The refusal of `bytes` with `used` in use, recorded.
     fn refuse(&self, bytes: usize, used: usize) -> BudgetExceeded {
         self.refused.store(true, Ordering::Relaxed);
+        self.return_credit();
         self.exceeded(bytes, used)
     }
 
@@ -660,11 +699,112 @@ impl Budget {
 
     fn release_above(&self, bytes: usize) {
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.release(bytes),
+            Some(Parent::Server(shared)) => self.release_server(shared, bytes),
             Some(Parent::Envelope(envelope)) => {
                 envelope.give(bytes);
             }
             None => {}
+        }
+    }
+
+    /// `bytes` charged at the server's budget `shared`: from this budget's credit as far as it
+    /// covers them, writing nothing there; the rest charged there exactly, with a new credit
+    /// of half the cap in the same charge where both fit, else alone. Refused as an exact
+    /// charge of the rest is, the credit it drew on kept. (Half: what the request releases
+    /// then fits the credit up to its cap, so a lookup's charge and release write nothing.)
+    fn charge_server(&self, shared: &SharedBudget, bytes: usize) -> Result<(), Refused> {
+        if !self.credits {
+            return shared.charge(bytes);
+        }
+        let from_credit = self.take_credit(bytes);
+        let rest = bytes - from_credit;
+        if rest == 0 {
+            return Ok(());
+        }
+        let cap = match self.credit_cap.load(Ordering::Relaxed) {
+            CREDIT_UNSET => {
+                let cap = credit_cap(shared);
+                self.credit_cap.store(cap, Ordering::Relaxed);
+                cap
+            }
+            cap => cap,
+        };
+        let new_credit = if self.refused() { 0 } else { cap / 2 };
+        if new_credit > 0
+            && let Some(with_credit) = rest.checked_add(new_credit)
+            && shared.charge(with_credit).is_ok()
+        {
+            self.credit.fetch_add(new_credit, Ordering::Relaxed);
+            return Ok(());
+        }
+        shared.charge(rest).inspect_err(|_| {
+            self.credit.fetch_add(from_credit, Ordering::Relaxed);
+        })
+    }
+
+    /// Up to `wanted` bytes taken from this budget's credit: what was taken.
+    fn take_credit(&self, wanted: usize) -> usize {
+        let mut credit = self.credit.load(Ordering::Relaxed);
+        loop {
+            let take = credit.min(wanted);
+            if take == 0 {
+                return 0;
+            }
+            match self.credit.compare_exchange_weak(
+                credit,
+                credit - take,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return take,
+                Err(actual) => credit = actual,
+            }
+        }
+    }
+
+    /// `bytes` released at the server's budget `shared`: into this budget's credit, and what
+    /// the credit then holds beyond its cap released there.
+    fn release_server(&self, shared: &SharedBudget, bytes: usize) {
+        if !self.credits {
+            shared.release(bytes);
+            return;
+        }
+        let cap = match self.credit_cap.load(Ordering::Relaxed) {
+            _ if self.refused() => 0,
+            CREDIT_UNSET => 0,
+            cap => cap,
+        };
+        let mut credit = self.credit.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        while credit > cap {
+            match self.credit.compare_exchange_weak(
+                credit,
+                cap,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    shared.release(credit - cap);
+                    return;
+                }
+                Err(actual) => credit = actual,
+            }
+        }
+    }
+
+    /// This budget's credit at the server's budget, unused: charged there, not here.
+    fn credit(&self) -> usize {
+        self.credit.load(Ordering::Relaxed)
+    }
+
+    /// Its credit returned to the server's budget: when it ends, and at a refusal, so that
+    /// near the limit a refused request holds nothing it doesn't use (it charges exactly
+    /// from then on).
+    fn return_credit(&self) {
+        if let Some(Parent::Server(shared)) = &self.parent {
+            let credit = self.credit.swap(0, Ordering::Relaxed);
+            if credit > 0 {
+                shared.release(credit);
+            }
         }
     }
 
@@ -689,7 +829,9 @@ impl Budget {
     pub fn room(&self) -> Result<usize, Unread> {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => Ok(own.min(shared.room()?)),
+            Some(Parent::Server(shared)) => {
+                Ok(own.min(shared.room()?.saturating_add(self.credit())))
+            }
             Some(Parent::Envelope(envelope)) => Ok(own.min(envelope.room()?)),
             None => Ok(own),
         }
@@ -715,7 +857,7 @@ impl Budget {
     pub fn bounded_by_shared(&self) -> bool {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.remaining() < own,
+            Some(Parent::Server(shared)) => shared.remaining().saturating_add(self.credit()) < own,
             Some(Parent::Envelope(envelope)) => {
                 envelope.remaining() < own && envelope.bounded_by_shared()
             }
@@ -730,25 +872,10 @@ impl Drop for Budget {
     fn drop(&mut self) {
         let used = self.used();
         self.release_above(used);
+        // An envelope's credit goes back with it, unused.
+        self.return_credit();
         #[cfg(any(test, feature = "measure"))]
         crate::measure::released(self, used);
-    }
-}
-
-/// Before the change: no credit (tests only).
-#[cfg(test)]
-fn credit_cap(shared: &SharedBudget) -> usize {
-    const MOST: usize = 64 << 10;
-    const LEAST: usize = 4 << 10;
-    let cap = MOST.min(shared.limit() >> 16);
-    if cap < LEAST { 0 } else { cap }
-}
-
-#[cfg(test)]
-impl Budget {
-    /// Before the change: no credit.
-    fn credit(&self) -> usize {
-        0
     }
 }
 
