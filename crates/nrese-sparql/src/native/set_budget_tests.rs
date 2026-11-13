@@ -608,7 +608,7 @@ fn plannings(
         plan::order(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &cancelled)
     };
     let planned = ctx
-        .with_sets(&inputs, &order)
+        .with_sets(&inputs, None, &order)
         .map_err(QueryEvaluationError::from);
     (planned, asked.into_inner())
 }
@@ -824,7 +824,7 @@ fn a_query_cancelled_in_its_set_search_gets_no_plan() {
         planned
     };
     let planned = ctx
-        .with_sets(&inputs, &order)
+        .with_sets(&inputs, None, &order)
         .map_err(QueryEvaluationError::from);
     assert!(
         matches!(planned, Err(QueryEvaluationError::Cancelled)),
@@ -893,5 +893,56 @@ fn a_bgp_without_an_open_star_is_planned_once() {
         (steps(&planned.unwrap()), asked),
         (steps(&with.unwrap()), vec![false]),
         "the plan the sets give, planned once"
+    );
+}
+
+/// Spec: the gate's code review (12 November, F2, catalogue D16-558): a fixed order (two
+/// patterns, the smaller first) reads at its start only its first pattern's sets, so the gate
+/// counts that start alone. Under the planner's own gate, a two-pattern BGP whose first
+/// pattern's predicate is in one set and whose second's is in more than
+/// [`plan::SET_START_ALLOWANCE`] gets the rows the sets give it; the same patterns searched
+/// from every start are kept from them. Red where the gate counts every open star's start.
+#[test]
+fn a_fixed_order_is_admitted_by_its_first_start_alone() {
+    let many = plan::SET_START_ALLOWANCE + 1;
+    let names: Vec<[String; 3]> = (0..many)
+        .flat_map(|i| {
+            [
+                [format!("s{i}"), "p".into(), format!("o{i}")],
+                [format!("s{i}"), format!("u{i}"), "v".into()],
+            ]
+        })
+        .chain((0..3).map(|k| ["s0".into(), "p".into(), format!("w{k}")]))
+        .chain([["s0".into(), "q".into(), "w".into()]])
+        .collect();
+    let triples: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|[s, p, o]| (s.as_str(), p.as_str(), o.as_str()))
+        .collect();
+    let engine = graph(&triples);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let patterns = ["?x p ?y", "?x q ?z"];
+    let (scans, counts) = bgp(&ctx, &patterns);
+    let mut vars = Vec::new();
+    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let sets = snapshot.characteristic_sets_in(ctx.model).unwrap();
+    let along = |sets: Option<&CharacteristicSets>| {
+        let order = [1, 0];
+        steps(&plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, usize::MAX, &order).unwrap())
+    };
+    let (with, without) = (along(Some(&*sets)), along(None));
+    assert_ne!(with, without, "the sets change its rows");
+    let planned = ctx
+        .join_order(&scans, &counts, &[], true)
+        .map_err(QueryEvaluationError::from)
+        .unwrap();
+    assert_eq!(steps(&planned), with, "the smaller first, with the sets");
+    let (_, asked) = plannings(&ctx, &patterns);
+    assert_eq!(
+        asked,
+        vec![false],
+        "searched from every start: kept from them"
     );
 }

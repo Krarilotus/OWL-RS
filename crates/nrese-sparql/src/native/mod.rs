@@ -3695,7 +3695,7 @@ impl<'a> Context<'a> {
             let along = |sets: Option<&CharacteristicSets>, budget: usize| {
                 plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &order)
             };
-            return self.with_sets(&inputs, &along);
+            return self.with_sets(&inputs, Some(order[0]), &along);
         }
         self.order_inputs(&inputs, vars.len())
     }
@@ -3713,21 +3713,23 @@ impl<'a> Context<'a> {
         let order = |sets: Option<&CharacteristicSets>, budget: usize| {
             plan::order(inputs, variables, PROBE_FACTOR, sets, budget, &cancelled)
         };
-        self.with_sets(inputs, &order)
+        self.with_sets(inputs, None, &order)
     }
 
     /// `planning` of `inputs`: first without the characteristic sets (the plain plan), then,
     /// where an input is part of an open star ([`plan::Star::open`]) and the reads the set
-    /// search would make at its starts
-    /// cost little against the work the plain plan expects ([`plan::admits`]), with them,
-    /// within a budget that follows that work ([`plan::budget_for`]; one policy for every path
-    /// that plans: scans, and scans with paths). A BGP the gate keeps from the sets, or whose
-    /// set search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
-    /// which planner a BGP got shows. A query cancelled in or between its plannings fails (a
-    /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
+    /// search would make at its starts (all of them, or only `first`'s where `planning` is a
+    /// fixed order that starts there) cost little against the work the plain plan expects
+    /// ([`plan::admits`]), with them, within a budget that follows that work
+    /// ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
+    /// paths). A BGP the gate keeps from the sets, or whose set search passes its budget, gets
+    /// the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]): which planner a BGP got shows. A
+    /// query cancelled in or between its plannings fails (a fixed order's planning doesn't
+    /// ask, so each is checked after), and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
+        first: Option<usize>,
         planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
         // Read only by EXPLAIN's notes: no clock for a query that isn't explained.
@@ -3753,7 +3755,7 @@ impl<'a> Context<'a> {
             return Ok(plain);
         };
         let expected = plan::expected_work(&plain);
-        let reads = plan::start_reads(inputs, &sets);
+        let reads = plan::start_reads(inputs, first, &sets);
         if !plan::admits(expected, reads) {
             if let Some(start) = start {
                 let detail = format!(
