@@ -124,16 +124,29 @@ pub(super) fn expected_work(plan: &Plan) -> f64 {
     plan.rows.iter().filter(|rows| !rows.is_nan()).sum()
 }
 
-/// The sets a search reads at its starts: each open star input's predicate's ([`search`]'s
-/// starts, by the sets' index), saturating.
-pub(super) fn start_reads(inputs: &[Input], sets: &CharacteristicSets) -> usize {
+/// The open stars whose predicates' sets a search reads at its starts, in input order: every
+/// input's, or only `first`'s for a fixed order that starts there. A start reads only where
+/// another input follows it, as [`search`]'s steps decide.
+fn start_stars(inputs: &[Input], first: Option<usize>) -> impl Iterator<Item = &Star> {
+    let n = inputs.len();
     inputs
         .iter()
-        .filter_map(|input| input.star)
-        .filter(Star::open)
-        .fold(0usize, |reads, star| {
-            reads.saturating_add(sets.sets_having(star.predicate))
-        })
+        .enumerate()
+        .filter(move |&(j, _)| n >= 2 && first.is_none_or(|f| f == j))
+        .filter_map(|(_, input)| input.star.as_ref())
+        .filter(|star| star.open())
+}
+
+/// The sets a search reads at its starts ([`start_stars`]: all of them, or a fixed order's
+/// `first`), by the sets' index, saturating.
+pub(super) fn start_reads(
+    inputs: &[Input],
+    first: Option<usize>,
+    sets: &CharacteristicSets,
+) -> usize {
+    start_stars(inputs, first).fold(0usize, |reads, star| {
+        reads.saturating_add(sets.sets_having(star.predicate))
+    })
 }
 
 /// Whether a BGP whose plain plan expects `expected` rows, and whose set search would read
@@ -652,24 +665,19 @@ fn search(
         });
     }
     // Every start state of an open star reads its predicate's sets (`star_of`) before the
-    // search first checks its work: the exhaustive and greedy searches
-    // build all their starts in input order, a fixed order its first (a start reads only where
-    // another input follows it, as `apply` decides). Where those reads would pass the budget,
-    // the search stops as it would after making them, with the work counted before the one
-    // that passes, having made none: their lengths come from the sets' index.
-    if let Some(sets) = sets
-        && n >= 2
-    {
-        let first = fixed.map(|order| order[0]);
+    // search first checks its work: the exhaustive and greedy searches build all their
+    // starts in input order, a fixed order its first ([`start_stars`]). Where those reads
+    // would pass the budget, the search stops as it would after making them, with the work
+    // counted before the one that passes, having made none: their lengths come from the
+    // sets' index.
+    if let Some(sets) = sets {
         let mut done = 0usize;
-        for j in (0..n).filter(|&j| first.is_none_or(|f| f == j)) {
-            if let Some(star) = inputs[j].star.filter(open) {
-                let next = done.saturating_add(sets.sets_having(star.predicate));
-                if next > budget {
-                    return Err(Stopped::Budget { work: done });
-                }
-                done = next;
+        for star in start_stars(inputs, fixed.map(|order| order[0])) {
+            let next = done.saturating_add(sets.sets_having(star.predicate));
+            if next > budget {
+                return Err(Stopped::Budget { work: done });
             }
+            done = next;
         }
     }
     // Every read and copy of the sets is counted before it is made; past the budget none is
