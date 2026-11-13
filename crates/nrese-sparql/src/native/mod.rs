@@ -3717,7 +3717,8 @@ impl<'a> Context<'a> {
     }
 
     /// `planning` of `inputs`: first without the characteristic sets (the plain plan), then,
-    /// where an input is part of a star and the reads the set search would make at its starts
+    /// where an input is part of an open star ([`plan::Star::open`]) and the reads the set
+    /// search would make at its starts
     /// cost little against the work the plain plan expects ([`plan::admits`]), with them,
     /// within a budget that follows that work ([`plan::budget_for`]; one policy for every path
     /// that plans: scans, and scans with paths). A BGP the gate keeps from the sets, or whose
@@ -3743,7 +3744,9 @@ impl<'a> Context<'a> {
             }
             Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
         };
-        if !inputs.iter().any(|i| i.star.is_some()) {
+        // Only an open star's patterns are estimated from the sets: with none, a search with
+        // them would make the plain plan again.
+        if !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())) {
             return Ok(plain);
         }
         let Some(sets) = self.snapshot.characteristic_sets_in(self.model) else {
