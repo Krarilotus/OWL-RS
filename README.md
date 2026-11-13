@@ -121,7 +121,8 @@ content-type: application/problem+json
 Nothing of the rejected commit remains: the query still answers no rows. With a name
 (`INSERT DATA { ex:felix a ex:Cat ; ex:name "Felix" }`) the commit passes, and the query
 answers `ex:felix`. When each part of a commit becomes visible, and what the checks see:
-[What a commit does](#what-a-commit-does).
+[What a commit does](#what-a-commit-does). The shape stays in the store: to run the example
+again, [start over](#change-a-setting-start-over) first.
 
 ### Your own data
 
@@ -473,6 +474,11 @@ runs recorded there are as of their dates.
 | Find any other document | [docs/README.md](docs/README.md) |
 
 ## State and limits
+
+These pages describe the code of the commit they are in. A running server names its build
+at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
+the ruleset with its semantics version and a fingerprint of what it derives
+([reasoning-semantics.md](docs/spec/reasoning-semantics.md)).
 
 What is done and what is open, item by item: [docs/STATUS.md](docs/STATUS.md) (its counts
 and measurements are as of when each was recorded); the order
