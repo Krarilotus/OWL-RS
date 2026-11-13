@@ -7,11 +7,10 @@ are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions
 
 ## Goal
 
-An RDF database and ontology platform with reasoning at its centre: fast SPARQL over
-large data, writes that are validated, access-controlled and transactional, OWL 2 RL
-materialised and maintained incrementally, and OWL 2 DL with complete answers where the
-plan has a complete path, on every core of one machine and
-across machines where a use case needs it ([vision](spec/00-vision-and-scope.md)).
+An RDF database and ontology platform with reasoning at its centre
+([vision](spec/00-vision-and-scope.md)). What it does today, with its limits, is listed
+in [What it covers](../README.md#what-it-covers). What is still to come is the order
+below; across machines, only read replicas are built so far.
 
 ## The order (owner, 5 October 2026)
 

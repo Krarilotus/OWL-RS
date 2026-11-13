@@ -1,5 +1,9 @@
 # Vision and Scope
 
+What NRESE is meant to become; "in scope" below includes work not done yet. What it does
+today: [What it covers](../../README.md#what-it-covers); what it leaves out:
+[limits](../limits.md); the order of the work left: [ROADMAP](../ROADMAP.md).
+
 ## Product vision
 
 NRESE is an RDF database and ontology platform that **reads like QLever and governs data like GraphDB**, and means to lead in reasoning:

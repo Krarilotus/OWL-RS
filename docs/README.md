@@ -5,7 +5,7 @@
 | Question | Document |
 |---|---|
 | How do I run it and send a first query? | the [quick start](../README.md#quick-start), then [getting started](dev/getting-started.md) |
-| What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-can-do) |
+| What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-covers) |
 | What doesn't it do, and when should I choose another system? | [Limits and deviations](limits.md) |
 | How do I load my own data? | [your own data](../README.md#your-own-data); large files: [bulk loading](ops/server-setup.md#54-bulk-loading) |
 | How do I change a setting, or switch reasoning? | [change a setting](../README.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
@@ -32,7 +32,7 @@ list wins and the lower one is corrected in the same change.
 | How is NRESE fast, which ideas worked and which didn't? | [design/performance.md](design/performance.md): the wins to keep with their guards (§0), the ideas by layer, the lab log |
 | How does a component work? | [design/](#design) |
 | What does reasoning compute? | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
-| What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-can-do) |
+| What can it do, and with which limits? | the capability list in the [README](../README.md#what-it-covers) |
 | How is it run and configured? | [ops/](#operations) |
 | How is it measured? | [benches/README.md](../benches/README.md) (the four levels, hosts), the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
 | What should research find out next? | [plan/2026-10-05-research-tasks.md](plan/2026-10-05-research-tasks.md) |
