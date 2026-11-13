@@ -39,6 +39,9 @@ with what to do instead, or "none known" where there is nothing. What is planned
   gives the standard merge; where it matters, read with `GRAPH ?g { … }` and keep `?g` in
   the answer.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
+- Directional strings in the data alone don't make a result announce RDF 1.2; a query that
+  makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
+  None known: a client that may meet them should read results as RDF 1.2.
 
 ## RDF syntaxes
 
@@ -59,8 +62,11 @@ with what to do instead, or "none known" where there is nothing. What is planned
   ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset)).
 - **`owl2-rl`** doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
   return one for each; an asserted one is returned), checks the datatype rules in part, and doesn't store axiomatic triples.
-  Lists past their limits are reported, not truncated
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)). Literals aren't
+  Lists past their limits (a property chain or key of more than 250 properties, more than
+  64 member sequences) aren't used at all, never truncated, and each is reported in the log
+  and the reasoning diagnostics
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
+  keeping lists within those limits. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
 - **What an answer promises.** Without the OWL 2 QL rewriting, every answer over a
