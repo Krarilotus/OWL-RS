@@ -1,113 +1,59 @@
-# Backup and Restore Drills
+# Backup and restore drills
 
-## Purpose
+A drill proves that a backup restores. This page gives one complete drill, small enough to
+run against the [quick start](../../README.md#quick-start)'s server, then the scenarios to
+repeat on a schedule. The endpoints: [http-api.md](http-api.md#engine-api-apiv1). Backups
+of large stores, offline: [server setup §10](server-setup.md#10-backup-and-recovery-setup).
+The storage design behind them: [ADR-0002](../adr/0002-engine-storage-lsm-permutations.md).
 
-Define repeatable backup/restore drills that prove recovery readiness under realistic failure scenarios.
+## A complete drill
 
-Status tracking for this concern lives in [docs/spec/06-target-capability-matrix.md](../spec/06-target-capability-matrix.md). The engine v2 durability design (WAL + checkpoints) is in [ADR-0002](../adr/0002-engine-storage-lsm-permutations.md); drills are revised with roadmap WP E4.
+The quick start's server answers on port 8080. The drill restores its backup into a second,
+empty server on port 8081 and compares the two. The commands are for Linux (GNU `head`).
 
-This document is the operational source of truth for backup/restore procedure and evidence.
+```bash
+# 1. Back up: an N-Quads export of every asserted statement, closed by its checksum.
+curl -sS -D backup-headers.txt -o export.nq http://localhost:8080/api/v1/repositories/nrese/backup
+grep -i '^x-nrese' backup-headers.txt   # its source revision and quad count
+tail -n 1 export.nq                     # "# nrese-sha256 <hex>"
+head -n -1 export.nq | sha256sum        # the same <hex>
 
-## Backup Artifact Contract
+# 2. Restore it into a fresh server.
+docker run -d --name nrese-drill -p 127.0.0.1:8081:8080 -v nrese-drill:/var/lib/nrese/data \
+  -e NRESE_REASONING_MODE=owl2-rl nrese
+curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8081/readyz
+curl -sS -X POST -H 'Content-Type: application/n-quads' --data-binary @export.nq \
+  http://localhost:8081/api/v1/repositories/nrese/restore
 
-Every drill must use an artifact with these recorded fields:
+# 3. Count the asserted statements of every graph on both.
+q='query=SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }'
+curl -sS --data-urlencode infer=false --data-urlencode "$q" http://localhost:8080/dataset/query
+curl -sS --data-urlencode infer=false --data-urlencode "$q" http://localhost:8081/dataset/query
 
-- artifact id
-- format
-- creation time
-- source revision
-- quad count
-- checksum
+# 4. Remove the drill's server.
+docker rm -f nrese-drill && docker volume rm nrese-drill
+```
 
-Where they come from: an image backup's `manifest.json` (revision, counts, size, SHA-256). For the N-Quads export (`GET /ops/api/admin/dataset/backup`), the headers `x-nrese-source-revision` and `x-nrese-quad-count`, and the SHA-256 at the end: the file's last line `# nrese-sha256 <hex>` (over every byte before it, so it stays with the file) and the trailer `x-nrese-checksum-sha256` (with `curl`, send `TE: trailers`). The HTTP restore checks the last line and refuses a mismatch; record its `checksum_verified`. The offline `nrese-server load --replace` doesn't: check the file first with `head -n -1 export.nq | sha256sum` against that line.
+The drill passes when:
 
-## Restore Verification Contract
+- the two checksums of step 1 are the same;
+- the restore answers `200` with `"checksum_verified":true` and a `quad_count` equal to
+  the backup's `x-nrese-quad-count`;
+- both counts of step 3 are that number too.
 
-Every restore drill must record these checks:
+A restore whose checksum doesn't match answers `400` and changes nothing. Over HTTP a
+restore takes at most about 384 MiB by default (3 × `budgets.upload_size` + 64 KiB, held
+whole while it is parsed). Larger exports restore offline with
+`nrese-server load --replace export.nq`, which doesn't check the checksum: check it first
+as in step 1.
 
-- readiness reaches `ready`
-- restored revision is recorded
-- critical parity query pack pass/fail is recorded
-- semantic restore outcome is recorded explicitly:
-  - accepted and published
-  - or rejected by the shared mutation gate without partial publication
+## Scenarios to repeat
 
-## Evidence Schema
+| Scenario | Steps | Passes when |
+|---|---|---|
+| Standard restore | The drill above, from the latest backup, into a clean data directory. For a store-sized backup, restore offline: an image with `nrese-server restore DIR` (checked against its `manifest.json`), an export with `nrese-server load --replace` | Step 3's counts match the backup's quad count, and your own check queries return their recorded answers |
+| Interrupted write | Stop the server hard (`docker kill nrese`) while updates run, then start it on the same data directory | It becomes ready; every acknowledged commit is there. Opening replays the log's intact records and cuts a torn last one; other damage stops the start unless `store.wal_damage` says otherwise ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)) |
+| Rollback | Restore the backup taken before a change, then run the queries your clients depend on | They return the answers recorded before the change |
 
-Each drill run must produce:
-
-- `drill-report.json`
-- `smoke-results.json`
-- `query-diff.json`
-- `checksums.txt`
-
-## Drill Cadence
-
-- Weekly: restore validation in staging from most recent backup
-- Monthly: full recovery simulation including service restart and smoke test pack
-- Quarterly: failure injection drill (interrupted update / abrupt process termination)
-
-## Drill Scenarios
-
-## Scenario A: Standard Restore
-
-1. Take latest backup artifact.
-2. Restore into clean staging data directory. For a store-sized backup, restore offline:
-   - an image backup: `nrese-server restore DIR` (checked against its manifest);
-   - an N-Quads export: `nrese-server load --replace export.nq` (with the target's configuration, `NRESE_STORE_MODE=on-disk`, `NRESE_DATA_DIR`).
-
-   The HTTP restore (`POST /ops/api/admin/dataset/restore`) takes at most the server's body limit, about 3 × `budgets.upload_size` + 64 KiB (about 384 MiB by default), held whole while it is parsed: for small datasets only.
-3. Start NRESE with restored dataset.
-4. Run smoke tests and critical query pack.
-
-Success criteria:
-
-- service starts cleanly
-- no data checksum mismatch
-- critical queries return expected outputs
-
-## Scenario B: Interrupted Update Recovery
-
-1. Trigger controlled interruption during update workload.
-2. Restart the service on the same data directory: opening replays the log's intact records and cuts a torn last record, if there is one, so a commit whose record is intact is there even if its client got no acknowledgement; other damage stops the start unless `store.wal_damage` says otherwise ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
-3. Validate dataset integrity and revision continuity.
-
-Success criteria:
-
-- no partial publication is observed
-- integrity checks pass
-- service returns to ready state
-
-## Scenario C: Rollback Restore
-
-1. Restore backup intended for rollback cutover.
-2. Re-run migration compatibility pack against restored state.
-
-Success criteria:
-
-- restored state is operationally valid for fallback use
-- rollback time objective is met
-
-## Evidence to Capture
-
-- backup artifact ID + checksum
-- restore start/end timestamps
-- smoke test report
-- query diff report
-- incident notes (if drill fails)
-
-## Pass/Fail Rule
-
-A drill passes only if:
-
-- the backup artifact metadata is complete
-- restore verification checks all pass
-- no checksum or query parity failure is observed
-
-Any failure triggers remediation and a repeat drill before the issue is considered closed.
-
-## Failure Handling
-
-- classify drill failure severity
-- create remediation task with owner and due date
-- rerun failed scenario after fix before closing task
+What to keep from each run: the backup's source revision, quad count and checksum; the
+restore's answer; the start and end times; the counts and query answers compared.
