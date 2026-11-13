@@ -276,11 +276,12 @@ struct State {
     distinct: Vec<f64>,
     order: Vec<usize>,
     estimates: Vec<f64>,
-    /// Per subject variable of the state's open star patterns: their predicates and, with
-    /// characteristic sets, the star's rows so far, extended as patterns join (one read of
-    /// each matching set per step, not the star from scratch per candidate).
+    /// Per subject variable of the state's open star patterns: their predicates and the
+    /// star's rows so far, extended as patterns join (one read of each matching set per step,
+    /// not the star from scratch per candidate). Empty in a search without the sets.
     stars: HashMap<usize, Subject>,
-    /// Per variable: the first edge `?x p ?y` in the order whose object it is.
+    /// Per variable: the first edge `?x p ?y` in the order whose object it is. Empty in a
+    /// search without the sets.
     edges_into: HashMap<usize, usize>,
     /// Per pattern with counted common values ([`Input::overlaps`]): the least share of
     /// a joined partner's values it has, kept up to date as partners join (a lookup per
@@ -349,6 +350,18 @@ thread_local! {
     /// Run at every step the orderer asks whether to stop, before it asks: a test's measure
     /// of planning work, and its way to cancel a query after a chosen amount of it.
     pub(super) static STEP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Star predicates and edges the orderer's states took on: the guard that a search
+    /// without the characteristic sets keeps none.
+    pub(super) static STAR_STATE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_star_state() {
+    #[cfg(test)]
+    STAR_STATE.with(|c| c.set(c.get() + 1));
 }
 
 fn note_statistics(_reads: usize, _steps: usize) {
@@ -449,25 +462,31 @@ fn search(
                 let known = &mut state.distinct[v];
                 *known = if *known > 0.0 { known.min(d) } else { d };
             }
-            if let Some(star) = input.star.filter(open) {
-                let subject = state.stars.entry(star.subject).or_default();
-                subject.rows = sets.and_then(|sets| match &subject.rows {
-                    Some(rows) => work.take(rows.len()).then(|| {
-                        note_statistics(rows.len(), 0);
-                        sets.star_with(rows, star.predicate)
-                    }),
-                    None => work.take(sets.sets_having(star.predicate)).then(|| {
-                        let rows = sets.star_of(star.predicate);
-                        note_statistics(rows.len(), 0);
-                        rows
-                    }),
-                });
-                subject.predicates.push(star.predicate);
-            }
-            if let (Some(object), Some(star)) = (input.edge_object, input.star)
-                && star.subject != object
-            {
-                state.edges_into.entry(object).or_insert(j);
+            // Stars and edges are read only by the estimates from the sets: a search without
+            // them builds and copies neither.
+            if let Some(sets) = sets {
+                if let Some(star) = input.star.filter(open) {
+                    let subject = state.stars.entry(star.subject).or_default();
+                    subject.rows = match &subject.rows {
+                        Some(rows) => work.take(rows.len()).then(|| {
+                            note_statistics(rows.len(), 0);
+                            sets.star_with(rows, star.predicate)
+                        }),
+                        None => work.take(sets.sets_having(star.predicate)).then(|| {
+                            let rows = sets.star_of(star.predicate);
+                            note_statistics(rows.len(), 0);
+                            rows
+                        }),
+                    };
+                    subject.predicates.push(star.predicate);
+                    note_star_state();
+                }
+                if let (Some(object), Some(star)) = (input.edge_object, input.star)
+                    && star.subject != object
+                {
+                    state.edges_into.entry(object).or_insert(j);
+                    note_star_state();
+                }
             }
             let partner = (input.count as f64).max(1.0);
             for &(i, both) in &input.overlaps {

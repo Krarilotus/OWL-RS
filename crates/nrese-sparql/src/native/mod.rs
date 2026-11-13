@@ -3729,7 +3729,8 @@ impl<'a> Context<'a> {
         inputs: &[plan::Input],
         planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
-        let start = Instant::now();
+        // Read only by EXPLAIN's notes: no clock for a query that isn't explained.
+        let start = self.trace.is_some().then(Instant::now);
         let cancelled = || {
             self.cancellation
                 .as_ref()
@@ -3751,7 +3752,7 @@ impl<'a> Context<'a> {
         let expected = plan::expected_work(&plain);
         let reads = plan::start_reads(inputs, &sets);
         if !plan::admits(expected, reads) {
-            if self.trace.is_some() {
+            if let Some(start) = start {
                 let detail = format!(
                     "{} patterns planned without characteristic sets: {reads} set entries at \
                      its starts against {expected:.0} rows expected",
@@ -3773,7 +3774,7 @@ impl<'a> Context<'a> {
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
         plain.work = work;
-        if self.trace.is_some() {
+        if let Some(start) = start {
             let detail = format!(
                 "{} patterns planned without characteristic sets: \
                  estimate budget of {budget} passed after {work}",
