@@ -128,7 +128,9 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         "the ABox makes compiling the larger part"
     );
     // What the store keeps for every request once the revision's U1, views and ontology are
-    // built: charged within the catalog since SYN-61, the same after every request.
+    // built: charged within the catalog since SYN-61, the same after every request (once it
+    // ends: a request holds its credit at the catalog until then).
+    drop(unlimited);
     let kept = catalog.used();
     assert_eq!(
         kept,
@@ -141,8 +143,9 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         let memory = store.envelope(Some(limit));
         let end = run(&store, &memory);
         assert!(memory.refused() || end == End::Answered, "at {limit} bytes");
-        // Back to what the store keeps: nothing of the request stays, in its envelope or in
-        // the bounds'.
+        // Back to what the store keeps once the request ends: nothing of it stays, in its
+        // envelope or in the bounds'.
+        drop(memory);
         assert_eq!(
             catalog.used(),
             kept,
@@ -184,7 +187,6 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         store.dl().bounds.kept().used() > 0,
         "the bounds kept nothing"
     );
-    drop(unlimited);
     drop(snapshot);
     drop(store);
     assert_eq!(
