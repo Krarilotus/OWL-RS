@@ -152,6 +152,8 @@ impl SharedBudget {
 
     /// Charges `bytes` above, then here; refused anywhere, nothing stays charged.
     fn charge(&self, bytes: usize) -> Result<(), Refused> {
+        #[cfg(test)]
+        writes::count();
         if let Some(parent) = &self.parent {
             parent.charge(bytes)?;
         }
@@ -188,6 +190,8 @@ impl SharedBudget {
 
     /// Releases `bytes` here, at most what is charged, and as much above.
     fn release(&self, bytes: usize) {
+        #[cfg(test)]
+        writes::count();
         let before = self
             .used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
@@ -202,6 +206,8 @@ impl SharedBudget {
     /// Up to `wanted` bytes charged here and above, never more than half of the room left
     /// at a level, never refused: what was taken (0 where there is no room).
     fn take_up_to(&self, wanted: usize) -> usize {
+        #[cfg(test)]
+        writes::count();
         let Ok(limit) = self.known_limit() else {
             return 0;
         };
@@ -256,6 +262,26 @@ mod calls {
     /// The calls this thread has made so far.
     pub(super) fn made() -> u64 {
         CALLS.with(Cell::get)
+    }
+}
+
+/// The writes a thread makes on shared budgets (a charge, a refill, a release), counted for
+/// tests: a request's charges within its credit must make none.
+#[cfg(test)]
+mod writes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WRITES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        WRITES.with(|writes| writes.set(writes.get() + 1));
+    }
+
+    /// The writes this thread has made so far.
+    pub(super) fn made() -> u64 {
+        WRITES.with(Cell::get)
     }
 }
 
@@ -706,6 +732,23 @@ impl Drop for Budget {
         self.release_above(used);
         #[cfg(any(test, feature = "measure"))]
         crate::measure::released(self, used);
+    }
+}
+
+/// Before the change: no credit (tests only).
+#[cfg(test)]
+fn credit_cap(shared: &SharedBudget) -> usize {
+    const MOST: usize = 64 << 10;
+    const LEAST: usize = 4 << 10;
+    let cap = MOST.min(shared.limit() >> 16);
+    if cap < LEAST { 0 } else { cap }
+}
+
+#[cfg(test)]
+impl Budget {
+    /// Before the change: no credit.
+    fn credit(&self) -> usize {
+        0
     }
 }
 
@@ -2742,7 +2785,8 @@ mod tests {
     /// Guard (the executor memory stack's timing, Harness notes/2026-11-02-exec-memory-stack.md
     /// EMS-13: a shared atomic per item cost GROUP_CONCAT x1.94 in parallel workers): an item
     /// within a grant's spare makes no budget call at all, so 10^4 items of 6 bytes after the
-    /// first make none; every level is exact again once the grant ends.
+    /// first make none; every level is exact again once the grant ends, the server's holding
+    /// the request's credit until the request ends.
     #[test]
     fn an_item_within_a_grants_spare_makes_no_budget_call() {
         let server = SharedBudget::new(1 << 30);
@@ -2758,8 +2802,12 @@ mod tests {
         assert_eq!(calls::made(), before, "no budget call within the spare");
         assert_eq!(grant.bytes(), 6 * 10_001);
         drop(grant);
-        assert_eq!((part.used(), request.used(), server.used()), (0, 0, 0));
+        assert_eq!((part.used(), request.used()), (0, 0));
+        assert_eq!(server.used(), request.credit());
         assert_eq!(part.ahead(), 0);
+        drop(part);
+        drop(request);
+        assert_eq!(server.used(), 0);
     }
 
     /// Spec (the budget types' owner's ruling, 3 Nov): a grant's refill is never refused and
@@ -2972,5 +3020,159 @@ mod tests {
         });
         assert_eq!(excess, 0);
         assert_eq!(request.used(), 0);
+    }
+
+    const GIB: usize = 1 << 30;
+
+    /// A request's credit is reserved at the server when taken, in the same charge: another
+    /// request is refused what the credit holds, and a request larger than its credit still
+    /// grows exactly up to the limit.
+    #[test]
+    fn a_requests_credit_is_reserved_at_the_server() {
+        let server = SharedBudget::new(GIB);
+        let credit = credit_cap(&server) / 2;
+        assert_eq!(
+            credit,
+            8 << 10,
+            "half the cap: 16 KiB, the 65,536th of 1 GiB"
+        );
+        let one = Envelope::new(None, Some(Arc::clone(&server)));
+        one.charge(1).unwrap();
+        assert_eq!(
+            server.used(),
+            1 + credit,
+            "the credit charged with the first byte"
+        );
+        let other = Envelope::new(None, Some(Arc::clone(&server)));
+        let left = GIB - 1 - credit;
+        let err = other.charge(left + 1).unwrap_err();
+        assert!(
+            err.shared,
+            "the server refuses what the credit holds: {err}"
+        );
+        other.charge(left).unwrap();
+        assert_eq!(
+            (server.used(), other.credit()),
+            (GIB, 0),
+            "the rest exactly, no credit"
+        );
+        assert!(other.charge(1).is_err());
+        drop(one);
+        assert_eq!(
+            server.used(),
+            left,
+            "the first request's byte and credit returned"
+        );
+    }
+
+    /// Requests charging and releasing at once: the server holds exactly what they hold,
+    /// their credits included, never more than its limit, and nothing once they end.
+    #[test]
+    fn the_limit_holds_exactly_under_concurrent_requests() {
+        let limit = 256 << 20;
+        let server = SharedBudget::new(limit);
+        assert!(credit_cap(&server) > 0, "credits in play");
+        let requests: Vec<Envelope> = (0..8)
+            .map(|_| Envelope::new(None, Some(Arc::clone(&server))))
+            .collect();
+        let barrier = std::sync::Barrier::new(requests.len());
+        std::thread::scope(|scope| {
+            for (i, request) in requests.iter().enumerate() {
+                let (barrier, server) = (&barrier, &server);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut held = Vec::new();
+                    for n in 0usize.. {
+                        let bytes = 512 + (n * 7919 + i * 104_729) % (48 << 10);
+                        if request.charge(bytes).is_err() {
+                            break;
+                        }
+                        held.push(bytes);
+                        assert!(server.used() <= limit, "over the limit");
+                        if n % 3 == 0
+                            && let Some(bytes) = held.pop()
+                        {
+                            request.release(bytes);
+                        }
+                    }
+                    assert_eq!(request.used(), held.iter().sum::<usize>());
+                });
+            }
+        });
+        let held: usize = requests.iter().map(|r| r.used() + r.credit()).sum();
+        assert_eq!(
+            server.used(),
+            held,
+            "the server holds what the requests hold"
+        );
+        assert!(held <= limit);
+        drop(requests);
+        assert_eq!(server.used(), 0);
+    }
+
+    /// A request's credit goes back however the request ends: released, dropped holding (an
+    /// error, a cancellation), after a refusal, its parts' grants and reservations dropped,
+    /// and only when its last clone goes.
+    #[test]
+    fn a_requests_credit_is_returned_on_every_exit() {
+        let server = SharedBudget::new(GIB);
+        let request = || Envelope::new(None, Some(Arc::clone(&server)));
+        let released = request();
+        released.charge(100).unwrap();
+        released.release(100);
+        assert!(server.used() > 0, "credit held while it runs");
+        drop(released);
+        assert_eq!(server.used(), 0, "released, then ended");
+        let holding = request();
+        holding.charge(5_000).unwrap();
+        drop(holding);
+        assert_eq!(server.used(), 0, "ended holding");
+        let refused = request();
+        refused.charge(10).unwrap();
+        assert!(refused.charge(GIB).is_err());
+        assert_eq!(server.used(), 10, "a refusal returns the credit");
+        refused.charge(5).unwrap();
+        assert_eq!(
+            server.used(),
+            15,
+            "and the request charges exactly from then on"
+        );
+        drop(refused);
+        assert_eq!(server.used(), 0, "ended after a refusal");
+        let parted = request();
+        {
+            let part = parted.part();
+            let mut grant = Grant::with_workers(&part, 1);
+            grant.take(3_000).unwrap();
+            let mut kept = Reservation::new(&part);
+            kept.charge(700).unwrap();
+        }
+        let clone = parted.clone();
+        drop(parted);
+        assert!(server.used() > 0, "a clone still runs");
+        drop(clone);
+        assert_eq!(server.used(), 0, "its parts ended, then it");
+    }
+
+    /// A lookup's charges and releases within its credit write the server's budget only
+    /// when the credit is taken and when it is returned; under a 256 MiB limit every charge
+    /// stays exact, as without a credit.
+    #[test]
+    fn a_request_writes_the_server_only_for_its_credit() {
+        let server = SharedBudget::new(GIB);
+        let request = Envelope::new(None, Some(Arc::clone(&server)));
+        let before = writes::made();
+        for _ in 0..1_000 {
+            request.charge(200).unwrap();
+            request.release(200);
+        }
+        assert_eq!(writes::made() - before, 1, "one charge took the credit");
+        drop(request);
+        assert_eq!(writes::made() - before, 2, "one release returned it");
+        assert_eq!(server.used(), 0);
+        let small = SharedBudget::new(32 << 20);
+        let request = Envelope::new(None, Some(Arc::clone(&small)));
+        request.charge(200).unwrap();
+        assert_eq!(small.used(), 200, "exact under 256 MiB");
     }
 }
