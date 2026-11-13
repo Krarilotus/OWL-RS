@@ -147,7 +147,7 @@ Commands marked *store* open the configured store and lock its data directory: t
 
 | Command | Arguments and options (defaults) | What it does and changes | Fails when |
 |---|---|---|---|
-| (none) | | *store*. Serves HTTP on `server.bind_address`: opens the store, brings the inferred stack up to date, then serves until SIGTERM or SIGINT ([stopping](#64-stopping), exit `0`) | the configuration is invalid; the directory is locked; the address can't be bound (`failed to bind ADDR`); startup reasoning fails |
+| (none) | | *store*. Serves HTTP on `server.bind_address`: opens the store, brings the inferred stack up to date, then serves until SIGTERM or SIGINT ([stopping](#64-stopping), exit `0`) | the configuration is invalid; the directory is locked; the address can't be bound ([`failed to bind ADDR`](#err-failed-to-bind)); startup reasoning fails |
 | `load` | `FILE...` (at least one; format by extension); `--replace` (default: add); `--graph IRI` (default: the default graph; triple formats only); `--strict` or `--quarantine` (older `--skip-errors`; default `store.invalid_statements`) | *store*. Commits the files' statements, then rematerialises the inferences and prepares the planner's statistics ([bulk loading](#54-bulk-loading)) | no file; a file can't be read or parsed (under `--strict`: any bad statement); the loaded data is inconsistent under the ruleset: exit `1` with the violation count, the data stays loaded and the server starts in quarantine |
 | `query` | `QUERY` or `--file FILE` (one of them); `--format F` (`json`, `xml`, `csv`, `tsv`, or for CONSTRUCT and DESCRIBE `nt`, `ttl`, `nq`, `trig`, `rdf`, `jsonld`; default JSON, N-Triples) | *store*. Brings the inferred stack up to date (it may rematerialise and write it), then writes the answers to standard output, reading every graph ([one-off queries](#541-one-off-queries-and-conversions)) | both or neither of `QUERY` and `--file`; an unknown format; `parsing the query failed`; `the query failed` |
 | `print-query` | `QUERY` or `--file FILE`; `--form paths\|values` (default `paths`); `--schema FILE` (repeatable; default: the configured store) | *store* without `--schema`. Prints the query as standard SPARQL 1.1 after a `# NRESE completeness:` line; changes nothing | exit `2`: not expressible, the reasons on standard error; exit `1`: other errors |
@@ -175,6 +175,20 @@ Caused by:
 - **Cause:** another process has the store in `store.data_dir` (the path shown) open: a running server, or an offline command (`load`, `query`, `print-query`, `backup`) on the same directory. The lock is that process's hold on the directory's `LOCK` file, released when it closes the store.
 - **Fix:** stop the other process (`systemctl stop nrese`, `docker stop nrese`), or wait for the offline command to end; or give this one another data directory. On Linux, `fuser DATA_DIR/LOCK` names the process. Don't delete `LOCK`: the file isn't the lock, the other process's hold on it is.
 - **Check:** start the server again; once it reports ready, `curl -fsS http://127.0.0.1:8080/readyz` answers `{"status":"ready"}`.
+
+<a id="err-failed-to-bind"></a>
+**Address can't be bound.**
+
+```text
+Error: failed to bind 0.0.0.0:8080
+
+Caused by:
+    Address already in use (os error 98)
+```
+
+- **Cause:** the cause line says which. `Address already in use`: another process listens on that port. `Cannot assign requested address`: the address isn't one of this machine's. `Permission denied`: a port below 1024 without the right to bind it.
+- **Fix:** stop the other listener (on Linux, `ss -ltnp 'sport = :8080'` names it), or set another address or port: `server.bind_address` (`NRESE_BIND_ADDR`), for example `127.0.0.1:8081`. In Docker the server binds inside the container; a busy port on the machine shows as `docker run`'s own error, `port is already allocated`: publish another one (`-p 127.0.0.1:8081:8080`).
+- **Check:** start the server again; `curl -fsS http://127.0.0.1:8080/readyz` (with the port you chose) answers `{"status":"ready"}`.
 
 ## 5.5 Local Test-Server Startup Example (PowerShell)
 
