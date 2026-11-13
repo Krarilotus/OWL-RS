@@ -128,6 +128,59 @@ fn a_failed_resolution_refuses_the_write_and_the_next_resolves() {
     assert!(!holds(&engine, 2), "the refused commit is there");
 }
 
+/// A first commit whose resolution fails does nothing of its own before it is refused: its note
+/// (a journal beside the log, `Transaction::note_commit`) isn't called, and the log's full
+/// segment isn't rotated. The next commit resolves the names, is noted once, rotates and is
+/// acknowledged.
+#[test]
+fn a_failed_resolution_runs_no_note_and_no_rotation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_base, root) = made_store();
+    // Every segment full: the next append rotates first.
+    let full = EngineConfig {
+        durability: DurabilityConfig {
+            wal_segment_bytes: 1,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(&root, full).unwrap();
+    let segments = || {
+        super::wal::list_segments(&super::wal::wal_dir(&root))
+            .unwrap()
+            .len()
+    };
+    let before = segments();
+    let noted = Arc::new(AtomicUsize::new(0));
+    let noting = |n: u64| {
+        let mut tx = engine.transaction();
+        tx.insert(quad(n).as_ref());
+        let noted = Arc::clone(&noted);
+        tx.note_commit(Box::new(move |_| {
+            noted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        tx.commit()
+    };
+    fault::FAIL_RESOLUTION.set(true);
+    let refused = noting(2);
+    fault::FAIL_RESOLUTION.set(false);
+    assert!(
+        refused.is_err(),
+        "acknowledged with its names unresolved: {refused:?}"
+    );
+    assert_eq!(
+        noted.load(Ordering::SeqCst),
+        0,
+        "noted before its names were resolved"
+    );
+    assert_eq!(segments(), before, "rotated before its names were resolved");
+    noting(3).expect("the commit after a refused resolution");
+    assert_eq!(noted.load(Ordering::SeqCst), 1, "the next commit's note");
+    assert_eq!(segments(), before + 1, "the next commit's rotation");
+}
+
 /// The log served to a follower before any write on this open resolves and syncs the store's
 /// names first: nothing leaves the process before they are durable.
 #[test]
