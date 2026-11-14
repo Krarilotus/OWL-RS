@@ -871,7 +871,7 @@ def run_case(case: dict, label: str, rep: int) -> dict:
 
 # A run that ended at one of these stopped at a limit of the case (its memory cap, its time),
 # not with a wrong answer.
-LIMITS = ("memory-limit", "timeout", "gave-up")
+LIMITS = ("memory-limit", "timeout", "gave-up", "query-memory-limit")
 
 
 def frontier(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
@@ -1049,6 +1049,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 if case.get("queries", "").startswith("@vectors") and code == 0:
                     result["recall"] = vector_recall(case, expect)
                 observation = invocation_observation(case, result, err, identity)
+                if refused := refused_queries(result):
+                    observation["refused"] = refused
                 observation["exit"] = code
                 observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
                 observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
@@ -1165,10 +1167,24 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]
     record["routes"] = [route(path, want, result) for path, want in case.get("route", {}).items()]
     wanted = case.get("outcome", "ok")
+    # A query refused at its memory limit, in any invocation: the record names it whatever its
+    # status (another failure may decide that), and the run fails for it whatever the case declares
+    # (not_as_expected; release_gate.state), as no case can declare a refusal.
+    refused = {q: e for o in observations for q, e in o.get("refused", {}).items()}
+    if refused:
+        record["refused"] = refused
+        record["notes"] += [f"{q}: refused at its memory limit: {e}" for q, e in sorted(refused.items())]
     if record["status"] == "ok":
-        # A check the tool can't report (ok None: --no-routes) is unchecked, not failed.
-        if any(c["ok"] is False for c in record["checks"] + [c for o in observations for c in o.get("checks", [])]):
+        # A check the tool can't report (ok None: --no-routes) is unchecked, not failed. A refused
+        # query's checks and routes fail for want of an answer, not for a wrong one: they don't make
+        # the run wrong, the refusal makes it QUERY_MEMORY_LIMIT, below a wrong answer of another.
+        last = observations[-1].get("refused", {}) if observations else {}
+        wrong = failing(record["checks"], last) + [c for o in observations
+                                                   for c in failing(o.get("checks", []), o.get("refused", {}))]
+        if wrong:
             record["status"] = "wrong"
+        elif refused:
+            record["status"] = QUERY_MEMORY_LIMIT
         elif any(r["ok"] is False for r in record["routes"] + [r for o in observations for r in o.get("routes", [])]):
             record["status"] = "off-route"
     record["expected_outcome"] = wanted
@@ -1276,6 +1292,31 @@ def same_taxonomy(case: dict) -> str | None:
     (SCRATCH / f"{case['name']}.reference.tax").write_text(found.stdout, encoding="utf-8")
     pairs = [tuple(line.rstrip("\n").split("\t")[:2]) for line in open(closure, encoding="utf-8") if "\t" in line]
     return canonical.compare(found.stdout, pairs)
+
+
+# A query the engine refused at its memory limit, as perf_lab reports it: the query's error, the
+# engine's message for it (nrese-exec `BudgetExceeded`, its own budget's or the shared one's, with
+# its amounts or, to a reader of some graphs, without; nrese-store `ProcessMemoryLimit`). Not the
+# message that the process's memory couldn't be read: no limit was reached (nrese-store
+# `is_memory_limit`).
+QUERY_REFUSAL = re.compile(r"(?:query memory budget exceeded|the server's query memory is in use): "
+                           r"(?:\d+ MiB in use, \d+ MiB more requested, )?limit \d+ MiB"
+                           r"|stopped at the process's memory limit \(\d+ MiB\)")
+# A run in which the engine refused a query at its memory limit (D16-596): no wrong answer, and no
+# case's declared outcome (suitekit/cases.py OUTCOMES), so it fails wherever a wrong answer does.
+QUERY_MEMORY_LIMIT = "query-memory-limit"
+
+
+def refused_queries(result: dict) -> dict[str, str]:
+    """The queries of a perf_lab result that the engine refused at its memory limit, and why."""
+    return {str(q.get("name")): str(q["error"])[:300] for q in result.get("queries") or []
+            if isinstance(q, dict) and QUERY_REFUSAL.search(str(q.get("error") or ""))}
+
+
+def failing(items: list[dict], refused: dict) -> list[dict]:
+    """The failed checks (or routes), but a refused query's: it has no answer to be wrong."""
+    return [c for c in items if c["ok"] is False
+            and not (c["path"].startswith("q.") and c["path"].split(".")[1] in refused)]
 
 
 def classify_failure(code: int, err: str, result: dict) -> str:
@@ -1806,10 +1847,12 @@ def changed_inputs(files: dict) -> list[str]:
 def not_as_expected(records: list[dict], off_route_ok: bool = False) -> list[dict]:
     """The runs that make `run` fail: each whose status isn't its case's expected outcome,
     except, for an A/B's base (`off_route_ok`), a case off its expected route: measured
-    without the operator the branch brings. Failed, wrong and missing runs always count."""
+    without the operator the branch brings. Failed, wrong and missing runs always count, and so
+    does a run in which a query was refused at its memory limit (`refused`), whatever its status:
+    no case declares a refusal."""
     tolerated = {"off-route"} if off_route_ok else set()
     return [r for r in records
-            if r["status"] != r.get("expected_outcome", "ok") and r["status"] not in tolerated]
+            if (r["status"] != r.get("expected_outcome", "ok") and r["status"] not in tolerated) or r.get("refused")]
 
 
 def suite_rows(report: dict, cases: list[dict]) -> list:
@@ -1833,13 +1876,16 @@ def suite_rows(report: dict, cases: list[dict]) -> list:
         observations = record.get("observations", [])
         for o in observations:
             checks = o.get("checks", [])
-            status = "wrong" if any(c["ok"] is False for c in checks) else "ok" if o.get("exit") == 0 else "failed"
+            refused = o.get("refused", {})
+            status = ("wrong" if failing(checks, refused) else "failed" if refused
+                      else "ok" if o.get("exit") == 0 else "failed")
             note = "; ".join([f"page cache {o['identity']['cache']}",
+                              *(f"{q} refused at its memory limit" for q in sorted(refused)),
                               *(f"{c['path']} {c['got']} (expected {c['expected']})" for c in checks)])
             rows.append(Result(**where, item=" ".join([case["name"], *sweep[o["identity"]["sweep"]]]),
                                status=status, ms="" if o.get("metric") is None else o["metric"],
                                peak_mib=o.get("peak_mib") or "", note=note))
-        if record["status"] in ("ok", "wrong", "off-route"):
+        if record["status"] in ("ok", "wrong", "off-route", QUERY_MEMORY_LIMIT):
             continue
         planned = invocation_plan(case, record.get("page_cache"))
         ended = planned[len(observations)] if len(observations) < len(planned) else None
