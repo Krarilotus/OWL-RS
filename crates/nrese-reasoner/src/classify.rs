@@ -26,10 +26,12 @@
 //! (property characteristics other than transitivity, disjoint properties, disjoint unions,
 //! self restrictions, named class expressions, the top and bottom properties, datatypes
 //! where a class is read, restrictions on data properties, nodes that state two
-//! expressions): the hierarchy is then complete for the part read only. A data property's domain and range, which say
-//! nothing about classes without such a restriction, assertions about individuals, and
-//! keys, which constrain only individuals, are not read: an inconsistency among them goes
-//! unseen.
+//! expressions): the hierarchy is then complete for the part read only. OWL 2's global
+//! restrictions are not checked: an irregular role hierarchy (*Structural Specification*
+//! §11.2), outside OWL 2 EL as well (Profiles §2.2.6), is read, and CR6 needs no regular one.
+//! A data property's domain and range, which say nothing about classes without such a
+//! restriction, assertions about individuals, and keys, which constrain only individuals,
+//! are not read: an inconsistency among them goes unseen.
 
 use std::time::{Duration, Instant};
 

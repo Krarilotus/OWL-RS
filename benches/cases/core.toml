@@ -1311,7 +1311,7 @@ reference = "/fast/ref/el-classes20000-roles12.elk.tax"
 [[case]]
 name = "el-classify-irregular"
 area = "dl"
-what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL, inside OWL 2 EL"
+what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL and OWL 2 EL, which keeps the regularity of Structural Specification §11.2 (Profiles §2.2.6)"
 semantics = "el"
 data = "el classes=20000 roles=12 irregular=1"
 tool = "classify-el"

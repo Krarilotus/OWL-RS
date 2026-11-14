@@ -24,7 +24,9 @@ What NRESE reasons with today ([reasoner v2](../design/reasoner-v2.md)):
   OWL 2 DL: disjunction, existentials that create anonymous individuals, cardinalities and
   most of nominals are beyond any rule set.
 - **OWL 2 EL classification** (`v2/classify.rs`): the completion rules of Baader, Brandt and
-  Lutz with ELK's normalisation. Axioms outside EL are skipped and counted.
+  Lutz with ELK's normalisation. Axioms it doesn't read are skipped and counted; OWL 2's
+  global restrictions aren't checked, so it also classifies an irregular role hierarchy,
+  which is outside OWL 2 EL (Profiles §2.2.6, Structural Specification §11.2).
 
 What users of an ontology platform ask that this can't answer:
 

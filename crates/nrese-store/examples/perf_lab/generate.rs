@@ -1377,7 +1377,8 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     )?;
     // The chain is regular by default (r1 ∘ r2 ⊑ r1, with r2 ⊑ r1), so HermiT and Openllet
     // take the ontology too. `irregular=1` puts it under r3 instead: r3 ⊑ r1 makes the role
-    // hierarchy irregular, outside OWL 2 DL (OWL 2 EL allows it; HermiT refuses it).
+    // hierarchy irregular, outside OWL 2 DL and OWL 2 EL alike (Structural Specification
+    // §11.2, which Profiles §2.2.6 keeps for EL); HermiT refuses it.
     let chain = list(nt, "chain", &[ex("r1"), ex("r2")])?;
     let implied = if p.get("irregular", 0) == 1 {
         "r3"
