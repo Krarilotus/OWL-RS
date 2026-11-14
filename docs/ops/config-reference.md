@@ -17,7 +17,7 @@ Notes:
 
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
-- **Reset:** to return a setting to its default, remove it from the command line, the environment and the file, then restart. A repository's own value (scope `repo` below) is removed with `PATCH /api/v1/repositories/{id}` and `null` ([HTTP API](http-api.md#engine-api-apiv1)).
+- To return a setting to its default, remove it from the command line, the environment and the file, then restart. A repository's own value (scope `repo` below) is removed with `PATCH /api/v1/repositories/{id}` and `null` ([HTTP API](http-api.md#engine-api-apiv1)).
 - The reasoner's profile comes from `reasoner.mode` and `reasoner.rules` alone (there is no `preset` or feature-override input); the server resolves them into one runtime profile before diagnostics, capabilities and the console see it. The other `reasoner.*` settings below tune it.
 
 ### Types and scopes
@@ -122,7 +122,7 @@ api_key = "replace-me"
 Posture effects:
 - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces (they answer 404)
 - `internal-authenticated` requires `auth.mode` other than `none`
-- `replacement-grade` additionally requires on-disk storage and `problem-json` SPARQL parse errors
+- `replacement-grade` also requires on-disk storage and `problem-json` SPARQL parse errors
 - a combination these rules refuse is a startup error
 
 ## Store
@@ -262,7 +262,7 @@ Details:
   | <a id="dl.consistency"></a>`dl.consistency` (`NRESE_DL_CONSISTENCY`), choice: `inline`, `off` | `inline` | A commit that makes the data inconsistent under OWL 2 DL is rejected, as the RL gate rejects; `off`: not checked, and every answer's status then says the consistency is unknown |
   | <a id="dl.threads"></a>`dl.threads` (`NRESE_DL_THREADS`), integer | `0` (every core) | The maximum workers of a DL operation |
 
-  - **The DL budgets.** None is built into the engines ([`nrese_dl::limits`](../../crates/nrese-dl/src/limits.rs)): each is one of these settings, of type limit (a number, with a unit where it has one, or `0` or `unlimited` for none). A run that reaches one stops with a reason naming the setting (`dl.max_nodes reached (…)`): its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer. A guard holds the engines to it (`crates/nrese-dl/tests/tableau/limits.rs`). The CLIs (`dl_classify`, `tableau_consistency`) take the same budgets as options, none by default.
+  - None of the DL budgets is built into the engines ([`nrese_dl::limits`](../../crates/nrese-dl/src/limits.rs)): each is one of these settings, of type limit (a number, with a unit where it has one, or `0` or `unlimited` for none). A run that reaches one stops with a reason naming the setting (`dl.max_nodes reached (…)`): its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer. A guard holds the engines to it (`crates/nrese-dl/tests/tableau/limits.rs`). The CLIs (`dl_classify`, `tableau_consistency`) take the same budgets as options, none by default.
 
     | Setting (env) | Default | Why this default |
     |---|---|---|
@@ -313,7 +313,7 @@ A `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`,
 
 Every limit on memory, time and request size is in one table, `[budgets]`. Memory shares range from `0%` to `100%` and use the process's capacity (including container limits), read once when configuration loads. `budgets.query_memory = "50%"` gives each query half of that capacity; `0%` has the same meaning as `0`.
 
-**Which memory limit.** Three settings bound memory; none of them bounds the store's own data and indexes.
+Three settings bound memory; none of them bounds the store's own data and indexes.
 - `budgets.query_memory`: what one query's evaluation may hold. Past it the query gets `413`.
 - `budgets.total_query_memory`: what all running queries and updates hold together. A request that finds no room gets `503` and may succeed later.
 - `budgets.process_memory`: what the whole process may hold before a long operation (a load's or a commit's reasoning) stops with an error instead of taking the machine. Queries count toward it too: one that finds no room left in it gets the same `503`.
