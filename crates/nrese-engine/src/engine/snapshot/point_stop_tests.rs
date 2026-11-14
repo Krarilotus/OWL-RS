@@ -45,7 +45,7 @@ fn refusal_sweep(
     case: &str,
     read: impl Fn(Visitor<'_>) -> Vec<Result<EncodedQuad, Stopped>>,
 ) -> Vec<EncodedQuad> {
-    let mut prefixes = Vec::new();
+    let mut prefixes: Vec<Vec<EncodedQuad>> = Vec::new();
     for yeses in 0.. {
         let (asked, allowed, last) = (Cell::new(0u64), Cell::new(0u64), Cell::new(read_work()));
         let gap = |at: &str| {
