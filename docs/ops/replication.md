@@ -71,13 +71,13 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
 
 ## Limits of this first step
 
-- **Failover:** a replica isn't promoted automatically. To promote one, stop it, set
+- A replica isn't promoted automatically. To promote one, stop it, set
   `replication.mode = "primary"` (or `"off"`), and point the writers and the other replicas
   at it.
-- **Support graph sets:** for `inferred = "supported"`, a replica computes them afresh after
+- For `inferred = "supported"`, a replica computes support graph sets afresh after
   the records it applies, not incrementally.
-- **Re-bootstrap:** a replica doesn't yet take a new image by itself when the log no longer
+- A replica doesn't yet take a new image by itself when the log no longer
   serves it.
-- **Reasoning semantics 3:** a replica computes no inferences, so it keeps a closure an older
+- A replica computes no inferences, so it keeps a closure an older
   build's maintenance wrote; after upgrading to reasoning semantics 3, start it again from an
   empty data directory.
