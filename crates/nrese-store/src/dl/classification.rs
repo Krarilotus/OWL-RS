@@ -383,6 +383,18 @@ pub(crate) fn el_answer(
     classification
         .subsumptions
         .retain(|&(a, b)| a != probe && b != probe);
+    // A class the DL engines' signature lacks (an annotation property's domain, a datatype
+    // declared `owl:DataRange`): the two readers read the ontology differently, so neither
+    // reading is trusted, and the DL engines' lower bound stands.
+    let signature: HashSet<u64> = taxonomy.classification.classes.iter().copied().collect();
+    let known = |c: &u64| signature.contains(c);
+    let c = &classification;
+    if !(c.unsatisfiable.iter().all(known)
+        && c.top.iter().all(known)
+        && c.subsumptions.iter().all(|(a, b)| known(a) && known(b)))
+    {
+        return None;
+    }
     Some(El {
         classification,
         consistency,

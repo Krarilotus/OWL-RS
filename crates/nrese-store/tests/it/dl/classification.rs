@@ -384,3 +384,25 @@ fn an_irregular_ontology_with_a_range_below_a_chains_equivalent_is_not_answered_
          :r3 owl:equivalentProperty :r4 . :r5 rdfs:subPropertyOf :r4 ; rdfs:range :X .",
     ));
 }
+
+/// The EL classifier reads an annotation property's domain as a class the DL engines don't
+/// have: the two read the ontology differently, and the answer stays the DL engines' marked
+/// lower bound.
+#[test]
+fn an_irregular_ontology_whose_annotation_domain_the_el_classifier_reads_as_a_class_is_not_answered_by_it()
+ {
+    assert_lower_bound(&irregular(
+        ":ap a owl:AnnotationProperty ; rdfs:domain :X . :T a owl:Class . \
+         owl:Thing rdfs:subClassOf :T .",
+    ));
+}
+
+/// The EL classifier reads datatypes declared `owl:DataRange` as classes, the DL engines as
+/// a datatype definition: the answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_whose_data_ranges_the_el_classifier_reads_as_classes_is_not_answered_by_it()
+ {
+    assert_lower_bound(&irregular(
+        ":Dt a owl:DataRange . :Et a owl:DataRange . :Dt owl:equivalentClass :Et .",
+    ));
+}
