@@ -5,7 +5,7 @@
 //! `2026-11-09-p2-reas3-design.md` §1). The uncounted reads are left as they were: what an
 //! uncounted reader runs is not this code.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use super::{CopyVisibility, Either, Snapshot};
 use crate::engine::equality::{Classes as EqualityClasses, Expand, Merged, OnMeter, Read, Step};
@@ -24,9 +24,6 @@ use crate::{Count, SnapshotIdentity, TermId};
 #[derive(Clone)]
 pub struct CountedSnapshot {
     snapshot: Snapshot,
-    /// What making a point read's scans counts, by read model ([`Self::point_quads`]): worked
-    /// out at the first point read in that model.
-    point_costs: [OnceLock<u64>; 3],
 }
 
 impl Snapshot {
@@ -34,7 +31,6 @@ impl Snapshot {
     pub fn counted(&self) -> CountedSnapshot {
         CountedSnapshot {
             snapshot: self.clone(),
-            point_costs: Default::default(),
         }
     }
 }
@@ -97,22 +93,23 @@ impl CountedSnapshot {
         Some(Ended::new(quads, visit))
     }
 
-    /// The quads of `[s, p, o]` in any graph, as [`Self::quads`] reads them, with the making of
-    /// their scans charged up front: before the first quad, one visit of what
-    /// [`Self::quads`] would count making them at most (each run's range search and its cursor
-    /// in a merge whose every range is taken), worked out once per read model. Each merge step
-    /// is then counted on one [`Ledger`] as in [`Self::quads`], and every refusal answers
-    /// [`Stopped`].
+    /// The quads of `[s, p, o]` in any graph, as [`Self::quads`] answers them, read on one of
+    /// three paths chosen from one ask of whether the read expands equality classes (design
+    /// note `2026-11-14-d16-543-point-reads-design.md`):
+    /// - where it does, [`Self::quads`]'s expanded read of those classes (Asserted reads never
+    ///   expand);
+    /// - else, where making the scans could count more than [`nrese_exec::POLL_UNITS`]
+    ///   (`Snapshot::point_cost`), [`Self::quads`]'s counted read of the stacks;
+    /// - else the point read: that cost asked of `visit` in one visit before the first quad,
+    ///   the scans then made uncounted, each merge step counted on one ledger.
     ///
-    /// `None` where that charge is over [`nrese_exec::POLL_UNITS`] or the read expands
-    /// equality classes: read with [`Self::quads`] instead (design note
-    /// `2026-11-14-d16-543-point-reads-design.md`).
+    /// Every refusal answers [`Stopped`].
     pub fn point_quads<'a>(
         &'a self,
         model: ReadModel,
         [s, p, o]: [TermId; 3],
         visit: Visitor<'a>,
-    ) -> Option<impl Iterator<Item = Result<EncodedQuad, Stopped>> + use<'a>> {
+    ) -> impl Iterator<Item = Result<EncodedQuad, Stopped>> + use<'a> {
         let snapshot = &self.snapshot;
         let pattern = QuadPattern {
             subject: Some(s),
@@ -122,25 +119,22 @@ impl CountedSnapshot {
         };
         let pattern = *snapshot.read_pattern(model, &pattern);
         let plan = AccessPlan::for_pattern(&pattern);
-        let data = snapshot.data(model);
-        // Every point plan reads one permutation, so its cost is the model's.
-        let cost = *self.point_costs[model as usize].get_or_init(|| {
-            Stack::ALL
-                .into_iter()
-                .filter(|&stack| model.includes(stack))
-                .map(|stack| data.stack(stack).scan_cost(&plan))
-                .sum()
-        });
-        if cost > u64::from(nrese_exec::POLL_UNITS) {
-            return None;
-        }
         let charge = match snapshot.expanding_with(model, &pattern, visit) {
-            Ok(Some(_)) => return None,
-            Ok(None) => Ok(cost),
+            Ok(Some(classes)) => {
+                let expanded = snapshot.expanded_visited(classes, model, &pattern, visit);
+                return Path::Read(Ended::new(Either::Left(expanded), visit));
+            }
+            Ok(None) => match snapshot.point_cost(model, &plan) {
+                Some(cost) => Ok(cost),
+                None => {
+                    let stacks = snapshot.stacks_visited(model, pattern, visit);
+                    return Path::Read(Ended::new(Either::Right(stacks), visit));
+                }
+            },
             Err(Stopped) => Err(Stopped),
         };
-        Some(PointQuads {
-            data,
+        Path::Point(PointQuads {
+            data: snapshot.data(model),
             model,
             plan,
             charge: Some(charge),
@@ -230,7 +224,30 @@ impl<I: Iterator<Item = EncodedQuad>> Iterator for Ended<'_, I> {
     }
 }
 
-/// [`CountedSnapshot::point_quads`]'s quads: its charge asked at the first `next`, then each
+/// [`CountedSnapshot::point_quads`]'s paths: one of [`CountedSnapshot::quads`]'s reads, or the
+/// point read.
+enum Path<R, P> {
+    Read(R),
+    Point(P),
+}
+
+impl<R, P> Iterator for Path<R, P>
+where
+    R: Iterator<Item = Result<EncodedQuad, Stopped>>,
+    P: Iterator<Item = Result<EncodedQuad, Stopped>>,
+{
+    type Item = Result<EncodedQuad, Stopped>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Read(quads) => quads.next(),
+            Self::Point(quads) => quads.next(),
+        }
+    }
+}
+
+/// [`CountedSnapshot::point_quads`]'s point read: its charge asked at the first `next`, then each
 /// stack's scan made as the one before ends, uncounted as charged, and stepped on the read's
 /// one ledger.
 struct PointQuads<'a> {
@@ -295,19 +312,51 @@ impl Snapshot {
         // A class build that stopped reads nothing more: the stack scans below find their
         // visitor stopped and end at once.
         if let Ok(Some(classes)) = self.expanding_with(model, &pattern, visit) {
-            let permutation = AccessPlan::for_pattern(&classes.normalised(&pattern)).permutation;
-            let expanded = self
-                .expanded_sorted_visited(classes, model, &pattern, permutation, visit)
-                .expect("every layout keeps the permutation of a pattern's access plan");
-            return Either::Left(expanded);
+            return Either::Left(self.expanded_visited(classes, model, &pattern, visit));
         }
+        Either::Right(self.stacks_visited(model, pattern, visit))
+    }
+
+    /// [`Self::quads_visited`]'s expanded read of `classes`, in its access plan's permutation.
+    fn expanded_visited<'a>(
+        &'a self,
+        classes: Arc<EqualityClasses>,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'a>,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let permutation = AccessPlan::for_pattern(&classes.normalised(pattern)).permutation;
+        self.expanded_sorted_visited(classes, model, pattern, permutation, visit)
+            .expect("every layout keeps the permutation of a pattern's access plan")
+    }
+
+    /// [`Self::quads_visited`]'s read of the stacks, a counted scan each.
+    fn stacks_visited<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: QuadPattern,
+        visit: Visitor<'a>,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
         let data = self.data(model);
-        Either::Right(
-            Stack::ALL
-                .into_iter()
-                .filter(move |&stack| model.includes(stack))
-                .flat_map(move |stack| data.stack(stack).scan_counted(&pattern, visit)),
-        )
+        Stack::ALL
+            .into_iter()
+            .filter(move |&stack| model.includes(stack))
+            .flat_map(move |stack| data.stack(stack).scan_counted(&pattern, visit))
+    }
+
+    /// The most making `plan`'s scans in `model` counts on [`Self::stacks_visited`]'s path,
+    /// worked out from the runs' sizes alone ([`IndexVersion::scan_cost`]): `None` once it is
+    /// over [`nrese_exec::POLL_UNITS`], the runs after that left unread.
+    pub(crate) fn point_cost(&self, model: ReadModel, plan: &AccessPlan) -> Option<u64> {
+        let data = self.data(model);
+        let mut cost = 0;
+        for stack in Stack::ALL {
+            if model.includes(stack) {
+                let most = u64::from(nrese_exec::POLL_UNITS) - cost;
+                cost += data.stack(stack).scan_cost(plan, most)?;
+            }
+        }
+        Some(cost)
     }
 
     /// [`Snapshot::scan_sorted_in`]'s work, counted.

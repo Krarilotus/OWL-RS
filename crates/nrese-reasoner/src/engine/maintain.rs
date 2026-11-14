@@ -55,18 +55,12 @@ impl<'a> EngineBase<'a> {
             return Err(Stopped);
         }
         // Its work in the engine counted too (REAS-3, SW016), a deleted copy found as any.
-        let visit = |n| poll.visit(n);
-        let first = match self
+        let first = self
             .snapshot
-            .point_quads(ReadModel::Materialised, ids(fact), &visit)
-        {
-            Some(mut quads) => quads.next(),
-            None => self
-                .snapshot
-                .quads(ReadModel::Materialised, &point(fact), &visit)
-                .next(),
-        };
-        Ok(first.transpose()?.is_some())
+            .point_quads(ReadModel::Materialised, ids(fact), &|n| poll.visit(n))
+            .next()
+            .transpose()?;
+        Ok(first.is_some())
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
@@ -80,19 +74,7 @@ impl<'a> EngineBase<'a> {
     ) -> Result<bool, Stopped> {
         // The engine's work below each copy counted too (REAS-3, SW017).
         let visit = |n| probe.visited(n);
-        match self.snapshot.point_quads(model, ids(fact), &visit) {
-            Some(quads) => self.kept(quads, probe),
-            None => self.kept(self.snapshot.quads(model, &point(fact), &visit), probe),
-        }
-    }
-
-    /// Whether `quads` hold one the change doesn't delete, each counted on `probe`.
-    fn kept(
-        &self,
-        quads: impl Iterator<Item = Result<EncodedQuad, Stopped>>,
-        probe: Probe<'_, '_>,
-    ) -> Result<bool, Stopped> {
-        for quad in quads {
+        for quad in self.snapshot.point_quads(model, ids(fact), &visit) {
             let quad = quad?;
             if !probe.units(1) {
                 return Err(Stopped);
@@ -108,11 +90,6 @@ impl<'a> EngineBase<'a> {
 /// `fact`'s terms.
 fn ids(fact: Triple) -> [TermId; 3] {
     fact.map(TermId::from_raw)
-}
-
-/// `fact` in any graph.
-fn point(fact: Triple) -> QuadPattern {
-    pattern(fact.map(Some), GraphSelector::Any)
 }
 
 /// Reads count as [`Base`] says: each quad a scan visits is a position, the deleted ones it

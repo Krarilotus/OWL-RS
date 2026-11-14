@@ -653,20 +653,22 @@ impl IndexVersion {
 
     /// The most [`Self::scan_plan_with`] counts making a scan in `plan`'s permutation: each
     /// run's range search, and its cursor added to a merge whose every range is taken
-    /// ([`merge::add_cost`]). O(r), from the runs and the permutation the layout reads alone.
-    /// The plain scan's making ([`Self::scan_plan`]) does no more than this: the same
-    /// searches, and a heap built at once compares no more than its pushes one by one.
-    pub(crate) fn scan_cost(&self, plan: &AccessPlan) -> u64 {
+    /// ([`merge::add_cost`]). From the runs' sizes and the permutation the layout reads alone,
+    /// a run at a time: `None` once it is over `most`, the runs after that left unread. The
+    /// plain scan's making ([`Self::scan_plan`]) does no more than this: the same searches,
+    /// and a heap built at once compares no more than its pushes one by one.
+    pub(crate) fn scan_cost(&self, plan: &AccessPlan, most: u64) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return 0;
+            return Some(0);
         };
-        self.runs
-            .iter()
-            .enumerate()
-            .map(|(added, run)| {
-                run.permutation(adapted.permutation).keys.range_cost() + merge::add_cost(added)
-            })
-            .sum()
+        let mut cost = 0;
+        for (added, run) in self.runs.iter().enumerate() {
+            cost += run.permutation(adapted.permutation).keys.range_cost() + merge::add_cost(added);
+            if cost > most {
+                return None;
+            }
+        }
+        Some(cost)
     }
 
     /// [`Self::scan`] for a counted read: made and stepped counted on `visit`
