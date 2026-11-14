@@ -88,12 +88,13 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   lane claiming the next probe while results keep their order. A query's `Resources`
   carry one too (the current registry by default); in SPARQL only result encoding
   dispatches through it (`native/output.rs`), the other kernels use the whole pool.
-- **One absolute deadline per DL operation, not yet everywhere.** A multi-axiom
-  entailment computes its deadline once and gives each batch what remains of it
-  (`store/dl/entailment.rs`, `Budget::remaining`). Not yet so: a single-axiom entailment
-  passes the whole budget to each of its negation tests, and each consistency check starts
-  its own deadline from it; classification (`nrese_dl::classify`) and the U1 rebuild
-  (`store/dl/bounds.rs`) have deadline types of their own. Phases check the request's
+- **One absolute deadline per DL operation.** An entailment computes its deadline once
+  and gives each test what remains of it (`store/dl/entailment.rs`, `Budget::remaining`);
+  a commit's pending and prior consistency checks and its rejection evidence share one
+  (`store/dl/gate.rs`). (14 Nov 2026: so since; this said a single-axiom entailment and each
+  consistency check started their own.) Classification (`nrese_dl::classify`, with a
+  deadline type of its own) and the U1 rebuild (`store/dl/bounds.rs`) each take one
+  deadline when they start. Phases check the request's
   cancellation token at their checkpoints. Tableau portfolio siblings share a child token
   that cannot cancel their request; the first decided outcome in input order is returned.
 - **What the envelopes don't cover.** Accounted capacities are not process RSS or a strict
