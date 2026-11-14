@@ -1645,21 +1645,26 @@ class Memory(unittest.TestCase):
 class ToolPhases(unittest.TestCase):
     def test_a_classifier_case_declares_the_phases_its_tool_resolves(self):
         # Spec (benches/cases/README.md, what the tool can resolve; master, 14 Nov 01:41):
-        # el-shallow-existentials' prepare and write print 0.0 at the EL classifier's 0.1 ms on
-        # every pass of the baseline, so its family has its other four phases, against each
-        # baseline; another EL case keeps all six the tool prints (its profile line, classify.rs).
+        # in a release run (13 Nov 2026) the EL classifier printed, at its 0.1 ms, 0.0 on every
+        # pass of the baseline for el-shallow-existentials' prepare and write and for el-classify's
+        # and el-classify-irregular's prepare; their families have their other phases, against
+        # each baseline. A classifier case that declares none keeps its tool's phases: horn-classify
+        # read, owl and write, against base (main lacks the Horn classifier: absent).
         catalog = fast.load_cases()
-        family = gate_module.family_of(catalog, ["el-shallow-existentials", "el-classify"])
+        cases = ["el-shallow-existentials", "el-classify", "el-classify-irregular", "horn-classify"]
+        family = gate_module.family_of(catalog, cases)
         times = lambda case, side: sorted(h.split("|")[2] for h in family
                                           if h.startswith(f"{side}|{case}|time/"))
+        five = ["time/assemble", "time/normalise", "time/read", "time/saturate", "time/write"]
         for side in ("base", "main"):
             with self.subTest(side=side):
                 self.assertEqual(times("el-shallow-existentials", side),
                                  ["time/assemble", "time/normalise", "time/read", "time/saturate"])
-                self.assertEqual(times("el-classify", side),
-                                 ["time/assemble", "time/normalise", "time/prepare", "time/read",
-                                  "time/saturate", "time/write"])
+                self.assertEqual(times("el-classify", side), five)
+                self.assertEqual(times("el-classify-irregular", side), five)
                 self.assertIn(f"{side}|el-shallow-existentials|memory/anon_kernel", family)
+        self.assertEqual(times("horn-classify", "base"), ["time/owl", "time/read", "time/write"])
+        self.assertEqual(times("horn-classify", "main"), [])
 
 
 class Evidence(unittest.TestCase):
