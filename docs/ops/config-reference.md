@@ -522,5 +522,5 @@ All AI settings are scope start. Secrets are never printed and are refused by `-
 
 - typed runtime defaults and validation live in owning crates
 - external config parsing and precedence live in `crates/nrese-server/src/config/`
-- every setting (file key, older keys, environment name, kind, description) is declared once in `crates/nrese-server/src/config/settings.rs`; a test checks that this reference names every key and environment variable
+- every setting (file key, older keys, environment name, kind, default, description) is declared once in `crates/nrese-server/src/config/settings.rs`; a test checks that this reference names every key and environment variable
 - do not document runtime knobs in multiple operator docs
