@@ -46,9 +46,17 @@ use std::time::{Duration, Instant};
 use hashbrown::{HashMap, HashSet};
 use nrese_xsd::owl::Datatype;
 
+use nrese_exec::stop::Ticker;
+
+use super::delta::Interrupted;
+use super::eval::OperationStop;
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
 
 type Triple = [u64; 3];
+
+/// The countdown of one loop to its stop's next poll ([`classify_parallel_within`]): every
+/// [`nrese_exec::stop::POLL_UNITS`] units it asks [`OperationStop::fired`].
+type Poll<'a> = Ticker<&'a (dyn Fn() -> bool + Sync)>;
 
 /// A classification's result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -724,12 +732,18 @@ impl Graph<'_> {
     }
 
     /// The class expression `node` is; `Err` names what EL lacks.
+    /// Each node read is a unit of `poll`'s; once it fires, `Err` (the caller sees the stop
+    /// latched).
     fn expr(
         &self,
         node: u64,
         named: &dyn Fn(u64) -> bool,
         depth: usize,
+        poll: &Poll<'_>,
     ) -> Result<Expr, &'static str> {
+        if poll.tick(1).is_err() {
+            return Err("stopped");
+        }
         if depth > 64 {
             return Err("too deeply nested");
         }
@@ -752,7 +766,7 @@ impl Graph<'_> {
             }
             return members
                 .into_iter()
-                .map(|m| self.expr(m, named, depth + 1))
+                .map(|m| self.expr(m, named, depth + 1, poll))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Expr::And);
         }
@@ -766,7 +780,7 @@ impl Graph<'_> {
             }
             return Ok(Expr::Some(
                 role,
-                Box::new(self.expr(filler, named, depth + 1)?),
+                Box::new(self.expr(filler, named, depth + 1, poll)?),
             ));
         }
         Err("unknown class expression")
@@ -805,8 +819,44 @@ pub fn classify_profiled(
     named: &dyn Fn(u64) -> bool,
     threads: usize,
 ) -> (Classification, Profile) {
+    let no_memory = || -> Option<nrese_exec::memory::MemoryStopCause> { None };
+    let never = OperationStop::with_poll(super::eval::NEVER, &no_memory);
+    match classify_profiled_within(triples, vocabulary, named, threads, &never) {
+        Ok(result) => result,
+        Err(_) => unreachable!("a stop that never fires doesn't stop"),
+    }
+}
+
+/// [`classify_parallel`] under `stop`: once it fires (a deadline, the memory limit), every
+/// worker stops within [`nrese_exec::stop::POLL_UNITS`] units of work (a message handled or
+/// sent, a class or pair assembled, a step of reading an axiom), the work so far is
+/// discarded, and the run answers its [`Interrupted`], never a partial classification. A
+/// soft bound: an excess is seen by the poll after it, not refused in advance. Unpolled,
+/// each growing with the input or the answer, not with time: indexing the triples, the
+/// role closure (`prepare`) and the answer's final sorts.
+pub fn classify_parallel_within(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+    threads: usize,
+    stop: &OperationStop<'_>,
+) -> Result<Classification, Interrupted> {
+    classify_profiled_within(triples, vocabulary, named, threads, stop).map(|(c, _)| c)
+}
+
+/// [`classify_parallel_within`] with its [`Profile`].
+pub fn classify_profiled_within(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+    threads: usize,
+    stop: &OperationStop<'_>,
+) -> Result<(Classification, Profile), Interrupted> {
+    let fired = || stop.fired();
+    let poll: Poll<'_> =
+        Ticker::new(&fired as &(dyn Fn() -> bool + Sync)).map_err(|_| stop.interrupted())?;
     let started = Instant::now();
-    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named);
+    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named, &poll, stop)?;
     let mut profile = Profile {
         normalise: started.elapsed(),
         concepts: tbox.named.len(),
@@ -814,21 +864,41 @@ pub fn classify_profiled(
         ..Profile::default()
     };
     let result = if threads <= 1 {
-        saturate(&mut tbox, thing, nothing, skipped, &mut profile)
+        saturate(
+            &mut tbox,
+            thing,
+            nothing,
+            skipped,
+            &mut profile,
+            &poll,
+            stop,
+        )
     } else {
-        parallel::saturate(&mut tbox, thing, nothing, skipped, threads, &mut profile)
-    };
-    (result, profile)
+        parallel::saturate(
+            &mut tbox,
+            thing,
+            nothing,
+            skipped,
+            threads,
+            &mut profile,
+            &poll,
+            stop,
+        )
+    }?;
+    Ok((result, profile))
 }
 
 type Built = (Tbox, Concept, Concept, Vec<(u64, &'static str)>);
 
-/// The normalised TBox of `triples`, with `owl:Thing`, `owl:Nothing` and what was skipped.
+/// The normalised TBox of `triples`, with `owl:Thing`, `owl:Nothing` and what was skipped;
+/// polling `stop` per triple, per class expression node read and per expansion step.
 fn build(
     triples: &[Triple],
     vocabulary: &mut impl Vocabulary,
     named: &dyn Fn(u64) -> bool,
-) -> Built {
+    poll: &Poll<'_>,
+    stop: &OperationStop<'_>,
+) -> Result<Built, Interrupted> {
     let names = Names::new(vocabulary);
     let graph = Graph::new(triples, &names, named);
     let mut tbox = Tbox::default();
@@ -836,7 +906,7 @@ fn build(
     let nothing = tbox.concept(Some(names.nothing));
     let mut skipped = Vec::new();
     let expr = |node: u64, predicate: u64, skipped: &mut Vec<(u64, &'static str)>| match graph
-        .expr(node, named, 0)
+        .expr(node, named, 0, poll)
     {
         Ok(e) => Some(e),
         Err(kind) => {
@@ -844,13 +914,22 @@ fn build(
             None
         }
     };
+    // A poll that fires, or fired since (an expression's read reports it as a skip): the
+    // run stops, what was read discarded.
+    let stopped = |units: u32| poll.tick(units).is_err() || stop.latched();
     // Every declared class is classified, also one no axiom names.
     for &[s, p, o] in triples {
+        if stopped(1) {
+            return Err(stop.interrupted());
+        }
         if p == names.rdf_type && named(s) && (o == names.class || o == names.rdfs_class) {
             let _ = tbox.concept(Some(s));
         }
     }
     for &[s, p, o] in triples {
+        if stopped(1) {
+            return Err(stop.interrupted());
+        }
         let Some(disposition) = names.disposition(p, o) else {
             continue;
         };
@@ -890,6 +969,9 @@ fn build(
                     .map(|e| tbox.name(&e))
                     .collect();
                 for (i, &a) in concepts.iter().enumerate() {
+                    if stopped(concepts.len() as u32) {
+                        return Err(stop.interrupted());
+                    }
                     for &b in &concepts[i + 1..] {
                         tbox.and_sub(a, b, nothing);
                     }
@@ -928,6 +1010,9 @@ fn build(
                     let mut roles: Vec<Role> = links.iter().map(|&l| tbox.role(Some(l))).collect();
                     // r1 ∘ r2 ∘ … ∘ rn ⊑ s as (((r1 ∘ r2) ∘ r3) …) with fresh roles.
                     while roles.len() > 2 {
+                        if stopped(1) {
+                            return Err(stop.interrupted());
+                        }
                         let fresh = tbox.role(None);
                         tbox.chains.push((roles[0], roles[1], fresh));
                         roles.splice(0..2, [fresh]);
@@ -971,7 +1056,10 @@ fn build(
             Disposition::Expression(..) => {}
         }
     }
-    (tbox, thing, nothing, skipped)
+    if stop.latched() {
+        return Err(stop.interrupted());
+    }
+    Ok((tbox, thing, nothing, skipped))
 }
 
 /// The role closure and chain indexes, and the ranges folded into the existentials: what
@@ -1034,14 +1122,17 @@ fn prepare(tbox: &mut Tbox) -> Prepared {
     }
 }
 
-/// The classification from every concept's subsumers.
+/// The classification from every concept's subsumers, polling `stop` per class and pair.
 fn assemble(
     tbox: &Tbox,
     subsumers: &[HashSet<Concept>],
     thing: Concept,
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
-) -> Classification {
+    poll: &Poll<'_>,
+    stop: &OperationStop<'_>,
+) -> Result<Classification, Interrupted> {
+    let stopped = |_| stop.interrupted();
     let mut result = Classification {
         skipped,
         ..Classification::default()
@@ -1054,6 +1145,7 @@ fn assemble(
         .collect();
     let top = &subsumers[thing as usize];
     for &(d, id) in &named_ids {
+        poll.tick(1).map_err(stopped)?;
         if d != thing && d != nothing && top.contains(&d) {
             result.top.push(id);
         }
@@ -1063,6 +1155,7 @@ fn assemble(
             continue;
         }
         let set = &subsumers[c as usize];
+        poll.tick(set.len().max(1) as u32).map_err(stopped)?;
         if set.contains(&nothing) {
             result.unsatisfiable.push(id);
             continue;
@@ -1077,23 +1170,35 @@ fn assemble(
             }
         }
     }
+    poll.finish().map_err(stopped)?;
     result.subsumptions.sort_unstable();
     result.unsatisfiable.sort_unstable();
     result.top.sort_unstable();
-    result
+    Ok(result)
 }
 
 mod parallel {
     //! The parallel saturation of [`super::classify_parallel`].
 
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::sync::{Mutex, MutexGuard};
 
     use hashbrown::HashSet;
+    use nrese_exec::stop::POLL_UNITS;
 
     use std::time::Instant;
 
-    use super::{Classification, Concept, Prepared, Profile, Role, Tbox, assemble, prepare};
+    use super::{
+        Classification, Concept, Interrupted, OperationStop, Poll, Prepared, Profile, Role, Tbox,
+        assemble, prepare,
+    };
+
+    thread_local! {
+        /// This worker's units left before its next poll: counted per thread, since an
+        /// activation is too short to reach [`POLL_UNITS`] alone.
+        static LEFT: Cell<u32> = const { Cell::new(POLL_UNITS) };
+    }
 
     enum Message {
         /// A subsumer of the context's concept.
@@ -1138,8 +1243,12 @@ mod parallel {
         contexts: Vec<Context>,
         thing: Concept,
         nothing: Concept,
+        /// The run's one stop: polled every [`POLL_UNITS`] units per worker; once it has
+        /// fired (its latch), every worker drops what it holds and sends nothing more.
+        stop: &'a OperationStop<'a>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn saturate(
         tbox: &mut Tbox,
         thing: Concept,
@@ -1147,7 +1256,9 @@ mod parallel {
         skipped: Vec<(u64, &'static str)>,
         threads: usize,
         profile: &mut Profile,
-    ) -> Classification {
+        poll: &Poll<'_>,
+        stop: &OperationStop<'_>,
+    ) -> Result<Classification, Interrupted> {
         let started = Instant::now();
         let prepared = prepare(tbox);
         profile.prepare = started.elapsed();
@@ -1159,10 +1270,15 @@ mod parallel {
             contexts: (0..n).map(|_| Context::default()).collect(),
             thing,
             nothing,
+            stop,
         };
         let run = || {
             rayon::scope(|scope| {
                 for c in 0..n as Concept {
+                    saturation.tick(1);
+                    if saturation.stop.latched() {
+                        break;
+                    }
                     if saturation.tbox.named[c as usize].is_some()
                         && !saturation.contexts[c as usize]
                             .initialised
@@ -1197,10 +1313,15 @@ mod parallel {
         profile.saturate = started.elapsed();
         profile.contexts = initialised;
         profile.subsumers = subsumers.iter().map(HashSet::len).sum();
+        // Every worker has joined: a stop that fired left the saturation partial, and
+        // nothing of it is assembled.
+        if stop.latched() {
+            return Err(stop.interrupted());
+        }
         let started = Instant::now();
-        let result = assemble(tbox, &subsumers, thing, nothing, skipped);
+        let result = assemble(tbox, &subsumers, thing, nothing, skipped, poll, stop)?;
         profile.assemble = started.elapsed();
-        result
+        Ok(result)
     }
 
     /// The context a worker is saturating, and the messages it sends itself: those are
@@ -1211,6 +1332,20 @@ mod parallel {
     }
 
     impl Saturation<'_> {
+        /// Counts `units` of this worker's work; polls the stop when its allowance runs out
+        /// (which latches it once it fires).
+        fn tick(&self, units: u32) {
+            LEFT.with(|left| {
+                let rest = left.get().saturating_sub(units);
+                if rest == 0 {
+                    left.set(POLL_UNITS);
+                    self.stop.fired();
+                } else {
+                    left.set(rest);
+                }
+            });
+        }
+
         /// A message into `to`'s inbox; `to` gets a worker unless it has one.
         fn deliver<'s>(&'s self, scope: &rayon::Scope<'s>, to: Concept, message: Message) {
             let context = &self.contexts[to as usize];
@@ -1227,6 +1362,7 @@ mod parallel {
             to: Concept,
             message: Message,
         ) {
+            self.tick(1);
             if to == own.context {
                 own.local.push(message);
             } else {
@@ -1268,6 +1404,13 @@ mod parallel {
                 }
                 let mut state = lock(&context.state);
                 while let Some(message) = batch.pop() {
+                    // Stopped: what this context holds is dropped; its inbox empties the same
+                    // way, and the worker returns.
+                    if self.stop.latched() {
+                        batch.clear();
+                        break;
+                    }
+                    self.tick(1);
                     let mut own = Own {
                         context: c,
                         local: &mut batch,
@@ -1369,7 +1512,9 @@ fn saturate(
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
     profile: &mut Profile,
-) -> Classification {
+    poll: &Poll<'_>,
+    stop: &OperationStop<'_>,
+) -> Result<Classification, Interrupted> {
     let started = Instant::now();
     let Prepared {
         supers,
@@ -1403,6 +1548,7 @@ fn saturate(
         }
     }
     while let Some(item) = todo.pop() {
+        poll.tick(1).map_err(|_| stop.interrupted())?;
         conclusions += 1;
         match item {
             Item::Sub(c, d) => {
@@ -1480,9 +1626,9 @@ fn saturate(
     profile.conclusions = conclusions;
     profile.duplicates = duplicates;
     let started = Instant::now();
-    let result = assemble(tbox, &subsumers, thing, nothing, skipped);
+    let result = assemble(tbox, &subsumers, thing, nothing, skipped, poll, stop)?;
     profile.assemble = started.elapsed();
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1533,6 +1679,78 @@ mod tests {
     fn holds(v: &mut LocalVocabulary, result: &Classification, sub: &str, sup: &str) -> bool {
         let (a, b) = (v.iri(&format!("{EX}{sub}")), v.iri(&format!("{EX}{sup}")));
         result.subsumptions.binary_search(&(a, b)).is_ok()
+    }
+
+    /// `n` classes, each below the next: n(n+1)/2 subsumers to derive, many polls' work.
+    fn chain(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("ex:C{i} rdfs:subClassOf ex:C{}\n", i + 1))
+            .collect()
+    }
+
+    /// `text` classified on `threads` workers under a stop whose caller fires from its
+    /// `caller_at`-th poll on and whose memory poll from its `memory_at`-th (`0`: never).
+    fn within(
+        text: &str,
+        threads: usize,
+        caller_at: u64,
+        memory_at: u64,
+    ) -> Result<Classification, Interrupted> {
+        use nrese_exec::memory::MemoryStopCause;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let mut v = LocalVocabulary::default();
+        let triples = load(&mut v, text);
+        let snapshot = v.clone();
+        let named = move |id: u64| snapshot.text(id).starts_with('<');
+        let (callers, memories) = (AtomicU64::new(0), AtomicU64::new(0));
+        let reached = |count: &AtomicU64, at: u64| at != 0 && count.fetch_add(1, Relaxed) + 1 >= at;
+        let caller = || reached(&callers, caller_at);
+        let memory = || reached(&memories, memory_at).then_some(MemoryStopCause::OverLimit);
+        let stop = OperationStop::with_poll(&caller, &memory);
+        classify_parallel_within(&triples, &mut v, &named, threads, &stop)
+    }
+
+    /// The bounded entry under a stop that never fires answers what the unbounded one does,
+    /// on one worker and on several.
+    #[test]
+    fn a_stop_that_never_fires_changes_no_classification() {
+        let text = chain(300);
+        for threads in [1, 4] {
+            let mut v = LocalVocabulary::default();
+            let triples = load(&mut v, &text);
+            let snapshot = v.clone();
+            let named = move |id: u64| snapshot.text(id).starts_with('<');
+            let unbounded = classify_parallel(&triples, &mut v, &named, threads);
+            assert_eq!(unbounded.subsumptions.len(), 300 * 301 / 2);
+            assert_eq!(
+                within(&text, threads, 0, 0),
+                Ok(unbounded),
+                "{threads} workers"
+            );
+        }
+    }
+
+    /// A stop that fires during the run ends it with the stop, never a classification: the
+    /// work so far is discarded (on one worker and on several), and a memory limit that
+    /// fires it is named as its cause.
+    #[test]
+    fn a_stop_that_fires_during_the_run_answers_no_classification() {
+        use nrese_exec::memory::MemoryStopCause;
+        let text = chain(300);
+        for threads in [1, 4] {
+            assert_eq!(
+                within(&text, threads, 3, 0),
+                Err(Interrupted { memory: None }),
+                "{threads} workers"
+            );
+            assert_eq!(
+                within(&text, threads, 0, 3),
+                Err(Interrupted {
+                    memory: Some(MemoryStopCause::OverLimit)
+                }),
+                "{threads} workers"
+            );
+        }
     }
 
     /// The textbook example (Baader et al.): pericarditis is a heart disease, through an
