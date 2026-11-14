@@ -1,7 +1,9 @@
 //! Classification and realisation of the store's asserted statements (all graphs), on
 //! request, by the OWL 2 DL engines ([`crate::dl::classification`]): complete for OWL 2
 //! DL within `dl.timeout`, and saying so when a budget or an unsupported construct leaves
-//! a result incomplete (what it contains is entailed either way).
+//! a result incomplete (what it contains is entailed either way). Where an irregular role
+//! hierarchy is all they leave out, the EL classifier answers if it is complete for the
+//! ontology ([`crate::dl::classification::el_answer`]).
 
 use std::time::Instant;
 
@@ -23,8 +25,9 @@ pub struct ClassificationReport {
     pub equivalent_to_thing: Vec<String>,
     /// Whether the ontology has a model; `Unknown`: what is listed holds either way.
     pub consistency: Verdict,
-    /// The engine that classified: `context-core` (the Horn stage took the ontology) or
-    /// `tableau` (the hypertableau driver).
+    /// The engine that classified: `context-core` (the Horn stage took the ontology),
+    /// `tableau` (the hypertableau driver) or `el` (the EL classifier, where an irregular
+    /// role hierarchy is all the DL engines left out: `dl::classification::el_answer`).
     pub engine: &'static str,
     /// Why the hierarchy may lack subsumptions (empty: it is complete).
     pub incomplete: Vec<String>,
@@ -92,10 +95,22 @@ impl StoreService {
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
         let taxonomy = crate::dl::classification::taxonomy(self, &snapshot);
-        let c = &taxonomy.classification;
-        let listed = c.consistency != Verdict::Inconsistent;
-        let mut subsumptions: Vec<(String, String)> = c
-            .subsumptions
+        let el = crate::dl::classification::el_answer(self, &snapshot, &taxonomy, started);
+        let ((pairs, unsatisfiable, top), consistency, engine, incomplete) = match &el {
+            Some(el) => {
+                let c = &el.classification;
+                let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
+                (lists, &el.consistency, "el", Vec::new())
+            }
+            None => {
+                let c = &taxonomy.classification;
+                let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
+                let why = taxonomy.incomplete.clone();
+                (lists, &c.consistency, taxonomy.profile.path, why)
+            }
+        };
+        let listed = *consistency != Verdict::Inconsistent;
+        let mut subsumptions: Vec<(String, String)> = pairs
             .iter()
             .filter(|_| listed)
             .filter_map(|&(a, b)| Some((iri(&snapshot, a)?, iri(&snapshot, b)?)))
@@ -107,11 +122,11 @@ impl StoreService {
         };
         Ok(ClassificationReport {
             subsumptions,
-            unsatisfiable: list(&c.unsatisfiable),
-            equivalent_to_thing: list(&c.top),
-            consistency: c.consistency.clone(),
-            engine: taxonomy.profile.path,
-            incomplete: reasons(&c.consistency, taxonomy.incomplete.clone()),
+            unsatisfiable: list(unsatisfiable),
+            equivalent_to_thing: list(top),
+            consistency: consistency.clone(),
+            engine,
+            incomplete: reasons(consistency, incomplete),
             micros: started.elapsed().as_micros() as u64,
         })
     }

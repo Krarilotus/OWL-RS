@@ -86,7 +86,12 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   cardinality; functional, inverse-functional, irreflexive, asymmetric, disjoint);
   `owl:topDataProperty` other than above another data property (§11.2); datatypes outside
   the map and undefined, facets outside a datatype's facet space, cyclic datatype
-  definitions (§11.2, §7.5); an irregular property hierarchy (§11.2); literals beyond what
+  definitions (§11.2, §7.5); an irregular property hierarchy (§11.2), except a classification
+  the EL classifier answers: where the irregular hierarchy is all the engines leave out and
+  the ontology has no assertion, no range on a property of a chain and nothing the EL
+  classifier skips, its completion rules (which need no regular hierarchy) answer
+  `/dataset/classification` completely, `engine` `el`, and it is then no independent oracle
+  for that answer; literals beyond what
   §4 asks an implementation to support (numbers past 128 bits, more than 18 fractional
   digits of a second);
 - *a budget the configuration set, answered `gave-up` naming its setting:* none is built

@@ -223,7 +223,7 @@ repetitions of one run isn't judged). Times decide where they must, with the int
 | Maintenance | `commits-*`, `deletes-*` (`deletes-tail`: p99) | incremental route; closure equals a fresh one; p50 and p99 |
 | DL pipeline | the `dl-*` cases (phases parse, read, normalise, compile, saturate, search as series), `dl-pipeline`, `ctx-ore-*`, `el-classify`, `horn-classify` | clauses, nodes, branch points, subsumption checks per generated clause (counts); time per phase |
 | QL rewriting | `ql-owl2bench` (OWL2Bench under owl2-ql) | the tree-witness rewrite on the queries that need it, absent on the others (routes); answers |
-| DL mode (`owl2-dl`) | `dlmode-lubm1` (LUBM 1's 14 queries), `dlmode-commits`, `dlmode-reject`, `dlmode-reject-dl`, `classify-store-horn`, `classify-store-tableau` | each answer's status (sound, complete) and the path that decided it; the gate that rejects an inconsistent commit (RL or the hypertableau); the classification engine (`context-core` or `tableau`); time |
+| DL mode (`owl2-dl`) | `dlmode-lubm1` (LUBM 1's 14 queries), `dlmode-commits`, `dlmode-reject`, `dlmode-reject-dl`, `classify-store-horn`, `classify-store-tableau` | each answer's status (sound, complete) and the path that decided it; the gate that rejects an inconsistent commit (RL or the hypertableau); the classification engine (`context-core`, `tableau` or `el`); time |
 | Loads and opening | `load-entities`, `load-threads` (1 to 16 threads), `open-first-query`, `reopen-dbpedia` (first against repeated execution, page faults, resident after open) | time; faults |
 
 The investigation of 6 October 2026 (v2-performance-investigation, §5) asked for: rule work
