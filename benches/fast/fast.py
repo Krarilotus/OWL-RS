@@ -233,15 +233,15 @@ def quiet_slot(what: str):
 
 
 def container(kind: str, cap_gb: float, command: list[str], env: dict | None = None,
-              timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+              timeout: float | None = CASE_TIMEOUT_S, measured: bool = True) -> tuple[int, str, str, float]:
     """Runs `command` under a memory cap without swap, in the Rust image or natively; (exit
     code, stdout, stderr, wall seconds). Exit 137: killed at the cap. Its name: `kind` in the
-    job's namespace."""
+    job's namespace. `measured`: a case's invocation, whose memory reading is required (process)."""
     name = ns.name(f"fast-{kind}", ROOT)
     cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
     if RUNTIME == "native":
-        return process(name, cap_gb, command, env, timeout)
+        return process(name, cap_gb, command, env, timeout, measured)
     argv = ["run", "--rm", *ns.name_args(name, ROOT, OWNER), f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             *quiet_label(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
@@ -262,33 +262,49 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
 # The scope's anonymous and kernel memory at its peak (research round 8: the gate's Linux memory
 # metric; memory.peak also counts the file cache the case's reads were charged, which depends on
 # what the host had cached). cgroup v2 keeps no such peak: a thread outside the measured process
-# samples memory.stat every 50 ms, so a spike shorter than that can be missed. The reading itself
+# samples memory.stat, every millisecond for the scope's first quarter second and every 50 ms
+# after, so a spike shorter than the period can be missed. At 50 ms throughout, a case of a few
+# tens of milliseconds got one reading at a random moment or none (F2, 13 Nov 2026: main's
+# ql-memberships-reuse, 0.05 s, none in four of six passes). The reading itself
 # (anon_kernel_bytes) is suitekit/runtime.py's, which the suite's Docker runtime reads too.
 SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
 
 
 class AnonKernelSampler(threading.Thread):
     """Samples a scope's anon + kernel memory until stopped; `peak`: the largest seen. The scope's
-    cgroup directory is what the command's wrapper writes to `where` once it runs in it."""
+    cgroup directory is what the command's wrapper writes to `where` once it runs in it. Until it
+    is found and for `dense_s` after, it looks every `dense_period_s`; then every `period_s`. It
+    keeps off `avoid`, the case's pinned CPUs (taskset notation), where it can run elsewhere."""
 
-    def __init__(self, where: Path, period_s: float = 0.05):
+    def __init__(self, where: Path, period_s: float = 0.05, dense_period_s: float = 0.001, dense_s: float = 0.25,
+                 avoid: str | None = None):
         super().__init__(daemon=True)
         self.where, self.period_s, self.peak = where, period_s, None
+        self.dense_period_s, self.dense_s, self.avoid = dense_period_s, dense_s, avoid
         self.halt = threading.Event()
 
     def run(self):
-        stat = None
+        if self.avoid and hasattr(os, "sched_setaffinity"):
+            # Linux: pid 0 is the calling thread, so this thread alone moves.
+            with contextlib.suppress(OSError, ValueError):
+                avoided = {c for part in self.avoid.split(",")
+                           for c in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)}
+                if others := os.sched_getaffinity(0) - avoided:
+                    os.sched_setaffinity(0, others)
+        stat, found = None, None
         while not self.halt.is_set():
             try:
                 if stat is None:
                     group = self.where.read_text().strip() if self.where.is_file() else ""
                     stat = Path(group) / "memory.stat" if group else None
+                    found = time.monotonic() if stat else None
                 value = anon_kernel_bytes(stat.read_text()) if stat else None
             except OSError:
                 value = None
             if value is not None:
                 self.peak = max(self.peak or 0, value)
-            self.halt.wait(self.period_s if stat else 0.005)
+            dense = found is None or time.monotonic() - found < self.dense_s
+            self.halt.wait(self.dense_period_s if dense else self.period_s)
 
     def stop(self) -> int | None:
         self.halt.set()
@@ -297,11 +313,12 @@ class AnonKernelSampler(threading.Thread):
 
 
 def process(name: str, cap_gb: float, command: list[str], env: dict | None = None,
-            timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+            timeout: float | None = CASE_TIMEOUT_S, measured: bool = True) -> tuple[int, str, str, float]:
     """`container` natively: the command, its container paths mapped (native_dirs), in a user
     scope capped at `cap_gb` without swap (as Docker's --memory and --memory-swap). A wrapper
     shell in the scope prints the scope's memory.peak after the command (`fast-scope-peak`
-    on stderr), also after a kill at the cap."""
+    on stderr), also after a kill at the cap. A `measured` command that succeeds without an
+    anon + kernel reading fails."""
     dirs = native_dirs()
     FAST_DATA.mkdir(parents=True, exist_ok=True)
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
@@ -320,7 +337,7 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     started = time.monotonic()
     cleanup_error = ""
     where = FAST_DATA / f".scope-{unit}"
-    sampler = AnonKernelSampler(where)
+    sampler = AnonKernelSampler(where, avoid=cpus)
     sampler.start()
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
@@ -346,9 +363,13 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
            + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "")
            + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "") + err)
-    if cleanup_error:
-        err += "\n" + cleanup_error
-    return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
+    # A command that succeeded has its scope's anon + kernel peak, or its case fails here, at once,
+    # not as an incomplete memory series in the report.
+    unread = "" if anon_kernel or done.returncode or not measured else "no anon+kernel reading of the case's scope"
+    for note in (cleanup_error, unread):
+        if note:
+            err += "\n" + note
+    return done.returncode or (1 if cleanup_error or unread else 0), done.stdout, err, time.monotonic() - started
 
 
 def scope_peak_mib(stderr: str) -> int | None:
@@ -595,7 +616,7 @@ def ensure_data(spec: str) -> dict:
                   f" && for f in {stage}/{name}.*; do case $f in *.expect.json) ;; *) mv -f $f {folder}/ ;; esac; done"
                   f" && mv -f {stage}/{name} {path} && mv -f {stage}/{name}.expect.json {path}.expect.json"
                   f" && rm -rf {stage} && cat {path}.expect.json")
-        code, out, err, _ = container("gen", 8, ["bash", "-c", script])
+        code, out, err, _ = container("gen", 8, ["bash", "-c", script], measured=False)
     if code != 0:
         raise RuntimeError(f"generating {spec} failed: {err[-500:]}")
     return json.loads(out)["expect"]
@@ -985,7 +1006,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             for report_nt in made:  # only the paths this measurement named, each its own invocation's
                 report_nt.unlink(missing_ok=True)
         if "setup" in case:
-            container(name, 1, ["rm", "-rf", scratch])
+            container(name, 1, ["rm", "-rf", scratch], measured=False)
         if samples_runs:
             result = samples_runs[-1]
             if len(samples_runs) > 1:
