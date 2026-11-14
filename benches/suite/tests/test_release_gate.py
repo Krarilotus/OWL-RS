@@ -2359,7 +2359,7 @@ class Measurement(unittest.TestCase):
         # floor and 2 ms) is timed 100 -> 50 by its phases, and its whole process is a slowdown
         # (exit 1); summed, both sides were 400 ms and nothing showed.
         def report(phase_ms, wall_ms):
-            records = [{"case": "el-x", "rep": rep, "status": "ok", "checks": [], "routes": [],
+            records = [{"case": "el-x", "rep": rep, "status": "ok", "checks": [], "routes": [], "inputs": {},
                         "metric": 2 * phase_ms, "samples": {"read": [phase_ms] * 5, "saturate": [phase_ms] * 5,
                                                             "wall": [wall_ms] * 5}} for rep in (1, 2)]
             return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
@@ -2370,6 +2370,35 @@ class Measurement(unittest.TestCase):
         self.assertIn("SLOWER", text.split("whole process:")[1].splitlines()[0])
         line = next(l for l in text.splitlines() if l.lstrip().startswith("el-x"))
         self.assertEqual([float(x) for x in line.split()[1:3]], [100.0, 50.0], line)
+
+    def test_compare_refuses_a_whole_process_line_from_part_of_its_evidence(self):
+        # Spec (compare.py's order, 1. Missing: series and repetitions one side has and the other
+        # doesn't; Sol, classifier-wall r2): a repetition of either side without a valid wall reading,
+        # while the other side has it, makes the whole process not comparable (exit 1), never a line
+        # from the rest and never silence. Neither side with it: an older report, phases only.
+        def report(*walls):
+            records = []
+            for rep, wall in enumerate(walls, 1):
+                samples = {"read": [50.0] * 5, "saturate": [50.0] * 5}
+                if wall != "absent":
+                    samples["wall"] = wall
+                records.append({"case": "el-x", "rep": rep, "status": "ok", "checks": [], "routes": [],
+                                "inputs": {}, "metric": 100.0, "samples": samples})
+            return {"reps": len(walls), "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-14T08:00:00", "records": records}
+        full = report([300.0] * 5, [300.0] * 5)
+        for label, base, new in (("the new run without it", full, report("absent", "absent")),
+                                 ("an empty reading", full, report([], [])),
+                                 ("only nulls", full, report([None] * 5, [None] * 5)),
+                                 ("one repetition without it", full, report([300.0] * 5, "absent")),
+                                 ("an older base without it", report("absent", "absent"), full)):
+            with self.subTest(label):
+                code, text = DeclaredMetric.compared(self, base, new)
+                self.assertEqual(code, 1, text)
+                self.assertIn("whole process NOT COMPARABLE", text)
+        code, text = DeclaredMetric.compared(self, report("absent", "absent"), report("absent", "absent"))
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("whole process", text)
 
     def test_fast_applies_the_calibration_alike_and_pools_repeated_processes(self):
         case = {"name": "x", "tool": "perf_lab", "args": ["--runs", "5", "--qerror"], "repeat": 1}
