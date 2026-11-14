@@ -402,6 +402,61 @@ fn a_declined_buffer_marks_no_refusal() {
     assert!(!refused, "a declined buffer marked the request refused");
 }
 
+/// Review r1, F1: the candidate pairs are stored only as far as the optional part has room
+/// for them; n patterns on one variable make n²/2 pairs, which no admission bounds before
+/// they are sorted. Where the room is short, the BGP plans with its counts alone and the
+/// request isn't marked refused.
+///
+/// - Input: `sI p oI` for I below 200, one commit; the 200 patterns `sI p ?x`, each one
+///   match (19,900 candidate pairs, 24 bytes each), planned without a limit, then within
+///   64 KiB: room for the lists the allowance admits (at most `MAX_LISTS` of one value each,
+///   and their directory), not for the candidates.
+/// - Expected: unlimited, overlaps counted; within 64 KiB, none for any pattern, and the
+///   request not marked refused.
+#[test]
+fn candidate_pairs_stay_within_the_optional_budget() {
+    let extra: Vec<Triple> = (0..200)
+        .map(|i| (format!("s{i}"), "p", format!("o{i}")))
+        .collect();
+    let engine = store(1, 1, false, false, &extra);
+    let snapshot = engine.snapshot();
+    let planned = |limit: Option<usize>| {
+        let options = QueryOptions {
+            resources: crate::Resources {
+                memory: Envelope::new(limit, None),
+                ..crate::Resources::default()
+            },
+            ..QueryOptions::default()
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let scans: Vec<ScanPattern> = (0..200)
+            .map(|i| super::join_order_tests::scan(&ctx.snapshot, &format!("s{i} p ?x")))
+            .collect();
+        let counts: Vec<u64> = scans
+            .iter()
+            .map(|s| ctx.snapshot.estimate_in(ctx.model, &s.quad_pattern()))
+            .collect();
+        let (inputs, reads) = ctx.plan_inputs(&scans, &counts, &[], &mut Vec::new(), true);
+        drop(reads);
+        let overlaps: Vec<_> = inputs.into_iter().map(|input| input.overlaps).collect();
+        (overlaps, ctx.memory.refused() || ctx.budget.refused())
+    };
+    let (overlaps, _) = planned(None);
+    assert!(
+        overlaps.iter().any(|o| !o.is_empty()),
+        "unlimited: no overlap"
+    );
+    let (within, refused) = planned(Some(64 << 10));
+    assert!(
+        within.iter().all(Vec::is_empty),
+        "within 64 KiB: {within:?}"
+    );
+    assert!(
+        !refused,
+        "the candidates' refusal marked the request refused"
+    );
+}
+
 /// The budget types' owner's review of the optional part, R2: a list building that the
 /// optional part refused once gives no overlap at all, not the counts of the lists read
 /// before the refusal; and the request isn't marked refused.

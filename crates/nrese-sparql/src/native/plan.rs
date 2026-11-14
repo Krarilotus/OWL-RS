@@ -217,9 +217,9 @@ impl Star {
 pub(super) struct Plan {
     pub order: Vec<usize>,
     pub rows: Vec<f64>,
-    /// The cost the orderer reckoned for it: rows read, a probe counting as [`PROBE_COST`]
-    /// rows. The work the plan expects, in the unit of a scanned row; 0 where no order was
-    /// searched.
+    /// The cost the orderer reckoned for it: per step, the rows it reads (a probe counting as
+    /// [`PROBE_COST`] rows per row it probes from) and the rows it makes. The work the plan
+    /// expects, in rows; 0 where no order was searched.
     pub(super) cost: f64,
     /// The characteristic-set work its planning counted ([`SET_BUDGET`]): all of it for a plan
     /// made within the budget; for one planned again without the sets, what was done before
