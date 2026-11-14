@@ -270,6 +270,8 @@ pub struct Budget {
     /// The spare this budget's [`Grant`]s hold ([`Self::ahead`]). Changed only when a grant
     /// refills, gives back or ends, never per item.
     ahead: AtomicUsize,
+    /// A refusal above is recorded here only ([`Envelope::optional_part`]).
+    optional: bool,
 }
 
 /// What a budget charges besides itself.
@@ -313,6 +315,19 @@ impl Envelope {
     pub fn part(&self) -> Budget {
         let mut part = Budget::unlimited();
         part.parent = Some(Parent::Envelope(self.clone()));
+        part
+    }
+
+    /// A part for work its caller can do without, such as a call into another crate that
+    /// charges for itself, with an exact path beside it. Its bytes are charged here and at
+    /// the server like any part's. A charge they refuse fails as any charge does, so the
+    /// call ends with its error, but the refusal is recorded on this part only: the request
+    /// isn't marked as limited by its budget for work its caller then does another way.
+    /// Hand it only to a call that ends complete or with that error, never to one that goes
+    /// on past a refusal.
+    pub fn optional_part(&self) -> Budget {
+        let mut part = self.part();
+        part.optional = true;
         part
     }
 }
@@ -388,6 +403,7 @@ impl Budget {
             refused: AtomicBool::new(false),
             parent: None,
             ahead: AtomicUsize::new(0),
+            optional: false,
         }
     }
 
@@ -458,9 +474,23 @@ impl Budget {
     }
 
     /// `bytes` charged at the levels above exactly: refused where one hasn't room, which
-    /// is recorded here too. Nothing to charge above a root.
+    /// is recorded here too (and only here, above an optional part). Nothing to charge
+    /// above a root.
     fn take_above(&self, bytes: usize) -> Result<(), BudgetExceeded> {
         let above = match &self.parent {
+            Some(Parent::Envelope(envelope)) if self.optional => {
+                if envelope.try_take(bytes) {
+                    Ok(())
+                } else {
+                    Err(BudgetExceeded {
+                        limit: envelope.limit(),
+                        requested: bytes,
+                        used: envelope.used(),
+                        shared: envelope.remaining() >= bytes,
+                        unread: false,
+                    })
+                }
+            }
             Some(Parent::Server(shared)) => {
                 shared.charge(bytes).map_err(|refused| BudgetExceeded {
                     limit: refused.limit,
@@ -2628,6 +2658,39 @@ mod tests {
         drop(held);
         assert_eq!((request.used(), server.used()), (0, 0));
         assert_eq!(request.peak(), 55);
+    }
+
+    /// An optional part's bytes are the request's and the server's like any part's. A
+    /// charge past the request's or the server's limit fails as any charge does, and is
+    /// recorded on the optional part alone, while an ordinary part refused at the same
+    /// point marks the request.
+    #[test]
+    fn a_refusal_above_an_optional_part_fails_its_charge_and_marks_only_that_part() {
+        let server = SharedBudget::new(100);
+        let request = Envelope::new(Some(60), Some(Arc::clone(&server)));
+        let optional = request.optional_part();
+        let mut held = Reservation::new(&optional);
+        held.charge(40).unwrap();
+        assert_eq!(
+            (optional.used(), request.used(), server.used()),
+            (40, 40, 40)
+        );
+        assert!(held.charge(30).is_err(), "past the request's limit");
+        // Another request leaves the server 10 bytes, the request 20.
+        let other = Envelope::new(None, Some(Arc::clone(&server)));
+        other.charge(50).unwrap();
+        assert!(held.charge(15).is_err(), "past the server's limit");
+        assert_eq!(
+            (held.bytes(), optional.used(), request.used(), server.used()),
+            (40, 40, 40, 90),
+            "nothing charged at any level"
+        );
+        assert!(optional.refused() && !request.refused());
+        let part = request.part();
+        assert!(part.charge(15).is_err());
+        assert!(part.refused() && request.refused());
+        drop(held);
+        assert_eq!((request.used(), server.used()), (0, 50));
     }
 
     #[test]
