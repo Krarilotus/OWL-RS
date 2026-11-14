@@ -355,3 +355,32 @@ fn an_irregular_ontology_with_an_assertion_is_not_answered_by_the_el_classifier(
 fn an_irregular_ontology_with_an_axiom_the_el_classifier_skips_is_not_answered_by_it() {
     assert_lower_bound(&irregular(":F owl:equivalentClass [ owl:oneOf ( :o ) ] ."));
 }
+
+/// A class the EL classifier reads nothing about (named only as a data property's domain)
+/// is still classified: below a class equivalent to `owl:Thing`, as every class is.
+#[test]
+fn an_irregular_el_answer_classifies_a_class_named_only_where_the_el_classifier_reads_nothing() {
+    let report = irregular(
+        ":dp a owl:DatatypeProperty ; rdfs:domain :X . :T a owl:Class . \
+         owl:Thing rdfs:subClassOf :T .",
+    );
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert_eq!(report.equivalent_to_thing, [format!("{EX}T")]);
+    assert!(
+        has(&report.subsumptions, "X", "T"),
+        "{:?}",
+        report.subsumptions
+    );
+}
+
+/// A range on a property below one equivalent to a chain's (`r5 ⊑ r4 ≡ r3`) is below the
+/// chain's too: the answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_with_a_range_below_a_chains_equivalent_is_not_answered_by_the_el_classifier()
+ {
+    assert_lower_bound(&irregular(
+        ":r4 a owl:ObjectProperty . :r5 a owl:ObjectProperty . :X a owl:Class . \
+         :r3 owl:equivalentProperty :r4 . :r5 rdfs:subPropertyOf :r4 ; rdfs:range :X .",
+    ));
+}

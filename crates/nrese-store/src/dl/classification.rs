@@ -231,16 +231,20 @@ fn el_complete_for(o: &Ontology) -> bool {
     if chained.is_empty() || ranged.is_empty() {
         return true;
     }
-    let mut related: HashSet<Term> = chained.iter().copied().collect();
+    // Each direction walks on its own: a property the upward walk reached (an equivalent)
+    // still leads the downward walk on to what is below it.
+    let mut related: HashSet<Term> = HashSet::new();
     for edges in [&up, &down] {
+        let mut seen: HashSet<Term> = chained.iter().copied().collect();
         let mut todo = chained.clone();
         while let Some(p) = todo.pop() {
             for &q in edges.get(&p).into_iter().flatten() {
-                if related.insert(q) {
+                if seen.insert(q) {
                     todo.push(q);
                 }
             }
         }
+        related.extend(seen);
     }
     !ranged.iter().any(|p| related.contains(p))
 }
@@ -341,12 +345,15 @@ pub(crate) fn el_answer(
     };
     use nrese_reasoner::ir::Vocabulary as _;
     let probe = vocabulary.fresh();
-    let declaration = [
-        probe,
-        vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
-        vocabulary.iri("http://www.w3.org/2002/07/owl#Class"),
-    ];
-    triples.push(declaration).ok()?;
+    let rdf_type = vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let class = vocabulary.iri("http://www.w3.org/2002/07/owl#Class");
+    triples.push([probe, rdf_type, class]).ok()?;
+    // The DL engines' classes, declared: the EL classifier classifies the classes of what it
+    // reads, and one named only where it reads nothing (a data property's domain) would
+    // be missing from its answer, with its subsumers among `owl:Thing`'s equivalents.
+    for &c in &taxonomy.classification.classes {
+        triples.push([c, rdf_type, class]).ok()?;
+    }
     triples.sort_unstable();
     let mut kept = 0;
     for i in 0..triples.len() {
