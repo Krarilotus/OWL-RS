@@ -1120,11 +1120,6 @@ impl PackedKeys {
             .then(|| self.bound_in(0, self.len, key, false))
     }
 
-    /// The most [`Self::range_counted`] counts: its bound search and its range end.
-    pub(super) fn range_cost(&self) -> u64 {
-        self.bound_cost() + self.end_cost()
-    }
-
     /// What [`Self::bound_counted`] counts, the run it reads included.
     fn bound_cost(&self) -> u64 {
         self.levels() + BLOCK_PROBES + 1

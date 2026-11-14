@@ -39,7 +39,7 @@ use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 pub(crate) use run::Forms;
 use run::{PermutationRun, Run};
 
-use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, Key, Permutation, QuadPattern};
 use crate::term::TermId;
 use crate::visit::{Account, Free, Ledger};
 
@@ -651,26 +651,44 @@ impl IndexVersion {
         ))
     }
 
-    /// The most [`Self::scan_plan_with`] counts making a scan in `plan`'s permutation: each
-    /// run's range search, and its cursor added to a merge whose every range is taken
-    /// ([`merge::add_cost`]). From the runs' sizes and the permutation the layout reads alone,
-    /// a run at a time: `None` once it is over `most`, the runs after that left unread. So it
-    /// reads at most `most / 22 + 1` runs' metadata (a run costs at least 22: its two searches
-    /// at one level, `levels()`'s least, and its cursor), and searches, decodes and allocates nothing. The
-    /// plain scan's making ([`Self::scan_plan`]) does no more than this: the same searches,
-    /// and a heap built at once compares no more than its pushes one by one.
-    pub(crate) fn scan_cost(&self, plan: &AccessPlan, most: u64) -> Option<u64> {
+    /// The sum over the runs of the signs of a point read's statement, `plan` binding its
+    /// subject, predicate and object, in a default-graph stack: each run's bound search counted
+    /// on `account` before it is made, and the key found there a unit. A run of this layout
+    /// holds at most one key with those three components (it holds the default graph alone:
+    /// [`Layout::DefaultGraph`]), so the key at the bound decides the run, and no range end is
+    /// searched. The sum is the statement's in the default graph: 1 where it is visible.
+    pub(crate) fn point_sum(
+        &self,
+        plan: &AccessPlan,
+        account: &mut impl Account,
+    ) -> Result<i64, Stopped> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return Some(0);
+            return Ok(0);
         };
-        let mut cost = 0;
-        for (added, run) in self.runs.iter().enumerate() {
-            cost += run.permutation(adapted.permutation).keys.range_cost() + merge::add_cost(added);
-            if cost > most {
-                return None;
+        let mut sum = 0;
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let at = perm
+                .keys
+                .bound_counted(&adapted.low, account)
+                .ok_or(Stopped)?;
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::RunProbes, 1);
+            if at == perm.keys.len() || perm.keys.get(at) > adapted.high {
+                continue;
             }
+            if !account.take(1) {
+                return Err(Stopped);
+            }
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
+            debug_assert!(
+                at + 1 == perm.keys.len() || perm.keys.get(at + 1) > adapted.high,
+                "a default-graph run holds at most one key with a point read's three components"
+            );
+            sum += if perm.is_tombstone(at) { -1 } else { 1 };
         }
-        Some(cost)
+        Ok(sum)
     }
 
     /// [`Self::scan`] for a counted read: made and stepped counted on `visit`
@@ -1324,6 +1342,28 @@ impl<'a> QuadScan<'a> {
         &mut self,
         account: &mut impl Account,
     ) -> Result<Option<EncodedQuad>, Stopped> {
+        let permutation = self.permutation;
+        Ok(self
+            .step_key_with(account)?
+            .map(|key| permutation.key_to_quad(&key)))
+    }
+
+    /// [`Self::step_with`]'s graph alone: a point read's caller, which knows the statement,
+    /// needs no more.
+    #[inline]
+    pub(crate) fn step_graph_with(
+        &mut self,
+        account: &mut impl Account,
+    ) -> Result<Option<TermId>, Stopped> {
+        let permutation = self.permutation;
+        Ok(self
+            .step_key_with(account)?
+            .map(|key| permutation.key_to_quad(&key).graph))
+    }
+
+    /// [`Self::step_with`]'s visible key, in the scan's permutation.
+    #[inline]
+    fn step_key_with(&mut self, account: &mut impl Account) -> Result<Option<Key>, Stopped> {
         loop {
             let Some((key, sign)) = self.merge.step(account)? else {
                 return Ok(None);
@@ -1333,11 +1373,12 @@ impl<'a> QuadScan<'a> {
             if sign <= 0 {
                 continue;
             }
-            let quad = self.permutation.key_to_quad(&key);
-            if self.exclude_default_graph && quad.graph.is_default_graph() {
+            if self.exclude_default_graph
+                && self.permutation.key_to_quad(&key).graph.is_default_graph()
+            {
                 continue;
             }
-            return Ok(Some(quad));
+            return Ok(Some(key));
         }
     }
 
