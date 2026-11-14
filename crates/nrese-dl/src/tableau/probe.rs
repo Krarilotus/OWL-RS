@@ -434,7 +434,7 @@ impl Prepared {
 /// built once, and each probe starts from a copy.
 ///
 /// - **From the model** of the individuals: the probe's concepts are added and the search
-///   goes on above the model's choices ([`Engine::floor`]). A refutation that depends on
+///   goes on above the model's choices (`Engine::floor`). A refutation that depends on
 ///   none of them stands (the probe's concepts and the deterministic facts hold in every
 ///   branch); a model is a model. Where a clash would undo a choice of the base, the run
 ///   stops and the probe goes on:

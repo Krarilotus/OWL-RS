@@ -14,7 +14,7 @@
 //! terms): where the saturation of a class never reaches a context in which a clause
 //! left out of the part could fire, the model the calculus builds for the class is a
 //! model of every clause, and the part's subsumers of the class are all of them: the
-//! class needs no hypertableau test ([`exact_for`]). Where that holds for every class
+//! class needs no hypertableau test (`exact_for`). Where that holds for every class
 //! and `owl:Thing`, the part's taxonomy is the terminology's, and only consistency is
 //! left to decide.
 

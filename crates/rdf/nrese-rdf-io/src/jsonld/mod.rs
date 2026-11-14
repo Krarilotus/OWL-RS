@@ -2,11 +2,11 @@
 //!
 //! The algorithms are those of JSON-LD 1.1 Processing Algorithms and API, with two
 //! changes of representation that leave the results alone:
-//! - expansion produces typed node, value and list objects ([`items`]), not JSON maps,
+//! - expansion produces typed node, value and list objects (`items`), not JSON maps,
 //!   and the conversion to RDF walks them directly, without the node map (its triples are
 //!   the same set);
 //! - a top-level array, and the `@graph` of a top-level object whose only other entry is
-//!   `@context`, are processed one element at a time ([`parser`]).
+//!   `@context`, are processed one element at a time (`parser`).
 //!
 //! Remote contexts and `@import` are read only through a [`DocumentLoader`] the caller
 //! supplies: by default there is none, and a document that names one is an error.

@@ -362,7 +362,7 @@ impl Saturated {
     }
 
     /// Saturation coupling (docs/design/owl2-dl.md §7): per named concept of the program
-    /// ([`Program::names`]), and for `owl:Thing` last, whether no context its query
+    /// ([`Program::names`](super::program::Program::names)), and for `owl:Thing` last, whether no context its query
     /// context reaches (through successor links) has a clause with a head `B(x)` for a
     /// `B` in `triggers` (about any term: `B(f(x))` is about a successor), or a head over
     /// a role in `roles`. The model the calculus builds for the concept then has no

@@ -19,7 +19,7 @@
 //!   activation scheme on rayon);
 //! - [`abox`]: consistency of assertions (no nominals): individuals' contexts and the
 //!   clauses on the edges between them, to a fixpoint;
-//! - [`classify`]: classification, the taxonomy and proofs of its subsumptions;
+//! - [`classify`](mod@classify): classification, the taxonomy and proofs of its subsumptions;
 //!   [`canonical`]: the canonical taxonomy of the DL lab; [`profile`]: the telemetry.
 
 pub mod abox;

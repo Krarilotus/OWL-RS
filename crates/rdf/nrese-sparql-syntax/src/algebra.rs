@@ -1,6 +1,6 @@
 //! The SPARQL algebra (SPARQL 1.1 §18 with the SPARQL 1.2 additions): what a query means,
 //! as the parser builds it and the engine plans from it. Each type prints as SPARQL that
-//! parses back to the same algebra (see [`crate::writer`]).
+//! parses back to the same algebra (see `crate::writer`).
 
 use std::fmt;
 

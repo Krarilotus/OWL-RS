@@ -9,7 +9,7 @@
 //! A repository's lifecycle is serialised: creation and removal reserve its id, and a
 //! change or removal holds the repository's lifecycle lock throughout. A change prepares
 //! (checks, compiles, recomputes the inferences) with the old write path retired, writes
-//! the settings whole ([`crate::metadata`]), then publishes; on failure the old reasoning
+//! the settings whole (`crate::metadata`), then publishes; on failure the old reasoning
 //! is published again, so the settings on disk are always the acknowledged ones. A removal
 //! writes a tombstone beside the repositories (outside the directory it reclaims) before
 //! reclaiming the files, and removes it only once the directory is gone: a repository
@@ -249,7 +249,7 @@ impl Repository {
     }
 
     /// Its settings and its write path as one observation: both before a change or both
-    /// after it, never one of each (C1001-R1-O1). Lock order, here and in [`Self::publish`]:
+    /// after it, never one of each (C1001-R1-O1). Lock order, here and in `Self::publish`:
     /// the write path, then the settings.
     pub fn observe(&self) -> (RepositorySettings, Arc<MutationPipeline>) {
         let pipeline = self.pipeline.read();
@@ -852,7 +852,7 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// Writes `settings` to `file`, whole or not at all ([`crate::metadata`]; an error may
+/// Writes `settings` to `file`, whole or not at all (`crate::metadata`; an error may
 /// still have put the new file in place, undurably: it says so).
 pub fn write_settings(
     file: &std::path::Path,

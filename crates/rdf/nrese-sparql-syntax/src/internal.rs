@@ -68,11 +68,11 @@ pub fn is_constant(iri: &str) -> bool {
 const SENT_CONSTANT: &str = "urn:nrese:substituted-blank-node:";
 
 /// `pattern` as another endpoint can read it: each made variable renamed to one the
-/// pattern doesn't use, each made constant in its previous spelling ([`SENT_CONSTANT`]);
+/// pattern doesn't use, each made constant in its previous spelling (`SENT_CONSTANT`);
 /// with the names to read the endpoint's answer by ([`Sent::local`]). A blank node whose
 /// made variable ([`blank_variable`]) the pattern names too is written as that renamed
 /// variable, so the two stay one node. A pattern that would match a made constant matches
-/// nothing ([`unmatchable`]). Unchanged, and nothing renamed, when the pattern holds no
+/// nothing (`unmatchable`). Unchanged, and nothing renamed, when the pattern holds no
 /// made name.
 pub fn printable(pattern: GraphPattern) -> (GraphPattern, Sent) {
     printable_avoiding(pattern, [])

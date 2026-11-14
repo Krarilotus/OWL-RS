@@ -233,7 +233,7 @@ impl RdfParser {
 
     /// `bytes` in up to `parts` chunks that parse independently, for parsing in parallel:
     /// N-Triples and N-Quads cut at line ends; Turtle and TriG at statement ends found by
-    /// a skim of the document (exact, see [`crate::turtle::split`]), each chunk starting
+    /// a skim of the document (exact, see `crate::turtle::split`), each chunk starting
     /// with the prefixes and base in force there. With renamed blank nodes, every chunk
     /// names a label alike.
     pub fn split_slice_for_parallel_parsing(

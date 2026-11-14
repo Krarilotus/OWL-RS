@@ -234,7 +234,7 @@ const NOTES: usize = 64;
 /// again.
 const TOUCHED: usize = 1024;
 
-/// One change a commit made to a membership of a class expression ([`touched_expressions`]):
+/// One change a commit made to a membership of a class expression (`touched_expressions`):
 /// the `rdf:type` statement asserted or retracted, its object the expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MembershipChange {
@@ -319,7 +319,7 @@ impl QlRewriting {
         }
     }
 
-    /// Commits `tx` with its note ([`Self::note_commit`]), which is in before the commit
+    /// Commits `tx` with its note (`Self::note_commit`), which is in before the commit
     /// publishes: no reader sees the new snapshot without it, so none reads every
     /// expression again for it (P2-C1, 8 Nov: noted after publication, 40-48 of about 340
     /// new snapshots a run were read fresh). A commit that fails leaves a note to an
