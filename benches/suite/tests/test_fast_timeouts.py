@@ -101,7 +101,8 @@ class FreshProcesses(unittest.TestCase):
         totals = iter([20.0, 24.0])
 
         def classify(*args, **kwargs):
-            return 0, "abcd\n7\n", f"profile read=1.0 owl=2.0 total={next(totals)} write=0.5\n", 1
+            return 0, "abcd\n7\n", (f"profile read=1.0 owl=2.0 total={next(totals)} write=0.5\n"
+                                    "fast-process-wall 100.000000 100.025000\n"), 1
 
         case = {**case, "tool": "classify-horn", "processes": 2}
         with patch.object(fast, "container", side_effect=classify) as run:
