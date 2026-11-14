@@ -98,7 +98,7 @@ approved = "2026-11-14"
 by = "Johannes"
 reason = "the DBpedia core store load peaks about 0.75 GiB above main (5.95 against 5.20 GiB, x1.14) and is 1.8 times as fast; the remainder is resident in the allocator's arenas, not memory freed lazily. The ceiling of 1.20 is the lowest the landed code's measured runs pass reliably as the gate reads them (comment above)"
 quote = "Ok"
-source = "his answer of 14 Nov 2026 to the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
+source = "his answer of 14 Nov 2026, 20:26 Berlin, accepting the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
 pays_with = { case = "load-entities", dimension = "time/_" }
 
 # The release baselines' measurement builds can't run these cases yet, though their products
