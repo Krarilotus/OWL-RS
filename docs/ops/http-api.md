@@ -219,7 +219,7 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 - A named graph exists while it holds statements; the default graph always exists. So an emptied or only created (`CREATE GRAPH`) named graph answers 404 to `GET` and `DELETE`. What to do: read that 404 as an empty graph; to keep an empty graph listed, none known.
 - `GET` streams the graph as it is read, in constant memory at any size; `HEAD` answers whether it exists without reading it. The read's timeout (`budgets.graph_read_timeout`) bounds the wait for the first chunk and then each stall: a client that keeps reading gets all of a large graph, one that stops reading for that long (or disconnects) ends the read. A failure after the first chunk aborts the transfer (no final chunk, or a reset HTTP/2 stream), so a truncated body never looks complete. RDF4J's `GET /statements` streams the same way.
 - Writers' named bounds, so a stream's memory doesn't grow with the data: JSON-LD writes a subject with more than 64 KiB of statements as several node objects with the same `@id` (`jsonld-node-flush`; JSON-LD merges them), and Binary RDF refers by id to at most 65,536 values holding at most 4 MiB, writing others in full (`binary-rdf-idtable-bytes`).
-- Payloads: any of the six graph formats, named by `Content-Type`. A payload that names graphs of its own (possible in N-Quads, TriG and JSON-LD) is rejected.
+- Payloads: any of the seven graph formats, named by `Content-Type`. A payload that names graphs of its own (possible in N-Quads, TriG and JSON-LD) is rejected.
 - `Content-Location` gives the base IRI for relative IRIs in the payload.
 - Writing the same content twice leaves the same graph: blank nodes are scoped to the payload, and a `PUT` replaces.
 

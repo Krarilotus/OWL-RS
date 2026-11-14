@@ -1,7 +1,7 @@
 # Roadmap
 
-The order of work: the detail of the "planned" list of the [scope](what-it-covers.md#scope), and
-nothing here is present. What is done is in [STATUS.md](STATUS.md); what is left before v2
+The order of work: the detail of the "planned" list of the [scope](what-it-covers.md#scope);
+only a stage marked done here is present. What is done is in [STATUS.md](STATUS.md); what is left before v2
 goes to `main` is the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md); why things are decided as they
 are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions.md).

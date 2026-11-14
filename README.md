@@ -113,8 +113,8 @@ The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
 complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
 ([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
 
-The [tutorial](docs/tutorial.md) goes on from here: retraction, validation, your own data, a changed
-setting, and starting over.
+The [tutorial](docs/tutorial.md) goes on from here: retraction, validation,
+[your own data](docs/tutorial.md#your-own-data), a changed setting, and starting over.
 
 Without Docker, from source with Rust: [getting started](docs/dev/getting-started.md#run-the-server).
 
@@ -138,6 +138,7 @@ each kind of problem is fixed; the decisions behind it, with their reasons, are 
 | Build, run and develop | [getting-started.md](docs/dev/getting-started.md), [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Deploy, load data, back up | [server-setup.md](docs/ops/server-setup.md) |
 | Look up an endpoint or a setting | [http-api.md](docs/ops/http-api.md), [config-reference.md](docs/ops/config-reference.md) |
+| Fix an error | [startup errors](docs/ops/server-setup.md#startup-errors), [status codes](docs/ops/http-api.md#status-codes) |
 | Know what reasoning computes | [reasoning-semantics.md](docs/spec/reasoning-semantics.md) |
 | Understand the design | [ARCHITECTURE.md](docs/ARCHITECTURE.md), [design/](docs/design/), the decisions in [adr/](docs/adr/) |
 | Find any other document | [docs/README.md](docs/README.md) |
@@ -151,9 +152,9 @@ the ruleset with its semantics version and a fingerprint of what it derives
 ([reasoning-semantics.md](docs/spec/reasoning-semantics.md)).
 
 Changes that affect stored data, answers or clients, with their dates and what to do:
-[dated changes](docs/STATUS.md#dated-changes). What is done and what is open, item by item:
-[docs/STATUS.md](docs/STATUS.md); the order of work: [docs/ROADMAP.md](docs/ROADMAP.md); the main
-limits and deviations, and when to choose another system: [docs/limits.md](docs/limits.md).
+[dated changes](docs/STATUS.md#dated-changes). What is in, what is left out and when to choose
+another system, and what is planned: the [scope](docs/what-it-covers.md#scope). The
+contributors' record of what is done and open, item by item: [docs/STATUS.md](docs/STATUS.md).
 
 Platforms: the image for `linux/amd64` and `linux/arm64`; the merge checks also build and
 test on Windows ([scripts/check.sh](scripts/check.sh)). Stopping, and what a crash or a kill
