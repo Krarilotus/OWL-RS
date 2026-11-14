@@ -370,8 +370,8 @@ fn explain_prints_one_estimate_per_bgp() {
 /// Estimates within their bounds (LUBM-10 materialised, `perf_lab --qerror`: q-error
 /// median 15 → 1.00, p90 2,540 → 1.89): a pattern whose variables are all bound keeps at
 /// most the rows it checks, a step over non-empty inputs is never estimated at 0, and two
-/// single-variable patterns on one variable, of the BGP's smallest count, are estimated by
-/// the values they share.
+/// single-variable patterns on one variable, read within the BGP's allowance (its plain
+/// plan's cost), are estimated by the values they share.
 #[test]
 fn estimates_never_exceed_their_bounds() {
     let engine = engine();
@@ -387,7 +387,7 @@ fn estimates_never_exceed_their_bounds() {
         .unwrap_or_else(|| panic!("{plan:#?}"));
     assert!(check.estimated_rows.is_some_and(|e| e <= 3), "{plan:#?}");
     // The 3 nodes knowing n2 (n1, n2971, n2995) and the 3 knowing n8 (n1, n7, n2977)
-    // share 1: counted, within the allowance of twice the smallest count, by the BGP's
+    // share 1: counted, within the allowance (the plain plan's cost), by the BGP's
     // own planning (its join step; estimate-time planning reads no lists).
     let plan = steps(
         &engine,

@@ -112,8 +112,8 @@ fn shared_values_lists_stay_inside_the_query_envelope() {
 ///   planned as 100 each (200 together, within that plan's cost of 300: two scans and the
 ///   join's rows), and as 1 each (narrowed: a plan costing 3, past which the patterns' own
 ///   200 are); `n` = 5,000 planned as 5,000 each (10,000, past [`plan::OVERLAP_VALUES`]).
-/// - Expected: 100 values counted; none for the others, and nothing charged: no list
-///   decoded.
+/// - Expected: 100 values counted; none for the others: no list decoded, and less charged
+///   than one list's values (only the candidates' storage is, review r1 F1).
 #[test]
 fn pairs_are_read_by_their_patterns_own_counts_not_narrowed_ones() {
     for (n, planned, expected) in [
@@ -133,7 +133,11 @@ fn pairs_are_read_by_their_patterns_own_counts_not_narrowed_ones() {
             "{n} values planned as {planned}"
         );
         if expected == none() {
-            assert_eq!(ctx.memory.peak(), peak, "{n} as {planned}: a list charged");
+            let list = n as usize * size_of::<u64>();
+            assert!(
+                ctx.memory.peak() - peak < list,
+                "{n} as {planned}: a list charged"
+            );
             assert_eq!(list_reads(), reads, "{n} as {planned}: a list decoded");
         }
     }

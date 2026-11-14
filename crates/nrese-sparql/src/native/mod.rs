@@ -3998,12 +3998,14 @@ impl<'a> Context<'a> {
     /// ordering and estimates plan with counts alone, as for a pair never counted.
     ///
     /// Admitted against the plan's expected work, per BGP: at most `plain_cost` values
-    /// decoded for the whole BGP (the cost of its plain plan, planned on its counts alone, in
-    /// scanned rows: reading the lists may at most double the work the plan expects), and at
-    /// most [`plan::OVERLAP_VALUES`], in at most [`reads::MAX_LISTS`] lists. The plain plan
-    /// is made only for a BGP with a candidate pair. The pairs are read in order of their
-    /// patterns' own counts, smallest first, a list read for an earlier pair counting once. Each list is read sorted from the index a column at a time and charged
-    /// to the query's budget. A pattern the index can't give so, or a read the budget
+    /// decoded for the whole BGP (the cost of its plain plan, planned on its counts alone: the
+    /// rows its steps read, a probe counting as `PROBE_COST`, and the rows they make; reading
+    /// the lists may at most double the work the plan expects), and at most
+    /// [`plan::OVERLAP_VALUES`], in at most [`reads::MAX_LISTS`] lists. The plain plan is made
+    /// only for a BGP with a candidate pair, and the candidates are stored only within the
+    /// optional part's room. The pairs are read in order of their patterns' own counts,
+    /// smallest first, a list read for an earlier pair counting once. Each list is read
+    /// sorted from the index a column at a time and charged to the query's budget. A pattern the index can't give so, or a read the budget
     /// refuses, has no count with any other: the plan keeps its plain estimate (D16-575).
     /// `vars` are each pattern's variables ([`ScanPattern::vars`]).
     fn overlaps(
@@ -4048,6 +4050,12 @@ impl<'a> Context<'a> {
         let most = plan::OVERLAP_VALUES;
         let mut own: Vec<Option<u64>> = vec![None; scans.len()];
         let mut pairs: Vec<(u64, usize, usize)> = Vec::new();
+        // The pairs' storage is charged to the optional part before it grows: n patterns on
+        // one variable make n²/2 pairs, more than any request's room (review r1, F1). Refused,
+        // the BGP plans with its counts alone, as for a pair the allowance leaves out. Made at
+        // the first pair: most BGPs have none.
+        let mut optional: Option<Arc<Budget>> = None;
+        let mut scratch: Option<Reservation<Arc<Budget>>> = None;
         for i in 0..scans.len() {
             if cancelled() {
                 return (out, Reads::default());
@@ -4069,9 +4077,23 @@ impl<'a> Context<'a> {
                     })
                 };
                 let both = size(i).saturating_add(size(j));
-                if both <= most {
-                    pairs.push((both, i, j));
+                if both > most {
+                    continue;
                 }
+                if pairs.len() == pairs.capacity() {
+                    let part =
+                        optional.get_or_insert_with(|| Arc::new(self.memory.optional_part()));
+                    let held = scratch.get_or_insert_with(|| Reservation::new(Arc::clone(part)));
+                    let more = pairs.capacity().max(16);
+                    if held
+                        .charge(more * size_of::<(u64, usize, usize)>())
+                        .is_err()
+                    {
+                        return (out, Reads::default());
+                    }
+                    pairs.reserve_exact(more);
+                }
+                pairs.push((both, i, j));
             }
         }
         // None (most BGPs): no list to read, nothing to charge, no plain plan made.
@@ -4084,9 +4106,16 @@ impl<'a> Context<'a> {
         };
         let allowance = cost.clamp(0.0, most as f64) as u64;
         pairs.sort_unstable();
-        // The pairs admitted, and the lists they read, each counted once.
+        if cancelled() {
+            return (out, Reads::default());
+        }
+        // The pairs admitted, and the lists they read, each counted once: at most MAX_LISTS
+        // lists, so at most as many pairs as two of them make, plus one per list.
         let (mut lists, mut admitted, mut decoded) = (Vec::new(), Vec::new(), 0u64);
-        for &(_, i, j) in &pairs {
+        for (n, &(_, i, j)) in pairs.iter().enumerate() {
+            if n % 4096 == 4095 && cancelled() {
+                return (out, Reads::default());
+            }
             let new: Vec<usize> = [i, j].into_iter().filter(|k| !lists.contains(k)).collect();
             let more: u64 = new.iter().map(|&k| own[k].unwrap_or(0)).sum();
             if decoded.saturating_add(more) > allowance
@@ -4098,9 +4127,12 @@ impl<'a> Context<'a> {
             lists.extend(new);
             admitted.push((i, j));
         }
+        // The candidates are freed before a list is read.
+        drop(pairs);
+        drop(scratch);
         // Planning can do without the lists: their charges go to an optional part, whose
         // refusals mark only itself, never the request.
-        let optional = Arc::new(self.memory.optional_part());
+        let optional = optional.expect("made with the first pair");
         let Some(mut reads) = Reads::with_room(&optional, lists.len()) else {
             return (out, Reads::default());
         };
