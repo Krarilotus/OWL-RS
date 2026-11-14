@@ -1,12 +1,14 @@
 //! Every setting of the server, once: its key in the configuration file, its environment
-//! variable, older file keys that still work, what values it takes and what it does.
+//! variable, older file keys that still work, what values it takes, its default and what it
+//! does.
 //!
 //! The file, the environment and the command line (`--set key=value`) are read through
 //! this table into one key-value source (keyed by the environment names), from which the
 //! typed configuration ([`super::ServerConfig`]) is parsed; precedence: command line,
 //! environment, file, defaults. The JSON Schema of the configuration file is generated
-//! from it ([`schema`], `nrese-server config-schema`), and a test checks that the
-//! operator reference documents every setting.
+//! from it ([`schema`], `nrese-server config-schema`), and tests check that the operator
+//! reference documents every setting and that the defaults here, the configuration's and
+//! the reference's are the same (`super::defaults_tests`).
 
 use std::collections::BTreeMap;
 
@@ -46,6 +48,21 @@ pub enum Unit {
     Duration,
 }
 
+/// What a setting is when nothing sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unset {
+    /// The default, as the file writes it: the schema's `default`.
+    Text(&'static str),
+    Number(u64),
+    Flag(bool),
+    /// No value: the setting has none until it is set. Why, in words.
+    Nothing(&'static str),
+    /// A default that no value states (one that depends on the host, where a value set
+    /// explicitly is taken as written): the description says what it is, and the schema
+    /// has no `default`. The tests list each such setting with its reason.
+    Computed,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Setting {
     /// The key in the configuration file (`store.data_dir`).
@@ -55,17 +72,26 @@ pub struct Setting {
     /// Older file keys that still work; a setting under two of its keys is an error.
     pub older: &'static [&'static str],
     pub kind: Kind,
+    /// Its default.
+    pub unset: Unset,
     /// A credential: never printed, write-only in the schema.
     pub secret: bool,
     pub doc: &'static str,
 }
 
-const fn setting(key: &'static str, env: &'static str, kind: Kind, doc: &'static str) -> Setting {
+const fn setting(
+    key: &'static str,
+    env: &'static str,
+    kind: Kind,
+    unset: Unset,
+    doc: &'static str,
+) -> Setting {
     Setting {
         key,
         env,
         older: &[],
         kind,
+        unset,
         secret: false,
         doc,
     }
@@ -84,6 +110,19 @@ const fn secret(mut setting: Setting) -> Setting {
 use Kind::{Amount, Bool, Choice, Integer, Limit, List, Text};
 use Unit::{Bytes, BytesOrShare, Duration};
 
+/// Why a credential has no default.
+const CREDENTIAL: Unset = Unset::Nothing("a credential: only the operator has it");
+/// Why the addresses of an identity provider or a primary have no default.
+const ADDRESS: Unset = Unset::Nothing("an address only the operator knows");
+/// Why an optional file has no default.
+const OPTIONAL_FILE: Unset = Unset::Nothing("an optional file: nothing is read unless it is set");
+/// Why a token's optional claim has no default.
+const UNCHECKED_CLAIM: Unset = Unset::Nothing("unset, the claim isn't checked");
+/// Why a list of who may read has no default.
+const NO_READERS: Unset = Unset::Nothing("unset, the list is empty: no one is granted by it");
+/// The loopback addresses, the proxies trusted unless others are listed.
+const LOOPBACK: Unset = Unset::Text("127.0.0.0/8,::1");
+
 /// Every setting, in the order of the operator reference.
 pub const SETTINGS: &[Setting] = &[
     // [server]
@@ -92,7 +131,8 @@ pub const SETTINGS: &[Setting] = &[
             "server.bind_address",
             names::BIND_ADDR,
             Text,
-            "The address and port the server listens on (default 127.0.0.1:8080).",
+            Unset::Text("127.0.0.1:8080"),
+            "The address and port the server listens on.",
         ),
         &["server.bind_addr"],
     ),
@@ -105,74 +145,83 @@ pub const SETTINGS: &[Setting] = &[
             "internal-authenticated",
             "replacement-grade",
         ]),
+        Unset::Text("open-workbench"),
         "What the deployment is for; read-only-demo disables writes, internal-authenticated \
          needs authentication, replacement-grade also on-disk storage and problem+json parse \
-         errors (default open-workbench).",
+         errors.",
     ),
     // [store]
     setting(
         "store.mode",
         names::STORE_MODE,
         Choice(&["in-memory", "on-disk"]),
+        Unset::Text("in-memory"),
         "Where the store keeps its data.",
     ),
     setting(
         "store.data_dir",
         names::DATA_DIR,
         Text,
-        "The data directory of an on-disk store (default ./data).",
+        Unset::Text("./data"),
+        "The data directory of an on-disk store.",
     ),
     setting(
         "store.default_graph",
         names::DEFAULT_GRAPH,
         Choice(&["default", "union"]),
+        Unset::Text("default"),
         "What a query that names no dataset reads: the default graph, or the union of all \
-         graphs (default default).",
+         graphs.",
     ),
     setting(
         "store.geosparql_relations",
         names::GEOSPARQL_RELATIONS,
         Choice(&["computed", "stated"]),
+        Unset::Text("computed"),
         "What GeoSPARQL relations in triple patterns match: those stated and those computed \
-         from the geometries (the query-rewrite extension, default computed), or the stated \
-         ones only.",
+         from the geometries (the query-rewrite extension), or the stated ones only.",
     ),
     setting(
         "store.search_scope",
         names::SEARCH_SCOPE,
         Choice(&["global", "reader"]),
+        Unset::Text("global"),
         "What full-text relevance, IRI search and vector selection are computed over: the \
-         dictionary's whole indexes (default global, the fastest), or what the reader's \
-         snapshot and graphs show alone (reader).",
+         dictionary's whole indexes (global, the fastest), or what the reader's snapshot and \
+         graphs show alone (reader).",
     ),
     setting(
         "store.reader_corpus_bytes",
         names::READER_CORPUS_BYTES,
         Amount(Bytes),
+        Unset::Text("256MiB"),
         "What the corpora a reader search scope keeps, and their lineage, may take within the \
-         queries' memory; the least recently used go first (default 256MiB: a 1M-document \
-         corpus takes about 250KB). A repository may set its own.",
+         queries' memory; the least recently used go first (a 1M-document corpus takes about \
+         250KB). A repository may set its own.",
     ),
     setting(
         "store.reader_walk_slice",
         names::READER_WALK_SLICE,
         Integer,
+        Unset::Number(1024),
         "Words of bits (64 terms each) one slice of a reader corpus walk covers at most; each \
-         slice also holds 16 bytes a term (default 1024).",
+         slice also holds 16 bytes a term.",
     ),
     setting(
         "store.reader_documents_per_probe",
         names::READER_DOCUMENTS_PER_PROBE,
         Integer,
+        Unset::Number(10),
         "Documents a reader corpus walk visits for the work of one probe: after commits, a \
          kept corpus is derived while the terms touched since are at most its documents over \
-         this, else walked again (default 10, measured in work; at least 1). A \
-         latency-first store with one tenant may raise it.",
+         this, else walked again (measured in work; at least 1). A latency-first store with \
+         one tenant may raise it.",
     ),
     setting(
         "store.import_directory",
         names::IMPORT_DIR,
         Text,
+        Unset::Nothing("a directory only the operator chooses: unset, no server-side imports"),
         "The directory administrators import files from by name; without it there are no \
          server-side imports.",
     ),
@@ -180,58 +229,66 @@ pub const SETTINGS: &[Setting] = &[
         "store.verify_on_open",
         names::VERIFY_ON_OPEN,
         Bool,
-        "Check the whole newest checkpoint when opening (default false).",
+        Unset::Flag(false),
+        "Check the whole newest checkpoint when opening.",
     ),
     setting(
         "store.map_checkpoints",
         names::MAP_CHECKPOINTS,
         Bool,
-        "Serve checkpointed data from the mapped file and free its copies in memory \
-         (default true).",
+        Unset::Flag(true),
+        "Serve checkpointed data from the mapped file and free its copies in memory.",
     ),
     setting(
         "store.checkpoint_after_wal",
         names::CHECKPOINT_AFTER_WAL_BYTES,
         Amount(Bytes),
+        Unset::Text("256MiB"),
         "Write a checkpoint in the background once the write-ahead log has grown by this \
-         much since the last (default 256MiB).",
+         much since the last.",
     ),
     setting(
         "store.wal_archive",
         names::WAL_ARCHIVE,
         Bool,
-        "Keep the WAL segments checkpoints cover, for point-in-time restores (default false).",
+        Unset::Flag(false),
+        "Keep the WAL segments checkpoints cover, for point-in-time restores.",
     ),
     setting(
         "store.wal_damage",
         names::WAL_DAMAGE,
         Choice(&["refuse", "keep-prefix"]),
+        Unset::Text("refuse"),
         "Damage in the newest WAL segment that a crash mid-append doesn't leave: refuse to \
-         open, or open with the log up to it, the rest copied to wal-cut/ (default refuse).",
+         open, or open with the log up to it, the rest copied to wal-cut/.",
     ),
     setting(
         "store.index_encoding",
         names::INDEX_ENCODING,
         Choice(&["fast", "compact"]),
-        "How index blocks are encoded when they are built (default fast).",
+        Unset::Text("fast"),
+        "How index blocks are encoded when they are built.",
     ),
     setting(
         "store.vocabulary",
         names::VOCABULARY,
         Choice(&["plain", "fsst"]),
-        "How checkpoints store the dictionary's keys (default plain).",
+        Unset::Text("plain"),
+        "How checkpoints store the dictionary's keys.",
     ),
     setting(
         "store.invalid_statements",
         names::INVALID_STATEMENTS,
         Choice(&["quarantine", "strict"]),
+        Unset::Text("quarantine"),
         "What a bulk load does with a statement it can't read: quarantine it and load the \
-         rest, or stop (default quarantine).",
+         rest, or stop.",
     ),
     setting(
         "store.ontology_path",
         names::ONTOLOGY_PATH,
         Text,
+        OPTIONAL_FILE,
         "A file loaded at startup; a missing file is a startup error.",
     ),
     // [shacl]
@@ -239,20 +296,22 @@ pub const SETTINGS: &[Setting] = &[
         "shacl.shapes_graph",
         names::SHACL_SHAPES_GRAPH,
         Text,
-        "The graph of the shapes validation uses (an IRI; default RDF4J's \
-         http://rdf4j.org/schema/rdf4j#SHACLShapeGraph).",
+        Unset::Text("http://rdf4j.org/schema/rdf4j#SHACLShapeGraph"),
+        "The graph of the shapes validation uses (an IRI).",
     ),
     setting(
         "shacl.gate",
         names::SHACL_GATE,
         Choice(&["off", "report", "enforce"]),
-        "SHACL as a commit gate: report what commits introduce, or reject them (default off).",
+        Unset::Text("off"),
+        "SHACL as a commit gate: report what commits introduce, or reject them.",
     ),
     setting(
         "shacl.gate_severity",
         names::SHACL_GATE_SEVERITY,
         Choice(&["violation", "warning", "info"]),
-        "The least severity an enforcing gate rejects (default violation).",
+        Unset::Text("violation"),
+        "The least severity an enforcing gate rejects.",
     ),
     // [reasoner]
     setting(
@@ -269,13 +328,15 @@ pub const SETTINGS: &[Setting] = &[
             "owl2-dl",
             "custom",
         ]),
-        "The ruleset materialised into the inferred stack (default disabled); owl2-dl \
-         materialises OWL 2 RL and adds the OWL 2 DL engines (the dl settings).",
+        Unset::Text("disabled"),
+        "The ruleset materialised into the inferred stack; owl2-dl materialises OWL 2 RL and \
+         adds the OWL 2 DL engines (the dl settings).",
     ),
     setting(
         "reasoner.rules",
         names::REASONING_RULES,
         Text,
+        OPTIONAL_FILE,
         "A Notation3 (.n3) or GraphDB (.pie) file of user rules: the whole program in the \
          custom mode, added to the ruleset otherwise.",
     ),
@@ -283,205 +344,231 @@ pub const SETTINGS: &[Setting] = &[
         "reasoner.equality",
         names::REASONING_EQUALITY,
         Choice(&["representatives", "compact", "replicate"]),
-        "How owl:sameAs is reasoned with and stored (default representatives).",
+        Unset::Text("representatives"),
+        "How owl:sameAs is reasoned with and stored.",
     ),
     setting(
         "reasoner.equality_answers",
         names::REASONING_EQUALITY_ANSWERS,
         Choice(&["strict", "canonical"]),
+        Unset::Text("strict"),
         "With equality = compact: answer with every identity of an owl:sameAs class \
-         (strict, the default), or with its representative only (canonical, for analytics).",
+         (strict), or with its representative only (canonical, for analytics).",
     ),
     setting(
         "reasoner.equality_expansion",
         names::REASONING_EQUALITY_EXPANSION,
         Choice(&["late", "early"]),
+        Unset::Text("late"),
         "With equality = compact: expand owl:sameAs classes after the joins where the \
-         answer can't tell (late, the default) or at every read (early). The same answers.",
+         answer can't tell (late) or at every read (early). The same answers.",
     ),
     setting(
         "reasoner.unnamed_classes",
         names::REASONING_UNNAMED_CLASSES,
         Choice(&["derive", "skip"]),
-        "Whether memberships in unnamed union classes that nothing consumes are derived \
-         (default derive).",
+        Unset::Text("derive"),
+        "Whether memberships in unnamed union classes that nothing consumes are derived.",
     ),
     setting(
         "reasoner.ql_rewriting",
         names::REASONING_QL_REWRITING,
         Choice(&["auto", "on", "off"]),
+        Unset::Text("auto"),
         "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto \
-         (the default) under owl2-ql, on under owl2-ql and owl2-rl, or off.",
+         under owl2-ql, on under owl2-ql and owl2-rl, or off.",
     ),
     setting(
         "reasoner.support_sets",
         names::REASONING_SUPPORT_SETS,
         Integer,
+        Unset::Number(16),
         "Support graph sets kept per inferred statement for inferred = \"supported\" in the \
-         access policy (default 16, at least 1): a bound on memory and work; a reader past \
-         it is decided by the closure of its graphs, with the same answers.",
+         access policy (at least 1): a bound on memory and work; a reader past it is decided \
+         by the closure of its graphs, with the same answers.",
     ),
     // [dl]
     setting(
         "dl.answers",
         names::DL_ANSWERS,
         Choice(&["certain-where-complete", "sound", "exact"]),
+        Unset::Text("certain-where-complete"),
         "Under owl2-dl, which answers a query returns: the certain ones where they can be \
-         proven complete and the sound ones otherwise (the default), the sound lower bound \
-         alone, or certain answers or an error.",
+         proven complete and the sound ones otherwise, the sound lower bound alone, or \
+         certain answers or an error.",
     ),
     setting(
         "dl.consistency",
         names::DL_CONSISTENCY,
         Choice(&["inline", "off"]),
+        Unset::Text("inline"),
         "Under owl2-dl, whether each commit is checked for consistency and rejected if it \
-         makes the data inconsistent (inline, the default) or not checked (off).",
+         makes the data inconsistent (inline) or not checked (off).",
     ),
     setting(
         "dl.timeout",
         names::DL_TIMEOUT_MS,
         Limit(Some(Duration)),
+        Unset::Text("30min"),
         "Under owl2-dl, the time one DL task may take: a commit's consistency check, a \
-         query's exact services, a classification (default 30min, the server's safety \
-         default; 0 or unlimited: none).",
+         query's exact services, a classification (0 or unlimited: none).",
     ),
     setting(
         "dl.memory",
         names::DL_MEMORY,
         Limit(Some(Bytes)),
+        Unset::Text("unlimited"),
         "Under owl2-dl, what one engine run may hold of its own, checked at work \
-         boundaries (default none: a request's runs draw from its memory envelope, \
-         budgets.query_memory; 0 or unlimited: none).",
+         boundaries (0 or unlimited: none, and a request's runs draw from its memory \
+         envelope, budgets.query_memory).",
     ),
     setting(
         "dl.max_candidates",
         names::DL_MAX_CANDIDATES,
         Limit(None),
+        Unset::Number(1000),
         "Under owl2-dl, the candidate answers a query checks with the exact services at \
-         most; the rest are reported unresolved (default 1000, so that the answer comes \
-         within the query's timeout; 0 or unlimited: none).",
+         most; the rest are reported unresolved (0 or unlimited: none).",
     ),
     setting(
         "dl.threads",
         names::DL_THREADS,
         Integer,
-        "Under owl2-dl, the workers of a classification (default 0: every core).",
+        Unset::Number(0),
+        "Under owl2-dl, the workers of a classification (0: every core).",
     ),
     setting(
         "dl.max_nodes",
         names::DL_MAX_NODES,
         Limit(None),
+        Unset::Text("unlimited"),
         "Under owl2-dl, the most nodes one hypertableau run may hold: a deterministic \
-         budget for reproducible runs (default none).",
+         budget for reproducible runs.",
     ),
     setting(
         "dl.max_branch_points",
         names::DL_MAX_BRANCH_POINTS,
         Limit(None),
+        Unset::Text("unlimited"),
         "Under owl2-dl, the most branch points one hypertableau run may open: a \
-         deterministic budget; past it the run decides nothing (default none).",
+         deterministic budget; past it the run decides nothing.",
     ),
     setting(
         "dl.max_merges",
         names::DL_MAX_MERGES,
         Limit(None),
+        Unset::Text("unlimited"),
         "Under owl2-dl, the most merges one hypertableau run may make: a deterministic \
-         budget (default none).",
+         budget.",
     ),
     setting(
         "dl.explanation_tests",
         names::DL_EXPLANATION_TESTS,
         Limit(None),
+        Unset::Text("unlimited"),
         "Under owl2-dl, the entailment tests one explanation or rejection evidence runs; \
-         past them the justification isn't minimal (default none).",
+         past them the justification isn't minimal.",
     ),
     setting(
         "dl.lower_bound_timeout",
         names::DL_LOWER_BOUND_TIMEOUT_MS,
         Limit(Some(Duration)),
+        Unset::Text("60s"),
         "Under owl2-dl, the time a classification's Horn lower bound may take, at most \
          half of what is left: a route threshold, past it the hypertableau decides \
-         (default 60s; 0 or unlimited: only the half).",
+         (0 or unlimited: only the half).",
     ),
     setting(
         "dl.max_join",
         names::DL_MAX_JOIN,
         Limit(None),
+        Unset::Number(1_048_576),
         "Under owl2-dl, the most conclusions one join of the context core may produce: a \
-         route threshold, past it the hypertableau decides (default 1048576).",
+         route threshold, past it the hypertableau decides.",
     ),
     setting(
         "dl.max_join_steps",
         names::DL_MAX_JOIN_STEPS,
         Limit(None),
+        Unset::Number(65_536),
         "Under owl2-dl, the most steps one Pred join of the context core may take: a \
-         route threshold, past it the hypertableau decides (default 65536).",
+         route threshold, past it the hypertableau decides.",
     ),
     // [federation]
     setting(
         "federation.allow",
         names::FEDERATION_ALLOW,
         List { delimiter: "," },
-        "The endpoints SERVICE may call (IRIs or prefixes, * for any); none by default.",
+        Unset::Nothing("unset, the list is empty: SERVICE calls no endpoint"),
+        "The endpoints SERVICE may call (IRIs or prefixes, * for any).",
     ),
     // [replication]
     setting(
         "replication.mode",
         names::REPLICATION_MODE,
         Choice(&["off", "primary", "replica"]),
+        Unset::Text("off"),
         "Read replicas (docs/ops/replication.md): a primary ships its log to replicas, \
-         which apply it and answer queries; off by default. Both need an on-disk store.",
+         which apply it and answer queries. Both need an on-disk store.",
     ),
     setting(
         "replication.primary",
         names::REPLICATION_PRIMARY,
         Text,
+        ADDRESS,
         "A replica's primary: its base URL (https://primary.example:8080).",
     ),
     secret(setting(
         "replication.token",
         names::REPLICATION_TOKEN,
         Text,
+        CREDENTIAL,
         "The bearer token a replica presents to its primary (an administrator's).",
     )),
     setting(
         "replication.poll",
         names::REPLICATION_POLL_MS,
         Amount(Duration),
-        "How long a replica waits before asking again once caught up (default 500ms).",
+        Unset::Text("500ms"),
+        "How long a replica waits before asking again once caught up.",
     ),
     setting(
         "replication.batch_bytes",
         names::REPLICATION_BATCH_BYTES,
         Amount(Bytes),
-        "About how much log a replica asks for at once (default 8MiB).",
+        Unset::Text("8MiB"),
+        "About how much log a replica asks for at once.",
     ),
     setting(
         "replication.round_timeout",
         names::REPLICATION_ROUND_TIMEOUT_MS,
         Limit(Some(Duration)),
+        Unset::Text("5min"),
         "The longest one round of following the primary's log may take, its answer whole \
-         (default 5min; 0 or unlimited: no total limit, the 30 s limits between pieces stay).",
+         (0 or unlimited: no total limit, the 30 s limits between pieces stay).",
     ),
     setting(
         "replication.image_timeout",
         names::REPLICATION_IMAGE_TIMEOUT_MS,
         Limit(Some(Duration)),
+        Unset::Text("1h"),
         "The longest a replica waits for its primary to prepare an image, until the answer \
-         begins (default 1h; 0 or unlimited: no limit); the image then streams as long as \
-         its pieces come.",
+         begins (0 or unlimited: no limit); the image then streams as long as its pieces \
+         come.",
     ),
     setting(
         "federation.timeout",
         names::FEDERATION_TIMEOUT_MS,
         Amount(Duration),
-        "Per request to an endpoint (default 30s).",
+        Unset::Text("30s"),
+        "Per request to an endpoint.",
     ),
     setting(
         "federation.max_rows",
         names::FEDERATION_MAX_ROWS,
         Integer,
-        "Rows one request may return (default 1000000).",
+        Unset::Number(1_000_000),
+        "Rows one request may return.",
     ),
     // [budgets]
     older(
@@ -489,7 +576,9 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.query_memory",
             names::MAX_QUERY_MEMORY_BYTES,
             Amount(BytesOrShare),
-            "Intermediate results of one query; 0 is unlimited (default 4GiB).",
+            Unset::Text("4GiB"),
+            "One query's memory envelope: its intermediate and retained results and, under \
+             owl2-dl, its DL work; 0 is unlimited.",
         ),
         &["policy.limits.max_query_memory_bytes"],
     ),
@@ -497,43 +586,50 @@ pub const SETTINGS: &[Setting] = &[
         "budgets.total_query_memory",
         names::MAX_TOTAL_QUERY_MEMORY_BYTES,
         Amount(BytesOrShare),
-        "Intermediate results of all running queries together; 0 is unlimited (default 50%).",
+        Unset::Text("50%"),
+        "Every running request's envelope across the catalog: queries, updates, DL \
+         entailment checks and explanations; 0 is unlimited.",
     ),
     setting(
         "budgets.process_memory",
         names::PROCESS_MEMORY_BYTES,
         Amount(BytesOrShare),
+        Unset::Text("75%"),
         "The memory the server may hold before a materialisation or a commit's reasoning \
-         stops with an error instead of taking the machine; 0 is unlimited (default 75%).",
+         stops with an error instead of taking the machine; 0 is unlimited.",
     ),
     setting(
         "budgets.huge_pages",
         names::HUGE_PAGES,
         Choice(&["off", "on", "bulk"]),
+        Unset::Text("on"),
         "Transparent huge pages for the server's memory (Linux): on is faster over large \
          heaps, off holds less memory while serving, bulk has them only while a bulk load \
-         or a materialisation runs (default on).",
+         or a materialisation runs.",
     ),
     setting(
         "budgets.reasoning_release",
         names::REASONING_RELEASE,
         Choice(&["off", "on"]),
+        Unset::Text("off"),
         "Memory given back between a materialisation's rounds: on lowers and steadies its \
-         peak (LUBM 100 by 14 %) for more reasoning time (5.6 %); default off.",
+         peak (LUBM 100 by 14 %) for more reasoning time (5.6 %).",
     ),
     setting(
         "budgets.bulk_load_memory",
         names::BULK_LOAD_MEMORY,
         Amount(BytesOrShare),
+        Unset::Text("25%"),
         "The quads of a bulk load before they are sorted in chunks and spilled; 0 is \
-         unlimited (default 25%).",
+         unlimited.",
     ),
     older(
         setting(
             "budgets.query_timeout",
             names::QUERY_TIMEOUT_MS,
             Amount(Duration),
-            "A query, until its last result is sent (default 30s).",
+            Unset::Text("30s"),
+            "A query, until its last result is sent.",
         ),
         &["policy.timeouts.query_ms"],
     ),
@@ -542,7 +638,8 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.update_timeout",
             names::UPDATE_TIMEOUT_MS,
             Amount(Duration),
-            "A SPARQL update, reasoning included (default 60s).",
+            Unset::Text("60s"),
+            "A SPARQL update, reasoning included.",
         ),
         &["policy.timeouts.update_ms"],
     ),
@@ -551,7 +648,8 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.graph_read_timeout",
             names::GRAPH_READ_TIMEOUT_MS,
             Amount(Duration),
-            "A Graph Store or statements read (default 30s).",
+            Unset::Text("30s"),
+            "A Graph Store or statements read.",
         ),
         &["policy.timeouts.graph_read_ms"],
     ),
@@ -560,7 +658,8 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.graph_write_timeout",
             names::GRAPH_WRITE_TIMEOUT_MS,
             Amount(Duration),
-            "A Graph Store write (default 60s).",
+            Unset::Text("60s"),
+            "A Graph Store write.",
         ),
         &["policy.timeouts.graph_write_ms"],
     ),
@@ -569,7 +668,8 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.query_text",
             names::MAX_QUERY_BYTES,
             Amount(Bytes),
-            "The text of a query (default 1MiB).",
+            Unset::Text("1MiB"),
+            "The text of a query.",
         ),
         &["policy.limits.max_query_bytes"],
     ),
@@ -578,7 +678,8 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.update_size",
             names::MAX_UPDATE_BYTES,
             Amount(Bytes),
-            "A SPARQL update request (default 16MiB).",
+            Unset::Text("16MiB"),
+            "A SPARQL update request.",
         ),
         &["policy.limits.max_update_bytes"],
     ),
@@ -587,7 +688,8 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.upload_size",
             names::MAX_RDF_UPLOAD_BYTES,
             Amount(Bytes),
-            "An RDF payload (default 128MiB).",
+            Unset::Text("128MiB"),
+            "An RDF payload.",
         ),
         &["policy.limits.max_rdf_upload_bytes"],
     ),
@@ -596,8 +698,11 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.result_cache",
             names::QUERY_CACHE_BYTES,
             Amount(BytesOrShare),
+            Unset::Computed,
             "Results of query parts (id columns) kept for repeated queries and shared \
-             sub-patterns; 0 switches the cache off (default 2% of memory, 64MiB to 8GiB).",
+             sub-patterns; 0 switches the cache off. Unset: 2% of the process's memory, kept \
+             between 64MiB and 8GiB (64MiB where the memory can't be read); a share set \
+             explicitly is taken as written, without those bounds.",
         ),
         &["store.query_cache_bytes"],
     ),
@@ -605,50 +710,58 @@ pub const SETTINGS: &[Setting] = &[
         "budgets.result_cache_pins",
         names::PINNED_QUERIES,
         List { delimiter: ";" },
+        Unset::Nothing("unset, the list is empty: no query is pinned"),
         "SPARQL query files whose results are pinned in the result cache at startup, each \
-         under its file name without the extension (none by default).",
+         under its file name without the extension.",
     ),
     // [policy]
     setting(
         "policy.rate_limits.window_secs",
         names::RATE_LIMIT_WINDOW_SECS,
         Integer,
+        Unset::Number(60),
         "The rate limits' window in seconds.",
     ),
     setting(
         "policy.rate_limits.read_requests_per_window",
         names::READ_REQUESTS_PER_WINDOW,
         Integer,
+        Unset::Number(0),
         "Read requests per client and window.",
     ),
     setting(
         "policy.rate_limits.write_requests_per_window",
         names::WRITE_REQUESTS_PER_WINDOW,
         Integer,
+        Unset::Number(0),
         "Write requests per client and window.",
     ),
     setting(
         "policy.rate_limits.admin_requests_per_window",
         names::ADMIN_REQUESTS_PER_WINDOW,
         Integer,
+        Unset::Number(0),
         "Administrative requests per client and window.",
     ),
     setting(
         "policy.sparql_parse_error_profile",
         names::SPARQL_PARSE_ERROR_PROFILE,
         Choice(&["problem-json", "plain-text", "fuseki-plain-text"]),
-        "How SPARQL syntax errors are answered (default problem-json).",
+        Unset::Text("problem-json"),
+        "How SPARQL syntax errors are answered.",
     ),
     setting(
         "policy.exposure.operator_ui",
         names::ENABLE_OPERATOR_UI,
         Bool,
+        Unset::Flag(true),
         "Whether the operator console is served.",
     ),
     setting(
         "policy.exposure.metrics",
         names::ENABLE_METRICS,
         Bool,
+        Unset::Flag(true),
         "Whether the Prometheus metrics are served.",
     ),
     // [auth]
@@ -662,138 +775,161 @@ pub const SETTINGS: &[Setting] = &[
             "mtls",
             "oidc-introspection",
         ]),
-        "How requests are authenticated (default none).",
+        Unset::Text("none"),
+        "How requests are authenticated.",
     ),
     setting(
         "auth.access_policy",
         names::ACCESS_POLICY,
         Text,
+        OPTIONAL_FILE,
         "An access policy file, imported into the access state at the first start.",
     ),
     setting(
         "auth.workspace_base",
         names::WORKSPACE_BASE,
         Text,
-        "What personal space and workspace graph prefixes start with (default urn:nrese:).",
+        Unset::Text("urn:nrese:"),
+        "What personal space and workspace graph prefixes start with.",
     ),
     setting(
         "auth.local_logins",
         names::LOCAL_LOGINS,
         Bool,
-        "Whether users of the access state log in with passwords (default true).",
+        Unset::Flag(true),
+        "Whether users of the access state log in with passwords.",
     ),
     setting(
         "auth.trusted_proxies",
         names::AUTH_TRUSTED_PROXIES,
         List { delimiter: "," },
-        "The proxies (addresses or ranges) whose X-Forwarded-For names the client, for login throttling (default loopback).",
+        LOOPBACK,
+        "The proxies (addresses or ranges) whose X-Forwarded-For names the client, for login throttling.",
     ),
     secret(setting(
         "auth.bearer_static.read_token",
         names::AUTH_READ_TOKEN,
         Text,
+        CREDENTIAL,
         "The static bearer token that may read.",
     )),
     secret(setting(
         "auth.bearer_static.admin_token",
         names::AUTH_ADMIN_TOKEN,
         Text,
+        CREDENTIAL,
         "The static bearer token that may administer.",
     )),
     secret(setting(
         "auth.bearer_jwt.shared_secret",
         names::AUTH_JWT_SECRET,
         Text,
+        CREDENTIAL,
         "The HMAC secret JWTs are signed with.",
     )),
     setting(
         "auth.bearer_jwt.issuer",
         names::AUTH_JWT_ISSUER,
         Text,
+        UNCHECKED_CLAIM,
         "The issuer JWTs must name.",
     ),
     setting(
         "auth.bearer_jwt.audience",
         names::AUTH_JWT_AUDIENCE,
         Text,
+        UNCHECKED_CLAIM,
         "The audience JWTs must name.",
     ),
     setting(
         "auth.bearer_jwt.read_role",
         names::AUTH_JWT_READ_ROLE,
         Text,
+        Unset::Text("nrese.read"),
         "The role that may read.",
     ),
     setting(
         "auth.bearer_jwt.admin_role",
         names::AUTH_JWT_ADMIN_ROLE,
         Text,
+        Unset::Text("nrese.admin"),
         "The role that may administer.",
     ),
     setting(
         "auth.bearer_jwt.leeway_seconds",
         names::AUTH_JWT_LEEWAY_SECS,
         Integer,
+        Unset::Number(30),
         "Clock leeway for expiry checks, in seconds.",
     ),
     setting(
         "auth.mtls.subject_header",
         names::AUTH_MTLS_SUBJECT_HEADER,
         Text,
+        Unset::Text("x-client-cert-subject"),
         "The header the TLS-terminating proxy passes the client certificate's subject in.",
     ),
     setting(
         "auth.mtls.read_subjects",
         names::AUTH_MTLS_READ_SUBJECTS,
         List { delimiter: ";" },
+        NO_READERS,
         "The subjects that may read.",
     ),
     setting(
         "auth.mtls.admin_subjects",
         names::AUTH_MTLS_ADMIN_SUBJECTS,
         List { delimiter: ";" },
+        Unset::Nothing("the mtls mode needs it: only the operator knows its administrators"),
         "The subjects that may administer.",
     ),
     setting(
         "auth.mtls.trusted_proxies",
         names::AUTH_MTLS_TRUSTED_PROXIES,
         List { delimiter: "," },
-        "The peers (addresses or ranges) that may send the subject header (default loopback).",
+        LOOPBACK,
+        "The peers (addresses or ranges) that may send the subject header.",
     ),
     setting(
         "auth.oidc_introspection.introspection_url",
         names::AUTH_OIDC_INTROSPECTION_URL,
         Text,
+        ADDRESS,
         "The OAuth 2.0 token introspection endpoint.",
     ),
     setting(
         "auth.oidc_introspection.client_id",
         names::AUTH_OIDC_CLIENT_ID,
         Text,
+        Unset::Nothing("the identity provider names it; unset, the server introspects without one"),
         "The client id the server introspects as.",
     ),
     secret(setting(
         "auth.oidc_introspection.client_secret",
         names::AUTH_OIDC_CLIENT_SECRET,
         Text,
+        CREDENTIAL,
         "The client secret the server introspects with.",
     )),
     setting(
         "auth.oidc_introspection.read_role",
         names::AUTH_OIDC_READ_ROLE,
         Text,
+        Unset::Text("nrese.read"),
         "The role that may read.",
     ),
     setting(
         "auth.oidc_introspection.admin_role",
         names::AUTH_OIDC_ADMIN_ROLE,
         Text,
+        Unset::Text("nrese.admin"),
         "The role that may administer.",
     ),
     setting(
         "auth.oidc_introspection.timeout_ms",
         names::AUTH_OIDC_TIMEOUT_MS,
         Integer,
+        Unset::Number(5000),
         "Per introspection request, in milliseconds.",
     ),
     // [ai]
@@ -801,67 +937,84 @@ pub const SETTINGS: &[Setting] = &[
         "ai.enabled",
         names::AI_ENABLED,
         Bool,
-        "Whether AI query suggestions are offered (default false).",
+        Unset::Flag(false),
+        "Whether AI query suggestions are offered.",
     ),
     setting(
         "ai.provider",
         names::AI_PROVIDER,
         Choice(&["disabled", "gemini", "openrouter"]),
+        Unset::Text("disabled"),
         "Who makes the suggestions.",
     ),
-    setting("ai.model", names::AI_MODEL, Text, "The provider's model."),
+    setting(
+        "ai.model",
+        names::AI_MODEL,
+        Text,
+        Unset::Text("gemini-2.5-flash"),
+        "The provider's model.",
+    ),
     setting(
         "ai.timeout_ms",
         names::AI_TIMEOUT_MS,
         Integer,
+        Unset::Number(20_000),
         "Per suggestion request, in milliseconds.",
     ),
     setting(
         "ai.max_suggestions",
         names::AI_MAX_SUGGESTIONS,
         Integer,
+        Unset::Number(4),
         "Suggestions per request.",
     ),
     setting(
         "ai.system_prompt",
         names::AI_SYSTEM_PROMPT,
         Text,
+        Unset::Text(crate::ai::DEFAULT_SYSTEM_PROMPT),
         "The system prompt of suggestion requests.",
     ),
     secret(setting(
         "ai.gemini.api_key",
         names::AI_GOOGLE_API_KEY,
         Text,
+        Unset::Nothing("a credential: unset, the environment's GOOGLE_API_KEY is used"),
         "The Gemini API key.",
     )),
     setting(
         "ai.gemini.api_base",
         names::AI_GOOGLE_API_BASE,
         Text,
+        Unset::Text("https://generativelanguage.googleapis.com"),
         "The Gemini API's base URL.",
     ),
     secret(setting(
         "ai.openrouter.api_key",
         names::AI_OPENROUTER_API_KEY,
         Text,
+        CREDENTIAL,
         "The OpenRouter API key.",
     )),
     setting(
         "ai.openrouter.api_base",
         names::AI_OPENROUTER_API_BASE,
         Text,
+        Unset::Text("https://openrouter.ai/api/v1"),
         "The OpenRouter API's base URL.",
     ),
     setting(
         "ai.openrouter.site_url",
         names::AI_OPENROUTER_SITE_URL,
         Text,
+        Unset::Nothing("optional: unset, no site URL is sent"),
         "The site URL sent to OpenRouter.",
     ),
     setting(
         "ai.openrouter.app_name",
         names::AI_OPENROUTER_APP_NAME,
         Text,
+        Unset::Nothing("optional: unset, no application name is sent"),
         "The application name sent to OpenRouter.",
     ),
 ];
@@ -1046,6 +1199,15 @@ fn property(setting: &Setting) -> Value {
     };
     let object = property.as_object_mut().expect("an object");
     object.insert("description".to_owned(), json!(setting.doc));
+    let default = match setting.unset {
+        Unset::Text(text) => Some(json!(text)),
+        Unset::Number(number) => Some(json!(number)),
+        Unset::Flag(flag) => Some(json!(flag)),
+        Unset::Nothing(_) | Unset::Computed => None,
+    };
+    if let Some(default) = default {
+        object.insert("default".to_owned(), default);
+    }
     object.insert("x-env".to_owned(), json!(setting.env));
     if setting.secret {
         object.insert("writeOnly".to_owned(), json!(true));
