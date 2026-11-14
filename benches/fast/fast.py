@@ -871,7 +871,7 @@ def run_case(case: dict, label: str, rep: int) -> dict:
 
 # A run that ended at one of these stopped at a limit of the case (its memory cap, its time),
 # not with a wrong answer.
-LIMITS = ("memory-limit", "timeout", "gave-up", "query-memory-limit")
+LIMITS = ("memory-limit", "timeout", "gave-up", "query-memory-limit", "not-answered")
 
 
 def frontier(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
@@ -1155,7 +1155,48 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 record["status"] = "failed"
                 record["notes"].append(f"missing input: reference taxonomy {case['reference']} "
                                        "(fast.py compete writes it; benches/hosts.toml inputs.fast)")
-    if tool != "perf_lab":
+    elif tool == "endpoint-classify":
+        # Fresh servers (`processes`), each in the case's scope and each its own observation: its
+        # request (curl's time_total; the server's start and the load outside it), its answer judged
+        # against the reference, its scope's peak (the load included). One wrong answer makes the
+        # case wrong; a process without an answer ends it, its checks unchecked.
+        times, wall, judged = [], 0.0, []
+        for i in range(int(case.get("processes", 1))):
+            command = ["bash", "-c", endpoint_script(data, free_port(), f"/out/{name}")]
+            code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
+            wall += w
+            found = ENDPOINT_REQUEST.findall(err)
+            one: dict = {}
+            if code == 0 and not found:
+                code, err = 1, f"{err}\nno classification request (fast-endpoint-request)"
+            if code != 0 and (code in (124, 137) or not found):  # the case's limit, or never asked
+                record["status"] = classify_failure(code, err, {})
+                record["notes"].append(err.strip()[-300:])
+            elif code != 0:  # the request itself failed (curl's exit): no answer
+                record["status"] = NOT_ANSWERED
+                record["notes"].append(f"not answered: the request failed (curl exit {code}, HTTP {found[-1][0]})")
+            elif (answer := endpoint_answer(int(found[-1][0]), SCRATCH / f"{name}.json"))[0] is None:
+                record["status"] = NOT_ANSWERED
+                record["notes"].append(answer[1])
+            elif not seed_from_inputs(case["reference"]):
+                record["status"] = "failed"
+                record["notes"].append(f"missing input: reference taxonomy {case['reference']}")
+            else:
+                times.append(float(found[-1][1]) * 1000)
+                (SCRATCH / f"{name}.tsv").write_text("".join(f"{a}\t{b}\n" for a, b in closed(answer[0])),
+                                                     encoding="utf-8")
+                one = {"phase_samples": {"request": [times[-1]]}, "taxonomy_equal": same_taxonomy(case)}
+                judged.append(one["taxonomy_equal"])
+            observations.append({**invocation_observation(case, one, err, {"sweep": 0, "repeat": i, "cache": "warm"}),
+                                 "exit": code, "checks": [check(p, want, one, expect, alt_expect)
+                                                          for p, want in case.get("check", {}).items()] if one else []})
+            if record["status"] != "ok":
+                break
+        result = {"samples_ms": times, "phase_samples": {"request": times},
+                  "whole_ms": statistics.median(times) if times else None,
+                  **({"taxonomy_equal": next((j for j in judged if j != "true"), "true")} if judged else {})}
+        record["wall_s"] = round(wall, 2)
+    if tool not in ("perf_lab", "endpoint-classify"):
         observations.append({**invocation_observation(case, result, err, invocation_plan(case)[0]), "exit": code})
     record.update(invocation_observation(case, result, err, {}))
     record.pop("identity")
@@ -1165,6 +1206,9 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         for observation in observations:
             record["cache_peaks"].setdefault(observation["identity"]["cache"], []).append(observation["peak_mib"])
     record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]
+    if record["status"] == NOT_ANSWERED or (tool == "endpoint-classify" and "taxonomy_equal" not in result):
+        # No answer to judge: its checks are neither right nor wrong (an observation's judged ones stay).
+        record["checks"] = [{**c, "ok": None, "note": "not answered"} for c in record["checks"]]
     record["routes"] = [route(path, want, result) for path, want in case.get("route", {}).items()]
     wanted = case.get("outcome", "ok")
     # A query refused at its memory limit, in any invocation: the record names it whatever its
@@ -1292,6 +1336,87 @@ def same_taxonomy(case: dict) -> str | None:
     (SCRATCH / f"{case['name']}.reference.tax").write_text(found.stdout, encoding="utf-8")
     pairs = [tuple(line.rstrip("\n").split("\t")[:2]) for line in open(closure, encoding="utf-8") if "\t" in line]
     return canonical.compare(found.stdout, pairs)
+
+
+# The endpoint's classification (tool `endpoint-classify`): a fresh server per process, the case's
+# data loaded by the Graph Store Protocol, then one `GET /dataset/classification`, timed. Every
+# side's server gets this environment and no other NRESE setting (as the DL lead's endpoint
+# measurement, 14 Nov 2026): an in-memory store without reasoning, limits wide enough for the case.
+ENDPOINT_ENV = {"NRESE_STORE_MODE": "in-memory", "NRESE_REASONING_MODE": "disabled",
+                "NRESE_QUERY_TIMEOUT_MS": "300000", "NRESE_GRAPH_WRITE_TIMEOUT_MS": "300000",
+                "NRESE_MAX_RDF_UPLOAD_BYTES": str(1 << 30)}
+ENDPOINT_REQUEST = re.compile(r"^fast-endpoint-request (\d{3}) (\S+)$", re.M)
+# An answer the server didn't give: not 200, or marked refused, undecided or incomplete. No answer
+# to judge, so never a wrong one and never a pass (as QUERY_MEMORY_LIMIT); no case declares it.
+NOT_ANSWERED = "not-answered"
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def endpoint_script(data: str, port: int, out: str) -> str:
+    """The shell that serves `data` on `port` and asks once for its classification: the request's
+    status and seconds on stderr (ENDPOINT_REQUEST), its answer in `out`.json."""
+    base = f"http://127.0.0.1:{port}"
+    env = " ".join(f"{k}={v}" for k, v in {**ENDPOINT_ENV, "NRESE_BIND_ADDR": f"127.0.0.1:{port}"}.items())
+    return (f"for v in $(compgen -e | grep '^NRESE_' | grep -vx NRESE_LAYOUT_PAD); do unset $v; done; "
+            f"env {env} /target/release/nrese-server > {out}-server.log 2>&1 & pid=$!; "
+            "trap 'kill $pid 2>/dev/null; wait $pid' EXIT; "
+            f"for i in $(seq 600); do curl -sf -o /dev/null --max-time 5 {base}/readyz && break; kill -0 $pid "
+            "2>/dev/null || { echo 'endpoint: the server ended before it was ready' >&2; exit 3; }; sleep 0.1; done; "
+            f"c=$(curl -sS -o {out}-load.txt --max-time 300 -X PUT -H 'Content-Type: application/n-triples' "
+            f"--data-binary @{data} '{base}/dataset/data?default' -w '%{{http_code}}'); "
+            "case $c in 2??) ;; *) echo \"endpoint: the load answered $c\" >&2; exit 4;; esac; "
+            f"curl -sS -o {out}.json --max-time 310 -w 'fast-endpoint-request %{{http_code}} %{{time_total}}\\n' "
+            f"'{base}/dataset/classification' >&2")
+
+
+def endpoint_answer(http: int, path: Path) -> tuple[list | None, str]:
+    """The pairs a `/dataset/classification` answer states, one form for every side's server, or
+    None and why it is no answer: not 200, unreadable, undecided (`consistent` null), or marked
+    incomplete (`complete` false or `incomplete` reasons: engine-v2's; `skipped` axioms: main's).
+    Its pairs: `subsumptions`, `unsatisfiable` below owl:Nothing, and `equivalent_to_thing` above
+    owl:Thing, a field only engine-v2's server has: an answer without it states no such class."""
+    if http != 200:
+        return None, f"not answered: HTTP {http}"
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+        path.unlink()
+    except (OSError, ValueError) as error:
+        return None, f"not answered: the answer can't be read ({error})"
+    lists = ("subsumptions", "unsatisfiable", "equivalent_to_thing")
+    if not (isinstance(body, dict) and isinstance(body.get("subsumptions"), list)
+            and all(isinstance(body.get(k, []), list) for k in lists)
+            and all(isinstance(p, list) and len(p) == 2 for p in body["subsumptions"])):
+        return None, f"not answered: not a classification answer ({json.dumps(body)[:200]})"
+    marks = {k: body[k] for k in ("complete", "incomplete", "skipped", "consistent") if k in body}
+    if marks.get("complete") is False or marks.get("incomplete") or marks.get("skipped") \
+            or ("consistent" in marks and marks["consistent"] is None):
+        return None, f"not answered: marked incomplete {json.dumps(marks)[:300]}"
+    thing, nothing = "http://www.w3.org/2002/07/owl#Thing", "http://www.w3.org/2002/07/owl#Nothing"
+    return ([tuple(p) for p in body.get("subsumptions", [])] + [(c, nothing) for c in body.get("unsatisfiable", [])]
+            + [(thing, c) for c in body.get("equivalent_to_thing", [])]), ""
+
+
+def closed(pairs: list) -> list:
+    """The transitive closure of `pairs` (neither server says whether its pairs are closed)."""
+    above: dict = {}
+    for a, b in pairs:
+        if a != b:
+            above.setdefault(a, set()).add(b)
+    out = []
+    for a, direct in above.items():
+        seen, todo = set(), list(direct)
+        while todo:
+            b = todo.pop()
+            if b not in seen:
+                seen.add(b)
+                todo.extend(above.get(b, ()))
+        out += [(a, b) for b in seen if b != a]
+    return out
 
 
 # A query the engine refused at its memory limit, as perf_lab reports it: the query's error, the
