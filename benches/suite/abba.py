@@ -522,6 +522,11 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
                                **{("back", h): p for h, p in back["pvalues"].items()}})
     problems += [f"the A-A' arm itself differs: {h} ({'A slower' if d == 'aa' else 'A faster'} than its copy)"
                  for d, h in sorted(rejected)]
+    # A cost appearing from below the counter's step between two copies of one build (the gate's
+    # `emerged`, decided by the readings, never by Holm): the instrument's, as above.
+    problems += [f"the A-A' arm itself differs: {e['case']} {e['dimension']}: emerged from below the counter's "
+                 f"step ({'A' if arm is back else 'A′'} {rg.fmt(e['new'])} {e['unit']})"
+                 for arm in (aa, back) for e in arm.get("emerged", [])]
     if problems:
         return problems, aa, None, host
     # B against A: its spread at least the run's own A-A' floor, or its host's where larger.
@@ -628,8 +633,15 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
     untested = decided["not_compared"]
     out["not_compared"] = untested
     m = len(family["hypotheses"])
-    if decided["losses"]:
-        code, word = CONFIRMED, "**Confirmed loss** (exit 4): Holm over the family rejects, the rounds combined"
+    # A cost appearing from below the counter's step in any round (the gate's `emerged`): decided
+    # by the readings, no round to wait for; A-B-B-A has no owner's policy to accept it.
+    emerged = [(k, e) for k, (_, _, ab, _) in enumerate(judged, 1) for e in ab.get("emerged", [])]
+    out["emerged"] = [{"round": k, **e} for k, e in emerged]
+    if decided["losses"] or emerged:
+        code, word = CONFIRMED, ("**Confirmed loss** (exit 4): " + "; ".join(
+            (["Holm over the family rejects, the rounds combined"] if decided["losses"] else [])
+            + [f"round {k}: {e['case']} {e['dimension']} emerged from below the counter's step "
+               f"({rg.fmt(e['base'])} -> {rg.fmt(e['new'])} {e['unit']})" for k, e in emerged]))
     elif decided["pending"]:
         code, word = LOSS_SHOWN, "**Loss shown** (exit 1): a confirmation round is due (abba.py jobs --round 2)"
     elif untested:
