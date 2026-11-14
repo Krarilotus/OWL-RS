@@ -14,6 +14,18 @@ What is left before v2 goes to `main`, with owners and state, is the status tabl
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the sections from "Audit
 work" on are the record by goal.
 
+## Dated changes
+
+Changes that affect stored data, answers or clients, with their dates and what to do:
+- Upgrading a store written by an earlier version: what changes on purpose, and rolling back
+  ([upgrade](ops/server-setup.md#131-upgrading-a-store-from-main-to-v2)).
+- Reasoning semantics versions 4 (7 November 2026) and 3 (28 October 2026): which stored
+  verdicts and closures are rebuilt once ([reasoning semantics](spec/reasoning-semantics.md)).
+- Crash recovery of the write-ahead log (2 November 2026) and durable renames on Windows
+  (7 November 2026): what each changed ([ADR-0002](adr/0002-engine-storage-lsm-permutations.md)).
+- Routes of the earlier release, deprecated since 3 October 2026 and answering until the next
+  release ([HTTP interface](ops/http-api.md#service-and-operations)).
+
 ## Execution and performance (PR #23)
 
 The PR's implementation base is `0f46563`. The measurements are rows of the

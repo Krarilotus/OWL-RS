@@ -1,7 +1,7 @@
 # Vision and Scope
 
 What NRESE is meant to become; "in scope" below includes work not done yet. What it does
-today: [What it covers](../../README.md#what-it-covers); what it leaves out:
+today: [What it covers](../what-it-covers.md); what it leaves out:
 [limits](../limits.md); the order of the work left: [ROADMAP](../ROADMAP.md).
 
 ## Product vision
@@ -42,4 +42,4 @@ Nothing of the above. Until 2 October 2026 this list excluded OWL 2 DL reasoning
 
 ## Success criteria
 
-See [ROADMAP.md §1](../ROADMAP.md#1-goal-and-how-well-know-were-there).
+See [the roadmap's goal](../ROADMAP.md#goal).

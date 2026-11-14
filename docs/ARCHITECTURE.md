@@ -2,7 +2,7 @@
 
 This is the canonical architecture document. It says which layer owns which concern, which way dependencies may point, and — most importantly for day-to-day work — **at which layer a given kind of problem must be fixed**. Specs under `docs/spec/` refine individual concerns; if they contradict this file, this file wins and the spec is updated.
 
-Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the code of the commit it is in; what NRESE covers today is listed in the [README](../README.md#what-it-covers), what is planned in [ROADMAP.md](ROADMAP.md).
+Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the code of the commit it is in; what NRESE covers today is listed in [what it covers](what-it-covers.md), what is planned in [ROADMAP.md](ROADMAP.md).
 
 ## 1. Product target
 
@@ -78,16 +78,16 @@ Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any chang
 
 **Bulk load:** `nrese-server load` bypasses the pipeline: the engine writes the quads,
 then the reasoner recomputes the inferences and runs the rules' consistency checks
-([what a commit does](../README.md#what-a-commit-does)).
+([what a commit does](what-it-covers.md#what-a-commit-does)).
 
 ### 2.3 Concepts: where each is explained and where its code is
 
 | Concept | Explained in | Code |
 |---|---|---|
 | Storage, snapshots, durability | [storage contract](spec/02-storage-and-transactions.md), §4 | `crates/nrese-engine/src/lib.rs`, `crates/nrese-engine/src/durability/mod.rs` |
-| A commit and its gates | [what a commit does](../README.md#what-a-commit-does), §2.2 | `crates/nrese-store/src/mutation/mod.rs` |
+| A commit and its gates | [what a commit does](what-it-covers.md#what-a-commit-does), §2.2 | `crates/nrese-store/src/mutation/mod.rs` |
 | SPARQL query and update | [HTTP interface](ops/http-api.md#sparql), §5 | `crates/nrese-sparql/src/lib.rs` |
-| What an answer promises | [the README](../README.md#what-an-answer-promises) | `crates/nrese-sparql/src/completeness.rs` |
+| What an answer promises | [what it covers](what-it-covers.md#what-an-answer-promises) | `crates/nrese-sparql/src/completeness.rs` |
 | Reasoning modes and rules | [reasoning semantics](spec/reasoning-semantics.md) | `crates/nrese-reasoner/src/lib.rs`; when it runs: `crates/nrese-store/src/reasoning.rs` |
 | OWL 2 DL | [design](design/owl2-dl.md) | `crates/nrese-dl/src/lib.rs`, `crates/nrese-owl/src/lib.rs`, `crates/nrese-store/src/dl/mod.rs` |
 | SHACL | [design](design/shacl.md), [HTTP interface](ops/http-api.md#shacl-validation) | `crates/nrese-shacl/src/lib.rs`, `crates/nrese-store/src/shacl.rs` |
@@ -98,7 +98,36 @@ then the reasoner recomputes the inferences and runs the rules' consistency chec
 | Read replicas | [replication](ops/replication.md) | `crates/nrese-server/src/replication.rs` |
 | Configuration | [configuration reference](ops/config-reference.md) | `crates/nrese-server/src/config.rs` |
 | HTTP endpoints and errors | [HTTP interface](ops/http-api.md) | `crates/nrese-server/src/http/mod.rs` |
-| RDF syntaxes | [the README](../README.md#rdf-syntaxes) | `crates/rdf/nrese-rdf-io/src/lib.rs` |
+| RDF syntaxes | [what it covers](what-it-covers.md#rdf-syntaxes) | `crates/rdf/nrese-rdf-io/src/lib.rs` |
+
+### 2.4 Dependencies, and using a crate on its own
+
+Every direct dependency of each crate (test-only ones left out); the picture in §2 shows the layers,
+and §2.1 what each crate owns. None of the crates is on crates.io
+(`publish = false`), and none promises a stable API yet. "On its own" says whether a
+crate's job stands without the rest of the stack; to use one, take it as a git dependency
+pinned to a commit. Their API reference isn't published: `cargo doc -p CRATE --open` builds
+it from a checkout, and each crate's `lib.rs` opens with what the crate owns.
+
+| Crate | Uses | On its own |
+|---|---|---|
+| [`nrese-xsd`](../crates/rdf/nrese-xsd) | – | Yes |
+| [`nrese-json`](../crates/rdf/nrese-json) | – | Yes |
+| [`nrese-rdf`](../crates/rdf/nrese-rdf) | `nrese-xsd` (optional) | Yes |
+| [`nrese-rdf-io`](../crates/rdf/nrese-rdf-io) | `nrese-rdf`, `nrese-json` | Yes |
+| [`nrese-sparql-syntax`](../crates/rdf/nrese-sparql-syntax) | `nrese-rdf` | Yes |
+| [`nrese-sparql-results`](../crates/rdf/nrese-sparql-results) | `nrese-rdf`, `nrese-json` | Yes |
+| [`nrese-exec`](../crates/nrese-exec) | – | Yes: knows no terms |
+| [`nrese-vector`](../crates/nrese-vector) | `nrese-exec` | Yes |
+| [`nrese-owl`](../crates/nrese-owl) | – | Yes: works over the caller's term ids |
+| [`nrese-dl`](../crates/nrese-dl) | `nrese-owl`, `nrese-exec`, `nrese-xsd` | Yes, with example command-line tools |
+| [`nrese-engine`](../crates/nrese-engine) | `nrese-rdf`, `nrese-exec`, `nrese-vector` | Yes: a quad store without SPARQL |
+| [`nrese-sparql`](../crates/nrese-sparql) | `nrese-engine`, `nrese-exec`, `nrese-owl`, `nrese-rdf`, `nrese-xsd`, `nrese-sparql-syntax`, `nrese-sparql-results` | With `nrese-engine` |
+| [`nrese-reasoner`](../crates/nrese-reasoner) | `nrese-engine`, `nrese-exec`, `nrese-owl`, `nrese-rdf`, `nrese-rdf-io`, `nrese-xsd` | With `nrese-engine` |
+| [`nrese-shacl`](../crates/nrese-shacl) | `nrese-engine`, `nrese-exec`, `nrese-sparql`, `nrese-sparql-syntax`, `nrese-rdf`, `nrese-xsd` | With `nrese-engine` and `nrese-sparql` |
+| [`nrese-store`](../crates/nrese-store) | every crate above | Yes: everything but HTTP |
+| [`nrese-server`](../crates/nrese-server) | `nrese-store`, `nrese-sparql`, `nrese-reasoner`, `nrese-exec`, `nrese-rdf`, `nrese-rdf-io`, `nrese-xsd`, `nrese-sparql-results` | The binary |
+| [`apps/nrese-console`](../apps/nrese-console) | the HTTP API only | With a server |
 
 ## 3. Where to fix what
 

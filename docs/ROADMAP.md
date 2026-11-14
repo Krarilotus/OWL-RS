@@ -9,7 +9,7 @@ are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions
 
 An RDF database and ontology platform with reasoning at its centre
 ([vision](spec/00-vision-and-scope.md)). What it does today, with its limits, is listed
-in [What it covers](../README.md#what-it-covers). What is still to come is the order
+in [What it covers](what-it-covers.md). What is still to come is the order
 below; across machines, only read replicas are built so far.
 
 ## The order (owner, 5 October 2026)

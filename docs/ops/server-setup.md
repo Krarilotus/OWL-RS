@@ -294,7 +294,7 @@ docker run -d --name nrese \
   nrese
 ```
 
-`nrese` is the image built from this repository (`docker build -t nrese .`, as in the [README](../../README.md#quick-start)). The image sets `NRESE_BIND_ADDR=0.0.0.0:8080`, `NRESE_STORE_MODE=on-disk` and `NRESE_DATA_DIR=/var/lib/nrese/data`, and keeps the server's defaults for everything else ([configuration](config-reference.md)); the example names two of them only to show them.
+`nrese` is the image built from this repository (`docker build -t nrese .`, as in the [README](../../README.md#quick-start)). The image sets `NRESE_BIND_ADDR=0.0.0.0:8080`, `NRESE_STORE_MODE=on-disk` and `NRESE_DATA_DIR=/var/lib/nrese/data`, and keeps the server's defaults for everything else ([configuration](config-reference.md)); the example names two of them only to show them. The image's entrypoint is `nrese-server`, so a [command](#commands) runs as `docker run --rm nrese config-schema`; from source, `cargo run --release -p nrese-server -- COMMAND`.
 
 ### 7.3 Kubernetes Notes
 - Use readiness probe `/readyz` and liveness probe `/healthz`.
