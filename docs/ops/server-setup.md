@@ -349,12 +349,12 @@ server {
 ## 10. Backup and Recovery Setup
 - Schedule periodic snapshot backups to local or remote object storage.
 - Validate backups with periodic restore drills.
-- Recovery procedure:
+- Recovery procedure, from an image backup (`backups/<seconds>/` of the data directory, or a copy of it elsewhere):
 1. Stop writer traffic.
-2. Restore latest consistent snapshot to staging path.
-3. Start the server on it with writes disabled (`server.deployment_posture = "read-only-demo"`).
-4. Run integrity checks and smoke queries.
-5. Promote restored dataset and switch traffic.
+2. Restore the newest image into an empty staging directory: `NRESE_DATA_DIR=/srv/nrese-staging nrese-server restore /srv/nrese-data/backups/<seconds>` (with `--wal` to replay the log after it: [point-in-time restore](#5-configuration-surface)). Exit `0` means the image passed its manifest check and is in place.
+3. Start a server on it with writes disabled, on another port: `NRESE_DATA_DIR=/srv/nrese-staging NRESE_DEPLOYMENT_POSTURE=read-only-demo NRESE_BIND_ADDR=127.0.0.1:8081 nrese-server`.
+4. Check it: `/readyz` answers `200`; `GET /api/v1/repositories/{id}/info` (as a whole-dataset reader or administrator) gives the `revision` and `quad_count` you expect; a few known queries answer as before. For a full comparison of two servers, run the [drill](backup-restore-drills.md#a-complete-drill)'s count step against both.
+5. Promote it: stop the staging server, start the production server with `NRESE_DATA_DIR` pointing at the restored directory, check `/readyz` again, then switch traffic.
 
 ## 11. Production Readiness Checklist
 - W3C protocol endpoints reachable and authenticated as expected.
