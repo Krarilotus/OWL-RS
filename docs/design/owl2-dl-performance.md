@@ -149,7 +149,7 @@ mechanisms, and where each lands:
 
 ## 4. NRESE's own levers, level by level
 
-Beyond the state of the art: what only a reasoner built into a store, in Rust, with this
+These levers are what only a reasoner built into a store, in Rust, with this
 project's existing engines can do.
 
 | Level | Lever | First measurable effect |
@@ -165,7 +165,7 @@ project's existing engines can do.
 | Machine | **Work stealing (rayon)** for contexts and classification tests; **per-worker arenas** freed per task (Konclude's block allocation); **lock-free activation** (ELK) | the concurrency curve, measured 1→16 threads |
 | Machine | **Profile-guided build** (PGO) once a corpus represents the load; `target-cpu` dispatch where AVX2 or AVX-512 pays | the whole-task times |
 
-## 5. The method: every number measured, nothing claimed
+## 5. The method
 
 **The DL lab** (`benches/reasoning/dl`, built in 2.3) is the perf lab of phase 3:
 - **The same tasks in the same runner:** the reference reasoners in one JVM per batch, and NRESE's engines through `nrese.py` (or a native runner once `nrese-dl` exists).

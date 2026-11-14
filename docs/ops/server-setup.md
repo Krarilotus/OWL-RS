@@ -68,8 +68,8 @@ Durable storage note:
 - Checkpoints run in the background and delete the WAL segments they cover.
 - Backups:
   - **Image backups** (physical): `POST /api/v1/repositories/{id}/image` (admins; the earlier `POST /ops/api/admin/dataset/image`, with `?repository=ID` for another repository than the default, still answers, into `backups/<ID>-<seconds>/`) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline: `nrese-server backup DIR`. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target: it checks the image against its manifest and places it in the data directory, which must hold no store; the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
-  - **N-Quads export**: `GET /api/v1/repositories/{id}/backup` and `POST …/restore` (earlier: `/ops/api/admin/dataset/backup`, `/restore`): asserted statements only, portable to other stores, inferences derived again after a restore.
-  - **Point-in-time restore**: with `store.wal_archive` on, checkpoints move the WAL segments they cover into `wal-archive/` instead of deleting them. `nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N` restores the image and replays the log up to revision `N` (every commit is one revision: `/api/v1/repositories/{id}/info` gives it to whole-dataset readers or administrators, and the logs record it), or with `--until-time 2026-10-02T14:05:00Z` (RFC 3339 with a zone, read by the `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's midnight, digits past the microsecond cut off) the commits made up to that time (logged since WAL version 6), cutting it there; without `--until-revision` as far as the log goes. A restore by time refuses an image whose last commit was made after the time (take an older image), or one with no commit time; restore by revision instead. Images without a commit time: those written before 7 Nov 2026 (checkpoint format 11), and every image, a bulk replacement's included, of a store that was upgraded from such a checkpoint, of a store created before 2 Oct 2026 (it keeps integer literals in its dictionary, and its log keeps no times), or of a replica of one of these. To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export into a new, empty data directory; that store's images have commit times. After a refusal the target directory holds the placed image, so clear it before trying again. The target data directory must hold no store. `nrese-server prune-archive R` removes the archived segments whose records all come before revision `R` (after an image backup at `R - 1` or later they are not needed; safe while the server runs).
+  - N-Quads export: `GET /api/v1/repositories/{id}/backup` and `POST …/restore` (earlier: `/ops/api/admin/dataset/backup`, `/restore`): asserted statements only, portable to other stores, inferences derived again after a restore.
+  - Point-in-time restore: with `store.wal_archive` on, checkpoints move the WAL segments they cover into `wal-archive/` instead of deleting them. `nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N` restores the image and replays the log up to revision `N` (every commit is one revision: `/api/v1/repositories/{id}/info` gives it to whole-dataset readers or administrators, and the logs record it), or with `--until-time 2026-10-02T14:05:00Z` (RFC 3339 with a zone, read by the `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's midnight, digits past the microsecond cut off) the commits made up to that time (logged since WAL version 6), cutting it there; without `--until-revision` as far as the log goes. A restore by time refuses an image whose last commit was made after the time (take an older image), or one with no commit time; restore by revision instead. Images without a commit time: those written before 7 Nov 2026 (checkpoint format 11), and every image, a bulk replacement's included, of a store that was upgraded from such a checkpoint, of a store created before 2 Oct 2026 (it keeps integer literals in its dictionary, and its log keeps no times), or of a replica of one of these. To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export into a new, empty data directory; that store's images have commit times. After a refusal the target directory holds the placed image, so clear it before trying again. The target data directory must hold no store. `nrese-server prune-archive R` removes the archived segments whose records all come before revision `R` (after an image backup at `R - 1` or later they are not needed; safe while the server runs).
   - Or copy the directory while the server is stopped.
 
 External exposure note:
@@ -97,14 +97,14 @@ $env:NRESE_STORE_MODE = "on-disk"; $env:NRESE_DATA_DIR = ".\data"
 nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] [--strict | --quarantine] data.nt more.nq ...
 ```
 
-- **Behaviour:**
+- Behaviour:
   - The format comes from each file's extension.
   - `--replace` swaps the dataset instead of adding to it.
   - `--graph` sets the target graph for triple formats; quad formats keep their own graphs.
   - Blank nodes are fresh per load.
   - A statement with a syntax error goes into the repository's quarantine and the load goes on (`store.invalid_statements = "quarantine"`, the default; `--quarantine`, or the older `--skip-errors`): a line of N-Triples or N-Quads, a Turtle or TriG statement up to its `.`, an RDF/XML node element, a JSON-LD top-level object. It is kept with its file, line and reason, and its text verbatim except for RDF/XML and JSON-LD, invisible to queries, reasoning, exports and statistics until it is re-admitted (fixed, or repaired on request, through the commit gates) or discarded ([quarantine.md](../design/quarantine.md)). The load prints the count and the first examples. With `--strict` (or `store.invalid_statements = "strict"`) the first stops the load and nothing of it is committed. Malformed XML or JSON and read errors always stop.
-- **Offline only.** The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
-- **Speed.** N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
+- Bulk loading is offline only. The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
+- N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
 
 ### 5.4.1 One-off Queries and Conversions
 
@@ -158,7 +158,7 @@ Commands marked *store* open the configured store and lock its data directory: t
 A server that fails to start writes `Error: <message>` and its causes to standard error (the journal, `docker logs`) and exits `1`. Configuration errors name the setting; run `nrese-server check-config` with the same configuration to see them without starting.
 
 <a id="err-data-directory-locked"></a>
-**Data directory locked.**
+#### Data directory locked
 
 ```text
 Error: storage engine error: data directory ./data is locked by another process
@@ -167,12 +167,12 @@ Caused by:
     data directory ./data is locked by another process
 ```
 
-- **Cause:** another process has the store in `store.data_dir` (the path shown) open: a running server, or an offline command (`load`, `query`, `print-query`, `backup`) on the same directory. The lock is that process's hold on the directory's `LOCK` file, released when it closes the store.
-- **Fix:** stop the other process (`systemctl stop nrese`, `docker stop nrese`), or wait for the offline command to end; or give this one another data directory. On Linux, `fuser DATA_DIR/LOCK` names the process. Don't delete `LOCK`: the file isn't the lock, the other process's hold on it is.
-- **Check:** start the server again; once it reports ready, `curl -fsS http://127.0.0.1:8080/readyz` answers `{"status":"ready"}`.
+- The cause is that another process has the store in `store.data_dir` (the path shown) open: a running server, or an offline command (`load`, `query`, `print-query`, `backup`) on the same directory. The lock is that process's hold on the directory's `LOCK` file, released when it closes the store.
+- To fix it, stop the other process (`systemctl stop nrese`, `docker stop nrese`), or wait for the offline command to end; or give this one another data directory. On Linux, `fuser DATA_DIR/LOCK` names the process. Don't delete `LOCK`: the file isn't the lock, the other process's hold on it is.
+- To check the fix, start the server again; once it reports ready, `curl -fsS http://127.0.0.1:8080/readyz` answers `{"status":"ready"}`.
 
 <a id="err-failed-to-bind"></a>
-**Address can't be bound.**
+#### Address can't be bound
 
 ```text
 Error: failed to bind 0.0.0.0:8080
@@ -181,9 +181,9 @@ Caused by:
     Address already in use (os error 98)
 ```
 
-- **Cause:** the cause line says which. `Address already in use`: another process listens on that port. `Cannot assign requested address`: the address isn't one of this machine's. `Permission denied`: a port below 1024 without the right to bind it.
-- **Fix:** stop the other listener (on Linux, `ss -ltnp 'sport = :8080'` names it), or set another address or port: `server.bind_address` (`NRESE_BIND_ADDR`), for example `127.0.0.1:8081`. In Docker the server binds inside the container; a busy port on the machine shows as `docker run`'s own error, `port is already allocated`: publish another one (`-p 127.0.0.1:8081:8080`).
-- **Check:** start the server again; `curl -fsS http://127.0.0.1:8080/readyz` (with the port you chose) answers `{"status":"ready"}`.
+- The cause line says which cause it is. `Address already in use`: another process listens on that port. `Cannot assign requested address`: the address isn't one of this machine's. `Permission denied`: a port below 1024 without the right to bind it.
+- To fix it, stop the other listener (on Linux, `ss -ltnp 'sport = :8080'` names it), or set another address or port: `server.bind_address` (`NRESE_BIND_ADDR`), for example `127.0.0.1:8081`. In Docker the server binds inside the container; a busy port on the machine shows as `docker run`'s own error, `port is already allocated`: publish another one (`-p 127.0.0.1:8081:8080`).
+- To check the fix, start the server again; `curl -fsS http://127.0.0.1:8080/readyz` (with the port you chose) answers `{"status":"ready"}`.
 
 ## 5.5 Local Test-Server Startup Example (PowerShell)
 
@@ -421,17 +421,17 @@ A data directory written by an earlier NRESE opens as it is: no migration step. 
 3. Check `/readyz` for readiness, then read `revision` and `quad_count` from `/api/v1/repositories/{id}/info` as a whole-dataset reader or administrator, and compare a few known queries against the old server's answers.
 
 What changes on purpose:
-- **Answers through existentials under `owl2-ql`:** the QL rewriting is on by default there (`reasoner.ql_rewriting = "auto"`), so queries can find individuals that only an existential axiom makes match (`Employee ⊑ ∃worksFor`: an employee without a stated employer now works for something). `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the earlier answers. Under `owl2-rl` nothing changes.
+- Queries under `owl2-ql` get answers through existentials: the QL rewriting is on by default there (`reasoner.ql_rewriting = "auto"`), so queries can find individuals that only an existential axiom makes match (`Employee ⊑ ∃worksFor`: an employee without a stated employer now works for something). `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the earlier answers. Under `owl2-rl` nothing changes.
 - **The N-Quads export's checksum** moves from a leading header to the end: the export streams (constant memory, at any store size), so its SHA-256 is known only after the body. It closes the body as the comment `# nrese-sha256 <hex>` (over every byte before it; N-Quads readers skip it) and follows it as the trailer `x-nrese-checksum-sha256`, announced in `Trailer` (HTTP/1.1 clients ask for trailers with `TE: trailers`). A restore checks the comment where present and refuses a mismatch (400). Graph Store `GET` and the export stream too, and their timeout (`budgets.graph_read_timeout`) bounds the first chunk and each stall, not the whole transfer.
-- **Repository ids:** new repositories can't have an id starting or ending with `.` or a Windows device name (`CON`, `NUL`, `COM1`, ...). Existing ones keep working and are logged at start; copy one into a repository with another id to move the data directory between systems.
+- New repositories can't have an id starting or ending with `.` or a Windows device name (`CON`, `NUL`, `COM1`, ...). Existing ones keep working and are logged at start; copy one into a repository with another id to move the data directory between systems.
 
-**One process per data directory:** a second process opening a data directory one already has open is refused (`Locked`), whichever version each runs: earlier and this version lock the directory's `LOCK` file the same way. The lock is the open file's (`flock` on Unix, `LockFileEx` on Windows): reading or copying `LOCK` doesn't release it, and it is released when the store is closed, even while a child process the server started is still starting. Don't put a data directory on NFS: Linux emulates that lock there in a way any other close of the file releases.
+A data directory is open in one process at a time: a second process opening a data directory one already has open is refused (`Locked`), whichever version each runs: earlier and this version lock the directory's `LOCK` file the same way. The lock is the open file's (`flock` on Unix, `LockFileEx` on Windows): reading or copying `LOCK` doesn't release it, and it is released when the store is closed, even while a child process the server started is still starting. Don't put a data directory on NFS: Linux emulates that lock there in a way any other close of the file releases.
 
-**New data directories:** opening a store or restoring an image creates the data directory and any missing directory above it, and makes each one's name durable by syncing the directory that holds it. A directory directly under a drive's root (`D:\nrese-data`) works. If the holding directory can't be synced (for example one this process can't read), the open or restore is refused: create the data directory beforehand.
+Opening a store or restoring an image creates the data directory and any missing directory above it, and makes each one's name durable by syncing the directory that holds it. A directory directly under a drive's root (`D:\nrese-data`) works. If the holding directory can't be synced (for example one this process can't read), the open or restore is refused: create the data directory beforehand.
 
-**Rolling back:** the earlier binary opens the directory again only until this version writes its first checkpoint (a bulk load, a background or explicit checkpoint): from then on checkpoints are format 12, which earlier binaries refuse (`UnsupportedFormat`). To roll back after that, restore the image backup taken before the upgrade, with the earlier binary. Before that point it opens the directory (checkpoint format 11, unchanged log), rebuilding the stacks whose rules differ. A repository switched to a mode only the new version has (`owl2-dl`) isn't opened by the earlier one: switch it back first. Settings only the new version knows (`ql_rewriting`, `query_timeout_ms`, access `inferred = "supported"`) are ignored, `supported` reading as `hidden`.
+On a rollback, the earlier binary opens the directory again only until this version writes its first checkpoint (a bulk load, a background or explicit checkpoint): from then on checkpoints are format 12, which earlier binaries refuse (`UnsupportedFormat`). To roll back after that, restore the image backup taken before the upgrade, with the earlier binary. Before that point it opens the directory (checkpoint format 11, unchanged log), rebuilding the stacks whose rules differ. A repository switched to a mode only the new version has (`owl2-dl`) isn't opened by the earlier one: switch it back first. Settings only the new version knows (`ql_rewriting`, `query_timeout_ms`, access `inferred = "supported"`) are ignored, `supported` reading as `hidden`.
 
-**Tested** (`crates/nrese-server/tests/it/upgrade_tests.rs`): a data directory written by `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that writes it) opened by this build's binary: the same data and answers in every repository (the QL rewriting's one answer apart), every setting, local logins, current stacks, writes surviving a restart, and `main`'s image backup restoring.
+The upgrade is tested (`crates/nrese-server/tests/it/upgrade_tests.rs`): a data directory written by `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that writes it) opened by this build's binary: the same data and answers in every repository (the QL rewriting's one answer apart), every setting, local logins, current stacks, writes surviving a restart, and `main`'s image backup restoring.
 
 ### 13.2 Rollout
 - Prefer blue/green or canary rollout.
