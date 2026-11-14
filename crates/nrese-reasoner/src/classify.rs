@@ -21,12 +21,19 @@
 //! `owl:Thing`, `owl:Nothing`, `rdfs:subPropertyOf`, `owl:equivalentProperty`,
 //! `owl:propertyChainAxiom`, `owl:TransitiveProperty`, `rdfs:domain`, and `rdfs:range`
 //! (applied where a class axiom creates the edge), between named object properties. Every
-//! other class or property axiom is skipped and counted, outside EL (unions, universal
-//! restrictions, complements, cardinalities, inverses, nominals, data ranges) or not
-//! (property characteristics other than transitivity, disjoint properties, disjoint unions,
-//! self restrictions, named class expressions, the top and bottom properties, datatypes
-//! where a class is read, restrictions on data properties, nodes that state two
-//! expressions): the hierarchy is then complete for the part read only. OWL 2's global
+//! other class or property axiom is skipped and counted (OWL 2 Profiles §2.2):
+//! - outside OWL 2 EL: unions and disjoint unions, universal restrictions, complements,
+//!   cardinalities, inverse properties, nominals of more than one individual, disjoint
+//!   properties, functional, inverse-functional, irreflexive, symmetric and asymmetric
+//!   properties, and the data ranges EL lacks (complements, facet restrictions);
+//! - inside OWL 2 EL but not read here: nominals of one individual (`owl:oneOf` with one
+//!   member, `owl:hasValue`), self restrictions, reflexive properties, restrictions on data
+//!   properties, EL's data ranges (its datatypes, their intersections, one-literal
+//!   enumerations), and the top and bottom properties;
+//! - neither, but how the triples state them: named class expressions, datatypes where a
+//!   class is read, nodes that state two expressions.
+//!
+//! The hierarchy is then complete for the part read only. OWL 2's global
 //! restrictions are not checked: an irregular role hierarchy (*Structural Specification*
 //! §11.2), outside OWL 2 EL as well (Profiles §2.2.6), is read, and CR6 needs no regular one.
 //! A data property's domain and range, which say nothing about classes without such a
