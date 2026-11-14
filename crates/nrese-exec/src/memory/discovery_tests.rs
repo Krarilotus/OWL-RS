@@ -670,7 +670,9 @@ fn both_mount_readings_name_the_mount_a_handle_is_on() {
     let root = kernel.root().expect("/");
     let proc = kernel.open_at(&root, "proc").expect("/proc");
     let meminfo = kernel.open_at(&proc, "meminfo").expect("/proc/meminfo");
-    // mountinfo's id for a mount point: the last line names the mount on top.
+    // mountinfo's id for a mount point, the last line for it: the kernel lists mounts in the
+    // order they were made, so this is the mount on top where nothing older was moved over it,
+    // as on the hosts the tests run on; no general promise.
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
     let listed = |point: &str| -> Option<u64> {
         let line = mountinfo
