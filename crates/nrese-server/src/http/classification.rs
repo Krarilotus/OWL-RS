@@ -7,11 +7,13 @@
 //! superclass of unsatisfiable classes; `rdf:type` statements; an inconsistent ontology
 //! as the one statement `owl:Thing rdfs:subClassOf owl:Nothing`). Both forms carry the
 //! `NRESE-Completeness` header, so an undecided or incomplete answer is never unmarked.
+//! Nor is one a procedure outside OWL 2 DL gave: the header's `outside` and `by`, the
+//! JSON's `outside_profile`, and a comment line first in N-Triples say so.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_sparql::{Completeness, Regime};
+use nrese_sparql::{Completeness, Outside, Regime};
 use nrese_store::dl::Verdict;
 
 use crate::error::ApiError;
@@ -25,13 +27,26 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// The answer's status under OWL 2 DL: what it lists is entailed either way, so it is
 /// sound; complete only without reasons, of which the store's report lists an undecided
-/// consistency's (`nrese_store::ClassificationReport::incomplete`).
-fn completeness(incomplete: &[String]) -> Completeness {
+/// consistency's (`nrese_store::ClassificationReport::incomplete`). Marked where a
+/// procedure outside OWL 2 DL answered.
+fn completeness(incomplete: &[String], outside: Option<Outside>) -> Completeness {
     let mut status = Completeness::under(Regime::Owl2Dl);
     for why in incomplete {
         status.incomplete("dl", why.clone());
     }
+    status.outside = outside;
     status
+}
+
+/// The N-Triples form's first line where a procedure outside OWL 2 DL answered.
+fn outside_comment(outside: &Outside) -> String {
+    format!(
+        "# Outside OWL 2 DL ({}); answered by {}. Guaranteed: {} Not guaranteed: {}\n",
+        outside.what.join(", "),
+        outside.by,
+        outside.guaranteed,
+        outside.not_guaranteed
+    )
 }
 
 /// The verdict as JSON: `consistent` (`null` where undecided) and `consistency`.
@@ -119,7 +134,11 @@ pub async fn classify(
     state.ensure_serving()?;
     let store = state.store();
     let report = blocking(&state, "classification", move || store.classify(&scope)).await?;
-    let mut text = triples_head(&report.consistency);
+    let mut text = report
+        .outside
+        .as_ref()
+        .map_or_else(String::new, outside_comment);
+    text.push_str(&triples_head(&report.consistency));
     for (sub, sup) in &report.subsumptions {
         text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
     }
@@ -127,7 +146,7 @@ pub async fn classify(
         text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
     }
     let (consistent, consistency) = verdict_json(&report.consistency);
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "profile": "OWL 2 DL",
         "engine": report.engine,
         "complete": report.complete(),
@@ -139,7 +158,15 @@ pub async fn classify(
         "unsatisfiable": report.unsatisfiable,
         "equivalent_to_thing": report.equivalent_to_thing,
     });
-    let status = completeness(&report.incomplete);
+    if let Some(outside) = &report.outside {
+        json["outside_profile"] = serde_json::json!({
+            "what": outside.what,
+            "by": outside.by,
+            "guaranteed": outside.guaranteed,
+            "not_guaranteed": outside.not_guaranteed,
+        });
+    }
+    let status = completeness(&report.incomplete, report.outside);
     respond(wants_triples(headers), text, json, &status)
 }
 
@@ -173,6 +200,6 @@ pub async fn realise(
         "micros": report.micros,
         "types": types,
     });
-    let status = completeness(&report.incomplete);
+    let status = completeness(&report.incomplete, None);
     respond(wants_triples(headers), text, json, &status)
 }

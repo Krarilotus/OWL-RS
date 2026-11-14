@@ -32,6 +32,9 @@ pub struct ClassificationReport {
     pub engine: &'static str,
     /// Why the hierarchy may lack subsumptions (empty: it is complete).
     pub incomplete: Vec<String>,
+    /// Set where a procedure outside OWL 2 DL answered (`el`): what is outside, and what
+    /// its answer guarantees and what not.
+    pub outside: Option<nrese_sparql::Outside>,
     pub micros: u64,
 }
 
@@ -116,7 +119,12 @@ impl StoreService {
             Ok(el) => {
                 let c = &el.classification;
                 let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
-                (lists, &el.consistency, "el", Vec::new())
+                (
+                    lists,
+                    &el.consistency,
+                    "el",
+                    el.unproven.iter().cloned().collect(),
+                )
             }
             Err((taxonomy, stopped)) => {
                 let c = &taxonomy.classification;
@@ -144,6 +152,7 @@ impl StoreService {
             consistency: consistency.clone(),
             engine,
             incomplete: reasons(consistency, incomplete),
+            outside: answer.is_ok().then(dl::el_outside),
             micros: started.elapsed().as_micros() as u64,
         })
     }
