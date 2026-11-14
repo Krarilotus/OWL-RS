@@ -293,7 +293,7 @@ Limits today:
 
 ## Engine API (`/api/v1`)
 
-One repository-scoped API for what the server does ([ADR-0007](../adr/0007-one-engine-api.md); library-only parts, such as Notation3 data and resolving quarantined statements, have none yet), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; a test checks that every route is in it), for generating clients. Where it is less exact than this page, this page holds: for the SPARQL Protocol routes it marks a request body as required, `GET` included, and `query` as optional (send one of them, [as the contracts say](#endpoint-contracts)), lists only some of the failures, and gives errors the type `application/json`, where the server sends `application/problem+json` ([status codes](#status-codes)).
+One repository-scoped API for what the server does ([ADR-0007](../adr/0007-one-engine-api.md); library-only parts, such as Notation3 data and resolving quarantined statements, have none yet), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; tests check that every route is in it, and that each SPARQL Protocol request form it names is served and each refusal is described as `application/problem+json`), for generating clients.
 
 | URL | What |
 |---|---|
