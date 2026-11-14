@@ -255,6 +255,10 @@ impl<'e> BulkLoad<'e> {
         nrese_exec::heap::phase("load: numbering");
         let mut renumbered = Ok(());
         shared.dictionary.adopt_pending(pending, |adopted| {
+            // The shards' arrays, freed as their texts moved into the segment's arena, go
+            // back before any sort or index build (a spilled chunk's here, the quads' after):
+            // held, the text would count twice. Here the adoption guard is let go.
+            crate::memory::release_all();
             nrese_exec::heap::phase("load: renumbering");
             adopted.renumber(&mut quads);
             if let Some(spill) = spilled.as_mut() {

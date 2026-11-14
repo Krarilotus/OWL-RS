@@ -9,11 +9,12 @@
 //! the chunks and batches are, since a loader numbers its chunks in input order. The
 //! quads get provisional ids meanwhile ([`provisional`]).
 //!
-//! At the end, [`Pending::number`] sorts each shard by first occurrence and merges them:
+//! At the end, [`Gathered::number`] sorts each shard by first occurrence and merges them:
 //! the terms take the next dense ids in the order they first occur in the input, the same
-//! at any thread count. Only ids move: the text stays in the shards' arenas, which become
-//! a segment of the dictionary ([`Adopted`]), and the quads are renumbered through the
-//! shards ([`Adopted::renumber`]).
+//! at any thread count. The shards' texts move once before that, into one arena in shard
+//! order ([`Pending::gather`]); the shards, with that arena, become a segment of the
+//! dictionary ([`Adopted`]), and the quads are renumbered through the shards
+//! ([`Adopted::renumber`]).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -85,8 +86,10 @@ pub(crate) fn split(payload: u64) -> Option<(usize, u32)> {
 /// One shard's keys, one after another, as the dictionary's heap holds them.
 #[derive(Default)]
 pub(crate) struct Shard {
-    pub(crate) bytes: Vec<u8>,
-    /// Each key's end offset in `bytes` (a shard's text stays under 4 GiB: the
+    /// The keys while the load interns; empty once numbered, when they lie in the
+    /// segment's arena ([`Adopted::text_of`]).
+    bytes: Vec<u8>,
+    /// Each key's end offset in the shard's text (a shard's text stays under 4 GiB: the
     /// dictionary's under 1 TiB).
     pub(crate) ends: Vec<u32>,
     /// Each key's first position while loading; its final id once numbered (atomic so
@@ -111,19 +114,18 @@ impl Shard {
         self.ends.len()
     }
 
-    pub(crate) fn key(&self, local: usize) -> &[u8] {
-        entry(&self.bytes, &self.ends, local)
-    }
-
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u32> {
+    /// The entry `local` of `key` in the shard's text `text`, with `hash`, if it holds it.
+    fn find(&self, text: &[u8], hash: u64, key: &[u8]) -> Option<u32> {
         self.table
-            .find(hash, |&local| self.key(local as usize) == key)
+            .find(hash, |&local| {
+                entry(text, &self.ends, local as usize) == key
+            })
             .copied()
     }
 
     /// `key`'s entry, added if new, with `at` as its first position if it is earlier.
     fn intern(&mut self, key: &[u8], hash: u64, at: u64) -> u32 {
-        if let Some(local) = self.find(hash, key) {
+        if let Some(local) = self.find(&self.bytes, hash, key) {
             let first = self.slots[local as usize].get_mut();
             *first = (*first).min(at);
             return local;
@@ -197,6 +199,68 @@ impl Pending {
         self.shards.iter().all(|shard| shard.lock().len() == 0)
     }
 
+    /// Moves the shards' texts into one arena, in shard order, before the dictionary's
+    /// adoption guard is taken: shard by shard into one reserved array, the emptied arrays
+    /// going back after each step of whole shards ([`GATHER_STEP`]). A shard's array was grown by
+    /// doubling among what the other threads freed, and the release after interning splits
+    /// the huge pages under that memory. Over 256 arrays on 4 KiB pages the substring scan
+    /// ran 1.33 times as long as over one arena, with the same instructions
+    /// (q06-label-prefix over entities-10m at one thread: 3.3 M dTLB misses in 401 runs
+    /// against 3 K; 14 Nov 2026). One arena allocated whole, after that release, lies on
+    /// huge pages where the kernel gives them. Copied whole and given back after, the
+    /// arrays and the arena were both resident: DBpedia core's store load peaked 0.25 GiB
+    /// higher (14 Nov 2026). The arena costs DBpedia core's load about 3 % of its
+    /// time, the new pages' faults; a parallel copy, a zeroed arena and steps of 512 MiB
+    /// were no faster (14 Nov 2026).
+    pub(crate) fn gather(self) -> Gathered {
+        self.gather_by(GATHER_STEP)
+    }
+
+    /// [`Pending::gather`], each step ending at the first shard that brings it to `step`
+    /// bytes.
+    fn gather_by(self, step: usize) -> Gathered {
+        let mut shards: Vec<Shard> = self
+            .shards
+            .into_vec()
+            .into_iter()
+            .map(Mutex::into_inner)
+            .collect();
+        let mut text = Vec::with_capacity(shards.iter().map(|shard| shard.bytes.len()).sum());
+        let mut starts = Vec::with_capacity(shards.len() + 1);
+        let mut released = 0;
+        let last = shards.len() - 1;
+        for (s, shard) in shards.iter_mut().enumerate() {
+            starts.push(text.len());
+            text.extend_from_slice(&shard.bytes);
+            shard.bytes = Vec::new();
+            // The last step's arrays go back with the load's release after the adoption.
+            if text.len() - released >= step && s < last {
+                crate::memory::release_all();
+                released = text.len();
+            }
+        }
+        starts.push(text.len());
+        Gathered {
+            text,
+            starts,
+            shards,
+        }
+    }
+}
+
+/// The text a step of [`Pending::gather`] copies before the arrays it emptied go back: a
+/// step ends at the first shard that brings it to this, so it holds less than this plus
+/// that shard's text.
+const GATHER_STEP: usize = 256 << 20;
+
+/// A bulk load's new terms, their texts in one arena ([`Pending::gather`]), to be numbered.
+pub(crate) struct Gathered {
+    text: Vec<u8>,
+    starts: Vec<usize>,
+    shards: Vec<Shard>,
+}
+
+impl Gathered {
     /// Numbers the pending terms from `start` in the order of their first occurrence; a
     /// term `existing` finds (interned meanwhile by another path: a triple term's
     /// components) keeps that id and takes no new one. Each shard is sorted on its own
@@ -216,19 +280,19 @@ impl Pending {
         start: u64,
         existing: impl Fn(&[u8]) -> Option<u64> + Sync,
     ) -> Adopted {
-        let mut shards: Vec<Shard> = self
-            .shards
-            .into_vec()
-            .into_iter()
-            .map(Mutex::into_inner)
-            .collect();
+        let Gathered {
+            text,
+            starts,
+            mut shards,
+        } = self;
         // Lanes beside the caller: one per 16 K entries, up to the pool's width.
         let lanes = nrese_exec::slices::lanes_for(shards.iter().map(Shard::len).sum(), 1 << 14);
         // Per shard: its new entries by first position; known ones take their ids.
-        let orders: Vec<Vec<u32>> = nrese_exec::slices::map_mut(&mut shards, lanes, |_, shard| {
+        let orders: Vec<Vec<u32>> = nrese_exec::slices::map_mut(&mut shards, lanes, |s, shard| {
+            let part = &text[starts[s]..starts[s + 1]];
             let mut order: Vec<u32> = Vec::with_capacity(shard.len());
             for local in 0..shard.len() {
-                match existing(shard.key(local)) {
+                match existing(entry(part, &shard.ends, local)) {
                     Some(id) => *shard.slots[local].get_mut() = id,
                     None => order.push(local as u32),
                 }
@@ -236,13 +300,10 @@ impl Pending {
             order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
             // The arrays shed what growing by doubling left over (a shard at a time,
             // so the copies are small).
-            shard.bytes.shrink_to_fit();
             shard.ends.shrink_to_fit();
             shard.slots.shrink_to_fit();
-            let Shard {
-                table, bytes, ends, ..
-            } = shard;
-            table.shrink_to_fit(|&local| super::hash::key_hash(entry(bytes, ends, local as usize)));
+            let Shard { table, ends, .. } = shard;
+            table.shrink_to_fit(|&local| super::hash::key_hash(entry(part, ends, local as usize)));
             order
         });
         let total: usize = orders.iter().map(Vec::len).sum();
@@ -306,16 +367,21 @@ impl Pending {
         });
         Adopted {
             start,
+            text,
+            starts,
             shards,
             places,
         }
     }
 }
 
-/// A bulk load's terms in the dictionary: the shards' arenas as they were filled, the
-/// ids `start..start + len` in the order of first occurrence.
+/// A bulk load's terms in the dictionary: the shards' texts in one arena, the ids
+/// `start..start + len` in the order of first occurrence.
 pub(crate) struct Adopted {
     pub(crate) start: u64,
+    /// The shards' texts one after another, shard `s`'s at `starts[s]..starts[s + 1]`.
+    text: Vec<u8>,
+    starts: Vec<usize>,
     pub(crate) shards: Vec<Shard>,
     /// Per id from `start`: where its key lies ([`place`]).
     places: Vec<u64>,
@@ -326,9 +392,16 @@ impl Adopted {
     pub(crate) fn empty(start: u64) -> Self {
         Self {
             start,
+            text: Vec::new(),
+            starts: Vec::new(),
             shards: Vec::new(),
             places: Vec::new(),
         }
+    }
+
+    /// Shard `shard`'s text: its keys one after another, ending where its `ends` say.
+    pub(crate) fn text_of(&self, shard: usize) -> &[u8] {
+        &self.text[self.starts[shard]..self.starts[shard + 1]]
     }
 
     /// Entries in the segment (not counting keys that turned out to exist already).
@@ -339,19 +412,21 @@ impl Adopted {
     /// The key of id `start + offset`.
     pub(crate) fn key(&self, offset: u64) -> &[u8] {
         let place = self.places[offset as usize];
-        let shard = &self.shards[(place >> (32 + LENGTH_BITS)) as usize];
+        let s = (place >> (32 + LENGTH_BITS)) as usize;
+        let text = self.text_of(s);
         let at = (place >> LENGTH_BITS) as u32 as usize;
         match place & LONG {
-            LONG => shard.key(at),
-            length => &shard.bytes[at..at + length as usize],
+            LONG => entry(text, &self.shards[s].ends, at),
+            length => &text[at..at + length as usize],
         }
     }
 
     /// The id of `key` (hash `hash`), if the load interned it.
     pub(crate) fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        let shard = &self.shards[shard_of(hash)];
+        let s = shard_of(hash);
+        let shard = &self.shards[s];
         shard
-            .find(hash, key)
+            .find(self.text_of(s), hash, key)
             .map(|local| shard.slots[local as usize].load(Relaxed))
     }
 
@@ -384,7 +459,7 @@ impl Adopted {
 
     /// Bytes of keys, and of what finds them (offsets, ids, tables).
     pub(crate) fn bytes(&self) -> (u64, u64) {
-        let keys = self.shards.iter().map(|s| s.bytes.len() as u64).sum();
+        let keys = self.text.len() as u64;
         let index = self
             .shards
             .iter()
@@ -392,7 +467,7 @@ impl Adopted {
                 (s.ends.capacity() * 4 + s.slots.capacity() * 8 + s.table.capacity() * 5) as u64
             })
             .sum::<u64>()
-            + self.places.capacity() as u64 * 8;
+            + (self.places.capacity() + self.starts.capacity()) as u64 * 8;
         (keys, index)
     }
 
@@ -428,7 +503,7 @@ mod tests {
                 });
                 assert!(indexes.iter().all(|&index| split(index).is_some()));
             }
-            let adopted = pending.number(10, |_| None);
+            let adopted = pending.gather().number(10, |_| None);
             (0..adopted.len())
                 .map(|i| {
                     let key = adopted.key(i);
@@ -458,7 +533,8 @@ mod tests {
         pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
             (words[k], hash(words[k]))
         });
-        let adopted = pending.number(0, |_| None);
+        // A step of one byte: the texts move in as many steps as shards hold any.
+        let adopted = pending.gather_by(1).number(0, |_| None);
         let keys: Vec<&[u8]> = (0..adopted.len()).map(|i| adopted.key(i)).collect();
         assert_eq!(keys, words);
     }
