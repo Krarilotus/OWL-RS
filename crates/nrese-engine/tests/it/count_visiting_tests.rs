@@ -413,7 +413,7 @@ fn an_expanded_count_up_to_a_limit_stops_there() {
     assert_eq!(past, whole, "a limit past the count: the whole count");
     let (first, first_units) = units(1);
     assert!(
-        matches!(first, Count::AtLeast(k) if k >= 1 && k <= n),
+        matches!(first, Count::AtLeast(k) if (1..=n).contains(&k)),
         "{first:?}: stopped at the limit"
     );
     assert!(
