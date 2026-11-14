@@ -148,7 +148,7 @@ class RuntimeTimeouts(unittest.TestCase):
                             patch.object(fast, "end_scope"), patch.object(fast, "docker", return_value=done) as docker, \
                             patch.object(fast, "pinned", side_effect=lambda tag: tag), \
                             patch.object(fast, "AnonKernelSampler", lambda where, **_: SimpleNamespace(
-                                start=lambda: None, stop=lambda: 1 << 20)), \
+                                start=lambda: None, stop=lambda: 1 << 20, thp={})), \
                             patch.object(fast.subprocess, "run", return_value=done) as process:
                         self.assertEqual(fast.container("contract", 2, ["example"], timeout=timeout)[0], 0)
                     run = docker if runtime == "docker" else process

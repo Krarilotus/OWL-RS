@@ -106,13 +106,35 @@ def busy(seconds: float = 1.0) -> dict:
     return {"loadavg": read("/proc/loadavg"), "busy": sorted(found, key=lambda x: -x["cores"])[:10]}
 
 
+# The kernel's huge-page and compaction counters (/proc/vmstat, since boot): fast.py records them at a
+# pass's start and end (host_state, host_state_finished), so their difference is what the pass met.
+VMSTAT = ("thp_fault_alloc", "thp_fault_fallback", "thp_collapse_alloc", "thp_collapse_alloc_failed",
+          "compact_stall", "compact_fail")
+
+
+def free_blocks(buddyinfo: str, order: int = 9) -> int:
+    """Free blocks of `order` and above over every node and zone (/proc/buddyinfo: a zone's
+    free block counts by order, 0 first); order 9 is 2 MiB with 4 KiB pages, a huge page."""
+    return sum(int(n) for line in buddyinfo.splitlines() for n in line.split()[4 + order:])
+
+
+def counters(vmstat: str) -> dict:
+    fields = dict(line.split() for line in vmstat.splitlines() if len(line.split()) == 2)
+    return {k: int(fields[k]) for k in VMSTAT if k in fields}
+
+
 def memory() -> dict:
     info = {}
     for line in (read("/proc/meminfo", "") or "").splitlines():
         key, _, rest = line.partition(":")
-        if key in ("MemTotal", "MemAvailable", "Cached", "Dirty", "SwapTotal", "SwapFree", "AnonHugePages"):
+        if key in ("MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "SwapTotal", "SwapFree", "AnonHugePages"):
             info[key] = int(rest.split()[0]) // 1024
+    collapsed = read("/sys/kernel/mm/transparent_hugepage/khugepaged/pages_collapsed")
+    buddyinfo = read("/proc/buddyinfo")  # unreadable: no field, never 0 free blocks
     return {"mib": info,
+            **({"free_2mib_blocks": free_blocks(buddyinfo)} if buddyinfo else {}),
+            "vmstat": {**counters(read("/proc/vmstat", "") or ""),
+                       **({"khugepaged_pages_collapsed": int(collapsed)} if collapsed else {})},
             "thp": read("/sys/kernel/mm/transparent_hugepage/enabled"),
             "thp_defrag": read("/sys/kernel/mm/transparent_hugepage/defrag"),
             "swappiness": read("/proc/sys/vm/swappiness"),
