@@ -495,10 +495,10 @@ mod tests {
     }
 
     /// An EL run answers in time and is kept: a later request on the revision gets that
-    /// answer. One stopped (by a `dl.timeout` of zero, by the memory unread) answers no
-    /// classification and keeps nothing, and a memory stop is told apart from the deadline
-    /// by the store's memory error. (The stopped stores get the first one's taxonomy: their
-    /// own DL engines would stop too.)
+    /// answer. One stopped (by a `dl.timeout` of 1 ns, past before the run starts; by the
+    /// memory unread) answers no classification and keeps nothing, and a memory stop is told
+    /// apart from the deadline by the store's memory error. (The stopped stores get the first
+    /// one's taxonomy: their own DL engines would stop too.)
     #[test]
     fn a_stopped_el_run_answers_nothing_and_keeps_nothing() {
         let store = StoreService::new(el_config(Duration::from_secs(3600))).unwrap();
@@ -519,7 +519,7 @@ mod tests {
         let kept = kept_el(&store, &snapshot).expect("an answer kept for the revision");
         assert!(Arc::ptr_eq(&el, &kept));
 
-        let late = StoreService::new(el_config(Duration::ZERO)).unwrap();
+        let late = StoreService::new(el_config(Duration::from_nanos(1))).unwrap();
         late.update_str_ungated(IRREGULAR).unwrap();
         let snapshot = late.engine().snapshot();
         assert!(matches!(
