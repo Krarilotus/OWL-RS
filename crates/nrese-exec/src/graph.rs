@@ -771,21 +771,18 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         self.rows.reserve_exact(components)?;
         self.reach_starts.push(0)?;
         let size = |starts: &[usize], d: u32| (starts[d as usize + 1] - starts[d as usize]) as u32;
+        // Every tick follows its work, as the entries' runs do: a tick before its work, then
+        // a run of a whole allowance, went 4,097 units unpolled (sol-loop r1 S1).
         for c in 0..components {
-            ticker.tick(1)?;
             let mut cyclic = self.members_of(c).len() > 1;
             let mut row = 0u32;
             for k in self.starts[c]..self.starts[c + 1] {
-                ticker.tick(1)?;
                 let x = self.members[k] as usize;
                 for j in self.offsets[x] as usize..self.offsets[x + 1] as usize {
-                    ticker.tick(1)?;
                     let d = self.component[self.targets[j] as usize];
                     if d as usize == c {
                         cyclic = true;
-                        continue;
-                    }
-                    if stamp[d as usize] != c as u32 {
+                    } else if stamp[d as usize] != c as u32 {
                         stamp[d as usize] = c as u32;
                         let (starts, stamp) = (&self.starts, &mut stamp);
                         let taken = &self.reach
@@ -806,7 +803,9 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
                             })
                         })??;
                     }
+                    ticker.tick(1)?;
                 }
+                ticker.tick(1)?;
             }
             if cyclic {
                 set.push(c as u32)?;
@@ -817,6 +816,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
             self.cyclic.push(cyclic)?;
             self.rows.push(row)?;
             self.reach_starts.push(self.reach.len())?;
+            ticker.tick(1)?;
         }
         Ok(())
     }
