@@ -1355,6 +1355,18 @@ pub use nrese_engine::Stopped;
 /// flag are cells: a plain load and store per tick, no borrow flag, no atomic), so a
 /// source's scan can tick it while the callback it calls reads through it too ([`Source`]);
 /// `Send`, not `Sync`. The shared stop is read only when the countdown runs out.
+///
+/// **The stopping bound under nested reads**, stated here once. Within one read with no
+/// nesting, a task does at most `POLL_UNITS` counted units plus one run between two asks of
+/// its stop, and nothing after a refusal. A level is a counted read suspended while another
+/// read runs inside its callback (a rule join's nested read, the engine's scan delivering
+/// into the reasoner); a suspended read spends what it counted ahead without asking again.
+/// With d such levels, up to `POLL_UNITS + d·POLL_UNITS` units run between two asks, and
+/// up to `d·POLL_UNITS` after a refusal, before the read answers [`Stopped`], never a part
+/// of its answer. d is at most the longest rule body plus the engine's scan and
+/// equality-product levels. The guard searches of grounding and of
+/// [`GroundProgram::one_step_images`] take [`Poller::never`]: they ask no stop inside their
+/// search. A redesign follows.
 pub struct Poller<'a> {
     ticker: nrese_exec::Ticker<Stop<'a>>,
     stopped: std::cell::Cell<bool>,
