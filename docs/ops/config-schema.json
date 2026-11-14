@@ -7,7 +7,8 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "description": "Whether AI query suggestions are offered (default false).",
+          "default": false,
+          "description": "Whether AI query suggestions are offered.",
           "type": "boolean",
           "x-env": "NRESE_AI_ENABLED"
         },
@@ -15,6 +16,7 @@
           "additionalProperties": false,
           "properties": {
             "api_base": {
+              "default": "https://generativelanguage.googleapis.com",
               "description": "The Gemini API's base URL.",
               "type": "string",
               "x-env": "NRESE_AI_GOOGLE_API_BASE"
@@ -29,12 +31,14 @@
           "type": "object"
         },
         "max_suggestions": {
+          "default": 4,
           "description": "Suggestions per request.",
           "minimum": 0,
           "type": "integer",
           "x-env": "NRESE_AI_MAX_SUGGESTIONS"
         },
         "model": {
+          "default": "gemini-2.5-flash",
           "description": "The provider's model.",
           "type": "string",
           "x-env": "NRESE_AI_MODEL"
@@ -43,6 +47,7 @@
           "additionalProperties": false,
           "properties": {
             "api_base": {
+              "default": "https://openrouter.ai/api/v1",
               "description": "The OpenRouter API's base URL.",
               "type": "string",
               "x-env": "NRESE_AI_OPENROUTER_API_BASE"
@@ -67,6 +72,7 @@
           "type": "object"
         },
         "provider": {
+          "default": "disabled",
           "description": "Who makes the suggestions.",
           "enum": [
             "disabled",
@@ -77,11 +83,13 @@
           "x-env": "NRESE_AI_PROVIDER"
         },
         "system_prompt": {
+          "default": "You generate concise SPARQL query ideas for an RDF and OWL knowledge graph. Return strict JSON only. Prefer safe read queries. Use prefixes only when you can justify them from the prompt or context. If uncertain, use full IRIs.",
           "description": "The system prompt of suggestion requests.",
           "type": "string",
           "x-env": "NRESE_AI_SYSTEM_PROMPT"
         },
         "timeout_ms": {
+          "default": 20000,
           "description": "Per suggestion request, in milliseconds.",
           "minimum": 0,
           "type": "integer",
@@ -102,6 +110,7 @@
           "additionalProperties": false,
           "properties": {
             "admin_role": {
+              "default": "nrese.admin",
               "description": "The role that may administer.",
               "type": "string",
               "x-env": "NRESE_AUTH_JWT_ADMIN_ROLE"
@@ -117,12 +126,14 @@
               "x-env": "NRESE_AUTH_JWT_ISSUER"
             },
             "leeway_seconds": {
+              "default": 30,
               "description": "Clock leeway for expiry checks, in seconds.",
               "minimum": 0,
               "type": "integer",
               "x-env": "NRESE_AUTH_JWT_LEEWAY_SECS"
             },
             "read_role": {
+              "default": "nrese.read",
               "description": "The role that may read.",
               "type": "string",
               "x-env": "NRESE_AUTH_JWT_READ_ROLE"
@@ -155,12 +166,14 @@
           "type": "object"
         },
         "local_logins": {
-          "description": "Whether users of the access state log in with passwords (default true).",
+          "default": true,
+          "description": "Whether users of the access state log in with passwords.",
           "type": "boolean",
           "x-env": "NRESE_AUTH_LOCAL_LOGINS"
         },
         "mode": {
-          "description": "How requests are authenticated (default none).",
+          "default": "none",
+          "description": "How requests are authenticated.",
           "enum": [
             "none",
             "bearer-static",
@@ -205,6 +218,7 @@
               "x-env": "NRESE_AUTH_MTLS_READ_SUBJECTS"
             },
             "subject_header": {
+              "default": "x-client-cert-subject",
               "description": "The header the TLS-terminating proxy passes the client certificate's subject in.",
               "type": "string",
               "x-env": "NRESE_AUTH_MTLS_SUBJECT_HEADER"
@@ -221,7 +235,8 @@
                   "type": "array"
                 }
               ],
-              "description": "The peers (addresses or ranges) that may send the subject header (default loopback).",
+              "default": "127.0.0.0/8,::1",
+              "description": "The peers (addresses or ranges) that may send the subject header.",
               "x-env": "NRESE_AUTH_MTLS_TRUSTED_PROXIES"
             }
           },
@@ -231,6 +246,7 @@
           "additionalProperties": false,
           "properties": {
             "admin_role": {
+              "default": "nrese.admin",
               "description": "The role that may administer.",
               "type": "string",
               "x-env": "NRESE_AUTH_OIDC_ADMIN_ROLE"
@@ -252,11 +268,13 @@
               "x-env": "NRESE_AUTH_OIDC_INTROSPECTION_URL"
             },
             "read_role": {
+              "default": "nrese.read",
               "description": "The role that may read.",
               "type": "string",
               "x-env": "NRESE_AUTH_OIDC_READ_ROLE"
             },
             "timeout_ms": {
+              "default": 5000,
               "description": "Per introspection request, in milliseconds.",
               "minimum": 0,
               "type": "integer",
@@ -277,11 +295,13 @@
               "type": "array"
             }
           ],
-          "description": "The proxies (addresses or ranges) whose X-Forwarded-For names the client, for login throttling (default loopback).",
+          "default": "127.0.0.0/8,::1",
+          "description": "The proxies (addresses or ranges) whose X-Forwarded-For names the client, for login throttling.",
           "x-env": "NRESE_AUTH_TRUSTED_PROXIES"
         },
         "workspace_base": {
-          "description": "What personal space and workspace graph prefixes start with (default urn:nrese:).",
+          "default": "urn:nrese:",
+          "description": "What personal space and workspace graph prefixes start with.",
           "type": "string",
           "x-env": "NRESE_WORKSPACE_BASE"
         }
@@ -292,7 +312,8 @@
       "additionalProperties": false,
       "properties": {
         "bulk_load_memory": {
-          "description": "The quads of a bulk load before they are sorted in chunks and spilled; 0 is unlimited (default 25%).",
+          "default": "25%",
+          "description": "The quads of a bulk load before they are sorted in chunks and spilled; 0 is unlimited.",
           "minimum": 0,
           "type": [
             "integer",
@@ -302,7 +323,8 @@
           "x-unit": "bytes-or-share"
         },
         "graph_read_timeout": {
-          "description": "A Graph Store or statements read (default 30s).",
+          "default": "30s",
+          "description": "A Graph Store or statements read.",
           "minimum": 0,
           "type": [
             "integer",
@@ -315,7 +337,8 @@
           "x-unit": "milliseconds"
         },
         "graph_write_timeout": {
-          "description": "A Graph Store write (default 60s).",
+          "default": "60s",
+          "description": "A Graph Store write.",
           "minimum": 0,
           "type": [
             "integer",
@@ -328,7 +351,8 @@
           "x-unit": "milliseconds"
         },
         "huge_pages": {
-          "description": "Transparent huge pages for the server's memory (Linux): on is faster over large heaps, off holds less memory while serving, bulk has them only while a bulk load or a materialisation runs (default on).",
+          "default": "on",
+          "description": "Transparent huge pages for the server's memory (Linux): on is faster over large heaps, off holds less memory while serving, bulk has them only while a bulk load or a materialisation runs.",
           "enum": [
             "off",
             "on",
@@ -338,7 +362,8 @@
           "x-env": "NRESE_HUGE_PAGES"
         },
         "process_memory": {
-          "description": "The memory the server may hold before a materialisation or a commit's reasoning stops with an error instead of taking the machine; 0 is unlimited (default 75%).",
+          "default": "75%",
+          "description": "The memory the server may hold before a materialisation or a commit's reasoning stops with an error instead of taking the machine; 0 is unlimited.",
           "minimum": 0,
           "type": [
             "integer",
@@ -348,7 +373,8 @@
           "x-unit": "bytes-or-share"
         },
         "query_memory": {
-          "description": "Intermediate results of one query; 0 is unlimited (default 4GiB).",
+          "default": "4GiB",
+          "description": "One query's memory envelope: its intermediate and retained results and, under owl2-dl, its DL work; 0 is unlimited.",
           "minimum": 0,
           "type": [
             "integer",
@@ -361,7 +387,8 @@
           "x-unit": "bytes-or-share"
         },
         "query_text": {
-          "description": "The text of a query (default 1MiB).",
+          "default": "1MiB",
+          "description": "The text of a query.",
           "minimum": 0,
           "type": [
             "integer",
@@ -374,7 +401,8 @@
           "x-unit": "bytes"
         },
         "query_timeout": {
-          "description": "A query, until its last result is sent (default 30s).",
+          "default": "30s",
+          "description": "A query, until its last result is sent.",
           "minimum": 0,
           "type": [
             "integer",
@@ -387,7 +415,8 @@
           "x-unit": "milliseconds"
         },
         "reasoning_release": {
-          "description": "Memory given back between a materialisation's rounds: on lowers and steadies its peak (LUBM 100 by 14 %) for more reasoning time (5.6 %); default off.",
+          "default": "off",
+          "description": "Memory given back between a materialisation's rounds: on lowers and steadies its peak (LUBM 100 by 14 %) for more reasoning time (5.6 %).",
           "enum": [
             "off",
             "on"
@@ -396,7 +425,7 @@
           "x-env": "NRESE_REASONING_RELEASE"
         },
         "result_cache": {
-          "description": "Results of query parts (id columns) kept for repeated queries and shared sub-patterns; 0 switches the cache off (default 2% of memory, 64MiB to 8GiB).",
+          "description": "Results of query parts (id columns) kept for repeated queries and shared sub-patterns; 0 switches the cache off. Unset: 2% of the process's memory, kept between 64MiB and 8GiB (64MiB where the memory can't be read); a share set explicitly is taken as written, without those bounds.",
           "minimum": 0,
           "type": [
             "integer",
@@ -420,11 +449,12 @@
               "type": "array"
             }
           ],
-          "description": "SPARQL query files whose results are pinned in the result cache at startup, each under its file name without the extension (none by default).",
+          "description": "SPARQL query files whose results are pinned in the result cache at startup, each under its file name without the extension.",
           "x-env": "NRESE_PINNED_QUERIES"
         },
         "total_query_memory": {
-          "description": "Intermediate results of all running queries together; 0 is unlimited (default 50%).",
+          "default": "50%",
+          "description": "Every running request's envelope across the catalog: queries, updates, DL entailment checks and explanations; 0 is unlimited.",
           "minimum": 0,
           "type": [
             "integer",
@@ -434,7 +464,8 @@
           "x-unit": "bytes-or-share"
         },
         "update_size": {
-          "description": "A SPARQL update request (default 16MiB).",
+          "default": "16MiB",
+          "description": "A SPARQL update request.",
           "minimum": 0,
           "type": [
             "integer",
@@ -447,7 +478,8 @@
           "x-unit": "bytes"
         },
         "update_timeout": {
-          "description": "A SPARQL update, reasoning included (default 60s).",
+          "default": "60s",
+          "description": "A SPARQL update, reasoning included.",
           "minimum": 0,
           "type": [
             "integer",
@@ -460,7 +492,8 @@
           "x-unit": "milliseconds"
         },
         "upload_size": {
-          "description": "An RDF payload (default 128MiB).",
+          "default": "128MiB",
+          "description": "An RDF payload.",
           "minimum": 0,
           "type": [
             "integer",
@@ -479,7 +512,8 @@
       "additionalProperties": false,
       "properties": {
         "answers": {
-          "description": "Under owl2-dl, which answers a query returns: the certain ones where they can be proven complete and the sound ones otherwise (the default), the sound lower bound alone, or certain answers or an error.",
+          "default": "certain-where-complete",
+          "description": "Under owl2-dl, which answers a query returns: the certain ones where they can be proven complete and the sound ones otherwise, the sound lower bound alone, or certain answers or an error.",
           "enum": [
             "certain-where-complete",
             "sound",
@@ -489,7 +523,8 @@
           "x-env": "NRESE_DL_ANSWERS"
         },
         "consistency": {
-          "description": "Under owl2-dl, whether each commit is checked for consistency and rejected if it makes the data inconsistent (inline, the default) or not checked (off).",
+          "default": "inline",
+          "description": "Under owl2-dl, whether each commit is checked for consistency and rejected if it makes the data inconsistent (inline) or not checked (off).",
           "enum": [
             "inline",
             "off"
@@ -498,7 +533,8 @@
           "x-env": "NRESE_DL_CONSISTENCY"
         },
         "explanation_tests": {
-          "description": "Under owl2-dl, the entailment tests one explanation or rejection evidence runs; past them the justification isn't minimal (default none).",
+          "default": "unlimited",
+          "description": "Under owl2-dl, the entailment tests one explanation or rejection evidence runs; past them the justification isn't minimal.",
           "minimum": 0,
           "type": [
             "integer",
@@ -512,7 +548,8 @@
           ]
         },
         "lower_bound_timeout": {
-          "description": "Under owl2-dl, the time a classification's Horn lower bound may take, at most half of what is left: a route threshold, past it the hypertableau decides (default 60s; 0 or unlimited: only the half).",
+          "default": "60s",
+          "description": "Under owl2-dl, the time a classification's Horn lower bound may take, at most half of what is left: a route threshold, past it the hypertableau decides (0 or unlimited: only the half).",
           "minimum": 0,
           "type": [
             "integer",
@@ -526,7 +563,8 @@
           ]
         },
         "max_branch_points": {
-          "description": "Under owl2-dl, the most branch points one hypertableau run may open: a deterministic budget; past it the run decides nothing (default none).",
+          "default": "unlimited",
+          "description": "Under owl2-dl, the most branch points one hypertableau run may open: a deterministic budget; past it the run decides nothing.",
           "minimum": 0,
           "type": [
             "integer",
@@ -540,7 +578,8 @@
           ]
         },
         "max_candidates": {
-          "description": "Under owl2-dl, the candidate answers a query checks with the exact services at most; the rest are reported unresolved (default 1000, so that the answer comes within the query's timeout; 0 or unlimited: none).",
+          "default": 1000,
+          "description": "Under owl2-dl, the candidate answers a query checks with the exact services at most; the rest are reported unresolved (0 or unlimited: none).",
           "minimum": 0,
           "type": [
             "integer",
@@ -554,7 +593,8 @@
           ]
         },
         "max_join": {
-          "description": "Under owl2-dl, the most conclusions one join of the context core may produce: a route threshold, past it the hypertableau decides (default 1048576).",
+          "default": 1048576,
+          "description": "Under owl2-dl, the most conclusions one join of the context core may produce: a route threshold, past it the hypertableau decides.",
           "minimum": 0,
           "type": [
             "integer",
@@ -568,7 +608,8 @@
           ]
         },
         "max_join_steps": {
-          "description": "Under owl2-dl, the most steps one Pred join of the context core may take: a route threshold, past it the hypertableau decides (default 65536).",
+          "default": 65536,
+          "description": "Under owl2-dl, the most steps one Pred join of the context core may take: a route threshold, past it the hypertableau decides.",
           "minimum": 0,
           "type": [
             "integer",
@@ -582,7 +623,8 @@
           ]
         },
         "max_merges": {
-          "description": "Under owl2-dl, the most merges one hypertableau run may make: a deterministic budget (default none).",
+          "default": "unlimited",
+          "description": "Under owl2-dl, the most merges one hypertableau run may make: a deterministic budget.",
           "minimum": 0,
           "type": [
             "integer",
@@ -596,7 +638,8 @@
           ]
         },
         "max_nodes": {
-          "description": "Under owl2-dl, the most nodes one hypertableau run may hold: a deterministic budget for reproducible runs (default none).",
+          "default": "unlimited",
+          "description": "Under owl2-dl, the most nodes one hypertableau run may hold: a deterministic budget for reproducible runs.",
           "minimum": 0,
           "type": [
             "integer",
@@ -610,7 +653,8 @@
           ]
         },
         "memory": {
-          "description": "Under owl2-dl, what one engine run may hold of its own, checked at work boundaries (default none: a request's runs draw from its memory envelope, budgets.query_memory; 0 or unlimited: none).",
+          "default": "unlimited",
+          "description": "Under owl2-dl, what one engine run may hold of its own, checked at work boundaries (0 or unlimited: none, and a request's runs draw from its memory envelope, budgets.query_memory).",
           "minimum": 0,
           "type": [
             "integer",
@@ -624,13 +668,15 @@
           ]
         },
         "threads": {
-          "description": "Under owl2-dl, the workers of a classification (default 0: every core).",
+          "default": 0,
+          "description": "Under owl2-dl, the workers of a classification (0: every core).",
           "minimum": 0,
           "type": "integer",
           "x-env": "NRESE_DL_THREADS"
         },
         "timeout": {
-          "description": "Under owl2-dl, the time one DL task may take: a commit's consistency check, a query's exact services, a classification (default 30min, the server's safety default; 0 or unlimited: none).",
+          "default": "30min",
+          "description": "Under owl2-dl, the time one DL task may take: a commit's consistency check, a query's exact services, a classification (0 or unlimited: none).",
           "minimum": 0,
           "type": [
             "integer",
@@ -661,17 +707,19 @@
               "type": "array"
             }
           ],
-          "description": "The endpoints SERVICE may call (IRIs or prefixes, * for any); none by default.",
+          "description": "The endpoints SERVICE may call (IRIs or prefixes, * for any).",
           "x-env": "NRESE_FEDERATION_ALLOW"
         },
         "max_rows": {
-          "description": "Rows one request may return (default 1000000).",
+          "default": 1000000,
+          "description": "Rows one request may return.",
           "minimum": 0,
           "type": "integer",
           "x-env": "NRESE_FEDERATION_MAX_ROWS"
         },
         "timeout": {
-          "description": "Per request to an endpoint (default 30s).",
+          "default": "30s",
+          "description": "Per request to an endpoint.",
           "minimum": 0,
           "type": [
             "integer",
@@ -690,11 +738,13 @@
           "additionalProperties": false,
           "properties": {
             "metrics": {
+              "default": true,
               "description": "Whether the Prometheus metrics are served.",
               "type": "boolean",
               "x-env": "NRESE_ENABLE_METRICS"
             },
             "operator_ui": {
+              "default": true,
               "description": "Whether the operator console is served.",
               "type": "boolean",
               "x-env": "NRESE_ENABLE_OPERATOR_UI"
@@ -706,6 +756,7 @@
           "additionalProperties": false,
           "properties": {
             "max_query_bytes": {
+              "default": "1MiB",
               "deprecated": true,
               "description": "Older name of `budgets.query_text`.",
               "minimum": 0,
@@ -720,6 +771,7 @@
               "x-unit": "bytes"
             },
             "max_query_memory_bytes": {
+              "default": "4GiB",
               "deprecated": true,
               "description": "Older name of `budgets.query_memory`.",
               "minimum": 0,
@@ -734,6 +786,7 @@
               "x-unit": "bytes-or-share"
             },
             "max_rdf_upload_bytes": {
+              "default": "128MiB",
               "deprecated": true,
               "description": "Older name of `budgets.upload_size`.",
               "minimum": 0,
@@ -748,6 +801,7 @@
               "x-unit": "bytes"
             },
             "max_update_bytes": {
+              "default": "16MiB",
               "deprecated": true,
               "description": "Older name of `budgets.update_size`.",
               "minimum": 0,
@@ -768,24 +822,28 @@
           "additionalProperties": false,
           "properties": {
             "admin_requests_per_window": {
+              "default": 0,
               "description": "Administrative requests per client and window.",
               "minimum": 0,
               "type": "integer",
               "x-env": "NRESE_ADMIN_REQUESTS_PER_WINDOW"
             },
             "read_requests_per_window": {
+              "default": 0,
               "description": "Read requests per client and window.",
               "minimum": 0,
               "type": "integer",
               "x-env": "NRESE_READ_REQUESTS_PER_WINDOW"
             },
             "window_secs": {
+              "default": 60,
               "description": "The rate limits' window in seconds.",
               "minimum": 0,
               "type": "integer",
               "x-env": "NRESE_RATE_LIMIT_WINDOW_SECS"
             },
             "write_requests_per_window": {
+              "default": 0,
               "description": "Write requests per client and window.",
               "minimum": 0,
               "type": "integer",
@@ -795,7 +853,8 @@
           "type": "object"
         },
         "sparql_parse_error_profile": {
-          "description": "How SPARQL syntax errors are answered (default problem-json).",
+          "default": "problem-json",
+          "description": "How SPARQL syntax errors are answered.",
           "enum": [
             "problem-json",
             "plain-text",
@@ -808,6 +867,7 @@
           "additionalProperties": false,
           "properties": {
             "graph_read_ms": {
+              "default": "30s",
               "deprecated": true,
               "description": "Older name of `budgets.graph_read_timeout`.",
               "minimum": 0,
@@ -822,6 +882,7 @@
               "x-unit": "milliseconds"
             },
             "graph_write_ms": {
+              "default": "60s",
               "deprecated": true,
               "description": "Older name of `budgets.graph_write_timeout`.",
               "minimum": 0,
@@ -836,6 +897,7 @@
               "x-unit": "milliseconds"
             },
             "query_ms": {
+              "default": "30s",
               "deprecated": true,
               "description": "Older name of `budgets.query_timeout`.",
               "minimum": 0,
@@ -850,6 +912,7 @@
               "x-unit": "milliseconds"
             },
             "update_ms": {
+              "default": "60s",
               "deprecated": true,
               "description": "Older name of `budgets.update_timeout`.",
               "minimum": 0,
@@ -873,7 +936,8 @@
       "additionalProperties": false,
       "properties": {
         "equality": {
-          "description": "How owl:sameAs is reasoned with and stored (default representatives).",
+          "default": "representatives",
+          "description": "How owl:sameAs is reasoned with and stored.",
           "enum": [
             "representatives",
             "compact",
@@ -883,7 +947,8 @@
           "x-env": "NRESE_REASONING_EQUALITY"
         },
         "equality_answers": {
-          "description": "With equality = compact: answer with every identity of an owl:sameAs class (strict, the default), or with its representative only (canonical, for analytics).",
+          "default": "strict",
+          "description": "With equality = compact: answer with every identity of an owl:sameAs class (strict), or with its representative only (canonical, for analytics).",
           "enum": [
             "strict",
             "canonical"
@@ -892,7 +957,8 @@
           "x-env": "NRESE_REASONING_EQUALITY_ANSWERS"
         },
         "equality_expansion": {
-          "description": "With equality = compact: expand owl:sameAs classes after the joins where the answer can't tell (late, the default) or at every read (early). The same answers.",
+          "default": "late",
+          "description": "With equality = compact: expand owl:sameAs classes after the joins where the answer can't tell (late) or at every read (early). The same answers.",
           "enum": [
             "late",
             "early"
@@ -901,7 +967,8 @@
           "x-env": "NRESE_REASONING_EQUALITY_EXPANSION"
         },
         "mode": {
-          "description": "The ruleset materialised into the inferred stack (default disabled); owl2-dl materialises OWL 2 RL and adds the OWL 2 DL engines (the dl settings).",
+          "default": "disabled",
+          "description": "The ruleset materialised into the inferred stack; owl2-dl materialises OWL 2 RL and adds the OWL 2 DL engines (the dl settings).",
           "enum": [
             "disabled",
             "rdfs",
@@ -917,7 +984,8 @@
           "x-env": "NRESE_REASONING_MODE"
         },
         "ql_rewriting": {
-          "description": "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto (the default) under owl2-ql, on under owl2-ql and owl2-rl, or off.",
+          "default": "auto",
+          "description": "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto under owl2-ql, on under owl2-ql and owl2-rl, or off.",
           "enum": [
             "auto",
             "on",
@@ -932,13 +1000,15 @@
           "x-env": "NRESE_REASONING_RULES"
         },
         "support_sets": {
-          "description": "Support graph sets kept per inferred statement for inferred = \"supported\" in the access policy (default 16, at least 1): a bound on memory and work; a reader past it is decided by the closure of its graphs, with the same answers.",
+          "default": 16,
+          "description": "Support graph sets kept per inferred statement for inferred = \"supported\" in the access policy (at least 1): a bound on memory and work; a reader past it is decided by the closure of its graphs, with the same answers.",
           "minimum": 0,
           "type": "integer",
           "x-env": "NRESE_REASONING_SUPPORT_SETS"
         },
         "unnamed_classes": {
-          "description": "Whether memberships in unnamed union classes that nothing consumes are derived (default derive).",
+          "default": "derive",
+          "description": "Whether memberships in unnamed union classes that nothing consumes are derived.",
           "enum": [
             "derive",
             "skip"
@@ -953,7 +1023,8 @@
       "additionalProperties": false,
       "properties": {
         "batch_bytes": {
-          "description": "About how much log a replica asks for at once (default 8MiB).",
+          "default": "8MiB",
+          "description": "About how much log a replica asks for at once.",
           "minimum": 0,
           "type": [
             "integer",
@@ -963,7 +1034,8 @@
           "x-unit": "bytes"
         },
         "image_timeout": {
-          "description": "The longest a replica waits for its primary to prepare an image, until the answer begins (default 1h; 0 or unlimited: no limit); the image then streams as long as its pieces come.",
+          "default": "1h",
+          "description": "The longest a replica waits for its primary to prepare an image, until the answer begins (0 or unlimited: no limit); the image then streams as long as its pieces come.",
           "minimum": 0,
           "type": [
             "integer",
@@ -977,7 +1049,8 @@
           ]
         },
         "mode": {
-          "description": "Read replicas (docs/ops/replication.md): a primary ships its log to replicas, which apply it and answer queries; off by default. Both need an on-disk store.",
+          "default": "off",
+          "description": "Read replicas (docs/ops/replication.md): a primary ships its log to replicas, which apply it and answer queries. Both need an on-disk store.",
           "enum": [
             "off",
             "primary",
@@ -987,7 +1060,8 @@
           "x-env": "NRESE_REPLICATION_MODE"
         },
         "poll": {
-          "description": "How long a replica waits before asking again once caught up (default 500ms).",
+          "default": "500ms",
+          "description": "How long a replica waits before asking again once caught up.",
           "minimum": 0,
           "type": [
             "integer",
@@ -1002,7 +1076,8 @@
           "x-env": "NRESE_REPLICATION_PRIMARY"
         },
         "round_timeout": {
-          "description": "The longest one round of following the primary's log may take, its answer whole (default 5min; 0 or unlimited: no total limit, the 30 s limits between pieces stay).",
+          "default": "5min",
+          "description": "The longest one round of following the primary's log may take, its answer whole (0 or unlimited: no total limit, the 30 s limits between pieces stay).",
           "minimum": 0,
           "type": [
             "integer",
@@ -1028,6 +1103,7 @@
       "additionalProperties": false,
       "properties": {
         "bind_addr": {
+          "default": "127.0.0.1:8080",
           "deprecated": true,
           "description": "Older name of `server.bind_address`.",
           "type": "string",
@@ -1037,7 +1113,8 @@
           ]
         },
         "bind_address": {
-          "description": "The address and port the server listens on (default 127.0.0.1:8080).",
+          "default": "127.0.0.1:8080",
+          "description": "The address and port the server listens on.",
           "type": "string",
           "x-env": "NRESE_BIND_ADDR",
           "x-older-keys": [
@@ -1045,7 +1122,8 @@
           ]
         },
         "deployment_posture": {
-          "description": "What the deployment is for; read-only-demo disables writes, internal-authenticated needs authentication, replacement-grade also on-disk storage and problem+json parse errors (default open-workbench).",
+          "default": "open-workbench",
+          "description": "What the deployment is for; read-only-demo disables writes, internal-authenticated needs authentication, replacement-grade also on-disk storage and problem+json parse errors.",
           "enum": [
             "open-workbench",
             "read-only-demo",
@@ -1062,7 +1140,8 @@
       "additionalProperties": false,
       "properties": {
         "gate": {
-          "description": "SHACL as a commit gate: report what commits introduce, or reject them (default off).",
+          "default": "off",
+          "description": "SHACL as a commit gate: report what commits introduce, or reject them.",
           "enum": [
             "off",
             "report",
@@ -1072,7 +1151,8 @@
           "x-env": "NRESE_SHACL_GATE"
         },
         "gate_severity": {
-          "description": "The least severity an enforcing gate rejects (default violation).",
+          "default": "violation",
+          "description": "The least severity an enforcing gate rejects.",
           "enum": [
             "violation",
             "warning",
@@ -1082,7 +1162,8 @@
           "x-env": "NRESE_SHACL_GATE_SEVERITY"
         },
         "shapes_graph": {
-          "description": "The graph of the shapes validation uses (an IRI; default RDF4J's http://rdf4j.org/schema/rdf4j#SHACLShapeGraph).",
+          "default": "http://rdf4j.org/schema/rdf4j#SHACLShapeGraph",
+          "description": "The graph of the shapes validation uses (an IRI).",
           "type": "string",
           "x-env": "NRESE_SHACL_SHAPES_GRAPH"
         }
@@ -1093,7 +1174,8 @@
       "additionalProperties": false,
       "properties": {
         "checkpoint_after_wal": {
-          "description": "Write a checkpoint in the background once the write-ahead log has grown by this much since the last (default 256MiB).",
+          "default": "256MiB",
+          "description": "Write a checkpoint in the background once the write-ahead log has grown by this much since the last.",
           "minimum": 0,
           "type": [
             "integer",
@@ -1103,12 +1185,14 @@
           "x-unit": "bytes"
         },
         "data_dir": {
-          "description": "The data directory of an on-disk store (default ./data).",
+          "default": "./data",
+          "description": "The data directory of an on-disk store.",
           "type": "string",
           "x-env": "NRESE_DATA_DIR"
         },
         "default_graph": {
-          "description": "What a query that names no dataset reads: the default graph, or the union of all graphs (default default).",
+          "default": "default",
+          "description": "What a query that names no dataset reads: the default graph, or the union of all graphs.",
           "enum": [
             "default",
             "union"
@@ -1117,7 +1201,8 @@
           "x-env": "NRESE_DEFAULT_GRAPH"
         },
         "geosparql_relations": {
-          "description": "What GeoSPARQL relations in triple patterns match: those stated and those computed from the geometries (the query-rewrite extension, default computed), or the stated ones only.",
+          "default": "computed",
+          "description": "What GeoSPARQL relations in triple patterns match: those stated and those computed from the geometries (the query-rewrite extension), or the stated ones only.",
           "enum": [
             "computed",
             "stated"
@@ -1131,7 +1216,8 @@
           "x-env": "NRESE_IMPORT_DIR"
         },
         "index_encoding": {
-          "description": "How index blocks are encoded when they are built (default fast).",
+          "default": "fast",
+          "description": "How index blocks are encoded when they are built.",
           "enum": [
             "fast",
             "compact"
@@ -1140,7 +1226,8 @@
           "x-env": "NRESE_INDEX_ENCODING"
         },
         "invalid_statements": {
-          "description": "What a bulk load does with a statement it can't read: quarantine it and load the rest, or stop (default quarantine).",
+          "default": "quarantine",
+          "description": "What a bulk load does with a statement it can't read: quarantine it and load the rest, or stop.",
           "enum": [
             "quarantine",
             "strict"
@@ -1149,11 +1236,13 @@
           "x-env": "NRESE_INVALID_STATEMENTS"
         },
         "map_checkpoints": {
-          "description": "Serve checkpointed data from the mapped file and free its copies in memory (default true).",
+          "default": true,
+          "description": "Serve checkpointed data from the mapped file and free its copies in memory.",
           "type": "boolean",
           "x-env": "NRESE_MAP_CHECKPOINTS"
         },
         "mode": {
+          "default": "in-memory",
           "description": "Where the store keeps its data.",
           "enum": [
             "in-memory",
@@ -1182,7 +1271,8 @@
           "x-unit": "bytes-or-share"
         },
         "reader_corpus_bytes": {
-          "description": "What the corpora a reader search scope keeps, and their lineage, may take within the queries' memory; the least recently used go first (default 256MiB: a 1M-document corpus takes about 250KB). A repository may set its own.",
+          "default": "256MiB",
+          "description": "What the corpora a reader search scope keeps, and their lineage, may take within the queries' memory; the least recently used go first (a 1M-document corpus takes about 250KB). A repository may set its own.",
           "minimum": 0,
           "type": [
             "integer",
@@ -1192,19 +1282,22 @@
           "x-unit": "bytes"
         },
         "reader_documents_per_probe": {
-          "description": "Documents a reader corpus walk visits for the work of one probe: after commits, a kept corpus is derived while the terms touched since are at most its documents over this, else walked again (default 10, measured in work; at least 1). A latency-first store with one tenant may raise it.",
+          "default": 10,
+          "description": "Documents a reader corpus walk visits for the work of one probe: after commits, a kept corpus is derived while the terms touched since are at most its documents over this, else walked again (measured in work; at least 1). A latency-first store with one tenant may raise it.",
           "minimum": 0,
           "type": "integer",
           "x-env": "NRESE_READER_DOCUMENTS_PER_PROBE"
         },
         "reader_walk_slice": {
-          "description": "Words of bits (64 terms each) one slice of a reader corpus walk covers at most; each slice also holds 16 bytes a term (default 1024).",
+          "default": 1024,
+          "description": "Words of bits (64 terms each) one slice of a reader corpus walk covers at most; each slice also holds 16 bytes a term.",
           "minimum": 0,
           "type": "integer",
           "x-env": "NRESE_READER_WALK_SLICE"
         },
         "search_scope": {
-          "description": "What full-text relevance, IRI search and vector selection are computed over: the dictionary's whole indexes (default global, the fastest), or what the reader's snapshot and graphs show alone (reader).",
+          "default": "global",
+          "description": "What full-text relevance, IRI search and vector selection are computed over: the dictionary's whole indexes (global, the fastest), or what the reader's snapshot and graphs show alone (reader).",
           "enum": [
             "global",
             "reader"
@@ -1213,12 +1306,14 @@
           "x-env": "NRESE_SEARCH_SCOPE"
         },
         "verify_on_open": {
-          "description": "Check the whole newest checkpoint when opening (default false).",
+          "default": false,
+          "description": "Check the whole newest checkpoint when opening.",
           "type": "boolean",
           "x-env": "NRESE_VERIFY_ON_OPEN"
         },
         "vocabulary": {
-          "description": "How checkpoints store the dictionary's keys (default plain).",
+          "default": "plain",
+          "description": "How checkpoints store the dictionary's keys.",
           "enum": [
             "plain",
             "fsst"
@@ -1227,12 +1322,14 @@
           "x-env": "NRESE_VOCABULARY"
         },
         "wal_archive": {
-          "description": "Keep the WAL segments checkpoints cover, for point-in-time restores (default false).",
+          "default": false,
+          "description": "Keep the WAL segments checkpoints cover, for point-in-time restores.",
           "type": "boolean",
           "x-env": "NRESE_WAL_ARCHIVE"
         },
         "wal_damage": {
-          "description": "Damage in the newest WAL segment that a crash mid-append doesn't leave: refuse to open, or open with the log up to it, the rest copied to wal-cut/ (default refuse).",
+          "default": "refuse",
+          "description": "Damage in the newest WAL segment that a crash mid-append doesn't leave: refuse to open, or open with the log up to it, the rest copied to wal-cut/.",
           "enum": [
             "refuse",
             "keep-prefix"
