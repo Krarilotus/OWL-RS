@@ -552,6 +552,91 @@ fn distinct_values_come_from_the_statistics_where_an_order_fits() {
     }
 }
 
+/// Spec: where deleted quads still shadow values in unmerged runs, the walk counts more
+/// distinct values than the pattern has matches; the estimate is capped at the matches, at
+/// the first ask as at a repeated one, so two asks in one query plan alike (once the first
+/// ask got the walk's number and only a repeat the capped one).
+/// Input: `s{i} p o{i}` for 100 subjects in one commit, then the quads of 90 of them deleted
+/// in another (no merge: two runs), so 10 matches; `?s p ?o`'s subjects asked twice in one
+/// query with a caller's count of 1,000.
+/// Expected: 10 both times.
+#[test]
+fn a_distinct_count_shadowed_by_deletions_is_capped_at_its_matches_from_the_first_ask() {
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        compaction: nrese_engine::CompactionPolicy {
+            fanout: 0,
+            inline_entry_limit: 0,
+        },
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let e = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+    let quad = |i: u32| {
+        Quad::new(
+            e(&format!("s{i}")),
+            e("p"),
+            e(&format!("o{i}")),
+            GraphName::DefaultGraph,
+        )
+    };
+    let mut tx = engine.transaction();
+    for i in 0..100 {
+        tx.insert(quad(i).as_ref());
+    }
+    tx.commit().unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..90 {
+        assert!(tx.remove(quad(i).as_ref()));
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let pattern = scan(&snapshot, "?s p ?o");
+    let s = Variable::new_unchecked("s");
+    assert_eq!(ctx.distinct(&pattern, &s, 1_000), 10, "the first ask");
+    assert_eq!(ctx.distinct(&pattern, &s, 1_000), 10, "a repeated ask");
+}
+
+/// Spec: a query keeps the distinct counts its planning asked for, charged to its budget and
+/// freed with it: a pattern planned again in the query (an EXISTS by substitution plans its
+/// pattern per outer key) gets its first count with no new walk, from a view too, which keeps
+/// none beyond the query. Observed through the query's stop: after it fires, a walk would
+/// stop and give the caller's count.
+/// Input: the people store read through a view; `?x ?p ?o`'s predicates asked (21), the
+/// query cancelled, asked again, with the caller's count 1,234.
+/// Expected: 21 both times; one count kept, its charge held by the query's budget.
+#[test]
+fn a_query_keeps_its_distinct_counts() {
+    let engine = people();
+    let view = engine
+        .snapshot()
+        .with_inferred_subset(nrese_engine::InferredSubset::Without(Vec::new()));
+    let token = CancellationToken::new();
+    let options = QueryOptions {
+        resources: crate::Resources {
+            cancellation: Some(token.clone()),
+            ..crate::Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let ctx = Context::new(&view, &options, None, None);
+    let pattern = scan(&view, "?x ?p ?o");
+    let p = Variable::new_unchecked("p");
+    assert_eq!(ctx.distinct(&pattern, &p, 1_234), 21);
+    token.cancel();
+    assert_eq!(
+        ctx.distinct(&pattern, &p, 1_234),
+        21,
+        "kept for the query: no walk, which would have stopped (1,234)"
+    );
+    let kept = ctx.distinct_counts.borrow();
+    assert_eq!(kept.len(), 1);
+    assert!(kept.charged() > 0, "charged");
+    assert!(ctx.budget.used() >= kept.charged(), "to the query's budget");
+}
+
 /// Spec: the q02 design review (12 Nov 2026, BLOCK 1) and the lead's reconciliation:
 /// planning looks up the distinct values of every pattern's variables, also of one that
 /// no other pattern has, whose value no estimate reads: a lookup fills the engine's

@@ -2271,25 +2271,31 @@ impl Snapshot {
     }
 
     /// The number of distinct values of the first unbound component of `pattern` in
-    /// `permutation`'s order, among its matches in `model`: a walk over each run's groups,
-    /// with d values of memory. Exact unless deleted quads still shadow values in unmerged
-    /// runs (then an upper bound). `None` if the pattern's bound components aren't a prefix
-    /// of that order, or an included stack can't answer it. Planners should call the cached
-    /// [`distinct_estimate_in`](Self::distinct_estimate_in) instead.
+    /// `permutation`'s order, among its matches in `model`: the runs' group walks merged in
+    /// key order, counting the value changes, with no list of the values (a head and one
+    /// block's column per run). Exact unless deleted quads still shadow values in unmerged
+    /// runs (then an upper bound). `Ok(None)` if the pattern's bound components aren't a
+    /// prefix of that order, or an included stack can't answer it. Its work is counted on
+    /// `visit` ([`crate::visit`]): [`Stopped`](crate::visit::Stopped) once it has stopped.
+    /// Planners should call the cached [`distinct_estimate_in`](Self::distinct_estimate_in)
+    /// instead.
     pub fn distinct_in(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
-    ) -> Option<u64> {
+        visit: crate::visit::Visitor<'_>,
+    ) -> Result<Option<u64>, crate::visit::Stopped> {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
-        if self.expanding(model, pattern).is_some() {
-            return None;
+        if self.expanding_with(model, pattern, visit)?.is_some() {
+            return Ok(None);
         }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let Some(plan) = AccessPlan::in_permutation(pattern, permutation) else {
+            return Ok(None);
+        };
         if plan.exclude_default_graph {
-            return None;
+            return Ok(None);
         }
         let bound = plan
             .low
@@ -2301,39 +2307,41 @@ impl Snapshot {
             !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
         });
         if bound >= 4 || !supported {
-            return None;
+            return Ok(None);
         }
-        let mut values = Vec::new();
-        let mut sources = 0;
+        let mut walks = Vec::new();
         for stack in Stack::ALL {
             if model.includes(stack) {
-                let before = values.len();
                 self.data(model)
                     .stack(stack)
-                    .distinct_values(&plan, bound, &mut values);
-                sources += usize::from(values.len() > before);
+                    .distinct_walks(&plan, bound, visit, &mut walks)?;
             }
         }
-        // One run of one stack yields sorted distinct values already.
-        if sources > 1 || !values.is_sorted() {
-            values.sort_unstable();
-            values.dedup();
-        }
-        Some(values.len() as u64)
+        crate::index::count_distinct(walks, visit).map(Some)
     }
 
     /// [`distinct_in`](Self::distinct_in), cached by the engine across revisions until the
-    /// pattern's match count drifts by more than a quarter. For cost estimates only: the
-    /// value may be slightly stale.
+    /// pattern's match count drifts by more than a quarter (a published snapshot of the
+    /// engine's keeps it; a view keeps nothing). For cost estimates only: the value may be
+    /// slightly stale. The count that gates it and the walk are counted on `visit`:
+    /// [`Stopped`](crate::visit::Stopped) once it has stopped.
     pub fn distinct_estimate_in(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
-    ) -> Option<u64> {
+        visit: crate::visit::Visitor<'_>,
+    ) -> Result<Option<u64>, crate::visit::Stopped> {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
-        self.statistics.distinct(self, model, pattern, permutation)
+        self.statistics
+            .distinct(self, model, pattern, permutation, visit)
+    }
+
+    /// The statistics this snapshot plans with (a view's own): what the tests read.
+    #[cfg(test)]
+    pub(crate) fn statistics(&self) -> &super::statistics::Statistics {
+        &self.statistics
     }
 
     /// The characteristic sets of the default graph in `model`, for estimates of star

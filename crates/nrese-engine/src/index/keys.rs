@@ -29,7 +29,7 @@ use rayon::prelude::*;
 
 use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
-use crate::visit::Account;
+use crate::visit::{Account, Free, PORTION, Stopped};
 
 /// How index blocks are encoded when they are built (`store.index_encoding`). Reading
 /// takes either, so a store can switch: blocks built after the switch take the new one.
@@ -883,51 +883,31 @@ impl PackedKeys {
         position: usize,
         mut f: impl FnMut(u64, usize, usize),
     ) {
-        if start >= end {
-            return;
+        let mut groups = self.group_cursor(start, end, position);
+        while let Ok(Some((value, from, to))) = groups.next(&mut Free) {
+            f(value, from, to);
         }
-        let mut value = self.get(start)[position];
-        let mut from = start;
-        let mut i = start;
-        let mut column = Vec::with_capacity(BLOCK);
-        while i < end {
-            let mut block = i / BLOCK;
-            if i == block * BLOCK {
-                let last = self.last_block_of(block, end, position, value);
-                if last > block {
-                    block = last;
-                    i = block * BLOCK;
-                }
-            }
-            let block_end = ((block + 1) * BLOCK).min(end);
-            let header = &self.headers[block];
-            let (tw, pw) = (header.widths[2 * position], header.widths[2 * position + 1]);
-            if tw == 0 && pw == 0 && !header.palette(position) {
-                let constant = (u64::from(header.tag_min[position]) << TAG_SHIFT)
-                    | header.payload_min[position];
-                if constant != value {
-                    f(value, from, i);
-                    (value, from) = (constant, i);
-                }
+    }
+
+    /// [`Self::groups`] as a cursor: the same walk, a group per [`Groups::next`], its work
+    /// counted on the caller's account a block at a time.
+    pub(crate) fn group_cursor(&self, start: usize, end: usize, position: usize) -> Groups<'_> {
+        Groups {
+            keys: self,
+            end,
+            position,
+            value: if start < end {
+                self.get(start)[position]
             } else {
-                column.clear();
-                self.decode_column(
-                    block,
-                    i - block * BLOCK,
-                    block_end - block * BLOCK,
-                    position,
-                    &mut column,
-                );
-                for (k, &v) in column.iter().enumerate() {
-                    if v != value {
-                        f(value, from, i + k);
-                        (value, from) = (v, i + k);
-                    }
-                }
-            }
-            i = block_end;
+                0
+            },
+            from: start,
+            i: start,
+            column: Vec::new(),
+            base: start,
+            at: 0,
+            done: start >= end,
         }
-        f(value, from, end);
     }
 
     /// The last block, from `block` on and starting before `end`, whose first key has
@@ -1242,6 +1222,103 @@ impl PackedKeys {
     /// Bytes used in place from a mapped file.
     pub(crate) fn mapped_bytes(&self) -> usize {
         self.headers.mapped_bytes() + self.firsts.mapped_bytes() + self.data.mapped_bytes()
+    }
+}
+
+/// The groups of a range of keys at one position, one at a time ([`PackedKeys::group_cursor`]).
+/// It holds one block's column at most: `BLOCK` values, whatever the range.
+pub(crate) struct Groups<'k> {
+    keys: &'k PackedKeys,
+    end: usize,
+    position: usize,
+    /// The open group's value and its first key.
+    value: u64,
+    from: usize,
+    /// The first key not yet loaded.
+    i: usize,
+    /// The decoded values of keys `base..base + column.len()`, read up to `at`.
+    column: Vec<u64>,
+    base: usize,
+    at: usize,
+    /// The last group has been handed out (or the range was empty).
+    done: bool,
+}
+
+impl Groups<'_> {
+    /// The next group: its value and its keys `from..to`, `None` after the last. Each block
+    /// it loads is counted on `account` before it is read: the gallop over the blocks' first
+    /// keys, then the keys it decodes. `Err` once the account has stopped: never a group
+    /// after that.
+    pub(crate) fn next(
+        &mut self,
+        account: &mut impl Account,
+    ) -> Result<Option<(u64, usize, usize)>, Stopped> {
+        let keys = self.keys;
+        loop {
+            while self.at < self.column.len() {
+                let (k, v) = (self.base + self.at, self.column[self.at]);
+                self.at += 1;
+                if v != self.value {
+                    let group = (self.value, self.from, k);
+                    (self.value, self.from) = (v, k);
+                    return Ok(Some(group));
+                }
+            }
+            if self.i >= self.end {
+                if self.done {
+                    return Ok(None);
+                }
+                self.done = true;
+                return Ok(Some((self.value, self.from, self.end)));
+            }
+            let mut block = self.i / BLOCK;
+            if self.i == block * BLOCK {
+                let gallop = 2 * u64::from(usize::BITS - keys.firsts.len().leading_zeros());
+                if !account.take(gallop.min(PORTION)) {
+                    return Err(Stopped);
+                }
+                let last = keys.last_block_of(block, self.end, self.position, self.value);
+                if last > block {
+                    block = last;
+                    self.i = block * BLOCK;
+                }
+            }
+            let block_end = ((block + 1) * BLOCK).min(self.end);
+            let header = &keys.headers[block];
+            let position = self.position;
+            let (tw, pw) = (header.widths[2 * position], header.widths[2 * position + 1]);
+            if tw == 0 && pw == 0 && !header.palette(position) {
+                if !account.take(1) {
+                    return Err(Stopped);
+                }
+                let constant = (u64::from(header.tag_min[position]) << TAG_SHIFT)
+                    | header.payload_min[position];
+                let at = self.i;
+                self.i = block_end;
+                if constant != self.value {
+                    let group = (self.value, self.from, at);
+                    (self.value, self.from) = (constant, at);
+                    return Ok(Some(group));
+                }
+            } else {
+                if !account.take((block_end - self.i) as u64) {
+                    return Err(Stopped);
+                }
+                if self.column.capacity() == 0 {
+                    self.column.reserve_exact(BLOCK);
+                }
+                self.column.clear();
+                keys.decode_column(
+                    block,
+                    self.i - block * BLOCK,
+                    block_end - block * BLOCK,
+                    position,
+                    &mut self.column,
+                );
+                (self.base, self.at) = (self.i, 0);
+                self.i = block_end;
+            }
+        }
     }
 }
 

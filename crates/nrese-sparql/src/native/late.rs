@@ -123,6 +123,9 @@ impl super::Context<'_> {
                 super::DECODE_CACHE_ENTRIES,
                 1,
             )),
+            distinct_counts: RefCell::new(nrese_exec::ChargedMap::new(std::sync::Arc::clone(
+                &self.budget,
+            ))),
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),
