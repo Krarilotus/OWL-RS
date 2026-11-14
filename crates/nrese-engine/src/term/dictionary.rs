@@ -1535,7 +1535,7 @@ impl Dictionary {
 
     /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
     /// their first occurrence in the input: [`super::pending`]), adds them as a segment
-    /// (their text stays where it was interned), then calls `remap` with them so the load's
+    /// (their text moved into one arena), then calls `remap` with them so the load's
     /// quads take their ids. Readers go on meanwhile; writers wait for the adoption.
     ///
     /// The adoption guard is held across the numbering only, whose parallel parts run on
