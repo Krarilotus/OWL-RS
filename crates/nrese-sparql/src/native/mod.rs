@@ -1523,6 +1523,10 @@ struct Context<'a> {
     computed_ids: RefCell<HashMap<Term, u64>>,
     /// Stored terms decoded once, charged to `budget` while kept ([`decode_cache`]).
     decoded: RefCell<decode_cache::DecodeCache>,
+    /// The distinct counts this query's planning asked for ([`Self::distinct`]), per pattern
+    /// and order, charged to `budget` and freed with the query: a pattern planned again (an
+    /// EXISTS per outer key) walks once, though a view keeps nothing beyond the query.
+    distinct_counts: RefCell<ChargedMap<(QuadPattern, Permutation), Option<u64>>>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
     decodes: AtomicU64,
@@ -1770,6 +1774,7 @@ impl<'a> Context<'a> {
                 DECODE_CACHE_ENTRIES,
                 1,
             )),
+            distinct_counts: RefCell::new(ChargedMap::new(Arc::clone(&budget))),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
@@ -4020,7 +4025,9 @@ impl<'a> Context<'a> {
     }
 
     /// Distinct values of `var` among `scan`'s `count` matches: the engine's statistics
-    /// where an index order puts `var` right after the constants, else `count`.
+    /// where an index order puts `var` right after the constants, else `count`; kept for the
+    /// query (`distinct_counts`). Their walk stops with the query: then `count`,
+    /// nothing kept, and the planner's next check of the cancellation ends the query.
     fn distinct(&self, scan: &ScanPattern, var: &Variable, count: u64) -> u64 {
         const CANDIDATES: [Permutation; 4] = [
             Permutation::Gspo,
@@ -4052,8 +4059,23 @@ impl<'a> Context<'a> {
                 order[prefix] == position && order[prefix + 1..].iter().all(|&c| !bound(c))
             })
             .and_then(|&p| {
-                self.snapshot
-                    .distinct_estimate_in(self.model, &scan.quad_pattern(), p)
+                let key = (scan.quad_pattern(), p);
+                if let Some(&kept) = self.distinct_counts.borrow().get(&key) {
+                    return kept;
+                }
+                let going = |_| {
+                    !self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                };
+                let distinct = self
+                    .snapshot
+                    .distinct_estimate_in(self.model, &key.0, p, &going)
+                    .ok()?;
+                // Refused, nothing is kept: the next plan asks the snapshot again.
+                let _ = self.distinct_counts.borrow_mut().insert(key, distinct);
+                distinct
             })
             .map_or(count, |d| d.min(count))
     }
