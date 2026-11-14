@@ -1,5 +1,5 @@
-description = """The README's first example (README.md, "A first example: inference, retraction,
-validation"), as written there: under owl2-rl with the SHACL gate enforcing, an instance of a
+description = """The first example (README.md, "A first answer: inference", and docs/tutorial.md),
+as written there: under owl2-rl with the SHACL gate enforcing, an instance of a
 subclass is an instance of its superclass by inference, with a sound-only answer; deleting the
 premise takes the inference with it; a shape in the shapes graph makes the gate reject an unnamed
 cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes."""

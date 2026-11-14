@@ -1,13 +1,14 @@
 # Building, running and developing NRESE
 
-The long form of the README's quick start: building from source, the console, the CLI, and where to start in the code. Building without filling the disk, the gate and how to measure are in [CONTRIBUTING.md](../../CONTRIBUTING.md).
+The long form of the README's [quick start](../../README.md#quick-start): building from source, the console, the CLI, and where to start in the code. Building without filling the disk, the gate and how to measure are in [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ## Setup
 
 ### Prerequisites
 
-- Rust toolchain
-- Cargo
+- Rust 1.98 or later (`rust-version` in [Cargo.toml](../../Cargo.toml); the builds here use the
+  version [rust-toolchain.toml](../../rust-toolchain.toml) names), with Cargo
+- for the console: Node.js
 - optional: Docker, to build and run the image
 
 ### Build
@@ -78,6 +79,15 @@ You can also bind at build time with:
 ```powershell
 cargo run -p nrese-server
 ```
+
+With only Rust, you get the server and its API on `127.0.0.1:8080`, from memory (nothing
+is written to disk) and with reasoning off; set `NRESE_STORE_MODE=on-disk` and
+`NRESE_REASONING_MODE` to change that ([configuration](../ops/config-reference.md)); `--release`
+builds it optimised. With reasoning off, the quick start's first query answers no rows, as
+`complete`: nothing is inferred. Start the server with `NRESE_REASONING_MODE=owl2-rl` and
+`NRESE_SHACL_GATE=enforce` for the quick start's example and the [tutorial](../tutorial.md). The
+operator page `/ops` is built in; the browser console is embedded only when it was built
+first ([above](#build-the-user-frontend)); without it, `/console` says how.
 
 Run with an explicit config file:
 

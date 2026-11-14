@@ -3,7 +3,7 @@
 What NRESE doesn't do, and where it departs from a standard on purpose, for the code of
 the commit this page is in. Each item is stated in the document it links to; this page only gathers them, each
 with what to do instead, or "none known" where there is nothing. What is in:
-[What it covers](../README.md#what-it-covers); what is planned: [ROADMAP.md](ROADMAP.md),
+[What it covers](what-it-covers.md); what is planned: [ROADMAP.md](ROADMAP.md),
 and nothing here is a promise about it.
 
 ## Choose another system when
@@ -86,7 +86,7 @@ and nothing here is a promise about it.
   Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
   budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
   monotone over answers that may be missing gives `unsound`
-  ([what an answer promises](../README.md#what-an-answer-promises)).
+  ([what an answer promises](what-it-covers.md#what-an-answer-promises)).
 - **User rules** (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.

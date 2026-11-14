@@ -1,7 +1,7 @@
-# The README's first example: test and last run
+# The first example: test and last run
 
-The README's [first example](../../README.md#a-first-example-inference-retraction-validation)
-is also a test: `scripts/verify/scenarios/readme-first-example.toml` sends each of its steps to a
+The first example, the README's [first answer](../../README.md#a-first-answer-inference) and the
+[tutorial](../tutorial.md)'s retraction and validation, is also a test: `scripts/verify/scenarios/first-example.toml` sends each of its steps to a
 running server and checks the answer. This page records what it sends, what it expects, and what
 the last run got.
 
@@ -9,10 +9,10 @@ the last run got.
 
 - **When:** 13 November 2026, 22:57 (CET).
 - **Code:** commit `78b4a49b7becb0df1decc3f858d8ddf7c8166286`, package version 0.1.0.
-- **Server:** built and started as the README's quick start says (`docker build -t nrese .`, then
+- **Server:** built and started as the README's [quick start](../../README.md#quick-start) says (`docker build -t nrese .`, then
   `docker run` with `NRESE_REASONING_MODE=owl2-rl` and `NRESE_SHACL_GATE=enforce`, a fresh volume)
   on a Linux x86-64 machine.
-- **Runner:** `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/readme-first-example.toml`.
+- **Runner:** `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml`.
 - **Result:** 9 of 9 steps passed.
 
 ## The steps
@@ -35,6 +35,6 @@ Every step is a `POST` with a form body; `ex:` is `http://example.org/`. "All an
 ## Run it yourself
 
 You need Python 3.11 or later (the runner uses only its standard library). Start a fresh server as
-the README's quick start says, then run the runner command above from the repository's root. It
+the README's [quick start](../../README.md#quick-start) says, then run the runner command above from the repository's root. It
 prints one line per step and writes every request and response, with a summary, to a new folder
 under `tmp/verify/`. It exits 0 when every step passed, 1 when one failed.

@@ -40,7 +40,7 @@ the asserted ones only.
 ### Reasoning mode, profile
 
 A reasoning mode is the set of rules that derives the inferred statements: `rdfs` up to
-`owl2-dl` ([modes](../README.md#reasoning)). OWL 2 QL, RL and DL are parts of OWL 2 that
+`owl2-dl` ([modes](what-it-covers.md#reasoning)). OWL 2 QL, RL and DL are parts of OWL 2 that
 the [OWL 2 profiles](https://www.w3.org/TR/owl2-profiles/) standard defines: QL for query
 rewriting, RL for rules, DL the whole decidable language. A mode's rules are complete only
 for an ontology inside its profile, which is why its answers say `sound-only`.
@@ -49,12 +49,12 @@ for an ontology inside its profile, which is why its answers say `sound-only`.
 
 One write (a SPARQL update, a Graph Store upload, a client transaction's commit), applied
 whole or not at all, with its inferences and checks
-([what a commit does](../README.md#what-a-commit-does)).
+([what a commit does](what-it-covers.md#what-a-commit-does)).
 
 ### Completeness status
 
 The `NRESE-Completeness` header on every SPARQL answer: what the answer promises
-([what an answer promises](../README.md#what-an-answer-promises)).
+([what an answer promises](what-it-covers.md#what-an-answer-promises)).
 
 ### Shape, shapes graph, SHACL gate
 
@@ -71,7 +71,7 @@ the one `/dataset/…` serves ([repositories](ops/http-api.md#engine-api-apiv1))
 ### Turtle
 
 A text syntax for RDF statements ([Turtle](https://www.w3.org/TR/turtle/)), the `.ttl`
-files of these pages. Other syntaxes: [RDF syntaxes](../README.md#rdf-syntaxes).
+files of these pages. Other syntaxes: [RDF syntaxes](what-it-covers.md#rdf-syntaxes).
 
 ### HTTP request, response, status
 
