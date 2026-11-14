@@ -1199,7 +1199,11 @@ impl<'r> Job<'r> {
             }
         };
         match &self.drivers {
-            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| visit(fact)),
+            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| {
+                #[cfg(test)]
+                crate::witness::trace(crate::witness::Event::Driver);
+                visit(fact)
+            }),
             Drivers::InPlace(_) => {
                 source.scan_range(self.pattern, self.seg, range, poll, &mut visit)?;
             }
@@ -1254,7 +1258,11 @@ impl<'r> Job<'r> {
             }
         };
         match &self.drivers {
-            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| visit(fact)),
+            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| {
+                #[cfg(test)]
+                crate::witness::trace(crate::witness::Event::Driver);
+                visit(fact)
+            }),
             Drivers::InPlace(_) => {
                 source.scan_range(self.pattern, self.seg, range, poll, &mut visit)?;
             }
@@ -1366,6 +1374,8 @@ impl<'a> Poller<'a> {
         if self.stopped.get() {
             return true;
         }
+        #[cfg(test)]
+        crate::witness::trace(crate::witness::Event::Charge(units));
         let units = u32::try_from(units).unwrap_or(u32::MAX);
         if self.ticker.tick(units).is_err() {
             self.stopped.set(true);
