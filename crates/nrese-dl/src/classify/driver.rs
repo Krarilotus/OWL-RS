@@ -27,7 +27,9 @@ use nrese_owl::{Normalised, Ontology, Term};
 use super::consistency::{self, Decided};
 use super::known::{self, Lower};
 use super::{Classification, Deadline, Options, Profile, Taxonomy};
-use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
+use crate::tableau::{
+    Answer, At, Base, From, Labels, Omissions, Prepared, Probe, ProbeOutcome, Want,
+};
 use crate::verdict::Verdict;
 
 /// A class's state.
@@ -132,7 +134,7 @@ impl<'a> Driver<'a> {
         // instead of after a search whose every "no" is unsupported.
         let left_out = crate::tableau::left_out(self.ontology, self.normalised);
         if !left_out.is_empty() {
-            let why = left_out.join("; ");
+            let why = left_out.messages().join("; ");
             self.incomplete
                 .push(format!("consistency not decided (unsupported): {why}"));
             if self.top_known.is_none() {
@@ -146,7 +148,9 @@ impl<'a> Driver<'a> {
             }
             let known = self.known.clone();
             let consistency = Verdict::Unknown(format!("unsupported: {why}"));
-            return self.finish(&known, &lower_top, consistency, started);
+            let mut taxonomy = self.finish(&known, &lower_top, consistency, started);
+            taxonomy.left_out = left_out;
+            return taxonomy;
         }
         super::trace("consistency");
         // 1. Consistency: the context core where it can, else the hypertableau.
@@ -281,6 +285,7 @@ impl<'a> Driver<'a> {
             classification: c,
             incomplete: self.incomplete,
             profile: self.profile,
+            left_out: Omissions::default(),
         }
     }
 
@@ -379,6 +384,7 @@ impl<'a> Driver<'a> {
             classification: c,
             incomplete: self.incomplete,
             profile: self.profile,
+            left_out: Omissions::default(),
         }
     }
 

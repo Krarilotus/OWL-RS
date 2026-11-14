@@ -755,6 +755,50 @@ fn tests_with_individuals_start_from_their_model() {
 /// 20,000 classes searched 600 s, 30 M nodes, to the same answer).
 #[test]
 fn left_out_axioms_answer_from_the_lower_bound_at_once() {
+    let t = classify::classify(&irregular(), &options());
+    assert_eq!(t.profile.tests, 0, "{}", t.profile.line());
+    assert!(
+        t.incomplete.iter().any(|i| i.contains("irregular")),
+        "{:?}",
+        t.incomplete
+    );
+    assert!(t.classification.subsumptions.contains(&(1, 4)));
+}
+
+/// The driver's lower bound names what it left out by cause: here the irregular hierarchy
+/// alone. A key beside it is none (the engines read keys as rules); a reader diagnostic
+/// beside it is one, and the hierarchy is then no longer all that is left out.
+#[test]
+fn a_lower_bound_names_the_causes_it_left_out() {
+    let irregular_only = |o: &Ontology| {
+        let t = classify::classify(o, &options());
+        assert!(!t.left_out.is_empty(), "{:?}", t.incomplete);
+        t.left_out
+            .only(nrese_owl::Unsupported::IrregularRoleHierarchy)
+    };
+    let o = irregular();
+    assert!(irregular_only(&o));
+    let mut keyed = o.clone();
+    let a = ExprId(keyed.classes.intern(ClassExpr::Class(1)));
+    keyed.axioms.push(Axiom::HasKey(
+        a,
+        vec![nrese_owl::ObjProp::Named(13)],
+        Vec::new(),
+    ));
+    keyed.sources.push(Vec::new());
+    assert!(irregular_only(&keyed));
+    let mut misread = o;
+    misread.diagnostics.push(nrese_owl::Diagnostic::Syntax {
+        line: 1,
+        column: 1,
+        what: "a test's",
+    });
+    assert!(!irregular_only(&misread));
+}
+
+/// An irregular role hierarchy (`r1∘r2 ⊑ r3` beside `r3 ⊑ r1`) with a universal over `r1`,
+/// which needs its automaton, and a Horn subsumption `1 ⊑ 4` over a role outside it.
+fn irregular() -> Ontology {
     use nrese_owl::ObjProp;
     let mut o = Ontology::default();
     let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
@@ -780,14 +824,7 @@ fn left_out_axioms_answer_from_the_lower_bound_at_once() {
     o.axioms.push(Axiom::SubClassOf(b, c));
     o.axioms.push(Axiom::EquivalentClasses(vec![d, some_c]));
     o.sources = vec![Vec::new(); o.axioms.len()];
-    let t = classify::classify(&o, &options());
-    assert_eq!(t.profile.tests, 0, "{}", t.profile.line());
-    assert!(
-        t.incomplete.iter().any(|i| i.contains("irregular")),
-        "{:?}",
-        t.incomplete
-    );
-    assert!(t.classification.subsumptions.contains(&(1, 4)));
+    o
 }
 
 /// Guard (small-scope case 1219488, 12 October 2026): a key over `owl:topObjectProperty`
