@@ -429,7 +429,7 @@ def record_check(catalog: list[dict], record: dict, floor: int = 1, off_route_ok
     if state == "known" and not e["unchecked"]:
         return []
     if state != "ok" or e["unchecked"]:
-        why = e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
+        why = e["refused"][:1] + e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
         problems.append(f"{name}: {', '.join(map(str, sorted(set(map(str, e['status'])))))}"
                         + (f" ({'; '.join(map(str, why))})" if why else "")
                         + (f", {e['unchecked']} checks unchecked" if e["unchecked"] else ""))
@@ -472,7 +472,7 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
         for case in planned:
             e = rg.evidence(mine, case)
             if rg.state(e, off_route_ok=side != "b") != "ok" or e["unchecked"]:
-                why = e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
+                why = e["refused"][:1] + e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
                 problems.append(f"{case} on {side}: {', '.join(map(str, sorted(set(e['status']))))}"
                                 + (f" ({'; '.join(why)})" if why else "")
                                 + (f", {e['unchecked']} checks unchecked" if e["unchecked"] else ""))

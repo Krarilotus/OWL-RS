@@ -255,6 +255,7 @@ def p50(values: list[float]) -> float:
 def evidence(passes: list[dict], case: str) -> dict:
     """One side's evidence of a case, pass by pass, each pass's block and layout beside it."""
     out = {"status": [], "expected": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
+           "refused": [],
            "samples": [], "blocks": [], "layouts": [],
            "process": [], "estimator": set(), "lifetime": [], "anon_kernel": [], "live": [], "kinds": set(),
            "phases": [], "cgroup": [], "qps": [],
@@ -276,8 +277,18 @@ def evidence(passes: list[dict], case: str) -> dict:
         observations = record.get("observations") or []
         out["status"].append(record.get("status"))
         out["expected"].append(record.get("expected_outcome", "ok"))
-        checks = record.get("checks", []) + [c for o in observations for c in o.get("checks", [])]
-        routes = record.get("routes", []) + [c for o in observations for c in o.get("routes", [])]
+        # A query refused at its memory limit (fast.py QUERY_REFUSAL, an invocation's `refused`) has
+        # no answer: its checks and routes are unanswered, not failed; the refusal is named instead,
+        # and fails the case whatever it declares (state()). The record's own checks are its last
+        # invocation's.
+        gone = [o.get("refused") or {} for o in observations]
+        last = gone[-1] if gone else {}
+        checks = [c for c in record.get("checks", []) if not unanswered(c, last)] + \
+            [c for o, g in zip(observations, gone) for c in o.get("checks", []) if not unanswered(c, g)]
+        routes = [c for c in record.get("routes", []) if not unanswered(c, last)] + \
+            [c for o, g in zip(observations, gone) for c in o.get("routes", []) if not unanswered(c, g)]
+        out["refused"] += [f"{q} refused at its memory limit ({e[:160]})" for g in gone for q, e in sorted(g.items())
+                           if f"{q} refused at its memory limit ({e[:160]})" not in out["refused"]]
         for key, items in (("failed_checks", checks), ("failed_routes", routes)):
             out[key] += [f"{c.get('path')}: expected {c.get('expected')}, got {c.get('got')}"
                          for c in items if c.get("ok") is False and
@@ -339,10 +350,19 @@ def evidence(passes: list[dict], case: str) -> dict:
     return out
 
 
+def unanswered(check: dict, refused: dict) -> bool:
+    """A check (or route) of a query its invocation refused at its memory limit: no answer to judge."""
+    path = str(check.get("path", ""))
+    return path.startswith("q.") and path.split(".")[1] in refused
+
+
 def state(e: dict, off_route_ok: bool = False) -> str:
     """ok (every pass ok), known (every pass the declared outcome, not ok), or failed. A
     baseline off the route the harness asserts (an operator it hasn't) with every answer
-    right is a valid time: ok with `off_route_ok`."""
+    right is a valid time: ok with `off_route_ok`. A refused query fails it, whatever the
+    case declares: no case declares a refusal (fast.py QUERY_MEMORY_LIMIT)."""
+    if e.get("refused"):
+        return "failed"
     fine = {"ok", "off-route"} if off_route_ok else {"ok"}
     if (e["status"] and all(s in fine for s in e["status"]) and not e["failed_checks"]
             and (off_route_ok or not e["failed_routes"])):
@@ -364,6 +384,8 @@ def why_not(e: dict, side: str) -> str:
     for note in e["notes"]:
         if match := CAPABILITY.search(note.replace("\\n", "\n")):
             return f"{side} can't run it ({match.group(0).strip()}; {statuses})"
+    if e.get("refused"):
+        return f"{side} refused a query ({e['refused'][0]}; {statuses})"
     if e["failed_checks"]:
         return f"{side}'s answer is wrong ({e['failed_checks'][0]}; {statuses})"
     return f"{side}: {statuses}" + (f" ({e['notes'][-1][:120]})" if e["notes"] else "")
@@ -1030,7 +1052,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         cand = evidence(by_side[candidate], case)
         cand_state = state(cand, off_route_ok=baseline_candidate)
         if cand_state == "failed":
-            why = cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
+            why = cand["refused"][:2] + cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
             summary["candidate_failures"][case] = f"statuses {', '.join(map(str, cand['status']))}; " + "; ".join(why)
         elif cand_state == "known":
             summary["known_issues"][case] = ", ".join(sorted(set(cand["status"])))
