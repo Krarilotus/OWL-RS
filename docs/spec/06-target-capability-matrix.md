@@ -1,7 +1,8 @@
 # Capability Matrix
 
 What NRESE can do, capability by capability: its state, the work package that owns it and
-the evidence behind it. This is the single status source for capabilities.
+the evidence behind it: the developers' status per capability; what is in, left out and
+planned, for a reader, is the [scope](../what-it-covers.md#scope).
 
 **Status values** (as of 30 September 2026):
 - `done`: implemented, serving, and its evidence gate passed

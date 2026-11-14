@@ -1,9 +1,51 @@
 # What it covers
 
-What NRESE does today, in the code of the commit this page is in. Each item links to the specification, document or test that backs it,
-with its limits beside it; nothing here is a plan. What is left out on purpose, and every
-deviation from a standard: [limits](limits.md). What is planned:
-[ROADMAP](ROADMAP.md).
+What NRESE does today, in the code of the commit this page is in, starting with its scope: what
+is in, what is left out, and what is planned, one line each, each linking to the page that holds
+the detail.
+
+## Scope
+
+**In:** the sections below. Each item there links the specification, document or test that backs
+it, with its limits beside it; nothing in them is a plan.
+
+- SPARQL 1.1 query, update and federation; SPARQL 1.2 drafts; full-text, vector and, in part,
+  GeoSPARQL search: [SPARQL](#sparql)
+- The W3C RDF syntaxes, JSON-LD 1.1, Notation3 data in the library, canonicalisation, parallel
+  bulk loads: [RDF syntaxes](#rdf-syntaxes)
+- Reasoning from RDFS to OWL 2 DL, materialised and kept up to date by every commit, and the
+  status every answer carries: [reasoning](#reasoning)
+- SHACL Core and SHACL-SPARQL, on request and as a commit gate: [SHACL](#shacl)
+- Its own storage engine: atomic commits, durability, client transactions, backups, read
+  replicas, several repositories: [storage](#storage-transactions-and-durability)
+- Authentication, graph-level access control, deployment postures, budgets, metrics:
+  [access control and operations](#access-control-and-operations)
+- The SPARQL, Graph Store, RDF4J and engine HTTP interfaces, the browser console, the server's
+  commands, the console CLI: [interfaces](#interfaces)
+
+**Left out**, today; each with what to do instead in [limits](limits.md):
+
+- Several writers at once; automatic failover; data split across machines:
+  [choose another system](limits.md#choose-another-system-when)
+- Named graphs as separate reasoning contexts; every OWL 2 DL answer proven complete:
+  [choose another system](limits.md#choose-another-system-when)
+- SHACL Advanced Features (rules) and `sh:entailment`: [SHACL](limits.md#shacl)
+- Embeddings computed by the store; a released Rust library; property-graph query languages
+  (planned, below): [choose another system](limits.md#choose-another-system-when)
+- The deviations from the standards, such as SPARQL Update's `LOAD`:
+  [SPARQL](limits.md#sparql), [RDF syntaxes](limits.md#rdf-syntaxes),
+  [reasoning](limits.md#reasoning), [storage](limits.md#storage-and-transactions)
+
+**Planned**, in order; nothing of it is present: [roadmap](ROADMAP.md).
+
+- The open items before v2 goes to `main`, then benchmarks, the merge into `main`, concise docs
+  and a refactoring, v3: [the order](ROADMAP.md#the-order-owner-5-october-2026)
+- Property graphs (ISO GQL, openCypher) over the same store, enterprise operations, data
+  integration, AI integration, exploration and history, ontology work and publishing:
+  [the order](ROADMAP.md#the-order-owner-5-october-2026), item 6
+- OWL 2 DL: classification speed and tighter answer bounds: [DL](ROADMAP.md#dl)
+- Not yet ordered: an audit log, SBOM and signed releases, a threat model, the frontend on the
+  engine API, scaling across machines: [not yet ordered](ROADMAP.md#not-yet-ordered)
 
 ## SPARQL
 

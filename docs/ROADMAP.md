@@ -1,6 +1,7 @@
 # Roadmap
 
-The order of work. What is done is in [STATUS.md](STATUS.md); what is left before v2
+The order of work: the detail of the "planned" list of the [scope](what-it-covers.md#scope), and
+nothing here is present. What is done is in [STATUS.md](STATUS.md); what is left before v2
 goes to `main` is the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md); why things are decided as they
 are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions.md).
@@ -14,9 +15,8 @@ below; across machines, only read replicas are built so far.
 
 ## The order (owner, 5 October 2026)
 
-1. **Finish v2:** the open items of the merge checklist (DL classification and its
-   outliers, the store's DL mode, the query items, materialisation memory, OWL 2 QL
-   rewriting, which is done: [STATUS](STATUS.md)).
+1. **Finish v2:** the open items of the merge checklist, as its
+   [status table](plan/2026-10-05-v2-merge-checklist.md) lists them.
 2. **Benchmark it:** the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the
