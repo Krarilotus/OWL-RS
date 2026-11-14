@@ -55,6 +55,7 @@ use super::snapshot::HeavyGroups;
 use super::{ReadModel, SharedState, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
+use crate::visit::{Stopped, Visitor};
 
 /// The characteristic sets of one read model as built at a size (`None`: there were too
 /// many to keep, or the budget couldn't take them), and whether a rebuild is under way.
@@ -82,8 +83,10 @@ enum Kept {
     Cold,
 }
 
-/// Cached entries; the cache is cleared when it fills up.
-const ENTRIES: usize = 1 << 14;
+/// Slots of the distinct-count cache: direct-mapped by the key's hash, an entry replacing
+/// the one in its slot. Allocated in full at the first entry kept, so what it holds is what
+/// is charged, and never more.
+const DISTINCT_SLOTS: usize = 1 << 14;
 
 /// Patterns with more matches get no distinct count (`None`): computing it would hold up
 /// the first query that plans with them.
@@ -91,11 +94,20 @@ const MAX_MATCHES: u64 = 1 << 22;
 
 type Key = (ReadModel, QuadPattern, Permutation);
 
+/// A distinct-count cache slot: the key, its distinct count and the match count it was
+/// computed at.
+type Slot = Option<(Key, u64, u64)>;
+
 /// The engine's distinct-count cache, shared by all snapshots.
 #[derive(Default)]
 pub(crate) struct Statistics {
-    /// Per key: the distinct count and the match count it was computed at.
-    distinct: Mutex<HashMap<Key, (u64, u64)>>,
+    /// Per key, in its slot: the distinct count and the match count it was computed at.
+    /// `None` before the first entry kept, where the budget refused the slots, and always in
+    /// a view's statistics (`view`), which keep none.
+    distinct: Mutex<Option<ChargedVec<Slot>>>,
+    /// A view's statistics ([`Self::for_view`]): they keep no distinct count, so a view's
+    /// planning query walks for itself and nothing of it outlives the query.
+    view: bool,
     /// Node counts (distinct subjects and objects) of versions, exact. An entry holds its
     /// version weakly: while it does, the allocation can't be reused, so a pointer match
     /// is the same version (a transaction's pending snapshot shares its base's revision
@@ -195,6 +207,7 @@ impl Statistics {
     pub(crate) fn for_view(&self) -> Self {
         Self {
             corpora: self.corpora.clone(),
+            view: true,
             ..Self::default()
         }
     }
@@ -374,6 +387,8 @@ impl Statistics {
     /// catalog's budget).
     pub(crate) fn set_budget(&self, budget: Arc<Budget>) {
         *self.budget.lock() = Some(budget);
+        // Made again, charged to this budget, at the next entry kept.
+        *self.distinct.lock() = None;
     }
 
     /// The sets of `model` kept, or read from their file if none are; drifted ones by more
@@ -676,46 +691,106 @@ impl Statistics {
 
     /// The number of distinct values of `permutation`'s first unbound component among the
     /// matches of `pattern` in `model`: cached, or computed now (see the module docs), and
-    /// kept for a published snapshot alone. `None` where [`Snapshot::distinct_in`] can't
-    /// answer.
+    /// kept for a published snapshot of the engine alone (a view's statistics keep none).
+    /// `Ok(None)` where [`Snapshot::distinct_in`] can't answer. The match count that gates
+    /// the walk and the walk are counted on `visit`: `Err` once it has stopped, nothing kept.
     pub(crate) fn distinct(
         &self,
         snapshot: &Snapshot,
         model: ReadModel,
         pattern: &QuadPattern,
         permutation: Permutation,
-    ) -> Option<u64> {
+        visit: Visitor<'_>,
+    ) -> Result<Option<u64>, Stopped> {
         let key = (model, *pattern, permutation);
-        let count = snapshot.count_in(model, pattern).at_least();
-        if let Some(&(distinct, at)) = self.distinct.lock().get(&key)
+        let count = snapshot
+            .count_visited(model, pattern, visit)
+            .ok_or(Stopped)?
+            .at_least();
+        let slot = Self::distinct_slot(&key);
+        if let Some(slots) = &*self.distinct.lock()
+            && let Some((kept, distinct, at)) = slots[slot]
+            && kept == key
             && count.abs_diff(at) <= at / 4
         {
-            return Some(distinct.min(count));
+            return Ok(Some(distinct.min(count)));
         }
         if count > MAX_MATCHES {
-            return None;
+            return Ok(None);
         }
         // Computed without the lock: concurrent planners may both compute it once.
-        let distinct = snapshot.distinct_in(model, pattern, permutation)?;
-        if let Some(state) = snapshot.shared_state() {
-            self.keep_distinct(&state, key, distinct, count);
+        let Some(distinct) = snapshot.distinct_in(model, pattern, permutation, visit)? else {
+            return Ok(None);
+        };
+        if !self.view
+            && let Some(state) = snapshot.shared_state()
+        {
+            self.keep_distinct(&state, slot, key, distinct, count);
         }
-        Some(distinct)
+        // Capped as a kept one is: a pattern has no more distinct values than matches, and
+        // the walk counts more only for values deleted quads still shadow. So the first ask
+        // and a repeated one get the same number.
+        Ok(Some(distinct.min(count)))
     }
 
-    /// Keeps `distinct` for `key` as computed at `count` matches. The key has no snapshot
-    /// dimension: the token proves only that a published snapshot computed it.
-    fn keep_distinct(&self, _state: &SharedState<'_>, key: Key, distinct: u64, count: u64) {
+    /// The cache slot of `key`.
+    fn distinct_slot(key: &Key) -> usize {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
+        (hash % DISTINCT_SLOTS as u64) as usize
+    }
+
+    /// Keeps `distinct` for `key` in its `slot`, as computed at `count` matches, replacing
+    /// what the slot held. The slots are allocated in full at the first entry, charged to
+    /// the budget at their capacity; where it can't take them, nothing is kept (the next
+    /// entry asks again). The key has no snapshot dimension: the token proves only that a
+    /// published snapshot computed it.
+    fn keep_distinct(
+        &self,
+        _state: &SharedState<'_>,
+        slot: usize,
+        key: Key,
+        distinct: u64,
+        count: u64,
+    ) {
         let mut cache = self.distinct.lock();
-        if cache.len() >= ENTRIES {
-            cache.clear();
+        if cache.is_none() {
+            let budget = self.budget.lock().clone();
+            let budget = budget.unwrap_or_else(|| Arc::new(Budget::unlimited()));
+            let Ok(mut slots) = ChargedVec::with_capacity(budget, DISTINCT_SLOTS) else {
+                return;
+            };
+            slots
+                .resize(DISTINCT_SLOTS, None)
+                .expect("the capacity is reserved");
+            *cache = Some(slots);
         }
-        cache.insert(key, (distinct, count));
+        if let Some(slots) = cache.as_mut() {
+            slots[slot] = Some((key, distinct, count));
+        }
+    }
+
+    /// The bytes the distinct-count cache holds, charged (`None`: no slots): what the tests
+    /// read.
+    #[cfg(test)]
+    pub(crate) fn distinct_bytes(&self) -> Option<usize> {
+        self.distinct.lock().as_ref().map(ChargedVec::charged)
+    }
+
+    /// The distinct counts kept: what the tests read.
+    #[cfg(test)]
+    pub(crate) fn distinct_entries(&self) -> usize {
+        self.distinct
+            .lock()
+            .as_ref()
+            .map_or(0, |slots| slots.iter().flatten().count())
     }
 }
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod distinct_tests;
 
 #[cfg(test)]
 mod tests {

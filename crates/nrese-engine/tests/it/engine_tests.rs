@@ -341,12 +341,12 @@ fn distinct_counts_match_the_data() {
         ] {
             let model = ReadModel::Materialised;
             assert_eq!(
-                snapshot.distinct_in(model, &pattern, permutation),
-                Some(expected as u64)
+                snapshot.distinct_in(model, &pattern, permutation, &|_| true),
+                Ok(Some(expected as u64))
             );
             assert_eq!(
-                snapshot.distinct_estimate_in(model, &pattern, permutation),
-                Some(expected as u64)
+                snapshot.distinct_estimate_in(model, &pattern, permutation, &|_| true),
+                Ok(Some(expected as u64))
             );
         }
     }
@@ -357,7 +357,9 @@ fn distinct_counts_match_the_data() {
         graph: default,
     };
     let predicates = |snapshot: &nrese_engine::Snapshot| {
-        snapshot.distinct_estimate_in(ReadModel::Materialised, &all, Permutation::Gpso)
+        snapshot
+            .distinct_estimate_in(ReadModel::Materialised, &all, Permutation::Gpso, &|_| true)
+            .unwrap()
     };
     assert_eq!(predicates(&snapshot), Some(3));
     // More than a quarter more matches: the estimate is recomputed.
