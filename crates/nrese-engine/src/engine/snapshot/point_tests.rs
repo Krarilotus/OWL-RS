@@ -8,10 +8,9 @@
 
 use nrese_rdf::NamedNode;
 
-use crate::quad::{GraphSelector, QuadPattern};
+use crate::quad::{AccessPlan, GraphSelector, QuadPattern};
 use crate::{
-    CompactionPolicy, CountedSnapshot, EncodedQuad, EncodedTriple, Engine, EngineConfig, ReadModel,
-    TermId,
+    CompactionPolicy, EncodedQuad, EncodedTriple, Engine, EngineConfig, ReadModel, Snapshot, TermId,
 };
 
 const TERMS: u64 = 3;
@@ -83,12 +82,13 @@ fn a_point_read_answers_the_quads_a_pattern_read_answers() {
             }
             tx.commit().unwrap();
             let case = format!("seed {seed}, deletion step {step}");
-            let snapshot = engine.snapshot().counted();
+            let snapshot = engine.snapshot();
             same_answers(&snapshot, point, &case);
             let held = snapshot
+                .counted()
                 .point_quads(ReadModel::Asserted, point, &|_| true)
-                .map(Iterator::count);
-            assert_eq!(held, Some([3, 2, 0][step]), "{case}: the copies left");
+                .count();
+            assert_eq!(held, [3, 2, 0][step], "{case}: the copies left");
         }
         for commit in 0..COMMITS {
             let mut tx = engine.transaction();
@@ -103,7 +103,7 @@ fn a_point_read_answers_the_quads_a_pattern_read_answers() {
                 };
             }
             tx.commit().unwrap();
-            let snapshot = engine.snapshot().counted();
+            let snapshot = engine.snapshot();
             for s in &terms {
                 for p in &terms {
                     for o in &terms {
@@ -116,9 +116,9 @@ fn a_point_read_answers_the_quads_a_pattern_read_answers() {
     }
 }
 
-/// The point read of `point` in each read model: its quads in the pattern read's order, and
-/// within one visit (`Some`), as these few runs are.
-fn same_answers(snapshot: &CountedSnapshot, point: [TermId; 3], case: &str) {
+/// The point read of `point` in each read model: its quads in the pattern read's order, read
+/// on the point path (making its scans fits one visit, as these few runs' does).
+fn same_answers(snapshot: &Snapshot, point: [TermId; 3], case: &str) {
     let [s, p, o] = point.map(Some);
     let pattern = QuadPattern {
         subject: s,
@@ -126,17 +126,18 @@ fn same_answers(snapshot: &CountedSnapshot, point: [TermId; 3], case: &str) {
         object: o,
         graph: GraphSelector::Any,
     };
+    let plan = AccessPlan::for_pattern(&pattern);
     let going = |_: u64| true;
+    let counted = snapshot.counted();
     for model in [
         ReadModel::Materialised,
         ReadModel::Asserted,
         ReadModel::Inferred,
     ] {
-        let read: Vec<_> = snapshot.quads(model, &pattern, &going).collect();
-        let point_read: Vec<_> = snapshot
-            .point_quads(model, point, &going)
-            .unwrap_or_else(|| panic!("{case}, {model:?}: a point read within one visit"))
-            .collect();
+        let cost = snapshot.point_cost(model, &plan);
+        assert!(cost.is_some(), "{case}, {model:?}: the point path");
+        let read: Vec<_> = counted.quads(model, &pattern, &going).collect();
+        let point_read: Vec<_> = counted.point_quads(model, point, &going).collect();
         assert_eq!(point_read, read, "{case}, {model:?}, {point:?}");
     }
 }
