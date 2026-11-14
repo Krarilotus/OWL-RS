@@ -14,7 +14,7 @@
 //!    lost a fact.
 //! 2. **Rederive.** Each overdeleted fact (and each deleted asserted fact) that still has a
 //!    one-step derivation from the remaining facts is put back
-//!    ([`GroundProgram::derivable`], which finds the candidate rules by head).
+//!    ([`GroundProgram::derivable_with`], which finds the candidate rules by head).
 //! 3. **Insert.** Semi-naive evaluation seeded with the rederived and the inserted facts.
 //!    Rule instances created by new schema or list facts are evaluated once over all
 //!    facts. Transitive properties are closed per new edge `(a, b)` as predecessors(a) ×
@@ -1674,7 +1674,7 @@ impl MemoryBase {
     }
 }
 
-/// Reads count on the store's ([`Source for Store`](Store)); a probe of the asserted set is
+/// Reads count on the store's (`Source for Store`); a probe of the asserted set is
 /// one unit.
 impl VisitsBase for MemoryBase {
     fn visit(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {

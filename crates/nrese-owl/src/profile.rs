@@ -519,7 +519,7 @@ pub fn covered(o: &Ontology, axiom: &Axiom, rl: bool) -> bool {
 }
 
 /// The terms an axiom concludes, where it isn't [`covered`]: those it can add positive
-/// facts on ([`positive_terms`]). They come from both sides of a subclass axiom and of each
+/// facts on (`positive_terms`). They come from both sides of a subclass axiom and of each
 /// uncovered direction of an equivalence (the left side negated: `L ⊑ R` is `¬R ⊑ ¬L`, so
 /// `≥ 1 R.(≤ 0 R.C) ⊑ ⊥` concludes `R` and `C`, D16-492), the class of a domain or range,
 /// every part of a disjointness (negated), a disjoint union's class and parts, and a
