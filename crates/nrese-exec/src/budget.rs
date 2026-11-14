@@ -32,7 +32,9 @@ pub struct SharedBudget {
     limit: AtomicUsize,
     /// How a lazy budget finds its limit ([`Self::lazy`]); `None`: it was given.
     resolve: Option<Resolve>,
-    /// Written by every charge and release: alone on its cache line ([`Line`]).
+    /// Written by every request's first charge and its return: on 128 bytes of its own
+    /// ([`Line`]), apart from every other field here, `limit` (read by every charge) and
+    /// `peak` above all.
     used: Line<AtomicUsize>,
     peak: AtomicUsize,
     /// The budget this one lies within, charged first.
@@ -42,9 +44,14 @@ pub struct SharedBudget {
 /// A lazy [`SharedBudget`]'s limit before its first need.
 const UNRESOLVED: usize = usize::MAX;
 
-/// A value alone on its 128 bytes (x86's spatial prefetcher pulls cache lines in pairs):
-/// writing it doesn't take the lines of what lies beside it, such as the limit every
-/// charge reads, from other cores.
+/// A value alone on 128 bytes: what cores write to it shares no cache line, nor the line
+/// beside it, with what they only read nearby. With `used` beside `limit` and `peak`,
+/// 32 clients doing point lookups served 3 % fewer queries than with no budget; on 128
+/// bytes of its own, as many. 128 is a conservative spacing (x86 cores prefetch lines in
+/// pairs; a coherence miss costs one line), chosen for the hosts measured, not a promise
+/// for every target. The gain is `used`'s own, not the `Arc`'s counts moving off with the
+/// raised alignment: padding `used` without raising it, which left the counts beside
+/// `limit` as before, kept the gain within half a percent.
 #[derive(Debug)]
 #[repr(align(128))]
 struct Line<T>(T);
@@ -3401,15 +3408,23 @@ mod tests {
     #[test]
     fn the_servers_used_counter_has_its_cache_lines_to_itself() {
         let server = SharedBudget::new(GIB);
-        let pair = |field: *const u8| field as usize / 128;
-        let used = std::ptr::addr_of!(server.used).cast::<u8>();
+        // A field's bytes, as addresses.
+        fn bytes<T>(field: &T) -> std::ops::Range<usize> {
+            let at = std::ptr::from_ref(field).addr();
+            at..at + size_of_val(field)
+        }
+        let used = bytes(&*server.used);
+        assert_eq!(used.start % 128, 0, "used starts its 128 bytes");
+        // The 128-byte blocks used's bytes lie in.
+        let blocks = used.start / 128 * 128..used.end.next_multiple_of(128);
         for (name, other) in [
-            ("limit", std::ptr::addr_of!(server.limit).cast::<u8>()),
-            ("resolve", std::ptr::addr_of!(server.resolve).cast::<u8>()),
-            ("peak", std::ptr::addr_of!(server.peak).cast::<u8>()),
-            ("parent", std::ptr::addr_of!(server.parent).cast::<u8>()),
+            ("limit", bytes(&server.limit)),
+            ("resolve", bytes(&server.resolve)),
+            ("peak", bytes(&server.peak)),
+            ("parent", bytes(&server.parent)),
         ] {
-            assert_ne!(pair(used), pair(other), "{name} beside used");
+            let apart = other.end <= blocks.start || blocks.end <= other.start;
+            assert!(apart, "{name} {other:x?} within used's {blocks:x?}");
         }
     }
 
