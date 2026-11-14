@@ -38,7 +38,7 @@ declares one and reports it apart.
 Every level shares four things, so a case written for level 2 runs unchanged at level 3,
 and every run ends in the same record.
 
-- **A case.** One registry entry: its data (an id in `datasets.toml`, with its SHA-256, or a
+- A case is one registry entry: its data (an id in `datasets.toml`, with its SHA-256, or a
   generator), its task (queries, load, reason, classify, commits, clients), its regime, the
   systems that may run it, the scenario, what a right answer is (`expect`: an oracle, a
   count, bag, sequence or legal `LIMIT` subset) and its exact work checks (`guards`: routes
@@ -57,13 +57,13 @@ and every run ends in the same record.
   needs = ["docker"]
   ```
 
-- **A result row.** [suite/suitekit/schema.py](suite/suitekit/schema.py): identity (run,
+- A result row is defined in [suite/suitekit/schema.py](suite/suitekit/schema.py): identity (run,
   case, system, version, host, scenario, item, repeat), then the answer (status, complete,
   rows, answer SHA-256, verdict), then time (ms, phase), memory (peak MiB and its kind:
   lifetime, cgroup, sampled) and disk (bytes), and the case's counters.
-- **A run record.** [runs/README.md](runs/README.md): the builds compared, the host, the
+- A run record is defined in [runs/README.md](runs/README.md): the builds compared, the host, the
   scenario, the inputs and results by SHA-256, a verdict per case.
-- **One `compare`.** Answers and completeness first (status and verdict changes), then
+- One `compare` puts answers and completeness first (status and verdict changes), then
   time, then memory by its kind, then disk; lost and missing cases are reported before
   anything else. Its thresholds are in [fast/README.md](fast/README.md#comparing).
 
@@ -275,14 +275,14 @@ campaign's resources: both clean by name and on low disk.
 
 ## Adding things
 
-- **A system:** an entry in `suite/systems.toml` (capabilities from its documentation, `publish`, `runs`), and an adapter in `suite/suitekit/adapters.py`. Its first run confirms the capabilities; a capability that doesn't work is removed, with a note.
-- **A workload:**
+- A system: an entry in `suite/systems.toml` (capabilities from its documentation, `publish`, `runs`), and an adapter in `suite/suitekit/adapters.py`. Its first run confirms the capabilities; a capability that doesn't work is removed, with a note.
+- A workload:
   1. An entry in `suite/workloads.toml`: `needs`, `tiers`, `source`, `licence`, `check`, `state = "planned"`.
   2. Its data and queries in a kit.
   3. A plan in `suite/suitekit/workloads.py` (then `state = "ready"`), or a kit driver that writes a run record.
-- **A fast case:** [fast/README.md](fast/README.md#adding-a-case).
-- **A host:** an entry in `hosts.toml`; its inputs verified against the preservation receipts before first use.
-- **A capability:** add it to `CAPABILITIES` in `suite.py` and to the vocabulary at the top of `systems.toml`.
+- A fast case: [fast/README.md](fast/README.md#adding-a-case).
+- A host: an entry in `hosts.toml`; its inputs verified against the preservation receipts before first use.
+- A capability: add it to `CAPABILITIES` in `suite.py` and to the vocabulary at the top of `systems.toml`.
 
 `suite.py --check` validates the registries. The hooks don't run benchmarks: they run in
 bulk at the end of a batch of work (PROTOCOL.md §8).

@@ -65,7 +65,7 @@ benches/sparql/watdiv/queries.sh watdiv-10m 5                 # then split.py in
 
 ## Findings kept for the backlog
 
-- **SP2Bench's generated documents don't reproduce its paper's result sizes.** NRESE on
+- SP2Bench's generated documents don't reproduce its paper's result sizes. NRESE on
   sp2bench-1m (12 Oct 2026, phuoc-yu, 1b611e7): q1, q9, q10, q11 equal Table V, but q2 32,452
   (paper 32,770), q3a 52,406 (52,676), q3b 402 (379), q4 2,583,025 (2,586,733), q5b 34,870
   (35,241), q7 303 (292), q8 491 (400). The differences across most queries point at the
