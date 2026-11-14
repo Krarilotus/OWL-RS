@@ -1121,7 +1121,7 @@ impl PackedKeys {
     }
 
     /// The most [`Self::range_counted`] counts: its bound search and its range end.
-    pub(crate) fn range_cost(&self) -> u64 {
+    pub(super) fn range_cost(&self) -> u64 {
         self.bound_cost() + self.end_cost()
     }
 
