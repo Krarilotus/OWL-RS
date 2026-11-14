@@ -912,3 +912,91 @@ fn a_search_from_a_bound_end_is_charged_while_it_searches() {
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Spec (D16-579): a LIMIT over several patterns joins its first pattern's rows in morsels
+/// until enough come out. Once its answer is consumed, the query's budget holds what it held
+/// before, as after any other pattern: every table charged on the way was released with it.
+/// A charge kept past its table would refuse the query's later work for memory that is free.
+#[test]
+fn a_limit_over_several_patterns_leaves_nothing_charged() {
+    use nrese_sparql_syntax::Query;
+    // Far more first-pattern rows than one morsel (`MIN_MORSEL`), each with a partner, so the
+    // first morsel's rows alone meet the limit and the rest are never joined.
+    const ROWS: usize = 10_000;
+    let engine = default_store((0..ROWS).flat_map(|i| {
+        [
+            (format!("s{i}"), "p".to_owned(), format!("o{i}")),
+            (format!("s{i}"), "q".to_owned(), format!("x{i}")),
+        ]
+    }));
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let text = "SELECT * WHERE { ?s <urn:p> ?o . ?s <urn:q> ?x } LIMIT 10";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let before = ctx.budget.used();
+    let answer = ctx.eval(&pattern).ok().expect("room");
+    assert!(answer.table.len() >= 10, "the limit's rows");
+    ctx.consumed(answer);
+    let held = ctx.budget.used() as i64 - before as i64;
+    assert_eq!(
+        held,
+        0,
+        "after the LIMIT's answer was consumed the budget still holds {held} bytes; it should \
+         hold 0 (the first pattern's {ROWS} rows of two columns are {} bytes)",
+        ROWS * 2 * 8
+    );
+}
+
+/// Spec (D16-579): the same LIMIT's morsels hold no more than they are charged at any moment
+/// ([`measure_within`]), so the query's budget never reads below the memory it holds. Its
+/// joins meet only three rows, under the limit, so every first-pattern row goes through a
+/// morsel; run at two sizes, the most held beyond its charge may not grow by a byte a
+/// first-pattern row adds.
+#[test]
+fn a_limit_over_several_patterns_holds_nothing_uncharged_per_row() {
+    use nrese_sparql_syntax::Query;
+    if !alone() {
+        return;
+    }
+    let text = "SELECT * WHERE { ?s <urn:p> ?o . ?o <urn:q> ?x } LIMIT 10";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let held = |n: usize| {
+        // `s<i> p o<i>`, and `y<i> q x<i>`, but `o<i> q x<i>` for three of them.
+        let engine = default_store((0..n).flat_map(|i| {
+            let linked = if i < 3 {
+                format!("o{i}")
+            } else {
+                format!("y{i}")
+            };
+            [
+                (format!("s{i}"), "p".to_owned(), format!("o{i}")),
+                (linked, "q".to_owned(), format!("x{i}")),
+            ]
+        }));
+        let snapshot = engine.snapshot();
+        let options = QueryOptions::default();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let (rows, excess) = measure_within(&options.resources.memory, || {
+            ctx.eval(&pattern).ok().map(|answer| {
+                let rows = answer.table.len();
+                ctx.consumed(answer);
+                rows
+            })
+        });
+        assert_eq!(rows, Some(3), "at {n} rows: the joins meet three rows");
+        excess
+    };
+    let (rows, more) = (10_000, 40_000);
+    let (few, many) = (held(rows), held(more));
+    assert!(
+        many.saturating_sub(few) < more - rows,
+        "held {few} bytes beyond its charge at {rows} first-pattern rows, {many} at {more}: \
+         {} bytes a row more than the budget reads",
+        many.saturating_sub(few) / (more - rows)
+    );
+}
