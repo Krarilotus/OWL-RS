@@ -103,6 +103,29 @@ quote = "Ok"
 source = "his answer of 14 Nov 2026, 20:26 Berlin, accepting the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
 pays_with = { case = "load-entities", dimension = "time/_" }
 
+# EL classification through the endpoint (el-classify-endpoint: el-classify's 20,000 classes loaded into a fresh
+# server, then GET /dataset/classification). The row is the server scope's anon + kernel peak, the load included.
+# Measured 14 Nov 2026 in the gate's form: its own runner, 12 blocks of the three sides in whole Latin squares, on
+# engine-v2 e0745e067 (the code this case runs is unchanged since).
+# - Memory: 720 MiB against main's 196, x3.60 (interval 3.50-3.71). The runs spread by 3.6 % (sd), main's by 4.4 %.
+# - Time: the request takes 0.53 s against main's 5.4 s, x0.096 (interval 0.094-0.098). This is the win the owner
+#   traded for, the same case's time/request; it shows as better against main in every round drawn from the blocks.
+# - max_ratio 4.49: the gate runs this case in 3-block rounds, where the interval is t(2) = 4.30 errors wide. Of
+#   every round of 3 of the 12 blocks, 1 in 220 ends above 4.49, 2 above 4.48, none above 4.61. It lets growth
+#   through: a head 10 % above this one passes 56 % of 3-block rounds, one 25 % above it 2 %. In 6-block rounds
+#   3.95 would hold every round and pass 10 % growth in 0.6 % of them.
+[[tradeoff]]
+case = "el-classify-endpoint"
+dimension = "memory/anon_kernel"
+against = "main"
+max_ratio = 4.49
+approved = "2026-11-14"
+by = "Johannes"
+reason = "classifying el-classify's ontology through the endpoint peaks at 720 MiB against main's 196 (x3.6) and answers ten times as fast (0.53 against 5.4 s); the memory is the DL classifier's working state, needed to the end. The ceiling of 4.49 is the lowest the measured blocks pass reliably in the 3-block rounds the gate runs; it lets about 10 % growth through in half of them and stops only about 25 % reliably (comment above)"
+quote = "Accepted and put on list for optimization efforts later with better caching design maybe we can trim down the memory further"
+source = "his answer of 14 Nov 2026, 21:31 Berlin, accepting the EL endpoint's memory against its time (727 against main's 208 MiB at 0.42 against 4.67 s)"
+pays_with = { case = "el-classify-endpoint", dimension = "time/request" }
+
 # The release baselines' measurement builds can't run these cases yet, though their products
 # can (a static audit of each build against each case's command, 11 Nov 2026). Each pair stays
 # uncompared until the port its entry names lands.
