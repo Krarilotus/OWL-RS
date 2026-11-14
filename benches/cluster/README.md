@@ -2,7 +2,7 @@
 
 For the runs a paper needs: a whole node that nothing else uses, enough memory for the systems that need it, and a record of what ran where. Written for the clusters of the University of Jena; the scripts assume only SLURM and a shared file system.
 
-**State on 30 September 2026:** the scripts were run on a Linux workstation without SLURM (`bash benches/cluster/integration.sbatch nrese example`). They have not run under SLURM: there is no cluster account yet. Expect to adjust partition names and paths on first use.
+As of 30 September 2026, the scripts were run on a Linux workstation without SLURM (`bash benches/cluster/integration.sbatch nrese example`). They have not run under SLURM: there is no cluster account yet. Expect to adjust partition names and paths on first use.
 
 ## The clusters
 
@@ -65,12 +65,12 @@ The suite's Apptainer path was run in WSL (Ubuntu 24.04, Apptainer 1.5.4) with S
 
 ## How a run is set up
 
-- **A whole node per run** (`--exclusive --mem=0`): no other job shares its cores, memory or memory bandwidth. One system at a time; systems are compared across jobs on the same node type, which `environment.txt` records.
-- **One hardware thread per core** (`--hint=nomultithread`), as the cluster's documentation recommends for threaded programs.
-- **No containers for NRESE, Fuseki and the client:** they run as processes. Peak memory is read from the processes; SLURM's accounting (`sacct.txt`) is kept next to it.
-- **Containers for the other systems:** the cluster has Apptainer, not Docker. The suite runs them from SIF images (below). Java without a module: `JAVA="apptainer exec temurin-21.sif java"`.
-- **Where things go:** results in `$NRESE_WORK/results/<date>-job<id>/` (they stay), the build in `$NRESE_WORK/target`, the store and temporary files in `$NRESE_WORK/scratch/<job id>/` (removed when the run ends). Nothing large in `/home`.
-- **What is recorded** (`environment.txt`): job, node, partition, CPU model and counts, memory, kernel, the commits of NRESE and of the workload, the toolchain, the arguments.
+- Each run has a whole node (`--exclusive --mem=0`): no other job shares its cores, memory or memory bandwidth. One system at a time; systems are compared across jobs on the same node type, which `environment.txt` records.
+- Runs use one hardware thread per core (`--hint=nomultithread`), as the cluster's documentation recommends for threaded programs.
+- There are no containers for NRESE, Fuseki and the client: they run as processes. Peak memory is read from the processes; SLURM's accounting (`sacct.txt`) is kept next to it.
+- The other systems run in containers: the cluster has Apptainer, not Docker. The suite runs them from SIF images (below). Java without a module: `JAVA="apptainer exec temurin-21.sif java"`.
+- Results go in `$NRESE_WORK/results/<date>-job<id>/` (they stay), the build in `$NRESE_WORK/target`, the store and temporary files in `$NRESE_WORK/scratch/<job id>/` (removed when the run ends). Nothing large in `/home`.
+- `environment.txt` records job, node, partition, CPU model and counts, memory, kernel, the commits of NRESE and of the workload, the toolchain, the arguments.
 
 ## Before a number is published
 

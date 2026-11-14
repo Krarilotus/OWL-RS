@@ -18,10 +18,10 @@ Elsewhere its closure is incomplete by design and wouldn't be a result.
 ## Closure checks (3 October 2026, main PC)
 
 These are set-for-set comparisons of the inferred statements, without timing.
-- **Blank nodes** are compared up to renaming (`../compare_blank_nodes.py`): each blank
+- Blank nodes are compared up to renaming (`../compare_blank_nodes.py`): each blank
   node gets a name from its statements with IRIs and literals.
-- **owlrl comparisons** use the benchmark's normalisation (`../compare_inferred.py`).
-- **Tools:** NRESE's set comes from `reason_query --inferred-out` (nrese-store example), and
+- owlrl comparisons use the benchmark's normalisation (`../compare_inferred.py`).
+- NRESE's set comes from `reason_query --inferred-out` (nrese-store example), and
   each Nemo set from the encoding run exactly as the suite runs it.
 
 | Tier | NRESE | `nemo` | `nemo-schemafirst` | `nemo-sparq` |
@@ -30,21 +30,29 @@ These are set-for-set comparisons of the inferred statements, without timing.
 | LUBM 10 | 830,003 | 829,971 | 829,971 | 622,249 |
 | OWL2Bench RL-1 | 1,399,563 | 1,399,531 | 1,399,531 | not run (LUBM only) |
 
-**NRESE against the general encodings.** The sets are identical, blank nodes included,
-except for **exactly 32 statements** on every tier. These are `dt rdf:type rdfs:Datatype`
+### NRESE against the general encodings
+
+The sets are identical, blank nodes included,
+except for exactly 32 statements on every tier. These are `dt rdf:type rdfs:Datatype`
 for the 32 datatypes of the OWL 2 RL datatype map (`rdf:PlainLiteral`, `rdf:XMLLiteral`,
-`rdfs:Literal` and 29 XSD types). Rule **dt-type1** (Table 8) derives them. Both general
+`rdfs:Literal` and 29 XSD types). Rule dt-type1 (Table 8) derives them. Both general
 encodings leave out Table 8 and the axiomatic triples, as their headers state.
 `compare_inferred.py` drops statements about RDF/RDFS/XSD vocabulary, so the normalised
 comparison shows no difference.
 
-**`nemo` against `nemo-schemafirst`.** Identical on LUBM 1 and 10 and OWL2Bench RL-1, blank
+### `nemo` against `nemo-schemafirst`
+
+The two are identical on LUBM 1 and 10 and OWL2Bench RL-1, blank
 nodes included, with the same violations.
 
-**Against the owlrl reference (LUBM 1, normalised).** NRESE, `nemo-schemafirst` and
+### Against the owlrl reference (LUBM 1, normalised)
+
+NRESE, `nemo-schemafirst` and
 `nemo-sparq` all have instance precision and recall 1.0 (37,935 statements each).
 
-**`nemo-sparq`'s schema extras.** Its schema precision is 0.91: on LUBM 1 and 10 it
+### `nemo-sparq`'s schema extras
+
+Its schema precision is 0.91: on LUBM 1 and 10 it
 derives 6 statements that OWL 2 RL/RDF doesn't:
 - `memberOf`, `worksFor` and `headOf` each get an `rdfs:domain Person` and an
   `rdfs:range Organization`;
@@ -71,11 +79,11 @@ encoding also does less work: it has no equality, cardinality, union, oneOf, has
 chain or key rules, and no consistency rules. How much of the time difference each
 omission accounts for hasn't been measured.
 
-**sparq's 55.1 s** is Nemo v0.9.1's self-reported `Reasoning:` time with this encoding on
+sparq's 55.1 s is Nemo v0.9.1's self-reported `Reasoning:` time with this encoding on
 LUBM(100) (13,880,276 input triples, TBox included), on a dedicated AWS box, best of 3
 (sparq `bench/canonical-competitor-results/2026-07-10/materialize-lubm100-*.json`). Batch
 B measures the same encoding on our LUBM(100), under these conditions:
-- **Nemo version:** v0.10.1 (theirs v0.9.1);
-- **Input:** 13,405,674 triples (another generator run, so different data);
-- **Hardware:** the office PC;
-- **Recorded time:** the step's `reason_ms`, Nemo's self-reported reasoning time.
+- Nemo version: v0.10.1 (theirs v0.9.1);
+- Input: 13,405,674 triples (another generator run, so different data);
+- Hardware: the office PC;
+- Recorded time: the step's `reason_ms`, Nemo's self-reported reasoning time.

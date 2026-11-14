@@ -66,13 +66,13 @@ ones, which the report still lists; 0 only when every declared hypothesis was te
 
 ## Rules
 
-- **What may be timed:**
+- What may be timed:
   - a job whose benchmark mode or harness is new waits for that harness's review r1;
   - cases and harness come from the current engine-v2 head, for both sides;
   - timing runs on the fleet's timing hosts only: the main PC builds and tests, it never times.
-- **The comparison:** A-B-B-A, interleaved, exclusive, on one host, with each run's spread
+- The comparison: A-B-B-A, interleaved, exclusive, on one host, with each run's spread
   reported. A timing claim names its job, family and rule (Holm, the A-A' floor).
-- **Effort follows spread** (owner, 20 Oct 2026):
+- Effort follows spread (owner, 20 Oct 2026):
   - size the first round from the case's recorded spread on that host: long, stable cases get
     one Latin square (3 blocks), noisy short ones more;
   - add blocks only to undecided cases: stop on precision, not on p-values;

@@ -6,7 +6,7 @@ hardware, storage and container overhead are identical.
 ## Licence rules for results: read before publishing anything
 
 Some competitors' licences forbid publishing benchmark results without the vendor's
-consent. This repository is public, so **committing results counts as publishing**.
+consent. This repository is public, so committing results counts as publishing.
 
 | System | Licence | Publishing results |
 |---|---|---|
@@ -16,7 +16,7 @@ consent. This repository is public, so **committing results counts as publishing
 | Virtuoso Open Source 7 | GPL v2 | free |
 | Licensed systems | the vendor's licence | **only with the vendor's written consent**, recorded in this file |
 
-**Therefore:**
+Therefore:
 - Raw results go to `benches/competitors/results/`, which is git-ignored.
 - Only numbers for the free-to-publish systems may appear in committed docs.
 - Licensed systems' numbers stay local until written permission exists. Record the permission (who, when, scope) in this file before publishing.
@@ -53,21 +53,21 @@ heap is not an equal total-memory budget. The current campaigns run on Office-PC
 with Phuoc-Yu reserved for compatible Office-built native binaries. Never compare
 a result from one host with NRESE's from another.
 
-- **Same input and host.** Every system reads the same file from the same Docker volume and writes to a fresh volume.
-- **Each vendor's own bulk loader and tuning guidance:**
+- Same input and host: every system reads the same file from the same Docker volume and writes to a fresh volume.
+- Each vendor's own bulk loader and tuning guidance:
   - JVM tools get a 16 GB heap.
   - QLever gets 8 GB of sort memory.
   - Virtuoso gets 16 GB of buffers.
   - Everything else runs with defaults.
-- **Timing.** Wall-clock from the start of the load until the store is durable and queryable. Container and JVM start-up are included (≈ 0.3–1 s); Virtuoso's server start-up is not.
-- **Vendor defaults changed for fairness:**
+- Timing: wall-clock from the start of the load until the store is durable and queryable. Container and JVM start-up are included (≈ 0.3–1 s); Virtuoso's server start-up is not.
+- Vendor defaults changed for fairness:
   - QLever's query-result cache is off (`-k 0`: a 1 MB cap alone still kept every small result, such as a count, so until 1 October 2026 repeated runs of small-result queries were cache hits), so repeated runs measure evaluation. This is cache-disabled evaluation, not proof of cold memory or storage. The suite (`benches/suite`) runs systems with supported result-cache modes (QLever, NRESE) both ways: off and on. It also shuffles the query order and reports each query's first execution apart.
   - Virtuoso's result-row cap and cost-based query rejection are disabled, so it returns complete results.
   - NRESE's rate limits are lifted.
   - All systems use the same per-query timeout (`QUERY_TIMEOUT_S`, default 120 s).
-- **Same data.** Real dumps contain a few lines strict parsers reject: 29 k of 229 M in Wikidata lexemes, plus some in DBpedia. They are dropped once for all systems (`nt-filter.py`).
-- **The stores differ.** Each builds different indexes: QLever 6 permutations plus a pattern index, Virtuoso 2 full plus 3 partial indexes, TDB2 triple and quad indexes, NRESE 6 permutations plus a checkpoint. Load time alone doesn't say which store is better. It has to be read together with store size, peak memory, restart time and query speed.
-- **Coverage:** LUBM, concurrent-client tools and Linux Office runs now exist in the
+- Same data: real dumps contain a few lines strict parsers reject: 29 k of 229 M in Wikidata lexemes, plus some in DBpedia. They are dropped once for all systems (`nt-filter.py`).
+- The stores differ: each builds different indexes: QLever 6 permutations plus a pattern index, Virtuoso 2 full plus 3 partial indexes, TDB2 triple and quad indexes, NRESE 6 permutations plus a checkpoint. Load time alone doesn't say which store is better. It has to be read together with store size, peak memory, restart time and query speed.
+- Coverage: LUBM, concurrent-client tools and Linux Office runs now exist in the
   wider suite. Their presence does not complete every competitor pair. BSBM and
   full Wikidata remain separate uncompleted scale work; consult the workload
   registry and dated run records instead of this legacy scorecard's scope.
