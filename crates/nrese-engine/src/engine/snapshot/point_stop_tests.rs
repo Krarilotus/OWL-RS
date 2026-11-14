@@ -18,25 +18,8 @@ use crate::{
     Snapshot, TermId,
 };
 
-/// The point read under test: `each` is handed the graph of each quad of `[s, p, o]` it
-/// answers, in order, until `each` breaks or refuses; the read's own answer.
-pub(super) fn point_read(
-    counted: &CountedSnapshot,
-    model: ReadModel,
-    point: [TermId; 3],
-    visit: Visitor<'_>,
-    mut each: impl FnMut(TermId) -> Result<ControlFlow<()>, Stopped>,
-) -> Result<ControlFlow<()>, Stopped> {
-    for quad in counted.point_quads(model, point, visit) {
-        if each(quad?.graph)?.is_break() {
-            return Ok(ControlFlow::Break(()));
-        }
-    }
-    Ok(ControlFlow::Continue(()))
-}
-
-/// [`point_read`] with a caller that goes on after each graph, as a list: the point's quad in
-/// each graph it was handed, then [`Stopped`] where the read answered that.
+/// [`CountedSnapshot::point_graphs`] with a caller that goes on after each graph, as a list:
+/// the point's quad in each graph it was handed, then [`Stopped`] where the read answered that.
 pub(super) fn point_answers(
     counted: &CountedSnapshot,
     model: ReadModel,
@@ -44,7 +27,7 @@ pub(super) fn point_answers(
     visit: Visitor<'_>,
 ) -> Vec<Result<EncodedQuad, Stopped>> {
     let mut answers = Vec::new();
-    let end = point_read(counted, model, point, visit, |graph| {
+    let end = counted.point_graphs(model, point, visit, |graph| {
         answers.push(Ok(quad(point, graph)));
         Ok(ControlFlow::Continue(()))
     });
@@ -339,7 +322,7 @@ fn a_point_read_expands_equality_in_either_first_read_order() {
                         witness::get(Site::ExpandCopies),
                     );
                     let mut graphs = Vec::new();
-                    let answer = point_read(&counted, model, point, &|_| true, |graph| {
+                    let answer = counted.point_graphs(model, point, &|_| true, |graph| {
                         graphs.push(graph);
                         Ok(ControlFlow::Continue(()))
                     });
@@ -580,8 +563,7 @@ fn a_decisive_graph_answers_before_a_later_refusal() {
         let model = ReadModel::Materialised;
         let asked = Cell::new(0u64);
         let mut first = None;
-        let going = point_read(
-            &counted,
+        let going = counted.point_graphs(
             model,
             point,
             &|_| {
@@ -600,8 +582,7 @@ fn a_decisive_graph_answers_before_a_later_refusal() {
         assert!(all > first, "{state}: an ask after the first graph");
         asked.set(0);
         let handed = Cell::new(None);
-        let answer = point_read(
-            &counted,
+        let answer = counted.point_graphs(
             model,
             point,
             &|_| {
@@ -641,8 +622,7 @@ fn a_refusing_caller_stops_the_read_at_once() {
         let counted = engine.snapshot().counted();
         let asked = Cell::new(0u64);
         let handed = Cell::new(None);
-        let answer = point_read(
-            &counted,
+        let answer = counted.point_graphs(
             ReadModel::Materialised,
             point,
             &|_| {
@@ -695,8 +675,7 @@ fn a_point_read_holds_no_credit_across_a_graph_it_hands_on() {
                 }
             };
             let mut graphs = 0;
-            let answer = point_read(
-                &counted,
+            let answer = counted.point_graphs(
                 model,
                 point,
                 &|_| {
@@ -774,4 +753,29 @@ fn a_point_read_over_nothing_tells_a_stopped_visitor() {
         let answer = point_answers(&counted, model, terms.point, &|_| false);
         assert_eq!(answer, [Err(Stopped)], "{model:?}");
     }
+}
+
+/// The default-graph loop checks its layout (D16-574 r3: a debug assertion of the layout's
+/// invariant on each key it finds). Spec ([`Layout::DefaultGraph`]: such a run holds the
+/// default graph alone, so at most one key with a statement's subject, predicate and object):
+/// a quads run holding the statement in two graphs, forced through the default-graph loop,
+/// fails that check.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "at most one key")]
+fn the_default_graph_loop_checks_its_layout() {
+    use crate::index::IndexVersion;
+    use crate::quad::AccessPlan;
+    use crate::visit::Ledger;
+
+    let [s, p, o, g1, g2] = [1, 2, 3, 4, 5].map(TermId::from_raw);
+    let quads = vec![quad([s, p, o], g1), quad([s, p, o], g2)];
+    let index = IndexVersion::from_quads(Layout::Quads, quads);
+    let plan = AccessPlan::for_pattern(&QuadPattern {
+        subject: Some(s),
+        predicate: Some(p),
+        object: Some(o),
+        graph: GraphSelector::Any,
+    });
+    let _ = index.point_sum(&plan, &mut Ledger::new(&|_| true));
 }

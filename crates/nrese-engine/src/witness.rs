@@ -46,8 +46,8 @@ pub enum Site {
     /// A merge's work: each key comparison its selection makes, each cursor it advances and
     /// each key a cursor decodes (`index::merge`; REAS-3a fix check r1 F1).
     MergeWork,
-    /// Reads that took a point read's own path (`CountedSnapshot::point_quads`), not one of
-    /// the counted reads it falls back to.
+    /// Reads that took a point read's own path (`CountedSnapshot::point_graphs`), not the
+    /// expanded read of equality classes.
     PointReads,
 }
 
