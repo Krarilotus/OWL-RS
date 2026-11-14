@@ -58,7 +58,15 @@ KEYS = {
     "systems", "home_turf", "rewrite", "hangs", "tracks", "guards",
     # a release-gate baseline whose product lacks what the case needs (release_gate.py family_of)
     "absent",
+    # a classifier tool's phases the case is compared by, where the tool can't resolve the others
+    "phases",
 }
+# The phases each classifier tool prints in its profile (fast.py samples(): its series). A case
+# declares fewer (`phases`) where the tool can't resolve one on the baseline (README.md), and then
+# `wall`, the harness's time of the whole process (fast.py PROCESS_WALL), in which it still counts.
+TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
+               "classify-horn": ("read", "owl", "write")}
+WHOLE_RUN = "wall"
 REQUIRED = ("name", "area", "what", "semantics", "data", "metric", "cap_gb", "systems")
 
 
@@ -150,6 +158,16 @@ def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
         if not (isinstance(absent, dict) and set(absent) <= BASELINES
                 and all(isinstance(v, str) and v.strip() for v in absent.values())):
             out.append(f"{where}: absent: a baseline (base, main) and the capability its product lacks")
+        if "phases" in c:
+            printed = TOOL_PHASES.get(c.get("tool", "perf_lab"))
+            if printed is None:
+                out.append(f"{where}: phases: only a classifier tool's case declares them ({', '.join(sorted(TOOL_PHASES))})")
+            elif not (isinstance(c["phases"], list) and c["phases"] and set(c["phases"]) <= {*printed, WHOLE_RUN}):
+                out.append(f"{where}: phases: a non-empty list of what {c['tool']} prints ({', '.join(printed)})"
+                           f" and {WHOLE_RUN}")
+            elif set(printed) - set(c["phases"]) and WHOLE_RUN not in c["phases"]:
+                out.append(f"{where}: phases: leaving out {', '.join(sorted(set(printed) - set(c['phases'])))}, it "
+                           f"declares {WHOLE_RUN} (the whole process), where the phase still counts")
     return out
 
 

@@ -192,9 +192,15 @@ ANON_KERNEL_S = 0.05
 INSPECT_S = 10  # `docker inspect` for a container's PID; a sampler's stop waits this and 10 s more
 
 
-def anon_kernel_bytes(stat: str) -> int | None:
-    """anon + kernel from a cgroup's memory.stat (kernel: its own field, else the sum of its parts)."""
-    fields = dict(line.split() for line in stat.splitlines() if len(line.split()) == 2)
+def stat_fields(stat: str) -> dict:
+    """A cgroup's memory.stat as its fields (name: value as text)."""
+    return dict(parts for parts in map(str.split, stat.splitlines()) if len(parts) == 2)
+
+
+def anon_kernel_bytes(stat: str | dict) -> int | None:
+    """anon + kernel from a cgroup's memory.stat, or its fields (stat_fields): kernel is its own
+    field, else the sum of its parts."""
+    fields = stat if isinstance(stat, dict) else stat_fields(stat)
     if "anon" not in fields:
         return None
     kernel = int(fields["kernel"]) if "kernel" in fields else sum(int(fields.get(k, 0)) for k in KERNEL_PARTS)

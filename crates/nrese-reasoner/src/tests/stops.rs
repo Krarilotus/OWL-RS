@@ -222,6 +222,103 @@ fn a_stopped_materialisation_is_never_reported_complete() {
     }
 }
 
+/// A rule's guards over representatives that the representatives fail search the members
+/// of their classes ([`crate::ir::Guard::OverClasses`]): a product of the classes' sizes,
+/// one unit per choice. Here a consistency rule's guards hold only for the last member of
+/// a class of `k` (they exclude the others, each checked once its constant is chosen), so
+/// the search makes about k³/2 choices before it finds the violation: it asks its stop
+/// once per `POLL_UNITS` of them (counted against the same run whose representatives
+/// satisfy the guards), and stopped at any poll, those inside the search included, the run
+/// ends `Interrupted` or with every violation, never "complete" without the one the search
+/// would have found. The stop is true at one poll only.
+#[test]
+fn a_guard_search_over_equality_members_stops_within_its_poll_interval() {
+    let k: usize = 40;
+    // `excluded`: the guards exclude every member of the class but the last.
+    let program = |excluded: bool| {
+        let mut vocabulary = LocalVocabulary::default();
+        let guards: String = match excluded {
+            true => (0..k - 1).map(|j| format!(", ?a != rdfs:c{j}")).collect(),
+            false => String::new(),
+        };
+        let text = [
+            "eq-sym: (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)".to_owned(),
+            "eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)".to_owned(),
+            "eq-rep-s: (?s owl:sameAs ?t), (?s ?p ?o) -> (?t ?p ?o)".to_owned(),
+            "eq-rep-p: (?p owl:sameAs ?q), (?s ?p ?o) -> (?s ?q ?o)".to_owned(),
+            "eq-rep-o: (?o owl:sameAs ?t), (?s ?p ?o) -> (?s ?p ?t)".to_owned(),
+            format!("clash: (?a rdfs:subClassOf ?b), ?a != ?b{guards} -> false"),
+        ];
+        let rules = parse_rules(
+            &text.join(
+                "
+",
+            ),
+            &mut vocabulary,
+        )
+        .unwrap();
+        let schema = Schema::owl(&mut vocabulary);
+        // Two classes of `k`: rdfs:c0 .. rdfs:c38 and rdfs:last, and rdfs:d0 .. rdfs:d39.
+        // rdfs:c0 is the class's smallest id, so its representative, which the guards fail.
+        let data: Vec<String> = (1..k - 1)
+            .map(|j| format!("rdfs:c{j} owl:sameAs rdfs:c0"))
+            .chain(["rdfs:last owl:sameAs rdfs:c0".to_owned()])
+            .chain((1..k).map(|j| format!("rdfs:d{j} owl:sameAs rdfs:d0")))
+            .chain(["rdfs:c0 rdfs:subClassOf rdfs:d0".to_owned()])
+            .collect();
+        let input = load(
+            &mut vocabulary,
+            &data.join(
+                "
+",
+            ),
+        );
+        (input, rules, schema)
+    };
+    let polls_of = |excluded: bool| {
+        let (input, rules, schema) = program(excluded);
+        let asks = AtomicUsize::new(0);
+        let counting = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let closure =
+            crate::representatives::materialise_until(&input, &rules, None, &schema, &counting)
+                .expect("runs");
+        assert_eq!(
+            closure.violations.to_vec().len(),
+            1,
+            "the clash ({excluded})"
+        );
+        (closure, asks.load(Ordering::Relaxed))
+    };
+    let (whole, polls) = polls_of(true);
+    let (_, plain) = polls_of(false);
+    let inside = k * (k - 1) * k / 2 / nrese_exec::POLL_UNITS as usize;
+    assert!(
+        polls >= plain + inside,
+        "{polls} polls against {plain} without the search: its {inside} at least (one unit          per choice)"
+    );
+    let (input, rules, schema) = program(true);
+    for at in 0..=polls {
+        let seen = AtomicUsize::new(0);
+        let once = || seen.fetch_add(1, Ordering::Relaxed) == at;
+        match crate::representatives::materialise_until(&input, &rules, None, &schema, &once) {
+            Err(stopped) => assert_eq!(stopped, Interrupted::default(), "poll {at} of {polls}"),
+            Ok(closure) => {
+                assert_eq!(
+                    closure.violations, whole.violations,
+                    "stopped at poll {at} of {polls}: reported complete without the violation"
+                );
+                assert_eq!(
+                    closure.facts, whole.facts,
+                    "stopped at poll {at} of {polls}"
+                );
+            }
+        }
+    }
+}
+
 /// An equality materialisation's expanded listing (every identity of a class) counts each
 /// fact's copies as it makes them: one class of 1000 identities lists about a million
 /// copies of its `sameAs` facts, a product far above `POLL_UNITS`. REAS-2's invariant: once
