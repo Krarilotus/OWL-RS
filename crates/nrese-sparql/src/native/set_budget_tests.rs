@@ -38,7 +38,9 @@ fn under(
     BUDGET.set(Some(budget));
     plan::ADMIT.set(Some(true));
     REPLANS.set(0);
-    let plan = ctx.join_order(&scans, &counts, &[], true);
+    let plan = ctx
+        .join_order(&scans, &counts, &[], true, true)
+        .map(|(plan, _)| plan);
     plan::ADMIT.set(None);
     BUDGET.set(None);
     let plan = plan.map_err(QueryEvaluationError::from)?;
@@ -50,7 +52,7 @@ fn under(
 fn without_sets(ctx: &Context<'_>, patterns: &[&str], order: Option<&[usize]>) -> Steps {
     let (scans, counts) = bgp(ctx, patterns);
     let mut vars = Vec::new();
-    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let (inputs, _) = ctx.plan_inputs(&scans, &counts, &[], &mut vars, true);
     let plan = match order {
         Some(order) => plan::along(
             &inputs,
@@ -607,7 +609,7 @@ fn plannings(
 ) -> (Result<plan::Plan, QueryEvaluationError>, Vec<bool>) {
     let (scans, counts) = bgp(ctx, patterns);
     let mut vars = Vec::new();
-    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let (inputs, _) = ctx.plan_inputs(&scans, &counts, &[], &mut vars, true);
     let asked = std::cell::RefCell::new(Vec::new());
     let cancelled = || {
         ctx.cancellation
@@ -700,7 +702,9 @@ fn a_cancelled_query_with_a_fixed_order_gets_no_plan() {
     let (scans, counts) = bgp(&ctx, &["?x p ?y", "?y q ?z"]);
     for admit in [None, Some(true)] {
         plan::ADMIT.set(admit);
-        let planned = ctx.join_order(&scans, &counts, &[], true);
+        let planned = ctx
+            .join_order(&scans, &counts, &[], true, true)
+            .map(|(plan, _)| plan);
         plan::ADMIT.set(None);
         assert!(
             matches!(
@@ -786,7 +790,7 @@ fn a_query_cancelled_in_its_set_search_gets_no_plan() {
     let ctx = Context::new(&snapshot, &options, None, None);
     let (scans, counts) = bgp(&ctx, &STAR);
     let mut vars = Vec::new();
-    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let (inputs, _) = ctx.plan_inputs(&scans, &counts, &[], &mut vars, true);
     let order = |sets: Option<&CharacteristicSets>, budget: usize| {
         let planned = plan::order(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &|| false);
         if sets.is_some() {
@@ -854,7 +858,7 @@ fn a_search_without_the_sets_keeps_no_star_or_edge_state() {
     let ctx = Context::new(&snapshot, &options, None, None);
     let (scans, counts) = bgp(&ctx, &STAR);
     let mut vars = Vec::new();
-    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let (inputs, _) = ctx.plan_inputs(&scans, &counts, &[], &mut vars, true);
     let sets = snapshot.characteristic_sets_in(ctx.model).unwrap();
     let kept = |sets: Option<&CharacteristicSets>| {
         STAR_STATE.set(0);
@@ -882,7 +886,7 @@ fn a_bgp_without_an_open_star_is_planned_once() {
     let patterns = ["?x type Student", "?x type Person", "a anchor ?x"];
     let (scans, counts) = bgp(&ctx, &patterns);
     let mut vars = Vec::new();
-    let inputs = ctx.plan_inputs(&scans, &counts, &[], &mut vars);
+    let (inputs, _) = ctx.plan_inputs(&scans, &counts, &[], &mut vars, true);
     assert!(
         inputs.iter().any(|i| i.star.is_some())
             && !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())),
@@ -947,7 +951,9 @@ fn a_bgp_that_expects_much_work_plans_past_the_least_budget() {
     plan::FLOOR.set(least);
     plan::ADMIT.set(Some(true));
     REPLANS.set(0);
-    let planned = ctx.join_order(&scans, &counts, &[], false);
+    let planned = ctx
+        .join_order(&scans, &counts, &[], false, true)
+        .map(|(plan, _)| plan);
     let replans = REPLANS.get();
     plan::ADMIT.set(None);
     plan::FLOOR.set(plan::SET_BUDGET);

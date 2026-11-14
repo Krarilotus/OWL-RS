@@ -45,12 +45,15 @@ mod plan;
 mod preparation;
 pub(crate) use preparation::prepare_ql_query;
 use preparation::{ql_rewriting, semantic_pattern};
+use reads::{Buffer, List, Reads};
 mod pushdown;
 pub(crate) use pushdown::per_solution;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod handover_tests;
 #[cfg(test)]
 mod join_order_tests;
 #[cfg(test)]
@@ -61,6 +64,7 @@ mod optimise_tests;
 mod overlap_tests;
 pub(crate) mod ql;
 mod ranges;
+mod reads;
 mod scan_columns;
 mod search;
 #[cfg(test)]
@@ -888,6 +892,15 @@ thread_local! {
     static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
     /// The patterns [`Context::bgp`] counted on this thread (exact or within a hint's ranges).
     static BGP_ESTIMATES: Cell<usize> = const { Cell::new(0) };
+    /// The lists [`Context::overlaps`] read on this thread ([`Context::read_list`]).
+    static LIST_READS: Cell<usize> = const { Cell::new(0) };
+    /// The column reads [`Context::scan`] made on this thread (its column path).
+    static SCAN_READS: Cell<usize> = const { Cell::new(0) };
+    /// Whether [`Context::bgp`] hands its planning's reads to its steps ([`reads`]); off,
+    /// it drops them once planned, as before the hand-over.
+    static HANDOVER: Cell<bool> = const { Cell::new(true) };
+    /// Whether [`Context::overlaps`] makes its intersection buffer ([`Context::shared`]).
+    static BUFFERS: Cell<bool> = const { Cell::new(true) };
     /// The plannings planned again without the characteristic sets on this thread
     /// ([`Context::with_sets`]).
     static REPLANS: Cell<usize> = const { Cell::new(0) };
@@ -902,6 +915,12 @@ thread_local! {
 #[cfg(test)]
 fn bgp_estimated() {
     BGP_ESTIMATES.set(BGP_ESTIMATES.get() + 1);
+}
+
+/// The lists read on this thread so far ([`LIST_READS`]).
+#[cfg(test)]
+fn list_reads() -> usize {
+    LIST_READS.get()
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.
@@ -1607,6 +1626,9 @@ struct Context<'a> {
     /// [`QueryOptions::search_scope`]: what the searches rank and select among, chosen once
     /// per search before its scan ([`search::SearchIn`]).
     search_scope: crate::SearchScope,
+    /// EXPLAIN: the trace line of the basic graph pattern [`Self::eval`] is evaluating, until
+    /// its planning ([`Self::bgp`]) gives it the estimate its steps have.
+    bgp_line: Cell<Option<usize>>,
 }
 
 /// The active graph of triple patterns.
@@ -1797,6 +1819,7 @@ impl<'a> Context<'a> {
             cache: None,
             pin: RefCell::default(),
             search_scope: options.search_scope,
+            bgp_line: Cell::new(None),
         };
         if let Some(cache) = &options.result_cache {
             // Besides the context's options, a result depends on the base IRI (`IRI()`)
@@ -2134,9 +2157,13 @@ impl<'a> Context<'a> {
             });
             trace.len() - 1
         };
+        if matches!(pattern, GraphPattern::Bgp { .. }) {
+            self.bgp_line.set(Some(index));
+        }
         self.depth.set(depth + 1);
         let start = Instant::now();
         let result = self.eval_cached(pattern, Some(index));
+        self.bgp_line.set(None);
         self.depth.set(depth);
         if let Ok(solutions) = &result {
             let mut trace = trace.borrow_mut();
@@ -3231,9 +3258,33 @@ impl<'a> Context<'a> {
             })
             .collect();
         let links = triple_joins::planned(filters);
-        let plan = self.join_order(&scans, &planned, &links, self.trace.is_some())?;
+        // What planning reads for the overlap counts is kept for the steps that read the same
+        // data ([`reads`]). None under a LIMIT, whose morsels may probe where a whole pattern
+        // would be read, nor with index joins forced, where every step probes.
+        let read = limit.is_none() && self.index_joins != Some(true);
+        let (plan, mut reads) =
+            self.join_order(&scans, &planned, &links, self.trace.is_some(), read)?;
+        #[cfg(test)]
+        if !HANDOVER.get() {
+            reads = Reads::default();
+        }
         let estimate = |step: usize| Some(plan.rows[step].max(0.0).round() as u64);
         let order = &plan.order;
+        // EXPLAIN: the BGP's own line shows what its planning estimated, as its last step
+        // does. Estimate-time planning reads no lists, so its estimate may lack the overlap
+        // counts; an enclosing operator's line keeps that one.
+        if let (Some(trace), Some(line)) = (&self.trace, self.bgp_line.take()) {
+            let last = estimate(order.len() - 1).map(|e| limit.map_or(e, |l| e.min(l as u64)));
+            trace.borrow_mut()[line].estimated_rows = last;
+        }
+        // A ranged step reads its ranges, never the whole pattern: its list serves no step.
+        for (k, ranged) in ranged.iter().enumerate() {
+            if ranged.is_some() {
+                reads.release(k);
+            }
+        }
+        reads.keep_buffer_for(order[0], order.get(1).copied());
+        let reads = RefCell::new(reads);
         // Each prefix of the order is a part of the result cache ([`cached::Joins`]): the
         // longest one cached is where the joins start.
         let given = filters.clone();
@@ -3245,7 +3296,12 @@ impl<'a> Context<'a> {
             filters: &given,
             keys: Default::default(),
         };
-        let reused = self.cached_prefix(&joins, filters, limit.is_some())?;
+        // A cached prefix replaces its steps: their lists are released before its rows are made.
+        let reused = self.cached_prefix(&joins, filters, limit.is_some(), |length| {
+            for &k in &order[..length] {
+                reads.borrow_mut().release(k);
+            }
+        })?;
         let first = order[0];
         let join_var = order.get(1).and_then(|&i| {
             scans[first]
@@ -3253,14 +3309,40 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .find(|v| scans[i].vars().contains(v))
         });
-        let (mut result, joined) = match reused {
-            Some(prefix) => prefix,
-            None => {
-                let result = match ranged[first] {
-                    Some((permutation, ranges)) => {
+        // The buffer, if kept: the first two steps' result (their join on their one variable
+        // is the intersection of their lists).
+        let buffer = if reused.is_none() {
+            reads.borrow_mut().take_buffer(first)
+        } else {
+            None
+        };
+        let (mut result, joined) = match (reused, buffer) {
+            (Some(prefix), _) => prefix,
+            (None, Some((Buffer { values, held, .. }, rows))) => {
+                let result = self.read_solutions(&scans[first], values, held)?;
+                if self.trace.is_some() {
+                    let detail = format!("{} (read at planning)", triples[first]);
+                    self.note("scan", detail, estimate(0), rows, start);
+                    let detail = format!("{} (read at planning)", triples[order[1]]);
+                    self.note("join", detail, estimate(1), result.table.len(), start);
+                }
+                // The conjuncts after step 1 and after step 2, at once: they read only bound
+                // variables.
+                let result = self.filter_bound(result, filters)?;
+                self.offer_prefix(&joins, 2, &result, start_joins.elapsed());
+                (result, 2)
+            }
+            (None, None) => {
+                let list = reads.borrow_mut().take(first);
+                let read = list.is_some();
+                let result = match (ranged[first], list) {
+                    (Some((permutation, ranges)), _) => {
                         self.scan_ranges(&scans[first], permutation, ranges)?
                     }
-                    None => self.scan(&scans[first], join_var.as_ref())?,
+                    (None, Some(List { values, held, .. })) => {
+                        self.read_solutions(&scans[first], values, held)?
+                    }
+                    (None, None) => self.scan(&scans[first], join_var.as_ref())?,
                 };
                 if self.trace.is_some() {
                     let operator = if ranged[first].is_some() {
@@ -3268,7 +3350,10 @@ impl<'a> Context<'a> {
                     } else {
                         "scan"
                     };
-                    let detail = triples[first].to_string();
+                    let mut detail = triples[first].to_string();
+                    if read {
+                        detail.push_str(" (read at planning)");
+                    }
                     self.note(operator, detail, estimate(0), result.table.len(), start);
                 }
                 (self.filter_bound(result, filters)?, 1)
@@ -3308,18 +3393,29 @@ impl<'a> Context<'a> {
                 .then(|| equijoin::link(filters, &result, &scans[next].vars()))
                 .flatten();
                 let triple = through.is_some();
+                // Pattern `next`'s list, for its scan or in place of its probe; a link reads
+                // otherwise, so the list is released first.
+                let list = reads.borrow_mut().take(next);
+                let list = list.filter(|_| !triple && linked.is_none());
+                let read = list.is_some();
                 result = if let Some((link, rows)) = through {
                     self.triple_join(result, &scans[next], counts[next], &link, rows)?
                 } else if let Some((a, b, same_term)) = &linked {
                     self.equality_join(result, &scans[next], counts[next], a, b, *same_term)?
                 } else if probe {
-                    self.probe_join(result, &scans[next], &shared)?
+                    match list {
+                        Some(list) => self.member_join(result, &scans[next], &shared[0], list)?,
+                        None => self.probe_join(result, &scans[next], &shared)?,
+                    }
                 } else {
-                    let scanned = match ranged[next] {
-                        Some((permutation, ranges)) => {
+                    let scanned = match (ranged[next], list) {
+                        (Some((permutation, ranges)), _) => {
                             self.scan_ranges(&scans[next], permutation, ranges)?
                         }
-                        None => self.scan(&scans[next], shared.first())?,
+                        (None, Some(List { values, held, .. })) => {
+                            self.read_solutions(&scans[next], values, held)?
+                        }
+                        (None, None) => self.scan(&scans[next], shared.first())?,
                     };
                     self.join(result, scanned)?
                 };
@@ -3332,7 +3428,9 @@ impl<'a> Context<'a> {
                         (false, false) => "join",
                     };
                     let mut detail = triples[next].to_string();
-                    if probe && linked.is_none() && !triple {
+                    if read {
+                        detail.push_str(" (read at planning)");
+                    } else if probe && linked.is_none() && !triple {
                         detail = self.probed_detail(detail);
                     }
                     self.note(operator, detail, estimate(step), result.table.len(), start);
@@ -3674,32 +3772,39 @@ impl<'a> Context<'a> {
     /// The rows after each step are estimated where `estimated` asks (or the order
     /// depends on them): a two-pattern BGP run without EXPLAIN skips its model. Planning
     /// observes the query's cancellation as evaluating does ([`Self::order_inputs`]).
+    /// With the order, the lists its overlap counts read where `read` asks ([`Reads`]):
+    /// `bgp`'s own planning, which hands them to its steps.
     fn join_order(
         &self,
         scans: &[ScanPattern],
         counts: &[u64],
         links: &[(Variable, Vec<Variable>)],
         estimated: bool,
-    ) -> NativeResult<plan::Plan> {
+        read: bool,
+    ) -> NativeResult<(plan::Plan, Reads)> {
         if scans.is_empty() {
-            return Ok(plan::Plan {
+            let plan = plan::Plan {
                 order: Vec::new(),
                 rows: Vec::new(),
+                cost: 0.0,
                 work: 0,
-            });
+            };
+            return Ok((plan, Reads::default()));
         }
         let mut order: Vec<usize> = (0..scans.len()).collect();
         order.sort_by_key(|&i| counts[i]);
         if scans.len() <= 2 && !estimated {
             let rows = vec![f64::NAN; order.len()];
-            return Ok(plan::Plan {
+            let plan = plan::Plan {
                 order,
                 rows,
+                cost: 0.0,
                 work: 0,
-            });
+            };
+            return Ok((plan, Reads::default()));
         }
         let mut vars: Vec<Variable> = Vec::new();
-        let inputs = self.plan_inputs(scans, counts, links, &mut vars);
+        let (inputs, reads) = self.plan_inputs(scans, counts, links, &mut vars, read);
         if scans.len() <= 2 {
             // The smaller pattern first; the join's rows by the orderer's model (a star's
             // pair by the characteristic sets, an edge and a star on its object by the
@@ -3707,9 +3812,9 @@ impl<'a> Context<'a> {
             let along = |sets: Option<&CharacteristicSets>, budget: usize| {
                 plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &order)
             };
-            return self.with_sets(&inputs, &along);
+            return Ok((self.with_sets(&inputs, &along)?, reads));
         }
-        self.order_inputs(&inputs, vars.len())
+        Ok((self.order_inputs(&inputs, vars.len())?, reads))
     }
 
     /// The join orderer's order of `inputs` over `variables` variables, with the
@@ -3812,23 +3917,24 @@ impl<'a> Context<'a> {
     /// edges for the characteristic sets and pairs. A pattern that binds every variable a
     /// link's other side reads (`triple_joins::planned`) also has the link's variable, as
     /// many values as matches: the link joins it to the patterns that bind that variable.
+    /// The overlaps are counted only where `read` asks, with the lists read for them
+    /// ([`Self::overlaps`]), against the cost of the plan these inputs give without them.
     fn plan_inputs(
         &self,
         scans: &[ScanPattern],
         counts: &[u64],
         links: &[(Variable, Vec<Variable>)],
         vars: &mut Vec<Variable>,
-    ) -> Vec<plan::Input> {
+        read: bool,
+    ) -> (Vec<plan::Input>, Reads) {
         let mut index_of = |v: Variable| variable_index(vars, v);
         // Each pattern's variables, read once for the overlaps and its input.
         let own: Vec<Vec<Variable>> = scans.iter().map(ScanPattern::vars).collect();
-        let overlaps = self.overlaps(scans, &own, counts);
-        scans
+        let mut inputs: Vec<plan::Input> = scans
             .iter()
             .zip(counts)
-            .zip(overlaps)
-            .zip(own)
-            .map(|(((scan, &count), overlaps), own)| {
+            .zip(&own)
+            .map(|((scan, &count), own)| {
                 let star = match &scan.slots[0] {
                     Slot::Var(v) => self.star(scan, count, index_of(v.clone())),
                     _ => None,
@@ -3845,10 +3951,10 @@ impl<'a> Context<'a> {
                     .map(|(v, _)| v.clone())
                     .collect();
                 let mut input_vars: Vec<(usize, u64)> = own
-                    .into_iter()
+                    .iter()
                     .map(|v| {
-                        let d = self.distinct(scan, &v, count).min(count);
-                        (index_of(v), d)
+                        let d = self.distinct(scan, v, count).min(count);
+                        (index_of(v.clone()), d)
                     })
                     .collect();
                 for v in linked {
@@ -3862,27 +3968,56 @@ impl<'a> Context<'a> {
                     edge_object,
                     vars: input_vars,
                     star,
-                    overlaps,
+                    overlaps: Vec::new(),
                 }
             })
-            .collect()
+            .collect();
+        // The plain plan's cost: these inputs ordered on their counts alone, without the
+        // characteristic sets (as `with_sets` first plans them). `None` if cancelled.
+        let plain_cost = || {
+            let cancelled = || {
+                self.cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+            };
+            plan::order(&inputs, vars.len(), PROBE_FACTOR, None, 0, &cancelled)
+                .ok()
+                .map(|plain| plain.cost)
+        };
+        let (overlaps, reads) = self.overlaps(scans, &own, counts, read, plain_cost);
+        for (input, overlaps) in inputs.iter_mut().zip(overlaps) {
+            input.overlaps = overlaps;
+        }
+        (inputs, reads)
     }
 
     /// Per pattern of `scans` with one variable, the values it has in common with each
-    /// other such pattern on the same variable ([`plan::Input::overlaps`]), where both their
-    /// `counts` (as planned, maybe narrowed by filters and ranges) and their patterns' own
-    /// counts are at most [`plan::OVERLAP_VALUES`] together: both lists are read sorted from
-    /// the index a column at a time, charged to the query's budget, and merged. A pattern the
-    /// index can't give so, or a read the budget refuses, has no count with any other: the
-    /// plan keeps its plain estimate (D16-575). `vars` are each pattern's variables
-    /// ([`ScanPattern::vars`]).
+    /// other such pattern on the same variable ([`plan::Input::overlaps`]), and the lists
+    /// read for them, kept for the steps that read the same data ([`Reads`]). Only where
+    /// `read` asks (`bgp`'s own planning, without a LIMIT or forced index joins): path
+    /// ordering and estimates plan with counts alone, as for a pair never counted.
+    ///
+    /// Admitted against the plan's expected work, per BGP: at most `plain_cost` values
+    /// decoded for the whole BGP (the cost of its plain plan, planned on its counts alone, in
+    /// scanned rows: reading the lists may at most double the work the plan expects), and at
+    /// most [`plan::OVERLAP_VALUES`], in at most [`reads::MAX_LISTS`] lists. The plain plan
+    /// is made only for a BGP with a candidate pair. The pairs are read in order of their
+    /// patterns' own counts, smallest first, a list read for an earlier pair counting once. Each list is read sorted from the index a column at a time and charged
+    /// to the query's budget. A pattern the index can't give so, or a read the budget
+    /// refuses, has no count with any other: the plan keeps its plain estimate (D16-575).
+    /// `vars` are each pattern's variables ([`ScanPattern::vars`]).
     fn overlaps(
         &self,
         scans: &[ScanPattern],
         vars: &[Vec<Variable>],
         counts: &[u64],
-    ) -> Vec<Vec<(usize, u64)>> {
+        read: bool,
+        plain_cost: impl FnOnce() -> Option<f64>,
+    ) -> (Vec<Vec<(usize, u64)>>, Reads) {
         let mut out = vec![Vec::new(); scans.len()];
+        if !read {
+            return (out, Reads::default());
+        }
         // The single-variable patterns: their variable and its position.
         let single: Vec<Option<(&Variable, usize)>> = scans
             .iter()
@@ -3898,25 +4033,6 @@ impl<'a> Context<'a> {
                 Some((v, position))
             })
             .collect();
-        // The pairs whose common values are counted: two of them on one variable, small as
-        // planned and by their patterns' own counts, the rows a read decodes (a filter's or a
-        // range's share is read whole). The own counts are taken once each, only for pairs
-        // small as planned: a pair past that isn't read either way.
-        let mut own: Vec<Option<u64>> = vec![None; scans.len()];
-        let mut counted = |i: usize, j: usize| match (single[i], single[j]) {
-            (Some((a, _)), Some((b, _)))
-                if a == b && counts[i].saturating_add(counts[j]) <= plan::OVERLAP_VALUES =>
-            {
-                let mut size = |k: usize| {
-                    *own[k].get_or_insert_with(|| {
-                        self.snapshot
-                            .estimate_in(self.model, &scans[k].quad_pattern())
-                    })
-                };
-                size(i).saturating_add(size(j)) <= plan::OVERLAP_VALUES
-            }
-            _ => false,
-        };
         // Pairs of patterns: cancelled, the rest is left out, here or below, so the lists are
         // complete only for a run that isn't cancelled; the orderer that reads them reports
         // the cancellation. Asked per pattern: the pairs are n²/2.
@@ -3925,73 +4041,195 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        // The first pattern with such a pair. None (most BGPs): no list to read, nothing to
-        // charge.
-        let mut first = None;
+        // The candidate pairs: two patterns on one variable, within OVERLAP_VALUES as planned
+        // and by their patterns' own counts, the rows a read decodes (a filter's or a range's
+        // share is read whole). The own counts are taken once each, only for pairs small as
+        // planned.
+        let most = plan::OVERLAP_VALUES;
+        let mut own: Vec<Option<u64>> = vec![None; scans.len()];
+        let mut pairs: Vec<(u64, usize, usize)> = Vec::new();
         for i in 0..scans.len() {
             if cancelled() {
-                return out;
+                return (out, Reads::default());
             }
-            if (i + 1..scans.len()).any(|j| counted(i, j)) {
-                first = Some(i);
-                break;
+            let Some((a, _)) = single[i] else {
+                continue;
+            };
+            for j in i + 1..scans.len() {
+                let Some((b, _)) = single[j] else {
+                    continue;
+                };
+                if a != b || counts[i].saturating_add(counts[j]) > most {
+                    continue;
+                }
+                let mut size = |k: usize| {
+                    *own[k].get_or_insert_with(|| {
+                        self.snapshot
+                            .estimate_in(self.model, &scans[k].quad_pattern())
+                    })
+                };
+                let both = size(i).saturating_add(size(j));
+                if both <= most {
+                    pairs.push((both, i, j));
+                }
             }
         }
-        let Some(first) = first else {
-            return out;
+        // None (most BGPs): no list to read, nothing to charge, no plain plan made.
+        if pairs.is_empty() {
+            return (out, Reads::default());
+        }
+        // The allowance: the plain plan's cost, at most OVERLAP_VALUES (NaN gives 0).
+        let Some(cost) = plain_cost() else {
+            return (out, Reads::default());
         };
-        // The lists' charge, while they live: the columns decoded for them are charged before
-        // they are.
-        let mut held = Reservation::new(&*self.budget);
-        // Declared after `held`: freed before their charge is released.
-        let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
-        for i in first..scans.len() {
+        let allowance = cost.clamp(0.0, most as f64) as u64;
+        pairs.sort_unstable();
+        // The pairs admitted, and the lists they read, each counted once.
+        let (mut lists, mut admitted, mut decoded) = (Vec::new(), Vec::new(), 0u64);
+        for &(_, i, j) in &pairs {
+            let new: Vec<usize> = [i, j].into_iter().filter(|k| !lists.contains(k)).collect();
+            let more: u64 = new.iter().map(|&k| own[k].unwrap_or(0)).sum();
+            if decoded.saturating_add(more) > allowance
+                || lists.len() + new.len() > reads::MAX_LISTS
+            {
+                continue;
+            }
+            decoded += more;
+            lists.extend(new);
+            admitted.push((i, j));
+        }
+        // Planning can do without the lists: their charges go to an optional part, whose
+        // refusals mark only itself, never the request.
+        let optional = Arc::new(self.memory.optional_part());
+        let Some(mut reads) = Reads::with_room(&optional, lists.len()) else {
+            return (out, Reads::default());
+        };
+        for &k in &lists {
             if cancelled() {
                 break;
             }
-            for j in i + 1..scans.len() {
-                if !counted(i, j) {
-                    continue;
-                }
-                for k in [i, j] {
-                    if lists[k].is_none() {
-                        let (v, position) = single[k].expect("single");
-                        let permutation = scans[k].permutation_for(Some(v));
-                        let pattern = scans[k].quad_pattern();
-                        // A column at a time where the index allows (a few ns a value;
-                        // a quad at a time took 50: LUBM-10 q11 0.06 → 0.18 ms).
-                        let decoded = self.snapshot.scan_columns_in(
-                            self.model,
-                            &pattern,
-                            permutation,
-                            &[position],
-                            &self.budget,
-                        );
-                        // Only a column read is a list: charged before it decodes, and
-                        // complete or refused. Where the index can't give the pattern so
-                        // (an equality expansion, several runs, deletions) a read quad by
-                        // quad would hold it uncharged, and an expansion the budget stops
-                        // would end as if complete (D16-575): no list, as for a refusal; the
-                        // plan goes without.
-                        lists[k] = match decoded {
-                            Ok(Some(columns)) => {
-                                let (mut columns, charge) = columns.into_parts();
-                                held.absorb(charge);
-                                columns.pop()
-                            }
-                            Ok(None) | Err(_) => None,
-                        };
-                    }
-                }
-                let (Some(x), Some(y)) = (&lists[i], &lists[j]) else {
-                    continue;
-                };
-                let both = sorted_overlap(x, y);
-                out[i].push((j, both));
-                out[j].push((i, both));
+            let (v, position) = single[k].expect("a listed pattern has one variable");
+            if let Some(list) = self.read_list(&optional, &scans[k], k, v, position) {
+                reads.keep(list);
             }
         }
-        out
+        // A read the optional part refused: no list of this building counts, so no overlap
+        // comes of a callee that went on past a refusal (the rule of use is a document; its
+        // owner's review, R2). The buffer's refusal comes later and leaves the counts.
+        if optional.refused() {
+            return (out, Reads::default());
+        }
+        // The counts, and the shared values of the pair with the fewest: the likeliest start.
+        // Each pair is merged once, its values written as they are counted; a pair's are
+        // dropped as soon as another has fewer.
+        let mut fewest: Option<(u64, Option<Buffer>)> = None;
+        for &(i, j) in &admitted {
+            let (Some(x), Some(y)) = (reads.list(i), reads.list(j)) else {
+                continue;
+            };
+            let (both, buffer) = self.shared(&optional, x, y, (i, j));
+            out[i].push((j, both));
+            out[j].push((i, both));
+            if fewest.as_ref().is_none_or(|(least, _)| both < *least) {
+                fewest = Some((both, buffer));
+            }
+        }
+        if let Some((_, Some(buffer))) = fewest {
+            reads.set_buffer(buffer);
+        }
+        (out, reads)
+    }
+
+    /// Pattern `pattern`'s list (`scan`'s column of its one variable `v`, at `position`):
+    /// the read the execution's [`Self::scan`] makes on the column path, sorted on `v`. The
+    /// one place planning reads a list. It reads on `optional`, the optional part
+    /// ([`nrese_exec::Envelope::optional_part`]; the budget types' owner, 14 November): a
+    /// refusal ends the read with its error and marks only that part, never the request
+    /// ([`Budget::refused`]). The read qualifies: it ends complete or with the error.
+    fn read_list(
+        &self,
+        optional: &Arc<Budget>,
+        scan: &ScanPattern,
+        pattern: usize,
+        v: &Variable,
+        position: usize,
+    ) -> Option<List> {
+        #[cfg(test)]
+        LIST_READS.set(LIST_READS.get() + 1);
+        // A column at a time where the index allows (a few ns a value; a quad at a time
+        // took 50: LUBM-10 q11 0.06 → 0.18 ms). Only a column read is a list: charged
+        // before it decodes, and complete or refused. Where the index can't give the pattern
+        // so (an equality expansion, several runs, deletions) a read quad by quad would hold
+        // it uncharged, and an expansion the budget stops would end as if complete
+        // (D16-575): no list, as for a refusal; the plan goes without.
+        let decoded = self.snapshot.scan_columns_in(
+            self.model,
+            &scan.quad_pattern(),
+            scan.permutation_for(Some(v)),
+            &[position],
+            optional,
+        );
+        let (mut columns, held) = match decoded {
+            Ok(Some(columns)) => columns.into_parts(),
+            Ok(None) | Err(_) => return None,
+        };
+        Some(List {
+            pattern,
+            values: columns.pop()?,
+            held: Reservation::adopt(Arc::clone(optional), held.transfer()),
+        })
+    }
+
+    /// The values the sorted lists `x` and `y` of the patterns `pair` share: their count, and
+    /// the values themselves, written in the same merge, as the pair's buffer. The buffer is
+    /// reserved on `optional` for the smaller list's length (a length already held, at most
+    /// [`reads::BUFFER_VALUES`]) before it is written, and what the count leaves unused is
+    /// freed, then released. Where that length is past [`reads::BUFFER_VALUES`] or the
+    /// reservation is refused, the pair is only counted: no buffer, no error, no refusal
+    /// marked on the request.
+    fn shared(
+        &self,
+        optional: &Arc<Budget>,
+        x: &[u64],
+        y: &[u64],
+        pair: (usize, usize),
+    ) -> (u64, Option<Buffer>) {
+        let most = x.len().min(y.len());
+        #[cfg(test)]
+        if !BUFFERS.get() {
+            return (sorted_overlap(x, y), None);
+        }
+        if most > reads::BUFFER_VALUES {
+            return (sorted_overlap(x, y), None);
+        }
+        let mut held = Reservation::new(Arc::clone(optional));
+        if held.charge(most * size_of::<u64>()).is_err() {
+            return (sorted_overlap(x, y), None);
+        }
+        let mut values = Vec::with_capacity(most);
+        let (mut a, mut b) = (0, 0);
+        while a < x.len() && b < y.len() {
+            match x[a].cmp(&y[b]) {
+                std::cmp::Ordering::Less => a += 1,
+                std::cmp::Ordering::Greater => b += 1,
+                std::cmp::Ordering::Equal => {
+                    // Counted once, as `sorted_overlap` counts it.
+                    let value = x[a];
+                    values.push(value);
+                    while a < x.len() && x[a] == value {
+                        a += 1;
+                    }
+                    while b < y.len() && y[b] == value {
+                        b += 1;
+                    }
+                }
+            }
+        }
+        values.shrink_to_fit();
+        held.release((most - values.len()) * size_of::<u64>());
+        let both = values.len() as u64;
+        let buffer = Buffer { pair, values, held };
+        (both, Some(buffer))
     }
 
     /// `scan` (with `count` matches) as part of a star on its subject (the variable with
@@ -4437,6 +4675,8 @@ impl<'a> Context<'a> {
                 .scan_columns_in(self.model, &pattern, permutation, &components, &self.budget)
                 .map_err(QueryEvaluationError::MemoryLimit)?
             {
+                #[cfg(test)]
+                SCAN_READS.set(SCAN_READS.get() + 1);
                 let sorted = sorted_columns(scan, permutation, &vars);
                 if vars.is_empty() {
                     let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
@@ -4660,6 +4900,65 @@ impl<'a> Context<'a> {
                 ordered: false,
             },
         )
+    }
+
+    /// Pattern `scan`'s scan from a list read at planning ([`reads`]): `values`, its one
+    /// variable's sorted column (the table the scan on that variable makes), with their
+    /// charge `held` on the optional part. The table's rows are released on the request's
+    /// own part ([`Self::consumed`]): a charge is released on the part it was taken on, so
+    /// the bytes move there as the step's own scan would charge them. Charged on this part
+    /// first, then released on the optional one, so they are never allocated and charged
+    /// nowhere; refused, the step fails as its scan would, and `held` releases them.
+    fn read_solutions(
+        &self,
+        scan: &ScanPattern,
+        values: Vec<u64>,
+        optional: Reservation<Arc<Budget>>,
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(optional.bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        drop(optional);
+        let vars = scan.vars();
+        let sorted = sorted_columns(scan, scan.permutation_for(vars.first()), &vars);
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table: IdTable::from_columns(vec![values]).assume_sorted_by(sorted),
+                ordered: false,
+            },
+        )
+    }
+
+    /// The index join of `result` with `scan` on `v`, from the pattern's list: the rows
+    /// whose `v` is in it. `scan` has the one variable `v`, its other components fixed, so
+    /// it holds each value of `v` at most once, and its probe keeps exactly these rows,
+    /// without a seek. Rows with `v` unbound join as the probe's do, by the scan.
+    fn member_join(
+        &self,
+        result: Solutions,
+        scan: &ScanPattern,
+        v: &Variable,
+        list: List,
+    ) -> NativeResult<Solutions> {
+        let List { values, held, .. } = list;
+        let column = result.column(v).expect("shared");
+        if has_undef(&result.table, &[column]) {
+            let scanned = self.read_solutions(scan, values, held)?;
+            return self.join(result, scanned);
+        }
+        // The retained rows' mask, a byte a row, charged as growth.
+        let rows = result.table.len();
+        let kept = self.reshaped(result, rows, |mut solutions| {
+            solutions
+                .table
+                .par_retain(|table, row| values.binary_search(&table.get(row, column)).is_ok());
+            solutions
+        });
+        drop(values);
+        drop(held);
+        kept
     }
 
     /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the

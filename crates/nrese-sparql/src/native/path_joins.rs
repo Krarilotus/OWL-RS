@@ -148,7 +148,9 @@ impl Context<'_> {
             .map(|scan| self.snapshot.estimate_in(self.model, &scan.quad_pattern()))
             .collect();
         let mut vars: Vec<Variable> = Vec::new();
-        let mut inputs = self.plan_inputs(&scans, &counts, &[], &mut vars);
+        // Counts alone: the BGPs are planned again where they run (`bgp`, `bgp_from`), so
+        // lists read here would be dropped and read again.
+        let (mut inputs, _) = self.plan_inputs(&scans, &counts, &[], &mut vars, false);
         for path in &join.paths {
             let rows = self.path_size(path) * path.filter.map_or(1.0, pushdown::selectivity);
             let count = rows.max(0.0).round() as u64;
