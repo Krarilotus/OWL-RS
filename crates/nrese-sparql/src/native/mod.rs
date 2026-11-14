@@ -57,6 +57,8 @@ mod join_order_tests;
 mod lone_pattern_tests;
 #[cfg(test)]
 mod optimise_tests;
+#[cfg(test)]
+mod overlap_tests;
 pub(crate) mod ql;
 mod ranges;
 mod scan_columns;
@@ -3846,9 +3848,13 @@ impl<'a> Context<'a> {
     }
 
     /// Per pattern of `scans` with one variable, the values it has in common with each
-    /// other such pattern on the same variable ([`plan::Input::overlaps`]), where their
-    /// `counts` together are at most [`plan::OVERLAP_VALUES`]: both lists are read sorted
-    /// from the index and merged. `vars` are each pattern's variables ([`ScanPattern::vars`]).
+    /// other such pattern on the same variable ([`plan::Input::overlaps`]), where both their
+    /// `counts` (as planned, maybe narrowed by filters and ranges) and their patterns' own
+    /// counts are at most [`plan::OVERLAP_VALUES`] together: both lists are read sorted from
+    /// the index a column at a time, charged to the query's budget, and merged. A pattern the
+    /// index can't give so, or a read the budget refuses, has no count with any other: the
+    /// plan keeps its plain estimate (D16-575). `vars` are each pattern's variables
+    /// ([`ScanPattern::vars`]).
     fn overlaps(
         &self,
         scans: &[ScanPattern],
@@ -3871,10 +3877,22 @@ impl<'a> Context<'a> {
                 Some((v, position))
             })
             .collect();
-        // The pairs whose common values are counted: two of them on one variable, small.
-        let counted = |i: usize, j: usize| match (single[i], single[j]) {
-            (Some((a, _)), Some((b, _))) => {
-                a == b && counts[i].saturating_add(counts[j]) <= plan::OVERLAP_VALUES
+        // The pairs whose common values are counted: two of them on one variable, small as
+        // planned and by their patterns' own counts, the rows a read decodes (a filter's or a
+        // range's share is read whole). The own counts are taken once each, only for pairs
+        // small as planned: a pair past that isn't read either way.
+        let mut own: Vec<Option<u64>> = vec![None; scans.len()];
+        let mut counted = |i: usize, j: usize| match (single[i], single[j]) {
+            (Some((a, _)), Some((b, _)))
+                if a == b && counts[i].saturating_add(counts[j]) <= plan::OVERLAP_VALUES =>
+            {
+                let mut size = |k: usize| {
+                    *own[k].get_or_insert_with(|| {
+                        self.snapshot
+                            .estimate_in(self.model, &scans[k].quad_pattern())
+                    })
+                };
+                size(i).saturating_add(size(j)) <= plan::OVERLAP_VALUES
             }
             _ => false,
         };
@@ -3902,7 +3920,7 @@ impl<'a> Context<'a> {
             return out;
         };
         // The lists' charge, while they live: the columns decoded for them are charged before
-        // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
+        // they are.
         let mut held = Reservation::new(&*self.budget);
         // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
@@ -3928,18 +3946,19 @@ impl<'a> Context<'a> {
                             &[position],
                             &self.budget,
                         );
+                        // Only a column read is a list: charged before it decodes, and
+                        // complete or refused. Where the index can't give the pattern so
+                        // (an equality expansion, several runs, deletions) a read quad by
+                        // quad would hold it uncharged, and an expansion the budget stops
+                        // would end as if complete (D16-575): no list, as for a refusal; the
+                        // plan goes without.
                         lists[k] = match decoded {
                             Ok(Some(columns)) => {
                                 let (mut columns, charge) = columns.into_parts();
                                 held.absorb(charge);
                                 columns.pop()
                             }
-                            Ok(None) => self
-                                .snapshot
-                                .scan_sorted_in(self.model, &pattern, permutation)
-                                .map(|quads| quads.map(|q| q.components()[position]).collect()),
-                            // Refused: no overlap known for it; the plan goes without.
-                            Err(_) => None,
+                            Ok(None) | Err(_) => None,
                         };
                     }
                 }
