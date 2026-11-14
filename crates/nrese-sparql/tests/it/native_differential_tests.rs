@@ -2434,8 +2434,7 @@ fn parallel_probe_join_equals_the_reference() {
 }
 
 /// EXPLAIN runs the query and reports every operator: the BGP's join order with estimated
-/// and actual rows, and the operators above it (beside the planner's note on the order,
-/// `join order`, which is no operator).
+/// and actual rows, and the operators above it.
 #[test]
 fn explain_reports_the_plan() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -2540,10 +2539,7 @@ fn explain_reports_the_plan() {
     assert_eq!(operators[0], (0, "project"));
     assert_eq!(operators[1], (1, "filter"));
     let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
-    let bgp: Vec<_> = below
-        .iter()
-        .filter(|s| s.operator != "filter" && s.operator != "join order")
-        .collect();
+    let bgp: Vec<_> = below.iter().filter(|s| s.operator != "filter").collect();
     assert_eq!(bgp.len(), 3, "{:#?}", explanation.steps);
     // memberOf d0 (20 rows) is the most selective start; every join step has an estimate.
     assert!(bgp[0].detail.contains("memberOf"), "{:#?}", bgp);
@@ -2576,11 +2572,7 @@ fn explain_reports_the_plan() {
         ),
         rows(reference(&snapshot, &query, &oracle).unwrap(), false)
     );
-    let below: Vec<_> = explanation
-        .steps
-        .iter()
-        .filter(|s| s.depth == 2 && s.operator != "join order")
-        .collect();
+    let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
     assert_eq!(
         (below[0].operator.as_str(), below[1].operator.as_str()),
         ("scan", "filter"),

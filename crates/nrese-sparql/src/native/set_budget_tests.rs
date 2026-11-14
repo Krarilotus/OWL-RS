@@ -629,10 +629,11 @@ fn plannings(
 /// with the plain counts first": every BGP is planned without the sets first. One whose plain
 /// plan expects too little, as every BGP on this small graph does under the planner's own gate
 /// (its predicates in few sets and its set plan another: there was an allowance for short lists
-/// until then), keeps that plan, reads no set and plans once; EXPLAIN says so, once, under the
-/// BGP, with the rows expected. Admitted, it is planned with the sets after, and gets their
-/// plan; past its budget there, the plain plan, planned once again. Red with an allowance that
-/// admits a BGP whose starts read few sets.
+/// until then), keeps that plan, reads no set and plans once, and EXPLAIN shows no note for it:
+/// that is the normal case (the master's decision of 14 November 03:26; a BGP admitted and past
+/// its budget is noted). Admitted, it is planned with the sets after, and gets their plan; past
+/// its budget there, the plain plan, planned once again. Red with an allowance that admits a BGP
+/// whose starts read few sets, and with a note for a BGP the gate keeps.
 #[test]
 fn a_bgp_is_refined_by_the_sets_only_where_its_expected_work_admits_it() {
     let engine = people();
@@ -655,22 +656,9 @@ fn a_bgp_is_refined_by_the_sets_only_where_its_expected_work_admits_it() {
                 ?x <http://e/p3> ?c . ?x <http://e/city> ?d }";
     let query = Query::parse(text, None).unwrap();
     let trace = explain(&snapshot, &query, &options).unwrap().1;
-    let notes: Vec<usize> = (0..trace.len())
-        .filter(|&i| trace[i].operator == "join order")
-        .collect();
-    assert_eq!(notes.len(), 1, "{trace:#?}");
-    let (above, note) = (&trace[notes[0].saturating_sub(1)], &trace[notes[0]]);
-    assert_eq!(
-        ("bgp", note.depth),
-        (above.operator.as_str(), above.depth + 1)
-    );
-    let rows = format!(" rows expected, fewer than {:.0}", plan::SET_GATE_ROWS);
     assert!(
-        note.detail
-            .starts_with("4 patterns planned without characteristic sets: ")
-            && note.detail.ends_with(&rows),
-        "{}",
-        note.detail
+        !trace.iter().any(|s| s.operator == "join order"),
+        "{trace:#?}"
     );
     plan::ADMIT.set(Some(true));
     let (admitted, asked) = plannings(&ctx, &STAR);

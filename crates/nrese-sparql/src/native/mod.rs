@@ -3722,9 +3722,10 @@ impl<'a> Context<'a> {
     /// statistics. Admitted, it is searched with the sets within a budget that follows that
     /// work ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
     /// paths), and only where an input is part of an open star ([`plan::Star::open`]): without
-    /// one, the search would make the plain plan again. A BGP kept from the sets, or whose set
-    /// search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
-    /// which planner a BGP got shows. A query cancelled in or between its plannings fails (a
+    /// one, the search would make the plain plan again. A BGP kept from the sets gets its plain
+    /// plan without a note: that is the normal case. One whose set search passes its budget gets
+    /// the plain plan too, noted for EXPLAIN ([`WITHOUT_SETS`]): the sets were wanted and the
+    /// budget stopped them. A query cancelled in or between its plannings fails (a
     /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
     fn with_sets(
         &self,
@@ -3755,15 +3756,6 @@ impl<'a> Context<'a> {
         }
         let expected = plan::expected_work(&plain);
         if !plan::admits(expected) {
-            if let Some(start) = start {
-                let detail = format!(
-                    "{} patterns planned without characteristic sets: {expected:.0} rows \
-                     expected, fewer than {:.0}",
-                    inputs.len(),
-                    plan::SET_GATE_ROWS,
-                );
-                self.note(WITHOUT_SETS, detail, None, 0, start);
-            }
             return Ok(plain);
         }
         // Asking for the statistics may build them, or wait for a build, and takes no
