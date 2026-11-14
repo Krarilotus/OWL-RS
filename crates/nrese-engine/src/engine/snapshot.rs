@@ -214,6 +214,8 @@ mod reference {
 
 #[cfg(test)]
 mod pending_bound_tests;
+#[cfg(test)]
+mod point_tests;
 
 /// A charge for memory masks and views keep, shared by every holder of it. The last holder
 /// takes the charge out of its box (freeing the box), drops its parts (the charges of what
