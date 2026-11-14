@@ -29,11 +29,14 @@
 //! expressions): the hierarchy is then complete for the part read only. A data property's domain and range, which say
 //! nothing about classes without such a restriction, assertions about individuals, and
 //! keys, which constrain only individuals, are not read: an inconsistency among them goes
-//! unseen.
+//! unseen. Nor are an annotation property's domain, range and sub-properties, which say
+//! nothing about classes. What a declaration declares is read from nrese-owl's table
+//! ([`DECLARATION_KINDS`]), as the mapping reads it.
 
 use std::time::{Duration, Instant};
 
 use hashbrown::{HashMap, HashSet};
+use nrese_owl::{DECLARATION_KINDS, EntityKind};
 use nrese_xsd::owl::Datatype;
 
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
@@ -189,8 +192,6 @@ struct Names {
     equivalent_property: u64,
     property_chain: u64,
     rdf_type: u64,
-    class: u64,
-    rdfs_class: u64,
     transitive: u64,
     domain: u64,
     range: u64,
@@ -201,11 +202,11 @@ struct Names {
     by_type: TermTable<Disposition>,
     /// `owl:topObjectProperty` and the other three, whose meaning no rule has.
     top_and_bottom: [u64; 4],
-    /// The datatypes of OWL 2's datatype map; and the declarations of others, and of data
-    /// properties.
+    /// The datatypes of OWL 2's datatype map.
     datatype_map: Vec<u64>,
-    datatype: u64,
-    datatype_property: u64,
+    /// What an `rdf:type` object declares its subject as: nrese-owl's table, so that a
+    /// declaration is read as the mapping reads it.
+    declarations: TermTable<EntityKind>,
 }
 
 impl Names {
@@ -230,8 +231,6 @@ impl Names {
             equivalent_property: owl(&mut iri, "equivalentProperty"),
             property_chain: owl(&mut iri, "propertyChainAxiom"),
             rdf_type: iri(&format!("{RDF}type")),
-            class: owl(&mut iri, "Class"),
-            rdfs_class: iri(&format!("{RDFS}Class")),
             transitive: owl(&mut iri, "TransitiveProperty"),
             domain: iri(&format!("{RDFS}domain")),
             range: iri(&format!("{RDFS}range")),
@@ -245,8 +244,10 @@ impl Names {
             ]
             .map(|local| owl(&mut iri, local)),
             datatype_map: Datatype::ALL.iter().map(|d| iri(&d.iri())).collect(),
-            datatype: iri(&format!("{RDFS}Datatype")),
-            datatype_property: owl(&mut iri, "DatatypeProperty"),
+            declarations: DECLARATION_KINDS
+                .iter()
+                .map(|&(class, kind)| (iri(class), kind))
+                .collect(),
         };
         // Every predicate of the mapping's class expressions and data ranges (OWL 2 Mapping to
         // RDF Graphs, Tables 1 to 3): the constructors a node has one of, their fields, and
@@ -366,6 +367,11 @@ impl Names {
             true => self.by_type.get(o),
             false => self.by_predicate.get(p),
         }
+    }
+
+    /// What `s p o` declares `s` as, if it is a declaration.
+    fn declared(&self, p: u64, o: u64) -> Option<EntityKind> {
+        (p == self.rdf_type).then(|| self.declarations.get(o))?
     }
 
     /// The predicate `p` of the mapping's class expressions and data ranges, if it is one:
@@ -564,12 +570,15 @@ struct Graph<'a> {
     names: &'a Names,
     /// The declared data properties, whose restrictions no rule reads.
     data_properties: HashSet<u64>,
+    /// The declared annotation properties, whose domains, ranges and sub-properties say
+    /// nothing about classes.
+    annotation_properties: HashSet<u64>,
     /// The blank nodes no class expression of EL can be read from, whatever uses them, and
-    /// why: those declared `rdfs:Datatype`, a data range, and those whose predicates of the
+    /// why: those declared datatypes, a data range, and those whose predicates of the
     /// mapping's class expressions say something EL lacks, decided once per node.
     refused: HashMap<u64, &'static str>,
-    /// The named datatypes (OWL 2's datatype map and those declared `rdfs:Datatype`): a
-    /// named class read is one of these or itself.
+    /// The named datatypes (OWL 2's datatype map and those declared datatypes,
+    /// `rdfs:Datatype` or `owl:DataRange`): a named class read is one of these or itself.
     datatypes: TermTable<()>,
 }
 
@@ -579,16 +588,18 @@ impl<'a> Graph<'a> {
             by_subject: HashMap::new(),
             names,
             data_properties: HashSet::new(),
+            annotation_properties: HashSet::new(),
             refused: HashMap::new(),
             datatypes: std::iter::empty().collect(),
         };
         let mut declared = Vec::new();
         for &[s, p, o] in triples {
             graph.by_subject.entry(s).or_default().push((p, o));
-            if p == names.rdf_type && o == names.datatype {
-                declared.push(s);
-            } else if p == names.rdf_type && o == names.datatype_property {
-                graph.data_properties.insert(s);
+            match names.declared(p, o) {
+                Some(EntityKind::Datatype) => declared.push(s),
+                Some(EntityKind::DataProperty) => graph.data_properties.extend([s]),
+                Some(EntityKind::AnnotationProperty) => graph.annotation_properties.extend([s]),
+                _ => {}
             }
         }
         for (&subject, pairs) in graph.by_subject.iter_mut() {
@@ -836,7 +847,7 @@ fn build(
     };
     // Every declared class is classified, also one no axiom names.
     for &[s, p, o] in triples {
-        if p == names.rdf_type && named(s) && (o == names.class || o == names.rdfs_class) {
+        if named(s) && names.declared(p, o) == Some(EntityKind::Class) {
             let _ = tbox.concept(Some(s));
         }
     }
@@ -885,6 +896,13 @@ fn build(
                     }
                 }
             }
+            // An annotation property's domain, range and sub-properties say nothing about
+            // classes, as nrese-owl's mapping reads them.
+            Disposition::Property(
+                PropertyAxiom::Sub { equivalent: false }
+                | PropertyAxiom::Domain
+                | PropertyAxiom::Range,
+            ) if graph.annotation_properties.contains(&s) => {}
             Disposition::Property(axiom) => match names.roles(axiom, [s, p, o], named) {
                 Err(kind) => skipped.push((p, kind)),
                 Ok(PropertyAxiom::Sub { equivalent }) => {
@@ -2315,5 +2333,48 @@ mod tests {
             Graph::new(&triples, &names, &named).datatypes.slots.len()
         };
         assert_eq!(held(1_000), held(1));
+    }
+
+    /// An annotation property's domain, range and sub-properties have no logical meaning:
+    /// no class is read from them, and nothing is left out for them. With `owl:Thing ⊑ T`,
+    /// a class read from one would show as a subclass of `T`.
+    #[test]
+    fn an_annotation_propertys_axioms_name_no_class() {
+        let (mut v, result) = run("ex:A rdf:type owl:Class
+             ex:T rdf:type owl:Class
+             owl:Thing rdfs:subClassOf ex:T
+             ex:note rdf:type owl:AnnotationProperty
+             ex:note rdfs:domain ex:X
+             ex:source rdf:type owl:AnnotationProperty
+             ex:source rdfs:range ex:Y
+             ex:remark rdf:type owl:AnnotationProperty
+             ex:remark rdfs:subPropertyOf ex:note");
+        let [a, t] = ["A", "T"].map(|name| v.iri(&format!("{EX}{name}")));
+        let expected = Classification {
+            subsumptions: vec![(a, t)],
+            top: vec![t],
+            ..Classification::default()
+        };
+        assert_eq!(result, expected);
+    }
+
+    /// A name declared `owl:DataRange` is a datatype, as one declared `rdfs:Datatype` is (the
+    /// RDF mapping reads OWL 1's `owl:DataRange` as `rdfs:Datatype`): an equivalence between
+    /// two of them is no class axiom, and is left out as a data range.
+    #[test]
+    fn names_declared_owl_data_range_are_no_classes() {
+        use std::collections::BTreeSet;
+        let (mut v, result) = run("ex:Dt rdf:type owl:DataRange
+             ex:Et rdf:type owl:DataRange
+             ex:Dt owl:equivalentClass ex:Et
+             ex:A rdf:type owl:Class
+             ex:B rdf:type owl:Class
+             ex:A rdfs:subClassOf ex:B");
+        let [a, b] = ["A", "B"].map(|name| v.iri(&format!("{EX}{name}")));
+        assert_eq!(result.subsumptions, vec![(a, b)]);
+        assert!(result.top.is_empty() && result.unsatisfiable.is_empty());
+        let skipped: BTreeSet<_> = result.skipped.into_iter().collect();
+        let equivalent_class = v.iri(&format!("{OWL}equivalentClass"));
+        assert_eq!(skipped, BTreeSet::from([(equivalent_class, "data range")]));
     }
 }
