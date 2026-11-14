@@ -20,6 +20,7 @@
 //! same consistency rules fire.
 
 use super::batch::{self, Schema};
+use super::eval::Poller;
 use super::ir::{Atom, Guard, Head, Rule, SharedClasses, Term};
 use super::ir::{Triple, Violations};
 use super::lists::ListVocabulary;
@@ -119,11 +120,13 @@ fn concludes_its_inequality_equal(rule: &Rule, same_as: u64) -> bool {
 
 /// Whether members of the classes of the guards' variables' values (a constant stands for
 /// itself, an unbound term is decided later) can be chosen, one per term, so that every
-/// guard holds.
+/// guard holds. Each choice is a unit on `poll`: the search is the product of the classes'
+/// sizes. Once `poll` has stopped it answers false, and the run around it `Stopped`.
 pub(crate) fn members_satisfy(
     guards: &[Guard],
     value: &dyn Fn(Term) -> Option<u64>,
     classes: &SharedClasses,
+    poll: &Poller<'_>,
 ) -> bool {
     let classes = classes.read();
     let mut terms: Vec<Term> = Vec::new();
@@ -158,11 +161,15 @@ pub(crate) fn members_satisfy(
         choices: &[Vec<Option<u64>>],
         checks: &[Vec<&Guard>],
         chosen: &mut [Option<u64>],
+        poll: &Poller<'_>,
     ) -> bool {
         if depth == terms.len() {
             return true;
         }
         for &choice in &choices[depth] {
+            if poll.tick() {
+                return false;
+            }
             chosen[depth] = choice;
             let value = |term: Term| {
                 terms
@@ -170,15 +177,22 @@ pub(crate) fn members_satisfy(
                     .position(|&t| t == term)
                     .and_then(|i| chosen[i])
             };
-            if checks[depth].iter().all(|guard| guard.holds(value))
-                && choose(depth + 1, terms, choices, checks, chosen)
+            if checks[depth].iter().all(|guard| guard.holds(value, poll))
+                && choose(depth + 1, terms, choices, checks, chosen, poll)
             {
                 return true;
             }
         }
         false
     }
-    choose(0, &terms, &choices, &checks, &mut vec![None; terms.len()])
+    choose(
+        0,
+        &terms,
+        &choices,
+        &checks,
+        &mut vec![None; terms.len()],
+        poll,
+    )
 }
 
 /// The closure of `input` under `rules` over representatives of `owl:sameAs` classes.

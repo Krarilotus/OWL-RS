@@ -3809,7 +3809,8 @@ pub(crate) fn check<S: Source + ?Sized>(
             if poll.tick() {
                 return Err(Interrupted::default());
             }
-            if guards_hold(&ground_rule.guards, &program.consistency[c].1.substitution) {
+            let substitution = &program.consistency[c].1.substitution;
+            if guards_hold(&ground_rule.guards, substitution, &poll) {
                 let Some(id) = group_of(c, found) else { break };
                 found.record(id, words(program, c, &[]));
             }

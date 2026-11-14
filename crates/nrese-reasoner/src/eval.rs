@@ -706,11 +706,12 @@ pub fn unbind(atom: &Atom, newly: u8, bindings: &mut [Option<u64>]) {
     }
 }
 
-/// Guards whose terms are both bound; unbound ones are decided later.
-pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>]) -> bool {
+/// Guards whose terms are both bound; unbound ones are decided later. A search over
+/// equality members counts on `poll`: once that has stopped, false ([`Guard::holds`]).
+pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>], poll: &Poller<'_>) -> bool {
     guards
         .iter()
-        .all(|guard| guard.holds(|term| value(term, bindings)))
+        .all(|guard| guard.holds(|term| value(term, bindings), poll))
 }
 
 /// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Its
@@ -730,7 +731,7 @@ pub fn walk<S: Source + ?Sized>(
     emit: &mut dyn FnMut(&[Option<u64>]),
 ) {
     let Some(&(index, seg)) = order.get(depth) else {
-        if guards_hold(guards, bindings) {
+        if guards_hold(guards, bindings, poll) {
             emit(bindings);
         }
         return;
@@ -765,7 +766,7 @@ pub fn walk_until<S: Source + ?Sized>(
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) -> bool {
     let Some(&(index, seg)) = order.get(depth) else {
-        return guards_hold(guards, bindings) && emit(bindings);
+        return guards_hold(guards, bindings, poll) && emit(bindings);
     };
     let atom = &body[index];
     let mut stopped = false;
@@ -883,6 +884,7 @@ fn instance(
     rule: &Rule,
     instance_atoms: &[usize],
     substitution: &[Option<u64>],
+    poll: &Poller<'_>,
 ) -> Option<Grounded> {
     let mut guards = Vec::new();
     for guard in &rule.guards {
@@ -932,7 +934,7 @@ fn instance(
                 };
                 if instance_atoms.is_empty()
                     && matches!(rule.head, Head::Facts(_))
-                    && !guard.holds(|term| value(term, substitution))
+                    && !guard.holds(|term| value(term, substitution), poll)
                 {
                     return None;
                 }
@@ -1004,7 +1006,7 @@ pub fn ground<S: Source + ?Sized>(
         &mut bindings,
         &poll,
         &mut |substitution| {
-            if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
+            if let Some(grounded) = instance(rule, &instance_atoms, substitution, &poll) {
                 emit(grounded);
             }
         },
@@ -1050,7 +1052,7 @@ pub fn ground_delta<S: Source + ?Sized>(
             &mut bindings,
             &poll,
             &mut |substitution| {
-                if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
+                if let Some(grounded) = instance(rule, &instance_atoms, substitution, &poll) {
                     emit(grounded);
                 }
             },
@@ -1868,7 +1870,7 @@ pub fn derivations<S: Source + ?Sized>(
             continue;
         };
         let stop = if rule.body.is_empty() {
-            guards_hold(&rule.guards, &bindings) && emit(&bindings)
+            guards_hold(&rule.guards, &bindings, poll) && emit(&bindings)
         } else {
             let bound: Vec<bool> = bindings.iter().map(Option::is_some).collect();
             let atoms: Vec<usize> = (0..rule.body.len()).collect();
@@ -2636,6 +2638,8 @@ impl GroundProgram {
     pub fn one_step_images(&self, fact: Triple) -> Vec<Triple> {
         let mut refs = Vec::new();
         self.dispatch.matching_fact(fact, &mut refs);
+        // Not stoppable: the search over equality members of a guard runs to its end.
+        let poll = Poller::never();
         let mut out = Vec::new();
         for (r, _) in refs {
             let rule = &self.rules[r];
@@ -2644,7 +2648,7 @@ impl GroundProgram {
             };
             let mut bindings = vec![None; rule.variables()];
             if bind(&rule.body[0], fact, &mut bindings).is_some()
-                && guards_hold(&rule.guards, &bindings)
+                && guards_hold(&rule.guards, &bindings, &poll)
             {
                 out.extend(heads.iter().map(|h| instantiate_head(h, &bindings)));
             }
