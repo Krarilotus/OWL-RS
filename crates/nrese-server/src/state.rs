@@ -403,7 +403,7 @@ impl AppState {
     /// Who the request is ([`crate::auth::Authenticated`]): a local login (`Basic`
     /// credentials of a user with a password, or a session token), else the
     /// authentication mode's credentials. 401 for missing or wrong ones. `client` is the
-    /// client's address ([`crate::http::authentication::client_address`]), which failed
+    /// client's address (`crate::http::authentication::client_address`), which failed
     /// logins are counted by.
     pub async fn authenticate(
         &self,

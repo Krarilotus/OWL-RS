@@ -95,7 +95,7 @@ pub struct QuarantinedStatement {
     /// RDF/XML and JSON-LD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// The text is the first [`MAX_TEXT`] bytes of a longer statement.
+    /// The text is the first `MAX_TEXT` bytes of a longer statement.
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
     /// The statement's bytes aren't UTF-8: `text` has replacement characters for them.
@@ -862,7 +862,7 @@ fn payload_format(format: RdfFormat) -> Option<GraphResultFormat> {
 /// The resolution and the commit are one outcome, keyed by the commit's revision (Q06
 /// remainder, invariant D): on disk the resolution is the commit's note
 /// ([`nrese_engine::Transaction::note_commit`]), durable before any of the commit's record is
-/// in the store's log, and [`Quarantine::open`] holds it in effect only where the store holds
+/// in the store's log, and `Quarantine::open` holds it in effect only where the store holds
 /// its revision. So a readmission stopped anywhere is in the data once or not at all, and its
 /// statement resolved exactly when it is in. A commit that publishes nothing (the statement
 /// was in the data already) is recorded after it, as it changes nothing to admit again. A

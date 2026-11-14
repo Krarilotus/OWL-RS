@@ -14,7 +14,7 @@
 //! transitivity by automata, which a folded model satisfies only on closure), and checks
 //! it; where the fold merged what the semantics keeps apart (a number restriction or an
 //! irreflexive property against a block), it checks the 3-fold covering lift instead
-//! ([`lift`]), then the graph unravelled one step at each block
+//! (`lift`), then the graph unravelled one step at each block
 //! ([`Model::unravelled`]) and its lift. A model that passes none is no certificate:
 //! [`Certificate::Declined`], which says nothing against the answer.
 //!
