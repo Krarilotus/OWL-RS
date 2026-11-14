@@ -73,15 +73,6 @@ pub enum OutsideProfile {
     Proven,
 }
 
-impl OutsideProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::DlPart => "dl-part",
-            Self::Proven => "proven",
-        }
-    }
-}
-
 /// The `owl2-dl` mode's settings. They apply when the reasoner's mode is `owl2-dl`.
 ///
 /// Every budget is a setting and `None` is unlimited (`nrese_dl::limits`: nothing is
