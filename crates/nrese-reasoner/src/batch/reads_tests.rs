@@ -15,6 +15,10 @@
 //! - no charge is larger than the read's run;
 //! - after a refusal, nothing: no work, no delivery, no charge, no ask;
 //! - a stopped read answers `Err(Stopped)`, never `Ok` with a part of its answer.
+//!
+//! The full contract is checked on the cases whose callbacks make no read of their own;
+//! with a nested lookup, a case checks that a nested refusal ends the read. The bound under
+//! nested reads is [`crate::Poller`]'s.
 
 use super::*;
 use crate::witness::{self, Event};
