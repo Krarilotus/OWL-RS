@@ -316,11 +316,13 @@ def pooled(report: dict) -> dict[str, dict]:
             entry["memory_kind"].add(kind or "unknown")
         if isinstance(r.get("metric"), (int, float)):
             entry["metrics"].append(r["metric"])
-        samples = {k: thin(sorted(v for v in vs if v is not None)) for k, vs in (r.get("samples") or {}).items()}
+        raw_samples = r.get("samples") or {}
+        samples = {k: thin(sorted(v for v in vs if v is not None)) for k, vs in raw_samples.items() if k != WHOLE_RUN}
         # A classifier process's whole run holds its phases and --repeat runs: never one of the series
-        # a case's time sums, compared on a line of its own.
-        if whole := samples.pop(WHOLE_RUN, None):
-            entry["whole"].append(whole)
+        # a case's time sums, compared on a line of its own. Kept per repetition, None where one has
+        # no valid reading, so a missing one is reported, never skipped.
+        wall = raw_samples.get(WHOLE_RUN)
+        entry["whole"].append(thin(sorted(wall)) if valid_series({WHOLE_RUN: wall}) else None)
         if any(samples.values()):
             entry["reps"].append(samples)
     return out
@@ -437,7 +439,14 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                     f"{threshold:>6.0%}  {verdict}", slower)
             if verdict.startswith(("SLOWER", "faster")) and len(series) > 1:
                 out.add("Time", f"{'':<28}by series: " + ", ".join(series_ratios(b["reps"], n["reps"], series)[:3]))
-            if b["whole"] and n["whole"]:
+            lacking = [sum(w is None for w in e["whole"]) for e in (b, n)]
+            if any(len(e["whole"]) > k for e, k in zip((b, n), lacking)) and any(lacking):
+                # One side has the whole process and a repetition of either side lacks it: no line
+                # from part of the evidence.
+                out.add("Missing", f"{case:<26} whole process NOT COMPARABLE: no valid {WHOLE_RUN} reading in "
+                        f"{lacking[0]} of {len(b['whole'])} base and {lacking[1]} of {len(n['whole'])} new "
+                        "repetitions", True)
+            elif not any(lacking) and b["whole"] and n["whole"]:
                 whole = [[{WHOLE_RUN: w} for w in e["whole"]] for e in (b, n)]
                 wr, wl, wh = bootstrap_ratio(*whole)
                 wb, wn = (statistic(reps, [WHOLE_RUN]) for reps in whole)
