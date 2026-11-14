@@ -294,9 +294,7 @@ fn exists_runs_once_as_a_set() {
 }
 
 /// EXPLAIN shows every operator's estimated rows beside its actual ones (the merge
-/// checklist's item): the operators the query names and those inside them. The planner's
-/// note on how it ordered a BGP (`join order`, such as a BGP planned without the
-/// characteristic sets) is no operator and has no rows of its own.
+/// checklist's item): the operators the query names and those inside them.
 #[test]
 fn explain_estimates_every_operator() {
     let engine = engine();
@@ -323,7 +321,7 @@ fn explain_estimates_every_operator() {
         let steps = steps(&engine, query);
         let missing: Vec<&PlanStep> = steps
             .iter()
-            .filter(|s| s.estimated_rows.is_none() && s.operator != "join order")
+            .filter(|s| s.estimated_rows.is_none())
             .collect();
         assert!(
             missing.is_empty(),
@@ -604,8 +602,7 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
 /// index joins, the estimate the same each time (main: 2.0-2.1 ms; v2 ran 3.3-7.5 ms while
 /// the characteristic sets were built beside the queries, release gate 14 Oct 2026). 4,000
 /// persons born in 40 cities, all with a birth date, six in seven with a name: 85 born in
-/// `city0` have one; the estimate within a quarter of that. (The planner's note under the
-/// BGP, that it expects too few rows for the characteristic sets, is no operator.)
+/// `city0` have one; the estimate within a quarter of that.
 #[test]
 fn a_star_from_a_constant_plans_alike_from_the_first_run() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -634,17 +631,13 @@ fn a_star_from_a_constant_plans_alike_from_the_first_run() {
     };
     let first = plan(steps(&engine, query));
     let bgp = first.iter().position(|s| s.0 == "bgp").expect("a bgp");
-    let below: Vec<_> = first[bgp + 1..]
-        .iter()
-        .filter(|s| s.0 != "join order")
-        .collect();
-    let operators: Vec<&str> = below.iter().map(|s| s.0.as_str()).collect();
+    let operators: Vec<&str> = first[bgp + 1..].iter().map(|s| s.0.as_str()).collect();
     assert_eq!(
         operators,
         ["scan", "index join", "index join"],
         "{first:#?}"
     );
-    assert!(below[0].1.contains("birthPlace"), "{first:#?}");
+    assert!(first[bgp + 1].1.contains("birthPlace"), "{first:#?}");
     assert_eq!(first[bgp].3, 85);
     assert!(
         first[bgp].2.is_some_and(|e| (68..=106).contains(&e)),
