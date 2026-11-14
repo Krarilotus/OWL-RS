@@ -100,8 +100,9 @@ impl CountedSnapshot {
     ///   expand);
     /// - else, where making the scans could count more than [`nrese_exec::POLL_UNITS`]
     ///   (`Snapshot::point_cost`), [`Self::quads`]'s counted read of the stacks;
-    /// - else the point read: that cost asked of `visit` in one visit before the first quad,
-    ///   the scans then made uncounted, each merge step counted on one ledger.
+    /// - else the point read: each stack's scan made as the one before ends, what making it
+    ///   counts asked of `visit` in one visit before it is made, uncounted, and its merge steps
+    ///   counted on a ledger of its own (so no units one visit allowed reach past the next).
     ///
     /// Every refusal answers [`Stopped`].
     pub fn point_quads<'a>(
@@ -119,27 +120,31 @@ impl CountedSnapshot {
         };
         let pattern = *snapshot.read_pattern(model, &pattern);
         let plan = AccessPlan::for_pattern(&pattern);
-        let charge = match snapshot.expanding_with(model, &pattern, visit) {
+        let (costs, refused) = match snapshot.expanding_with(model, &pattern, visit) {
             Ok(Some(classes)) => {
                 let expanded = snapshot.expanded_visited(classes, model, &pattern, visit);
                 return Path::Read(Ended::new(Either::Left(expanded), visit));
             }
             Ok(None) => match snapshot.point_cost(model, &plan) {
-                Some(cost) => Ok(cost),
+                Some(costs) => {
+                    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+                    crate::witness::add(crate::witness::Site::PointReads, 1);
+                    (costs, false)
+                }
                 None => {
                     let stacks = snapshot.stacks_visited(model, pattern, visit);
                     return Path::Read(Ended::new(Either::Right(stacks), visit));
                 }
             },
-            Err(Stopped) => Err(Stopped),
+            Err(Stopped) => ([0; 2], true),
         };
         Path::Point(PointQuads {
             data: snapshot.data(model),
             model,
             plan,
-            charge: Some(charge),
+            stacks: Stack::ALL.into_iter().zip(costs),
+            refused,
             visit,
-            stacks: Stack::ALL.into_iter(),
             scan: None,
             ledger: Ledger::new(visit),
             done: false,
@@ -247,17 +252,17 @@ where
     }
 }
 
-/// [`CountedSnapshot::point_quads`]'s point read: its charge asked at the first `next`, then each
-/// stack's scan made as the one before ends, uncounted as charged, and stepped on the read's
-/// one ledger.
+/// [`CountedSnapshot::point_quads`]'s point read: each stack's scan made as the one before
+/// ends, what making it counts asked first in one visit, then stepped on a ledger of its own.
 struct PointQuads<'a> {
     data: &'a Version,
     model: ReadModel,
     plan: AccessPlan,
-    /// The charge still to ask, or the class build's refusal; `None` once asked.
-    charge: Option<Result<u64, Stopped>>,
+    /// The stacks still to read, with what making each one's scan counts.
+    stacks: std::iter::Zip<std::array::IntoIter<Stack, 2>, std::array::IntoIter<u64, 2>>,
+    /// Whether the class build stopped the read before it began.
+    refused: bool,
     visit: Visitor<'a>,
-    stacks: std::array::IntoIter<Stack, 2>,
     scan: Option<QuadScan<'a>>,
     ledger: Ledger<'a>,
     done: bool,
@@ -270,21 +275,23 @@ impl Iterator for PointQuads<'_> {
         if self.done {
             return None;
         }
-        match self.charge.take() {
-            Some(Ok(cost)) if (self.visit)(cost) => {}
-            None => {}
-            Some(_) => {
-                self.done = true;
-                return Some(Err(Stopped));
-            }
+        if self.refused {
+            self.done = true;
+            return Some(Err(Stopped));
         }
         loop {
             if self.scan.is_none() {
                 let model = self.model;
-                let Some(stack) = self.stacks.find(|&stack| model.includes(stack)) else {
+                let Some((stack, cost)) = self.stacks.find(|&(stack, _)| model.includes(stack))
+                else {
                     self.done = true;
                     return None;
                 };
+                if !(self.visit)(cost) {
+                    self.done = true;
+                    return Some(Err(Stopped));
+                }
+                self.ledger = Ledger::new(self.visit);
                 self.scan = Some(self.data.stack(stack).scan_plan(&self.plan));
             }
             let scan = self.scan.as_mut().expect("made above");
@@ -344,19 +351,21 @@ impl Snapshot {
             .flat_map(move |stack| data.stack(stack).scan_counted(&pattern, visit))
     }
 
-    /// The most making `plan`'s scans in `model` counts on [`Self::stacks_visited`]'s path,
-    /// worked out from the runs' sizes alone ([`IndexVersion::scan_cost`]): `None` once it is
-    /// over [`nrese_exec::POLL_UNITS`], the runs after that left unread.
-    pub(crate) fn point_cost(&self, model: ReadModel, plan: &AccessPlan) -> Option<u64> {
+    /// The most making `plan`'s scan of each stack in `model` counts on
+    /// [`Self::stacks_visited`]'s path, in [`Stack::ALL`]'s order (0 for a stack the model
+    /// leaves out), worked out from the runs' sizes alone ([`IndexVersion::scan_cost`]): `None`
+    /// once their sum is over [`nrese_exec::POLL_UNITS`], the runs after that left unread.
+    pub(crate) fn point_cost(&self, model: ReadModel, plan: &AccessPlan) -> Option<[u64; 2]> {
         let data = self.data(model);
-        let mut cost = 0;
-        for stack in Stack::ALL {
+        let mut costs = [0; 2];
+        let mut most = u64::from(nrese_exec::POLL_UNITS);
+        for (stack, cost) in Stack::ALL.into_iter().zip(&mut costs) {
             if model.includes(stack) {
-                let most = u64::from(nrese_exec::POLL_UNITS) - cost;
-                cost += data.stack(stack).scan_cost(plan, most)?;
+                *cost = data.stack(stack).scan_cost(plan, most)?;
+                most -= *cost;
             }
         }
-        Some(cost)
+        Some(costs)
     }
 
     /// [`Snapshot::scan_sorted_in`]'s work, counted.

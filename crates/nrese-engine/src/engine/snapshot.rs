@@ -215,6 +215,8 @@ mod reference {
 #[cfg(test)]
 mod pending_bound_tests;
 #[cfg(test)]
+mod point_stop_tests;
+#[cfg(test)]
 mod point_tests;
 
 /// A charge for memory masks and views keep, shared by every holder of it. The last holder

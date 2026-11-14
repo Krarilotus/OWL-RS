@@ -32,7 +32,8 @@ lib = true
 filters = ["index::model_tests::random_commits_with_policy_compaction_match_the_model",
            "index::model_tests::arbitrary_compaction_windows_preserve_contents",
            "index::model_tests::old_versions_are_unaffected_by_later_writes",
-           "index::model_tests::default_graph_versions_turn_into_quad_versions_at_a_named_graph"]
+           "index::model_tests::default_graph_versions_turn_into_quad_versions_at_a_named_graph",
+           "engine::snapshot::point_tests::a_point_read_answers_the_quads_a_pattern_read_answers"]
 
 [[target]]
 crate = "nrese-engine"
