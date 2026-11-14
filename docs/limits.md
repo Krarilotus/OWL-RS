@@ -72,7 +72,7 @@ and nothing here is a promise about it.
 - **`rdfs`** is a six-rule subset without axiomatic triples; `rdfs-full` has every RDFS rule
   ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset)).
 - **`owl2-rl`** doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
-  return one for each; an asserted one is returned), checks the datatype rules in part, and doesn't store axiomatic triples.
+  return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain or key of more than 250 properties, more than
   64 member sequences) aren't used at all, never truncated, and each is reported in the log
   and the reasoning diagnostics

@@ -13,6 +13,8 @@ the last run got.
   `docker run` with `NRESE_REASONING_MODE=owl2-rl` and `NRESE_SHACL_GATE=enforce`, a fresh volume)
   on a Linux x86-64 machine.
 - **Runner:** `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml`.
+  That run used the file under its earlier name, `readme-first-example.toml`; since then only its
+  description has changed, to name where the example now is.
 - **Result:** 9 of 9 steps passed.
 
 ## The steps
