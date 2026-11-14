@@ -32,7 +32,8 @@ names its family with `workload` and `tier`.
 name = "bsbm-explore-100k"                 # unique across benches/cases/
 area = "query"
 what = "BSBM explore mix, 100 k products: 12 queries of an e-commerce browsing session"
-workload = "bsbm"; tier = "100k"            # the family it measures (workloads.toml)
+workload = "bsbm"                           # the family it measures (workloads.toml)
+tier = "100k"
 levels = ["full"]                           # focused (level 2), full (level 3), or both
 semantics = "none"                          # what NRESE computes
 data = "volume:bsbm-100k.nt"                # a frozen dataset (datasets.toml), or a generator
@@ -44,7 +45,8 @@ systems = ["virtuoso:plain", "qlever:plain", "oxigraph:plain", "jena:plain"]
 home_turf = "virtuoso"                      # whose documented strength this is
 scenario = "native"                         # native, matched or frontier (PROTOCOL.md §3)
 needs = ["docker"]                          # what the host must have (hosts.toml `has`)
-cap_gb = 16; est_min = 20
+cap_gb = 16
+est_min = 20
 ```
 
 | Field | Meaning |
