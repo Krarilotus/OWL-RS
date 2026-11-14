@@ -4049,13 +4049,14 @@ impl<'a> Context<'a> {
         // planned.
         let most = plan::OVERLAP_VALUES;
         let mut own: Vec<Option<u64>> = vec![None; scans.len()];
-        let mut pairs: Vec<(u64, usize, usize)> = Vec::new();
-        // The pairs' storage is charged to the optional part before it grows: n patterns on
-        // one variable make n²/2 pairs, more than any request's room (review r1, F1). Refused,
-        // the BGP plans with its counts alone, as for a pair the allowance leaves out. Made at
-        // the first pair: most BGPs have none.
+        // The pairs are kept in a vector charged to the optional part, each growth charged
+        // beside the storage it replaces (a reallocation holds both), and freed before its
+        // charge is released: n patterns on one variable make n²/2 pairs, more than any
+        // request's room (review r1, F1, and its fix check). Refused, the BGP plans with its
+        // counts alone, as for a pair the allowance leaves out. Made at the first pair: most
+        // BGPs have none.
         let mut optional: Option<Arc<Budget>> = None;
-        let mut scratch: Option<Reservation<Arc<Budget>>> = None;
+        let mut pairs: Option<ChargedVec<(u64, usize, usize)>> = None;
         for i in 0..scans.len() {
             if cancelled() {
                 return (out, Reads::default());
@@ -4080,26 +4081,20 @@ impl<'a> Context<'a> {
                 if both > most {
                     continue;
                 }
-                if pairs.len() == pairs.capacity() {
+                let kept = pairs.get_or_insert_with(|| {
                     let part =
                         optional.get_or_insert_with(|| Arc::new(self.memory.optional_part()));
-                    let held = scratch.get_or_insert_with(|| Reservation::new(Arc::clone(part)));
-                    let more = pairs.capacity().max(16);
-                    if held
-                        .charge(more * size_of::<(u64, usize, usize)>())
-                        .is_err()
-                    {
-                        return (out, Reads::default());
-                    }
-                    pairs.reserve_exact(more);
+                    ChargedVec::new(Arc::clone(part))
+                });
+                if kept.push((both, i, j)).is_err() {
+                    return (out, Reads::default());
                 }
-                pairs.push((both, i, j));
             }
         }
         // None (most BGPs): no list to read, nothing to charge, no plain plan made.
-        if pairs.is_empty() {
+        let Some(mut pairs) = pairs else {
             return (out, Reads::default());
-        }
+        };
         // The allowance: the plain plan's cost, at most OVERLAP_VALUES (NaN gives 0).
         let Some(cost) = plain_cost() else {
             return (out, Reads::default());
@@ -4127,9 +4122,8 @@ impl<'a> Context<'a> {
             lists.extend(new);
             admitted.push((i, j));
         }
-        // The candidates are freed before a list is read.
+        // The candidates are freed, then their charge released, before a list is read.
         drop(pairs);
-        drop(scratch);
         // Planning can do without the lists: their charges go to an optional part, whose
         // refusals mark only itself, never the request.
         let optional = optional.expect("made with the first pair");

@@ -411,8 +411,8 @@ fn a_declined_buffer_marks_no_refusal() {
 ///   match (19,900 candidate pairs, 24 bytes each), planned without a limit, then within
 ///   64 KiB: room for the lists the allowance admits (at most `MAX_LISTS` of one value each,
 ///   and their directory), not for the candidates.
-/// - Expected: unlimited, overlaps counted; within 64 KiB, none for any pattern, and the
-///   request not marked refused.
+/// - Expected: unlimited, overlaps counted; within 64 KiB, none for any pattern, no list
+///   read (counts alone decode none), and the request not marked refused.
 #[test]
 fn candidate_pairs_stay_within_the_optional_budget() {
     let extra: Vec<Triple> = (0..200)
@@ -436,25 +436,101 @@ fn candidate_pairs_stay_within_the_optional_budget() {
             .iter()
             .map(|s| ctx.snapshot.estimate_in(ctx.model, &s.quad_pattern()))
             .collect();
-        let (inputs, reads) = ctx.plan_inputs(&scans, &counts, &[], &mut Vec::new(), true);
-        drop(reads);
+        let mut inputs = Vec::new();
+        let (lists, _) = reads_of(|| {
+            let (planned, reads) = ctx.plan_inputs(&scans, &counts, &[], &mut Vec::new(), true);
+            drop(reads);
+            inputs = planned;
+        });
         let overlaps: Vec<_> = inputs.into_iter().map(|input| input.overlaps).collect();
-        (overlaps, ctx.memory.refused() || ctx.budget.refused())
+        (
+            overlaps,
+            lists,
+            ctx.memory.refused() || ctx.budget.refused(),
+        )
     };
-    let (overlaps, _) = planned(None);
+    let (overlaps, _, _) = planned(None);
     assert!(
         overlaps.iter().any(|o| !o.is_empty()),
         "unlimited: no overlap"
     );
-    let (within, refused) = planned(Some(64 << 10));
+    let (within, lists, refused) = planned(Some(64 << 10));
     assert!(
         within.iter().all(Vec::is_empty),
         "within 64 KiB: {within:?}"
     );
+    assert_eq!(lists, 0, "within 64 KiB: lists read past the refusal");
     assert!(
         !refused,
         "the candidates' refusal marked the request refused"
     );
+}
+
+/// Review r1, F1, and its fix check: the candidate pairs are never held beyond what is
+/// charged for them, a growth included (a reallocation holds the old storage and the new at
+/// once), however many the patterns make; and none is kept where no list can be read.
+///
+/// - Input: n subjects `sI`, each with two objects `aI` and `bI` of `p` in two uncompacted
+///   commits, so no pattern's list is in one run (r1's case: the lists can't be read); the n
+///   patterns `sI p ?x`, each counted 2, so every pair is a candidate (n²/2 of them, 24 bytes
+///   each); no pair admitted (an allowance of 0). n = 150 and 300, measured within the
+///   request's envelope (`measure_within`), unlimited, then within 64 KiB.
+/// - Expected: at every n and both limits, what the pass holds beyond its charges stays
+///   within 256 bytes a pattern (its own per-pattern bookkeeping), where the candidates'
+///   storage is 12 n² bytes and a growth's old storage half of that; no overlap; and the
+///   request not marked refused.
+#[test]
+fn candidate_pairs_are_charged_before_they_are_held() {
+    use nrese_exec::measure::{alone, measure_within};
+    if !alone() {
+        return;
+    }
+    for n in [150, 300] {
+        let extra: Vec<Triple> = (0..n)
+            .flat_map(|i| {
+                [
+                    (format!("s{i}"), "p", format!("a{i}")),
+                    (format!("s{i}"), "p", format!("b{i}")),
+                ]
+            })
+            .collect();
+        // Every second triple in the second commit: each subject's `aI` in the first, `bI`
+        // in the second.
+        let engine = store(1, 2, false, false, &extra);
+        let snapshot = engine.snapshot();
+        for limit in [None, Some(64 << 10)] {
+            let options = QueryOptions {
+                resources: crate::Resources {
+                    memory: Envelope::new(limit, None),
+                    ..crate::Resources::default()
+                },
+                ..QueryOptions::default()
+            };
+            let ctx = Context::new(&snapshot, &options, None, None);
+            let scans: Vec<ScanPattern> = (0..n)
+                .map(|i| super::join_order_tests::scan(&ctx.snapshot, &format!("s{i} p ?x")))
+                .collect();
+            let vars: Vec<Vec<Variable>> = scans.iter().map(ScanPattern::vars).collect();
+            let counts: Vec<u64> = scans
+                .iter()
+                .map(|s| ctx.snapshot.estimate_in(ctx.model, &s.quad_pattern()))
+                .collect();
+            assert!(counts.iter().all(|&c| c == 2), "{n}: counts {counts:?}");
+            let ((overlaps, reads), beyond) = measure_within(&ctx.memory, || {
+                ctx.overlaps(&scans, &vars, &counts, true, || Some(0.0))
+            });
+            drop(reads);
+            assert!(
+                beyond < 256 * n,
+                "{n} patterns, limit {limit:?}: {beyond} bytes held beyond their charge"
+            );
+            assert!(overlaps.iter().all(Vec::is_empty), "{n}: {overlaps:?}");
+            assert!(
+                !(ctx.memory.refused() || ctx.budget.refused()),
+                "{n} patterns, limit {limit:?}: the request marked refused"
+            );
+        }
+    }
 }
 
 /// The budget types' owner's review of the optional part, R2: a list building that the
