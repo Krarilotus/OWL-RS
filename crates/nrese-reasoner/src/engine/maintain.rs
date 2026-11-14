@@ -1,6 +1,7 @@
 //! Maintenance of a transaction's inferred stack on a commit ([`super::maintain`]).
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use nrese_engine::{
@@ -55,12 +56,13 @@ impl<'a> EngineBase<'a> {
             return Err(Stopped);
         }
         // Its work in the engine counted too (REAS-3, SW016), a deleted copy found as any.
-        let first = self
-            .snapshot
-            .point_quads(ReadModel::Materialised, ids(fact), &|n| poll.visit(n))
-            .next()
-            .transpose()?;
-        Ok(first.is_some())
+        let found = self.snapshot.point_graphs(
+            ReadModel::Materialised,
+            ids(fact),
+            &|n| poll.visit(n),
+            |_| Ok(ControlFlow::Break(())),
+        )?;
+        Ok(found.is_break())
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
@@ -73,17 +75,22 @@ impl<'a> EngineBase<'a> {
         probe: Probe<'_, '_>,
     ) -> Result<bool, Stopped> {
         // The engine's work below each copy counted too (REAS-3, SW017).
+        let [s, p, o] = ids(fact);
         let visit = |n| probe.visited(n);
-        for quad in self.snapshot.point_quads(model, ids(fact), &visit) {
-            let quad = quad?;
-            if !probe.units(1) {
-                return Err(Stopped);
-            }
-            if !self.deletes.contains(&quad) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let found = self
+            .snapshot
+            .point_graphs(model, [s, p, o], &visit, |graph| {
+                if !probe.units(1) {
+                    return Err(Stopped);
+                }
+                Ok(
+                    match self.deletes.contains(&EncodedQuad::new(s, p, o, graph)) {
+                        true => ControlFlow::Continue(()),
+                        false => ControlFlow::Break(()),
+                    },
+                )
+            })?;
+        Ok(found.is_break())
     }
 }
 

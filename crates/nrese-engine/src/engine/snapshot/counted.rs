@@ -5,12 +5,13 @@
 //! `2026-11-09-p2-reas3-design.md` §1). The uncounted reads are left as they were: what an
 //! uncounted reader runs is not this code.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::{CopyVisibility, Either, Snapshot};
 use crate::engine::equality::{Classes as EqualityClasses, Expand, Merged, OnMeter, Read, Step};
-use crate::engine::{ReadModel, Stack, Version};
-use crate::index::{IndexVersion, QuadScan};
+use crate::engine::{ReadModel, Stack};
+use crate::index::{IndexVersion, Layout, QuadScan};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::visit::{Account, Ledger, Stopped, Visitor};
 use crate::{Count, SnapshotIdentity, TermId};
@@ -93,24 +94,32 @@ impl CountedSnapshot {
         Some(Ended::new(quads, visit))
     }
 
-    /// The quads of `[s, p, o]` in any graph, as [`Self::quads`] answers them, read on one of
-    /// three paths chosen from one ask of whether the read expands equality classes (design
-    /// note `2026-11-14-d16-543-point-reads-design.md`):
-    /// - where it does, [`Self::quads`]'s expanded read of those classes (Asserted reads never
-    ///   expand);
-    /// - else, where making the scans could count more than [`nrese_exec::POLL_UNITS`]
-    ///   (`Snapshot::point_cost`), [`Self::quads`]'s counted read of the stacks;
-    /// - else the point read: each stack's scan made as the one before ends, what making it
-    ///   counts asked of `visit` in one visit before it is made, uncounted, and its merge steps
-    ///   counted on a ledger of its own (so no units one visit allowed reach past the next).
+    /// The graphs of the quads of `[s, p, o]`, as [`Self::quads`] answers them, each handed to
+    /// `each` in that order (design note `2026-11-14-d16-574-lever2-point-loop-design.md` r3).
+    /// One ask of whether the read expands equality classes chooses its path:
+    /// - where it does, the graphs of [`Self::quads`]'s expanded read of those classes
+    ///   (Asserted reads never expand);
+    /// - else each stack in `model`, by its own layout, on one account on `visit`:
+    ///   - a default-graph stack: each run's bound search for the statement counted before it
+    ///     is made, the key found a unit, and the runs' signs summed
+    ///     (`IndexVersion::point_sum`); the default graph handed on where the sum is positive;
+    ///   - a quads stack: the counted merge of its runs' ranges, made and stepped as
+    ///     `IndexVersion::scan_plan_with` and `QuadScan::step_with` count them, the graph of
+    ///     each visible quad handed on as the merge reaches it.
     ///
-    /// Every refusal answers [`Stopped`].
-    pub fn point_quads<'a>(
-        &'a self,
+    ///   What the account has left is dropped at each graph handed on, so no units one visit
+    ///   allowed are spent after `each` has run.
+    ///
+    /// Where `each` answers `Break`, the read answers it at once, and where `each` refuses,
+    /// [`Stopped`] at once: nothing more is counted or read. Every refusal of `visit` answers
+    /// [`Stopped`]; a read with no run to search asks `visit` once whether it has stopped.
+    pub fn point_graphs(
+        &self,
         model: ReadModel,
         [s, p, o]: [TermId; 3],
-        visit: Visitor<'a>,
-    ) -> impl Iterator<Item = Result<EncodedQuad, Stopped>> + use<'a> {
+        visit: Visitor<'_>,
+        mut each: impl FnMut(TermId) -> Result<ControlFlow<()>, Stopped>,
+    ) -> Result<ControlFlow<()>, Stopped> {
         let snapshot = &self.snapshot;
         let pattern = QuadPattern {
             subject: Some(s),
@@ -119,36 +128,51 @@ impl CountedSnapshot {
             graph: GraphSelector::Any,
         };
         let pattern = *snapshot.read_pattern(model, &pattern);
-        let plan = AccessPlan::for_pattern(&pattern);
-        let (costs, refused) = match snapshot.expanding_with(model, &pattern, visit) {
-            Ok(Some(classes)) => {
-                let expanded = snapshot.expanded_visited(classes, model, &pattern, visit);
-                return Path::Read(Ended::new(Either::Left(expanded), visit));
+        if let Some(classes) = snapshot.expanding_with(model, &pattern, visit)? {
+            let expanded = snapshot.expanded_visited(classes, model, &pattern, visit);
+            for quad in Ended::new(expanded, visit) {
+                if each(quad?.graph)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
             }
-            Ok(None) => match snapshot.point_cost(model, &plan) {
-                Some(costs) => {
-                    #[cfg(any(test, all(feature = "witness", debug_assertions)))]
-                    crate::witness::add(crate::witness::Site::PointReads, 1);
-                    (costs, false)
+            return Ok(ControlFlow::Continue(()));
+        }
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        crate::witness::add(crate::witness::Site::PointReads, 1);
+        let plan = AccessPlan::for_pattern(&pattern);
+        let data = snapshot.data(model);
+        let mut ledger = Ledger::new(visit);
+        let mut searched = false;
+        for stack in Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+        {
+            let index = data.stack(stack);
+            searched |= !index.runs().is_empty();
+            match index.layout() {
+                Layout::DefaultGraph => {
+                    if index.point_sum(&plan, &mut ledger)? > 0 {
+                        if each(TermId::DEFAULT_GRAPH)?.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        ledger = Ledger::new(visit);
+                    }
                 }
-                None => {
-                    let stacks = snapshot.stacks_visited(model, pattern, visit);
-                    return Path::Read(Ended::new(Either::Right(stacks), visit));
+                Layout::Quads => {
+                    let mut scan = index.scan_plan_with(&plan, &mut ledger)?;
+                    while let Some(graph) = scan.step_graph_with(&mut ledger)? {
+                        if each(graph)?.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        ledger = Ledger::new(visit);
+                    }
                 }
-            },
-            Err(Stopped) => ([0; 2], true),
-        };
-        Path::Point(PointQuads {
-            data: snapshot.data(model),
-            model,
-            plan,
-            stacks: Stack::ALL.into_iter().zip(costs),
-            refused,
-            visit,
-            scan: None,
-            ledger: Ledger::new(visit),
-            done: false,
-        })
+            }
+        }
+        match !searched && crate::visit::stopped(visit) {
+            true => Err(Stopped),
+            false => Ok(ControlFlow::Continue(())),
+        }
     }
 
     /// [`Snapshot::contains_in`], counted.
@@ -245,84 +269,6 @@ impl<I: Iterator<Item = EncodedQuad>> Iterator for Ended<'_, I> {
     }
 }
 
-/// [`CountedSnapshot::point_quads`]'s paths: one of [`CountedSnapshot::quads`]'s reads, or the
-/// point read.
-enum Path<R, P> {
-    Read(R),
-    Point(P),
-}
-
-impl<R, P> Iterator for Path<R, P>
-where
-    R: Iterator<Item = Result<EncodedQuad, Stopped>>,
-    P: Iterator<Item = Result<EncodedQuad, Stopped>>,
-{
-    type Item = Result<EncodedQuad, Stopped>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Read(quads) => quads.next(),
-            Self::Point(quads) => quads.next(),
-        }
-    }
-}
-
-/// [`CountedSnapshot::point_quads`]'s point read: each stack's scan made as the one before
-/// ends, what making it counts asked first in one visit, then stepped on a ledger of its own.
-struct PointQuads<'a> {
-    data: &'a Version,
-    model: ReadModel,
-    plan: AccessPlan,
-    /// The stacks still to read, with what making each one's scan counts.
-    stacks: std::iter::Zip<std::array::IntoIter<Stack, 2>, std::array::IntoIter<u64, 2>>,
-    /// Whether the class build stopped the read before it began.
-    refused: bool,
-    visit: Visitor<'a>,
-    scan: Option<QuadScan<'a>>,
-    ledger: Ledger<'a>,
-    done: bool,
-}
-
-impl Iterator for PointQuads<'_> {
-    type Item = Result<EncodedQuad, Stopped>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        if self.refused {
-            self.done = true;
-            return Some(Err(Stopped));
-        }
-        loop {
-            if self.scan.is_none() {
-                let model = self.model;
-                let Some((stack, cost)) = self.stacks.find(|&(stack, _)| model.includes(stack))
-                else {
-                    self.done = true;
-                    return None;
-                };
-                if !(self.visit)(cost) {
-                    self.done = true;
-                    return Some(Err(Stopped));
-                }
-                self.ledger = Ledger::new(self.visit);
-                self.scan = Some(self.data.stack(stack).scan_plan(&self.plan));
-            }
-            let scan = self.scan.as_mut().expect("made above");
-            match scan.step_with(&mut self.ledger) {
-                Ok(Some(quad)) => return Some(Ok(quad)),
-                Ok(None) => self.scan = None,
-                Err(Stopped) => {
-                    self.done = true;
-                    return Some(Err(Stopped));
-                }
-            }
-        }
-    }
-}
-
 impl Snapshot {
     /// [`Snapshot::quads_for_pattern_in`]'s work, counted ([`Ended`] tells a stop).
     fn quads_visited<'a>(
@@ -365,23 +311,6 @@ impl Snapshot {
             .into_iter()
             .filter(move |&stack| model.includes(stack))
             .flat_map(move |stack| data.stack(stack).scan_counted(&pattern, visit))
-    }
-
-    /// The most making `plan`'s scan of each stack in `model` counts on
-    /// [`Self::stacks_visited`]'s path, in [`Stack::ALL`]'s order (0 for a stack the model
-    /// leaves out), worked out from the runs' sizes alone ([`IndexVersion::scan_cost`]): `None`
-    /// once their sum is over [`nrese_exec::POLL_UNITS`], the runs after that left unread.
-    pub(super) fn point_cost(&self, model: ReadModel, plan: &AccessPlan) -> Option<[u64; 2]> {
-        let data = self.data(model);
-        let mut costs = [0; 2];
-        let mut most = u64::from(nrese_exec::POLL_UNITS);
-        for (stack, cost) in Stack::ALL.into_iter().zip(&mut costs) {
-            if model.includes(stack) {
-                *cost = data.stack(stack).scan_cost(plan, most)?;
-                most -= *cost;
-            }
-        }
-        Some(costs)
     }
 
     /// [`Snapshot::scan_sorted_in`]'s work, counted.
