@@ -102,3 +102,153 @@ async fn every_engine_api_route_is_described() {
     }
     assert!(text.contains("#/components/schemas/Problem"));
 }
+
+/// Sends `method` to the default repository's `path` with `body` as `media` (no
+/// `Content-Type` if `None`); the answer's status and media type.
+async fn send(app: &axum::Router, request: Sent) -> (u16, String) {
+    let (method, path, media, body) = request;
+    let uri = format!("/api/v1/repositories/nrese{path}");
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(media) = media {
+        request = request.header("content-type", media);
+    }
+    let request = request.body(Body::from(body)).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let media = response.headers().get("content-type");
+    let media = media.map_or("", |value| value.to_str().unwrap());
+    (
+        response.status().as_u16(),
+        media.split(';').next().unwrap().to_owned(),
+    )
+}
+
+type Sent = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    &'static str,
+);
+
+const SPARQL_QUERY: &str = "application/sparql-query";
+const SPARQL_UPDATE: &str = "application/sparql-update";
+const FORM: &str = "application/x-www-form-urlencoded";
+const ASK: &str = "ASK {}";
+const INSERT: &str = "INSERT DATA { <urn:ex:s> <urn:ex:p> <urn:ex:o> }";
+const ASK_FORM: &str = "query=ASK%20%7B%7D";
+const INSERT_FORM: &str = "update=INSERT%20DATA%20%7B%20%3Curn%3Aex%3As%3E%20%3Curn%3Aex%3Ap%3E%20%3Curn%3Aex%3Ao%3E%20%7D";
+
+/// The SPARQL Protocol endpoints' description says how their handlers take a request
+/// (SPARQL 1.1 Protocol §2.1, §2.2; docs/ops/http-api.md, "Endpoint contracts"): `GET` with
+/// the query in the URL, required on `…/query`, optional on `…/sparql` (without it, the
+/// service description), and no body; `POST` with a required body, in each media type the
+/// handler reads; and every failure the handlers answer here is listed, as the media type
+/// they send it as.
+#[tokio::test]
+async fn sparql_protocol_description_matches_its_handlers() {
+    let app = test_app().unwrap();
+    let request = Request::builder().uri("/api/v1/openapi.json");
+    let response = app.clone().oneshot(request.body(Body::empty()).unwrap());
+    let text = body_text(response.await.unwrap()).await.unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let operation = |(path, method): (&str, &str)| {
+        &doc["paths"][format!("/api/v1/repositories/{{id}}{path}")][method]
+    };
+    // Whether `query` is a required URL parameter; `None` if it isn't one.
+    let query_required = |at| {
+        let parameters = operation(at)["parameters"].as_array().unwrap();
+        let query = parameters
+            .iter()
+            .find(|p| p["name"] == "query" && p["in"] == "query");
+        query.map(|parameter| parameter["required"] == true)
+    };
+    // The request body's media types, if it is required; `None` if there is no body.
+    let body_media = |at| {
+        let body = &operation(at)["requestBody"];
+        body["content"].as_object().map(|content| {
+            assert_eq!(body["required"], true, "{at:?}");
+            content.keys().cloned().collect::<BTreeSet<_>>()
+        })
+    };
+    let set = |media: &[&str]| -> Option<BTreeSet<String>> {
+        Some(media.iter().map(|&m| m.to_owned()).collect())
+    };
+    let (query_get, query_post) = (("/query", "get"), ("/query", "post"));
+    let (sparql_get, sparql_post) = (("/sparql", "get"), ("/sparql", "post"));
+    let update = ("/update", "post");
+
+    assert_eq!(query_required(query_get), Some(true));
+    assert_eq!(query_required(sparql_get), Some(false));
+    assert_eq!(query_required(query_post), None);
+    assert_eq!(body_media(query_get), None);
+    assert_eq!(body_media(sparql_get), None);
+    assert_eq!(body_media(query_post), set(&[SPARQL_QUERY, FORM]));
+    assert_eq!(
+        body_media(update),
+        set(&[SPARQL_UPDATE, "text/plain", FORM])
+    );
+    assert_eq!(
+        body_media(sparql_post),
+        set(&[SPARQL_QUERY, SPARQL_UPDATE, FORM])
+    );
+
+    // Each way the description names, as the handler answers it.
+    let served: [(Sent, u16); 13] = [
+        (("GET", "/query?query=ASK%20%7B%7D", None, ""), 200),
+        (("POST", "/query", Some(SPARQL_QUERY), ASK), 200),
+        (("POST", "/query", Some(FORM), ASK_FORM), 200),
+        (("POST", "/update", Some(SPARQL_UPDATE), INSERT), 204),
+        (("POST", "/update", Some("text/plain"), INSERT), 204),
+        (("POST", "/update", None, INSERT), 204),
+        (("POST", "/update", Some(FORM), INSERT_FORM), 204),
+        (("GET", "/sparql?query=ASK%20%7B%7D", None, ""), 200),
+        (("GET", "/sparql", None, ""), 200),
+        (("POST", "/sparql", Some(SPARQL_QUERY), ASK), 200),
+        (("POST", "/sparql", Some(SPARQL_UPDATE), INSERT), 204),
+        (("POST", "/sparql", Some(FORM), ASK_FORM), 200),
+        (("POST", "/sparql", Some(FORM), INSERT_FORM), 204),
+    ];
+    for (request, status) in served {
+        assert_eq!(send(&app, request).await.0, status, "{request:?}");
+    }
+    assert_eq!(
+        send(&app, ("GET", "/sparql", None, "")).await.1,
+        "text/turtle"
+    );
+
+    // What the handler refuses, with the failure described for it, in its media type.
+    let refused: [((&str, &str), Sent); 6] = [
+        (query_get, ("GET", "/query", None, "")),
+        (
+            query_get,
+            (
+                "GET",
+                "/query?query=ASK%20%7B%7D&query=ASK%20%7B%7D",
+                None,
+                "",
+            ),
+        ),
+        // A POST's query is in its body, never in its URL.
+        (
+            query_post,
+            ("POST", "/query?query=ASK%20%7B%7D", Some(SPARQL_QUERY), ""),
+        ),
+        (
+            update,
+            ("POST", "/update", Some("application/json"), INSERT),
+        ),
+        (sparql_post, ("POST", "/sparql", None, ASK)),
+        (sparql_post, ("POST", "/sparql", Some(FORM), "")),
+    ];
+    for (at, request) in refused {
+        let (status, media) = send(&app, request).await;
+        let response = &operation(at)["responses"][status.to_string()];
+        let described = response["content"]
+            .as_object()
+            .map(|c| c.keys().collect::<Vec<_>>());
+        assert_eq!(
+            described,
+            Some(vec![&media]),
+            "{request:?}: {status} {response}"
+        );
+    }
+}
