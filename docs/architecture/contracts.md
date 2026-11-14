@@ -11,8 +11,8 @@ Line numbers refer to the baseline above; proposed APIs and guards are not imple
 **Owner:** `nrese_exec::stop::{StopSource, StopCheck, Ticker, Stop}` in `crates/nrese-exec/src/stop.rs:65`, :104, :126 and :28; contract at :1. Use one
 source per request and one ticker per sequential loop or parallel task. Tick attempted work, check before and after opaque calls, and finish before
 accepting results. The interval is 4096 work units per executing task; one large tick does not bound the opaque work inside it. Under nested counted
-reads (a read suspended while another runs inside its callback) a task can run up to 4096 more units per suspended level: the
-bound is stated at `nrese_reasoner::Poller` (`crates/nrese-reasoner/src/eval.rs`). Retain the original
+reads (a read suspended while another runs inside its callback), with d suspended levels, up to 4096 plus one run plus d × 4096
+units run between two asks, and up to d × 4096 after a refusal: the bound is stated at `nrese_reasoner::Poller` (`crates/nrese-reasoner/src/eval.rs`). Retain the original
 stop reason when adapting bool callbacks. See [execution-core](../design/execution-core.md).
 
 Known bypasses:
