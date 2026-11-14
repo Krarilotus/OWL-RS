@@ -43,7 +43,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry  # noqa: E402
-from suitekit import driver, gatestats  # noqa: E402
+from suitekit import driver, gatestats, manifest  # noqa: E402
 from suitekit.compare import counter_changes  # noqa: E402
 from suitekit import hosts as hosts_registry  # noqa: E402
 from suitekit.hosts import run_identity  # noqa: E402
@@ -1018,6 +1018,18 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     if not planned:
         summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    # Sides that ran one build compare nothing (D16-593): a round of a build against itself reads "no
+    # loss". Sides of one revision are declared identical (an A-A' control; a confirmation's main that
+    # is its base); any other two must differ, layout by layout. Per build, not per case: a case one
+    # side doesn't run changes no side's binaries.
+    for layout in sorted({(p["report"].get("binaries") or {}).get("layout", 1) for p in passes}):
+        hashes: dict[str, dict | None] = {}
+        for p in passes:
+            built = p["report"].get("binaries") or {}
+            if built.get("layout", 1) == layout:
+                hashes.setdefault(p["side"], built.get("sha256"))
+        identical = {frozenset((s, t)) for s in hashes for t in hashes if s != t and sides.get(s) == sides.get(t)}
+        summary["errors"] += [f"layout {layout}: {e}" if layout > 1 else e for e in manifest.one_binary(hashes, identical)]
     summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
