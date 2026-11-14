@@ -200,8 +200,8 @@ impl Pending {
     }
 
     /// Moves the shards' texts into one arena, in shard order, before the dictionary's
-    /// adoption guard is taken: a step of whole shards at a time, copied in parallel, whose
-    /// freed arrays go back before the next ([`GATHER_STEP`]). A shard's array was grown by
+    /// adoption guard is taken: shard by shard into one reserved array, the emptied arrays
+    /// going back after each step of whole shards ([`GATHER_STEP`]). A shard's array was grown by
     /// doubling among what the other threads freed, and the release after interning splits
     /// the huge pages under that memory. Over 256 arrays on 4 KiB pages the substring scan
     /// ran 1.33 times as long as over one arena, with the same instructions
@@ -209,7 +209,9 @@ impl Pending {
     /// against 3 K; 14 Nov 2026). One arena allocated whole, after that release, lies on
     /// huge pages where the kernel gives them. Copied whole and given back after, the
     /// arrays and the arena were both resident: DBpedia core's store load peaked 0.25 GiB
-    /// higher (phuoc-yu, 14 Nov 2026).
+    /// higher (phuoc-yu, 14 Nov 2026). The arena costs DBpedia core's load about 3 % of its
+    /// time, the new pages' faults; a parallel copy, a zeroed arena and steps of 512 MiB
+    /// were no faster (office-pc, 14 Nov 2026).
     pub(crate) fn gather(self) -> Gathered {
         self.gather_by(GATHER_STEP)
     }
@@ -223,35 +225,21 @@ impl Pending {
             .into_iter()
             .map(Mutex::into_inner)
             .collect();
-        let starts: Vec<usize> = std::iter::once(0)
-            .chain(shards.iter().scan(0, |end, shard| {
-                *end += shard.bytes.len();
-                Some(*end)
-            }))
-            .collect();
-        let mut text = vec![0u8; starts[shards.len()]];
-        let mut from = 0;
-        while from < shards.len() {
-            let to = (from + 1..shards.len())
-                .find(|&to| starts[to] - starts[from] >= step)
-                .unwrap_or(shards.len());
-            let mut parts: Vec<(&mut Shard, &mut [u8])> = Vec::with_capacity(to - from);
-            let mut rest = &mut text[starts[from]..starts[to]];
-            for shard in &mut shards[from..to] {
-                let (part, tail) = std::mem::take(&mut rest).split_at_mut(shard.bytes.len());
-                parts.push((shard, part));
-                rest = tail;
-            }
-            parts.into_par_iter().for_each(|(shard, part)| {
-                part.copy_from_slice(&shard.bytes);
-                shard.bytes = Vec::new();
-            });
+        let mut text = Vec::with_capacity(shards.iter().map(|shard| shard.bytes.len()).sum());
+        let mut starts = Vec::with_capacity(shards.len() + 1);
+        let mut released = 0;
+        let last = shards.len() - 1;
+        for (s, shard) in shards.iter_mut().enumerate() {
+            starts.push(text.len());
+            text.extend_from_slice(&shard.bytes);
+            shard.bytes = Vec::new();
             // The last step's arrays go back with the load's release after the adoption.
-            if to < shards.len() {
+            if text.len() - released >= step && s < last {
                 crate::memory::release_all();
+                released = text.len();
             }
-            from = to;
         }
+        starts.push(text.len());
         Gathered {
             text,
             starts,
