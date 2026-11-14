@@ -1145,9 +1145,18 @@ class Tradeoffs(Scratch):
                       self.entry(dimension="time/q01"), self.entry(by="the owner")):
             self.assertEqual(self.verdict(entry).returncode, 1, entry)
 
-    def test_the_list_starts_empty_and_a_malformed_entry_is_refused(self):
+    def test_the_trees_policy_names_gated_rows_and_a_malformed_entry_is_refused(self):
+        # A malformed file makes every verdict NOT PASSED; a trade-off whose loss or win names no
+        # row the gate judges covers nothing, and the loss it was approved for blocks.
         policy = gate_module.load_policy((ROOT / POLICY).read_text(encoding="utf-8"))
-        self.assertEqual((policy.tradeoffs, policy.exceptions, policy.errors), ([], [], []))
+        self.assertEqual(policy.errors, [])
+        catalog = gate_module.cases_registry.load()
+        for t in policy.tradeoffs:
+            sides = [t["against"]] if "against" in t else ["base", "main"]
+            for case, dimension_ in ((t["case"], t["dimension"]), (t["pays_with"]["case"], t["pays_with"]["dimension"])):
+                family = gate_module.family_of(catalog, [case])
+                self.assertTrue(any(gate_module.hypothesis(s, case, dimension_) in family for s in sides),
+                                f"{case} {dimension_}: no row the gate judges ({t['reason']})")
         bad = gate_module.load_policy('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n')
         self.assertEqual(bad.tradeoffs, [])
         self.assertIn("missing approved, by, pays_with, quote, reason, source", bad.errors[0])
