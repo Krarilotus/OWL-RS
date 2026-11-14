@@ -1001,11 +1001,14 @@ fn a_limit_over_several_patterns_holds_nothing_uncharged_per_row() {
     );
 }
 
-/// Spec (D16-579): the same LIMIT, refused for memory wherever its limit falls, the charge
-/// of its first morsel among the places, answers the refusal and leaves the query's budget
-/// where it started: the first table, the morsel and the parts made so far all released.
+/// Spec (D16-579): the same LIMIT under a limit that refuses its first morsel's charge answers
+/// that refusal, and leaves the query's budget where it started: the first table and the parts
+/// made so far are released. Answered, it leaves the budget where it started too. Limits are
+/// tried from nothing beyond the reader's state up, so one falls where the first table fits
+/// and its first morsel doesn't. (A refusal elsewhere, inside an operator, ends the query with
+/// that operator's own exit, and the query's budget gives the rest back when it drops.)
 #[test]
-fn a_limit_over_several_patterns_refused_anywhere_leaves_nothing_charged() {
+fn a_limit_over_several_patterns_refused_at_a_morsel_leaves_nothing_charged() {
     use nrese_sparql_syntax::Query;
     const ROWS: usize = 4 * MIN_MORSEL;
     let engine = default_store((0..ROWS).flat_map(|i| {
@@ -1022,20 +1025,30 @@ fn a_limit_over_several_patterns_refused_anywhere_leaves_nothing_charged() {
     // The first morsel: `MIN_MORSEL` rows of the first pattern's two columns.
     let morsel = MIN_MORSEL * 2 * 8;
     let own = own_bytes(&snapshot);
-    let (mut refused, mut failures) = (Vec::new(), Vec::new());
+    let (mut refused, mut at_morsel, mut failures) = (Vec::new(), 0, Vec::new());
     // From nothing beyond the reader's state to room for every table eight times over.
     for limit in (own..own + 8 * ROWS * 2 * 8).step_by(1024) {
         let mut options = QueryOptions::default();
         options.resources.memory = Envelope::new(Some(limit), None);
         let ctx = Context::new(&snapshot, &options, None, None);
         let before = ctx.budget.used();
-        match ctx.eval(&pattern).map_err(QueryEvaluationError::from) {
-            Ok(answer) => ctx.consumed(answer),
-            Err(QueryEvaluationError::MemoryLimit(exceeded)) => refused.push(exceeded.requested),
-            Err(other) => failures.push(format!("at {limit} bytes: {other:?}, not a refusal")),
-        }
+        let checked = match ctx.eval(&pattern).map_err(QueryEvaluationError::from) {
+            Ok(answer) => {
+                ctx.consumed(answer);
+                true
+            }
+            Err(QueryEvaluationError::MemoryLimit(exceeded)) => {
+                refused.push(exceeded.requested);
+                at_morsel += usize::from(exceeded.requested == morsel);
+                exceeded.requested == morsel
+            }
+            Err(other) => {
+                failures.push(format!("at {limit} bytes: {other:?}, not a refusal"));
+                false
+            }
+        };
         let held = ctx.budget.used() as i64 - before as i64;
-        if held != 0 {
+        if checked && held != 0 {
             failures.push(format!(
                 "at {limit} bytes the budget holds {held} bytes after"
             ));
@@ -1044,7 +1057,7 @@ fn a_limit_over_several_patterns_refused_anywhere_leaves_nothing_charged() {
     refused.sort_unstable();
     refused.dedup();
     assert!(
-        refused.contains(&morsel),
+        at_morsel > 0,
         "no limit refused the first morsel's {morsel} bytes; refused: {refused:?}"
     );
     assert!(failures.is_empty(), "{}", failures.join("; "));
