@@ -1060,28 +1060,42 @@ impl IndexVersion {
         })
     }
 
-    /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
-    /// per run; values may repeat across runs). Tombstones are ignored: for estimates.
-    pub(crate) fn distinct_values(&self, plan: &AccessPlan, position: usize, out: &mut Vec<u64>) {
+    /// Appends the walks of the distinct values at key `position` of each run's range for
+    /// `plan`, sorted per walk (values may repeat across walks: [`count_distinct`] merges
+    /// them). Tombstones are ignored: for estimates. Its searches and a count are counted
+    /// on `visit`: `Err` once it has stopped.
+    pub(crate) fn distinct_walks<'a>(
+        &'a self,
+        plan: &AccessPlan,
+        position: usize,
+        visit: Visitor<'_>,
+        out: &mut Vec<ValueWalk<'a>>,
+    ) -> Result<(), Stopped> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return;
+            return Ok(());
         };
         let position = if adapted.permutation == plan.permutation {
             position
         } else if position == 0 {
-            if self.count_plan(plan) > 0 {
-                out.push(TermId::DEFAULT_GRAPH.raw());
-            }
-            return;
+            let count = self.count_plan_visiting(plan, visit).ok_or(Stopped)?;
+            out.push(ValueWalk::One(
+                (count > 0).then_some(TermId::DEFAULT_GRAPH.raw()),
+            ));
+            return Ok(());
         } else {
             position - 1
         };
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
-            let (start, end) = perm.range(&adapted.low, &adapted.high);
-            perm.keys
-                .groups(start, end, position, |value, _, _| out.push(value));
+            let (start, end) = perm
+                .keys
+                .range_counted(&adapted.low, &adapted.high, &mut { visit })
+                .ok_or(Stopped)?;
+            out.push(ValueWalk::Groups(
+                perm.keys.group_cursor(start, end, position),
+            ));
         }
+        Ok(())
     }
 
     /// The scan, a block and a column at a time, of `components` (quad components:
@@ -1434,6 +1448,86 @@ impl Iterator for CountedScan<'_, '_> {
     fn next(&mut self) -> Option<EncodedQuad> {
         self.scan.next_counted(self.visit).ok().flatten()
     }
+}
+
+/// One source of a distinct count ([`IndexVersion::distinct_walks`]): its values in
+/// ascending order, each once.
+pub(crate) enum ValueWalk<'a> {
+    /// A run's groups at a position.
+    Groups(keys::Groups<'a>),
+    /// At most one value, known already (the default graph of a layout without the graph
+    /// position).
+    One(Option<u64>),
+}
+
+impl ValueWalk<'_> {
+    fn next(&mut self, account: &mut impl Account) -> Result<Option<u64>, Stopped> {
+        match self {
+            Self::Groups(groups) => Ok(groups.next(account)?.map(|(value, _, _)| value)),
+            Self::One(value) => Ok(value.take()),
+        }
+    }
+}
+
+/// The number of distinct values among `walks`: merged in ascending order, each value
+/// counted once however many walks hold it, so the count is exact where today's gathered
+/// list was (no list is held: a head per walk). The walks' blocks and each merge step are
+/// counted on `visit`: `Err` once it has stopped.
+pub(crate) fn count_distinct(
+    walks: Vec<ValueWalk<'_>>,
+    visit: Visitor<'_>,
+) -> Result<u64, Stopped> {
+    let mut account = Ledger::new(visit);
+    let mut heads = Vec::with_capacity(walks.len());
+    for mut walk in walks {
+        if let Some(value) = walk.next(&mut account)? {
+            heads.push((value, walk));
+        }
+    }
+    let mut count = 0u64;
+    if let [(_, walk)] = &mut heads[..] {
+        count += 1;
+        while walk.next(&mut account)?.is_some() {
+            count += 1;
+        }
+        return Ok(count);
+    }
+    while !heads.is_empty() {
+        // A step compares every head twice, for the least and to advance, however many runs
+        // merge: each comparison counted before it is made, and each portion's comparisons
+        // made before the next portion is taken (the `Ledger`'s rule).
+        let mut least = u64::MAX;
+        for portion in heads.chunks(crate::visit::PORTION as usize) {
+            if !account.take(portion.len() as u64) {
+                return Err(Stopped);
+            }
+            least = portion
+                .iter()
+                .fold(least, |least, &(value, _)| least.min(value));
+        }
+        count += 1;
+        let mut k = 0;
+        while k < heads.len() {
+            // One at a time: an advance takes its block's own portions.
+            if !account.take(1) {
+                return Err(Stopped);
+            }
+            if heads[k].0 != least {
+                k += 1;
+                continue;
+            }
+            match heads[k].1.next(&mut account)? {
+                Some(value) => {
+                    heads[k].0 = value;
+                    k += 1;
+                }
+                None => {
+                    heads.swap_remove(k);
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

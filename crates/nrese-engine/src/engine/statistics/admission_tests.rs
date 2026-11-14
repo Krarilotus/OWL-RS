@@ -304,16 +304,16 @@ fn an_unpublished_distinct_count_answers_no_published_read() {
     }
     let pending = tx.pending_snapshot();
     assert_eq!(
-        pending.distinct_estimate_in(MODEL, &pattern, Permutation::Spog),
-        Some(400)
+        pending.distinct_estimate_in(MODEL, &pattern, Permutation::Spog, &|_| true),
+        Ok(Some(400))
     );
     assert_eq!(
-        published.distinct_estimate_in(MODEL, &pattern, Permutation::Spog),
-        Some(300),
+        published.distinct_estimate_in(MODEL, &pattern, Permutation::Spog, &|_| true),
+        Ok(Some(300)),
         "the published read gets its own count"
     );
     assert_eq!(
-        statistics.distinct.lock().len(),
+        statistics.distinct_entries(),
         1,
         "the published entry alone"
     );
@@ -457,7 +457,7 @@ fn no_view_of_an_unpublished_snapshot_admits() {
         no_sets_admitted(&statistics, name);
     }
     for (name, view) in &shared {
-        let _ = view.distinct_estimate_in(MODEL, &pattern, Permutation::Posg);
+        let _ = view.distinct_estimate_in(MODEL, &pattern, Permutation::Posg, &|_| true);
         let _ = view.node_count_in(
             ReadModel::Asserted,
             GraphSelector::Any,
@@ -470,7 +470,7 @@ fn no_view_of_an_unpublished_snapshot_admits() {
             2,
         );
         assert!(
-            statistics.distinct.lock().is_empty(),
+            statistics.distinct_entries() == 0,
             "{name}: no distinct entry"
         );
         assert!(statistics.nodes.lock().is_empty(), "{name}: no node count");
