@@ -336,15 +336,15 @@ fn class_build_units(n: usize) -> u64 {
 
 /// Spec (`CountedSnapshot::count_up_to`): asked up to `limit`, a count answers at least the
 /// smaller of the count and `limit` and never more than the count: [`Count::AtLeast`] where
-/// an expanded count reached the limit, the whole count wherever it didn't (and wherever the
-/// count is held). Once its visitor has stopped it answers `Stopped`. On a compact snapshot
+/// an expanded count reached the limit, the whole count wherever it didn't, and a held count
+/// exactly at every limit. Once its visitor has stopped it answers `Stopped`. On a compact snapshot
 /// (expanded counts) and on a layered one (held counts), for every pattern and model asked,
 /// at limits 0, 1, either side of the count, at it, and past it.
 #[test]
 fn a_count_up_to_a_limit_answers_at_least_the_limit_or_the_whole_count() {
     let go = |_: u64| true;
     let halt = |_: u64| false;
-    for snapshot in [compact(50, 400), layered(400)] {
+    for (snapshot, equality) in [(compact(50, 400), true), (layered(400), false)] {
         let counted = snapshot.counted();
         for pattern in patterns(&snapshot) {
             for model in [
@@ -354,6 +354,11 @@ fn a_count_up_to_a_limit_answers_at_least_the_limit_or_the_whole_count() {
             ] {
                 let whole = snapshot.count_in(model, &pattern);
                 let n = whole.at_least();
+                // Expanded only under equality, in a model with inferred statements, where the
+                // pattern can match the default graph; every other count is held.
+                let held = !equality
+                    || model == ReadModel::Asserted
+                    || pattern.graph == GraphSelector::AnyNamed;
                 for limit in [0, 1, 2, n.saturating_sub(1), n, n + 1, u64::MAX] {
                     let at = format!("{model:?} {pattern:?}, count {n}, limit {limit}");
                     let bounded = counted
@@ -362,7 +367,9 @@ fn a_count_up_to_a_limit_answers_at_least_the_limit_or_the_whole_count() {
                     let answer = bounded.at_least();
                     assert!(answer >= n.min(limit), "{bounded:?} under the limit, {at}");
                     assert!(answer <= n, "{bounded:?} more than the count, {at}");
-                    if limit > n {
+                    if held {
+                        assert_eq!(bounded, whole, "a held count answers exactly, {at}");
+                    } else if limit > n {
                         assert_eq!(bounded, whole, "the whole count below the limit, {at}");
                     } else {
                         assert!(
@@ -383,8 +390,9 @@ fn a_count_up_to_a_limit_answers_at_least_the_limit_or_the_whole_count() {
 
 /// Spec (`CountedSnapshot::count_up_to`): an expanded count stops at its limit. On a compact
 /// snapshot, `? p ?` (20,000 stored matches of 50 copies each, and as many in a named graph)
-/// asked up to 1 answers [`Count::AtLeast`] and tells its visitor of less than half the units
-/// the whole count does; asked up to one past the count, it answers the whole count.
+/// asked up to 1,000 (above one match's copies) and up to 1 answers [`Count::AtLeast`] and
+/// tells its visitor of less than half the units the whole count does; asked up to one past
+/// the count, it answers the whole count.
 #[test]
 fn an_expanded_count_up_to_a_limit_stops_there() {
     let snapshot = compact(50, 20_000);
@@ -411,6 +419,17 @@ fn an_expanded_count_up_to_a_limit_stops_there() {
     assert_eq!(all, whole);
     let (past, _) = units(n + 1);
     assert_eq!(past, whole, "a limit past the count: the whole count");
+    // Above one stored match's 50 copies, far below the whole count.
+    let limit = 1_000;
+    let (some, some_units) = units(limit);
+    assert!(
+        matches!(some, Count::AtLeast(k) if (limit..=n).contains(&k)),
+        "{some:?}: stopped at the limit {limit}"
+    );
+    assert!(
+        2 * some_units < all_units,
+        "{some_units} units asked up to {limit}, {all_units} for the whole count: it didn't stop"
+    );
     let (first, first_units) = units(1);
     assert!(
         matches!(first, Count::AtLeast(k) if (1..=n).contains(&k)),
