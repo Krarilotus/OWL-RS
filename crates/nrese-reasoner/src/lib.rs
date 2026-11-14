@@ -54,6 +54,11 @@ mod witness;
 
 pub use capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature, ReasonerRunStatus};
 pub use config::{ConfigError, ReasonerConfig, ReasoningMode};
+/// The read interface a store implements to be reasoned over: [`Source`] and [`Base`], provided
+/// through [`Visits`] and [`VisitsBase`], with the types their methods take.
+pub use delta::{Base, VisitsBase};
+pub use eval::{Poller, Probe, Seg, Source, Stopped, Visit, Visits};
+pub use ir::Triple;
 pub use output::{RejectEvidence, RejectExplanation};
 pub use profile::{ReasonerProfile, mode_name, profile_for_config, profile_for_mode};
 pub use program::{RuleFormat, RuleProgram, UserRules};
