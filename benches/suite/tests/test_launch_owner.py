@@ -28,6 +28,12 @@ DECLARED = {"FLEET_JOB": JOB, "NRESE_SUITE_MEMORY_GB": "1.5"}  # a fraction: Doc
 BYTES = f"{3 * 2**29}b"  # 1.5 GiB
 
 
+def cpu_limits(argv):
+    """Every CPU limit a `docker run` argv gives, in either of Docker's spellings (`--cpus N`, `--cpus=N`)."""
+    return [b for a, b in zip(argv, argv[1:]) if a == "--cpus"] + [a[len("--cpus="):] for a in argv
+                                                                   if a.startswith("--cpus=")]
+
+
 class Docker:
     """Every command run, recorded and none executed; docker answers as its callers read it."""
 
@@ -82,6 +88,29 @@ class LaunchOwner(unittest.TestCase):
             self.assertNotIn("other", runtime.containers)
         self.assertEqual(len(docker.runs()), 1)
 
+    def test_a_measured_container_has_one_cpu_limit_the_declared_one_in_a_job_declaring_cpus(self):
+        # Spec: fleet Spec 9 (declared.py fits(): a container's CPUs are its declaration's) and DOCKER_CPUS (every
+        # system on the same CPUs): Docker takes the last `--cpus` it is given, so a container carries one. In a job
+        # declaring 3 CPUs that is 3; a run asking 4 there starts nothing; outside a job, DOCKER_CPUS's 8.
+        here = {k: v for k, v in os.environ.items() if k not in ("FLEET_JOB", "NRESE_SUITE_MEMORY_GB",
+                                                                 "NRESE_SUITE_CPUS", "DOCKER_CPUS", "DOCKER_MEMORY")}
+        declared = {**DECLARED, "NRESE_SUITE_CPUS": "3"}
+        for environ, cpus in (({"DOCKER_CPUS": "8"}, ["8"]), (declared, ["3"]), ({**declared, "DOCKER_CPUS": "3"}, ["3"]),
+                              ({**declared, "DOCKER_CPUS": "4"}, None)):
+            docker = Docker()
+            with self.subTest(environ=environ), tempfile.TemporaryDirectory() as tmp, \
+                    patch.dict(os.environ, {**here, **environ}, clear=True), patch("subprocess.run", docker), \
+                    patch.object(DockerRuntime, "names", return_value=[]), patch.object(DockerRuntime, "sample"):
+                runtime = DockerRuntime(Path(tmp), 0)
+                if cpus is None:
+                    with self.assertRaises(ValueError):  # the watcher would stop the step at it: never started
+                        runtime.start(Spec("serve", "sha256:fixture", ["true"]), None)
+                    self.assertEqual(docker.runs(), [])
+                    continue
+                runtime.start(Spec("serve", "sha256:fixture", ["true"]), None)
+                argv = docker.runs()[0]
+                self.assertEqual(cpu_limits(argv), cpus, argv)
+
     def test_the_build_toolchain_probe_is_the_jobs_with_its_memory(self):
         # The controlled build reads the pinned Rust image's toolchain in a container of its own before every
         # NRESE build (driver.toolchain_in).
@@ -124,14 +153,16 @@ class LaunchOwner(unittest.TestCase):
         self.assertEqual(done.stdout.splitlines().count(f"fleet.job={JOB}"), 1, done.stdout)
 
     def test_no_container_start_is_built_outside_the_launch_owner(self):
-        """A `docker run`/`create` argv spelled out anywhere in the suite's code but ns.py bypasses the owner. Seen:
-        the literal forms (the docker executable or ns.executable() followed by "run"/"create", ns.docker(["run" ...).
-        Not seen: an argv assembled from variables; the shell makers have their own owner (release_gate held_makers)."""
+        """A `docker run`/`create` argv spelled out anywhere in the suite's code, or in the DL kit's (the ORE and
+        W3C runs, which fleet jobs declaring their containers start), but ns.py bypasses the owner. Seen: the
+        literal forms (the docker executable or ns.executable() followed by "run"/"create", ns.docker(["run" ...).
+        Not seen: an argv assembled from variables; the shell makers have their own owner (release_gate held_makers);
+        the other kits are listed, not migrated (D16-586)."""
         launch = re.compile(r'''(["']docker["']|executable\(\))\s*,\s*["'](run|create)["']|'''
                             r'''\.docker\(\s*\[\s*["'](run|create)["']''')
-        suite = ROOT / "benches" / "suite"
         found = [f"{path.relative_to(ROOT).as_posix()}:{n}"
-                 for path in sorted(suite.rglob("*.py")) if "tests" not in path.relative_to(suite).parts
+                 for base in (ROOT / "benches" / "suite", ROOT / "benches" / "reasoning" / "dl")
+                 for path in sorted(base.rglob("*.py")) if "tests" not in path.relative_to(base).parts
                  and path.name != "ns.py"
                  for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if launch.search(line)]
         self.assertEqual(found, [])
