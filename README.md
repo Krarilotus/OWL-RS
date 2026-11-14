@@ -171,7 +171,9 @@ curl http://localhost:8080/dataset/query --data-urlencode infer=false \
 
 - The `PUT` answers `204 No Content` and replaces the [default graph](docs/glossary.md#graph) with your file.
 - `infer=false` reads the asserted statements only, so the count is your file's number of
-  statements (for a file of three: `"value":"3"`). Without it, the inferred ones count too.
+  statements (for a file of three: `"value":"3"`). Without it, the inferred ones count too;
+  under `owl2-rl` they include 32 that every store holds, an empty one too: each datatype the
+  profile supports is an `rdfs:Datatype` ([why](docs/spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
 - After the restart the count is the same. On Docker's stop signal the server lets the
   requests in flight finish, closes the store and exits
   ([stopping](docs/ops/server-setup.md#64-stopping)). Every commit is synced to the log
