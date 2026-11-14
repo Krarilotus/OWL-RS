@@ -19,7 +19,7 @@
 //! set `S2` (an object that is a subject itself; `NONE` otherwise). The chain
 //! `?x p ?y . ?y q ?z` then counts only the links whose object has `q`
 //! ([`CharacteristicSets::pair`]), where independence assumes every object might. A second
-//! scan finds them (`CharacteristicSets::with_pairs`), within [`MAX_PAIR_SUBJECTS`] and
+//! scan finds them (`Gathered::pair_counts`), within [`MAX_PAIR_SUBJECTS`] and
 //! [`MAX_PAIRS`].
 //!
 //! A scan gathers them first (`Gathered`); what is kept ([`CharacteristicSets`]) is built
