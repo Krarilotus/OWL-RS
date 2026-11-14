@@ -803,6 +803,9 @@ verdict)
   # timed host's, the big host's, their confirmations'), then the checks'. Every part must be the
   # candidate's tree's (release_gate.py verdict); a directory without its result, or a checks'
   # directory with more than one of a kind (a rerun beside the first), is refused, never one taken.
+  # The earlier verdict goes first: a step stopped at any point leaves none, never an earlier PASSED.
+  { rm -f "$OUT/verdict.md" && [ ! -e "$OUT/verdict.md" ]; } \
+    || { echo "release-gate.sh verdict: the earlier $OUT/verdict.md can't be removed: no verdict" >&2; exit 2; }
   shift
   cd "$launch" || exit 2
   [ $# -ge 3 ] || { echo "usage: release-gate.sh verdict CAND TIMED_DIR... CHECKS_DIR" >&2; exit 2; }
