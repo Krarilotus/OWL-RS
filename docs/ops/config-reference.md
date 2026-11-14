@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document is the operator-facing source of truth for `nrese-server` runtime configuration: every setting's file key, environment variable, type, default and scope, and the precedence between them. Implementation ownership remains in `crates/nrese-server/src/config/`.
+This document is the operator-facing source of truth for `nrese-server` runtime configuration: every setting's file key, environment variable, type, default and scope, and the precedence between them. Each setting's row has an anchor named as its file key, so a link can name one setting: [`config-reference.md#store.mode`](#store.mode). Implementation ownership remains in `crates/nrese-server/src/config/`.
 
 ## Precedence
 
@@ -113,8 +113,8 @@ api_key = "replace-me"
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `server.bind_address` (older `server.bind_addr`) | `NRESE_BIND_ADDR` | text: `IP:PORT` | `127.0.0.1:8080` | start | The address and port the server listens on. Port `0`: the system picks one, and the start log names it. `0.0.0.0:8080` listens on every interface (put a TLS proxy in front: [server-setup.md](server-setup.md)) |
-| `server.deployment_posture` | `NRESE_DEPLOYMENT_POSTURE` | choice: `open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade` | `open-workbench` | start | What the deployment is for (below) |
+| <a id="server.bind_address"></a>`server.bind_address` (older `server.bind_addr`) | `NRESE_BIND_ADDR` | text: `IP:PORT` | `127.0.0.1:8080` | start | The address and port the server listens on. Port `0`: the system picks one, and the start log names it. `0.0.0.0:8080` listens on every interface (put a TLS proxy in front: [server-setup.md](server-setup.md)) |
+| <a id="server.deployment_posture"></a>`server.deployment_posture` | `NRESE_DEPLOYMENT_POSTURE` | choice: `open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade` | `open-workbench` | start | What the deployment is for (below) |
 
 Posture effects:
 - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces (they answer 404)
@@ -126,24 +126,24 @@ Posture effects:
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `store.mode` | `NRESE_STORE_MODE` | choice: `in-memory` (aliases `inmemory`, `memory`), `on-disk` (aliases `ondisk`, `disk`, `durable`) | `in-memory` | start | Where the store keeps its data; `in-memory` loses it at exit. Unknown values are a startup error |
-| `store.data_dir` | `NRESE_DATA_DIR` | text: a path | `./data` | start | The data directory (on disk: the log, checkpoints, repositories; one process at a time, [locked](server-setup.md#err-data-directory-locked)) |
-| `store.ontology_path` | `NRESE_ONTOLOGY_PATH` | text: a path | none | start | A file loaded at startup; a missing file is a startup error. Unset: nothing is preloaded (no implicit fallback locations) |
-| `store.default_graph` | `NRESE_DEFAULT_GRAPH` | choice: `default`, `union` | `default` | start | What a query that names no dataset reads (below) |
-| `store.geosparql_relations` | `NRESE_GEOSPARQL_RELATIONS` | choice: `computed`, `stated` | `computed` | start | What a GeoSPARQL relation in a triple pattern matches (below) |
-| `store.search_scope` | `NRESE_SEARCH_SCOPE` | choice: `global`, `reader` | `global` | repo | What full-text relevance, IRI search and vector selection are computed over (below) |
-| `store.reader_corpus_bytes` | `NRESE_READER_CORPUS_BYTES` | size | `256MiB` | repo | What the corpora of a `reader` search scope may keep (below) |
-| `store.reader_walk_slice` | `NRESE_READER_WALK_SLICE` | integer, at least 1 | `1024` | start | Words of bits one slice of a corpus walk covers (below) |
-| `store.reader_documents_per_probe` | `NRESE_READER_DOCUMENTS_PER_PROBE` | integer, at least 1 | `10` | start | When a `reader` corpus is derived instead of walked again (below) |
-| `store.import_directory` | `NRESE_IMPORT_DIR` | text: a path | none | start | The directory administrators import files from by name (`POST /api/v1/repositories/{id}/import/files`): large loads without uploading them, as jobs. Paths can't leave it. Unset: no server-side imports |
-| `store.verify_on_open` | `NRESE_VERIFY_ON_OPEN` | bool | `false` | start | Check the whole newest checkpoint when opening (below) |
-| `store.map_checkpoints` | `NRESE_MAP_CHECKPOINTS` | bool | `true` | start | Serve checkpointed data from the mapped file (below) |
-| `store.checkpoint_after_wal` | `NRESE_CHECKPOINT_AFTER_WAL_BYTES` | size | `256MiB` | start | Write a checkpoint once the log has grown this much (below) |
-| `store.wal_archive` | `NRESE_WAL_ARCHIVE` | bool | `false` | start | Keep covered WAL segments for point-in-time restores (below) |
-| `store.wal_damage` | `NRESE_WAL_DAMAGE` | choice: `refuse`, `keep-prefix` | `refuse` | start | What opening does with damage in the newest log segment (below) |
-| `store.index_encoding` | `NRESE_INDEX_ENCODING` | choice: `fast`, `compact` | `fast` | process | How index blocks are encoded when built (below) |
-| `store.vocabulary` | `NRESE_VOCABULARY` | choice: `plain`, `fsst` | `plain` | process | How checkpoints store the dictionary's keys (below) |
-| `store.invalid_statements` | `NRESE_INVALID_STATEMENTS` | choice: `quarantine`, `strict` | `quarantine` | start | What a bulk load does with a statement it can't read (below) |
+| <a id="store.mode"></a>`store.mode` | `NRESE_STORE_MODE` | choice: `in-memory` (aliases `inmemory`, `memory`), `on-disk` (aliases `ondisk`, `disk`, `durable`) | `in-memory` | start | Where the store keeps its data; `in-memory` loses it at exit. Unknown values are a startup error |
+| <a id="store.data_dir"></a>`store.data_dir` | `NRESE_DATA_DIR` | text: a path | `./data` | start | The data directory (on disk: the log, checkpoints, repositories; one process at a time, [locked](server-setup.md#err-data-directory-locked)) |
+| <a id="store.ontology_path"></a>`store.ontology_path` | `NRESE_ONTOLOGY_PATH` | text: a path | none | start | A file loaded at startup; a missing file is a startup error. Unset: nothing is preloaded (no implicit fallback locations) |
+| <a id="store.default_graph"></a>`store.default_graph` | `NRESE_DEFAULT_GRAPH` | choice: `default`, `union` | `default` | start | What a query that names no dataset reads (below) |
+| <a id="store.geosparql_relations"></a>`store.geosparql_relations` | `NRESE_GEOSPARQL_RELATIONS` | choice: `computed`, `stated` | `computed` | start | What a GeoSPARQL relation in a triple pattern matches (below) |
+| <a id="store.search_scope"></a>`store.search_scope` | `NRESE_SEARCH_SCOPE` | choice: `global`, `reader` | `global` | repo | What full-text relevance, IRI search and vector selection are computed over (below) |
+| <a id="store.reader_corpus_bytes"></a>`store.reader_corpus_bytes` | `NRESE_READER_CORPUS_BYTES` | size | `256MiB` | repo | What the corpora of a `reader` search scope may keep (below) |
+| <a id="store.reader_walk_slice"></a>`store.reader_walk_slice` | `NRESE_READER_WALK_SLICE` | integer, at least 1 | `1024` | start | Words of bits one slice of a corpus walk covers (below) |
+| <a id="store.reader_documents_per_probe"></a>`store.reader_documents_per_probe` | `NRESE_READER_DOCUMENTS_PER_PROBE` | integer, at least 1 | `10` | start | When a `reader` corpus is derived instead of walked again (below) |
+| <a id="store.import_directory"></a>`store.import_directory` | `NRESE_IMPORT_DIR` | text: a path | none | start | The directory administrators import files from by name (`POST /api/v1/repositories/{id}/import/files`): large loads without uploading them, as jobs. Paths can't leave it. Unset: no server-side imports |
+| <a id="store.verify_on_open"></a>`store.verify_on_open` | `NRESE_VERIFY_ON_OPEN` | bool | `false` | start | Check the whole newest checkpoint when opening (below) |
+| <a id="store.map_checkpoints"></a>`store.map_checkpoints` | `NRESE_MAP_CHECKPOINTS` | bool | `true` | start | Serve checkpointed data from the mapped file (below) |
+| <a id="store.checkpoint_after_wal"></a>`store.checkpoint_after_wal` | `NRESE_CHECKPOINT_AFTER_WAL_BYTES` | size | `256MiB` | start | Write a checkpoint once the log has grown this much (below) |
+| <a id="store.wal_archive"></a>`store.wal_archive` | `NRESE_WAL_ARCHIVE` | bool | `false` | start | Keep covered WAL segments for point-in-time restores (below) |
+| <a id="store.wal_damage"></a>`store.wal_damage` | `NRESE_WAL_DAMAGE` | choice: `refuse`, `keep-prefix` | `refuse` | start | What opening does with damage in the newest log segment (below) |
+| <a id="store.index_encoding"></a>`store.index_encoding` | `NRESE_INDEX_ENCODING` | choice: `fast`, `compact` | `fast` | process | How index blocks are encoded when built (below) |
+| <a id="store.vocabulary"></a>`store.vocabulary` | `NRESE_VOCABULARY` | choice: `plain`, `fsst` | `plain` | process | How checkpoints store the dictionary's keys (below) |
+| <a id="store.invalid_statements"></a>`store.invalid_statements` | `NRESE_INVALID_STATEMENTS` | choice: `quarantine`, `strict` | `quarantine` | start | What a bulk load does with a statement it can't read (below) |
 
 The result cache (`budgets.result_cache`, older key `store.query_cache_bytes`) and its pins (`budgets.result_cache_pins`) are in [Budgets](#budgets), with their details [below](#the-result-cache).
 
@@ -202,9 +202,9 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `shacl.shapes_graph` | `NRESE_SHACL_SHAPES_GRAPH` | text: an IRI | `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use) | start | The graph whose shapes `GET /dataset/shacl` validates against ([http-api.md](http-api.md#shacl-validation)) and the gate uses |
-| `shacl.gate` | `NRESE_SHACL_GATE` | choice: `off`, `report`, `enforce` | `off` | start | SHACL as a commit gate (below) |
-| `shacl.gate_severity` | `NRESE_SHACL_GATE_SEVERITY` | choice: `violation`, `warning`, `info` | `violation` | start | The least severity `enforce` rejects |
+| <a id="shacl.shapes_graph"></a>`shacl.shapes_graph` | `NRESE_SHACL_SHAPES_GRAPH` | text: an IRI | `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use) | start | The graph whose shapes `GET /dataset/shacl` validates against ([http-api.md](http-api.md#shacl-validation)) and the gate uses |
+| <a id="shacl.gate"></a>`shacl.gate` | `NRESE_SHACL_GATE` | choice: `off`, `report`, `enforce` | `off` | start | SHACL as a commit gate (below) |
+| <a id="shacl.gate_severity"></a>`shacl.gate_severity` | `NRESE_SHACL_GATE_SEVERITY` | choice: `violation`, `warning`, `info` | `violation` | start | The least severity `enforce` rejects |
 
 `report` validates every commit against the shapes graph and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity`, or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full.
 
@@ -212,14 +212,14 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `reasoner.mode` | `NRESE_REASONING_MODE` | choice: `disabled` (aliases `none`, `off`), `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl`, `custom` | `disabled` | repo (as `reasoning`) | The ruleset materialised into the inferred stack (below) |
-| `reasoner.rules` | `NRESE_REASONING_RULES` | text: a `.n3` or `.pie` file | none | repo (as `rules`) | User rules (below) |
-| `reasoner.equality` | `NRESE_REASONING_EQUALITY` | choice: `representatives`, `compact`, `replicate` | `representatives` | start | How `owl:sameAs` is reasoned with and stored |
-| `reasoner.equality_answers` | `NRESE_REASONING_EQUALITY_ANSWERS` | choice: `strict`, `canonical` | `strict` | start | With `compact`: every identity, or one per class |
-| `reasoner.equality_expansion` | `NRESE_REASONING_EQUALITY_EXPANSION` | choice: `late`, `early` | `late` | start | With `compact`: when classes are expanded |
-| `reasoner.unnamed_classes` | `NRESE_REASONING_UNNAMED_CLASSES` | choice: `derive`, `skip` | `derive` | start | Memberships in unnamed union classes nothing consumes |
-| `reasoner.ql_rewriting` | `NRESE_REASONING_QL_REWRITING` | choice: `auto`, `on`, `off` | `auto` | repo (as `ql_rewriting`) | OWL 2 QL answers through existentials |
-| `reasoner.support_sets` | `NRESE_REASONING_SUPPORT_SETS` | integer, at least 1 | `16` | start | Support graph sets kept per inferred statement |
+| <a id="reasoner.mode"></a>`reasoner.mode` | `NRESE_REASONING_MODE` | choice: `disabled` (aliases `none`, `off`), `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl`, `custom` | `disabled` | repo (as `reasoning`) | The ruleset materialised into the inferred stack (below) |
+| <a id="reasoner.rules"></a>`reasoner.rules` | `NRESE_REASONING_RULES` | text: a `.n3` or `.pie` file | none | repo (as `rules`) | User rules (below) |
+| <a id="reasoner.equality"></a>`reasoner.equality` | `NRESE_REASONING_EQUALITY` | choice: `representatives`, `compact`, `replicate` | `representatives` | start | How `owl:sameAs` is reasoned with and stored |
+| <a id="reasoner.equality_answers"></a>`reasoner.equality_answers` | `NRESE_REASONING_EQUALITY_ANSWERS` | choice: `strict`, `canonical` | `strict` | start | With `compact`: every identity, or one per class |
+| <a id="reasoner.equality_expansion"></a>`reasoner.equality_expansion` | `NRESE_REASONING_EQUALITY_EXPANSION` | choice: `late`, `early` | `late` | start | With `compact`: when classes are expanded |
+| <a id="reasoner.unnamed_classes"></a>`reasoner.unnamed_classes` | `NRESE_REASONING_UNNAMED_CLASSES` | choice: `derive`, `skip` | `derive` | start | Memberships in unnamed union classes nothing consumes |
+| <a id="reasoner.ql_rewriting"></a>`reasoner.ql_rewriting` | `NRESE_REASONING_QL_REWRITING` | choice: `auto`, `on`, `off` | `auto` | repo (as `ql_rewriting`) | OWL 2 QL answers through existentials |
+| <a id="reasoner.support_sets"></a>`reasoner.support_sets` | `NRESE_REASONING_SUPPORT_SETS` | integer, at least 1 | `16` | start | Support graph sets kept per inferred statement |
 
 `reasoner.mode` values:
 - `disabled`: no reasoning; reads see asserted statements only
@@ -280,13 +280,13 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `replication.mode` | `NRESE_REPLICATION_MODE` | choice: `off`, `primary`, `replica` | `off` | start | `primary`: serve the log and an image to administrators. `replica`: start from the primary's image when the data directory holds no store, follow its log, take no writes, don't reason |
-| `replication.primary` | `NRESE_REPLICATION_PRIMARY` | text: a base URL | none | start | A replica's primary (`https://primary.example:8080`) |
-| `replication.token` | `NRESE_REPLICATION_TOKEN` | text, secret | none | start | The bearer token a replica presents to its primary (an administrator's); never printed, refused by `--set` |
-| `replication.poll` | `NRESE_REPLICATION_POLL_MS` | duration | `500ms` | start | How long a replica waits before asking again once caught up |
-| `replication.batch_bytes` | `NRESE_REPLICATION_BATCH_BYTES` | size | `8MiB` | start | About how much log a replica asks for at once |
-| `replication.round_timeout` | `NRESE_REPLICATION_ROUND_TIMEOUT_MS` | limit (duration) | `5min` | start | The longest one round of following the primary's log may take, its answer whole; `0` or `unlimited`: no total limit |
-| `replication.image_timeout` | `NRESE_REPLICATION_IMAGE_TIMEOUT_MS` | limit (duration) | `1h` | start | The longest a replica waits for its primary to prepare an image (the primary writes and checks it before its answer begins); `0` or `unlimited`: no limit |
+| <a id="replication.mode"></a>`replication.mode` | `NRESE_REPLICATION_MODE` | choice: `off`, `primary`, `replica` | `off` | start | `primary`: serve the log and an image to administrators. `replica`: start from the primary's image when the data directory holds no store, follow its log, take no writes, don't reason |
+| <a id="replication.primary"></a>`replication.primary` | `NRESE_REPLICATION_PRIMARY` | text: a base URL | none | start | A replica's primary (`https://primary.example:8080`) |
+| <a id="replication.token"></a>`replication.token` | `NRESE_REPLICATION_TOKEN` | text, secret | none | start | The bearer token a replica presents to its primary (an administrator's); never printed, refused by `--set` |
+| <a id="replication.poll"></a>`replication.poll` | `NRESE_REPLICATION_POLL_MS` | duration | `500ms` | start | How long a replica waits before asking again once caught up |
+| <a id="replication.batch_bytes"></a>`replication.batch_bytes` | `NRESE_REPLICATION_BATCH_BYTES` | size | `8MiB` | start | About how much log a replica asks for at once |
+| <a id="replication.round_timeout"></a>`replication.round_timeout` | `NRESE_REPLICATION_ROUND_TIMEOUT_MS` | limit (duration) | `5min` | start | The longest one round of following the primary's log may take, its answer whole; `0` or `unlimited`: no total limit |
+| <a id="replication.image_timeout"></a>`replication.image_timeout` | `NRESE_REPLICATION_IMAGE_TIMEOUT_MS` | limit (duration) | `1h` | start | The longest a replica waits for its primary to prepare an image (the primary writes and checks it before its answer begins); `0` or `unlimited`: no limit |
 
 Fixed limits on every exchange with the primary: a log answer must begin within 30 s, and every answer's body may pause at most 30 s between pieces (an image streams as long as it keeps coming, however large); a round past a limit is an error, retried with a growing pause and shown in the status.
 
@@ -294,9 +294,9 @@ Fixed limits on every exchange with the primary: a log answer must begin within 
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `federation.allow` | `NRESE_FEDERATION_ALLOW` | list (`,`): `http(s)` IRIs or prefixes, or `*` | none (`SERVICE` off) | start | The endpoints `SERVICE` may call (`https://query.wikidata.org/`), or `*` for any. Empty: `SERVICE` is an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL |
-| `federation.timeout` | `NRESE_FEDERATION_TIMEOUT_MS` | duration | `30s` | start | Per request to an endpoint |
-| `federation.max_rows` | `NRESE_FEDERATION_MAX_ROWS` | integer | `1000000` | start | Rows one request may return |
+| <a id="federation.allow"></a>`federation.allow` | `NRESE_FEDERATION_ALLOW` | list (`,`): `http(s)` IRIs or prefixes, or `*` | none (`SERVICE` off) | start | The endpoints `SERVICE` may call (`https://query.wikidata.org/`), or `*` for any. Empty: `SERVICE` is an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL |
+| <a id="federation.timeout"></a>`federation.timeout` | `NRESE_FEDERATION_TIMEOUT_MS` | duration | `30s` | start | Per request to an endpoint |
+| <a id="federation.max_rows"></a>`federation.max_rows` | `NRESE_FEDERATION_MAX_ROWS` | integer | `1000000` | start | Rows one request may return |
 
 A `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache. With access enforced, calling `SERVICE` is a role's privilege ([below](#graph-level-access-control)).
 
@@ -313,21 +313,21 @@ To give the server's request work 2 GiB, set `budgets.total_query_memory = "2GiB
 
 | Key | Environment | Type | Default | Scope | What it bounds |
 |---|---|---|---|---|---|
-| `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | size or share | 4 GiB | start | One query's memory envelope: its intermediate and retained results and, under `owl2-dl`, its DL work (the exact services' compilation scratch and engines). A query whose evaluation needs more is answered `413`; DL candidates past it are left unresolved, the status says so (`422` under `dl.answers = exact`). `0` = unlimited |
-| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | size or share | 50 % of the machine's memory | start | Every running request's envelope across the catalog: queries, updates (their WHERE evaluation and `owl2-dl` commit gate), DL entailment checks and explanations. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
-| `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | size or share | 75 % of the machine's memory (the container's limit where there is one) | start | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. `0` = unlimited. An operation is admitted by this limit less what the process holds, not by what the system has free at that moment: a container shared with other large users is the operator's to size. A size above the memory the process may use counts as that memory, where it can be read. The default is refused at startup where the memory the process may use can't be read, Linux before 3.15 among them (its kernel doesn't show which mount a file was opened on): set this there. On cgroup v2 a limit set above the container's cgroup namespace (Docker's `--cgroup-parent`, a Kubernetes pod without a limit of its own under a node's cap) isn't visible to it: set this there. Likewise on Windows only the job object the server runs in directly is visible, not an enclosing one: when a launcher or service wrapper caps a parent job, set this there |
-| `budgets.huge_pages` | `NRESE_HUGE_PAGES` | choice: `on`, `off`, `bulk` | `on` | process | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. `bulk`: on while a bulk load or a materialisation runs, off otherwise (serving): their speed with serving's memory. See [server-setup.md](server-setup.md) §12.1 |
-| `budgets.reasoning_release` | `NRESE_REASONING_RELEASE` | choice: `off`, `on` | `off` | process | Whether a materialisation gives back between its rounds, after the last one and before the inferred stack what the last round freed. `on`: a lower and steadier peak, as the allocator keeps a freed large block about a round's time (host A, LUBM 100: 2,074 → 1,776 MiB, 5.6 % more reasoning time; OWL2Bench RL-1: −25 % for 6.6 %; a small RDFS materialisation: −28 % for 14 %). `off`: the fastest materialisation. For a memory budget near its limit, or for peaks that must compare between runs |
-| `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | size or share | 25 % of the machine's memory | start | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
-| `budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | duration | 30 s | repo (as `query_timeout_ms`, not the default repository) | A query, until its last result is sent (`408`) |
-| `budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | duration | 60 s | start | A SPARQL update, reasoning included |
-| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | duration | 30 s | start | A streamed read of stored statements (Graph Store `GET`, RDF4J `GET /statements`, the N-Quads export): the wait for its first chunk, then for each next one. A client that keeps reading is never cut off; one that stops for this long is. A Graph Store `HEAD` |
-| `budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | duration | 60 s | start | A Graph Store write |
-| `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | size | 1 MiB | start | The text of a query (`413`) |
-| `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | size | 16 MiB | start | A SPARQL update request (`413`) |
-| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | size | 128 MiB | start | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load`. An N-Quads restore (`POST …/restore`) has no limit of its own: the server's body limit bounds it, 3 × the largest of this, `budgets.update_size` and `budgets.query_text`, plus 64 KiB (about 384 MiB, some 3 million statements, by default), and it holds the whole payload while it parses. Store-sized backups restore offline: `nrese-server load --replace` for an N-Quads export, `nrese-server restore DIR` for an image |
-| `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | size or share | 2% of memory (64 MiB to 8 GiB) | start | Results of query parts (id columns) kept for repeated queries and shared sub-patterns ([the result cache](#the-result-cache)). `0` switches the cache off. Where the memory can't be read, 64 MiB |
-| `budgets.result_cache_pins` | `NRESE_PINNED_QUERIES` | list (`;`): paths | none | start | Query files whose results are pinned in the result cache at startup ([the result cache](#the-result-cache)) |
+| <a id="budgets.query_memory"></a>`budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | size or share | 4 GiB | start | One query's memory envelope: its intermediate and retained results and, under `owl2-dl`, its DL work (the exact services' compilation scratch and engines). A query whose evaluation needs more is answered `413`; DL candidates past it are left unresolved, the status says so (`422` under `dl.answers = exact`). `0` = unlimited |
+| <a id="budgets.total_query_memory"></a>`budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | size or share | 50 % of the machine's memory | start | Every running request's envelope across the catalog: queries, updates (their WHERE evaluation and `owl2-dl` commit gate), DL entailment checks and explanations. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
+| <a id="budgets.process_memory"></a>`budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | size or share | 75 % of the machine's memory (the container's limit where there is one) | start | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. `0` = unlimited. An operation is admitted by this limit less what the process holds, not by what the system has free at that moment: a container shared with other large users is the operator's to size. A size above the memory the process may use counts as that memory, where it can be read. The default is refused at startup where the memory the process may use can't be read, Linux before 3.15 among them (its kernel doesn't show which mount a file was opened on): set this there. On cgroup v2 a limit set above the container's cgroup namespace (Docker's `--cgroup-parent`, a Kubernetes pod without a limit of its own under a node's cap) isn't visible to it: set this there. Likewise on Windows only the job object the server runs in directly is visible, not an enclosing one: when a launcher or service wrapper caps a parent job, set this there |
+| <a id="budgets.huge_pages"></a>`budgets.huge_pages` | `NRESE_HUGE_PAGES` | choice: `on`, `off`, `bulk` | `on` | process | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. `bulk`: on while a bulk load or a materialisation runs, off otherwise (serving): their speed with serving's memory. See [server-setup.md](server-setup.md) §12.1 |
+| <a id="budgets.reasoning_release"></a>`budgets.reasoning_release` | `NRESE_REASONING_RELEASE` | choice: `off`, `on` | `off` | process | Whether a materialisation gives back between its rounds, after the last one and before the inferred stack what the last round freed. `on`: a lower and steadier peak, as the allocator keeps a freed large block about a round's time (host A, LUBM 100: 2,074 → 1,776 MiB, 5.6 % more reasoning time; OWL2Bench RL-1: −25 % for 6.6 %; a small RDFS materialisation: −28 % for 14 %). `off`: the fastest materialisation. For a memory budget near its limit, or for peaks that must compare between runs |
+| <a id="budgets.bulk_load_memory"></a>`budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | size or share | 25 % of the machine's memory | start | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
+| <a id="budgets.query_timeout"></a>`budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | duration | 30 s | repo (as `query_timeout_ms`, not the default repository) | A query, until its last result is sent (`408`) |
+| <a id="budgets.update_timeout"></a>`budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | duration | 60 s | start | A SPARQL update, reasoning included |
+| <a id="budgets.graph_read_timeout"></a>`budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | duration | 30 s | start | A streamed read of stored statements (Graph Store `GET`, RDF4J `GET /statements`, the N-Quads export): the wait for its first chunk, then for each next one. A client that keeps reading is never cut off; one that stops for this long is. A Graph Store `HEAD` |
+| <a id="budgets.graph_write_timeout"></a>`budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | duration | 60 s | start | A Graph Store write |
+| <a id="budgets.query_text"></a>`budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | size | 1 MiB | start | The text of a query (`413`) |
+| <a id="budgets.update_size"></a>`budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | size | 16 MiB | start | A SPARQL update request (`413`) |
+| <a id="budgets.upload_size"></a>`budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | size | 128 MiB | start | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load`. An N-Quads restore (`POST …/restore`) has no limit of its own: the server's body limit bounds it, 3 × the largest of this, `budgets.update_size` and `budgets.query_text`, plus 64 KiB (about 384 MiB, some 3 million statements, by default), and it holds the whole payload while it parses. Store-sized backups restore offline: `nrese-server load --replace` for an N-Quads export, `nrese-server restore DIR` for an image |
+| <a id="budgets.result_cache"></a>`budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | size or share | 2% of memory (64 MiB to 8 GiB) | start | Results of query parts (id columns) kept for repeated queries and shared sub-patterns ([the result cache](#the-result-cache)). `0` switches the cache off. Where the memory can't be read, 64 MiB |
+| <a id="budgets.result_cache_pins"></a>`budgets.result_cache_pins` | `NRESE_PINNED_QUERIES` | list (`;`): paths | none | start | Query files whose results are pinned in the result cache at startup ([the result cache](#the-result-cache)) |
 
 `/version` reports, under `budgets`, `query_memory`, `total_query_memory`, `query_text`, `update_size`, `upload_size` and `result_cache` in bytes, and `query_timeout_ms`, `update_timeout_ms`, `graph_read_timeout_ms` and `graph_write_timeout_ms`. It doesn't report `process_memory`, `bulk_load_memory`, `huge_pages`, `reasoning_release` or the pins.
 
@@ -360,10 +360,10 @@ Requests per client and window; a client over its limit gets `429`.
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `policy.rate_limits.window_secs` | `NRESE_RATE_LIMIT_WINDOW_SECS` | integer (seconds) | `60` | start | The window |
-| `policy.rate_limits.read_requests_per_window` | `NRESE_READ_REQUESTS_PER_WINDOW` | integer | `0` (no limit) | start | Queries, Graph Store reads, service descriptions |
-| `policy.rate_limits.write_requests_per_window` | `NRESE_WRITE_REQUESTS_PER_WINDOW` | integer | `0` (no limit) | start | Updates, `TELL`, Graph Store writes |
-| `policy.rate_limits.admin_requests_per_window` | `NRESE_ADMIN_REQUESTS_PER_WINDOW` | integer | `0` (no limit) | start | Operator reads, administration, metrics |
+| <a id="policy.rate_limits.window_secs"></a>`policy.rate_limits.window_secs` | `NRESE_RATE_LIMIT_WINDOW_SECS` | integer (seconds) | `60` | start | The window |
+| <a id="policy.rate_limits.read_requests_per_window"></a>`policy.rate_limits.read_requests_per_window` | `NRESE_READ_REQUESTS_PER_WINDOW` | integer | `0` (no limit) | start | Queries, Graph Store reads, service descriptions |
+| <a id="policy.rate_limits.write_requests_per_window"></a>`policy.rate_limits.write_requests_per_window` | `NRESE_WRITE_REQUESTS_PER_WINDOW` | integer | `0` (no limit) | start | Updates, `TELL`, Graph Store writes |
+| <a id="policy.rate_limits.admin_requests_per_window"></a>`policy.rate_limits.admin_requests_per_window` | `NRESE_ADMIN_REQUESTS_PER_WINDOW` | integer | `0` (no limit) | start | Operator reads, administration, metrics |
 
 ## Timeouts and writes
 
@@ -385,7 +385,7 @@ A fixed limit comes before every authenticated request: a body of known length u
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `policy.sparql_parse_error_profile` | `NRESE_SPARQL_PARSE_ERROR_PROFILE` | choice: `problem-json`, `plain-text`, `fuseki-plain-text` (lower case) | `problem-json` | start | How invalid SPARQL syntax is answered |
+| <a id="policy.sparql_parse_error_profile"></a>`policy.sparql_parse_error_profile` | `NRESE_SPARQL_PARSE_ERROR_PROFILE` | choice: `problem-json`, `plain-text`, `fuseki-plain-text` (lower case) | `problem-json` | start | How invalid SPARQL syntax is answered |
 
 `plain-text` reports invalid SPARQL syntax as a plain-text error instead of a problem document ([example](http-api.md#example-a-sparql-syntax-error)); the rest of the API keeps problem+json. `fuseki-plain-text` is another name for `plain-text`.
 
@@ -393,8 +393,8 @@ A fixed limit comes before every authenticated request: a body of known length u
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
-| `policy.exposure.operator_ui` | `NRESE_ENABLE_OPERATOR_UI` | bool | `true` | start | Whether the operator console (`/ops`) is served |
-| `policy.exposure.metrics` | `NRESE_ENABLE_METRICS` | bool | `true` | start | Whether `/metrics` is served |
+| <a id="policy.exposure.operator_ui"></a>`policy.exposure.operator_ui` | `NRESE_ENABLE_OPERATOR_UI` | bool | `true` | start | Whether the operator console (`/ops`) is served |
+| <a id="policy.exposure.metrics"></a>`policy.exposure.metrics` | `NRESE_ENABLE_METRICS` | bool | `true` | start | Whether `/metrics` is served |
 
 ## Auth Modes
 
@@ -402,34 +402,34 @@ All authentication settings are scope start. Secrets are never printed and are r
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `auth.mode` | `NRESE_AUTH_MODE` | choice: `none`, `bearer-static`, `bearer-jwt`, `mtls`, `oidc-introspection` | `none` | How requests are authenticated; each mode's required settings are below, and a missing one is a startup error |
+| <a id="auth.mode"></a>`auth.mode` | `NRESE_AUTH_MODE` | choice: `none`, `bearer-static`, `bearer-jwt`, `mtls`, `oidc-introspection` | `none` | How requests are authenticated; each mode's required settings are below, and a missing one is a startup error |
 
 ### Static Bearer
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `auth.bearer_static.read_token` | `NRESE_AUTH_READ_TOKEN` | text, secret | none | The token that may read |
-| `auth.bearer_static.admin_token` | `NRESE_AUTH_ADMIN_TOKEN` | text, secret | required | The token that may administer |
+| <a id="auth.bearer_static.read_token"></a>`auth.bearer_static.read_token` | `NRESE_AUTH_READ_TOKEN` | text, secret | none | The token that may read |
+| <a id="auth.bearer_static.admin_token"></a>`auth.bearer_static.admin_token` | `NRESE_AUTH_ADMIN_TOKEN` | text, secret | required | The token that may administer |
 
 ### JWT Bearer
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `auth.bearer_jwt.shared_secret` | `NRESE_AUTH_JWT_SECRET` | text, secret | required | The HMAC secret tokens are signed with |
-| `auth.bearer_jwt.issuer` | `NRESE_AUTH_JWT_ISSUER` | text | none | The issuer tokens must name |
-| `auth.bearer_jwt.audience` | `NRESE_AUTH_JWT_AUDIENCE` | text | none | The audience tokens must name |
-| `auth.bearer_jwt.read_role` | `NRESE_AUTH_JWT_READ_ROLE` | text | `nrese.read` | The role that may read |
-| `auth.bearer_jwt.admin_role` | `NRESE_AUTH_JWT_ADMIN_ROLE` | text | `nrese.admin` | The role that may administer |
-| `auth.bearer_jwt.leeway_seconds` | `NRESE_AUTH_JWT_LEEWAY_SECS` | integer (seconds) | `30` | Clock leeway for expiry checks |
+| <a id="auth.bearer_jwt.shared_secret"></a>`auth.bearer_jwt.shared_secret` | `NRESE_AUTH_JWT_SECRET` | text, secret | required | The HMAC secret tokens are signed with |
+| <a id="auth.bearer_jwt.issuer"></a>`auth.bearer_jwt.issuer` | `NRESE_AUTH_JWT_ISSUER` | text | none | The issuer tokens must name |
+| <a id="auth.bearer_jwt.audience"></a>`auth.bearer_jwt.audience` | `NRESE_AUTH_JWT_AUDIENCE` | text | none | The audience tokens must name |
+| <a id="auth.bearer_jwt.read_role"></a>`auth.bearer_jwt.read_role` | `NRESE_AUTH_JWT_READ_ROLE` | text | `nrese.read` | The role that may read |
+| <a id="auth.bearer_jwt.admin_role"></a>`auth.bearer_jwt.admin_role` | `NRESE_AUTH_JWT_ADMIN_ROLE` | text | `nrese.admin` | The role that may administer |
+| <a id="auth.bearer_jwt.leeway_seconds"></a>`auth.bearer_jwt.leeway_seconds` | `NRESE_AUTH_JWT_LEEWAY_SECS` | integer (seconds) | `30` | Clock leeway for expiry checks |
 
 ### Proxy-Terminated mTLS
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `auth.mtls.subject_header` | `NRESE_AUTH_MTLS_SUBJECT_HEADER` | text | `x-client-cert-subject` | The header the TLS-terminating proxy passes the client certificate's subject in |
-| `auth.mtls.read_subjects` | `NRESE_AUTH_MTLS_READ_SUBJECTS` | list (`;`) | none | The subjects that may read |
-| `auth.mtls.admin_subjects` | `NRESE_AUTH_MTLS_ADMIN_SUBJECTS` | list (`;`) | required | The subjects that may administer |
-| `auth.mtls.trusted_proxies` | `NRESE_AUTH_MTLS_TRUSTED_PROXIES` | list (`,`): addresses or ranges such as `10.0.0.0/8` | loopback | The peers that terminate TLS and may pass the subject header on. From any other peer the header is dropped before authentication, so a client that reaches the server's port directly can't claim a subject. With the proxy in another container or host, list its address or network here |
+| <a id="auth.mtls.subject_header"></a>`auth.mtls.subject_header` | `NRESE_AUTH_MTLS_SUBJECT_HEADER` | text | `x-client-cert-subject` | The header the TLS-terminating proxy passes the client certificate's subject in |
+| <a id="auth.mtls.read_subjects"></a>`auth.mtls.read_subjects` | `NRESE_AUTH_MTLS_READ_SUBJECTS` | list (`;`) | none | The subjects that may read |
+| <a id="auth.mtls.admin_subjects"></a>`auth.mtls.admin_subjects` | `NRESE_AUTH_MTLS_ADMIN_SUBJECTS` | list (`;`) | required | The subjects that may administer |
+| <a id="auth.mtls.trusted_proxies"></a>`auth.mtls.trusted_proxies` | `NRESE_AUTH_MTLS_TRUSTED_PROXIES` | list (`,`): addresses or ranges such as `10.0.0.0/8` | loopback | The peers that terminate TLS and may pass the subject header on. From any other peer the header is dropped before authentication, so a client that reaches the server's port directly can't claim a subject. With the proxy in another container or host, list its address or network here |
 
 File format of the subject lists:
 - string: `admin_subjects = "CN=admin,O=Example"`
@@ -439,12 +439,12 @@ File format of the subject lists:
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `auth.oidc_introspection.introspection_url` | `NRESE_AUTH_OIDC_INTROSPECTION_URL` | text: a URL | required | The OAuth 2.0 token introspection endpoint |
-| `auth.oidc_introspection.client_id` | `NRESE_AUTH_OIDC_CLIENT_ID` | text | none | The client id the server introspects as |
-| `auth.oidc_introspection.client_secret` | `NRESE_AUTH_OIDC_CLIENT_SECRET` | text, secret | none | The client secret the server introspects with |
-| `auth.oidc_introspection.read_role` | `NRESE_AUTH_OIDC_READ_ROLE` | text | `nrese.read` | The role that may read |
-| `auth.oidc_introspection.admin_role` | `NRESE_AUTH_OIDC_ADMIN_ROLE` | text | `nrese.admin` | The role that may administer |
-| `auth.oidc_introspection.timeout_ms` | `NRESE_AUTH_OIDC_TIMEOUT_MS` | integer (milliseconds, no unit) | `5000` | Per introspection request |
+| <a id="auth.oidc_introspection.introspection_url"></a>`auth.oidc_introspection.introspection_url` | `NRESE_AUTH_OIDC_INTROSPECTION_URL` | text: a URL | required | The OAuth 2.0 token introspection endpoint |
+| <a id="auth.oidc_introspection.client_id"></a>`auth.oidc_introspection.client_id` | `NRESE_AUTH_OIDC_CLIENT_ID` | text | none | The client id the server introspects as |
+| <a id="auth.oidc_introspection.client_secret"></a>`auth.oidc_introspection.client_secret` | `NRESE_AUTH_OIDC_CLIENT_SECRET` | text, secret | none | The client secret the server introspects with |
+| <a id="auth.oidc_introspection.read_role"></a>`auth.oidc_introspection.read_role` | `NRESE_AUTH_OIDC_READ_ROLE` | text | `nrese.read` | The role that may read |
+| <a id="auth.oidc_introspection.admin_role"></a>`auth.oidc_introspection.admin_role` | `NRESE_AUTH_OIDC_ADMIN_ROLE` | text | `nrese.admin` | The role that may administer |
+| <a id="auth.oidc_introspection.timeout_ms"></a>`auth.oidc_introspection.timeout_ms` | `NRESE_AUTH_OIDC_TIMEOUT_MS` | integer (milliseconds, no unit) | `5000` | Per introspection request |
 
 ### Graph-Level Access Control
 
@@ -452,10 +452,10 @@ The rules are the server's access state (users, workspaces, personal spaces, rol
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `auth.access_policy` | `NRESE_ACCESS_POLICY` | text: a path | none | An access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form |
-| `auth.local_logins` | `NRESE_AUTH_LOCAL_LOGINS` | bool | `true` | Whether users of the access state with a password log in (`Basic` credentials, or a session from `POST /api/v1/access/login`) besides the authentication mode; for standalone and desktop installations without an identity provider |
-| `auth.trusted_proxies` | `NRESE_AUTH_TRUSTED_PROXIES` | list (`,`): addresses or ranges | loopback | The reverse proxies whose `X-Forwarded-For` names the client. Failed local logins are counted per user name and client address (past 10, each further attempt waits, from one second doubling up to five minutes) and per client address over all names (past 100); behind a proxy that isn't listed here, every client has the proxy's address, so list it |
-| `auth.workspace_base` | `NRESE_WORKSPACE_BASE` | text | `urn:nrese:` | What workspace graph prefixes start with: a personal space is `{base}space/{user}/` (a local user's `{base}space/{user}~{id}/`), a workspace `{base}workspace/{name}~{id}/` ([HTTP interface](http-api.md#users-workspaces-and-policies-apiv1access)) |
+| <a id="auth.access_policy"></a>`auth.access_policy` | `NRESE_ACCESS_POLICY` | text: a path | none | An access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form |
+| <a id="auth.local_logins"></a>`auth.local_logins` | `NRESE_AUTH_LOCAL_LOGINS` | bool | `true` | Whether users of the access state with a password log in (`Basic` credentials, or a session from `POST /api/v1/access/login`) besides the authentication mode; for standalone and desktop installations without an identity provider |
+| <a id="auth.trusted_proxies"></a>`auth.trusted_proxies` | `NRESE_AUTH_TRUSTED_PROXIES` | list (`,`): addresses or ranges | loopback | The reverse proxies whose `X-Forwarded-For` names the client. Failed local logins are counted per user name and client address (past 10, each further attempt waits, from one second doubling up to five minutes) and per client address over all names (past 100); behind a proxy that isn't listed here, every client has the proxy's address, so list it |
+| <a id="auth.workspace_base"></a>`auth.workspace_base` | `NRESE_WORKSPACE_BASE` | text | `urn:nrese:` | What workspace graph prefixes start with: a personal space is `{base}space/{user}/` (a local user's `{base}space/{user}~{id}/`), a workspace `{base}workspace/{name}~{id}/` ([HTTP interface](http-api.md#users-workspaces-and-policies-apiv1access)) |
 
 The policy file (TOML), per role:
 
@@ -487,28 +487,28 @@ All AI settings are scope start. Secrets are never printed and are refused by `-
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `ai.enabled` | `NRESE_AI_ENABLED` | bool | `false` | Whether suggestions are offered; while `false` the provider is off whatever `ai.provider` says |
-| `ai.provider` | `NRESE_AI_PROVIDER` | choice: `disabled`, `gemini`, `openrouter` (lower case) | `disabled` | Who makes the suggestions; `gemini` and `openrouter` need their API key (a startup error without it) |
-| `ai.model` | `NRESE_AI_MODEL` | text | `gemini-2.5-flash` | The provider's model |
-| `ai.timeout_ms` | `NRESE_AI_TIMEOUT_MS` | integer (milliseconds, no unit) | `20000` | Per suggestion request |
-| `ai.max_suggestions` | `NRESE_AI_MAX_SUGGESTIONS` | integer | `4` | Suggestions per request |
-| `ai.system_prompt` | `NRESE_AI_SYSTEM_PROMPT` | text | a built-in prompt asking for strict JSON and safe read queries | The system prompt of suggestion requests |
+| <a id="ai.enabled"></a>`ai.enabled` | `NRESE_AI_ENABLED` | bool | `false` | Whether suggestions are offered; while `false` the provider is off whatever `ai.provider` says |
+| <a id="ai.provider"></a>`ai.provider` | `NRESE_AI_PROVIDER` | choice: `disabled`, `gemini`, `openrouter` (lower case) | `disabled` | Who makes the suggestions; `gemini` and `openrouter` need their API key (a startup error without it) |
+| <a id="ai.model"></a>`ai.model` | `NRESE_AI_MODEL` | text | `gemini-2.5-flash` | The provider's model |
+| <a id="ai.timeout_ms"></a>`ai.timeout_ms` | `NRESE_AI_TIMEOUT_MS` | integer (milliseconds, no unit) | `20000` | Per suggestion request |
+| <a id="ai.max_suggestions"></a>`ai.max_suggestions` | `NRESE_AI_MAX_SUGGESTIONS` | integer | `4` | Suggestions per request |
+| <a id="ai.system_prompt"></a>`ai.system_prompt` | `NRESE_AI_SYSTEM_PROMPT` | text | a built-in prompt asking for strict JSON and safe read queries | The system prompt of suggestion requests |
 
 ### Gemini
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `ai.gemini.api_key` | `NRESE_AI_GOOGLE_API_KEY` | text, secret | none (`GOOGLE_API_KEY` is the fallback when `NRESE_AI_GOOGLE_API_KEY` is not set) | The Gemini API key |
-| `ai.gemini.api_base` | `NRESE_AI_GOOGLE_API_BASE` | text: a URL | `https://generativelanguage.googleapis.com` | The Gemini API's base URL |
+| <a id="ai.gemini.api_key"></a>`ai.gemini.api_key` | `NRESE_AI_GOOGLE_API_KEY` | text, secret | none (`GOOGLE_API_KEY` is the fallback when `NRESE_AI_GOOGLE_API_KEY` is not set) | The Gemini API key |
+| <a id="ai.gemini.api_base"></a>`ai.gemini.api_base` | `NRESE_AI_GOOGLE_API_BASE` | text: a URL | `https://generativelanguage.googleapis.com` | The Gemini API's base URL |
 
 ### OpenRouter
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
-| `ai.openrouter.api_key` | `NRESE_AI_OPENROUTER_API_KEY` | text, secret | none | The OpenRouter API key |
-| `ai.openrouter.api_base` | `NRESE_AI_OPENROUTER_API_BASE` | text: a URL | `https://openrouter.ai/api/v1` | The OpenRouter API's base URL |
-| `ai.openrouter.site_url` | `NRESE_AI_OPENROUTER_SITE_URL` | text | none | The site URL sent to OpenRouter |
-| `ai.openrouter.app_name` | `NRESE_AI_OPENROUTER_APP_NAME` | text | none | The application name sent to OpenRouter |
+| <a id="ai.openrouter.api_key"></a>`ai.openrouter.api_key` | `NRESE_AI_OPENROUTER_API_KEY` | text, secret | none | The OpenRouter API key |
+| <a id="ai.openrouter.api_base"></a>`ai.openrouter.api_base` | `NRESE_AI_OPENROUTER_API_BASE` | text: a URL | `https://openrouter.ai/api/v1` | The OpenRouter API's base URL |
+| <a id="ai.openrouter.site_url"></a>`ai.openrouter.site_url` | `NRESE_AI_OPENROUTER_SITE_URL` | text | none | The site URL sent to OpenRouter |
+| <a id="ai.openrouter.app_name"></a>`ai.openrouter.app_name` | `NRESE_AI_OPENROUTER_APP_NAME` | text | none | The application name sent to OpenRouter |
 
 ## Ownership Rules
 
