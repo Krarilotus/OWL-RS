@@ -1276,7 +1276,7 @@ metric = "whole_ms"
 # The tool prints its phases in 0.1 ms steps, and here prepare and write take microseconds (there
 # is no subsumption to write): in a release run (13 Nov 2026) both were 0.0 on every pass of the
 # baseline. The gate judges them below the counter's resolution, covered by `wall`, the process's
-# whole run as the harness times it (release_gate.dimension).
+# whole run as the harness times it, and a cost appearing in them blocks (release_gate.dimension).
 # Disjointness axioms imply no subsumption between named classes; 150,002 concepts is three
 # per axiom (A_i, B_i, the filler) and two more, as every round of #78's timing read it.
 check = { "concepts" = "150002", "subsumptions" = "0" }

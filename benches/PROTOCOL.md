@@ -308,7 +308,10 @@ phuoc-yu and the big host); a declared hypothesis a round doesn't test counts at
   dropped: it stands for half a step. Below it on both sides in every block, a hypothesis is
   *below resolution*: outside the Holm family, and covered by its case's measured whole run
   (`time/wall`), or it blocks. Below it on the candidate alone in every block: *vanished*, a gain,
-  outside the family. Any other mix of blocks is tested, and `unresolved` where it isn't rejected.
+  outside the family. Below it on the baseline alone in every block: *emerged*, a cost appearing
+  where there was none to time; outside the family, it blocks from whichever round has it unless
+  an `[[emerged]]` entry of the owner's policy covers it. Any other mix of blocks is tested, and
+  `unresolved` where it isn't rejected.
 
 Other blocks (a case failing, lost series or answers, a run that doesn't qualify) aren't
 retried away: they block from whichever round has them.

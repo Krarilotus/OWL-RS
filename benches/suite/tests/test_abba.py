@@ -44,13 +44,15 @@ min_samples = 3
 '''
 
 
-def records(b=1.0, a2=1.0, broken=None, checked=True):
+def records(b=1.0, a2=1.0, broken=None, checked=True, zero=()):
     """records_of for fixture.passes: B `b` times A, A' `a2` times A (each a little jitter), every
-    declared content check passing (`checked`), and `broken(side, n)` a record that failed."""
+    declared content check passing (`checked`), `broken(side, n)` a record that failed, and the
+    sides in `zero` reading 0.0 for q06."""
     def records_of(side, n):
         jitter = 1 + 0.004 * ((n * 7) % 5 - 2)
         scale = {"b": fixture.worse(b, n) if b != 1 else 1.0, "a2": a2 * jitter}.get(side, 1.0)
-        rec = fixture.record(samples={s: [v * scale for v in (4.8, 4.85, 4.8)] for s in SERIES})
+        rec = fixture.record(samples={s: [0.0] * 3 if side in zero and s == SERIES[1] else
+                                      [v * scale for v in (4.8, 4.85, 4.8)] for s in SERIES})
         if checked:
             rec["checks"] = [{"path": p, "expected": v, "got": v, "ok": True} for p, v in CHECKS.items()]
             for o in rec["observations"]:  # perf_lab checks each invocation's answer
@@ -313,6 +315,18 @@ systems = []
                 code, text = self.verdict(*rounds)
                 self.assertEqual(code, abba.NO_VERDICT, text)
                 self.assertIn(why, text)
+
+    def test_a_cost_appearing_from_below_the_counter_s_step_is_a_confirmed_loss(self):
+        """The gate's `emerged` (below-resolution design, 14 Nov 2026): A and A' read q06 0.0 in
+        every block, B 4.8: a cost decided by the readings, no round to wait for, and A-B-B-A has
+        no owner's entry to accept it (Sol, below-resolution r1: it exited 0, "no loss shown").
+        Between A and its copy the same appearance voids the round, as any A-A' difference does."""
+        code, text = self.verdict(self.round_(records(zero=("a", "a2")), name="emerged"))
+        self.assertEqual(code, abba.CONFIRMED, text)
+        self.assertIn("q06-text-filter emerged from below the counter's step", text)
+        code, text = self.verdict(self.round_(records(zero=("a", "b")), name="copy-emerged"))
+        self.assertEqual(code, abba.NO_VERDICT, text)
+        self.assertIn("the A-A' arm itself differs: lab-olympics", text)
 
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 8"), encoding="utf-8")
