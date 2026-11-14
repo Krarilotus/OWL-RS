@@ -288,7 +288,7 @@ impl<T: Visits + ?Sized> Source for T {
 /// How a source hands a scan's positions to its reader: each counted on the reading task's
 /// poller before the reader sees it, so no source can deliver work the poller didn't count.
 /// Only [`Source`]'s reads make one; a source that reads another hands it on
-/// ([`Visit::within`]).
+/// (`Visit::within`).
 pub struct Visit<'v, 'p> {
     poll: &'v Poller<'p>,
     f: &'v mut dyn FnMut(Triple),
@@ -1649,7 +1649,7 @@ impl<'a> OperationStop<'a> {
 }
 
 /// The filter of a morsel's derived facts, reading with the morsel's poller: [`Stopped`]
-/// once that has stopped, which ends the morsel's keep ([`keep_until_stopped`]).
+/// once that has stopped, which ends the morsel's keep (`keep_until_stopped`).
 pub type Keep<'k> = &'k (dyn Fn(Triple, &Poller<'_>) -> Result<bool, Stopped> + Sync);
 
 /// Keeps the facts `keep` accepts, in order, until it answers [`Stopped`]: then `facts` is
@@ -2764,7 +2764,7 @@ impl GroundProgram {
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`): a
     /// bodiless instance, a rule whose head matches it, or (optionally: the caller may
     /// recompute its closure) transitivity; searching under `stop`
-    /// ([`Self::derivable_through`]).
+    /// (`Self::derivable_through`).
     pub fn derivable_with<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -2873,7 +2873,7 @@ impl GroundProgram {
     }
 
     /// Whether one of the rules `only` marks, or with `bodiless_too` a bodiless instance,
-    /// derives `fact` from `source` in one step ([`Self::derivable_through`], without
+    /// derives `fact` from `source` in one step (`Self::derivable_through`, without
     /// transitivity), searching under `stop`.
     pub fn derivable_by<S: Source + ?Sized>(
         &self,

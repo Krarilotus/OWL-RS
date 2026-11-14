@@ -1,7 +1,7 @@
 //! The OWL 2 Functional-Style Syntax reader (W3C *OWL 2 Structural Specification*,
 //! §§3–11): ontology documents straight into the structural model the RDF reader builds
 //! ([`crate::read`]), over the same term ids, so that both readings of an ontology are one
-//! model and the model's way back to triples ([`crate::write`]) serves both.
+//! model and the model's way back to triples ([`crate::write()`]) serves both.
 //!
 //! - **Terms** are made by the caller ([`Intern`]): the IRIs, literals and anonymous
 //!   individuals the text names get the ids the caller's store gives them, as the triples
