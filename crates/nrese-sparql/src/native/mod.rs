@@ -889,6 +889,11 @@ thread_local! {
     /// The plannings planned again without the characteristic sets on this thread
     /// ([`Context::with_sets`]).
     static REPLANS: Cell<usize> = const { Cell::new(0) };
+    /// Run where an admitted BGP has asked for the statistics ([`Context::with_sets`]), as
+    /// part of that call, which builds them or waits for a build: true keeps its answer,
+    /// false makes it none (a build that failed or wasn't kept). A test's way to cancel a
+    /// query while it asks.
+    static STATISTICS_ASKED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
 }
 
 /// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
@@ -3759,13 +3764,19 @@ impl<'a> Context<'a> {
             return Ok(plain);
         }
         // Asking for the statistics may build them, or wait for a build, and takes no
-        // cancellation of its own: a cancelled query doesn't ask.
-        let Some(sets) = self.snapshot.characteristic_sets_in(self.model) else {
-            return Ok(plain);
-        };
+        // cancellation of its own: a cancelled query doesn't ask, and one cancelled while it
+        // asked fails, whether the statistics came back or not.
+        let sets = self.snapshot.characteristic_sets_in(self.model);
+        #[cfg(test)]
+        let sets = sets.filter(|_| {
+            STATISTICS_ASKED.with_borrow(|asked| asked.as_ref().is_none_or(|asked| asked()))
+        });
         if cancelled() {
             return Err(QueryEvaluationError::Cancelled.into());
         }
+        let Some(sets) = sets else {
+            return Ok(plain);
+        };
         let budget = plan::budget_for(expected);
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.

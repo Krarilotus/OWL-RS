@@ -806,6 +806,41 @@ fn a_query_cancelled_in_its_set_search_gets_no_plan() {
     );
 }
 
+/// Spec: the budget's cancellation rule and the code review of 14 November (R2-F1): a query
+/// cancelled while its admitted BGP asks for the statistics fails as cancelled, whether they
+/// come back or not (a build that failed or wasn't kept answers none), and plans nothing more.
+/// Red with the plain plan returned for no statistics before the check.
+#[test]
+fn a_query_cancelled_while_it_asks_for_the_statistics_gets_no_plan() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    for answer in [false, true] {
+        let token = CancellationToken::new();
+        let options = QueryOptions {
+            resources: Resources {
+                cancellation: Some(token.clone()),
+                ..Resources::default()
+            },
+            ..QueryOptions::default()
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        STATISTICS_ASKED.set(Some(Box::new(move || {
+            token.cancel();
+            answer
+        })));
+        plan::ADMIT.set(Some(true));
+        let (planned, asked) = plannings(&ctx, &STAR);
+        plan::ADMIT.set(None);
+        STATISTICS_ASKED.set(None);
+        assert!(
+            matches!(planned, Err(QueryEvaluationError::Cancelled)),
+            "statistics kept {answer}: {:?}",
+            planned.ok().map(|p| steps(&p))
+        );
+        assert_eq!(asked, vec![false], "statistics kept {answer}: plannings");
+    }
+}
+
 /// Spec: the master's order of 13 November, "plain planning pays only for what it uses: no
 /// search state built when the gate keeps a group from the sets": a search without the
 /// characteristic sets keeps no star predicates or edges in its states (only the estimates
