@@ -73,6 +73,30 @@
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
 
+# The DBpedia core store load's memory peak (reopen-dbpedia's setup: 67 M quads loaded into a store on
+# disk), measured apart in the gate's form: a 10 GB scope, anon + kernel every 50 ms, on the gate's host,
+# 14 Nov 2026.
+# - engine-v2 with the arena fix (#335) and the checkpoint release (#330): 5.95 GiB, the median of five
+#   runs; seven later runs of the same code gave 5.80-5.95 (median 5.91). Main: 5.20, and 5.14-5.18 in
+#   the later runs. That is x1.14-1.15.
+# - Load time: 15.4 s against main's 28.0 s. The gate doesn't time a case's setup, so the paying win
+#   named is the bulk load it does time: load-entities, 1.98 s against main's 4.01 s (the medians of
+#   every pass of the last release run).
+# - max_ratio 1.25: from these runs, every 3-block round that would flag the row has its interval's
+#   worse end at or below 1.25 (typically 1.17-1.20). Loads that lose the checkpoint release (6.5 GiB,
+#   x1.27) stay above it.
+[[tradeoff]]
+case = "reopen-dbpedia"
+dimension = "memory/anon_kernel"
+against = "main"
+max_ratio = 1.25
+approved = "2026-11-14"
+by = "Johannes"
+reason = "the DBpedia core store load peaks about 0.75 GiB above main (5.95 against 5.20 GiB) and is 1.8 times as fast; the remainder is resident in the allocator's arenas, not memory freed lazily. budgets.bulk_load_memory and budgets.huge_pages lower it, at a cost in load time"
+quote = "Ok"
+source = "his answer of 14 Nov 2026 to the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
+pays_with = { case = "load-entities", dimension = "time/_" }
+
 # The release baselines' measurement builds can't run these cases yet, though their products
 # can (a static audit of each build against each case's command, 11 Nov 2026). Each pair stays
 # uncompared until the port its entry names lands.
