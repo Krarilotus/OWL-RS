@@ -46,13 +46,8 @@ The service user MUST own data and log directories with least privilege.
 ## 5. Configuration Surface
 The canonical runtime knob reference is [config-reference.md](./config-reference.md).
 
-Configuration precedence ([config-reference.md](./config-reference.md#precedence)): a value is
-taken from the first of
-1. the command line: `--set KEY=VALUE` with a file key, repeatable, for every command
-   (secrets are refused there)
-2. the environment variable
-3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
-4. the built-in default
+Which value wins when a setting is given in several places (command line, environment, file,
+default): [precedence](./config-reference.md#precedence).
 
 Current behavior:
 

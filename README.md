@@ -38,7 +38,7 @@ You need:
   default builder;
 - curl 7.71 or later (`curl --version`; [download](https://curl.se/download.html));
 - for the build: an amd64 CPU of level [x86-64-v3](https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels)
-  (AVX2 and FMA: Intel from Haswell, 2013; AMD from Excavator, 2015; on Linux,
+  (Intel from Haswell, 2013; AMD from Excavator, 2015; on Linux,
   `/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3` says `supported`), or an arm64 CPU
   from Neoverse N1 on (AWS Graviton2, Ampere Altra); for an older one, add
   `--build-arg NRESE_TARGET_CPU=portable` to `docker build`; and about 3 GB of free
@@ -106,7 +106,7 @@ nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the
 ```
 
 Other headers are left out here, and `…` marks shortened text: compare the status, the
-`regime` and the rows.
+`regime` and the rows, as [the record of its last run](docs/dev/first-example-record.md) does.
 
 The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
 `NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
