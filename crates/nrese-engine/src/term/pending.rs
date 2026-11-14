@@ -209,9 +209,9 @@ impl Pending {
     /// against 3 K; 14 Nov 2026). One arena allocated whole, after that release, lies on
     /// huge pages where the kernel gives them. Copied whole and given back after, the
     /// arrays and the arena were both resident: DBpedia core's store load peaked 0.25 GiB
-    /// higher (phuoc-yu, 14 Nov 2026). The arena costs DBpedia core's load about 3 % of its
+    /// higher (14 Nov 2026). The arena costs DBpedia core's load about 3 % of its
     /// time, the new pages' faults; a parallel copy, a zeroed arena and steps of 512 MiB
-    /// were no faster (office-pc, 14 Nov 2026).
+    /// were no faster (14 Nov 2026).
     pub(crate) fn gather(self) -> Gathered {
         self.gather_by(GATHER_STEP)
     }
