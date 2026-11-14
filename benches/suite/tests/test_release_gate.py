@@ -1642,6 +1642,26 @@ class Memory(unittest.TestCase):
         self.assertIn("base|alloc-load-live|memory/live", gate_module.family_of([live], ["alloc-load-live"]))
 
 
+class ToolPhases(unittest.TestCase):
+    def test_a_classifier_case_declares_the_phases_its_tool_resolves(self):
+        # Spec (benches/cases/README.md, what the tool can resolve; master, 14 Nov 01:41):
+        # el-shallow-existentials' prepare and write print 0.0 at the EL classifier's 0.1 ms on
+        # every pass of the baseline, so its family has its other four phases, against each
+        # baseline; another EL case keeps all six the tool prints (its profile line, classify.rs).
+        catalog = fast.load_cases()
+        family = gate_module.family_of(catalog, ["el-shallow-existentials", "el-classify"])
+        times = lambda case, side: sorted(h.split("|")[2] for h in family
+                                          if h.startswith(f"{side}|{case}|time/"))
+        for side in ("base", "main"):
+            with self.subTest(side=side):
+                self.assertEqual(times("el-shallow-existentials", side),
+                                 ["time/assemble", "time/normalise", "time/read", "time/saturate"])
+                self.assertEqual(times("el-classify", side),
+                                 ["time/assemble", "time/normalise", "time/prepare", "time/read",
+                                  "time/saturate", "time/write"])
+                self.assertIn(f"{side}|el-shallow-existentials|memory/anon_kernel", family)
+
+
 class Evidence(unittest.TestCase):
     def test_a_declared_hypothesis_without_candidate_evidence_fails_closed(self):
         """Sol, 20 Oct 2026: with the baseline's memory reading and none from the candidate, the

@@ -587,9 +587,9 @@ def hypothesis(side: str, case: str, dimension_: str) -> str:
     return f"{side}|{case}|{dimension_}"
 
 
-# The phases each classifier tool times (fast.py's samples(): the profile's fields it reports).
-DL_TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
-                  "classify-horn": ("read", "owl", "write")}
+# The phases each classifier tool times (fast.py's samples(): the profile's fields it reports);
+# a case's `phases` declares fewer where the tool can't resolve the others (benches/cases/README.md).
+DL_TOOL_PHASES = cases_registry.TOOL_PHASES
 
 
 def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] = ("base", "main")) -> list[str]:
@@ -607,7 +607,7 @@ def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] 
             continue
         tool = case.get("tool", "perf_lab")
         series = manifest_["series"].get(name) or (list(fast.DL_PHASES) if tool == "tableau" else
-                                                   list(DL_TOOL_PHASES.get(tool, ["_"])))
+                                                   list(case.get("phases") or DL_TOOL_PHASES.get(tool, ["_"])))
         dims = [f"time/{s}" for s in series]
         dims += [f"qps/{n}" for n in manifest_["clients"].get(name, [])]
         dims.append("memory/anon_kernel")
