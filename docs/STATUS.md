@@ -159,7 +159,7 @@ The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gat
 ## Beyond OWL 2 DL (branch `v15/dl-beyond`, 13 October)
 
 Inputs outside OWL 2 DL are decided where that is sound, and where it isn't the answer says why ([design](design/owl2-dl.md) §16;
-[campaigns and ORE](../benches/reasoning/dl/README.md#inputs-outside-owl-2-dl-13-october-2026-office-pc-queue-jobs)):
+[campaigns and ORE](../benches/reasoning/dl/README.md#inputs-outside-owl-2-dl-13-october-2026-queue-jobs)):
 `nrese_dl::beyond` answers consistency and classification of inputs the reader finds
 outside OWL 2 DL. Every "consistent" rests on a model the independent checker verifies
 against every axiom and rule (data values included since 13 October), every
