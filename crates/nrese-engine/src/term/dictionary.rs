@@ -1230,7 +1230,7 @@ impl Dictionary {
             Part::Shard(adopted, s, slice) => {
                 let shard = &adopted.shards[s];
                 let from = out.len();
-                let tested = matcher.slice(&shard.bytes, &shard.ends[..], slice, 0, out);
+                let tested = matcher.slice(adopted.text_of(s), &shard.ends[..], slice, 0, out);
                 let mut kept = from;
                 for i in from..out.len() {
                     let found = out[i];
@@ -1535,25 +1535,28 @@ impl Dictionary {
 
     /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
     /// their first occurrence in the input: [`super::pending`]), adds them as a segment
-    /// (their text stays where it was interned), then calls `remap` with them so the load's
+    /// (their text moved into one arena), then calls `remap` with them so the load's
     /// quads take their ids. Readers go on meanwhile; writers wait for the adoption.
     ///
-    /// The adoption guard is held across the numbering only, whose parallel parts run on
-    /// threads of no pool and take no lock ([`Pending::number`]): every one ends, whatever
-    /// waits for the dictionary. `remap` runs after the guard is let go, with any parallel
-    /// work it likes: the ids it reads are published, and the terms are entries before any
-    /// quad refers to them (as an aborted transaction's are).
+    /// The texts move into the arena before the adoption guard is taken
+    /// ([`Pending::gather`]). The guard is held across the numbering only, whose parallel
+    /// parts run on threads of no pool and take no lock
+    /// ([`super::pending::Gathered::number`]): every one ends, whatever waits for the
+    /// dictionary. `remap` runs after the guard is let go, with any parallel work it likes:
+    /// the ids it reads are published, and the terms are entries before any quad refers to
+    /// them (as an aborted transaction's are).
     pub(crate) fn adopt_pending(&self, pending: Pending, remap: impl FnOnce(&Adopted)) {
         if pending.is_empty() {
             remap(&Adopted::empty(self.len()));
             return;
         }
+        let gathered = pending.gather();
         let segment = {
             let inner = self.inner.upgradable_read();
             let held: &Inner = &inner;
             // A load into an empty dictionary finds none of its terms there: no hashing.
             let empty = held.len() == 0;
-            let adopted = pending.number(held.len(), |key| match empty {
+            let adopted = gathered.number(held.len(), |key| match empty {
                 true => None,
                 false => held.find(key_hash(key), key),
             });
