@@ -57,6 +57,8 @@ mod join_order_tests;
 mod lone_pattern_tests;
 #[cfg(test)]
 mod optimise_tests;
+#[cfg(test)]
+mod overlap_tests;
 pub(crate) mod ql;
 mod ranges;
 mod scan_columns;
@@ -889,6 +891,11 @@ thread_local! {
     /// The plannings planned again without the characteristic sets on this thread
     /// ([`Context::with_sets`]).
     static REPLANS: Cell<usize> = const { Cell::new(0) };
+    /// Run where an admitted BGP has asked for the statistics ([`Context::with_sets`]), as
+    /// part of that call, which builds them or waits for a build: true keeps its answer,
+    /// false makes it none (a build that failed or wasn't kept). A test's way to cancel a
+    /// query while it asks.
+    static STATISTICS_ASKED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
 }
 
 /// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
@@ -3716,25 +3723,33 @@ impl<'a> Context<'a> {
         self.with_sets(inputs, &order)
     }
 
-    /// `planning` of `inputs`: first without the characteristic sets (the plain plan), then,
-    /// where an input is part of a star and the reads the set search would make at its starts
-    /// cost little against the work the plain plan expects ([`plan::admits`]), with them,
-    /// within a budget that follows that work ([`plan::budget_for`]; one policy for every path
-    /// that plans: scans, and scans with paths). A BGP the gate keeps from the sets, or whose
-    /// set search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
-    /// which planner a BGP got shows. A query cancelled in or between its plannings fails (a
+    /// `planning` of `inputs`: the plain plan (without the characteristic sets) first, and a
+    /// BGP is refined by the sets only where the work that plan expects admits it
+    /// ([`plan::admits`]): every other BGP keeps its plain plan and never asks for the
+    /// statistics. Admitted, it is searched with the sets within a budget that follows that
+    /// work ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
+    /// paths), and only where an input is part of an open star ([`plan::Star::open`]): without
+    /// one, the search would make the plain plan again. A BGP kept from the sets gets its plain
+    /// plan without a note: that is the normal case. One whose set search passes its budget gets
+    /// the plain plan too, noted for EXPLAIN ([`WITHOUT_SETS`]): the sets were wanted and the
+    /// budget stopped them. A query cancelled in or between its plannings fails (a
     /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
         planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
-        let start = Instant::now();
+        // Read only by EXPLAIN's notes: no clock for a query that isn't explained.
+        let start = self.trace.is_some().then(Instant::now);
         let cancelled = || {
             self.cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
+        // A cancelled query plans nothing.
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
         let mut plain = match planning(None, 0) {
             Ok(planned) if !cancelled() => planned,
             Ok(_) | Err(plan::Stopped::Cancelled) => {
@@ -3742,25 +3757,28 @@ impl<'a> Context<'a> {
             }
             Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
         };
-        if !inputs.iter().any(|i| i.star.is_some()) {
+        // Only an open star's patterns are estimated from the sets.
+        if !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())) {
             return Ok(plain);
         }
-        let Some(sets) = self.snapshot.characteristic_sets_in(self.model) else {
+        let expected = plan::expected_work(&plain);
+        if !plan::admits(expected) {
+            return Ok(plain);
+        }
+        // Asking for the statistics may build them, or wait for a build, and takes no
+        // cancellation of its own: a cancelled query doesn't ask, and one cancelled while it
+        // asked fails, whether the statistics came back or not.
+        let sets = self.snapshot.characteristic_sets_in(self.model);
+        #[cfg(test)]
+        let sets = sets.filter(|_| {
+            STATISTICS_ASKED.with_borrow(|asked| asked.as_ref().is_none_or(|asked| asked()))
+        });
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
+        let Some(sets) = sets else {
             return Ok(plain);
         };
-        let expected = plan::expected_work(&plain);
-        let reads = plan::start_reads(inputs, &sets);
-        if !plan::admits(expected, reads) {
-            if self.trace.is_some() {
-                let detail = format!(
-                    "{} patterns planned without characteristic sets: {reads} set entries at \
-                     its starts against {expected:.0} rows expected",
-                    inputs.len(),
-                );
-                self.note(WITHOUT_SETS, detail, None, 0, start);
-            }
-            return Ok(plain);
-        }
         let budget = plan::budget_for(expected);
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.
@@ -3773,7 +3791,7 @@ impl<'a> Context<'a> {
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
         plain.work = work;
-        if self.trace.is_some() {
+        if let Some(start) = start {
             let detail = format!(
                 "{} patterns planned without characteristic sets: \
                  estimate budget of {budget} passed after {work}",
@@ -3846,9 +3864,13 @@ impl<'a> Context<'a> {
     }
 
     /// Per pattern of `scans` with one variable, the values it has in common with each
-    /// other such pattern on the same variable ([`plan::Input::overlaps`]), where their
-    /// `counts` together are at most [`plan::OVERLAP_VALUES`]: both lists are read sorted
-    /// from the index and merged. `vars` are each pattern's variables ([`ScanPattern::vars`]).
+    /// other such pattern on the same variable ([`plan::Input::overlaps`]), where both their
+    /// `counts` (as planned, maybe narrowed by filters and ranges) and their patterns' own
+    /// counts are at most [`plan::OVERLAP_VALUES`] together: both lists are read sorted from
+    /// the index a column at a time, charged to the query's budget, and merged. A pattern the
+    /// index can't give so, or a read the budget refuses, has no count with any other: the
+    /// plan keeps its plain estimate (D16-575). `vars` are each pattern's variables
+    /// ([`ScanPattern::vars`]).
     fn overlaps(
         &self,
         scans: &[ScanPattern],
@@ -3871,10 +3893,22 @@ impl<'a> Context<'a> {
                 Some((v, position))
             })
             .collect();
-        // The pairs whose common values are counted: two of them on one variable, small.
-        let counted = |i: usize, j: usize| match (single[i], single[j]) {
-            (Some((a, _)), Some((b, _))) => {
-                a == b && counts[i].saturating_add(counts[j]) <= plan::OVERLAP_VALUES
+        // The pairs whose common values are counted: two of them on one variable, small as
+        // planned and by their patterns' own counts, the rows a read decodes (a filter's or a
+        // range's share is read whole). The own counts are taken once each, only for pairs
+        // small as planned: a pair past that isn't read either way.
+        let mut own: Vec<Option<u64>> = vec![None; scans.len()];
+        let mut counted = |i: usize, j: usize| match (single[i], single[j]) {
+            (Some((a, _)), Some((b, _)))
+                if a == b && counts[i].saturating_add(counts[j]) <= plan::OVERLAP_VALUES =>
+            {
+                let mut size = |k: usize| {
+                    *own[k].get_or_insert_with(|| {
+                        self.snapshot
+                            .estimate_in(self.model, &scans[k].quad_pattern())
+                    })
+                };
+                size(i).saturating_add(size(j)) <= plan::OVERLAP_VALUES
             }
             _ => false,
         };
@@ -3902,7 +3936,7 @@ impl<'a> Context<'a> {
             return out;
         };
         // The lists' charge, while they live: the columns decoded for them are charged before
-        // they are (the read quad by quad is bounded by OVERLAP_VALUES, as before).
+        // they are.
         let mut held = Reservation::new(&*self.budget);
         // Declared after `held`: freed before their charge is released.
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
@@ -3928,18 +3962,19 @@ impl<'a> Context<'a> {
                             &[position],
                             &self.budget,
                         );
+                        // Only a column read is a list: charged before it decodes, and
+                        // complete or refused. Where the index can't give the pattern so
+                        // (an equality expansion, several runs, deletions) a read quad by
+                        // quad would hold it uncharged, and an expansion the budget stops
+                        // would end as if complete (D16-575): no list, as for a refusal; the
+                        // plan goes without.
                         lists[k] = match decoded {
                             Ok(Some(columns)) => {
                                 let (mut columns, charge) = columns.into_parts();
                                 held.absorb(charge);
                                 columns.pop()
                             }
-                            Ok(None) => self
-                                .snapshot
-                                .scan_sorted_in(self.model, &pattern, permutation)
-                                .map(|quads| quads.map(|q| q.components()[position]).collect()),
-                            // Refused: no overlap known for it; the plan goes without.
-                            Err(_) => None,
+                            Ok(None) | Err(_) => None,
                         };
                     }
                 }
