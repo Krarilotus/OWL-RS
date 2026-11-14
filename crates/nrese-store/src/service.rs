@@ -290,15 +290,17 @@ impl StoreService {
             last_materialisation: std::sync::Arc::default(),
         };
         // The planner's statistics are the store's, shared by its requests: an envelope of
-        // their own within the catalog's budget, as classification's.
+        // their own within the catalog's budget, exact (no request's credit: it lives as long
+        // as the store).
+        let kept = || nrese_exec::Envelope::exact(None, service.runtime().query_memory());
         service
             .engine
-            .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
+            .charge_statistics_to(std::sync::Arc::new(kept().part()));
         // So are the owl2-dl bounds' U1 and read views (SYN-61), the same way.
         service
             .dl
             .bounds
-            .set_kept(std::sync::Arc::new(service.envelope(None).part()));
+            .set_kept(std::sync::Arc::new(kept().part()));
         // Under the writer slot, as every change of the certificate (Q06 remainder, invariant C).
         let tx = service.engine.transaction();
         let writer = tx.writer().expect("a transaction holds the writer slot");
@@ -1331,9 +1333,11 @@ impl StoreService {
         Ok(planned)
     }
 
-    /// Bytes of intermediate results the running queries hold now, the most they held at
-    /// once, and the limit; `None` without a limit
-    /// ([`StoreConfig::total_query_memory_bytes`]).
+    /// Bytes the running queries have reserved now, the most reserved at once, and the
+    /// limit; `None` without a limit ([`StoreConfig::total_query_memory_bytes`]). A
+    /// reservation is what a query's intermediate results hold plus what it took ahead and
+    /// hasn't used yet: its credit (at most 64 KiB) and its operators' spare, both bounded
+    /// per query and returned when it ends.
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
         let budget = self.settings.runtime.query_pool()?;
         Some((budget.used(), budget.peak(), budget.limit()))

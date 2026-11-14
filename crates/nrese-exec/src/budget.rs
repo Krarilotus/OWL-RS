@@ -32,7 +32,10 @@ pub struct SharedBudget {
     limit: AtomicUsize,
     /// How a lazy budget finds its limit ([`Self::lazy`]); `None`: it was given.
     resolve: Option<Resolve>,
-    used: AtomicUsize,
+    /// Written by every request's first charge and its return: on 128 bytes of its own
+    /// ([`Line`]), apart from every other field here, `limit` (read by every charge) and
+    /// `peak` above all.
+    used: Line<AtomicUsize>,
     peak: AtomicUsize,
     /// The budget this one lies within, charged first.
     parent: Option<Arc<SharedBudget>>,
@@ -40,6 +43,26 @@ pub struct SharedBudget {
 
 /// A lazy [`SharedBudget`]'s limit before its first need.
 const UNRESOLVED: usize = usize::MAX;
+
+/// A value alone on 128 bytes: what cores write to it shares no cache line, nor the line
+/// beside it, with what they only read nearby. With `used` beside `limit` and `peak`,
+/// 32 clients doing point lookups served 3 % fewer queries than with no budget; on 128
+/// bytes of its own, as many. 128 is a conservative spacing (x86 cores prefetch lines in
+/// pairs; a coherence miss costs one line), chosen for the hosts measured, not a promise
+/// for every target. The gain is `used`'s own, not the `Arc`'s counts moving off with the
+/// raised alignment: padding `used` without raising it, which left the counts beside
+/// `limit` as before, kept the gain within half a percent.
+#[derive(Debug)]
+#[repr(align(128))]
+struct Line<T>(T);
+
+impl<T> Deref for Line<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 /// A lazy [`SharedBudget`]'s limit: `explicit` bytes or the default share, of the capacity
 /// `capacity` reads ([`crate::memory::limit_within`]).
@@ -70,7 +93,7 @@ impl SharedBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(limit_bytes),
             resolve: None,
-            used: AtomicUsize::new(0),
+            used: Line(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             parent: None,
         })
@@ -88,7 +111,7 @@ impl SharedBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(UNRESOLVED),
             resolve: Some(Resolve { explicit, capacity }),
-            used: AtomicUsize::new(0),
+            used: Line(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             parent: None,
         })
@@ -100,7 +123,7 @@ impl SharedBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(limit_bytes),
             resolve: None,
-            used: AtomicUsize::new(0),
+            used: Line(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             parent: Some(parent),
         })
@@ -152,6 +175,8 @@ impl SharedBudget {
 
     /// Charges `bytes` above, then here; refused anywhere, nothing stays charged.
     fn charge(&self, bytes: usize) -> Result<(), Refused> {
+        #[cfg(test)]
+        writes::count();
         if let Some(parent) = &self.parent {
             parent.charge(bytes)?;
         }
@@ -188,6 +213,8 @@ impl SharedBudget {
 
     /// Releases `bytes` here, at most what is charged, and as much above.
     fn release(&self, bytes: usize) {
+        #[cfg(test)]
+        writes::count();
         let before = self
             .used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
@@ -202,6 +229,8 @@ impl SharedBudget {
     /// Up to `wanted` bytes charged here and above, never more than half of the room left
     /// at a level, never refused: what was taken (0 where there is no room).
     fn take_up_to(&self, wanted: usize) -> usize {
+        #[cfg(test)]
+        writes::count();
         let Ok(limit) = self.known_limit() else {
             return 0;
         };
@@ -259,6 +288,50 @@ mod calls {
     }
 }
 
+/// The writes a thread makes on shared budgets (a charge, a refill, a release), counted for
+/// tests: a request's charges within its credit must make none.
+#[cfg(test)]
+mod writes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WRITES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        WRITES.with(|writes| writes.set(writes.get() + 1));
+    }
+
+    /// The writes this thread has made so far.
+    pub(super) fn made() -> u64 {
+        WRITES.with(Cell::get)
+    }
+}
+
+/// A point where a test holds a thread just before it adds to a credit (`add_credit`), to
+/// run other workers' steps in between.
+#[cfg(test)]
+mod seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_CREDIT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// `hold` runs on this thread before each of its additions to a credit.
+    pub(super) fn set(hold: impl FnMut() + 'static) {
+        BEFORE_CREDIT.with(|seam| *seam.borrow_mut() = Some(Box::new(hold)));
+    }
+
+    pub(super) fn before_credit() {
+        BEFORE_CREDIT.with(|seam| {
+            if let Some(hold) = seam.borrow_mut().as_mut() {
+                hold();
+            }
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct Budget {
     limit: usize,
@@ -272,6 +345,32 @@ pub struct Budget {
     ahead: AtomicUsize,
     /// A refusal above is recorded here only ([`Envelope::optional_part`]).
     optional: bool,
+    /// An envelope's credit at the server's budget ([`Envelope::new`]): bytes charged there,
+    /// for this budget's next charges, not yet charged here. Reserved when taken, so what
+    /// all budgets hold at the server never exceeds its limit; returned when this budget
+    /// ends, however it ends.
+    credit: AtomicUsize,
+    /// The most credit this budget keeps ([`credit_cap`]), found at its first charge at the
+    /// server; [`CREDIT_UNSET`] before, and for a budget without credit ([`Self::credits`]).
+    credit_cap: AtomicUsize,
+    /// Whether its charges at the server's budget go through [`Self::credit`]: an envelope's.
+    credits: bool,
+}
+
+/// [`Budget::credit_cap`] before it is found.
+const CREDIT_UNSET: usize = usize::MAX;
+
+/// The most credit an envelope keeps at the server's budget `shared`: 64 KiB, and no more
+/// than a 65,536th of that budget's limit; none under 4 KiB (a limit under 256 MiB), where
+/// every charge stays exact. The credit is reserved, so the limit holds exactly; what it
+/// can cost is an earlier refusal close to the limit, by what other running requests hold
+/// as credit unused: under a thousandth of the limit with up to 64 requests at once. A
+/// request that is refused returns its credit at once and charges exactly from then on.
+fn credit_cap(shared: &SharedBudget) -> usize {
+    const MOST: usize = 64 << 10;
+    const LEAST: usize = 4 << 10;
+    let cap = MOST.min(shared.limit() >> 16);
+    if cap < LEAST { 0 } else { cap }
 }
 
 /// What a budget charges besides itself.
@@ -291,8 +390,23 @@ enum Parent {
 pub struct Envelope(Arc<Budget>);
 
 impl Envelope {
-    /// `limit` bytes (`None`: unlimited) within `server`'s budget.
+    /// `limit` bytes (`None`: unlimited) within `server`'s budget. Its charges there draw on
+    /// a credit of its own ([`credit_cap`]), so that a request's charges and releases stay
+    /// on its own counter, and the server's is written only when a credit is taken or
+    /// returned: one cache line all running requests share.
     pub fn new(limit: Option<usize>, server: Option<Arc<SharedBudget>>) -> Self {
+        let mut budget = limit
+            .map_or_else(Budget::unlimited, Budget::new)
+            .within(server);
+        budget.credits = true;
+        Self(Arc::new(budget))
+    }
+
+    /// As [`Self::new`], without a credit: every charge and release here writes `server`'s
+    /// budget, which then holds exactly what this envelope holds. For budgets that live as
+    /// long as their store (what it keeps, its statistics): they charge rarely, and a credit
+    /// would stay reserved for their whole life.
+    pub fn exact(limit: Option<usize>, server: Option<Arc<SharedBudget>>) -> Self {
         Self(Arc::new(
             limit
                 .map_or_else(Budget::unlimited, Budget::new)
@@ -404,6 +518,9 @@ impl Budget {
             parent: None,
             ahead: AtomicUsize::new(0),
             optional: false,
+            credit: AtomicUsize::new(0),
+            credit_cap: AtomicUsize::new(CREDIT_UNSET),
+            credits: false,
         }
     }
 
@@ -465,7 +582,9 @@ impl Budget {
         loop {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
                 if record {
-                    self.refused.store(true, Ordering::Relaxed);
+                    // Before the credit is returned: see `add_credit`.
+                    self.refused.store(true, Ordering::SeqCst);
+                    self.return_credit();
                 }
                 return Err(self.exceeded(bytes, used));
             };
@@ -488,19 +607,22 @@ impl Budget {
     fn take_above(&self, bytes: usize, record: bool) -> Result<(), BudgetExceeded> {
         let above = match &self.parent {
             Some(Parent::Server(shared)) => {
-                shared.charge(bytes).map_err(|refused| BudgetExceeded {
-                    limit: refused.limit,
-                    requested: bytes,
-                    used: refused.used,
-                    shared: true,
-                    unread: refused.unread,
-                })
+                self.charge_server(shared, bytes)
+                    .map_err(|refused| BudgetExceeded {
+                        limit: refused.limit,
+                        requested: bytes,
+                        used: refused.used,
+                        shared: true,
+                        unread: refused.unread,
+                    })
             }
             Some(Parent::Envelope(envelope)) => envelope.take_as(bytes, record && !self.optional),
             None => Ok(()),
         };
         if record && above.is_err() {
-            self.refused.store(true, Ordering::Relaxed);
+            // Before the credit is returned: see `add_credit`.
+            self.refused.store(true, Ordering::SeqCst);
+            self.return_credit();
         }
         above
     }
@@ -510,7 +632,10 @@ impl Budget {
     /// above a root).
     fn take_above_up_to(&self, wanted: usize) -> usize {
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.take_up_to(wanted),
+            Some(Parent::Server(shared)) => match self.take_credit(wanted) {
+                from_credit if from_credit == wanted => wanted,
+                from_credit => from_credit + shared.take_up_to(wanted - from_credit),
+            },
             Some(Parent::Envelope(envelope)) => envelope.take_up_to(wanted),
             None => 0,
         }
@@ -539,7 +664,7 @@ impl Budget {
             }
         }
         let above = match &self.parent {
-            Some(Parent::Server(shared)) => shared.charge(bytes).is_ok(),
+            Some(Parent::Server(shared)) => self.charge_server(shared, bytes).is_ok(),
             Some(Parent::Envelope(envelope)) => envelope.try_take(bytes),
             None => true,
         };
@@ -588,7 +713,9 @@ impl Budget {
 
     /// The refusal of `bytes` with `used` in use, recorded.
     fn refuse(&self, bytes: usize, used: usize) -> BudgetExceeded {
-        self.refused.store(true, Ordering::Relaxed);
+        // Before the credit is returned: see `add_credit`.
+        self.refused.store(true, Ordering::SeqCst);
+        self.return_credit();
         self.exceeded(bytes, used)
     }
 
@@ -634,11 +761,127 @@ impl Budget {
 
     fn release_above(&self, bytes: usize) {
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.release(bytes),
+            Some(Parent::Server(shared)) => self.release_server(shared, bytes),
             Some(Parent::Envelope(envelope)) => {
                 envelope.give(bytes);
             }
             None => {}
+        }
+    }
+
+    /// `bytes` charged at the server's budget `shared`: from this budget's credit as far as it
+    /// covers them, writing nothing there; the rest charged there exactly, with a new credit
+    /// of half the cap in the same charge where both fit, else alone. Refused as an exact
+    /// charge of the rest is, the credit it drew on kept. (Half: what the request releases
+    /// then fits the credit up to its cap, so a lookup's charge and release write nothing.)
+    fn charge_server(&self, shared: &SharedBudget, bytes: usize) -> Result<(), Refused> {
+        if !self.credits {
+            return shared.charge(bytes);
+        }
+        let from_credit = self.take_credit(bytes);
+        let rest = bytes - from_credit;
+        if rest == 0 {
+            return Ok(());
+        }
+        let cap = match self.credit_cap.load(Ordering::Relaxed) {
+            CREDIT_UNSET => {
+                let cap = credit_cap(shared);
+                self.credit_cap.store(cap, Ordering::Relaxed);
+                cap
+            }
+            cap => cap,
+        };
+        let new_credit = if self.refused() { 0 } else { cap / 2 };
+        if new_credit > 0
+            && let Some(with_credit) = rest.checked_add(new_credit)
+            && shared.charge(with_credit).is_ok()
+        {
+            self.add_credit(shared, new_credit);
+            return Ok(());
+        }
+        shared
+            .charge(rest)
+            .inspect_err(|_| self.add_credit(shared, from_credit))
+    }
+
+    /// `bytes` already charged at the server's budget `shared` added to this budget's credit:
+    /// kept up to the cap, the rest released there; all of it released there once this
+    /// budget is refused. So however many workers add at once, and whenever a refusal comes,
+    /// the credit settles at most at the cap, and at nothing after a refusal: an adder checks
+    /// the refusal after its addition, and a refusal is stored before its credit is
+    /// returned, both in one order every thread sees ([`Ordering::SeqCst`]), so one of the
+    /// two returns what was added.
+    fn add_credit(&self, shared: &SharedBudget, bytes: usize) {
+        #[cfg(test)]
+        seam::before_credit();
+        let cap = match self.credit_cap.load(Ordering::Relaxed) {
+            CREDIT_UNSET => 0,
+            cap => cap,
+        };
+        let mut credit = self.credit.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        while credit > cap {
+            match self.credit.compare_exchange_weak(
+                credit,
+                cap,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    shared.release(credit - cap);
+                    break;
+                }
+                Err(actual) => credit = actual,
+            }
+        }
+        if self.refused.load(Ordering::SeqCst) {
+            self.return_credit();
+        }
+    }
+
+    /// Up to `wanted` bytes taken from this budget's credit: what was taken.
+    fn take_credit(&self, wanted: usize) -> usize {
+        let mut credit = self.credit.load(Ordering::Relaxed);
+        loop {
+            let take = credit.min(wanted);
+            if take == 0 {
+                return 0;
+            }
+            match self.credit.compare_exchange_weak(
+                credit,
+                credit - take,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return take,
+                Err(actual) => credit = actual,
+            }
+        }
+    }
+
+    /// `bytes` released at the server's budget `shared`: into this budget's credit, and what
+    /// the credit then holds beyond its cap (all of it once refused) released there.
+    fn release_server(&self, shared: &SharedBudget, bytes: usize) {
+        if !self.credits {
+            shared.release(bytes);
+            return;
+        }
+        self.add_credit(shared, bytes);
+    }
+
+    /// This budget's credit at the server's budget, unused: charged there, not here.
+    fn credit(&self) -> usize {
+        self.credit.load(Ordering::Relaxed)
+    }
+
+    /// Its credit returned to the server's budget: when it ends, and at a refusal, so that
+    /// near the limit a refused request holds nothing it doesn't use (it charges exactly
+    /// from then on).
+    fn return_credit(&self) {
+        if let Some(Parent::Server(shared)) = &self.parent {
+            let credit = self.credit.swap(0, Ordering::SeqCst);
+            if credit > 0 {
+                shared.release(credit);
+            }
         }
     }
 
@@ -663,7 +906,9 @@ impl Budget {
     pub fn room(&self) -> Result<usize, Unread> {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => Ok(own.min(shared.room()?)),
+            Some(Parent::Server(shared)) => {
+                Ok(own.min(shared.room()?.saturating_add(self.credit())))
+            }
             Some(Parent::Envelope(envelope)) => Ok(own.min(envelope.room()?)),
             None => Ok(own),
         }
@@ -689,7 +934,7 @@ impl Budget {
     pub fn bounded_by_shared(&self) -> bool {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.remaining() < own,
+            Some(Parent::Server(shared)) => shared.remaining().saturating_add(self.credit()) < own,
             Some(Parent::Envelope(envelope)) => {
                 envelope.remaining() < own && envelope.bounded_by_shared()
             }
@@ -704,6 +949,8 @@ impl Drop for Budget {
     fn drop(&mut self) {
         let used = self.used();
         self.release_above(used);
+        // An envelope's credit goes back with it, unused.
+        self.return_credit();
         #[cfg(any(test, feature = "measure"))]
         crate::measure::released(self, used);
     }
@@ -2742,7 +2989,8 @@ mod tests {
     /// Guard (the executor memory stack's timing, Harness notes/2026-11-02-exec-memory-stack.md
     /// EMS-13: a shared atomic per item cost GROUP_CONCAT x1.94 in parallel workers): an item
     /// within a grant's spare makes no budget call at all, so 10^4 items of 6 bytes after the
-    /// first make none; every level is exact again once the grant ends.
+    /// first make none; every level is exact again once the grant ends, the server's holding
+    /// the request's credit until the request ends.
     #[test]
     fn an_item_within_a_grants_spare_makes_no_budget_call() {
         let server = SharedBudget::new(1 << 30);
@@ -2758,8 +3006,12 @@ mod tests {
         assert_eq!(calls::made(), before, "no budget call within the spare");
         assert_eq!(grant.bytes(), 6 * 10_001);
         drop(grant);
-        assert_eq!((part.used(), request.used(), server.used()), (0, 0, 0));
+        assert_eq!((part.used(), request.used()), (0, 0));
+        assert_eq!(server.used(), request.credit());
         assert_eq!(part.ahead(), 0);
+        drop(part);
+        drop(request);
+        assert_eq!(server.used(), 0);
     }
 
     /// Spec (the budget types' owner's ruling, 3 Nov): a grant's refill is never refused and
@@ -2972,5 +3224,400 @@ mod tests {
         });
         assert_eq!(excess, 0);
         assert_eq!(request.used(), 0);
+    }
+
+    const GIB: usize = 1 << 30;
+
+    /// A request's credit is reserved at the server when taken, in the same charge: another
+    /// request is refused what the credit holds, and a request larger than its credit still
+    /// grows exactly up to the limit.
+    #[test]
+    fn a_requests_credit_is_reserved_at_the_server() {
+        let server = SharedBudget::new(GIB);
+        let credit = credit_cap(&server) / 2;
+        assert_eq!(
+            credit,
+            8 << 10,
+            "half the cap: 16 KiB, the 65,536th of 1 GiB"
+        );
+        let one = Envelope::new(None, Some(Arc::clone(&server)));
+        one.charge(1).unwrap();
+        assert_eq!(
+            server.used(),
+            1 + credit,
+            "the credit charged with the first byte"
+        );
+        let other = Envelope::new(None, Some(Arc::clone(&server)));
+        let left = GIB - 1 - credit;
+        let err = other.charge(left + 1).unwrap_err();
+        assert!(
+            err.shared,
+            "the server refuses what the credit holds: {err}"
+        );
+        other.charge(left).unwrap();
+        assert_eq!(
+            (server.used(), other.credit()),
+            (GIB, 0),
+            "the rest exactly, no credit"
+        );
+        assert!(other.charge(1).is_err());
+        drop(one);
+        assert_eq!(
+            server.used(),
+            left,
+            "the first request's byte and credit returned"
+        );
+    }
+
+    /// Requests charging and releasing at once: the server holds exactly what they hold,
+    /// their credits included, never more than its limit, and nothing once they end.
+    #[test]
+    fn the_limit_holds_exactly_under_concurrent_requests() {
+        let limit = 256 << 20;
+        let server = SharedBudget::new(limit);
+        assert!(credit_cap(&server) > 0, "credits in play");
+        let requests: Vec<Envelope> = (0..8)
+            .map(|_| Envelope::new(None, Some(Arc::clone(&server))))
+            .collect();
+        let barrier = std::sync::Barrier::new(requests.len());
+        std::thread::scope(|scope| {
+            for (i, request) in requests.iter().enumerate() {
+                let (barrier, server) = (&barrier, &server);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut held = Vec::new();
+                    for n in 0usize.. {
+                        let bytes = 512 + (n * 7919 + i * 104_729) % (48 << 10);
+                        if request.charge(bytes).is_err() {
+                            break;
+                        }
+                        held.push(bytes);
+                        assert!(server.used() <= limit, "over the limit");
+                        if n % 3 == 0
+                            && let Some(bytes) = held.pop()
+                        {
+                            request.release(bytes);
+                        }
+                    }
+                    assert_eq!(request.used(), held.iter().sum::<usize>());
+                });
+            }
+        });
+        let held: usize = requests.iter().map(|r| r.used() + r.credit()).sum();
+        assert_eq!(
+            server.used(),
+            held,
+            "the server holds what the requests hold"
+        );
+        assert!(held <= limit);
+        drop(requests);
+        assert_eq!(server.used(), 0);
+    }
+
+    /// A request's credit goes back however the request ends: released, dropped holding (an
+    /// error, a cancellation), after a refusal, its parts' grants and reservations dropped,
+    /// and only when its last clone goes.
+    #[test]
+    fn a_requests_credit_is_returned_on_every_exit() {
+        let server = SharedBudget::new(GIB);
+        let request = || Envelope::new(None, Some(Arc::clone(&server)));
+        let released = request();
+        released.charge(100).unwrap();
+        released.release(100);
+        assert!(server.used() > 0, "credit held while it runs");
+        drop(released);
+        assert_eq!(server.used(), 0, "released, then ended");
+        let holding = request();
+        holding.charge(5_000).unwrap();
+        drop(holding);
+        assert_eq!(server.used(), 0, "ended holding");
+        let refused = request();
+        refused.charge(10).unwrap();
+        assert!(refused.charge(GIB).is_err());
+        assert_eq!(server.used(), 10, "a refusal returns the credit");
+        refused.charge(5).unwrap();
+        assert_eq!(
+            server.used(),
+            15,
+            "and the request charges exactly from then on"
+        );
+        drop(refused);
+        assert_eq!(server.used(), 0, "ended after a refusal");
+        let parted = request();
+        {
+            let part = parted.part();
+            let mut grant = Grant::with_workers(&part, 1);
+            grant.take(3_000).unwrap();
+            let mut kept = Reservation::new(&part);
+            kept.charge(700).unwrap();
+        }
+        let clone = parted.clone();
+        drop(parted);
+        assert!(server.used() > 0, "a clone still runs");
+        drop(clone);
+        assert_eq!(server.used(), 0, "its parts ended, then it");
+    }
+
+    /// A lookup's charges and releases within its credit write the server's budget only
+    /// when the credit is taken and when it is returned; under a 256 MiB limit every charge
+    /// stays exact, as without a credit.
+    #[test]
+    fn a_request_writes_the_server_only_for_its_credit() {
+        let server = SharedBudget::new(GIB);
+        let request = Envelope::new(None, Some(Arc::clone(&server)));
+        let before = writes::made();
+        for _ in 0..1_000 {
+            request.charge(200).unwrap();
+            request.release(200);
+        }
+        assert_eq!(writes::made() - before, 1, "one charge took the credit");
+        drop(request);
+        assert_eq!(writes::made() - before, 2, "one release returned it");
+        assert_eq!(server.used(), 0);
+        let small = SharedBudget::new(32 << 20);
+        let request = Envelope::new(None, Some(Arc::clone(&small)));
+        request.charge(200).unwrap();
+        assert_eq!(small.used(), 200, "exact under 256 MiB");
+    }
+
+    /// An exact envelope (one that lives as long as its store) takes no credit: the server
+    /// holds exactly what it holds after every charge and release, each of which writes the
+    /// server's budget.
+    #[test]
+    fn an_exact_envelope_writes_the_server_per_charge() {
+        let server = SharedBudget::new(GIB);
+        let kept = Envelope::exact(None, Some(Arc::clone(&server)));
+        let before = writes::made();
+        for n in 1..=10 {
+            kept.charge(200).unwrap();
+            assert_eq!(server.used(), 200, "exact after charge {n}");
+            kept.release(200);
+            assert_eq!(server.used(), 0, "exact after release {n}");
+        }
+        assert_eq!(
+            writes::made() - before,
+            20,
+            "one write per charge and release"
+        );
+        assert_eq!(kept.credit(), 0);
+    }
+
+    /// The server's used counter, written by every request's charge and return, shares its
+    /// 128 bytes (a pair of cache lines) with nothing else of the budget: not the limit every
+    /// charge reads, not the peak.
+    #[test]
+    fn the_servers_used_counter_has_its_cache_lines_to_itself() {
+        let server = SharedBudget::new(GIB);
+        // A field's bytes, as addresses.
+        fn bytes<T>(field: &T) -> std::ops::Range<usize> {
+            let at = std::ptr::from_ref(field).addr();
+            at..at + size_of_val(field)
+        }
+        let used = bytes(&*server.used);
+        assert_eq!(used.start % 128, 0, "used starts its 128 bytes");
+        // The 128-byte blocks used's bytes lie in.
+        let blocks = used.start / 128 * 128..used.end.next_multiple_of(128);
+        for (name, other) in [
+            ("limit", bytes(&server.limit)),
+            ("resolve", bytes(&server.resolve)),
+            ("peak", bytes(&server.peak)),
+            ("parent", bytes(&server.parent)),
+        ] {
+            let apart = other.end <= blocks.start || blocks.end <= other.start;
+            assert!(apart, "{name} {other:x?} within used's {blocks:x?}");
+        }
+    }
+
+    /// Workers of one request that all find its credit empty take a new one at once: what
+    /// they add settles at most at the cap, the rest returned to the server.
+    #[test]
+    fn concurrent_refills_of_one_request_keep_at_most_the_cap() {
+        let server = SharedBudget::new(GIB);
+        let cap = credit_cap(&server);
+        let request = Envelope::new(None, Some(Arc::clone(&server)));
+        let workers = 3;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let (request, barrier) = (&request, Arc::clone(&barrier));
+                scope.spawn(move || {
+                    // Each holds before adding until all have charged a new credit.
+                    seam::set(move || {
+                        barrier.wait();
+                    });
+                    request.charge(1).unwrap();
+                });
+            }
+        });
+        assert!(
+            request.credit() <= cap,
+            "{} past the cap {cap}",
+            request.credit()
+        );
+        assert_eq!(server.used(), request.used() + request.credit());
+        drop(request);
+        assert_eq!(server.used(), 0);
+    }
+
+    /// A request refused while a worker is about to add a new credit keeps none: the late
+    /// addition is returned, and the server holds only what the request holds.
+    #[test]
+    fn a_refused_request_keeps_no_credit_added_late() {
+        let server = SharedBudget::new(GIB);
+        let request = Envelope::new(Some(2), Some(Arc::clone(&server)));
+        let (at, arrived) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let request = &request;
+            let worker = scope.spawn(move || {
+                seam::set(move || {
+                    at.send(()).unwrap();
+                    wait.recv().unwrap();
+                });
+                request.charge(1).unwrap();
+            });
+            arrived.recv().unwrap();
+            // Past its own limit: refused, its credit (still empty) returned.
+            assert!(request.charge(2).is_err());
+            go.send(()).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(request.refused());
+        assert_eq!((request.credit(), server.used()), (0, 1));
+    }
+
+    /// A release that adds to the credit as the request is refused: returned too.
+    #[test]
+    fn a_release_into_a_refused_requests_credit_is_returned() {
+        let server = SharedBudget::new(GIB);
+        let request = Envelope::new(Some(2), Some(Arc::clone(&server)));
+        request.charge(1).unwrap();
+        assert!(request.credit() > 0, "a credit taken");
+        let (at, arrived) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let request = &request;
+            let worker = scope.spawn(move || {
+                seam::set(move || {
+                    at.send(()).unwrap();
+                    wait.recv().unwrap();
+                });
+                request.release(1);
+            });
+            arrived.recv().unwrap();
+            assert!(request.charge(3).is_err());
+            go.send(()).unwrap();
+            worker.join().unwrap();
+        });
+        assert!(request.refused());
+        assert_eq!((request.credit(), server.used()), (0, 0));
+    }
+
+    /// An optional part charges on its request's credit like any part, and a refusal above
+    /// it, at the server or at the request's own limit, leaves the request as it was: not
+    /// refused, its credit neither spent nor returned, so the request's own charges still
+    /// draw on the credit without writing the server. Only a refusal the request records
+    /// returns the credit.
+    #[test]
+    fn an_optional_refusal_leaves_the_requests_credit_and_flag() {
+        let server = SharedBudget::new(GIB);
+        let request = Envelope::new(Some(1 << 20), Some(Arc::clone(&server)));
+        request.charge(1).unwrap();
+        let credit = credit_cap(&server) / 2;
+        assert_eq!(
+            request.credit(),
+            credit,
+            "a credit taken with the first byte"
+        );
+        let optional = request.optional_part();
+        let mut held = Reservation::new(&optional);
+        let before = writes::made();
+        held.charge(credit / 2).unwrap();
+        assert_eq!(
+            writes::made(),
+            before,
+            "within the credit: the server unwritten"
+        );
+        let credit = credit - credit / 2;
+        assert_eq!(request.credit(), credit);
+        // Another request leaves the server no room.
+        let other = Envelope::exact(None, Some(Arc::clone(&server)));
+        other.charge(GIB - server.used()).unwrap();
+        let err = held.charge(2 * credit).unwrap_err();
+        assert!(err.shared, "the server's refusal: {err}");
+        assert!(optional.refused() && !request.refused());
+        assert_eq!(
+            (request.credit(), server.used()),
+            (credit, GIB),
+            "the credit kept, nothing charged"
+        );
+        let err = held.charge(2 << 20).unwrap_err();
+        assert!(
+            !err.shared && err.limit == 1 << 20,
+            "the request's limit: {err}"
+        );
+        assert!(!request.refused());
+        assert_eq!(request.credit(), credit, "kept at the request's limit too");
+        let before = writes::made();
+        request.charge(credit).unwrap();
+        assert_eq!(
+            writes::made(),
+            before,
+            "the request's own charge on the credit"
+        );
+        assert_eq!(request.credit(), 0);
+        // A refusal the request records returns what credit it holds.
+        request.release(credit);
+        assert_eq!(request.credit(), credit);
+        assert!(request.charge(2 << 20).is_err());
+        assert!(request.refused());
+        assert_eq!(request.credit(), 0, "returned at the request's own refusal");
+        drop(held);
+        drop((optional, request, other));
+        assert_eq!(server.used(), 0);
+    }
+
+    /// A credit an optional part's charge adds late, while a sibling is refused: kept when
+    /// the refusal was the request's own optional one (unrecorded), returned when the
+    /// request recorded it. Either way the server holds exactly what the request holds.
+    #[test]
+    fn a_credit_added_late_by_an_optional_part_follows_the_requests_refusal() {
+        for recorded in [true, false] {
+            let server = SharedBudget::new(GIB);
+            let request = Envelope::new(Some(2), Some(Arc::clone(&server)));
+            // Ends on this thread: its release adds no credit where the seam holds.
+            let optional = request.optional_part();
+            let (at, arrived) = std::sync::mpsc::channel();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            std::thread::scope(|scope| {
+                let (request, optional) = (&request, &optional);
+                let worker = scope.spawn(move || {
+                    seam::set(move || {
+                        at.send(()).unwrap();
+                        wait.recv().unwrap();
+                    });
+                    // Takes a new credit for the request, held before adding it.
+                    optional.charge(1).unwrap();
+                });
+                arrived.recv().unwrap();
+                // Past the request's own limit of 2: recorded by the request itself, not
+                // above an optional part.
+                let refused = match recorded {
+                    true => request.charge(2),
+                    false => request.optional_part().charge(2),
+                };
+                assert!(refused.is_err());
+                go.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            assert_eq!(request.refused(), recorded);
+            match recorded {
+                true => assert_eq!(request.credit(), 0, "returned after the refusal"),
+                false => assert!(request.credit() > 0, "kept: the request goes on"),
+            }
+            assert_eq!(server.used(), request.used() + request.credit());
+            drop((optional, request));
+            assert_eq!(server.used(), 0);
+        }
     }
 }
