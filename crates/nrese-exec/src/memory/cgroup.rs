@@ -29,6 +29,7 @@
 //! never "no limit").
 
 use std::io::{self, ErrorKind};
+use std::rc::Rc;
 
 /// A limit that may apply wasn't read, so what the process may use, or has left, isn't known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,8 +198,18 @@ fn unescape(field: &str) -> String {
 
 /// A group's directory as the process reached it through one view: the handle, and its mount.
 struct Place<H> {
-    dir: H,
+    dir: Rc<H>,
     mount: u64,
+}
+
+/// One view's way down to the process's group, walked once: the directories reached on the
+/// view's own mount, `dirs[i]` the group `i` names below the view's group (`dirs[0]` the view's
+/// point). It ends where the way left the mount or a name wasn't there. Each ancestor the view
+/// reaches is a directory on this way, so the ancestors are read from it, not walked again
+/// (each walk from the root made the reading's opens grow with the square of the depth).
+struct Trail<H> {
+    view: usize,
+    dirs: Vec<Rc<H>>,
 }
 
 /// What resolution needs: the kernel, the hierarchy's files and its views.
@@ -260,12 +271,66 @@ impl<F: Fs> Walk<'_, F> {
             }
             if reached {
                 found.push(Place {
-                    dir,
+                    dir: Rc::new(dir),
                     mount: view.id,
                 });
             }
         }
         Ok(found)
+    }
+
+    /// Each view's way to `group` ([`Trail`]), in the views' order: the opens and checks of
+    /// [`Self::places`] for `group`, every directory on the way kept. A way the kernel refuses
+    /// or fails to open is `Unknown`, as there.
+    fn trails(&self, group: &Path) -> Result<Vec<Trail<F::Handle>>, Unknown> {
+        let mut trails = Vec::new();
+        for (at, view) in self.views.iter().enumerate() {
+            let Some(below) = group.strip_prefix(view.root.as_slice()) else {
+                continue;
+            };
+            if below.iter().any(|name| name == "..") {
+                continue;
+            }
+            let point = match self.point(&view.point) {
+                Ok(dir) => dir,
+                Err(error) if absent(&error) => continue,
+                Err(_) => return Err(Unknown),
+            };
+            let mut dirs = Vec::new();
+            if self.mount(&point)? == view.id {
+                dirs.push(Rc::new(point));
+            }
+            for name in below {
+                let Some(dir) = dirs.last() else {
+                    break;
+                };
+                match self.fs.open_at(dir, name) {
+                    Ok(next) if self.mount(&next)? == view.id => dirs.push(Rc::new(next)),
+                    Ok(_) => break,
+                    Err(error) if absent(&error) => break,
+                    Err(_) => return Err(Unknown),
+                }
+            }
+            trails.push(Trail { view: at, dirs });
+        }
+        Ok(trails)
+    }
+
+    /// The first view's directory of `up`, a group on the ways `trails` walked (`up` a prefix
+    /// of their group): what [`Self::places`] would find first for it, without walking again.
+    fn on_trails(&self, trails: &[Trail<F::Handle>], up: &Path) -> Option<Place<F::Handle>> {
+        trails.iter().find_map(|trail| {
+            let view = &self.views[trail.view];
+            let below = up.strip_prefix(view.root.as_slice())?;
+            if below.iter().any(|name| name == "..") {
+                return None;
+            }
+            let dir = trail.dirs.get(below.len())?;
+            Some(Place {
+                dir: Rc::clone(dir),
+                mount: view.id,
+            })
+        })
     }
 
     /// The group's file `name` in `place`, opened on the place's own mount: a file bound over
@@ -331,8 +396,19 @@ fn limited<F: Fs>(
         files,
         views: views(&mounts, files).ok_or(Unknown)?,
     };
+    // The ways down to the group, walked once: the group and its ancestors are read from them.
+    let trails = walk.trails(&group)?;
+    let own = group.clone();
     let mut place = None;
-    for candidate in walk.places(&group)? {
+    for trail in &trails {
+        let below = own.len() - walk.views[trail.view].root.len();
+        let Some(dir) = trail.dirs.get(below) else {
+            continue;
+        };
+        let candidate = Place {
+            dir: Rc::clone(dir),
+            mount: walk.views[trail.view].id,
+        };
         if walk.own(&candidate)? {
             place = Some(candidate);
             break;
@@ -369,8 +445,15 @@ fn limited<F: Fs>(
         // group) doesn't change which group the parent is.
         let up = parent(&group);
         // None reaches it (above every view's group, or hidden by a mount): not visible to
-        // the process, as above a namespace, so nothing above it is read (option 1).
-        let Some(found) = walk.places(&up)?.into_iter().next() else {
+        // the process, as above a namespace, so nothing above it is read (option 1). A group
+        // on the ways down is read from them; one past their top (a step above the namespace's
+        // root, `..`) is walked to as before.
+        let found = if own.starts_with(&up) {
+            walk.on_trails(&trails, &up)
+        } else {
+            walk.places(&up)?.into_iter().next()
+        };
+        let Some(found) = found else {
             return Ok(());
         };
         place = found;
@@ -445,10 +528,12 @@ pub(super) fn left(fs: &impl Fs) -> Result<Option<u64>, Unknown> {
 
 /// The kernel's own answers: every handle a path-only descriptor (`O_PATH`, which needs search
 /// permission on the way and none on the entry, so a directory the process may pass but not
-/// list is passed, sol-loop r7 S2), opened one name at a time through `/proc/self/fd/N/name`
-/// (the directory the descriptor holds, then the name in it); mount ids from
-/// `/proc/self/fdinfo/N`; a file read by opening its descriptor's own link, the same file on
-/// the same mount, no path walked again.
+/// list is passed, sol-loop r7 S2), opened one name at a time by `openat` on the directory's
+/// descriptor, no symbolic link followed (the name alone is resolved, in the directory the
+/// descriptor holds, which no rename or mount elsewhere changes); mount ids from `statx`'s
+/// `STATX_MNT_ID` (Linux 5.8), else `/proc/self/fdinfo/N` ([`Kernel::mount_in_fdinfo`]); a file
+/// read by opening its descriptor's own link, the same file on the same mount, no path walked
+/// again.
 #[cfg(target_os = "linux")]
 pub(super) struct Kernel;
 
@@ -461,6 +546,50 @@ impl Kernel {
             .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
             .open(path)
     }
+
+    /// The mount id `statx` gives for a descriptor, where the kernel fills it in (`STATX_MNT_ID`
+    /// in the answer's mask: Linux 5.8; the same ids `/proc/self/mountinfo` lists). `None`
+    /// before 5.8, or where the C library has no `statx`: the caller asks `fdinfo`.
+    #[cfg(target_env = "gnu")]
+    fn mount_in_statx(handle: &std::fs::File) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        let mut answer = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: an empty path with `AT_EMPTY_PATH` asks about the open descriptor itself,
+        // whatever it is (an `O_PATH` one included); `answer` is a `statx` the call writes,
+        // zeroed so every field is initialised whatever the kernel fills in.
+        let done = unsafe {
+            libc::statx(
+                handle.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_MNT_ID,
+                answer.as_mut_ptr(),
+            )
+        };
+        if done != 0 {
+            return None;
+        }
+        // SAFETY: zeroed, then written by the kernel: every field holds a value.
+        let answer = unsafe { answer.assume_init() };
+        mount_filled(answer.stx_mask, answer.stx_mnt_id)
+    }
+
+    /// The mount id `/proc/self/fdinfo/N` shows (Linux 3.15): the reading before `statx` had
+    /// one, and where it doesn't fill it in.
+    pub(super) fn mount_in_fdinfo(handle: &std::fs::File) -> io::Result<u64> {
+        use std::os::fd::AsRawFd;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", handle.as_raw_fd()))?;
+        info.lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .and_then(|id| id.trim().parse().ok())
+            .ok_or_else(|| ErrorKind::Unsupported.into())
+    }
+}
+
+/// A `statx` answer's mount id, if its mask says the kernel filled it in.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(super) fn mount_filled(mask: u32, id: u64) -> Option<u64> {
+    (mask & libc::STATX_MNT_ID != 0).then_some(id)
 }
 
 #[cfg(target_os = "linux")]
@@ -476,20 +605,33 @@ impl Fs for Kernel {
     }
 
     fn open_at(&self, dir: &std::fs::File, name: &str) -> io::Result<std::fs::File> {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsRawFd, FromRawFd};
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(ErrorKind::InvalidInput.into());
         }
-        Self::path_only(&format!("/proc/self/fd/{}/{name}", dir.as_raw_fd()))
+        let name = std::ffi::CString::new(name).map_err(|_| ErrorKind::InvalidInput)?;
+        // SAFETY: `dir` is an open descriptor and `name` a NUL-terminated single name; the
+        // call makes a new descriptor or none.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is the new descriptor the call made, owned by nothing else.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
     fn mount(&self, handle: &std::fs::File) -> io::Result<u64> {
-        use std::os::fd::AsRawFd;
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", handle.as_raw_fd()))?;
-        info.lines()
-            .find_map(|line| line.strip_prefix("mnt_id:"))
-            .and_then(|id| id.trim().parse().ok())
-            .ok_or_else(|| ErrorKind::Unsupported.into())
+        #[cfg(target_env = "gnu")]
+        if let Some(id) = Self::mount_in_statx(handle) {
+            return Ok(id);
+        }
+        Self::mount_in_fdinfo(handle)
     }
 
     fn read(&self, handle: &std::fs::File) -> io::Result<String> {
@@ -527,6 +669,8 @@ pub(super) mod declared {
         mounts: Vec<Mount>,
         /// The kernel shows no mount ids (before Linux 3.15).
         pub no_mount_ids: bool,
+        /// How many names were opened (`open_at`), refused ones included.
+        pub opens: std::cell::Cell<usize>,
     }
 
     impl Declared {
@@ -561,6 +705,7 @@ pub(super) mod declared {
                 denied: denied.to_owned(),
                 mounts,
                 no_mount_ids: false,
+                opens: std::cell::Cell::new(0),
             }
         }
 
@@ -639,6 +784,7 @@ pub(super) mod declared {
                 !name.is_empty() && name != "." && name != ".." && !name.contains('/'),
                 "one name: {name:?}"
             );
+            self.opens.set(self.opens.get() + 1);
             let path = format!("{}/{name}", dir.0.trim_end_matches('/'));
             self.check(&path)?;
             if self.files.contains_key(&path) || is_dir(&self.files, &self.mounts, &path) {

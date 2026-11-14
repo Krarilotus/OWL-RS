@@ -614,6 +614,105 @@ fn a_directory_that_may_be_searched_but_not_listed_is_passed() {
     assert_eq!(read.ok().as_deref(), Some("1073741824\n"));
 }
 
+/// The walk opens each name on the way to the group once, however deep the group: the group's
+/// ancestors are directories on that way. A group 32 names below the root of a v2 hierarchy at
+/// /sys/fs/cgroup takes 3 + 32 opens to reach, 2 for its `cgroup.procs` and `cgroup.controllers`,
+/// and one `memory.max` for each of its 33 groups (the root's isn't there); the least limit,
+/// 2 GiB ten names down, is read. A walk from the root for each ancestor opened about 660.
+#[test]
+fn the_walk_opens_each_name_on_the_way_once() {
+    let depth = 32;
+    let mut paths = vec![String::from("/sys/fs/cgroup")];
+    for level in 0..depth {
+        paths.push(format!("{}/g{level}", paths[level]));
+    }
+    let leaf = &paths[depth];
+    let mut files: Vec<(String, String)> = vec![
+        ("/proc/self/mountinfo".into(), V2_MOUNT.into()),
+        (
+            "/proc/self/cgroup".into(),
+            format!("0::{}", &leaf["/sys/fs/cgroup".len()..]),
+        ),
+        (format!("{leaf}/cgroup.procs"), procs().into()),
+        (format!("{leaf}/cgroup.controllers"), "memory".into()),
+    ];
+    for (level, path) in paths.iter().enumerate().skip(1) {
+        let limit = match level {
+            10 => (2 * G).to_string(),
+            l if l == depth => (4 * G).to_string(),
+            _ => "max".into(),
+        };
+        files.push((format!("{path}/memory.max"), limit));
+    }
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let kernel = system(&files, "");
+    assert_eq!(cgroup::limit(&kernel), Ok(Some(2 * G)));
+    assert_eq!(kernel.opens.get(), 3 + depth + 2 + (depth + 1));
+}
+
+/// Both of the kernel's mount readings name the mount a handle is on, a directory's and a
+/// file's, across a mount (the root's file system, then /proc): `statx`'s `STATX_MNT_ID` (Linux
+/// 5.8) and `/proc/self/fdinfo/N`, which the reading falls back to where `statx` leaves the
+/// mount out of its answer's mask. A handle past a mount carries that mount's id, which is how a
+/// mount over a group's point, over part of the way or over a single file is told apart.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn both_mount_readings_name_the_mount_a_handle_is_on() {
+    use cgroup::Fs;
+    let kernel = cgroup::Kernel;
+    let root = kernel.root().expect("/");
+    let proc = kernel.open_at(&root, "proc").expect("/proc");
+    let meminfo = kernel.open_at(&proc, "meminfo").expect("/proc/meminfo");
+    for (name, handle) in [("/", &root), ("/proc", &proc), ("/proc/meminfo", &meminfo)] {
+        let fdinfo = cgroup::Kernel::mount_in_fdinfo(handle).expect("fdinfo's mnt_id");
+        assert_eq!(kernel.mount(handle).ok(), Some(fdinfo), "{name}");
+    }
+    let (root_mount, proc_mount) = (kernel.mount(&root).unwrap(), kernel.mount(&proc).unwrap());
+    assert_ne!(root_mount, proc_mount, "/proc is a mount of its own");
+    assert_eq!(kernel.mount(&meminfo).ok(), Some(proc_mount));
+    #[cfg(target_env = "gnu")]
+    {
+        // A kernel before 5.8 leaves the bit out of the mask: fdinfo is asked then.
+        assert_eq!(cgroup::mount_filled(0, 7), None);
+        assert_eq!(cgroup::mount_filled(libc::STATX_MNT_ID, 7), Some(7));
+    }
+}
+
+/// A symbolic link on the way isn't followed: opened, a name is the link itself, and a name
+/// below it isn't there (`ENOTDIR`); the directory the link names is reached by its own name.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn a_link_on_the_way_is_not_followed() {
+    use cgroup::Fs;
+    let base = std::env::temp_dir().join(format!("nrese-exec-link-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("real")).unwrap();
+    std::fs::write(base.join("real").join("memory.max"), "1073741824\n").unwrap();
+    std::os::unix::fs::symlink("real", base.join("link")).unwrap();
+    let canonical = std::fs::canonicalize(&base).unwrap();
+    let kernel = cgroup::Kernel;
+    let opened = (|| {
+        let mut dir = kernel.root()?;
+        for name in canonical.iter().skip(1) {
+            dir = kernel.open_at(&dir, &name.to_string_lossy())?;
+        }
+        let through_link = kernel
+            .open_at(&kernel.open_at(&dir, "link")?, "memory.max")
+            .map(|_| ());
+        let real = kernel.read(&kernel.open_at(&kernel.open_at(&dir, "real")?, "memory.max")?)?;
+        std::io::Result::Ok((through_link, real))
+    })();
+    std::fs::remove_dir_all(&base).unwrap();
+    let (through_link, real) = opened.expect("the way to the test's directory");
+    assert_eq!(
+        through_link.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::NotADirectory)
+    );
+    assert_eq!(real, "1073741824\n");
+}
+
 /// A kernel that shows no mount ids (`/proc/self/fdinfo` has `mnt_id` from Linux 3.15) can't
 /// say which mount a file was reached through, so a limit that may apply is unknown; the same
 /// files with mount ids read as the group's 4 GiB.
