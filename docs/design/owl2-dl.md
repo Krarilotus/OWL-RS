@@ -1099,3 +1099,23 @@ each, checkable by hand (§ results in [STATUS](../STATUS.md)).
 builder can't certify (counting cases the fold breaks, §10); a built-in NRESE doesn't
 evaluate (named); an ill-typed literal (§5.7); what the reader couldn't map (no direct
 semantics); a budget.
+
+**Answers by a proven procedure (as built, 15 November).** Under `dl.outside_profile =
+proven` (the default; a repository's `outside_profile` overrides it), a procedure proven
+sound for an input outside OWL 2 DL answers it where its guard holds, and the answer says
+so: an `outside` record in its status (what is outside, by which procedure, what is
+guaranteed and what not), in the header, the JSON and the N-Triples form. `dl-part` keeps
+the DL engines' answer on the part they read. No value lets an unproven procedure answer.
+
+| Case | What it answers | Soundness and completeness rest on | Complete |
+|---|---|---|---|
+| `el`, classification | an irregular role hierarchy that is all the DL engines leave out; no assertion, no range on a property of a chain, nothing the EL classifier skips | the EL++ completion rules, which allow arbitrary role inclusions (Baader, Brandt and Lutz, *Pushing the EL Envelope*, IJCAI 2005, Lemma 3, Theorem 4) | where the input states no object-property range (the paper has none); with one, marked incomplete |
+
+**A further case** is keyed on the reason the DL engines left out (`Unsupported`), and
+brings: its guard, the input checks its proof needs (where one fails it refuses, and the
+DL part's answer stands); its proof, cited, as a row above; completeness proven and cited,
+or every answer marked incomplete; its two texts; its bound (the request's stop and memory
+poll; stopped, the DL part's answer stands); its tests, red first, one per guard
+condition, with hand-written expected answers and an independent oracle where one accepts
+the input; and its time and memory against main. One setting value governs every case; a
+case gets a switch of its own only when a measured cost makes it worth turning off alone.
