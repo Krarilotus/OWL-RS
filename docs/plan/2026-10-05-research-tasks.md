@@ -6,18 +6,18 @@ layout, evaluation, parallelism, incremental maintenance, equality, machine leve
 
 ## Where knowledge is missing
 
-1. **Scaling across machines** (coverage plan §6): no design yet for partitioning,
+1. Scaling across machines (coverage plan §6): no design yet for partitioning,
    distributed query evaluation, distributed reasoning, replication and failover.
-2. **How in-memory leaders get their speed** (RDFox first; the owner's target is to beat
+2. How in-memory leaders get their speed (RDFox first; the owner's target is to beat
    it with less memory): what is published, what is measured, under which
    configurations.
-3. **Store size** below QLever's: which layout and codecs, and at what scan and lookup cost.
+3. Store size below QLever's: which layout and codecs, and at what scan and lookup cost.
 4. OWL 2 QL: NRESE materialises; existentials on the right of `SubClassOf` aren't
    materialised, so certain answers through them are missing. Query rewriting (or a
    combined approach) is not designed.
-5. **Classification and realisation** at Konclude's level (package 3.4).
-6. **Incremental reasoning** at high update rates, against RDFox's and GraphDB's methods.
-7. **Machine-level kernels** for the hot paths the profiles show (sorting wide keys,
+5. Classification and realisation at Konclude's level (package 3.4).
+6. Incremental reasoning at high update rates, against RDFox's and GraphDB's methods.
+7. Machine-level kernels for the hot paths the profiles show (sorting wide keys,
    membership probes in sorted arrays, intersections).
 
 ## General tasks

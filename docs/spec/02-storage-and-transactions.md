@@ -11,7 +11,7 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
 - Named graphs exist iff they contain at least one quad.
   - `CREATE GRAPH` stores nothing.
   - `CLEAR`/`DROP` of an empty named graph succeeds and changes nothing.
-- **Asserted and inferred statements are stored separately** (ADR-0003, roadmap E6).
+- Asserted and inferred statements are stored separately (ADR-0003, roadmap E6).
   - The *asserted* stack holds what clients wrote, in any graph.
   - The *inferred* stack holds what the reasoner derived, always in the default graph.
   - The two are disjoint: a statement that is both asserted and derivable counts as asserted.
@@ -55,7 +55,7 @@ Every write goes through the mutation pipeline:
   - These rules apply to the transaction's final state, so asserting and retracting a statement within one request changes nothing.
 - Request paths write asserted statements only. SPARQL Update, the Graph Store Protocol and restore can't reach the inferred stack. `DELETE`, `CLEAR` and `DROP` retract asserted statements, never inferred ones.
 - Writes are serialised by the engine's writer slot. Commit cost is O(d log d) for a delta of d quads, independent of the dataset size.
-- **Revisions** increase by one per commit with a net change. They are persistent in on-disk mode and don't change for no-op writes.
+- Revisions increase by one per commit with a net change. They are persistent in on-disk mode and don't change for no-op writes.
 - Any error before the commit discards the whole request. There are no partial writes.
 
 ## Bulk loads
@@ -65,14 +65,14 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
 - A bulk load holds the writer slot and publishes one revision. `Append` adds to the asserted data; `Replace` swaps it and clears the inferred stack.
 - The load isn't written to the WAL. A checkpoint of the new revision is written before the revision is published, so a crash either loses the whole unacknowledged load or none of it. Its cost is O(dataset), which is why regular writes use transactions.
 - Batches are parsed and interned from many threads. The dictionary encodes, hashes and deduplicates a batch before taking its lock.
-- **Blank nodes** are fresh per load, and consistent across the chunks of one load.
+- Blank nodes are fresh per load, and consistent across the chunks of one load.
 - Bulk loads are operator actions and don't run validation gates.
 
 ## Durability (on-disk mode)
 
 - A commit is acknowledged only after its WAL record is synced (`SyncPolicy::EveryCommit`, the default).
-- **Checkpoints** run in the background once the WAL grows past a threshold. Writers keep committing while a checkpoint is written, and covered WAL segments are deleted afterwards.
-- **Recovery** loads the newest checkpoint and then replays later WAL records.
+- Checkpoints run in the background once the WAL grows past a threshold. Writers keep committing while a checkpoint is written, and covered WAL segments are deleted afterwards.
+- Recovery loads the newest checkpoint and then replays later WAL records.
   - A torn record at the end of the log (a crash mid-write: one incomplete last record, or zeros to the end, with no intact record after it) is cut; it was never acknowledged. Its bytes are kept in `wal-cut/`.
   - Other damage in the newest segment is a startup error that leaves the log as it is (`store.wal_damage = "refuse"`, the default), or, opted into, the log is kept up to the damage with the rest copied to `wal-cut/` (`"keep-prefix"`).
   - Invalid data in an older segment is a startup error, never silently skipped.
