@@ -51,7 +51,8 @@ Rust and Node.js aren't needed: the image builds the server and its console. The
 below fetch the code, build the [image](docs/glossary.md#image-container-volume) `nrese`
 and start it as the container `nrese`:
 
-- its data on the volume `nrese-data`;
+- its data on disk (the image sets `NRESE_STORE_MODE=on-disk`), on the volume `nrese-data`,
+  so it outlives the container;
 - its port bound to this machine only, since no authentication is on (set
   `NRESE_AUTH_MODE` before you expose it: [access control](#access-control-and-operations));
 - reasoning under OWL 2 RL, and the [SHACL commit gate](docs/glossary.md#shape-shapes-graph-shacl-gate)
@@ -104,6 +105,9 @@ nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the
 
 {"head":{"vars":["x"]},"results":{"bindings":[{"x":{"type":"uri","value":"http://example.org/tom"}}]}}
 ```
+
+Other headers are left out here, and `…` marks shortened text: compare the status, the
+`regime` and the rows.
 
 The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
 `NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
@@ -267,7 +271,7 @@ deviation from a standard: [limits](docs/limits.md). What is planned:
 
 | Capability | Limits and notes |
 |---|---|
-| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) Query, Update and federated `SERVICE` | The W3C suites run in the checks and in CI, with no known failure listed ([evaluation](crates/nrese-sparql/tests/w3c_sparql11), [syntax](crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)). Deviations (`LOAD`, `SERVICE`, `HAVING` aliases, merged blank nodes), each with what to do: [limits](docs/limits.md#sparql) |
+| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) Query, Update and federated `SERVICE` | The W3C suites run in the checks and in CI, with no known failure listed (505 of 505 on 2 October 2026: [capability matrix](docs/spec/06-target-capability-matrix.md); [evaluation](crates/nrese-sparql/tests/w3c_sparql11), [syntax](crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)). Deviations (`LOAD`, `SERVICE`, `HAVING` aliases, merged blank nodes), each with what to do: [limits](docs/limits.md#sparql) |
 | SPARQL 1.2 and RDF 1.2 drafts: triple terms, directional strings | Results announce `version 1.2` when they may use them ([HTTP interface](docs/ops/http-api.md#sparql)) |
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), service description | [HTTP interface](docs/ops/http-api.md) |
 | Results in JSON, XML, CSV and TSV; graphs in every RDF syntax below | Chosen by `Accept` ([formats](docs/ops/http-api.md#sparql)) |
