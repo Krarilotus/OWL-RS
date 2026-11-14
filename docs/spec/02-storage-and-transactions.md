@@ -14,7 +14,7 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
 - **Asserted and inferred statements are stored separately** (ADR-0003, roadmap E6).
   - The *asserted* stack holds what clients wrote, in any graph.
   - The *inferred* stack holds what the reasoner derived, always in the default graph.
-  - The two are **disjoint**: a statement that is both asserted and derivable counts as asserted, as in GraphDB.
+  - The two are **disjoint**: a statement that is both asserted and derivable counts as asserted.
   - An N-Quads export holds the asserted statements only; an image backup holds the inferred
     ones too ([backups](../ops/server-setup.md#10-backup-and-recovery-setup)).
 - **Blank nodes are scoped to one payload.** Every write request (update, Graph Store write, `TELL`, restore) gets fresh blank nodes. Within one payload, labels stay consistent. The startup ontology preload keeps the file's labels, so re-preloading is idempotent.
