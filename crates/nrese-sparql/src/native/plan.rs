@@ -217,6 +217,10 @@ impl Star {
 pub(super) struct Plan {
     pub order: Vec<usize>,
     pub rows: Vec<f64>,
+    /// The cost the orderer reckoned for it: rows read, a probe counting as [`PROBE_COST`]
+    /// rows. The work the plan expects, in the unit of a scanned row; 0 where no order was
+    /// searched.
+    pub(super) cost: f64,
     /// The characteristic-set work its planning counted ([`SET_BUDGET`]): all of it for a plan
     /// made within the budget; for one planned again without the sets, what was done before
     /// the next read or copy would have passed it.
@@ -634,12 +638,14 @@ fn search(
     let finish = |state: State| Plan {
         order: state.order,
         rows: state.estimates,
+        cost: state.cost,
         work: work.done.get(),
     };
     if n == 0 {
         return Ok(Plan {
             order: Vec::new(),
             rows: Vec::new(),
+            cost: 0.0,
             work: 0,
         });
     }
@@ -785,6 +791,7 @@ mod tests {
         let plan = |rows: Vec<f64>| Plan {
             order: (0..rows.len()).collect(),
             rows,
+            cost: 0.0,
             work: 0,
         };
         assert_eq!(expected_work(&plan(vec![f64::NAN, 10.0, 5.5])), 15.5);
