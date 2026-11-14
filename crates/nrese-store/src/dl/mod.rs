@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use bounds::BoundsReport;
-pub use config::{DlAnswers, DlConfig, DlConsistency};
+pub use config::{DlAnswers, DlConfig, DlConsistency, OutsideProfile};
 pub use consistency::{Checked, Verdict};
 
 /// What decided a DL answer's status, beside the shared status
