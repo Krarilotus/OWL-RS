@@ -62,9 +62,11 @@ KEYS = {
     "phases",
 }
 # The phases each classifier tool prints in its profile (fast.py samples(): its series). A case
-# declares fewer (`phases`) where the tool can't resolve one on the baseline (README.md).
+# declares fewer (`phases`) where the tool can't resolve one on the baseline (README.md), and then
+# `wall`, the harness's time of the whole process (fast.py PROCESS_WALL), in which it still counts.
 TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
                "classify-horn": ("read", "owl", "write")}
+WHOLE_RUN = "wall"
 REQUIRED = ("name", "area", "what", "semantics", "data", "metric", "cap_gb", "systems")
 
 
@@ -160,8 +162,12 @@ def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
             printed = TOOL_PHASES.get(c.get("tool", "perf_lab"))
             if printed is None:
                 out.append(f"{where}: phases: only a classifier tool's case declares them ({', '.join(sorted(TOOL_PHASES))})")
-            elif not (isinstance(c["phases"], list) and c["phases"] and set(c["phases"]) <= set(printed)):
-                out.append(f"{where}: phases: a non-empty list of what {c['tool']} prints ({', '.join(printed)})")
+            elif not (isinstance(c["phases"], list) and c["phases"] and set(c["phases"]) <= {*printed, WHOLE_RUN}):
+                out.append(f"{where}: phases: a non-empty list of what {c['tool']} prints ({', '.join(printed)})"
+                           f" and {WHOLE_RUN}")
+            elif set(printed) - set(c["phases"]) and WHOLE_RUN not in c["phases"]:
+                out.append(f"{where}: phases: leaving out {', '.join(sorted(set(printed) - set(c['phases'])))}, it "
+                           f"declares {WHOLE_RUN} (the whole process), where the phase still counts")
     return out
 
 

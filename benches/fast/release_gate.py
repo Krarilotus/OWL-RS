@@ -1586,8 +1586,10 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_bl
                 for (rev, s), m in e["series"].items() if len(m) >= 2 and min(m) > 0]
         seconds = {rev: statistics.mean(v) for rev, v in e["seconds"].items()}
         # One execution of every query (a DL tool's file: its phases), on the slowest side that
-        # ran the case (a baseline that can't run it has no times).
-        per_run = max((sum(r["median_ms"] for r in rows if r["rev"] == rev) for rev in revs), default=0.0)
+        # ran the case (a baseline that can't run it has no times). A classifier process's whole
+        # run (its phases and every --repeat run) is no part of one execution.
+        once = [r for r in rows if r["series"] != cases_registry.WHOLE_RUN]
+        per_run = max((sum(r["median_ms"] for r in once if r["rev"] == rev) for rev in revs), default=0.0)
         added = 0.0  # a process's added measured time, on every side
         entry = {}
         measured_runs = e["measured"].get("runs")
@@ -1612,10 +1614,10 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_bl
                 if len(short) < len({r["series"] for r in rows}):
                     entry["batch_queries"] = short
             added = (new_runs - (measured_runs or runs)) * per_run / 1000
-        elif case.get("tool") in ("tableau", "classify-horn") and "ok" in e["status"] and rows:
+        elif case.get("tool") in ("tableau", "classify-horn") and "ok" in e["status"] and once:
             # Files a process (the tableau's), or classifications whose median it reports
             # (the context classifier's).
-            whole = per_run if case["tool"] == "tableau" else max(r["median_ms"] for r in rows)
+            whole = per_run if case["tool"] == "tableau" else max(r["median_ms"] for r in once)
             repeat = int(case.get("repeat", 1))
             limit = 0.4 * float(case.get("timeout_s", 300)) * 1000 / max(whole, 1e-3)
             new = int(min(MAX_REPEAT, limit, max(repeat, math.ceil(DL_MS / max(whole, 1e-3)))))

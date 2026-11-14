@@ -280,6 +280,23 @@ SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
 # is its pid and name: a shell that execs its last command (a setup's `setup && case`) becomes the
 # case's process under the same pid.
 SCOPE_THP = re.compile(r"^fast-scope-thp (\{.*\})$", re.M)
+# A classifier process's wall time (series `wall`, ms), from the shell's clock just before and
+# after it in the case's scope: its whole run, its start, its --repeat runs and its exit included,
+# without the tool's own timers. A phase too short for the tool's 0.1 ms step is left out of the
+# case's comparison (`phases`) and still counts here (14 Nov 2026: nothing unobserved). bash 5's
+# EPOCHREALTIME: the realtime clock in microseconds, its decimal point the locale's.
+PROCESS_WALL = re.compile(r"^fast-process-wall (\S+) (\S+)\n?", re.M)
+
+
+def process_wall_ms(stderr: str) -> tuple[str, float | None]:
+    """`stderr` without the shell's clock line, and the process's wall time in ms between its two
+    readings (None without both, or with a clock that went back)."""
+    found = PROCESS_WALL.findall(stderr)
+    try:
+        start, end = (float(x.replace(",", ".")) for x in found[-1])
+    except (IndexError, ValueError):
+        return PROCESS_WALL.sub("", stderr), None
+    return PROCESS_WALL.sub("", stderr), round((end - start) * 1000, 3) if end > start else None
 
 
 def thp_modes(group: Path, known: set) -> list[dict]:
@@ -1093,14 +1110,19 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     elif tool in ("classify-el", "classify-horn"):
         binary = "classify" if tool == "classify-el" else "context_classify"
         out_tsv = f"/out/{case['name']}.tsv"
-        command = ["bash", "-c", f"/target/release/examples/{binary} --out {out_tsv} --repeat {repeat} {data}"
-                                 f" && sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
+        # The shell reads its clock just before and after the classifier process (PROCESS_WALL).
+        command = ["bash", "-c", f"s=$EPOCHREALTIME; /target/release/examples/{binary} --out {out_tsv} --repeat {repeat}"
+                                 f" {data}; c=$?; echo \"fast-process-wall $s $EPOCHREALTIME\" >&2; [ $c = 0 ] || exit $c;"
+                                 f" sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
         # Fresh processes (`processes`): each one's profile, pooled below; the last one's answer.
         profiles, wall = [], 0.0
         for _ in range(int(case.get("processes", 1))):
             code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
-            profiles.append(profile_line(err, out))
+            err, process_wall = process_wall_ms(err)
+            profiles.append({**profile_line(err, out), **({"wall": process_wall} if process_wall else {})})
             wall += w
+            if code == 0 and not process_wall:
+                code, err = 1, f"{err}\nno wall time of the classifier process (fast-process-wall)"
             if code != 0:
                 break
         result = profiles[-1]
@@ -1118,8 +1140,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         result["samples_ms"] = [x for x in totals if x is not None]
         result["whole_ms"] = statistics.median(result["samples_ms"]) if result["samples_ms"] else total
         result["phase_samples"] = {k: [pr[k] for pr in profiles if isinstance(pr.get(k), float)] for k in
-                                   ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
-                                   if isinstance(result.get(k), float)}
+                                   ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write",
+                                    "wall") if isinstance(result.get(k), float)}
         record["wall_s"] = round(wall, 2)
         if code != 0:
             record["status"] = classify_failure(code, err, result)

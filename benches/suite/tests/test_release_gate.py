@@ -1648,20 +1648,22 @@ class ToolPhases(unittest.TestCase):
         # in a release run (13 Nov 2026) the EL classifier printed, at its 0.1 ms, 0.0 on every
         # pass of the baseline for el-shallow-existentials' prepare and write and for el-classify's
         # and el-classify-irregular's prepare; their families have their other phases, against
-        # each baseline. A classifier case that declares none keeps its tool's phases: horn-classify
-        # read, owl and write, against base (main lacks the Horn classifier: absent).
+        # each baseline, and the process's whole run as the harness times it (`wall`; master, 14 Nov
+        # 08:12: nothing unobserved after the drop). A classifier case that declares none keeps its
+        # tool's phases: horn-classify read, owl and write, against base (main lacks the Horn
+        # classifier: absent).
         catalog = fast.load_cases()
         cases = ["el-shallow-existentials", "el-classify", "el-classify-irregular", "horn-classify"]
         family = gate_module.family_of(catalog, cases)
         times = lambda case, side: sorted(h.split("|")[2] for h in family
                                           if h.startswith(f"{side}|{case}|time/"))
-        five = ["time/assemble", "time/normalise", "time/read", "time/saturate", "time/write"]
+        el = ["time/assemble", "time/normalise", "time/read", "time/saturate", "time/wall", "time/write"]
         for side in ("base", "main"):
             with self.subTest(side=side):
                 self.assertEqual(times("el-shallow-existentials", side),
-                                 ["time/assemble", "time/normalise", "time/read", "time/saturate"])
-                self.assertEqual(times("el-classify", side), five)
-                self.assertEqual(times("el-classify-irregular", side), five)
+                                 ["time/assemble", "time/normalise", "time/read", "time/saturate", "time/wall"])
+                self.assertEqual(times("el-classify", side), el)
+                self.assertEqual(times("el-classify-irregular", side), el)
                 self.assertIn(f"{side}|el-shallow-existentials|memory/anon_kernel", family)
         self.assertEqual(times("horn-classify", "base"), ["time/owl", "time/read", "time/write"])
         self.assertEqual(times("horn-classify", "main"), [])
@@ -2336,6 +2338,38 @@ class Measurement(unittest.TestCase):
         import tomllib
         self.assertEqual(tomllib.loads(gate_module.write_measure(rich, "a test"))["case"]["q-paths"]["blocks"],
                          rich["cases"]["q-paths"]["blocks"])
+
+    def test_calibrate_sizes_a_horn_case_by_one_classification_not_by_its_whole_process(self):
+        # Spec (calibrate: a context classifier's process repeats its classification `repeat` times,
+        # its time DL_MS = 3000 ms at most; Sol, classifier-wall r1): its largest phase, 300 ms, is
+        # one classification, so 3000 ms buys ten; the process's whole run (910 ms for three
+        # classifications and the process around them) is no classification.
+        def records_of(side, n):
+            r = record(case="horn-x", samples={"read": [100.0] * 5, "owl": [300.0] * 5, "write": [50.0] * 5,
+                                               "wall": [910.0] * 5})
+            r["case_s"] = 5.0
+            return [r]
+        catalog = [{"name": "horn-x", "tool": "classify-horn", "metric": "whole_ms", "repeat": 3, "args": []}]
+        plan = gate_module.calibrate(catalog, passes(records_of), budget_min=240, m=10, batch=False)
+        self.assertEqual(plan["cases"]["horn-x"].get("repeat"), 10)
+
+    def test_compare_keeps_a_classifier_s_whole_process_out_of_its_phases_sum(self):
+        # Spec (Sol, classifier-wall r1): the whole process holds its phases. A case whose phases
+        # fell from 100 to 50 ms while its process grew from 300 to 350 ms (+17 %, above the 10 %
+        # floor and 2 ms) is timed 100 -> 50 by its phases, and its whole process is a slowdown
+        # (exit 1); summed, both sides were 400 ms and nothing showed.
+        def report(phase_ms, wall_ms):
+            records = [{"case": "el-x", "rep": rep, "status": "ok", "checks": [], "routes": [],
+                        "metric": 2 * phase_ms, "samples": {"read": [phase_ms] * 5, "saturate": [phase_ms] * 5,
+                                                            "wall": [wall_ms] * 5}} for rep in (1, 2)]
+            return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-14T08:00:00", "records": records}
+        code, text = DeclaredMetric.compared(self, report(50.0, 300.0), report(25.0, 350.0))
+        self.assertEqual(code, 1, text)
+        self.assertIn("whole process: 300 -> 350 ms", text)
+        self.assertIn("SLOWER", text.split("whole process:")[1].splitlines()[0])
+        line = next(l for l in text.splitlines() if l.lstrip().startswith("el-x"))
+        self.assertEqual([float(x) for x in line.split()[1:3]], [100.0, 50.0], line)
 
     def test_fast_applies_the_calibration_alike_and_pools_repeated_processes(self):
         case = {"name": "x", "tool": "perf_lab", "args": ["--runs", "5", "--qerror"], "repeat": 1}
