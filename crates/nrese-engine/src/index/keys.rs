@@ -1108,7 +1108,7 @@ impl PackedKeys {
             return Some((start, start));
         }
         account
-            .take_cost(|| 3 * self.levels() + BLOCK_PROBES)
+            .take_cost(|| self.end_cost())
             .then(|| (start, self.end_from(start, high)))
     }
 
@@ -1116,8 +1116,23 @@ impl PackedKeys {
     /// (the run it reads counted with it): `None` once the account has stopped.
     pub(crate) fn bound_counted(&self, key: &Key, account: &mut impl Account) -> Option<usize> {
         account
-            .take_cost(|| self.levels() + BLOCK_PROBES + 1)
+            .take_cost(|| self.bound_cost())
             .then(|| self.bound_in(0, self.len, key, false))
+    }
+
+    /// The most [`Self::range_counted`] counts: its bound search and its range end.
+    pub(super) fn range_cost(&self) -> u64 {
+        self.bound_cost() + self.end_cost()
+    }
+
+    /// What [`Self::bound_counted`] counts, the run it reads included.
+    fn bound_cost(&self) -> u64 {
+        self.levels() + BLOCK_PROBES + 1
+    }
+
+    /// What a range end counts in [`Self::range_counted`].
+    fn end_cost(&self) -> u64 {
+        3 * self.levels() + BLOCK_PROBES
     }
 
     /// The most comparisons a search over the blocks' first keys makes, one per level of a

@@ -46,10 +46,13 @@ pub enum Site {
     /// A merge's work: each key comparison its selection makes, each cursor it advances and
     /// each key a cursor decodes (`index::merge`; REAS-3a fix check r1 F1).
     MergeWork,
+    /// Reads that took a point read's own path (`CountedSnapshot::point_quads`), not one of
+    /// the counted reads it falls back to.
+    PointReads,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 9] = const { [const { Cell::new(0) }; 9] };
+    static COUNTS: [Cell<u64>; 10] = const { [const { Cell::new(0) }; 10] };
 }
 
 /// Counts `n` units at `site` on this thread.
