@@ -234,6 +234,15 @@ fn pipeline_without_gate() -> nrese_store::MutationPipeline {
     })
 }
 
+/// [`pipeline_without_gate`], answering outside OWL 2 DL by a proven procedure (the EL route).
+fn pipeline_proven() -> nrese_store::MutationPipeline {
+    super::pipeline_with(nrese_store::DlConfig {
+        consistency: nrese_store::DlConsistency::Off,
+        outside_profile: nrese_store::OutsideProfile::Proven,
+        ..nrese_store::DlConfig::default()
+    })
+}
+
 /// An EL ontology whose role hierarchy is irregular (`r1 ∘ r2 ⊑ r3` with `r3 ⊑ r1`,
 /// *OWL 2 Structural Specification* §11.2): outside OWL 2 DL and OWL 2 EL, so the DL
 /// engines leave its chain out; the EL classifier's completion rules (CR6) need no
@@ -254,7 +263,7 @@ const IRREGULAR: &str = ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . \
 const LEFT_OUT: &str = "axioms left out: an irregular role hierarchy";
 
 fn irregular(extra: &str) -> nrese_store::ClassificationReport {
-    let dl = pipeline_without_gate();
+    let dl = pipeline_proven();
     insert(&dl, &format!("{IRREGULAR} {extra}")).expect("ontology");
     dl.store()
         .classify(&ReadScope::All)
@@ -296,7 +305,7 @@ fn an_irregular_el_ontology_is_answered_completely_by_the_el_classifier() {
 /// listing nothing (the DL engines' Horn part, without the chain, can't find it).
 #[test]
 fn an_irregular_el_ontology_whose_thing_is_unsatisfiable_is_inconsistent() {
-    let dl = pipeline_without_gate();
+    let dl = pipeline_proven();
     insert(
         &dl,
         ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :r3 a owl:ObjectProperty . \
@@ -329,6 +338,25 @@ fn assert_lower_bound(report: &nrese_store::ClassificationReport) {
         "{:?}",
         report.incomplete
     );
+}
+
+/// By default no procedure outside OWL 2 DL runs: the irregular ontology the EL classifier
+/// would answer gets the DL engines' marked lower bound, as before the EL route. (No red
+/// run first: this default keeps today's behaviour, so no tree fails it.)
+#[test]
+fn by_default_an_irregular_el_ontology_gets_the_dl_engines_lower_bound() {
+    let dl = pipeline_without_gate();
+    insert(&dl, IRREGULAR).expect("ontology");
+    let report = dl
+        .store()
+        .classify(&ReadScope::All)
+        .expect("classification");
+    assert!(
+        !has(&report.subsumptions, "A", "D"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert_lower_bound(&report);
 }
 
 /// A range on a property above a chain's (`r3 ⊑ r4`) needs applying on the edges the

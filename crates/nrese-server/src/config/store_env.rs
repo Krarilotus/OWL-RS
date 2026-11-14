@@ -240,6 +240,8 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
             defaults.max_join_steps,
             count,
         )?,
+        // Not a setting until the outside-profile setting lands; the route stays off.
+        outside_profile: nrese_store::OutsideProfile::default(),
     })
 }
 
