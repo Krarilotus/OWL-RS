@@ -310,8 +310,9 @@ pub(crate) struct El {
 /// Its consistency: with no assertion, `owl:Thing`'s satisfiability, read from a fresh class
 /// that no axiom names (unsatisfiable iff `owl:Thing` is), left out of the answer.
 ///
-/// The classifier takes no stop and no budget (docs/architecture/contracts.md): once
-/// started it runs to its end, polynomial in the ontology; the triples it reads are charged.
+/// The classifier (`nrese_reasoner::classify::classify_parallel`) takes no stop and no
+/// budget: once started it runs to its end, polynomial in the ontology; the triples it
+/// reads are charged.
 pub(crate) fn el_answer(
     store: &StoreService,
     snapshot: &Snapshot,
