@@ -391,10 +391,17 @@ fn an_irregular_ontology_with_a_range_below_a_chains_equivalent_is_not_answered_
 #[test]
 fn an_irregular_ontology_whose_annotation_domain_the_el_classifier_reads_as_a_class_is_not_answered_by_it()
  {
-    assert_lower_bound(&irregular(
+    let report = irregular(
         ":ap a owl:AnnotationProperty ; rdfs:domain :X . :T a owl:Class . \
          owl:Thing rdfs:subClassOf :T .",
-    ));
+    );
+    // X is no class: an annotation property's domain has no logical meaning.
+    assert!(
+        !has(&report.subsumptions, "X", "T"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert_lower_bound(&report);
 }
 
 /// The EL classifier reads datatypes declared `owl:DataRange` as classes, the DL engines as
@@ -402,7 +409,13 @@ fn an_irregular_ontology_whose_annotation_domain_the_el_classifier_reads_as_a_cl
 #[test]
 fn an_irregular_ontology_whose_data_ranges_the_el_classifier_reads_as_classes_is_not_answered_by_it()
  {
-    assert_lower_bound(&irregular(
-        ":Dt a owl:DataRange . :Et a owl:DataRange . :Dt owl:equivalentClass :Et .",
-    ));
+    let report =
+        irregular(":Dt a owl:DataRange . :Et a owl:DataRange . :Dt owl:equivalentClass :Et .");
+    // Dt and Et are datatypes, no classes: no pair between them.
+    assert!(
+        !has(&report.subsumptions, "Dt", "Et") && !has(&report.subsumptions, "Et", "Dt"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert_lower_bound(&report);
 }
