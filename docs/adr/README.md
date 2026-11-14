@@ -12,7 +12,7 @@ One file per decision that is expensive to reverse. Format: context → decision
 | [0006](0006-full-text-search-and-researchspace.md) | Built-in full-text search; ResearchSpace is adapted to NRESE | accepted |
 | [0007](0007-one-engine-api.md) | One engine API; protocols and the frontend translate to it | accepted |
 | [0008](0008-users-workspaces-policies.md) | Users, workspaces and graph policies in the store | accepted |
-| [0009](0009-owl2-dl-reasoning.md) | OWL 2 DL reasoning: one OWL model, hypertableau, consequence-based classification, certain answers with datalog bounds | proposed |
+| [0009](0009-owl2-dl-reasoning.md) | OWL 2 DL reasoning: one OWL model, hypertableau, consequence-based classification, certain answers with datalog bounds | accepted |
 | [0010](0010-standing-product-decisions.md) | Standing product decisions: reasoning leads, configurable defaults, one execution core, Rust natively, no C/C++ speed dependencies, licence | accepted |
 | [0011](0011-equality-one-contract-three-backends.md) | Equality: one contract (reasons, deltas, owner domains), backends per lifetime (monotone, persistent, rollback) | proposed |
 | [0012](0012-query-depth.md) | Query depth: sequences (UNION, joins, paths, BIND runs) n-ary in the algebra, so no pass recurses in proportion to a query's length; one nesting limit counting the algebra; queries on their caller's stack | proposed |

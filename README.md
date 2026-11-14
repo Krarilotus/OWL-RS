@@ -39,8 +39,11 @@ You need:
   Desktop ([install](https://docs.docker.com/desktop/)): the build needs BuildKit, their
   default builder;
 - curl 7.71 or later (`curl --version`; [download](https://curl.se/download.html));
-- for the build: a CPU from x86-64-v3 (amd64) or Neoverse N1 (arm64) on (for an older one,
-  add `--build-arg NRESE_TARGET_CPU=portable` to `docker build`), and about 3 GB of free
+- for the build: an amd64 CPU of level [x86-64-v3](https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels)
+  (AVX2 and FMA: Intel from Haswell, 2013; AMD from Excavator, 2015; on Linux,
+  `/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3` says `supported`), or an arm64 CPU
+  from Neoverse N1 on (AWS Graviton2, Ampere Altra); for an older one, add
+  `--build-arg NRESE_TARGET_CPU=portable` to `docker build`; and about 3 GB of free
   memory and 3 GB of free disk, besides the base images Docker downloads;
 - port 8080 free on this machine.
 
