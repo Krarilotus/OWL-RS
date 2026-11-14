@@ -78,9 +78,10 @@ const GREEDY_EFFORT: usize = 1 << 19;
 pub(super) const SET_BUDGET: usize = 1 << 16;
 
 /// The rows a BGP's plain plan (planned without the characteristic sets) must expect for the
-/// sets to be read where its predicates are in many ([`admits`]). Planning effort follows the
-/// work the query expects: a set search on WatDiv's long lists costs about 0.5 ms whether or
-/// not it pays, so only a query that expects millions of rows can repay it. On WatDiv
+/// sets to be read at all ([`admits`]). Planning effort follows the work the query expects: a
+/// set search costs more than a small query can repay, even on short lists (WatDiv's S1,
+/// 13 November 2026: 0.34 ms to plan with the sets against 0.10 without, for an execution
+/// 0.05 ms faster), so only a query that expects millions of rows is searched. On WatDiv
 /// (12 November 2026), the one query whose set plan beats main's, watdiv-100m C3-1 (106 ms
 /// against 394), expects 3.1 M rows; the others whose set plan differs from main's expect at
 /// most 210 k (S2-8, slower with its sets: 5.04 ms against 4.19 without), and every F, S and
@@ -89,15 +90,6 @@ pub(super) const SET_BUDGET: usize = 1 << 16;
 /// sits between it and C3-1, two points only. A tuning signal, not a bound on execution; like
 /// [`SET_BUDGET`], a constant.
 pub(super) const SET_GATE_ROWS: f64 = 2_000_000.0;
-
-/// Set entries any planning may read at its starts, whatever it expects ([`admits`]): where
-/// its predicates are in few sets, the sets are read as before the gate. About 7 µs of
-/// lookups. The join-order identity fixtures' graphs are in few sets, so they keep their plans;
-/// WatDiv's S1 reads 98 and keeps the plan its sets give; WatDiv's other queries read 2,625 to
-/// 96,518 (12 November 2026). It bounds the starts only: a search it admits may read long
-/// lists after them (a chain's links), up to its budget, [`SET_BUDGET`] for a query that
-/// expects little, before the BGP keeps its plain plan. A constant, as [`SET_BUDGET`] is.
-pub(super) const SET_START_ALLOWANCE: usize = 1 << 10;
 
 /// Set entries a planning may spend per row its plain plan expects, above [`SET_BUDGET`]
 /// ([`budget_for`]): a query that expects much work may plan longer. watdiv-100m C3-1's set
@@ -137,40 +129,15 @@ fn start_stars(inputs: &[Input], first: Option<usize>) -> impl Iterator<Item = &
         .filter(|star| star.open())
 }
 
-/// The sets a search reads at its starts ([`start_stars`]: all of them, or a fixed order's
-/// `first`), by the sets' index, saturating.
-pub(super) fn start_reads(
-    inputs: &[Input],
-    first: Option<usize>,
-    sets: &CharacteristicSets,
-) -> usize {
-    start_stars(inputs, first).fold(0usize, |reads, star| {
-        reads.saturating_add(sets.sets_having(star.predicate))
-    })
-}
-
-/// Whether a BGP whose plain plan expects `expected` rows, and whose set search would read
-/// `reads` entries at its starts, is planned with the sets too: where those reads are within
-/// [`SET_START_ALLOWANCE`], or it expects at least [`SET_GATE_ROWS`] rows (NaN doesn't). A
-/// test's decision ([`ADMIT`]) instead.
-pub(super) fn admits(expected: f64, reads: usize) -> bool {
+/// Whether a BGP whose plain plan expects `expected` rows is refined by the characteristic
+/// sets: where it expects at least [`SET_GATE_ROWS`] (NaN doesn't). A test's decision
+/// ([`ADMIT`]) instead.
+pub(super) fn admits(expected: f64) -> bool {
     #[cfg(test)]
     if let Some(admit) = ADMIT.with(Cell::get) {
         return admit;
     }
-    reads <= SET_START_ALLOWANCE || expected >= SET_GATE_ROWS
-}
-
-/// Whether a BGP whose set search would read `reads` entries at its starts is admitted by
-/// them alone ([`SET_START_ALLOWANCE`]), whatever its plain plan expects: such a BGP is
-/// searched with the sets before it is planned without them. Not where a test keeps every
-/// BGP from the sets ([`ADMIT`]).
-pub(super) fn short_starts(reads: usize) -> bool {
-    #[cfg(test)]
-    if ADMIT.with(Cell::get) == Some(false) {
-        return false;
-    }
-    reads <= SET_START_ALLOWANCE
+    expected >= SET_GATE_ROWS
 }
 
 /// [`SET_ENTRIES_PER_ROW`] per expected row, in entries: a float cast saturates, NaN to 0 and
@@ -808,12 +775,13 @@ mod tests {
     /// Spec: the master's order of 12 November 13:53, "enter the set search only when that
     /// plan's own estimate says the query is expensive enough", with "effort follows expected
     /// work", and its doubt review: a plan's expected work is its steps' estimates summed, NaN
-    /// left out and infinity kept; a BGP is planned with the sets where its starts' reads are
-    /// within [`SET_START_ALLOWANCE`] or it expects at least [`SET_GATE_ROWS`] rows, not else;
-    /// its budget is [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`] per expected row where that is
-    /// more, saturating (NaN to the floor); a test's budget and decision replace the planner's.
+    /// left out and infinity kept; a BGP is planned with the sets where it expects at least
+    /// [`SET_GATE_ROWS`] rows, not else (the master's decision of 13 November 23:58: no
+    /// allowance for short lists); its budget is [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`]
+    /// per expected row where that is more, saturating (NaN to the floor); a test's budget and
+    /// decision replace the planner's.
     #[test]
-    fn the_sets_are_read_only_where_their_lists_are_short_or_the_query_expects_much_work() {
+    fn the_sets_are_read_only_where_the_query_expects_much_work() {
         let plan = |rows: Vec<f64>| Plan {
             order: (0..rows.len()).collect(),
             rows,
@@ -824,16 +792,15 @@ mod tests {
             expected_work(&plan(vec![1.0, f64::INFINITY])),
             f64::INFINITY
         );
-        let many = SET_START_ALLOWANCE + 1;
         assert_eq!(
             [
-                admits(0.0, SET_START_ALLOWANCE),
-                admits(SET_GATE_ROWS - 1.0, many),
-                admits(SET_GATE_ROWS, many),
-                admits(f64::NAN, many),
-                admits(f64::INFINITY, usize::MAX),
+                admits(0.0),
+                admits(SET_GATE_ROWS - 1.0),
+                admits(SET_GATE_ROWS),
+                admits(f64::NAN),
+                admits(f64::INFINITY),
             ],
-            [true, false, true, false, true]
+            [false, false, true, false, true]
         );
         let large = SET_BUDGET as f64 / SET_ENTRIES_PER_ROW;
         assert_eq!(budget_for(0.0), SET_BUDGET);
@@ -842,11 +809,11 @@ mod tests {
         assert_eq!(budget_for(4.0 * large), 4 * SET_BUDGET);
         assert_eq!(budget_for(f64::INFINITY), usize::MAX);
         BUDGET.set(Some(2));
-        ADMIT.set(Some(false));
-        let (budget, admit) = (budget_for(4.0 * large), admits(0.0, 0));
+        ADMIT.set(Some(true));
+        let (budget, admit) = (budget_for(4.0 * large), admits(0.0));
         BUDGET.set(None);
         ADMIT.set(None);
-        assert_eq!((budget, admit), (2, false));
+        assert_eq!((budget, admit), (2, true));
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! bit, for planning problems of each shape its searches meet. Identity tests: the tables
 //! were captured from the orderer before its state lifecycle change (engine-v2 38202f73d),
 //! which keeps every comparison, so they hold on both trees by design. A change to the
-//! cost model changes them on purpose; the failure prints the new table.
+//! cost model changes them on purpose; the failure prints the new table. Last, the estimates
+//! the characteristic sets and pairs give a BGP admitted to them ([`plan::admits`]).
 
 use super::plan::{self, Input};
 use super::*;
@@ -331,8 +332,9 @@ fn planned(ctx: &Context<'_>, patterns: &[&str], links: &Links) -> Steps {
     steps(&plan.map_err(QueryEvaluationError::from).unwrap())
 }
 
+/// The plans the characteristic sets and pairs give these cases, admitted to them.
 #[rustfmt::skip]
-const FROM_THE_STORE: &Table = &[
+const FROM_THE_STORE_WITH_SETS: &Table = &[
     // [1.0, 1.5, 1.5]
     ("q02", &[0, 1, 2], &[0x3ff0000000000000, 0x3ff8000000000000, 0x3ff8000000000000]),
     // [40.0]
@@ -361,9 +363,43 @@ const FROM_THE_STORE: &Table = &[
     ("path", &[0, 1, 2], &[0x402e000000000000, 0x4036800000000000, 0x4099f98000000000]),
 ];
 
+/// The planner's own plans of these cases: each expects too few rows for the sets
+/// ([`plan::admits`]), so each is its plain plan.
+#[rustfmt::skip]
+const FROM_THE_STORE: &Table = &[
+    // [1.0, 1.5, 1.5]
+    ("q02", &[0, 1, 2], &[0x3ff0000000000000, 0x3ff8000000000000, 0x3ff8000000000000]),
+    // [40.0]
+    ("one", &[0], &[0x4044000000000000]),
+    // [40.0, 60.0]
+    ("two", &[1, 0], &[0x4044000000000000, 0x404e000000000000]),
+    // [30.0, 30.0, 30.0, 45.0]
+    ("star", &[3, 0, 2, 1], &[0x403e000000000000, 0x403e000000000000, 0x403e000000000000, 0x4046800000000000]),
+    // [3.0, 24.0, 36.0, 54.0]
+    ("chain", &[3, 2, 1, 0], &[0x4008000000000000, 0x4038000000000000, 0x4042000000000000, 0x404b000000000000]),
+    // [5.0, 40.0, 40.0]
+    ("edge-after-star", &[0, 1, 2], &[0x4014000000000000, 0x4044000000000000, 0x4044000000000000]),
+    // [8.0, 2.0, 3.0]
+    ("common-values", &[1, 0, 2], &[0x4020000000000000, 0x4000000000000000, 0x4008000000000000]),
+    // [90.0, 135.0, 3.375]
+    ("cycle", &[0, 1, 2], &[0x4056800000000000, 0x4060e00000000000, 0x400b000000000000]),
+    // [15.0, 22.5, 22.5]
+    ("constant-objects", &[0, 1, 2], &[0x402e000000000000, 0x4036800000000000, 0x4036800000000000]),
+    // [40.0, 40.0, 40.0]
+    ("link", &[2, 0, 1], &[0x4044000000000000, 0x4044000000000000, 0x4044000000000000]),
+    // [36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0]
+    ("star-12", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000]),
+    // [36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0, 36.0]
+    ("star-13", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], &[0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000, 0x4042000000000000]),
+    // [15.0, 22.5, 1662.375]
+    ("path", &[0, 1, 2], &[0x402e000000000000, 0x4036800000000000, 0x4099f98000000000]),
+];
+
 /// Spec: as for [`hand_built_inputs_plan_as_before`], through the planner's inputs from a
 /// store (counts, distinct values, stars, edges, counted common values, a link's
-/// variable) and the store's characteristic sets and pairs: q02's shape, one and two
+/// variable), under the planner's own gate (the master's decision of 13 November 23:58:
+/// these small BGPs expect too few rows for the sets, so each gets its plain plan) and
+/// admitted to the store's characteristic sets and pairs: q02's shape, one and two
 /// patterns, a star, a chain, an edge after a star on its object, two small patterns on
 /// one variable, a cycle (EXPLAIN plans it), constant objects, stars of 12 (exhaustive)
 /// and 13 (greedy) patterns, and two patterns with a path after them, the path the last
@@ -445,20 +481,28 @@ fn store_patterns_plan_as_before() {
         ("star-12", star12.iter().map(String::as_str).collect(), none),
         ("star-13", star13.iter().map(String::as_str).collect(), none),
     ];
-    let mut actual: Vec<(&str, Steps)> = cases
-        .iter()
-        .map(|(name, patterns, links)| (*name, planned(&ctx, patterns, links)))
-        .collect();
     // Two triple patterns, then a path from the second one's object: ordered as one join,
     // the path an input after the patterns' ([`Context::path_join_order`]).
     let text = "SELECT * WHERE { ?x <http://e/type> <http://e/Student> . \
                 ?x <http://e/knows> ?y . ?y <http://e/knows>+ ?z }";
     let query = Query::parse(text, None).unwrap();
     let join = path_join(pattern_and_form(&query).0).expect("triple patterns and a path");
-    let plan = ctx.path_join_order(&join);
-    let plan = plan.map_err(QueryEvaluationError::from).unwrap();
-    actual.push(("path", steps(&plan.expect("its terms are in the store"))));
-    assert_table(FROM_THE_STORE, &actual);
+    let all = || {
+        let mut actual: Vec<(&str, Steps)> = cases
+            .iter()
+            .map(|(name, patterns, links)| (*name, planned(&ctx, patterns, links)))
+            .collect();
+        let plan = ctx.path_join_order(&join);
+        let plan = plan.map_err(QueryEvaluationError::from).unwrap();
+        actual.push(("path", steps(&plan.expect("its terms are in the store"))));
+        actual
+    };
+    let own = all();
+    plan::ADMIT.set(Some(true));
+    let admitted = all();
+    plan::ADMIT.set(None);
+    assert_table(FROM_THE_STORE_WITH_SETS, &admitted);
+    assert_table(FROM_THE_STORE, &own);
 }
 
 /// The join of triple patterns and paths that `pattern` is, under its projection.
@@ -549,5 +593,100 @@ fn planning_looks_up_a_variable_only_one_pattern_has() {
         ctx.distinct(&pattern, &Variable::new_unchecked("o"), 20),
         2,
         "the first revision's lookup is what the second reads (20 if it made none)"
+    );
+}
+
+/// An engine holding `e:<subject> e:<predicate> e:<object>` for each triple.
+fn store(triples: impl Iterator<Item = (String, &'static str, String)>) -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let e = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+    let mut tx = engine.transaction();
+    for (s, p, o) in triples {
+        tx.insert(Quad::new(e(&s), e(p), e(&o), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// The estimate EXPLAIN gives the BGP `text` on `engine`, admitted to the sets or under the
+/// planner's own gate, and the rows the query has.
+fn estimated(engine: &Engine, text: &str, admitted: bool) -> (Option<u64>, u64) {
+    let text = format!("PREFIX : <http://e/> SELECT * WHERE {{ {text} }}");
+    let query = Query::parse(&text, None).unwrap();
+    plan::ADMIT.set(admitted.then_some(true));
+    let explained = explain(&engine.snapshot(), &query, &QueryOptions::default());
+    plan::ADMIT.set(None);
+    let (_, steps, rows, ..) = explained.unwrap();
+    let bgp = steps.iter().find(|s| s.operator == "bgp").expect("a bgp");
+    (bgp.estimated_rows, rows)
+}
+
+/// Spec: stars are estimated from the characteristic sets, where admitted: 200 products have
+/// a label and a price, 2,000 persons a label and a name. No subject has a name and a price,
+/// which the sets know and independence doesn't (it estimates 200 rows); and the products'
+/// pair is estimated as what it is. Red where the admitted BGP doesn't read the sets.
+#[test]
+fn stars_admitted_to_the_sets_are_estimated_from_them() {
+    let products = (0..200).flat_map(|i| {
+        [
+            (format!("product{i}"), "label", "l".to_owned()),
+            (format!("product{i}"), "price", format!("p{}", i % 7)),
+        ]
+    });
+    let persons = (0..2_000).flat_map(|i| {
+        [
+            (format!("person{i}"), "label", "l".to_owned()),
+            (format!("person{i}"), "name", format!("n{i}")),
+        ]
+    });
+    let engine = store(products.chain(persons));
+    let none = "?s :label ?l ; :name ?n ; :price ?p";
+    assert_eq!(estimated(&engine, none, true), (Some(0), 0));
+    assert_ne!(estimated(&engine, none, false).0, Some(0), "independence");
+    assert_eq!(
+        estimated(&engine, "?s :label ?l ; :price ?p", true),
+        (Some(200), 200)
+    );
+    // A constant object keeps its share: one price in seven.
+    let (estimate, found) = estimated(&engine, "?s :label ?l ; :price :p3", true);
+    assert_eq!(found, (0..200).filter(|i| i % 7 == 3).count() as u64);
+    assert!(
+        estimate.is_some_and(|e| e.abs_diff(found) <= 1),
+        "{estimate:?} for {found}"
+    );
+}
+
+/// Spec: chains are estimated from the characteristic pairs, where admitted: 1,000 offers
+/// point at products with `:product`, 1,000 reviews at persons with `:author`, and the
+/// products alone have a `:price`. `?x :product ?y . ?y :price ?p` has a row per offer, which
+/// the pairs know; `?x :author ?y . ?y :price ?p` has none: no author has a price, which
+/// independence doesn't know. Red where the admitted BGP doesn't read the pairs.
+#[test]
+fn chains_admitted_to_the_sets_are_estimated_from_the_pairs() {
+    let prices = (0..200).map(|i| (format!("product{i}"), "price", format!("p{}", i % 7)));
+    let names = (0..100).map(|i| (format!("person{i}"), "name", format!("n{i}")));
+    let links = (0..1_000).flat_map(|i| {
+        [
+            (
+                format!("offer{i}"),
+                "product",
+                format!("product{}", i % 200),
+            ),
+            (format!("review{i}"), "author", format!("person{}", i % 100)),
+        ]
+    });
+    let engine = store(prices.chain(names).chain(links));
+    let offers = "?x :product ?y . ?y :price ?p";
+    assert_eq!(estimated(&engine, offers, true), (Some(1_000), 1_000));
+    let none = "?x :author ?y . ?y :price ?p";
+    assert_eq!(estimated(&engine, none, true), (Some(0), 0));
+    assert_ne!(estimated(&engine, none, false).0, Some(0), "independence");
+    // Three patterns: the chain then a star on the offers.
+    let three = "?x :product ?y . ?y :price ?p . ?x :product ?z";
+    let (estimate, found) = estimated(&engine, three, true);
+    assert_eq!(found, 1_000);
+    assert!(
+        estimate.is_some_and(|e| e.abs_diff(found) <= 1),
+        "{estimate:?} for {found}"
     );
 }

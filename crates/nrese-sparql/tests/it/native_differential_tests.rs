@@ -2434,7 +2434,8 @@ fn parallel_probe_join_equals_the_reference() {
 }
 
 /// EXPLAIN runs the query and reports every operator: the BGP's join order with estimated
-/// and actual rows, and the operators above it.
+/// and actual rows, and the operators above it (beside the planner's note on the order,
+/// `join order`, which is no operator).
 #[test]
 fn explain_reports_the_plan() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -2539,7 +2540,10 @@ fn explain_reports_the_plan() {
     assert_eq!(operators[0], (0, "project"));
     assert_eq!(operators[1], (1, "filter"));
     let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
-    let bgp: Vec<_> = below.iter().filter(|s| s.operator != "filter").collect();
+    let bgp: Vec<_> = below
+        .iter()
+        .filter(|s| s.operator != "filter" && s.operator != "join order")
+        .collect();
     assert_eq!(bgp.len(), 3, "{:#?}", explanation.steps);
     // memberOf d0 (20 rows) is the most selective start; every join step has an estimate.
     assert!(bgp[0].detail.contains("memberOf"), "{:#?}", bgp);
@@ -2572,7 +2576,11 @@ fn explain_reports_the_plan() {
         ),
         rows(reference(&snapshot, &query, &oracle).unwrap(), false)
     );
-    let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
+    let below: Vec<_> = explanation
+        .steps
+        .iter()
+        .filter(|s| s.depth == 2 && s.operator != "join order")
+        .collect();
     assert_eq!(
         (below[0].operator.as_str(), below[1].operator.as_str()),
         ("scan", "filter"),
@@ -6208,119 +6216,6 @@ fn long_operator_chains_neither_overflow_nor_print_unreadably() {
         .unwrap()
         .join()
         .unwrap();
-}
-
-/// Stars are estimated from the characteristic sets: 200 products have a label and a
-/// price, 2,000 persons a label and a name. No subject has a name and a price, which the
-/// sets know and independence doesn't (it estimates 200 rows); and the products' pair is
-/// estimated as what it is.
-#[test]
-fn stars_are_estimated_from_characteristic_sets() {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut tx = engine.transaction();
-    let quad =
-        |s: String, p: &str, o: NamedNode| Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph);
-    for i in 0..200 {
-        tx.insert(quad(format!("product{i}"), "label", ex("l")).as_ref());
-        tx.insert(quad(format!("product{i}"), "price", ex(&format!("p{}", i % 7))).as_ref());
-    }
-    for i in 0..2_000 {
-        tx.insert(quad(format!("person{i}"), "label", ex("l")).as_ref());
-        tx.insert(quad(format!("person{i}"), "name", ex(&format!("n{i}"))).as_ref());
-    }
-    tx.commit().unwrap();
-    let snapshot = engine.snapshot();
-    let bgp = |text: &str| {
-        let query = SparqlParser::new()
-            .parse_query(&format!("PREFIX : <{EX}> SELECT * WHERE {{ {text} }}"))
-            .unwrap();
-        let planned = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
-        let found = rows(
-            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-            false,
-        )
-        .len();
-        let estimate = planned
-            .steps
-            .iter()
-            .find(|s| s.operator == "bgp")
-            .and_then(|s| s.estimated_rows);
-        (estimate, found)
-    };
-    assert_eq!(bgp("?s :label ?l ; :name ?n ; :price ?p"), (Some(0), 0));
-    assert_eq!(bgp("?s :label ?l ; :price ?p"), (Some(200), 200));
-    // A constant object keeps its share: one price in seven.
-    let (estimate, found) = bgp("?s :label ?l ; :price :p3");
-    assert_eq!(found, (0..200).filter(|i| i % 7 == 3).count());
-    assert!(
-        estimate.is_some_and(|e| e.abs_diff(found as u64) <= 1),
-        "{estimate:?} for {found}"
-    );
-}
-
-/// Chains are estimated from the characteristic pairs: 1,000 offers point at products
-/// with `:product`, 1,000 reviews at persons with `:author`, and the products alone have a
-/// `:price`. `?x :product ?y . ?y :price ?p` has a row per offer, which the pairs know;
-/// independence spreads the 200 prices over all 1,300 subjects and estimates about 150.
-/// `?x :author ?y . ?y :price ?p` has none: no author has a price.
-#[test]
-fn chains_are_estimated_from_characteristic_pairs() {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut tx = engine.transaction();
-    let quad =
-        |s: String, p: &str, o: NamedNode| Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph);
-    for i in 0..200 {
-        tx.insert(quad(format!("product{i}"), "price", ex(&format!("p{}", i % 7))).as_ref());
-    }
-    for i in 0..100 {
-        tx.insert(quad(format!("person{i}"), "name", ex(&format!("n{i}"))).as_ref());
-    }
-    for i in 0..1_000 {
-        tx.insert(
-            quad(
-                format!("offer{i}"),
-                "product",
-                ex(&format!("product{}", i % 200)),
-            )
-            .as_ref(),
-        );
-        tx.insert(
-            quad(
-                format!("review{i}"),
-                "author",
-                ex(&format!("person{}", i % 100)),
-            )
-            .as_ref(),
-        );
-    }
-    tx.commit().unwrap();
-    let snapshot = engine.snapshot();
-    let bgp = |text: &str| {
-        let query = SparqlParser::new()
-            .parse_query(&format!("PREFIX : <{EX}> SELECT * WHERE {{ {text} }}"))
-            .unwrap();
-        let planned = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
-        let found = rows(
-            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-            false,
-        )
-        .len();
-        let estimate = planned
-            .steps
-            .iter()
-            .find(|s| s.operator == "bgp")
-            .and_then(|s| s.estimated_rows);
-        (estimate, found)
-    };
-    assert_eq!(bgp("?x :product ?y . ?y :price ?p"), (Some(1_000), 1_000));
-    assert_eq!(bgp("?x :author ?y . ?y :price ?p"), (Some(0), 0));
-    // Three patterns: the chain then a star on the offers.
-    let (estimate, found) = bgp("?x :product ?y . ?y :price ?p . ?x :product ?z");
-    assert_eq!(found, 1_000);
-    assert!(
-        estimate.is_some_and(|e| e.abs_diff(found as u64) <= 1),
-        "{estimate:?} for {found}"
-    );
 }
 
 /// The early group of eager aggregation must pay for itself: with one offer per product (the shape of DBpedia's
