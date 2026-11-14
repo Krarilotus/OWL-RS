@@ -1,8 +1,7 @@
 # Vision and Scope
 
-What NRESE is meant to become; "in scope" below includes work not done yet. What it does
-today: [What it covers](../what-it-covers.md); what it leaves out:
-[limits](../limits.md); the order of the work left: [ROADMAP](../ROADMAP.md).
+What NRESE is meant to become; "in scope" below is the goal, and includes work not done yet.
+What is in today, left out and planned: the [scope](../what-it-covers.md#scope).
 
 ## Product vision
 

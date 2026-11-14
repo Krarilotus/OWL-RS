@@ -83,7 +83,7 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
 
 - **Memory.** Index runs are packed (compressed keys) in memory and in checkpoints. In on-disk mode a restart, a bulk load and a background checkpoint map the checkpoint and use its dictionary and packed runs in place (`durability/checkpoint.rs`, `crate::mapped`): the OS pages in what queries touch. Runs written since the last checkpoint are on the heap.
 - **Commit size.** One commit holds at most 4 GiB of WAL payload, about 130 M quads. Larger loads go through the bulk loader.
-- **Reasoning cost.** A commit's reasoning is incremental (the delta executor) unless the program changes; the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
+- **Reasoning cost.** A commit's reasoning is incremental (the delta executor) unless the program changes or a compact-equality split falls back to a whole-dataset rebuild, in the commit's transaction and holding the writer ([reasoner design](../design/reasoner-v2.md) §2.1); the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
 
 ## Evidence
 

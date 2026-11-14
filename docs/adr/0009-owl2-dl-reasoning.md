@@ -73,7 +73,7 @@ own and each measured against the systems above:
      - the OWL 2 RL closure is the persistent lower bound L, as today;
      - a candidate upper bound U1 comes from a datalog relaxation of the ontology (disjunctions read as conjunctions, existentials as fresh constants);
      - U1 is materialised in a stack of its own and is **never visible as inferred data**;
-     - tighter bounds (PAGOdA's U2/U3, RSA approximation, summarisation) are computed per query, where a query needs them.
+     - tighter bounds (PAGOdA's U2/U3, RSA approximation, summarisation) are computed per query, where a query needs them (14 Nov 2026: not built yet; U2 and RSA are open: [STATUS](../STATUS.md#owl-2-dl-v15-branch-v15dl-complete-12-october)).
    - **Completeness status:** every answer carries `sound`, `complete`, the lower and upper counts, and `unresolved`. A hypertableau is a complete oracle for consistency, entailment and atomic instance queries. It is **not** one for arbitrary conjunctive queries (cyclic ones, or ones whose non-projected variables are witnessed by anonymous individuals). So:
      - an exact query service names the class of queries it is complete for, as part of its public contract;
      - answers in the gap outside that class stay `unresolved`;
@@ -105,7 +105,8 @@ own and each measured against the systems above:
 The order is the list's: the model, then the complete engine (correctness first), then
 classification speed, then certain answers in the store, then justifications. Each step
 ships behind its own reasoning mode or endpoint (`/classification` gains `profile=dl`;
-`owl2-dl` as a reasoning mode once step 4 lands); OWL 2 RL stays the default.
+`owl2-dl` as a reasoning mode once step 4 lands); OWL 2 RL stays the default. (14 Nov 2026:
+the default is no reasoning, `disabled`: [configuration](../ops/config-reference.md#reasoner.mode).)
 
 ## Consequences
 
@@ -127,4 +128,6 @@ ships behind its own reasoning mode or endpoint (`/classification` gains `profil
 
 ## Open for the owner
 
-- Whether SWRL (DL-safe rules) belongs with step 2 or later. The plan's default: later.
+- Whether SWRL (DL-safe rules) belongs with step 2 or later. The plan's default: later. (14 Nov
+  2026: settled since; DL-safe rules are read and decided:
+  [STATUS](../STATUS.md#beyond-owl-2-dl-branch-v15dl-beyond-13-october).)

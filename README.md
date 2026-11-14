@@ -12,8 +12,8 @@ follow from the stored (asserted) ones and keeps these inferred statements up to
 every commit (a write, applied whole or not at all), so you query them like asserted ones.
 Reasoning goes from [RDFS](https://www.w3.org/TR/rdf11-schema/) to
 OWL 2 DL; in the OWL 2 QL, RL and DL
-[profiles](docs/glossary.md#reasoning-mode-profile) a commit that would make the data
-inconsistent is rejected, with the reason. Every SPARQL answer carries a status that says what it promises
+[profiles](docs/glossary.md#reasoning-mode-profile) a commit shown to make the data
+inconsistent is rejected, with the reason (under OWL 2 DL a check that can't decide lets it through and says so). Every SPARQL answer carries a status that says what it promises
 (complete, or sound with rows possibly missing, and why) and warns where it can promise
 neither. [SHACL](https://www.w3.org/TR/shacl/) validation, full-text and vector search,
 graph-level access control and the SPARQL, Graph Store and RDF4J protocols are built in.
