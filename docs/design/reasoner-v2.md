@@ -99,6 +99,12 @@ Other timings are configurable (§2.2).
 
 ### 2.2 What is fixed and what is configured
 
+(14 Nov 2026: a plan. Of the repository settings below only `ruleset` and `same_as` exist, as
+`reasoner.mode` and `reasoner.equality` ([configuration](../ops/config-reference.md#reasoner.mode));
+reasoning runs in the commit. The bulk-load and backup flags under "Per operation" don't exist:
+a load rematerialises, and a backup is an image with the inferred stack
+([commands](../ops/server-setup.md#commands)).)
+
 What reasoning is needed, when it runs and what a reader sees depend on the use case. So the reasoner is **configured, not hard-wired**.
 - **Defaults** are the tuned fast path, and the §1.2 targets are measured on them.
 - **Other modes** are supported and tested, and their extra cost is documented.
@@ -224,7 +230,7 @@ Used for typical interactive writes, where Δ is between 1 and ~10⁴ facts.
   - An explicit statement that is also derivable counts as explicit.
   - Deleting an asserted fact that is still derivable moves it into the inferred stack. The maintenance step does this (§5).
 - **The layout follows `placement` (§2.2).**
-  - `default-graph` and `graph:<IRI>` keep inferences in one constant graph, so the stack needs only **three permutations** (SPO, POS, OSP) instead of six. That halves its memory (T8) at the same key width; key-width specialisation and Pf1 compression reduce it further. E6 implements the default-graph case; generalising it to any single graph is part of R4.
+  - `default-graph` and `graph:<IRI>` keep inferences in one constant graph, so the stack needs only **three permutations** (SPO, POS, OSP) instead of six (14 Nov 2026: four, with PSOG for joins: [storage contract](../spec/02-storage-and-transactions.md)). That halves its memory (T8) at the same key width; key-width specialisation and Pf1 compression reduce it further. E6 implements the default-graph case; generalising it to any single graph is part of R4.
   - `source-graph` uses the six-permutation quad layout, which the engine already supports for the asserted stack.
 - **One `Version` holds both stacks.**
   - A commit publishes the asserted and inferred deltas atomically under one revision.

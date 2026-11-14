@@ -1,0 +1,97 @@
+description = """The first example (README.md, "A first answer: inference", and docs/tutorial.md),
+as written there: under owl2-rl with the SHACL gate enforcing, an instance of a
+subclass is an instance of its superclass by inference, with a sound-only answer; deleting the
+premise takes the inference with it; a shape in the shapes graph makes the gate reject an unnamed
+cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes."""
+
+[server]
+set = { "reasoner.mode" = "owl2-rl", "shacl.gate" = "enforce" }
+
+[vars]
+prefix = "PREFIX ex: <http://example.org/>"
+animals = "PREFIX ex: <http://example.org/> SELECT ?x WHERE { ?x a ex:Animal }"
+
+[[step]]
+name = "a class hierarchy and an instance"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat }" }
+[step.expect]
+status = [200, 204]
+
+[[step]]
+name = "tom is an animal by inference, sound-only"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = { contains = "sound-only; regime=owl2-rl" } }
+rows = 1
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/tom" } }
+
+[[step]]
+name = "delete the premise"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} DELETE DATA { ex:tom a ex:Cat }" }
+[step.expect]
+status = [200, 204]
+
+[[step]]
+name = "the inference went with it"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 0
+
+[[step]]
+name = "every animal needs a name"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} PREFIX sh: <http://www.w3.org/ns/shacl#> INSERT DATA { GRAPH <http://rdf4j.org/schema/rdf4j#SHACLShapeGraph> { ex:AnimalShape a sh:NodeShape ; sh:targetClass ex:Animal ; sh:property [ sh:path ex:name ; sh:minCount 1 ] } }" }
+[step.expect]
+status = [200, 204]
+
+[[step]]
+name = "the gate rejects an unnamed cat"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} INSERT DATA { ex:felix a ex:Cat }" }
+[step.expect]
+status = 400
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.title" = "SHACL Reject", "$.type" = "https://nrese.dev/problems/shacl-reject", "$.detail" = { contains = "focus node <http://example.org/felix>" } }
+
+[[step]]
+name = "nothing of the rejected commit remains"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 0
+
+[[step]]
+name = "with a name the commit passes"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} INSERT DATA { ex:felix a ex:Cat ; ex:name \"Felix\" }" }
+[step.expect]
+status = [200, 204]
+
+[[step]]
+name = "felix is an animal"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 1
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/felix" } }

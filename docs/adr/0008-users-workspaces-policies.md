@@ -86,6 +86,10 @@ API and the UI manage, with an audit log.
   stays) or a session token from `POST /api/v1/access/login`; failures throttled per
   user name; sessions end with a password change. On by default, beside any token mode.
 - Provenance-based visibility of inferred statements waits for G3.
+- (14 Nov 2026, changed since: a remembered credential is kept by its HMAC-SHA-256 under a key
+  drawn at start, not by its SHA-256; failures are counted per user name and client address,
+  never per name alone; inferred statements are visible by the graphs they came from,
+  `inferred = "supported"` ([STATUS](../STATUS.md)).)
 
 ## A reused name starts empty (8 November)
 

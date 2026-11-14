@@ -1,6 +1,6 @@
 # HTTP interface
 
-What the server answers on which URL, as implemented on 30 September 2026. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)); a disabled surface answers 404.
+What the server answers on which URL, for the code of the commit this page is in. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)); a disabled surface answers 404.
 
 ## SPARQL
 
@@ -12,10 +12,53 @@ What the server answers on which URL, as implemented on 30 September 2026. Paths
 
 Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL repository, Fuseki- and Blazegraph-style configurations).
 
-**Queries** (SPARQL 1.1 Protocol):
-- `GET ?query=…`
-- `POST` with `Content-Type: application/x-www-form-urlencoded` and a `query` field
-- `POST` with `Content-Type: application/sparql-query` and the query as the body
+### Endpoint contracts
+
+The examples run against a server started with the defaults (`open-workbench`, no authentication, an empty in-memory store, reasoning off), in this order.
+
+**`/dataset/query`**: queries only.
+- Methods: `GET` with `?query=…`; `POST` with a form (`Content-Type: application/x-www-form-urlencoded`, a `query` field); `POST` with the query as the body (`application/sparql-query`; a body with any other `Content-Type`, or none, is read as the query too, never refused as `415`) and the other parameters in the URL. The query is in the body or the URL, not both, and only once.
+- Parameters: `query` (required), the dataset and `infer`, `explain`, `dl-answers` parameters ([below](#query-parameters)); others are ignored.
+- Response: `200` with the results in the format the `Accept` header asks for ([formats](#result-formats); JSON by default) and the `NRESE-Completeness` header.
+- Failures: `400` (syntax error: [example](#example-a-sparql-syntax-error); empty or repeated `query`; a parameter value it doesn't take), `401`/`403`, `406` (no acceptable format), `408` (`budgets.query_timeout`, or an operator cancelled it), `413` (`budgets.query_text`, or the query's memory past `budgets.query_memory`), `422` (`dl-answers=exact` not provable), `429`, `503` (`budgets.total_query_memory` taken; try again).
+
+```bash
+curl -sS http://localhost:8080/dataset/query --data-urlencode 'query=ASK {}'
+```
+```json
+{"head":{},"boolean":true}
+```
+
+**`/dataset/update`**: updates only.
+- Method: `POST` with a form (an `update` field), or with the update as the body (`application/sparql-update`; `text/plain` or no `Content-Type` are read the same) and the other parameters in the URL. The update is in the body or the URL, not both, and only once.
+- Parameters: `update` (required), `using-graph-uri`, `using-named-graph-uri` (repeatable; [below](#update-parameters)).
+- Response: `204 No Content`, no body; the change is committed and synced.
+- Failures: `400` (syntax error; a commit a consistency check or the SHACL gate rejects: problem type `reasoner-reject`, `shacl-reject` or `commit-reject`, [below](#status-codes)), `401`/`403`, `404` (the deployment posture disables updates), `408` (`budgets.update_timeout`; nothing committed), `413` (`budgets.update_size`), `415` (another `Content-Type`), `429`, `503`.
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8080/dataset/update \
+  --data-urlencode 'update=INSERT DATA { <urn:ex:s> <urn:ex:p> "o" }'
+```
+```text
+204
+```
+
+**`/dataset/sparql` and `/dataset`**: queries and updates on one URL.
+- `GET` with `query`: as `/dataset/query`. `GET` without `query`: the service description (Turtle, `200`).
+- `POST`: a form is a query or an update by its field (`query` or `update`; both, or neither, is `400`); a body by its media type (`application/sparql-query` or `application/sparql-update`; any other is `415`).
+- Response and failures: those of the endpoint the request is routed to.
+
+```bash
+curl -sS http://localhost:8080/dataset/sparql -H 'Content-Type: application/sparql-query' \
+  --data-binary 'ASK { <urn:ex:s> <urn:ex:p> "o" }'
+```
+```json
+{"head":{},"boolean":true}
+```
+
+### Requests in detail
+
+**Queries** (SPARQL 1.1 Protocol; how to send them: [contracts](#endpoint-contracts)).
 
 Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
 header `NRESE-Completeness`: `complete; regime=owl2-ql`, or `sound-only; regime=owl2-ql; reasons="ql: …"` when answers
@@ -36,6 +79,8 @@ wherever the QL rewriting runs, inside a transaction too: the status would be re
 schema of every graph. Answers may then be missing or wrong, and no regime, reason or count
 is given. Its EXPLAIN (`explain=true` or `plan`) says the same and has no `ql`. Other readers get the status as before. Clients warn on `not-certified` and on any
 token they don't know; the console's CLI exits 3 under `--require-complete`.
+
+<a id="query-parameters"></a>
 
 | Parameter | Meaning |
 |---|---|
@@ -99,7 +144,7 @@ PREFIX luc: <http://www.ontotext.com/owlim/lucene#>
 SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 ```
 
-`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals (counted among the objects of the property, if one is given) and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
+`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals (counted among the objects of the property, if one is given) and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped ([what to do](../limits.md#sparql)). Scores are the relevance above, not Lucene's.
 
 **Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
 
@@ -125,11 +170,11 @@ SELECT ?doc ?score WHERE {
 
 The subject is the matched vector literal; only literals the query's dataset uses as objects are found, so a user finds no vector of a graph it may not read. The search returns the `k` nearest vectors that satisfy the patterns joined to it (`?doc ex:embedding ?v` with other conditions on `?doc`). Where those patterns are estimated to bind few rows, they go first and the search is among their values: an exact scan when they are few (under 2% of the vectors of that dimension), the graph with that filter otherwise. Where they bind many, the search goes first, its beam widened by the share of the vectors they are estimated to bind (as for a filter the graph applies itself), and each hit, nearest first, is checked against them through the indexes until `k` pass (100,000 vectors of 384 dimensions: 0.24 ms a query through the graph, recall@10 0.94; 1.3 ms exact). Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; up to 20,000 of a dimension are compared exactly, beyond that through an HNSW graph per metric. The graph is built at the first search that needs it, at once up to 50,000 vectors and on a thread of its own beyond (searches scan exactly until it is there); vectors added later are scanned exactly until they pass a tenth of the graph, which is then extended on a thread. A durable store keeps the vectors and graphs in `derived/` (written after each checkpoint), so a restart doesn't rebuild them. Wrong options are client errors that name the option.
 
-**GeoSPARQL functions** over geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`, and `geo:gmlLiteral` for the simple features: points, lines, polygons, envelopes and their multi-forms), in any expression: the Simple Features, Egenhofer and RCC8 relations (`geof:sfWithin`, `geof:ehCovers`, `geof:rcc8ntpp`, …), `geof:relate` (DE-9IM), `geof:distance`, `geof:area`, `geof:length` (with an OGC unit such as `uom:metre`), `geof:buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference`, `getSRID`, `isEmpty`, `dimension`, `boundary`, `asWKT`, `asGeoJSON`. Constructions answer in their first argument's serialisation (GeoJSON only in CRS84), coordinates rounded to 9 decimal places; `buffer` in metres works on CRS84 too (in a plane about the geometry); an empty literal is the empty geometry. Coordinates are CRS84 (longitude, latitude) unless the literal names another system (GeoJSON is always CRS84; GML names it in `srsName`); EPSG:4326 is read latitude first. In CRS84, metres are geodesic (WGS84), degrees planar. `distance`, `area`, `length` and `buffer` also measure, planar and in metres only, in these projected systems whose axes are in metres (from the EPSG registry): WGS 84 / UTM zones (EPSG:32601–32660, 32701–32760), WGS 84 / Pseudo-Mercator (3857), ETRS89 / UTM zones 28N–38N (25828–25838), ETRS89 / LAEA Europe (3035), RGF93 / Lambert-93 (2154), OSGB36 / British National Grid (27700) and DHDN / Gauss-Krüger zones 2–5 (31466–31469), under any EPSG identifier form (`http://www.opengis.net/def/crs/EPSG/<version>/<code>`, `urn:ogc:def:crs:EPSG:<version>:<code>`, `http://www.opengis.net/gml/srs/epsg.xml#<code>`, GML's `EPSG:<code>`). Another unit there, or a measure in any other system, gives no value (an expression error, as for a unit a measure doesn't know): its coordinates' unit isn't known, so no requested unit can be shown to be its own. A CRS database, with units and conversions for every system, comes in v2.0. The other functions work in any system, both geometries in the same one. The relations also work as triple patterns between features and geometries (`?building geo:sfWithin ex:Berlin`, GeoSPARQL's query-rewrite extension): a feature relates through its `geo:hasDefaultGeometry` (else its `geo:hasGeometry`), a geometry through its `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML`; relation statements in the data count as well; an R-tree over the shapes' bounding boxes finds the candidates (built at the first such pattern, kept for the snapshot, and charged to the memory of the query that builds it: a filter whose query has no room for it runs without it, a relation pattern fails with the memory error). Geometries, features and relation statements come from the graph the pattern reads (the dataset's default graph or the `GRAPH`), as the user's access restricts it, so a user gets no relation, candidate or count from a graph it may not read; `GRAPH ?g` relates within each graph. A filter `geof:sfWithin(?wkt, constant)` (any relation but the disjointness ones) over a `geo:asWKT`-style pattern starts the joins from the literals the R-tree finds near the constant, in the same graphs. Not read: GML curves with arcs and 3D solids. The GeoSPARQL compliance benchmark runs in CI: 175 of its 212 queries pass, the others are reference answers that contradict the standard (`crates/nrese-sparql/tests/geosparql_compliance/disputed.txt`).
+**GeoSPARQL functions** over geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`, and `geo:gmlLiteral` for the simple features: points, lines, polygons, envelopes and their multi-forms), in any expression: the Simple Features, Egenhofer and RCC8 relations (`geof:sfWithin`, `geof:ehCovers`, `geof:rcc8ntpp`, …), `geof:relate` (DE-9IM), `geof:distance`, `geof:area`, `geof:length` (with an OGC unit such as `uom:metre`), `geof:buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference`, `getSRID`, `isEmpty`, `dimension`, `boundary`, `asWKT`, `asGeoJSON`. Constructions answer in their first argument's serialisation (GeoJSON only in CRS84), coordinates rounded to 9 decimal places; `buffer` in metres works on CRS84 too (in a plane about the geometry); an empty literal is the empty geometry. Coordinates are CRS84 (longitude, latitude) unless the literal names another system (GeoJSON is always CRS84; GML names it in `srsName`); EPSG:4326 is read latitude first. In CRS84, metres are geodesic (WGS84), degrees planar. `distance`, `area`, `length` and `buffer` also measure, planar and in metres only, in these projected systems whose axes are in metres (from the EPSG registry): WGS 84 / UTM zones (EPSG:32601–32660, 32701–32760), WGS 84 / Pseudo-Mercator (3857), ETRS89 / UTM zones 28N–38N (25828–25838), ETRS89 / LAEA Europe (3035), RGF93 / Lambert-93 (2154), OSGB36 / British National Grid (27700) and DHDN / Gauss-Krüger zones 2–5 (31466–31469), under any EPSG identifier form (`http://www.opengis.net/def/crs/EPSG/<version>/<code>`, `urn:ogc:def:crs:EPSG:<version>:<code>`, `http://www.opengis.net/gml/srs/epsg.xml#<code>`, GML's `EPSG:<code>`). Another unit there, or a measure in any other system, gives no value (an expression error, as for a unit a measure doesn't know): its coordinates' unit isn't known, so no requested unit can be shown to be its own. A CRS database, with units and conversions for every system, comes in v2.0; until then, convert the coordinates to CRS84 or one of the systems above before loading, and measure those. The other functions work in any system, both geometries in the same one. The relations also work as triple patterns between features and geometries (`?building geo:sfWithin ex:Berlin`, GeoSPARQL's query-rewrite extension): a feature relates through its `geo:hasDefaultGeometry` (else its `geo:hasGeometry`), a geometry through its `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML`; relation statements in the data count as well; an R-tree over the shapes' bounding boxes finds the candidates (built at the first such pattern, kept for the snapshot, and charged to the memory of the query that builds it: a filter whose query has no room for it runs without it, a relation pattern fails with the memory error). Geometries, features and relation statements come from the graph the pattern reads (the dataset's default graph or the `GRAPH`), as the user's access restricts it, so a user gets no relation, candidate or count from a graph it may not read; `GRAPH ?g` relates within each graph. A filter `geof:sfWithin(?wkt, constant)` (any relation but the disjointness ones) over a `geo:asWKT`-style pattern starts the joins from the literals the R-tree finds near the constant, in the same graphs. Not read: GML curves with arcs and 3D solids. Such a literal is no geometry, so every function over it gives no value (an expression error). What to do: store an arc as straight segments (a `LineString`, or a `Polygon`'s ring); for a 3D solid, none known. The GeoSPARQL compliance benchmark runs in CI: 175 of its 212 queries pass, the others are reference answers that contradict the standard (`crates/nrese-sparql/tests/geosparql_compliance/disputed.txt`).
 
-**Updates:**
-- `POST` with a form and an `update` field
-- `POST` with `Content-Type: application/sparql-update` and the update as the body
+**Updates** (how to send them: [contracts](#endpoint-contracts)):
+
+<a id="update-parameters"></a>
 
 | Parameter | Meaning |
 |---|---|
@@ -137,9 +182,7 @@ The subject is the matched vector literal; only literals the query's dataset use
 
 `CLEAR GRAPH` and `DROP GRAPH` of a graph that holds nothing succeed: the store doesn't record empty graphs, so there is nothing to miss.
 
-On the combined URL a form is a query or an update by its field, and a body by its media type. A `GET` without `query` returns the service description.
-
-**Result formats,** chosen from the `Accept` header by weight (`q`), with wildcards; the first of each list is the default:
+<a id="result-formats"></a>**Result formats,** chosen from the `Accept` header by weight (`q`), with wildcards; the first of each list is the default:
 
 | Query form | Media types |
 |---|---|
@@ -173,10 +216,10 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 | POST | Adds the payload to the graph | as PUT |
 | DELETE | Removes the graph | 204; 404 if the named graph doesn't exist |
 
-- A named graph exists while it holds statements. The default graph always exists.
+- A named graph exists while it holds statements; the default graph always exists. So an emptied or only created (`CREATE GRAPH`) named graph answers 404 to `GET` and `DELETE`. What to do: read that 404 as an empty graph; to keep an empty graph listed, none known.
 - `GET` streams the graph as it is read, in constant memory at any size; `HEAD` answers whether it exists without reading it. The read's timeout (`budgets.graph_read_timeout`) bounds the wait for the first chunk and then each stall: a client that keeps reading gets all of a large graph, one that stops reading for that long (or disconnects) ends the read. A failure after the first chunk aborts the transfer (no final chunk, or a reset HTTP/2 stream), so a truncated body never looks complete. RDF4J's `GET /statements` streams the same way.
 - Writers' named bounds, so a stream's memory doesn't grow with the data: JSON-LD writes a subject with more than 64 KiB of statements as several node objects with the same `@id` (`jsonld-node-flush`; JSON-LD merges them), and Binary RDF refers by id to at most 65,536 values holding at most 4 MiB, writing others in full (`binary-rdf-idtable-bytes`).
-- Payloads: any of the six graph formats, named by `Content-Type`. A payload that names graphs of its own (possible in N-Quads, TriG and JSON-LD) is rejected.
+- Payloads: any of the seven graph formats, named by `Content-Type`. A payload that names graphs of its own (possible in N-Quads, TriG and JSON-LD) is rejected.
 - `Content-Location` gives the base IRI for relative IRIs in the payload.
 - Writing the same content twice leaves the same graph: blank nodes are scoped to the payload, and a `PUT` replaces.
 
@@ -250,7 +293,7 @@ Limits today:
 
 ## Engine API (`/api/v1`)
 
-One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engine-api.md)), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; a test keeps it complete), for generating clients.
+One repository-scoped API for what the server does ([ADR-0007](../adr/0007-one-engine-api.md); library-only parts, such as Notation3 data and resolving quarantined statements, have none yet), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; tests check that every route is in it, and that each SPARQL Protocol request form it names is served and each refusal is described as `application/problem+json`), for generating clients. The same description is committed beside this page as [openapi.json](openapi.json); a test fails when it differs from what the code generates.
 
 | URL | What |
 |---|---|
@@ -310,29 +353,68 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 
 ## Status codes
 
-| Code | When |
-|---|---|
-| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) or by the SHACL gate under `enforce`. An OWL 2 DL consistency check that isn't decided rejects nothing: the commit goes through, and the status says `unknown` ([consistency](../spec/reasoning-semantics.md#consistency)) |
-| 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
-| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner |
-| 422 | Under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete: type `incomplete-answer`, with the reasons, the bounds and the unresolved candidates |
-| 404 | The surface is disabled, or the named graph doesn't exist |
-| 406 | The client accepts no format the result has |
-| 408 | The policy timeout passed; a timed-out write was not committed |
-| 413 | The request or the query's memory need exceeds the policy limit |
-| 415 | The body's media type isn't one the endpoint reads |
-| 429 | Rate limit |
-| 500 | The server's fault; logged with the request id |
-| 503 | Starting; (for `/readyz`) in quarantine; or the memory queries and client transactions share is taken, so try again later |
+Nothing of a request refused with a `4xx` status is applied. Each row says what to do; the check is the same request answering `2xx`.
 
-Every error is an `application/problem+json` document (RFC 9457), whoever answered: a handler, or the framework itself (no such route 404, a method the route doesn't take 405 with `Allow`, a body that doesn't decode). It has `type`, `title`, `status` and `detail`, and `request_id`, the id that `x-request-id` carries on every response and the server's log carries with the request. A rejected commit answers 400, its type saying what kind of reason the committer is shown, not which check rejected: `reasoner-reject` (the data shown is inconsistent), `shacl-reject` (the data shown has SHACL results the gate rejects for) or `commit-reject` (the committer's graphs show no reason by themselves, whichever check rejected). The data shown is the whole data for a committer that may read every graph, else the graphs it may read. Its `reasoner_reject` has the rule or constraint and the statements shown, where there are any; the field keeps its name for every kind, so that clients that read it go on working. The exceptions are for clients that show the message as text: SPARQL parse errors under the `plain-text` profile, and an RDF4J transaction's refused isolation level. The console and its CLI print an error as `title: detail (request <id>)`, and the CLI exits non-zero.
+| Code | When | What to do |
+|---|---|---|
+| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) or by the SHACL gate under `enforce`. An OWL 2 DL consistency check that isn't decided rejects nothing: the commit goes through, and the status says `unknown` ([consistency](../spec/reasoning-semantics.md#consistency)) | Fix what `detail` names (for a rejected commit, the statements in `reasoner_reject`) and send it again ([worked example](#example-a-sparql-syntax-error)) |
+| 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write | 401: send credentials the [auth mode](config-reference.md#auth-modes) takes. 403: an administrator grants the role or graph ([graph access](#graph-level-access-control)) |
+| 404 | The surface is disabled, or the named graph doesn't exist | Check the URL, and that the [deployment posture](config-reference.md#server) enables the surface; a named graph without statements doesn't exist ([Graph Store Protocol](#graph-store-protocol)) |
+| 406 | The client accepts no format the result has | Send an `Accept` the result has ([formats](#result-formats)) |
+| 408 | The policy timeout passed; a timed-out write was not committed | Narrow the query, or raise its timeout ([timeouts](config-reference.md#timeouts-and-writes)); send a timed-out write again |
+| 409 | The resource exists already (a repository; also while one with that id is being created or removed), or the change would leave a workspace without an owner | A repository: use another id, or the existing one (`GET /api/v1/repositories/{id}`), or `DELETE` it first; while it is being created or removed, send again shortly. A workspace: make another member `owner` first (`PUT …/members/{user}`) |
+| 413 | The request or the query's memory need exceeds the policy limit | Send less, or a narrower query, or raise the limit that applies ([budgets](config-reference.md#budgets)) |
+| 415 | The body's media type isn't one the endpoint reads (`/dataset/query` reads every body that isn't a form as the query, so it never answers 415) | Send a `Content-Type` the endpoint's contract names ([contracts](#endpoint-contracts)) |
+| 422 | Under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete: type `incomplete-answer`, with the reasons, the bounds and the unresolved candidates | Ask without `exact` (`dl-answers=certain-where-complete`, the default, or `sound`) and read `NRESE-Completeness`; the `reasons` say what wasn't decided |
+| 429 | Rate limit | Wait for the [rate-limit window](config-reference.md#policy-rate-limits) (`policy.rate_limits.window_secs`, 60 s by default) to pass, then send again |
+| 500 | The server's fault; logged with the request id | Report it with `request_id`: the server's log has the error under that id |
+| 503 | Starting; (for `/readyz`) in quarantine; or the memory queries and client transactions share is taken, so try again later | Starting: wait for `/readyz` to answer 200. Memory taken: send again (after `Retry-After`, where sent); if it recurs, raise `budgets.total_query_memory` ([budgets](config-reference.md#budgets)) |
+
+Every error is an `application/problem+json` document (RFC 9457), whoever answered: a handler, or the framework itself (no such route 404, a method the route doesn't take 405 with `Allow`, a body that doesn't decode). It has `type`, `title`, `status` and `detail`, and `request_id`, the id that `x-request-id` carries on every response and the server's log carries with the request. A rejected commit answers 400, its type saying what kind of reason the committer is shown, not which check rejected: `reasoner-reject` (the data shown is inconsistent), `shacl-reject` (the data shown has SHACL results the gate rejects for) or `commit-reject` (the committer's graphs show no reason by themselves, whichever check rejected). The data shown is the whole data for a committer that may read every graph, else the graphs it may read. Its `reasoner_reject` has the rule or constraint and the statements shown, where there are any; the field keeps its name for every kind, so that clients that read it go on working. The exceptions are for clients that show the message as text: SPARQL parse errors under the `plain-text` profile, and an RDF4J transaction's refused isolation level; and a not-ready `503` from `/readyz` or the extended health, which is the status document probes read. The console and its CLI print an error as `title: detail (request <id>)`, and the CLI exits non-zero.
+
+A server that doesn't start answers nothing: its errors are in the log and its exit status ([startup errors](server-setup.md#startup-errors), such as a [locked data directory](server-setup.md#err-data-directory-locked) or an [address that can't be bound](server-setup.md#err-failed-to-bind)).
+
+### Example: a SPARQL syntax error
+
+```bash
+curl -sS -i http://localhost:8080/dataset/query --data-urlencode 'query=SELECT ?x WHERE { ?x a }'
+```
+```text
+HTTP/1.1 400 Bad Request
+content-type: application/problem+json
+x-request-id: <id>
+…
+```
+```json
+{
+  "type": "https://nrese.dev/problems/bad-request",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "SPARQL syntax error: line 1, column 24: expected a subject or object (a variable, IRI, literal or blank node), found '}'",
+  "reasoner_reject": null,
+  "request_id": "<id>"
+}
+```
+
+(The body is shown formatted; the server sends it on one line, its fields possibly in another order.)
+
+- **What it means:** the server couldn't parse the query. Nothing ran and nothing changed. `detail` gives the place (line 1, column 24 is the `}`) and what the parser expected there: the pattern `?x a` has no object.
+- **What to change:** complete the triple pattern, for example `SELECT ?x WHERE { ?x a ?type }`. Other 400s name their cause in `detail` the same way; `request_id` finds the request in the server's log.
+- **Check the fix:** send the corrected query; it answers `200` (on an empty store `{"head":{"vars":["x"]},"results":{"bindings":[]}}`):
+
+  ```bash
+  curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8080/dataset/query \
+    --data-urlencode 'query=SELECT ?x WHERE { ?x a ?type }'
+  ```
+
+Under `policy.sparql_parse_error_profile = "plain-text"` the same error is `400` with `Content-Type: text/plain` and the `detail` text as the body ([configuration](config-reference.md#sparql-parse-error-profile)).
 
 ## Service and operations
 
 | URL | What |
 |---|---|
 | `/healthz`, `/readyz` | Public liveness; public readiness with only `status`: `ready` (200), `starting` or `quarantined` (503). Readiness never includes dataset diagnostics, even with credentials |
-| `/version` | Build, enabled surfaces, reasoning semantics |
+| `/version` | Public. The build (`service`, `version`), the deployment posture, store mode and durability, the reasoning mode, profile and `reasoning_semantics`, `default_graph`, which surfaces are on, and `budgets`: the request budgets in effect (sizes in bytes, `0` unlimited; times in milliseconds), not `process_memory` ([which ones](config-reference.md#budgets)) |
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Alias of `/api/v1/repositories/nrese/info`: detailed readiness, revision, statement and graph counts, consistency and violation counts; under `owl2-dl`, `dl` includes consistency, reason, engine and checked revision. Only whole-dataset readers or administrators (403 for restricted readers). `degraded` lists unavailable repositories while readiness stays 200 for the others |
 | `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. `limit` (default 10, at most 1000), `infer=false` for asserted statements only. The indexes are built at the first use |
@@ -344,7 +426,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `GET /api/v1/replication/image` | A primary's, to administrators: an image of the latest revision, streamed, its manifest (JSON) in `x-nrese-image-manifest` |
 | `GET /api/v1/replication/status` | `{mode, revision, primary, primary_revision, lag_revisions, records_applied, last_contact_unix, last_error}` (operators) |
 | `GET /api/v1/health` | Readiness and the state of every part (store, reasoning, access, jobs) |
-| `GET /api/v1/diagnostics` | How the server runs: memory, caches, the query budget, requests |
+| `GET /api/v1/diagnostics` | A service summary (operators): `service`, `version`, `deployment_posture`, `ready`, the default repository's `revision`, `quad_count` and `named_graph_count`, `store_mode`, `durability`, `reasoning_mode`, `reasoning_profile`, `reasoning_read_model`, and whether graph writes, the admin surface, the operator UI and metrics are on. No memory, cache or budget figures: memory and the result cache are in `/metrics` (below), the cache's counts per repository at `…/repositories/{id}/cache`, the budgets in `/version` |
 | `GET /api/v1/ai/status`, `POST /api/v1/ai/query-suggestions` | AI query suggestions, where configured |
 
 Monitoring that needs figures or DL diagnostics should authenticate to `/api/v1/repositories/{id}/info` as a whole-dataset reader or administrator. With access enforcement off, the existing unrestricted access view preserves detailed `/info` responses, including for an unconfigured single-user server without credentials. `/readyz` remains status-only.

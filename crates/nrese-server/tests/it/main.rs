@@ -15,6 +15,7 @@ mod dl_api_tests;
 mod draft_check_tests;
 mod engine_api_tests;
 mod federation_tests;
+mod generated_views_tests;
 mod graph_store_api_tests;
 mod http_api_tests;
 mod http_fuzz_tests;

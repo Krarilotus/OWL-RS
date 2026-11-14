@@ -74,7 +74,8 @@ known through a source read; *ours* = measured or tested here).
   support them) the existentials of readable graphs only, compiled per reader; with
   `"visible"` (every inference, whatever graphs it came from) the whole schema, so schema
   graphs are exempt exactly as they are for the RL inferences that reader already sees;
-  with `"hidden"` no rewriting and no status. Test
+  with `"hidden"` no rewriting and no QL report, while the answer still carries its
+  `NRESE-Completeness` header ([HTTP interface](../ops/http-api.md#requests-in-detail)). Test
   `rewritten_answers_follow_the_readers_graph_access`. The same holds where the rewriting
   goes further (7 October, `restricted_readers_get_nothing_from_graphs_they_cant_read`):
   the data check (§3) is asked only for a reader of every graph, since its answer comes
