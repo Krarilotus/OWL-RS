@@ -25,6 +25,8 @@
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
 //! evaluator's closure equals the owlrl oracle's on the benchmark data.
 
+use std::sync::OnceLock;
+
 use super::ir::{
     ParseError, Rule, RuleSource, Vocabulary, parse_rules, parse_sources, rule_sources,
 };
@@ -102,7 +104,17 @@ impl Ruleset {
     /// compiles, so editing one changes the fingerprint of every ruleset using it: the
     /// review of 3 October 2026, C6). Stable across builds and platforms (no std hasher,
     /// which may change).
+    ///
+    /// The text is static, so the hashes are computed once per process, for every ruleset
+    /// at the first ask: a store asks on every commit.
     pub fn fingerprint(self) -> u64 {
+        static FINGERPRINTS: OnceLock<[u64; ALL.len()]> = OnceLock::new();
+        // `ALL` lists the variants in declaration order, so a variant's discriminant is its index.
+        FINGERPRINTS.get_or_init(|| ALL.map(Self::hash_parts))[self as usize]
+    }
+
+    /// The FNV-1a hash [`Ruleset::fingerprint`] returns.
+    fn hash_parts(self) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut feed = |bytes: &[u8]| {
             for &byte in bytes {
@@ -510,6 +522,55 @@ mod tests {
                     added.iter().any(|rule| rule.name == *name),
                     "{}: {name} isn't an OWL 2 RL rule",
                     ruleset.name()
+                );
+            }
+        }
+    }
+
+    /// A ruleset's fingerprint is FNV-1a (64-bit) over the semantics version, its name, its
+    /// text, the name and text of each OWL 2 RL rule it adds, and its axioms, in that order:
+    /// the value stored reasoning states carry, whether computed now or remembered.
+    #[test]
+    fn every_fingerprint_is_the_fnv1a_of_its_parts() {
+        fn fnv1a(parts: &[&[u8]]) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in parts.iter().flat_map(|part| part.iter()) {
+                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+        for ruleset in ALL {
+            let version = SEMANTICS_VERSION.to_le_bytes();
+            let added = ruleset.added_rules();
+            let mut parts: Vec<&[u8]> = vec![
+                &version,
+                ruleset.name().as_bytes(),
+                ruleset.text().as_bytes(),
+            ];
+            for rule in &added {
+                parts.push(rule.name.as_bytes());
+                parts.push(rule.source.as_bytes());
+            }
+            parts.push(ruleset.axioms().as_bytes());
+            // Asked twice: the remembered value is the computed one.
+            for _ in 0..2 {
+                assert_eq!(ruleset.fingerprint(), fnv1a(&parts), "{}", ruleset.name());
+            }
+        }
+    }
+
+    /// Rulesets that derive different statements never share a fingerprint, so no stored
+    /// state of one reads as current for another.
+    #[test]
+    fn no_two_rulesets_share_a_fingerprint() {
+        for (i, a) in ALL.into_iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(
+                    a.fingerprint(),
+                    b.fingerprint(),
+                    "{} {}",
+                    a.name(),
+                    b.name()
                 );
             }
         }
