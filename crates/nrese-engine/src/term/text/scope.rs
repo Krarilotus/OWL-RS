@@ -27,7 +27,7 @@ fn ones(bits: &[u64]) -> impl Iterator<Item = u64> + '_ {
 
 /// The documents a search ranks among (by number: dictionary entries), with the
 /// statistics BM25 takes from them: built by the caller from what a reader sees
-/// ([`Corpus::finish`]). Its members are held on the budget they were charged to before
+/// (`Corpus::finish`). Its members are held on the budget they were charged to before
 /// they were allocated, until it drops.
 #[derive(Debug)]
 pub struct Corpus {

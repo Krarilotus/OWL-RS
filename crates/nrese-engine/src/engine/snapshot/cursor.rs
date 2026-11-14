@@ -35,7 +35,7 @@ pub enum Seek {
 /// component a leapfrog step asks for.
 type Shape = ([bool; 4], usize);
 
-/// A snapshot's index in one read model, read probe after probe ([module docs](self)).
+/// A snapshot's index in one read model, read probe after probe (the module's docs).
 pub struct ProbeCursor<'a> {
     snapshot: &'a Snapshot,
     model: ReadModel,

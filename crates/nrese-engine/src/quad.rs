@@ -3,7 +3,7 @@
 use crate::term::TermId;
 
 /// A quad in canonical `(subject, predicate, object, graph)` order. `repr(C)`: four
-/// `u64`s in that order, the layout and order of its SPOG key ([`as_keys_mut`]).
+/// `u64`s in that order, the layout and order of its SPOG key (`as_keys_mut`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(C)]
 pub struct EncodedQuad {
@@ -151,7 +151,7 @@ impl QuadPattern {
 pub(crate) type Key = [u64; 4];
 
 /// The sort orders the index maintains. Every [`QuadPattern`] is answered by a contiguous
-/// key range in one of the first six (see [`AccessPlan::for_pattern`]).
+/// key range in one of the first six (see `AccessPlan::for_pattern`).
 ///
 /// The last two exist for executors that need `(?s p ?o)` sorted by subject (star joins):
 /// [`Gpso`](Self::Gpso) in the asserted stack, and [`Psog`](Self::Psog) in the inferred

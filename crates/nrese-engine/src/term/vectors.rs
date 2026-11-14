@@ -14,7 +14,7 @@
 //!   the search scanning exactly until it is there. Once the vectors no graph covers pass a tenth of those it does, a copy of
 //!   the graph is extended with them, again on a thread of its own, and replaces it.
 //! - **Keeping:** the vectors and graphs are written with the other derived indexes after
-//!   a checkpoint ([`super::derived`]) and read at the first search after a start.
+//!   a checkpoint (`super::derived`) and read at the first search after a start.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

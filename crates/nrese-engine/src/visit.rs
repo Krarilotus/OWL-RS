@@ -10,7 +10,7 @@
 //! - a copy an equality read makes;
 //! - a `sameAs` statement or identity an equality class build reads, and a class it lists.
 //!
-//! Work is counted a portion at a time ([`Account`]), each portion at most [`PORTION`] units
+//! Work is counted a portion at a time (`Account`), each portion at most `PORTION` units
 //! (fix check r1 F1). Once `visit` answers false
 //! the read does no more work and answers [`Stopped`]: never a value, never the end of the
 //! data. `visit(0)` asks whether the reader has stopped without counting anything, and a

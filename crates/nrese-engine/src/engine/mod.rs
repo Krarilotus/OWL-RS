@@ -2,7 +2,7 @@
 //! background maintenance.
 //!
 //! Concurrency model:
-//! - `Versions::current` holds the latest committed [`Version`]. A [`Snapshot`] clones that
+//! - `Versions::current` holds the latest committed `Version`. A [`Snapshot`] clones that
 //!   `Arc` under a read lock held for nanoseconds and afterwards touches no shared state except
 //!   the append-only dictionary. Readers are never blocked by an open transaction.
 //! - A version holds two index stacks (ADR-0003, roadmap E6): *asserted* statements and
@@ -12,7 +12,7 @@
 //!   lock, appends the WAL record (durable mode) and swaps `current` under a short write lock.
 //!   The WAL mutex is held across append and publish, so a checkpoint that snapshots under the
 //!   WAL mutex sees exactly the logged revisions.
-//! - Compaction merges one window at a time (the merge claim, [`Versions::claim`]) without
+//! - Compaction merges one window at a time (the merge claim, `Versions::claim`) without
 //!   any slot, and publishes under the compaction slot where the window's runs are still
 //!   there. Commits only append runs; holders of the compaction slot replace them (a
 //!   merge's publication, a conversion to the quad layout, a mapped checkpoint, a load's
@@ -1085,7 +1085,7 @@ impl Engine {
     /// inferred stack holds the closure over one representative per `owl:sameAs` class,
     /// each other identity stored as `identity sameAs representative`, and snapshots taken
     /// from now on read the default graph expanded to every identity
-    /// ([`equality`](self::equality)). The reasoner that fills the stack decides; `None`
+    /// (`equality`). The reasoner that fills the stack decides; `None`
     /// reads the stacks as stored.
     pub fn set_equality(&self, same_as: Option<TermId>) {
         *self.inner.shared.equality.write() = same_as;

@@ -46,7 +46,7 @@ pub use counted::CountedSnapshot;
 ///
 /// With equality by representatives on ([`crate::Engine::set_equality`]), reads of the
 /// default graph with inferred statements expand the stored closure to every identity of
-/// its terms ([`super::equality`]); [`Self::stored`] reads the statements as stored.
+/// its terms (`super::equality`); [`Self::stored`] reads the statements as stored.
 #[derive(Clone)]
 pub struct Snapshot {
     version: Arc<Version>,
@@ -490,7 +490,7 @@ impl Snapshot {
     }
 
     /// This snapshot charging what its reads hold while they run to `budget` (a query's): the
-    /// copies an equality expansion holds until they are in order ([`Expand`]). A read the
+    /// copies an equality expansion holds until they are in order (`Expand`). A read the
     /// budget has no room for stops, and the refusal is kept: [`Self::read_refused`] tells the
     /// reader, which must not use what it read then. Without one, reads charge nothing. The
     /// reader's shared state is charged to `budget` too: refused where it has no room for it.
@@ -1476,7 +1476,7 @@ impl Snapshot {
     /// moved iterator otherwise (docs-prefix-w12 against main, 11 Nov). So the read with no
     /// equality to apply (the asserted model, or no `owl:sameAs` closure and no canonical
     /// view) takes the pattern as given from this snapshot's version, and the rest is out of
-    /// line ([`Self::equality_read`], [`Self::expanded`]).
+    /// line (`Self::equality_read`, `Self::expanded`).
     #[inline]
     pub fn quads_for_pattern_in<'a>(
         &'a self,
@@ -2061,7 +2061,7 @@ impl Snapshot {
     /// [`scan_sorted_in`](Self::scan_sorted_in) yields, decoded a block and a column at a
     /// time instead of a quad at a time. `None` where that can't answer: the matches lie
     /// in several runs or a run with deletions, which must be merged quad by quad, or in
-    /// both stacks with columns that can't order them ([`Self::columns_of_stacks`]); or
+    /// both stacks with columns that can't order them (`Self::columns_of_stacks`); or
     /// the plan needs a post-filter. Decided before anything is charged.
     ///
     /// The columns are charged to `budget` before they are decoded (each stack's rows are

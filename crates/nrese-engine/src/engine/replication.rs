@@ -182,7 +182,7 @@ impl Engine {
     /// revision are skipped, as an answer applied twice); the frames are complete records,
     /// nothing else; their revisions are exactly `after + 1 ..= last`, `records` of them;
     /// their dictionary entries follow on from each other; their commit times are ones a
-    /// store keeps ([`crate::durability::check_commit_time`]). Then the batch's dictionary
+    /// store keeps (`crate::durability::check_commit_time`). Then the batch's dictionary
     /// entries are restored at once, all or none, each checked under that lock as
     /// `Dictionary::restore_key` takes one (continuing this dictionary; a speculative
     /// transaction may have interned meanwhile). Anything else is refused

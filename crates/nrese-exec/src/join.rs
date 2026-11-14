@@ -12,7 +12,7 @@
 //! | [`outer_join_with_undef`] | a hash table for rows with bound keys, scans for rows with UNDEF; left order kept | OPTIONAL, and joins that keep the left order, where a key may be unbound |
 //! | [`compatible_mask`] | the same | MINUS and (NOT) EXISTS where a key may be unbound |
 //!
-//! Key values must not be [`UNDEF`](crate::UNDEF) except in the `*_with_undef` functions,
+//! Key values must not be [`UNDEF`] except in the `*_with_undef` functions,
 //! in [`compatible_mask`], and on the right side of [`left_join`]'s output.
 //!
 //! Joins that can multiply rows take `max_rows` and stop with [`TooManyRows`] once their
@@ -119,7 +119,7 @@ impl RowIds {
 }
 
 /// How far a join may go: at most `max_rows` output rows, and no further once `stop` is set
-/// (the query was cancelled). Both are checked every [`LIMIT_STEP`] output rows, so a
+/// (the query was cancelled). Both are checked every `LIMIT_STEP` output rows, so a
 /// join that would run for hours stops within a few thousand rows of either.
 #[derive(Debug, Clone, Default)]
 pub struct RowLimit {
