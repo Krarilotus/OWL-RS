@@ -416,6 +416,7 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     the case's A-A' noise floor on this host, per dimension (read_floor()). `not_compared`: each
     dimension deliberately not tested, with its reason (one this baseline doesn't support, or one
     whose loss of evidence blocks); gate() holds every other untested hypothesis an error."""
+    import fast
     floor = floor or {}
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}, "not_compared": {}}
     base_state = state(base, off_route_ok=True)
@@ -461,6 +462,10 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     series = sorted({s for rep in cand[key] + base[key] for s in rep})
     for s in series:
         if s in excluded:
+            continue
+        if why := fast.ready_not_compared(f"time/{s}", side):
+            row["notes"].append(f"time/{s}: {why}")
+            row["not_compared"][f"time/{s}"] = why
             continue
         on_cand = all(s in rep for rep in cand[key])
         on_base = all(s in rep for rep in base[key])
@@ -687,7 +692,8 @@ def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] 
         # --count-allocations alone counts calls and bytes, as the baselines' perf labs do.
         if "--count-live" in case.get("args", []):
             dims.append("memory/live")
-        out += [hypothesis(side, name, d) for side in baselines if side not in case.get("absent", {}) for d in dims]
+        out += [hypothesis(side, name, d) for side in baselines if side not in case.get("absent", {}) for d in dims
+                if not fast.ready_not_compared(d, side)]
     return out
 
 
