@@ -116,7 +116,7 @@ const fn levels(len: usize) -> u64 {
 /// What [`SignedMerge::add`] counts for an input added to `heads` others: reading its first
 /// key, and pushing its head onto theirs, or building the heap at the input after the
 /// [`LINEAR_UP_TO`]th.
-pub(crate) const fn add_cost(heads: usize) -> u64 {
+pub(super) const fn add_cost(heads: usize) -> u64 {
     let push = if heads < LINEAR_UP_TO {
         0
     } else if heads == LINEAR_UP_TO {

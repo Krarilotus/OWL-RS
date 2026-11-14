@@ -355,7 +355,7 @@ impl Snapshot {
     /// [`Self::stacks_visited`]'s path, in [`Stack::ALL`]'s order (0 for a stack the model
     /// leaves out), worked out from the runs' sizes alone ([`IndexVersion::scan_cost`]): `None`
     /// once their sum is over [`nrese_exec::POLL_UNITS`], the runs after that left unread.
-    pub(crate) fn point_cost(&self, model: ReadModel, plan: &AccessPlan) -> Option<[u64; 2]> {
+    pub(super) fn point_cost(&self, model: ReadModel, plan: &AccessPlan) -> Option<[u64; 2]> {
         let data = self.data(model);
         let mut costs = [0; 2];
         let mut most = u64::from(nrese_exec::POLL_UNITS);
