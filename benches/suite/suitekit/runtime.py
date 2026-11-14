@@ -590,7 +590,10 @@ class DockerRuntime(Runtime):
         self.containers: dict[str, Server] = {}
 
     def args(self, spec: Spec, detached: bool) -> list[str]:
-        args = [ns.executable(), *ns.run_args(ROOT, OWNER, spec.name, spec.memory), "--init"]
+        # Every system on the same CPUs when a run asks for it (DOCKER_CPUS, e.g. "8"), given once, by
+        # ns.run_args, as its memory: in a fleet job that declares CPUs, those (fleet Spec 9).
+        cpus = os.environ.get("DOCKER_CPUS") or None
+        args = [ns.executable(), *ns.run_args(ROOT, OWNER, spec.name, spec.memory, cpus=cpus), "--init"]
         # A measurement's own container: the quiet slot's watcher pauses the others.
         if os.environ.get("NRESE_QUIET_TOKEN"):
             args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
@@ -605,9 +608,6 @@ class DockerRuntime(Runtime):
             args += ["-p", f"{self.port}:{spec.port}"]
         if spec.user:
             args += ["-u", spec.user]
-        # Every system on the same CPUs when a run asks for it (DOCKER_CPUS, e.g. "8").
-        if os.environ.get("DOCKER_CPUS"):
-            args += ["--cpus", os.environ["DOCKER_CPUS"]]
         for key, value in spec.env.items():
             args += ["-e", f"{key}={value}"]
         for m in spec.mounts:

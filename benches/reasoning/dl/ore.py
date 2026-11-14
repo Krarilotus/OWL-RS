@@ -49,6 +49,7 @@ DEV_TRACKS = {"dl/classification": 100, "el/classification": 60, "pure_dl/classi
 FAMILIES = [("nominals", {"O"}), ("numbers", {"N", "Q", "F"}), ("disjunctive", {"C", "U"}),
             ("chains", {"R"}), ("inverse", {"I"})]
 SOLVED = ("classified", "consistent", "inconsistent", "realised")
+NOT_RUN = "not-run"  # nrese.py: a task whose step did not run; never an answer
 AXIOM = re.compile(r"^[A-Z][A-Za-z]*\(")
 
 
@@ -200,6 +201,8 @@ def manifest(args):
 
 
 def compare(args):
+    """The tasks' answers side by side, a reasoner's latest row each. Exit 1 on a disagreement; else
+    2 when a reasoner's step did not run (`not-run`, nrese.py): such a task has no answer of its."""
     by_task = collections.defaultdict(dict)
     times = {}
     for line in open(pathlib.Path(args.cases) / "results.tsv", encoding="utf-8"):
@@ -210,11 +213,14 @@ def compare(args):
         times[(tid, reasoner)] = int(ms)
     tally = collections.Counter()
     solved = collections.Counter()
+    not_run = collections.Counter()
     out = []
     for tid, answers in sorted(by_task.items()):
         decided = {r: a for r, (s, a) in answers.items() if s in SOLVED}
         for r in decided:
             solved[r] += 1
+        for r, (s, _) in answers.items():
+            not_run[r] += s == NOT_RUN
         distinct = set(decided.values())
         if len(distinct) > 1:
             verdict = "DISAGREE"
@@ -224,20 +230,25 @@ def compare(args):
             print("DISAGREE", tid, dict(groups), sep="\t")
         elif distinct:
             verdict = f"agree({len(decided)})"
+        elif all(s == NOT_RUN for s, _ in answers.values()):
+            verdict = NOT_RUN  # no reasoner ran it: no outcome at all
         else:
             verdict = "undecided"
         tally[verdict.split("(")[0]] += 1
         for r, (s, a) in sorted(answers.items()):
-            out.append([tid, r, s, times[(tid, r)], a[:16], verdict])
+            out.append([tid, r, s, times[(tid, r)], a[:16], NOT_RUN if s == NOT_RUN else verdict])
     print(f"{len(by_task)} tasks: " + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
     print("solved: " + ", ".join(f"{k} {v}" for k, v in sorted(solved.items())))
+    if +not_run:
+        print("NOT RUN (no answer; the step did not run): "
+              + ", ".join(f"{k} {v}" for k, v in sorted((+not_run).items())))
     if args.out:
         pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter="\t", lineterminator="\n")
             w.writerow(["task", "reasoner", "status", "ms", "answer", "verdict"])
             w.writerows(out)
-    return 1 if tally["DISAGREE"] else 0
+    return 1 if tally["DISAGREE"] else 2 if +not_run else 0
 
 
 def percentile(values, q):
@@ -250,27 +261,37 @@ def percentile(values, q):
 
 
 def stats(args):
-    """Per reasoner (and group): solved, PAR-2, median/p90/p95/p99 with unsolved at the limit."""
+    """Per reasoner (and group), a reasoner's latest row of each task: solved, PAR-2, median/p90/p95/p99
+    with unsolved at the limit. A task whose step did not run (`not-run`) is in none of these, only
+    in its own column."""
     index = {f"{r['id']}-{r['track'].replace('/', '-')}": r for r in read_index(args.cases)}
     limit = args.limit_s * 1000
     groups = collections.defaultdict(list)  # (group, reasoner) -> [(solved, ms)]
+    missed = collections.Counter()  # (group, reasoner) -> tasks not run
+    latest = {}
     for line in open(pathlib.Path(args.cases) / "results.tsv", encoding="utf-8"):
-        tid, reasoner, _task, status, ms = (line.rstrip("\n").split("\t") + [""] * 5)[:5]
+        row = (line.rstrip("\n").split("\t") + [""] * 5)[:5]
+        latest[(row[0], row[1])] = row
+    for tid, reasoner, _task, status, ms in latest.values():
         meta = index.get(tid.split("~")[0], {})
         if args.split != "all" and meta.get("split", "dev") != args.split:
             continue
         stratum = meta.get("stratum", "-")
         group = {"stratum": f"{meta.get('track', '-')} {stratum}", "track": meta.get("track", "-"),
                  "family": stratum.split("-", 1)[-1], "size": stratum.split("-", 1)[0]}.get(args.by, "all")
+        if status == NOT_RUN:
+            missed[(group, reasoner)] += 1
+            continue
         solved = status in SOLVED
         groups[(group, reasoner)].append((solved, min(float(ms or limit), limit) if solved else limit))
-    print("| group | reasoner | solved | PAR-2 s | median ms | p90 | p95 | p99 | sum solved s |")
-    print("|---|---|---|---|---|---|---|---|---|")
-    for (group, reasoner), rs in sorted(groups.items()):
+    print("| group | reasoner | solved | not run | PAR-2 s | median ms | p90 | p95 | p99 | sum solved s |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for key in sorted(set(groups) | set(missed)):
+        (group, reasoner), rs = key, groups.get(key, [])
         times = [ms for _, ms in rs]
         solved = [ms for s, ms in rs if s]
         par2 = sum(ms if s else 2 * limit for s, ms in rs) / 1000
-        print(f"| {group} | {reasoner} | {len(solved)}/{len(rs)} | {par2:,.1f} | {percentile(times, .5):,.0f} | "
+        print(f"| {group} | {reasoner} | {len(solved)}/{len(rs)} | {missed[key]} | {par2:,.1f} | {percentile(times, .5):,.0f} | "
               f"{percentile(times, .9):,.0f} | {percentile(times, .95):,.0f} | {percentile(times, .99):,.0f} | "
               f"{sum(solved) / 1000:,.1f} |")
 

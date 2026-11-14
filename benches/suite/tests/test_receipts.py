@@ -448,6 +448,32 @@ class Driver(unittest.TestCase):
         self.assertEqual(receipt["settings"], {"JAVA_HEAP": "8g"})
         self.assertTrue({"RUST_IMAGE", "NRESE_TARGET_CPU", "RUSTFLAGS"} <= set(manifest.SETTINGS))
 
+    def test_the_build_container_has_one_cpu_limit_the_declared_one_in_a_declaring_job(self):
+        """Spec: fleet Spec 9 (its watcher, declared.py `fits`): in a job declaring its containers' CPUs, each
+        container has the declared CPUs, and Docker takes the last `--cpus` it is given; elsewhere half the
+        cores, as scripts/cargo-guarded.sh. So the build container carries one limit: the declared 3 in a
+        job declaring 3 (cargo -j 3), else half of 8 cores."""
+        self.checkout(self.root, "suite")
+        job = {"FLEET_JOB": "suite-x", "NRESE_SUITE_MEMORY_GB": "2", "NRESE_SUITE_CPUS": "3"}
+        here = {k: v for k, v in driver.os.environ.items() if k not in job}
+        suite = self.suite(runs=1, skip_build=False)
+        for environ, cpus in ((job, "3"), ({}, "4")):
+            with self.subTest(cpus=cpus), patch.dict(driver.os.environ, {**here, **environ}, clear=True):
+                nrese = Mock(spec=driver.Nrese, key="nrese", source=Mock(return_value=self.root),
+                             rust_image=Mock(return_value="rust:1.98.1-bookworm"), target_volume="v")
+                host = Mock(return_value=0)
+                with patch.object(suite, "host_command", host), patch.object(driver.ns, "docker"), \
+                        patch.object(driver.os, "cpu_count", return_value=8), \
+                        patch.object(driver.ns, "pinned", return_value={"rust:1.98.1-bookworm": "sha256:" + "r" * 64}), \
+                        patch.object(driver, "toolchain_in", return_value=dict(self.DECLARED)), \
+                        patch.object(suite.args, "runtime", "docker"):
+                    self.assertTrue(suite.build_nrese(nrese))
+                start = next(c.args[0] for c in host.call_args_list if "cargo" in c.args[0])
+                head = start[:start.index("cargo")]
+                self.assertEqual([b for a, b in zip(head, head[1:]) if a == "--cpus"]
+                                 + [a[len("--cpus="):] for a in head if a.startswith("--cpus=")], [cpus])
+                self.assertEqual(start[start.index("-j") + 1], cpus)
+
     def checkout(self, path: Path, version: str, harness: str = "") -> Path:
         """A source checkout of its own: what the builds compile (crates, Cargo.toml, Cargo.lock,
         rust-toolchain.toml, .cargo, the harness's own workspace, and the launcher), committed."""

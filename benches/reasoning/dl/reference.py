@@ -25,6 +25,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]  # the checkout: the containe
 # The image, or its verified preserved alias on a host whose Docker has only that (hosts.toml).
 IMAGE = hosts.image("nrese-bench/dl-reference")
 GRACE = 30
+MEMORY, CPUS = "12g", "8"
+
+
+def limits(memory=None, cpus=None):
+    """A reference container's memory and CPUs: those asked; else, in a fleet job that declares its
+    containers, the declared ones (ns.run_args); else MEMORY and CPUS."""
+    return memory or (None if ns.declared_memory() else MEMORY), cpus or (None if ns.declared_cpus() else CPUS)
 
 
 def lines(path):
@@ -58,7 +65,7 @@ def run(cases, timeout, cpus, memory, name=None):
         part.unlink(missing_ok=True)
         subprocess.run([ns.executable(), "rm", "-f", name], capture_output=True)
         subprocess.run(
-            [ns.executable(), "run", "-d", *ns.name_args(name, ROOT, "reasoning"), f"--cpus={cpus}", "-m", memory,
+            [ns.executable(), *ns.run_args(ROOT, "reasoning", name=name, memory=memory, cpus=cpus), "-d",
              "-v", f"{cases.as_posix()}:/work", ns.image_id(IMAGE, ROOT), "batch", "/work/manifest.rest.tsv",
              "/work/results.part.tsv", "/work/tax", str(timeout)],
             check=True, capture_output=True)
@@ -102,12 +109,15 @@ def main():
     r = sub.add_parser("run")
     r.add_argument("cases")
     r.add_argument("--timeout", type=int, default=60)
-    r.add_argument("--cpus", default="8")
-    r.add_argument("--memory", default="12g")
+    r.add_argument("--cpus", help=f"the container's CPUs (default {CPUS}; in a fleet job that declares its "
+                                   "containers, the declared CPUs)")
+    r.add_argument("--memory", help=f"the container's memory (default {MEMORY}; in a fleet job that declares "
+                                     "its containers, the declared memory)")
     r.add_argument("--name", default="dl-reference",
                    help="the container's kind, in this job's namespace (one per concurrent run of a job)")
     args = p.parse_args()
-    run(args.cases, args.timeout, args.cpus, args.memory, ns.name(args.name, ROOT))
+    memory, cpus = limits(args.memory, args.cpus)
+    run(args.cases, args.timeout, cpus, memory, ns.name(args.name, ROOT))
 
 
 if __name__ == "__main__":
