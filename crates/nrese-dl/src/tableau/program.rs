@@ -247,7 +247,7 @@ pub(crate) fn leaves_out(cause: Unsupported) -> bool {
 }
 
 /// What every program of an ontology leaves out ([`left_out`]): the normalisation's causes
-/// that leave answers a lower bound ([`leaves_out`]), and how many reader diagnostics
+/// that leave answers a lower bound (`leaves_out`), and how many reader diagnostics
 /// weren't OWL 2 DL.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Omissions {
@@ -286,7 +286,7 @@ impl Omissions {
 }
 
 /// The axioms any program of `normalised` leaves out, and why: those the normalisation
-/// reports unsupported where that leaves answers a lower bound ([`leaves_out`]), and those
+/// reports unsupported where that leaves answers a lower bound (`leaves_out`), and those
 /// the reader couldn't take as OWL 2 DL. Known before any test: with one, no test can show
 /// a class satisfiable or a subsumption absent.
 pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Omissions {
