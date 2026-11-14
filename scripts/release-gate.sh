@@ -887,8 +887,17 @@ plan-blocks)
   cp "$GATE"/plan-block-*.json "$OUT/"
   ;;
 
+begin)
+  # A timed part's run (its first step; release_gate.py jobs): its attempt, recorded in $OUT before
+  # anything else. Its report carries it and the verdict takes only the newest attempt's report, so a
+  # report an earlier run of the part left in $OUT is refused, never taken for this run's (D16-490).
+  py benches/fast/release_gate.py attempt timed "$OUT" > /dev/null || { log "begin: no attempt record: no run"; exit 1; }
+  ;;
+
 plan-cases)
-  # A confirmation runs just its cases, all prepared by the gate's own prepare before.
+  # A confirmation runs just its cases, all prepared by the gate's own prepare before. It is the
+  # confirmation's first step: its run's attempt first (begin).
+  py benches/fast/release_gate.py attempt timed "$OUT" > /dev/null || { log "plan-cases: no attempt record: no run"; exit 1; }
   [ -n "${GATE_PLAN:-}" ] || { log "plan-cases needs GATE_PLAN"; exit 2; }
   py - "$2" "$GATE/plan.json" "$PLAN" <<'EOF' || exit 2
 import json, sys
