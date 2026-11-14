@@ -3004,12 +3004,15 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
     for h in d["losses"]:
         side, case, dim = h.split("|")
         ps = d["rounds"].get(h, [])
-        # The approval must cover the loss in every round that shows it (its worse end within the bound,
-        # its win shown there): one round within the bound never waives another beyond it.
+        # The approval must cover the loss in every round that showed it, confirmations beyond the
+        # third included (the round's own status: its worse end within the bound, its win shown
+        # there): one round within the bound never waives another beyond it. A round that showed no
+        # loss neither needs nor gives cover: its interval, too broad to show the loss, says nothing
+        # of its size (a 3-block round's is t(2) = 4.30 errors wide). A confirmed loss always has two
+        # rounds that showed it (combine_rounds: two p at most ALPHA * PAIR_WEIGHTS[0]); none, none covers it.
         covers = [accepted(policy.tradeoffs, side, case, dim, r, report.get("comparisons", {}))
                   for rounds in parts for report in rounds
-                  if (r := report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dim))
-                  is not None]
+                  if (r := dimension_in(report, side, case, dim)) is not None and r.get("status") == "loss shown"]
         accepted_ = covers[0] if covers and all(covers) else None
         text = f"{case} against {side}: {dim}: p per round {ps}, combined {d['combined'][h]:.3g}"
         if accepted_:
