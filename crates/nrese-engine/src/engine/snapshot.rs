@@ -1519,7 +1519,7 @@ impl Snapshot {
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
     /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
-        self.count_with(model, pattern, Unmetered)
+        self.count_with(model, pattern, u64::MAX, Unmetered)
             .expect("never stopped")
     }
 
@@ -1563,15 +1563,17 @@ impl Snapshot {
         pattern: &QuadPattern,
         visit: crate::visit::Visitor<'_>,
     ) -> Option<Count> {
-        self.count_with(model, pattern, visit)
+        self.count_with(model, pattern, u64::MAX, visit)
     }
 
     /// [`Self::count_in`]'s work on `meter`: unmetered, the plain reads; on a visitor,
-    /// counted.
+    /// counted. An expanded count stops at `limit` ([`Self::expanded_count`]); a held count
+    /// answers exactly whatever it is.
     fn count_with<M: Metering>(
         &self,
         model: ReadModel,
         pattern: &QuadPattern,
+        limit: u64,
         meter: M,
     ) -> Option<Count> {
         // Asked once whatever the count does (a layout that holds nothing of it does no
@@ -1582,7 +1584,7 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding_with(model, pattern, meter).ok()? {
-            return self.expanded_count(&classes, model, pattern, u64::MAX, meter);
+            return self.expanded_count(&classes, model, pattern, limit, meter);
         }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan, both

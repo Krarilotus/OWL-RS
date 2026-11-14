@@ -74,6 +74,13 @@ pub trait Base: Sync + sealed::Read {
     ) -> Result<(), Stopped>;
     /// An upper bound on the matches of `pattern`; zero only if nothing matches.
     fn estimate(&self, pattern: [Option<u64>; 3], poll: &Poller<'_>) -> Result<usize, Stopped>;
+    /// [`Base::estimate`], asked only up to `limit` ([`crate::eval::Source::estimate_up_to`]).
+    fn estimate_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        limit: usize,
+        poll: &Poller<'_>,
+    ) -> Result<usize, Stopped>;
     fn contains(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped>;
     /// Whether `fact` is asserted (after the change).
     fn is_asserted(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped>;
@@ -95,6 +102,15 @@ pub trait VisitsBase: Sync {
     fn visit(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>);
     /// [`Base::estimate`], the call already counted.
     fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped>;
+    /// [`Base::estimate_up_to`], the call already counted. By default the whole estimate.
+    fn size_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        _limit: usize,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
+        self.size(pattern, probe)
+    }
     /// [`Base::contains`], the call already counted.
     fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped>;
     /// [`Base::is_asserted`], the call already counted.
@@ -136,6 +152,19 @@ impl<T: VisitsBase + ?Sized> Base for T {
             return Err(Stopped);
         }
         self.size(pattern, Probe::of(poll))
+    }
+
+    #[inline]
+    fn estimate_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        limit: usize,
+        poll: &Poller<'_>,
+    ) -> Result<usize, Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
+        }
+        self.size_up_to(pattern, limit, Probe::of(poll))
     }
 
     #[inline]
@@ -295,12 +324,23 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
         seg: Seg,
         probe: Probe<'_, '_>,
     ) -> Result<usize, Stopped> {
+        self.size_up_to(pattern, seg, usize::MAX, probe)
+    }
+
+    /// The extra store's estimate (exact, in memory) and the base's asked up to `limit`.
+    fn size_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        limit: usize,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         let seg = seg.plain();
         let extra = self.extra.size(pattern, seg, probe)?;
         Ok(match seg {
             // The base's estimate saturates (`Snapshot::count_in`), so the sum does too.
             Seg::Old | Seg::All => {
-                extra.saturating_add(self.base.estimate(pattern, probe.poller())?)
+                extra.saturating_add(self.base.estimate_up_to(pattern, limit, probe.poller())?)
             }
             _ => extra,
         })
