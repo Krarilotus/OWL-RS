@@ -433,12 +433,16 @@ fn a_count_up_to_a_limit_stops_with_its_visitor() {
     let counted = snapshot.counted();
     let limit = snapshot.count_in(ReadModel::Materialised, &all).at_least() - 1;
     let whole = std::cell::Cell::new(0u64);
-    counted
+    let unstopped = counted
         .count_up_to(ReadModel::Materialised, &all, limit, &|k| {
             whole.set(whole.get() + k);
             true
         })
         .expect("never stopped");
+    assert!(
+        unstopped.at_least() >= limit,
+        "{unstopped:?}: unstopped, it reaches the limit"
+    );
     let stop_at = whole.get() / 2;
     let (seen, refused, after) = (
         std::cell::Cell::new(0u64),
