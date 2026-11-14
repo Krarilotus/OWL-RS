@@ -7,6 +7,10 @@
 //! search) are checked before and after ([`Ticker::check`]): after a stop, at most the call
 //! already running finishes.
 //!
+//! That bound holds for work that ticks as it goes. A read that counts a run ahead and runs
+//! another read inside its callback can do more before it answers: the stopping bound under
+//! nested reads is stated at nrese-reasoner's `Poller`.
+//!
 //! The common path of a tick is a subtraction and a predictable branch on a local count; the
 //! poll itself (one relaxed load, and the clock only with a deadline) is out of line.
 
