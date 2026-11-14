@@ -196,7 +196,7 @@ follow from their rules); nothing is assumed.
 | A1 `tmp/` and the legacy tree | done | Runners and probes committed with usage lines; spent files, `artifacts/`, `ops/fuseki/`, `Spezifikation.md` removed |
 | A2 mTLS subject header from trusted proxies only | done | `auth.mtls.trusted_proxies`, loopback by default |
 | A2 Reads in client transactions without the writer slot | done | Speculative transactions; the view cached per session by base version, operation count and the reader's access |
-| A2 The reasoner's list cap | done | Lists of any length; native rules where expansion is quadratic |
+| A2 The reasoner's list cap | done | Lists of any length; native rules where expansion is quadratic; what is left (a chain or key over 250 properties, over 64 member sequences) is reported, never truncated ([list limits](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)) |
 | A2 `Decoded::keep` without the moved `Box` | done | Raw pointers with a `Drop`; a test |
 | A2 Miri over the engine's unsafe code | deferred | Never ran (Miri isn't installed on the main PC). Planned with the refactoring after the merge to `main` ([roadmap](ROADMAP.md) step 4) |
 | A2 Dead wildcard arms | done | Four deleted; six covered real variants and name them |

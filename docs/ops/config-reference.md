@@ -225,7 +225,8 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 `reasoner.mode` values:
 - `disabled`: no reasoning; reads see asserted statements only
 - `rdfs`: the RDFS closure is materialised into the inferred stack (the six rules queries over data use)
-- `rdfs-full`: every RDFS entailment rule and the axiomatic triples
+- `rdfs-full`: the RDFS entailment rules but `rdfD1`, and the axiomatic triples but the
+  infinitely many about `rdf:_1`, `rdf:_2`, … ([modes](../spec/reasoning-semantics.md#modes))
 - `rdfs-plus`: RDFS with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties
 - `owl-horst`: RDFS-Plus with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*)
 - `owl2-ql`: OWL 2 QL materialised; commits that violate its disjointness axioms are rejected
@@ -376,9 +377,8 @@ Once a reasoning run observes cancellation and finishes unwinding, it discards t
 and inferred changes and releases the writer. The DL gate shares its deadline and token
 across pending/prior consistency checks and rejection evidence. Cancellation is cooperative;
 schema reading, normalisation and compilation are not all internally interruptible.
-Two rule-reasoning steps also don't poll the deadline:
-- the one-off full materialisation that runs when no current reasoning state is recorded;
-- closing a newly declared transitive property.
+One rule-reasoning step also doesn't poll the deadline: the one-off full materialisation that
+runs when no current reasoning state is recorded.
 
 A fixed limit comes before every authenticated request: a body of known length up to 64 KiB is read whole before the answer (clients that send the headers and the body apart need that), and that read waits at most 10 s. A body still missing then gets 401 if authentication refused the request's credentials, else 408.
 

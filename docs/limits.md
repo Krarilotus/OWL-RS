@@ -69,8 +69,9 @@ planned.
 
 - **Materialised, in the default graph.** A statement both asserted and derivable counts as
   asserted ([storage](spec/02-storage-and-transactions.md#data-model)).
-- **`rdfs`** is a six-rule subset without axiomatic triples; `rdfs-full` has every RDFS rule
-  ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset)).
+- **`rdfs`** is a six-rule subset without axiomatic triples; `rdfs-full` has the RDFS rules
+  but `rdfD1`, and the axioms but those about `rdf:_1`, `rdf:_2`, …
+  ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset), [modes](spec/reasoning-semantics.md#modes)).
 - **`owl2-rl`** doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
   return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain or key of more than 250 properties, more than

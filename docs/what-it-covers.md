@@ -27,8 +27,8 @@ it, with its limits beside it; nothing in them is a plan.
 
 - Several writers at once; automatic failover; data split across machines:
   [choose another system](limits.md#choose-another-system-when)
-- Named graphs as separate reasoning contexts; every OWL 2 DL answer proven complete:
-  [choose another system](limits.md#choose-another-system-when)
+- Named graphs as separate reasoning contexts (planned for v2.0); every OWL 2 DL answer proven
+  complete: [choose another system](limits.md#choose-another-system-when)
 - SHACL Advanced Features (rules) and `sh:entailment`: [SHACL](limits.md#shacl)
 - Embeddings computed by the store; a released Rust library; property-graph query languages
   (planned, below): [choose another system](limits.md#choose-another-system-when)
@@ -36,7 +36,7 @@ it, with its limits beside it; nothing in them is a plan.
   [SPARQL](limits.md#sparql), [RDF syntaxes](limits.md#rdf-syntaxes),
   [reasoning](limits.md#reasoning), [storage](limits.md#storage-and-transactions)
 
-**Planned**, in order; nothing of it is present: [roadmap](ROADMAP.md).
+**Planned**, in order: [roadmap](ROADMAP.md); of it, only the stages it marks done are present.
 
 - The open items before v2 goes to `main`, then benchmarks, the merge into `main`, concise docs
   and a refactoring, v3: [the order](ROADMAP.md#the-order-owner-5-october-2026)
@@ -44,6 +44,10 @@ it, with its limits beside it; nothing in them is a plan.
   integration, AI integration, exploration and history, ontology work and publishing:
   [the order](ROADMAP.md#the-order-owner-5-october-2026), item 6
 - OWL 2 DL: classification speed and tighter answer bounds: [DL](ROADMAP.md#dl)
+- With a version named: one snapshot for a whole RDF4J transaction, v1.6
+  ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)); named graphs as reasoning boundaries,
+  v2.0 ([engine gaps](STATUS.md#engine-gaps)); a CRS database with units and conversions for
+  every system, v2.0 ([requests in detail](ops/http-api.md#requests-in-detail))
 - Not yet ordered: an audit log, SBOM and signed releases, a threat model, the frontend on the
   engine API, scaling across machines: [not yet ordered](ROADMAP.md#not-yet-ordered)
 
@@ -81,7 +85,7 @@ default, or only the asserted ones with `infer=false`. The contract for every mo
 | Mode | What it computes | Limits |
 |---|---|---|
 | `disabled` (default) | Nothing | |
-| `rdfs` | Six RDFS rules: domain, range, sub-class and sub-property | No axiomatic triples; `rdfs-full` has every RDFS rule and the axioms |
+| `rdfs` | Six RDFS rules: domain, range, sub-class and sub-property | No axiomatic triples; `rdfs-full` has the RDFS rules and axioms but `rdfD1` and those about `rdf:_1`, `rdf:_2`, … ([modes](spec/reasoning-semantics.md#modes)) |
 | `rdfs-plus`, `owl-horst` | RDFS with equality, inverse, symmetric, transitive and functional properties; `owl-horst` adds `hasValue`, `someValuesFrom`, `allValuesFrom` | Named subsets of the OWL 2 RL rules ([rules](spec/reasoning-semantics.md#modes)) |
 | `owl2-ql` | The OWL 2 QL rules, plus answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)); a commit that violates a disjointness, irreflexivity or asymmetry axiom is rejected | Answers say `sound-only` where an axiom outside QL could add an answer the query reads, where a pattern reaches a rewriting bound or runs without the rewriting (a variable predicate or class, a property path, a pattern inside an aggregate), and for queries the rewriting doesn't apply to, such as those with a dataset of their own |
 | `owl2-rl` | The W3C OWL 2 RL/RDF rules; a commit that violates a consistency rule is rejected, naming the rule and its premises | Answers are `sound-only`, since the rules are complete only for ontologies inside the profile, unless `reasoner.ql_rewriting = "on"`, which checks each query as under `owl2-ql`. `owl:sameAs` reflexivity isn't stored; datatype rules in part ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)) |
@@ -191,7 +195,7 @@ is checked
 | `/console`, `/ops` | A browser console for queries, updates and graphs, and one for operators ([apps/nrese-console](../apps/nrese-console)) |
 | `nrese-server` | The server, and the commands `load`, `query`, `convert`, `backup`, `restore`, `prune-archive`, `check-config`, `config-schema` and `print-query` ([server setup](ops/server-setup.md)) |
 | Console CLI | A small TypeScript command-line client of the same API ([getting started](dev/getting-started.md#frontend-cli)) |
-| Errors | Every HTTP error is a problem document (RFC 9457) with the request id the server's log also carries ([status codes](ops/http-api.md#status-codes), [a worked example](ops/http-api.md#example-a-sparql-syntax-error)); a server that doesn't start says why on standard error ([startup errors](ops/server-setup.md#startup-errors)) |
+| Errors | Every HTTP error is a problem document (RFC 9457) with the request id the server's log also carries, but for clients that show it as text: a SPARQL parse error under the `plain-text` profile and a refused RDF4J isolation level ([status codes](ops/http-api.md#status-codes), [a worked example](ops/http-api.md#example-a-sparql-syntax-error)); a server that doesn't start says why on standard error ([startup errors](ops/server-setup.md#startup-errors)) |
 
 Configuration comes from a TOML file, environment variables or `--set`, with a JSON
 Schema (`nrese-server config-schema`). The [Dockerfile](../Dockerfile) builds images for

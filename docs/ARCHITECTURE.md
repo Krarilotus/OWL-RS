@@ -11,7 +11,7 @@ NRESE is an RDF database with reasoning built in. It runs as one server that use
 - **Query execution** — dictionary-encoded, sorted permutation indexes; merge, hash and worst-case-optimal joins; parallel bulk loading; full-text, vector and geospatial search.
 - **Semantics and data governance** — materialised, incrementally maintained reasoning from RDFS to OWL 2 RL, inferred statements kept apart from asserted ones; SHACL validation on request and, with its gate on, on commit; transactional writes; access control by graph.
 - **Reasoning beyond the materialisable profiles** — OWL 2 DL: consistency, classification, realisation, explanations, and query answers that state their completeness. Reasoning is the centre of the project, built on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
-- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it.
+- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it. That frontend is still to come ([ADR-0007](adr/0007-one-engine-api.md)); the browser console today calls the protocol routes (`/dataset/…`).
 
 Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the benchmark kits in [`benches/`](../benches/README.md) ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
 
@@ -74,7 +74,7 @@ handle. Resource lifetimes, reservations and the kernel boundary are in
 5. **Commit:** the engine writes the asserted and inferred deltas to the WAL (durable mode), appends it as a new immutable run, and publishes the new version atomically. Revisions are persistent and monotonic.
 6. **Post-commit:** background compaction and checkpoints. Reasoning is *not* post-commit: inferences are committed with the write that causes them, under the same revision ([design/reasoner-v2.md](design/reasoner-v2.md) §2.1).
 
-Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any change that reintroduces work proportional to the dataset on the write path must be justified in an ADR.
+Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any change that reintroduces work proportional to the dataset on the write path must be justified in an ADR. One case is open: splitting an equality class can fall back to work over the whole dataset while it holds the writer ([open work](STATUS.md#open-work)).
 
 **Bulk load:** `nrese-server load` bypasses the pipeline: the engine writes the quads,
 then the reasoner recomputes the inferences and runs the rules' consistency checks
@@ -151,7 +151,7 @@ Each crate's `lib.rs` starts with a short module doc restating its ownership. Wh
 
 See [ADR-0002](adr/0002-engine-storage-lsm-permutations.md) for the full rationale.
 
-- **Terms** are encoded as 64-bit `TermId`s. The top bits carry the term kind: IRI, blank node, literal, and **inline** values for canonical `xsd:integer` and `xsd:boolean`. A value is only inlined if its lexical form is canonical, so `"01"^^xsd:integer` and `"1"^^xsd:integer` stay distinct terms. This is RDF-correct, unlike QLever's value folding. Everything else goes through a dictionary (SwissTable hash index over one string arena).
+- **Terms** are encoded as 64-bit `TermId`s. The top bits carry the term kind: IRI, blank node, literal, and **inline** values for canonical `xsd:integer` and the types derived from it, `xsd:boolean`, `xsd:decimal`, `xsd:date` and `xsd:dateTime` (within ranges). A value is only inlined if its lexical form is canonical, so `"01"^^xsd:integer` and `"1"^^xsd:integer` stay distinct terms. This is RDF-correct, unlike QLever's value folding. Everything else goes through a dictionary (SwissTable hash index over one string arena).
 - **Quads** are `[TermId; 4]` in **seven permutations**: `SPOG POSG OSPG` answer patterns with an unbound graph, and `GSPO GPOS GOSP` answer patterns with a bound graph (including the default graph, `TermId::DEFAULT_GRAPH`). Every triple pattern is a contiguous range scan in one of them. The seventh, `GPSO`, gives executors `(?s p ?o)` sorted by subject for star joins (XC1). The inferred stack keeps `SPOG POSG OSPG PSOG`. `Snapshot::count_in` is exact: range bounds suffice for tombstone-free runs; tombstones add bitmap counts, and equality expansion or post-filtered access paths can require scanning. `Snapshot::scan_sorted_in` returns a scan in a requested order.
 - **Log-structured runs:** the index is a stack of immutable sorted runs, oldest (largest) first. A commit appends one small run containing inserts and tombstones. Reads k-way merge the runs covering a range (newest wins). A size-tiered compaction policy keeps O(log N) runs, with O(log N) amortised merge work per quad. Large merges run off the write path.
 - **MVCC:** a snapshot is an `Arc` of the run list plus the revision. Readers never block writers or each other. A snapshot stays valid for as long as it's held.
