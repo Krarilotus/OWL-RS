@@ -57,7 +57,8 @@ fn within(limit: Option<usize>) -> QueryOptions {
 /// pattern, the other and the count.
 fn recorded(ctx: &Context<'_>, counts: [u64; 2]) -> Vec<Vec<(usize, u64)>> {
     let scans = [scan(&ctx.snapshot, "a p ?x"), scan(&ctx.snapshot, "b q ?x")];
-    ctx.plan_inputs(&scans, &counts, &[], &mut Vec::new())
+    ctx.plan_inputs(&scans, &counts, &[], &mut Vec::new(), true)
+        .0
         .into_iter()
         .map(|input| input.overlaps)
         .collect()
@@ -101,25 +102,43 @@ fn shared_values_lists_stay_inside_the_query_envelope() {
     }
 }
 
-/// D16-575 E2: a pair is read where its patterns' own counts are small, not where the
-/// counts it is planned with are: those may be narrowed by a filter or a range, while the
-/// read decodes the whole pattern.
+/// D16-575 E2: a pair is read where its patterns' own counts fit the BGP's allowance, not
+/// where the counts it is planned with do: those may be narrowed by a filter or a range,
+/// while the read decodes the whole pattern. The allowance is the cost of the plan the
+/// planned counts give without the overlaps, at most [`plan::OVERLAP_VALUES`] (the master's
+/// GO of 14 November, 12:06).
 ///
-/// - Input: `a p ?x` and `b q ?x` in one commit, sharing all their `n` values, planned with
-///   counts of 1 each: `n` = 100 (200 together, within [`plan::OVERLAP_VALUES`]) and 5,000
-///   (10,000, past it).
-/// - Expected: 100 values counted; for 5,000 none, and nothing charged: no list decoded.
+/// - Input: `a p ?x` and `b q ?x` in one commit, sharing all their `n` values: `n` = 100
+///   planned as 100 each (200 together, within that plan's cost of 300: two scans and the
+///   join's rows), and as 1 each (narrowed: a plan costing 3, past which the patterns' own
+///   200 are); `n` = 5,000 planned as 5,000 each (10,000, past [`plan::OVERLAP_VALUES`]).
+/// - Expected: 100 values counted; none for the others: no list decoded, and less charged
+///   than one list's values (only the candidates' storage is, review r1 F1).
 #[test]
 fn pairs_are_read_by_their_patterns_own_counts_not_narrowed_ones() {
-    for (n, expected) in [(100, counted(100)), (5_000, none())] {
-        let engine = shared(n, 1);
+    for (n, planned, expected) in [
+        (100, 100, counted(100)),
+        (100, 1, none()),
+        (5_000, 5_000, none()),
+    ] {
+        let engine = shared(n as usize, 1);
         let snapshot = engine.snapshot();
         let options = QueryOptions::default();
         let ctx = Context::new(&snapshot, &options, None, None);
-        let peak = ctx.budget.peak();
-        assert_eq!(recorded(&ctx, [1, 1]), expected, "{n} values");
-        if n > 100 {
-            assert_eq!(ctx.budget.peak(), peak, "{n} values: a list decoded");
+        let peak = ctx.memory.peak();
+        let reads = list_reads();
+        assert_eq!(
+            recorded(&ctx, [planned, planned]),
+            expected,
+            "{n} values planned as {planned}"
+        );
+        if expected == none() {
+            let list = n as usize * size_of::<u64>();
+            assert!(
+                ctx.memory.peak() - peak < list,
+                "{n} as {planned}: a list charged"
+            );
+            assert_eq!(list_reads(), reads, "{n} as {planned}: a list decoded");
         }
     }
 }

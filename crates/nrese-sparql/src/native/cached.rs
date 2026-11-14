@@ -578,12 +578,14 @@ impl Context<'_> {
     /// The longest prefix of `joins`' order (of at least two patterns) that the result
     /// cache holds, and its length; the conjuncts it applied are removed from `filters`.
     /// Under a LIMIT (`whole`) only the whole pattern's rows will do: a prefix's would
-    /// be cut by the joins after it.
+    /// be cut by the joins after it. On a hit, `hit` is told its length before its rows are
+    /// made, so what the prefix replaces is released first.
     pub(super) fn cached_prefix(
         &self,
         joins: &Joins<'_, '_>,
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
         whole: bool,
+        hit: impl FnOnce(usize),
     ) -> NativeResult<Option<(Solutions, usize)>> {
         let (Some(scope), Some(keys)) = (&self.cache, self.prefix_keys(joins)) else {
             return Ok(None);
@@ -599,6 +601,7 @@ impl Context<'_> {
             let Some(part) = scope.cache.lookup(key) else {
                 continue;
             };
+            hit(length);
             let start = Instant::now();
             let solutions = self.solutions_of(&part, vars, None, "hit")?;
             filters.retain(|(_, read)| keys.applies_from(read).is_none_or(|from| from > length));
