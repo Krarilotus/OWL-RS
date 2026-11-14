@@ -190,7 +190,8 @@ def power(rows: list[dict], m: int, blocks: dict | None, default_blocks: int) ->
 PRIMARY = ("time/headline", "memory/peak")  # one time and one memory metric a case
 
 
-def aa_splits(rounds: list[list[Path]], splits: int, seed: int) -> tuple[list[list[dict]], list[list[dict]]]:
+def aa_splits(rounds: list[list[Path]], splits: int,
+              seed: int) -> tuple[list[list[dict]], list[list[dict]], list[list[dict]]]:
     """Each round directory's A/A passes split at random into pseudo-blocks (a baseline pass
     against a candidate pass each), compared as the gate compares them (release_gate.evidence,
     compare_case): per split the p-values of every series' hypothesis, and of the primary ones,
@@ -221,7 +222,7 @@ def aa_splits(rounds: list[list[Path]], splits: int, seed: int) -> tuple[list[li
                        and r["metric"] > 0 else [])
         return out
 
-    def one_split(reports: list[dict]) -> tuple[dict, dict]:
+    def one_split(reports: list[dict]) -> tuple[dict, dict, dict]:
         order = rng.sample(range(len(reports)), len(reports))
         sides = {"base": [], "cand": []}
         for i in range(len(reports) // 2):
@@ -232,11 +233,22 @@ def aa_splits(rounds: list[list[Path]], splits: int, seed: int) -> tuple[list[li
         ps: dict[str, float] = {}
         primary: dict[str, float] = {}
         blocks = list(range(1, len(reports) // 2 + 1))
+        # Series the readings decide below the counter's step (rg.OUTSIDE_FAMILY): out of the
+        # test, and those the gate blocks on by their readings alone (below resolution with no
+        # measured whole run) beside it.
+        readings: dict = {"resolution": {}, "blocking": set()}
         for case in planned:
             cand, base = rg.evidence(sides["cand"], case), rg.evidence(sides["base"], case)
             row = rg.compare_case(cand, base, "base", checks.get(case, set()))
+            mine = [rg.hypothesis("base", case, dim) for dim in row.get("dimensions", {})]
             for dim, r in row.get("dimensions", {}).items():
-                ps[rg.hypothesis("base", case, dim)] = r.get("p", 1.0)
+                h = rg.hypothesis("base", case, dim)
+                if r.get("status") in rg.OUTSIDE_FAMILY:
+                    readings["resolution"][h] = r["status"]
+                    if rg.uncovered("base", case, dim, row, mine):
+                        readings["blocking"].add(h)
+                    continue
+                ps[h] = r.get("p", 1.0)
             higher = "qps" in str(by_name.get(case, {}).get("metric", ""))
             for dim, b_, c_, unit in (("time/headline", metric(sides["base"], case), metric(sides["cand"], case), "ms"),
                                       ("memory/peak", [[v] for v in base["lifetime"]],
@@ -244,10 +256,10 @@ def aa_splits(rounds: list[list[Path]], splits: int, seed: int) -> tuple[list[li
                 r = rg.dimension(b_, blocks, c_, blocks, {}, unit, higher if unit == "ms" else False)
                 if r["status"] != "incomplete":
                     primary[rg.hypothesis("base", case, dim)] = r["p"]
-        return ps, primary
+        return ps, primary, readings
 
     per_round = [[one_split(reports) for _ in range(splits)] for reports in loaded]
-    return [[s[0] for s in r] for r in per_round], [[s[1] for s in r] for r in per_round]
+    return tuple([[s[k] for s in r] for r in per_round] for k in range(3))
 
 
 def aa(rounds: list[list[Path]], splits: int, seed: int) -> dict:
@@ -255,24 +267,36 @@ def aa(rounds: list[list[Path]], splits: int, seed: int) -> dict:
     round 2 on the cases round 1 left pending, round 3 what it leaves pending)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fast"))
     import release_gate as rg
-    per_round, _ = aa_splits(rounds, splits, seed)
-    family = sorted(set.intersection(*(set(s) for s in per_round[0])))
+    per_round, _, readings = aa_splits(rounds, splits, seed)
+    family = sorted(set.intersection(*(set(s) | set(o["resolution"]) for s, o in zip(per_round[0], readings[0]))))
     out = {"rounds": [len(r) for r in rounds], "m": len(family), "splits": splits, "per round": []}
     for k, samples in enumerate(per_round):
-        ps = [s.get(h, 1.0) for s in samples for h in family]
-        out["per round"].append({"round": k + 1, "share p <= 0.05": round(sum(p <= 0.05 for p in ps) / len(ps), 4),
-                                 "share p <= 0.045 (pending)": round(sum(p <= 0.045 for p in ps) / len(ps), 4)})
-    false_loss = third = 0
+        ps = [s.get(h, 1.0) for s, o in zip(samples, readings[k]) for h in family if h not in o["resolution"]]
+        def share(limit):  # None where the readings decided every series: nothing tested
+            return round(sum(p <= limit for p in ps) / len(ps), 4) if ps else None
+        out["per round"].append({"round": k + 1, "tested": len(ps), "share p <= 0.05": share(0.05),
+                                 "share p <= 0.045 (pending)": share(0.045)})
+    def round_report(k, i, hs):  # round k + 1 of split i, as gate() leaves it, on the hypotheses hs
+        o = readings[k][i]
+        return ({"family": hs, "pvalues": {h: per_round[k][i].get(h, 1.0) for h in hs if h not in o["resolution"]},
+                 "resolution": {h: o["resolution"][h] for h in hs if h in o["resolution"]}},
+                {h for h in o["blocking"] if h in hs})
+
+    false_loss = false_block = third = 0
     for i in range(splits):
-        first = {"family": family, "pvalues": {h: per_round[0][i].get(h, 1.0) for h in family}}
+        first, blocked = round_report(0, i, family)
         reports = [first]
         if len(per_round) > 1:
             cases = {h.split("|")[1] for h in rg.decide([[first]])["pending"]}
-            reports.append({"pvalues": {h: per_round[1][i].get(h, 1.0) for h in family if h.split("|")[1] in cases}})
+            again, also = round_report(1, i, [h for h in family if h.split("|")[1] in cases])
+            reports.append({k: v for k, v in again.items() if k != "family"})
+            blocked |= also
         d = rg.decide([reports])
         false_loss += bool(d["losses"])
+        false_block += bool(d["losses"] or blocked)
         third += len(reports) == 2 and bool(d["pending"])
     out["family-wise false losses (gates with any)"] = round(false_loss / splits, 4)
+    out["family-wise false blocks (losses, or readings below the step that block)"] = round(false_block / splits, 4)
     out["gates with a hypothesis due round 3"] = round(third / splits, 4)
     return out
 
@@ -372,7 +396,9 @@ def designs(rounds: list[list[Path]], splits: int, seed: int, hosts: dict[str, l
         out["hours"]["khaleesi-wsl (est.)"] = round(sum(6 * s * (first + p_big * n_big) for s in big.values()) / 3600, 1)
         return out
 
-    per_round, primary = aa_splits(rounds, splits, seed)
+    # Statistical rejections only: a series the readings block on blocks alike under every design
+    # (aa counts it, "family-wise false blocks").
+    per_round, primary, _ = aa_splits(rounds, splits, seed)
     series = sorted(set.intersection(*(set(s) for s in per_round[0])))
     prim = sorted(set.intersection(*(set(s) for s in primary[0])))
 

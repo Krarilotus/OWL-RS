@@ -1273,13 +1273,10 @@ data = "dl-roles roles=60 axioms=50000"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
-# Compared by four of the tool's six phases. The tool prints each in 0.1 ms steps, and here prepare
-# and write take microseconds (there is no subsumption to write). In a release run (13 Nov 2026)
-# both were 0.0 on every pass of the baseline; the candidate's prepare too, its write 0.1 twice.
-# Unresolved on the baseline, they can't be compared. read, normalise, saturate and assemble
-# hold the case's measurable time (about 130 ms). All six stay in each record and report, and
-# both still count in `wall`, the process's whole run as the harness times it.
-phases = ["read", "normalise", "saturate", "assemble", "wall"]
+# The tool prints its phases in 0.1 ms steps, and here prepare and write take microseconds (there
+# is no subsumption to write): in a release run (13 Nov 2026) both were 0.0 on every pass of the
+# baseline. The gate judges them below the counter's resolution, covered by `wall`, the process's
+# whole run as the harness times it (release_gate.dimension).
 # Disjointness axioms imply no subsumption between named classes; 150,002 concepts is three
 # per axiom (A_i, B_i, the filler) and two more, as every round of #78's timing read it.
 check = { "concepts" = "150002", "subsumptions" = "0" }
@@ -1297,12 +1294,9 @@ data = "el classes=20000 roles=12"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
-# Compared by five of the tool's six phases. prepare takes microseconds here and prints 0.0 at the
-# tool's 0.1 ms step: on all 30 samples of the baseline in a release run (13 Nov 2026), and of the
-# candidate, so no run can compare it. The other five hold the case's time (about 560 ms). All six
-# stay in each record and report, and prepare still counts in `wall`, the process's whole run as
-# the harness times it.
-phases = ["read", "normalise", "saturate", "assemble", "write", "wall"]
+# prepare takes microseconds here and prints 0.0 at the tool's 0.1 ms step: on all 30 samples of
+# the baseline in a release run (13 Nov 2026), and of the candidate. The gate judges it below the
+# counter's resolution, covered by `wall`, the process's whole run as the harness times it.
 check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
@@ -1323,11 +1317,8 @@ data = "el classes=20000 roles=12 irregular=1"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
-# Compared by five of the tool's six phases, as el-classify: prepare printed 0.0 on all 30 samples
-# of the baseline in a release run (13 Nov 2026), and of the candidate. The other five hold the
-# case's time (about 700 ms). All six stay in each record and report, and prepare still counts
-# in `wall`, the process's whole run as the harness times it.
-phases = ["read", "normalise", "saturate", "assemble", "write", "wall"]
+# prepare printed 0.0 on all 30 samples of the baseline in a release run (13 Nov 2026), and of the
+# candidate, as el-classify's: below the counter's resolution, covered by `wall`.
 check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6

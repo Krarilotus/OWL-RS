@@ -67,7 +67,7 @@ cap_gb = 16; est_min = 20
 | `route` | the plan or engine path the case must take: `path = "OP VALUE"` (`==`, `<=`, `>=`, `has`, `lacks`) |
 | `expect` | `{ answers = [SYSTEM, ...] }`: the reference systems the comparators' captured answers are checked against, in order (the first with a complete, stable answer, confirmed by the next; never NRESE: [../suite/suitekit/answers.py](../suite/suitekit/answers.py)); default jena, oxigraph, virtuoso, qlever. Single answers the case checks (`q.NAME.value`, `q.NAME.rows`) are known answers to every system |
 | `reference` | a reference taxonomy file for the classification cases |
-| `phases` | a classifier tool's case (`classify-el`, `classify-horn`): the phases it is compared by, where the tool can't resolve the others on the baseline (below, "What the tool can resolve"); default all the tool prints. A case that leaves one out declares `wall` too, the process's whole run as the harness times it. The others stay in each record and report |
+| `phases` | a classifier tool's case (`classify-el`, `classify-horn`): the phases it is compared by; default all the tool prints and `wall`, the process's whole run as the harness times it (below, "What the tool can resolve"). A case that leaves one out declares `wall` too. The others stay in each record and report |
 | `absent` | `{ main = "CAPABILITY" }`: a release-gate baseline (`base`, `main`) whose product lacks what the case needs; the gate declares no hypothesis against it and the verdict names it "main has no CAPABILITY" ([../PROTOCOL.md](../PROTOCOL.md) §5). A baseline that has it but whose measurement build can't run it is absent only by Johannes's entry in [../release-tradeoffs.toml](../release-tradeoffs.toml) |
 | `outcome`, `known`, `frontier` | a known product issue: the outcome a run ends as (`memory-limit`, `gave-up`, `timeout`, `unsupported`, `wrong`), what the issue is (required with an outcome), and the settings to run it once more past its limit (`cap_gb`, `timeout_s`) |
 | `systems` | the comparators, `SYSTEM:SEMANTICS`: `plain` (the same SPARQL on the same data), `closure` (NRESE's closure, for stores without reasoning), `rewritten` (NRESE's rewritten queries), or the system's own `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql`, `custom`, `el`, `dl`, `shacl`, `text`, `geosparql`, `federation`, `vector`. A system is a key of [../suite/systems.toml](../suite/systems.toml). `[]`: NRESE only. Required |
@@ -102,11 +102,11 @@ Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
   without the vendor's written consent ([../competitors/README.md](../competitors/README.md)).
 - **Known issues stay visible.** An expected outcome fails no gate but every run's verdict
   says it; a case is never weakened to pass.
-- **What the tool can resolve.** A phase is declared for a case only when the tool can resolve
-  it on the baseline. A phase that prints 0 at the tool's own resolution on every pass can never
-  be compared. Leaving it out (`phases`) corrects the case. It is neither a capability the
-  baseline lacks (`absent`) nor a loss waived, and the case names why in a comment. The case
-  then declares `wall`, the whole process timed by the harness, so the phase still counts.
+- **What the tool can resolve.** A phase that prints 0 at the tool's own step is a reading
+  below its resolution, never a missing one. The gate judges it as such (PROTOCOL.md, "The
+  counter's resolution"), and `wall`, the whole process timed by the harness, covers it. A
+  classifier case's family holds every phase and `wall` by default, so no case needs to leave a
+  phase out. A case that does (`phases`) declares `wall` too, and names why in a comment.
 
 ## Running
 
