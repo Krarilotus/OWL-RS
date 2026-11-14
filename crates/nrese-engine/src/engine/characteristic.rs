@@ -19,10 +19,10 @@
 //! set `S2` (an object that is a subject itself; `NONE` otherwise). The chain
 //! `?x p ?y . ?y q ?z` then counts only the links whose object has `q`
 //! ([`CharacteristicSets::pair`]), where independence assumes every object might. A second
-//! scan finds them ([`CharacteristicSets::with_pairs`]), within [`MAX_PAIR_SUBJECTS`] and
+//! scan finds them (`CharacteristicSets::with_pairs`), within [`MAX_PAIR_SUBJECTS`] and
 //! [`MAX_PAIRS`].
 //!
-//! A scan gathers them first ([`Gathered`]); what is kept ([`CharacteristicSets`]) is built
+//! A scan gathers them first (`Gathered`); what is kept ([`CharacteristicSets`]) is built
 //! from that into vectors charged to the keeper's budget before they are allocated, sorted
 //! and looked up by binary search, so that its charge is what it holds.
 
@@ -47,7 +47,7 @@ pub const MAX_PAIRS: usize = 1 << 20;
 const NONE: u32 = u32::MAX;
 
 /// The characteristic sets of a graph, as kept: every container charged to the keeper's
-/// budget ([`Gathered::kept`]).
+/// budget (`Gathered::kept`).
 #[derive(Debug)]
 pub struct CharacteristicSets {
     /// Per set: where its predicates begin in `predicates` (they end where the next set's

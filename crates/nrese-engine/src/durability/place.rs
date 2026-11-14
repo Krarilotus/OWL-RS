@@ -444,7 +444,7 @@ fn make_exact(holders: &mut Vec<PathBuf>, keys: &mut Vec<PathBuf>, exact: &mut b
 
 /// Makes the names leading to the existing directory `dir` durable, as [`create_dir_all`] does
 /// for the levels it finds, and makes none: the holder of each entry its resolution reads
-/// synced ([`resolve`]: through links, the link's own entry and its target's chain), outermost
+/// synced (`resolve`: through links, the link's own entry and its target's chain), outermost
 /// first (a holder this process may not open for the sync, `PermissionDenied`, is left as it
 /// is). `NotFound` if `dir` isn't there (or a link on its way is dangling): a write into a
 /// directory gone meanwhile must not make it again. For writes under a store's directory that
@@ -469,7 +469,7 @@ pub fn name_existing(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Makes the names the existing file `path` is reached through durable beyond its own
-/// directory's ([`file_holders`]), each holder synced (one this process may not open for the
+/// directory's (`file_holders`), each holder synced (one this process may not open for the
 /// sync, `PermissionDenied`, left as [`name_existing`] leaves it). For a file a store appends
 /// to through its name (the quarantine's log): after each append and its sync, which make a
 /// target not there yet, before the append is acknowledged. A failure leaves the append

@@ -171,7 +171,7 @@ impl<'e> PrivateTransaction<'e> {
 
     /// The base with the pending changes, as [`super::Transaction::pending_snapshot`] makes it,
     /// reading this transaction's terms: private ([`Snapshot::is_private`]). Charged to the
-    /// transaction's budget, as [`Self::build`] charges, so this can be refused.
+    /// transaction's budget, as `Self::build` charges, so this can be refused.
     pub fn pending_snapshot(&self) -> EngineResult<Snapshot> {
         self.build(self.overlay.budget())
     }

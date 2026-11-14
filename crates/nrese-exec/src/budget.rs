@@ -391,7 +391,7 @@ pub struct Envelope(Arc<Budget>);
 
 impl Envelope {
     /// `limit` bytes (`None`: unlimited) within `server`'s budget. Its charges there draw on
-    /// a credit of its own ([`credit_cap`]), so that a request's charges and releases stay
+    /// a credit of its own (`credit_cap`), so that a request's charges and releases stay
     /// on its own counter, and the server's is written only when a credit is taken or
     /// returned: one cache line all running requests share.
     pub fn new(limit: Option<usize>, server: Option<Arc<SharedBudget>>) -> Self {
@@ -959,7 +959,7 @@ impl Drop for Budget {
 /// Bytes charged to a budget that outlive the operation which charged them: released when
 /// the reservation drops, however its holder ends. `B` borrows or shares the budget.
 ///
-/// A measurement ([`crate::measure`]) tells reservations apart: it counts the charges and
+/// A measurement (`crate::measure`) tells reservations apart: it counts the charges and
 /// releases of those made while it runs, and of no other.
 #[derive(Debug)]
 pub struct Reservation<B: Deref<Target = Budget> = Arc<Budget>> {
@@ -1103,13 +1103,13 @@ impl<B: Deref<Target = Budget>> Drop for Reservation<B> {
 /// it costs one local subtraction, no atomic, no call up the levels (the executor memory
 /// stack's timing: a shared atomic per item cost GROUP_CONCAT up to x1.94 in parallel
 /// workers). Past the spare the item is charged exactly ([`Budget`]'s `take`, refused and
-/// recorded where it doesn't fit), then the spare refilled with [`Budget::take_up_to`]:
+/// recorded where it doesn't fit), then the spare refilled with `Budget::take_up_to`:
 /// never refused, never recorded as refused, never more than half of what a level has
 /// left, never waiting. Nothing is shared between grants, so nothing races. The owner of
 /// the budget types ruled this shape (3 Nov); a `Grant` is the executor's one way to
 /// charge items.
 ///
-/// A grant's spare is at most its budget's [`Budget::grant_cap`] divided by the workers
+/// A grant's spare is at most its budget's `Budget::grant_cap` divided by the workers
 /// its operator runs on, none where that is under 1 KiB: an envelope's part holds at most
 /// one cap of spare across the grants live on it at once (a grant held across a rayon
 /// `join` may have a stolen sibling's grant live on the same thread, so the bound is per
@@ -1354,8 +1354,8 @@ pub mod hold {
         /// [`Self::renew`] to at least `least` bytes and at most `most`, in whole `unit`s:
         /// `least` charged exactly (refused, and recorded as refused, where it doesn't fit),
         /// the rest never refused nor recorded: whole where every level has room for it
-        /// ([`super::Budget::try_take`]), else no more than half of the room left at a level
-        /// ([`super::Budget::take_up_to`]'s rule, which leaves siblings room). What it holds
+        /// (`super::Budget::try_take`), else no more than half of the room left at a level
+        /// (`super::Budget::take_up_to`'s rule, which leaves siblings room). What it holds
         /// then, with the old bytes' holder. A refusal changes nothing.
         fn renew_up_to(
             &mut self,
@@ -1570,7 +1570,7 @@ impl<B: Deref<Target = Budget>> Drop for Share<'_, B> {
 }
 
 /// A vector whose memory is charged before it is allocated, to a budget ([`ChargedVec`]) or
-/// to a [`Pool`]. Every change of its capacity takes one path ([`Charged::set_capacity`]):
+/// to a [`Pool`]. Every change of its capacity takes one path (`Charged::set_capacity`):
 /// the new capacity is charged first, beside the old (a reallocation holds both while it
 /// moves the items), then allocated, then the old capacity released; one there is no room
 /// for fails without allocating. It never holds more than it was charged, however a call
