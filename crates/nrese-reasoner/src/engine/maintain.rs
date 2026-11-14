@@ -126,11 +126,22 @@ impl VisitsBase for EngineBase<'_> {
     /// The engine's count's work counted on `probe` as it goes (review r1 F2: under compact
     /// equality it scans the stored matches); [`Stopped`] where the count stopped.
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
+        self.size_up_to(bound, usize::MAX, probe)
+    }
+
+    /// The committed count asked up to `limit`, plus the pending inserts (exact, in memory).
+    fn size_up_to(
+        &self,
+        bound: [Option<u64>; 3],
+        limit: usize,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
         let committed = self
             .snapshot
-            .count(
+            .count_up_to(
                 ReadModel::Materialised,
                 &pattern(bound, GraphSelector::Any),
+                u64::try_from(limit).unwrap_or(u64::MAX),
                 &|n| probe.visited(n),
             )?
             .at_least();
