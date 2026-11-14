@@ -353,20 +353,22 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 
 ## Status codes
 
-| Code | When |
-|---|---|
-| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) or by the SHACL gate under `enforce`. An OWL 2 DL consistency check that isn't decided rejects nothing: the commit goes through, and the status says `unknown` ([consistency](../spec/reasoning-semantics.md#consistency)) |
-| 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
-| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner |
-| 422 | Under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete: type `incomplete-answer`, with the reasons, the bounds and the unresolved candidates |
-| 404 | The surface is disabled, or the named graph doesn't exist |
-| 406 | The client accepts no format the result has |
-| 408 | The policy timeout passed; a timed-out write was not committed |
-| 413 | The request or the query's memory need exceeds the policy limit |
-| 415 | The body's media type isn't one the endpoint reads |
-| 429 | Rate limit |
-| 500 | The server's fault; logged with the request id |
-| 503 | Starting; (for `/readyz`) in quarantine; or the memory queries and client transactions share is taken, so try again later |
+Nothing of a request refused with a `4xx` status is applied. Each row says what to do; the check is the same request answering `2xx`.
+
+| Code | When | What to do |
+|---|---|---|
+| 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) or by the SHACL gate under `enforce`. An OWL 2 DL consistency check that isn't decided rejects nothing: the commit goes through, and the status says `unknown` ([consistency](../spec/reasoning-semantics.md#consistency)) | Fix what `detail` names (for a rejected commit, the statements in `reasoner_reject`) and send it again ([worked example](#example-a-sparql-syntax-error)) |
+| 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write | 401: send credentials the [auth mode](config-reference.md#auth-modes) takes. 403: an administrator grants the role or graph ([graph access](#graph-level-access-control)) |
+| 404 | The surface is disabled, or the named graph doesn't exist | Check the URL, and that the [deployment posture](config-reference.md#server) enables the surface; a named graph without statements doesn't exist ([Graph Store Protocol](#graph-store-protocol)) |
+| 406 | The client accepts no format the result has | Send an `Accept` the result has ([formats](#result-formats)) |
+| 408 | The policy timeout passed; a timed-out write was not committed | Narrow the query, or raise its timeout ([timeouts](config-reference.md#timeouts-and-writes)); send a timed-out write again |
+| 409 | The resource exists already (a repository; also while one with that id is being created or removed), or the change would leave a workspace without an owner | A repository: use another id, or the existing one (`GET /api/v1/repositories/{id}`), or `DELETE` it first; while it is being created or removed, send again shortly. A workspace: make another member `owner` first (`PUT …/members/{user}`) |
+| 413 | The request or the query's memory need exceeds the policy limit | Send less, or a narrower query, or raise the limit that applies ([budgets](config-reference.md#budgets)) |
+| 415 | The body's media type isn't one the endpoint reads | Send a `Content-Type` the endpoint's contract names ([contracts](#endpoint-contracts)) |
+| 422 | Under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete: type `incomplete-answer`, with the reasons, the bounds and the unresolved candidates | Ask without `exact` (`dl-answers=certain-where-complete`, the default, or `sound`) and read `NRESE-Completeness`; the `reasons` say what wasn't decided |
+| 429 | Rate limit | Wait for the [rate-limit window](config-reference.md#policy-rate-limits) (`policy.rate_limits.window_secs`, 60 s by default) to pass, then send again |
+| 500 | The server's fault; logged with the request id | Report it with `request_id`: the server's log has the error under that id |
+| 503 | Starting; (for `/readyz`) in quarantine; or the memory queries and client transactions share is taken, so try again later | Starting: wait for `/readyz` to answer 200. Memory taken: send again (after `Retry-After`, where sent); if it recurs, raise `budgets.total_query_memory` ([budgets](config-reference.md#budgets)) |
 
 Every error is an `application/problem+json` document (RFC 9457), whoever answered: a handler, or the framework itself (no such route 404, a method the route doesn't take 405 with `Allow`, a body that doesn't decode). It has `type`, `title`, `status` and `detail`, and `request_id`, the id that `x-request-id` carries on every response and the server's log carries with the request. A rejected commit answers 400, its type saying what kind of reason the committer is shown, not which check rejected: `reasoner-reject` (the data shown is inconsistent), `shacl-reject` (the data shown has SHACL results the gate rejects for) or `commit-reject` (the committer's graphs show no reason by themselves, whichever check rejected). The data shown is the whole data for a committer that may read every graph, else the graphs it may read. Its `reasoner_reject` has the rule or constraint and the statements shown, where there are any; the field keeps its name for every kind, so that clients that read it go on working. The exceptions are for clients that show the message as text: SPARQL parse errors under the `plain-text` profile, and an RDF4J transaction's refused isolation level. The console and its CLI print an error as `title: detail (request <id>)`, and the CLI exits non-zero.
 
