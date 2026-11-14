@@ -163,13 +163,21 @@ def verdict(repo: Path, candidate: str, timed: list[dict], w3c: dict, guards: di
 def verdict_on(repo: Path, candidate: str, where: Path, timed: list[dict], w3c: dict | Path,
                guards: dict | Path) -> subprocess.CompletedProcess:
     """`release_gate.py verdict` with the timed parts and each check written into WHERE (a check given as a
-    path: that file, where its attempt record lies beside it)."""
+    path: that file, where its attempt record lies beside it). A timed part goes where a fetch puts it, a
+    directory of its own (WHERE/part-I), its report its part's newest attempt's (one carrying none is
+    given one)."""
     files = []
     for i, part in enumerate([*timed, w3c, guards]):
         if isinstance(part, Path):
             files.append(part)
             continue
-        files.append(where / ("w3c.json" if i == len(timed) else "guards.json" if i > len(timed) else f"part-{i}.json"))
+        if i < len(timed):
+            (where / f"part-{i}").mkdir(exist_ok=True)
+            files.append(where / f"part-{i}" / "release-gate.json")
+            part = {**part, "attempt": part.get("attempt") or f"{i + 1:032x}"}
+            write_attempts(files[-1].parent, "timed", [attempt_record("timed", part["attempt"], "t")])
+        else:
+            files.append(where / ("w3c.json" if i == len(timed) else "guards.json"))
         files[-1].write_text(json.dumps(part), encoding="utf-8")
     args = [a for f in files[:-2] for a in ("--timed", str(f))]
     return subprocess.run([sys.executable, str(GATE), "verdict", "--checkout", str(repo), "--candidate", candidate,

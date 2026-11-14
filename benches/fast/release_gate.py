@@ -1432,6 +1432,11 @@ def checkout_receipt(kind: str, identity: str, attempt: str, outcomes: list[Outc
 # receipt carry; `verdict` takes a result only of the newest record's id, and nothing at all from a
 # history it can't order (a sequence held twice, a name of another form, at any position). The
 # orchestrator's design, fix checks r2 and r3, 9 Nov 2026. The run directory is per job: old records stay.
+# A timed part's run is an attempt too ("timed", its first step: release-gate.sh begin): its report
+# carries it, and `verdict` takes a part's report only of its newest attempt, whatever an earlier run
+# left beside it (a job submitted again under its id keeps its directory; a fetch copies over an
+# earlier fetch) (D16-490). Its blocks resume from earlier attempts' passes by design; the report is
+# made anew by every attempt, so a report is its newest attempt's or stale.
 ATTEMPT_SEQUENCE = re.compile(r"(\d+)")
 # Sequences an attempt tries past the highest it found before it refuses: as many steps of one kind
 # overlapping in one job's directory as this is no gate's (one step a kind runs at a time).
@@ -2716,7 +2721,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
     # work, so the part starts only where it can time and every step runs where these binaries are
     # (Sol r1 S1; 2 Nov 2026: an untimed first step built on a host outside its timing window).
-    builds = [["bash", "-c", 'set -e; harness=$1; shift; for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
+    builds = [["bash", "-c", 'set -e; harness=$1; shift; bash scripts/release-gate.sh begin; '
+               'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
                'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
     # the sides timed (a main that is the base isn't timed again)
     sides = 2 + (main != base)
@@ -3138,12 +3144,30 @@ def attempt_errors(kind: str, result: dict | None, newest: tuple[dict | None, st
     return errors
 
 
+def timed_attempt_errors(report: dict, newest: tuple[dict | None, str | None]) -> list[str]:
+    """A timed part's report against its part's newest attempt record (newest_attempt(), "timed"):
+    one there, and the report that attempt's."""
+    c = report.get("context") or {}
+    part = f"timed part {c.get('prefix') or '?'} on {c.get('host') or '?'}, round {c.get('round', '?')}"
+    record, wrong = newest
+    if wrong:
+        return [f"{part}: {wrong}"]
+    if record is None:
+        return [f"{part}: no attempt record (timed.attempt.*.json beside its report): no run stands for it"]
+    if report.get("attempt") != record["attempt"]:
+        return [f"{part}: stale report from an earlier attempt (it carries {report.get('attempt')}; "
+                f"the latest attempt is {record['attempt']})"]
+    return []
+
+
 def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate: Candidate,
-                    contract: Contract, attempts: dict[str, tuple[dict | None, str | None]]) -> list[str]:
+                    contract: Contract, attempts: dict[str, tuple[dict | None, str | None]],
+                    timed_attempts: list[tuple[dict | None, str | None]]) -> list[str]:
     """What isn't evidence of the candidate's tree: a timed part that timed another tree, a check
     without a receipt (one from before receipts, or not the gate's), with a receipt of another tree,
     of a checkout with changes, or whose commit isn't of the tree it names; a check that isn't its
-    step's latest attempt (ATTEMPTS: each kind's record, attempt_errors()); and a check that isn't
+    step's latest attempt (ATTEMPTS: each kind's record, attempt_errors()); a timed part's report that
+    isn't its part's latest attempt (TIMED_ATTEMPTS, one a part, timed_attempt_errors()); and a check that isn't
     the run the candidate's CONTRACT requires (its own `passed` decides nothing). A tree, not a
     commit: the same tree under a merge commit is the same candidate
     (rule.owl-rs-results-keyed-by-tree)."""
@@ -3151,7 +3175,8 @@ def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate
     for kind, result in checks.items():
         errors += attempt_errors(kind, result, attempts.get(kind, (None, None)), candidate)
     checks = {kind: result for kind, result in checks.items() if result is not None}
-    for report in timed:
+    for report, newest in zip(timed, timed_attempts, strict=True):
+        errors += timed_attempt_errors(report, newest)
         rev = str((report.get("candidate") or {}).get("revision") or "")
         tree = candidate.tree_of(rev) if rev else None
         if tree != candidate.tree:
@@ -3183,11 +3208,13 @@ def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate
 
 def release_verdict(timed: list[dict], w3c: dict | None, guards: dict | None, candidate: Candidate,
                     policy: Policy, contract: Contract,
-                    attempts: dict[str, tuple[dict | None, str | None]]) -> tuple[bool, str]:
+                    attempts: dict[str, tuple[dict | None, str | None]],
+                    timed_attempts: list[tuple[dict | None, str | None]]) -> tuple[bool, str]:
     """`verdict`: the parts bound to the candidate, each check to its step's latest attempt (ATTEMPTS)
+    and each timed part's report to its part's (TIMED_ATTEMPTS)
     and to its tree's contract (evidence_errors()), under its tree's policy. A check without a result
     (None) is no pass."""
-    evidence = evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract, attempts)
+    evidence = evidence_errors(timed, {"w3c": w3c, "guards": guards}, candidate, contract, attempts, timed_attempts)
     passed, text = verdict(timed, w3c or {}, guards or {}, policy, evidence)
     head, rest = text.split("\n", 1)
     return passed, f"{head}\n\nCandidate: {candidate.commit} (tree {candidate.tree})\n{rest}"
@@ -3263,8 +3290,9 @@ def main() -> int:
     s.add_argument("--identity", help="with --run: the build identity (scripts/lib/gate-key.sh gate_identity)")
     s.add_argument("--attempt", help="with --run: its step's attempt (release_gate.py attempt), in result and receipt")
     s.add_argument("--json", type=Path)
-    s = sub.add_parser("attempt", help="a new attempt of a check's step, recorded beside its result; prints its id")
-    s.add_argument("kind", choices=("w3c", "guards"))
+    s = sub.add_parser("attempt", help="a new attempt of a check's step, or of a timed part's run (its first "
+                                       "step), recorded beside its result; prints its id")
+    s.add_argument("kind", choices=("w3c", "guards", "timed"))
     s.add_argument("where", type=Path, help="the step's results directory (KIND.attempt.SEQUENCE.json)")
     s = sub.add_parser("jobs", help="the fleet jobs of a whole gate, as TOML files")
     s.add_argument("candidate", help="the head to gate (a revision of --checkout)")
@@ -3360,6 +3388,9 @@ def main() -> int:
         summary["host_notes"] = [*summary.get("host_notes", []), *notes]
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
         summary["prepared_manifest"] = sorted(map(str, prepared))
+        # The part's run this report is of: the newest attempt record beside the report.
+        record, _ = newest_attempt(args.json.parent, "timed") if args.json else (None, None)
+        summary["attempt"] = record["attempt"] if record else None
         text = render(summary)
         print(text)
         if args.out:
@@ -3558,7 +3589,8 @@ def main() -> int:
         attempts[kind] = newest_attempt(path.parent, kind)
     if not all(isinstance(part, dict) for part in [*timed, *(c for c in checks.values() if c is not None)]):
         p.error("verdict: every part is a JSON object (release-gate.json, w3c.json, guards.json)")
-    passed, text = release_verdict(timed, checks["w3c"], checks["guards"], candidate, policy, contract, attempts)
+    passed, text = release_verdict(timed, checks["w3c"], checks["guards"], candidate, policy, contract, attempts,
+                                   [newest_attempt(path.parent, "timed") for path in args.timed])
     print(text)
     if args.out:
         args.out.write_text(text, encoding="utf-8")
