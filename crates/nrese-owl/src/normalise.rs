@@ -35,6 +35,7 @@ use crate::mapping::Ontology;
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, ExprId, Interner, ObjProp, RangeId, Term,
 };
+use crate::unsupported::Unsupported;
 
 /// How the normalisation encodes what has more than one encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +121,7 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
         for &index in &r.unsupported {
             n.out
                 .unsupported
-                .push((index, crate::universal::UNSUPPORTED));
+                .push((index, Unsupported::UniversalObjectProperty));
         }
     }
     for (index, axiom) in ontology.axioms.iter().enumerate() {
@@ -128,7 +129,9 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
             continue;
         }
         if n.uses_top(axiom) {
-            n.out.unsupported.push((index, UNIVERSAL));
+            n.out
+                .unsupported
+                .push((index, Unsupported::UniversalDataProperty));
             continue;
         }
         n.axiom(index, axiom);
@@ -146,28 +149,8 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     n.finish()
 }
 
-/// Why a datatype definition is in [`Normalised::unsupported`]: the clauses don't cover
-/// it; a datatype theory reads it from [`Normalised::definitions`].
-pub const UNSUPPORTED_DATATYPE_DEFINITIONS: &str = "datatype definitions (the datatype theory)";
-
-/// Why a key is in [`Normalised::unsupported`]: the clauses don't cover it; an engine with
-/// DL-safe rules reads it from [`Normalised::rules`].
-pub const UNSUPPORTED_KEYS: &str = "keys (a DL-safe rule over named individuals)";
-
 /// The most GCIs one GCI is distributed into over its conjunctions.
 const MAX_DISTRIBUTED: usize = 16;
-
-/// Why an axiom over a universal property is left out.
-const UNIVERSAL: &str = "the universal data property (owl:topDataProperty)";
-
-/// Why an axiom with a cardinality past `u32` in its negation is left out.
-const UNCOUNTED: &str = "a cardinality whose negation is past 4294967295";
-
-/// Why an axiom whose clause or key needs more variables than a `u16` numbers is left out.
-const TOO_WIDE: &str = "a clause or key with more than 65535 variables";
-
-/// Why an axiom whose universal needs an automaton of an irregular role is left out.
-const IRREGULAR: &str = "an irregular role hierarchy";
 
 /// `count` clause variables numbered from `*next` on; `next` moves past them. `None` where
 /// a `u16` doesn't number them all: two would be one.
@@ -245,7 +228,7 @@ struct Normaliser<'a> {
     /// Per shared name, what took it.
     takers: HashMap<u32, Vec<Taker>>,
     /// The shared names whose definitions can't be read in full, with why.
-    failed: HashMap<u32, &'static str>,
+    failed: HashMap<u32, Unsupported>,
     /// With exact provenance: each clause of a shared name's definition, with the name and
     /// what else the clause needs besides the definition's axiom (a transition's role
     /// inclusions). `finish` gives it a source set per axiom that takes the name.
@@ -461,7 +444,7 @@ impl<'a> Normaliser<'a> {
     /// Axiom `source` needs `≥ n + 1` past a `u32` count (`nnf_not`): what it gave until
     /// then holds, the rest is left out, and the axiom is unsupported.
     fn uncounted(&mut self, source: usize) {
-        self.fail(Taker::Axiom(source), UNCOUNTED);
+        self.fail(Taker::Axiom(source), Unsupported::UncountedNegation);
     }
 
     /// The current taker takes the shared name `name` from the caches; if `name`'s
@@ -476,7 +459,7 @@ impl<'a> Normaliser<'a> {
     /// `taker` can't be read in full (`why`): what it gave until then holds, the rest is
     /// left out. An axiom is unsupported; a shared name's definition fails, and so does
     /// everything that took the name, then or later (`take`): each is weaker without it.
-    fn fail(&mut self, taker: Taker, why: &'static str) {
+    fn fail(&mut self, taker: Taker, why: Unsupported) {
         let mut todo = vec![taker];
         while let Some(taker) = todo.pop() {
             match taker {
@@ -766,11 +749,11 @@ impl<'a> Normaliser<'a> {
             Axiom::DatatypeDefinition(t, r) => {
                 self.out
                     .unsupported
-                    .push((index, UNSUPPORTED_DATATYPE_DEFINITIONS));
+                    .push((index, Unsupported::DatatypeDefinitions));
                 self.out.definitions.push((*t, *r));
             }
             Axiom::HasKey(c, objects, data) => {
-                self.out.unsupported.push((index, UNSUPPORTED_KEYS));
+                self.out.unsupported.push((index, Unsupported::Keys));
                 self.key(index, *c, objects, data);
             }
             Axiom::ClassAssertion(c, a) => {
@@ -827,7 +810,7 @@ impl<'a> Normaliser<'a> {
             variables(&mut 0, data.len()),
             variables(&mut 1, objects.len()),
         ) else {
-            self.out.unsupported.push((index, TOO_WIDE));
+            self.out.unsupported.push((index, Unsupported::TooWide));
             return;
         };
         // A non-simple property with no named individual to reach: no pair the key merges,
@@ -1008,7 +991,7 @@ impl<'a> Normaliser<'a> {
     }
 
     /// The clause of `gci`, or why it can't be read in full (`drain` fails its taker).
-    fn clausify(&mut self, gci: Gci) -> Result<(), &'static str> {
+    fn clausify(&mut self, gci: Gci) -> Result<(), Unsupported> {
         let Some(items) = self.flatten(gci.items) else {
             return Ok(());
         };
@@ -1133,11 +1116,11 @@ impl<'a> Normaliser<'a> {
                         // disjunction `A → B ∨ Q`; 4 October 2026).
                         if many && self.negative_filler(c) {
                             let Some(d) = self.nnf_not(c) else {
-                                return Err(UNCOUNTED);
+                                return Err(Unsupported::UncountedNegation);
                             };
                             let some = self.e(ClassExpr::Some(r, d));
                             let Some(p) = self.fresh_negative(some, gci.source) else {
-                                return Err(UNCOUNTED);
+                                return Err(Unsupported::UncountedNegation);
                             };
                             body.push(BodyAtom::Concept(Concept::Fresh(p), Var::X));
                             continue;
@@ -1148,7 +1131,7 @@ impl<'a> Normaliser<'a> {
                         continue;
                     }
                     let Some(ys) = variables(&mut next_y, 1) else {
-                        return Err(TOO_WIDE);
+                        return Err(Unsupported::TooWide);
                     };
                     let y = Var::Y(ys[0]);
                     body.push(Self::edge(r, Var::X, y));
@@ -1160,7 +1143,7 @@ impl<'a> Normaliser<'a> {
                         ClassExpr::Class(a) => Some(Concept::Named(a)),
                         _ => match self.fresh_negative(c, gci.source) {
                             Some(q) => Some(Concept::Fresh(q)),
-                            None => return Err(UNCOUNTED),
+                            None => return Err(Unsupported::UncountedNegation),
                         },
                     };
                     if n > self.expand_up_to {
@@ -1173,7 +1156,7 @@ impl<'a> Normaliser<'a> {
                         continue;
                     }
                     let Some(ys) = variables(&mut next_y, n as usize + 1) else {
-                        return Err(TOO_WIDE);
+                        return Err(Unsupported::TooWide);
                     };
                     let ys: Vec<Var> = ys.into_iter().map(Var::Y).collect();
                     for &y in &ys {
@@ -1202,7 +1185,7 @@ impl<'a> Normaliser<'a> {
                 }),
                 ClassExpr::DataAll(d, r) => {
                     let Some(vs) = variables(&mut next_v, 1) else {
-                        return Err(TOO_WIDE);
+                        return Err(Unsupported::TooWide);
                     };
                     let v = Var::V(vs[0]);
                     body.push(BodyAtom::Data(d, Var::X, v));
@@ -1218,7 +1201,7 @@ impl<'a> Normaliser<'a> {
                 }
                 ClassExpr::DataMax(n, d, r) => {
                     let Some(vs) = variables(&mut next_v, n as usize + 1) else {
-                        return Err(TOO_WIDE);
+                        return Err(Unsupported::TooWide);
                     };
                     let vs: Vec<Var> = vs.into_iter().map(Var::V).collect();
                     let outside = self.range_not(r);
@@ -1653,7 +1636,7 @@ impl<'a> Normaliser<'a> {
             let q = self.new_fresh(FreshOf::State { role, state: 0 });
             self.automata.insert((role, filler), q);
             self.take(q);
-            self.fail(Taker::Name(q), IRREGULAR);
+            self.fail(Taker::Name(q), Unsupported::IrregularRoleHierarchy);
             return q;
         };
         let names: Vec<u32> = (0..nfa.states)

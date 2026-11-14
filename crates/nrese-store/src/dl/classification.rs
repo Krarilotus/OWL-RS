@@ -19,7 +19,7 @@ use std::time::Instant;
 use nrese_dl::classify::{self, Realisation, Taxonomy};
 use nrese_dl::verdict::Verdict;
 use nrese_engine::{ReadModel, Snapshot, TermId, TermKind};
-use nrese_owl::{Axiom, Characteristic, Ontology, Term};
+use nrese_owl::{Axiom, Characteristic, Ontology, Term, Unsupported};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::classify::Classification;
 
@@ -162,31 +162,6 @@ fn run<T>(
     }
 }
 
-/// What the DL engines say where an irregular role hierarchy is the only part they leave
-/// out (`nrese_dl::tableau::left_out` over nrese-owl's `IRREGULAR`, normalise.rs).
-const IRREGULAR_ONLY: &str = "axioms left out: an irregular role hierarchy";
-
-/// Whether `taxonomy` is the driver's lower bound for an ontology whose only part left out
-/// is an irregular role hierarchy: its verdict and the reasons it writes on that path
-/// (`nrese_dl` classify/driver.rs). `Taxonomy` carries them as text only; reworded there,
-/// this holds for nothing and the lower bound stays the answer.
-fn irregular_only(taxonomy: &Taxonomy) -> bool {
-    let consistency = format!("consistency not decided (unsupported): {IRREGULAR_ONLY}");
-    let thing = format!("owl:Thing not decided (unsupported): {IRREGULAR_ONLY}");
-    let classes = format!(" classes not decided (unsupported: {IRREGULAR_ONLY})");
-    taxonomy.profile.path == "tableau"
-        && taxonomy.classification.consistency
-            == Verdict::Unknown(format!("unsupported: {IRREGULAR_ONLY}"))
-        && taxonomy.incomplete.contains(&consistency)
-        && taxonomy.incomplete.iter().all(|why| {
-            *why == consistency
-                || *why == thing
-                || why
-                    .strip_suffix(&classes)
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        })
-}
-
 /// Whether the EL classifier's completion rules are complete for `o`, given that it reads
 /// all of it: no assertion (the ontology then has a model iff `owl:Thing` is satisfiable),
 /// and no object-property range on a property of a chain or a transitivity, or above or
@@ -319,7 +294,8 @@ pub(crate) fn el_answer(
     taxonomy: &Taxonomy,
     started: Instant,
 ) -> Option<El> {
-    if !irregular_only(taxonomy) {
+    // The driver's lower bound, where an irregular role hierarchy is all it left out.
+    if !taxonomy.left_out.only(Unsupported::IrregularRoleHierarchy) {
         return None;
     }
     let options = options(store);

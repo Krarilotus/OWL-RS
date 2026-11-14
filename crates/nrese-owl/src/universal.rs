@@ -29,9 +29,6 @@
 use crate::mapping::Ontology;
 use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Term};
 
-/// What can't be encoded: what OWL 2 DL rules out.
-pub(crate) const UNSUPPORTED: &str = "the universal object property where OWL 2 DL requires a simple property (a cardinality; functional, inverse-functional, irreflexive, asymmetric or disjoint properties: OWL 2 Structural Specification §11.1, §11.2)";
-
 /// The rewriting of an ontology that uses `owl:topObjectProperty`.
 pub(crate) struct Rewritten {
     /// The ontology with U encoded; axioms keep their indexes (one left out becomes a

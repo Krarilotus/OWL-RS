@@ -366,9 +366,9 @@ ex:D a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ; owl:onDatatype xs
         assert!(rule.body.contains(&atom), "{atom:?} in {:?}", rule.body);
     }
     assert_eq!(n.definitions.len(), 1);
-    let reasons: Vec<&str> = n.unsupported.iter().map(|(_, r)| *r).collect();
-    assert!(reasons.contains(&nrese_owl::UNSUPPORTED_KEYS));
-    assert!(reasons.contains(&nrese_owl::UNSUPPORTED_DATATYPE_DEFINITIONS));
+    let reasons: Vec<nrese_owl::Unsupported> = n.unsupported.iter().map(|&(_, r)| r).collect();
+    assert!(reasons.contains(&nrese_owl::Unsupported::Keys));
+    assert!(reasons.contains(&nrese_owl::Unsupported::DatatypeDefinitions));
 }
 
 /// `SubDataPropertyOf(p, owl:topDataProperty)` holds in every interpretation: no clause,

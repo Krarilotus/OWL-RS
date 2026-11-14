@@ -64,7 +64,7 @@ fn survey(path: &str) -> String {
     let normalised = nrese_owl::normalise(&nrese_dl::tableau::prepared(&o));
     let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, why) in &normalised.unsupported {
-        *reasons.entry(why).or_default() += 1;
+        *reasons.entry(why.as_str()).or_default() += 1;
     }
     let left = if reasons.is_empty() {
         "-".to_owned()

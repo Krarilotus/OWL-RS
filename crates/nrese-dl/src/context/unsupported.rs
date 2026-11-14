@@ -31,7 +31,7 @@ pub enum Unsupported {
     /// What the normalisation couldn't cover itself.
     Normalisation {
         axiom: usize,
-        why: &'static str,
+        why: nrese_owl::Unsupported,
     },
     /// More concepts, roles or functions than an atom holds.
     TooLarge,

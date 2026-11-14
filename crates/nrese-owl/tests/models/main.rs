@@ -1174,7 +1174,7 @@ fn a_shared_definition_that_fails_leaves_out_every_user() {
     let unsupported = normalise_with(&o, Options::default()).unsupported;
     if unsupported
         .iter()
-        .any(|&(i, why)| i != 4 || why.contains("irregular"))
+        .any(|&(i, why)| i != 4 || why == nrese_owl::Unsupported::IrregularRoleHierarchy)
     {
         wrong.push(format!("needed nothing: {unsupported:?}"));
     }
@@ -1241,7 +1241,7 @@ fn clauses_and_keys_past_u16_are_left_out() {
         let unsupported = normalise_with(&o, Options::default()).unsupported;
         if unsupported
             .iter()
-            .any(|(_, why)| why.contains("65535 variables"))
+            .any(|&(_, why)| why == nrese_owl::Unsupported::TooWide)
             != too_wide
         {
             wrong.push(format!("{what}: {unsupported:?}"));

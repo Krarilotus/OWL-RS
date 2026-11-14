@@ -188,12 +188,20 @@ fn admissible<'n>(
                 .any(|a| matches!(a, BodyAtom::Role(..) | BodyAtom::Data(..)))
         });
     for &(axiom, why) in &n.unsupported {
-        // Datatype definitions only constrain data values, of which there are none once
-        // the data clauses are dropped.
-        if why.starts_with("datatype definitions") || (why.starts_with("keys") && !keys_apply) {
-            continue;
+        let skipped = match why {
+            // Datatype definitions only constrain data values, of which there are none once
+            // the data clauses are dropped.
+            nrese_owl::Unsupported::DatatypeDefinitions => true,
+            nrese_owl::Unsupported::Keys => !keys_apply,
+            nrese_owl::Unsupported::UniversalDataProperty
+            | nrese_owl::Unsupported::UniversalObjectProperty
+            | nrese_owl::Unsupported::UncountedNegation
+            | nrese_owl::Unsupported::TooWide
+            | nrese_owl::Unsupported::IrregularRoleHierarchy => false,
+        };
+        if !skipped {
+            return Err(Unsupported::Normalisation { axiom, why });
         }
-        return Err(Unsupported::Normalisation { axiom, why });
     }
     let mut kept = Vec::with_capacity(n.clauses.len());
     for clause in &n.clauses {

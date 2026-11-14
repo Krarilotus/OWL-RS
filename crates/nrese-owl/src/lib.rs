@@ -25,6 +25,7 @@ pub mod ql;
 pub mod rules;
 pub mod scope;
 mod universal;
+mod unsupported;
 pub mod vocab;
 pub mod write;
 
@@ -38,12 +39,11 @@ pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
     ObjProp, RangeId, Term,
 };
-pub use normalise::{
-    Options, UNSUPPORTED_DATATYPE_DEFINITIONS, UNSUPPORTED_KEYS, normalise, normalise_with,
-};
+pub use normalise::{Options, normalise, normalise_with};
 pub use ofn::{Document, FunctionalReader, Intern, read_functional};
 pub use profile::Profiles;
 pub use proof::{Inference, Justifications, Proof, ProofError, ProofGraph};
 pub use rules::Rule;
+pub use unsupported::Unsupported;
 pub use vocab::Vocabulary;
 pub use write::{Make, write};
