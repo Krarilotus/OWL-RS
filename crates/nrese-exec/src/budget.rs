@@ -32,7 +32,8 @@ pub struct SharedBudget {
     limit: AtomicUsize,
     /// How a lazy budget finds its limit ([`Self::lazy`]); `None`: it was given.
     resolve: Option<Resolve>,
-    used: AtomicUsize,
+    /// Written by every charge and release: alone on its cache line ([`Line`]).
+    used: Line<AtomicUsize>,
     peak: AtomicUsize,
     /// The budget this one lies within, charged first.
     parent: Option<Arc<SharedBudget>>,
@@ -40,6 +41,21 @@ pub struct SharedBudget {
 
 /// A lazy [`SharedBudget`]'s limit before its first need.
 const UNRESOLVED: usize = usize::MAX;
+
+/// A value alone on its 128 bytes (x86's spatial prefetcher pulls cache lines in pairs):
+/// writing it doesn't take the lines of what lies beside it, such as the limit every
+/// charge reads, from other cores.
+#[derive(Debug)]
+#[repr(align(128))]
+struct Line<T>(T);
+
+impl<T> Deref for Line<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 /// A lazy [`SharedBudget`]'s limit: `explicit` bytes or the default share, of the capacity
 /// `capacity` reads ([`crate::memory::limit_within`]).
@@ -70,7 +86,7 @@ impl SharedBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(limit_bytes),
             resolve: None,
-            used: AtomicUsize::new(0),
+            used: Line(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             parent: None,
         })
@@ -88,7 +104,7 @@ impl SharedBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(UNRESOLVED),
             resolve: Some(Resolve { explicit, capacity }),
-            used: AtomicUsize::new(0),
+            used: Line(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             parent: None,
         })
@@ -100,7 +116,7 @@ impl SharedBudget {
         Arc::new(Self {
             limit: AtomicUsize::new(limit_bytes),
             resolve: None,
-            used: AtomicUsize::new(0),
+            used: Line(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             parent: Some(parent),
         })
@@ -3377,6 +3393,24 @@ mod tests {
             "one write per charge and release"
         );
         assert_eq!(kept.credit(), 0);
+    }
+
+    /// The server's used counter, written by every request's charge and return, shares its
+    /// 128 bytes (a pair of cache lines) with nothing else of the budget: not the limit every
+    /// charge reads, not the peak.
+    #[test]
+    fn the_servers_used_counter_has_its_cache_lines_to_itself() {
+        let server = SharedBudget::new(GIB);
+        let pair = |field: *const u8| field as usize / 128;
+        let used = std::ptr::addr_of!(server.used).cast::<u8>();
+        for (name, other) in [
+            ("limit", std::ptr::addr_of!(server.limit).cast::<u8>()),
+            ("resolve", std::ptr::addr_of!(server.resolve).cast::<u8>()),
+            ("peak", std::ptr::addr_of!(server.peak).cast::<u8>()),
+            ("parent", std::ptr::addr_of!(server.parent).cast::<u8>()),
+        ] {
+            assert_ne!(pair(used), pair(other), "{name} beside used");
+        }
     }
 
     /// Workers of one request that all find its credit empty take a new one at once: what
