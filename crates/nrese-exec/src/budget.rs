@@ -442,23 +442,32 @@ impl Budget {
     /// [`Self::charge`] here and above, unseen by a measurement: the caller tells it whose
     /// the bytes are.
     fn take(&self, bytes: usize) -> Result<(), BudgetExceeded> {
-        self.take_own(bytes)?;
-        let above = self.take_above(bytes);
+        self.take_as(bytes, true)
+    }
+
+    /// [`Self::take`], with a refusal recorded here and above only if `record` (not above
+    /// an optional part: [`Envelope::optional_part`]); the error is the same either way.
+    fn take_as(&self, bytes: usize, record: bool) -> Result<(), BudgetExceeded> {
+        self.take_own(bytes, record)?;
+        let above = self.take_above(bytes, record);
         if above.is_err() {
             self.used.fetch_sub(bytes, Ordering::Relaxed);
         }
         above
     }
 
-    /// `bytes` charged at this level only: refused, and recorded, where its own limit
-    /// hasn't room.
-    fn take_own(&self, bytes: usize) -> Result<(), BudgetExceeded> {
+    /// `bytes` charged at this level only: refused, and recorded if `record`, where its own
+    /// limit hasn't room.
+    fn take_own(&self, bytes: usize, record: bool) -> Result<(), BudgetExceeded> {
         #[cfg(test)]
         calls::count();
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
-                return Err(self.refuse(bytes, used));
+                if record {
+                    self.refused.store(true, Ordering::Relaxed);
+                }
+                return Err(self.exceeded(bytes, used));
             };
             match self
                 .used
@@ -474,23 +483,10 @@ impl Budget {
     }
 
     /// `bytes` charged at the levels above exactly: refused where one hasn't room, which
-    /// is recorded here too (and only here, above an optional part). Nothing to charge
-    /// above a root.
-    fn take_above(&self, bytes: usize) -> Result<(), BudgetExceeded> {
+    /// is recorded here too if `record` (above an optional part, here only). Nothing to
+    /// charge above a root.
+    fn take_above(&self, bytes: usize, record: bool) -> Result<(), BudgetExceeded> {
         let above = match &self.parent {
-            Some(Parent::Envelope(envelope)) if self.optional => {
-                if envelope.try_take(bytes) {
-                    Ok(())
-                } else {
-                    Err(BudgetExceeded {
-                        limit: envelope.limit(),
-                        requested: bytes,
-                        used: envelope.used(),
-                        shared: envelope.remaining() >= bytes,
-                        unread: false,
-                    })
-                }
-            }
             Some(Parent::Server(shared)) => {
                 shared.charge(bytes).map_err(|refused| BudgetExceeded {
                     limit: refused.limit,
@@ -500,10 +496,10 @@ impl Budget {
                     unread: refused.unread,
                 })
             }
-            Some(Parent::Envelope(envelope)) => envelope.take(bytes),
+            Some(Parent::Envelope(envelope)) => envelope.take_as(bytes, record && !self.optional),
             None => Ok(()),
         };
-        if above.is_err() {
+        if record && above.is_err() {
             self.refused.store(true, Ordering::Relaxed);
         }
         above
@@ -593,6 +589,11 @@ impl Budget {
     /// The refusal of `bytes` with `used` in use, recorded.
     fn refuse(&self, bytes: usize, used: usize) -> BudgetExceeded {
         self.refused.store(true, Ordering::Relaxed);
+        self.exceeded(bytes, used)
+    }
+
+    /// The refusal of `bytes` at this level with `used` in use.
+    fn exceeded(&self, bytes: usize, used: usize) -> BudgetExceeded {
         BudgetExceeded {
             limit: self.limit,
             requested: bytes,
@@ -2675,11 +2676,21 @@ mod tests {
             (optional.used(), request.used(), server.used()),
             (40, 40, 40)
         );
-        assert!(held.charge(30).is_err(), "past the request's limit");
+        let err = held.charge(30).unwrap_err();
+        assert_eq!(
+            (err.limit, err.used, err.shared),
+            (60, 40, false),
+            "the request's limit"
+        );
         // Another request leaves the server 10 bytes, the request 20.
         let other = Envelope::new(None, Some(Arc::clone(&server)));
         other.charge(50).unwrap();
-        assert!(held.charge(15).is_err(), "past the server's limit");
+        let err = held.charge(15).unwrap_err();
+        assert_eq!(
+            (err.limit, err.used, err.shared),
+            (100, 90, true),
+            "the server's limit"
+        );
         assert_eq!(
             (held.bytes(), optional.used(), request.used(), server.used()),
             (40, 40, 40, 90),
@@ -2687,10 +2698,25 @@ mod tests {
         );
         assert!(optional.refused() && !request.refused());
         let part = request.part();
-        assert!(part.charge(15).is_err());
+        let ordinary = part.charge(15).unwrap_err();
+        assert_eq!(
+            format!("{ordinary:?}"),
+            format!("{err:?}"),
+            "the same refusal"
+        );
         assert!(part.refused() && request.refused());
         drop(held);
         assert_eq!((request.used(), server.used()), (0, 50));
+
+        // A server whose capacity can't be read refuses as unread, above an optional part too.
+        fn unread() -> Reading {
+            Err(Unread::Failed)
+        }
+        let request = Envelope::new(None, Some(SharedBudget::lazy(None, unread)));
+        let optional = request.optional_part();
+        let err = optional.charge(1).unwrap_err();
+        assert!(err.unread && err.shared, "{err:?}");
+        assert!(optional.refused() && !request.refused());
     }
 
     #[test]
