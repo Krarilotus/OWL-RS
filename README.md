@@ -5,6 +5,9 @@ An [RDF](https://www.w3.org/TR/rdf11-primer/) store with built-in
 the open; not yet for parallel writers, failover or data split across machines
 ([limits, and when to choose another system](docs/limits.md)).
 
+To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
+planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
+
 NRESE stores RDF datasets (statements: subject,
 predicate, object) and answers [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/) queries
 and updates. Given an [ontology](docs/glossary.md#ontology), it derives the statements that
@@ -25,9 +28,6 @@ It may suit you if you:
 - need to know when an answer under OWL reasoning may be missing rows;
 - want a store you can read and take apart: small crates in clear layers.
 
-To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
-planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
-
 ## Quick start
 
 You need:
@@ -38,12 +38,27 @@ You need:
   default builder;
 - curl 7.71 or later (`curl --version`; [download](https://curl.se/download.html));
 - for the build: an amd64 CPU of level [x86-64-v3](https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels)
-  (Intel from Haswell, 2013; AMD from Excavator, 2015; on Linux,
-  `/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3` says `supported`), or an arm64 CPU
+  (Intel from Haswell, 2013; AMD from Excavator, 2015), or an arm64 CPU
   from Neoverse N1 on (AWS Graviton2, Ampere Altra); for an older one, add
   `--build-arg NRESE_TARGET_CPU=portable` to `docker build`; and about 3 GB of free
   memory and 3 GB of free disk, besides the base images Docker downloads;
 - port 8080 free on this machine.
+
+The commands on this page are for a POSIX shell: Linux, macOS, or Git Bash or WSL on Windows.
+In PowerShell, write a backtick for a `\` that ends a line, and in Windows PowerShell 5.1
+`curl.exe` for `curl` (there `curl` is `Invoke-WebRequest`). To check what you need first:
+
+```bash
+git --version
+docker version --format '{{.Server.Version}}'  # 23 or later; fails if the engine isn't running
+docker buildx version                          # BuildKit, which the build needs
+curl --version                                 # 7.71 or later
+docker info --format '{{.MemTotal}}'           # memory Docker can use, in bytes: at least 3 GB
+/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3  # optional: amd64 Linux, glibc 2.33 or later
+```
+
+The last line, on amd64 Linux with glibc 2.33 or later, says `supported` on an x86-64-v3 CPU. Where that
+loader is absent or older (musl, an older glibc, another system), skip it: it proves nothing about the CPU.
 
 Rust and Node.js aren't needed: the image builds the server and its console. The commands
 below fetch the code, build the [image](docs/glossary.md#image-container-volume) `nrese`
@@ -94,6 +109,11 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
   SELECT ?x WHERE { ?x a ex:Animal }'
 ```
 
+The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
+`NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
+complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
+([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
+
 The answer: the [HTTP](docs/glossary.md#http-request-response-status) status and headers,
 then the rows as [JSON](docs/glossary.md#json):
 
@@ -108,10 +128,9 @@ nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the
 Other headers are left out here, and `…` marks shortened text: compare the status, the
 `regime` and the rows, as [the record of its last run](docs/dev/first-example-record.md) does.
 
-The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
-`NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
-complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
-([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
+`/dataset/query` takes queries only and never refuses a body for its media type; `/dataset/sparql`
+takes queries and updates on one URL and refuses a missing or unknown media type with `415`
+([endpoints](docs/ops/http-api.md#endpoint-contracts)).
 
 The [tutorial](docs/tutorial.md) goes on from here: retraction, validation,
 [your own data](docs/tutorial.md#your-own-data), a changed setting, and starting over.
