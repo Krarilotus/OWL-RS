@@ -58,7 +58,7 @@ it, with its limits beside it; nothing in them is a plan.
 | [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) Query, Update and federated `SERVICE` | The W3C suites run in the checks and in CI, with no known failure listed (505 of 505 on 2 October 2026: [capability matrix](spec/06-target-capability-matrix.md); [evaluation](../crates/nrese-sparql/tests/w3c_sparql11), [syntax](../crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)). Deviations (`LOAD`, `SERVICE`, `HAVING` aliases, merged blank nodes), each with what to do: [limits](limits.md#sparql) |
 | SPARQL 1.2 and RDF 1.2 drafts: triple terms, directional strings | Results announce `version 1.2` when they may use them ([HTTP interface](ops/http-api.md#sparql)) |
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), service description | [HTTP interface](ops/http-api.md) |
-| Results in JSON, XML, CSV and TSV; graphs in every RDF syntax below | Chosen by `Accept` ([formats](ops/http-api.md#sparql)) |
+| Results in JSON, XML, CSV and TSV; graphs in seven RDF syntaxes ([which](ops/http-api.md#requests-in-detail)) | Chosen by `Accept` ([formats](ops/http-api.md#sparql)) |
 | `EXPLAIN`: the plan with estimated rows, or the run with actual rows and times | A reader of only some graphs gets no plan steps (they would reveal statistics of the others) |
 | Full-text search (BM25) through the `bds:` and Jena `text:query` vocabularies, with phrases, prefixes, fuzzy words and stemming in 18 languages | One index over every string literal, built at the first search; an on-disk store keeps it across restarts ([full-text](ops/http-api.md#sparql)) |
 | Vector search: vectors as literals (`"[…]"^^nrv:vector`), `SERVICE nrv:search` with cosine, dot product or Euclidean distance, exact or through HNSW, filtered by the rest of the query | You bring the vectors; the store computes no embeddings. Approximate search trades recall for speed through `nrv:searchBudget` ([vector search](ops/http-api.md#sparql)) |
@@ -122,7 +122,7 @@ downloads (Graph Store, RDF4J `/statements`) carry none.
 | `complete; regime=…` | Every answer the regime entails is there. Under `owl2-dl`, `owl2-ql` and `owl2-rl` that is every certain answer under the OWL 2 Direct Semantics; under `owl2-ql` and `owl2-rl` it is given only where the QL rewriting ran on the query. Without reasoning, or with `infer=false`, the header says `complete` with no regime |
 | `sound-only; regime=…; reasons="…"` | Every row is entailed, but rows may be missing; the reasons say why. Without the QL rewriting, every answer over a ruleset's closure is `sound-only`, because the rules are complete only for ontologies inside their profile. Where the rewriting runs, each query is checked against the schema, and `complete` is withheld when an axiom outside the profile, or an individual the axioms imply, could add an answer the query reads |
 | `unsound` | Rows may be wrong as well as missing: inside a transaction whose pending changes delete statements (their inferences stay until the commit), or where answers that may be missing sit under `MINUS`, `NOT EXISTS` or another operator that can turn a missing row into a wrong one |
-| `not-certified` | No status can be given, so rows may be missing or wrong. This is the case for a reader of only some graphs, with inferred statements visible, where the QL rewriting runs |
+| `not-certified` | No status can be given, so rows may be missing or wrong. This is the case for a reader of only some graphs with `inferred = "visible"`, where the QL rewriting runs ([HTTP interface](ops/http-api.md#requests-in-detail)) |
 
 Under `owl2-dl` you can ask for exact answers only (`dl-answers=exact`): an answer that
 can't be proven complete is then a 422 error naming the undecided candidates. With user
@@ -191,11 +191,11 @@ is checked
 |---|---|
 | `/dataset/…` | SPARQL Protocol and Graph Store Protocol for the default repository |
 | `/repositories/…` | The [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/), version 12 (`GET /protocol`), for RDF4J's `HTTPRepository` and the tools built on it ([HTTP interface](ops/http-api.md#rdf4j-protocol)) |
-| `/api/v1/…` | One API for every capability, described as OpenAPI 3.1 at `/api/v1/openapi.json` ([HTTP interface](ops/http-api.md#engine-api-apiv1)) |
+| `/api/v1/…` | One API for what the server does (the library-only parts, such as Notation3 data and resolving quarantined statements, have none yet), described as OpenAPI 3.1 at `/api/v1/openapi.json` ([HTTP interface](ops/http-api.md#engine-api-apiv1)) |
 | `/console`, `/ops` | A browser console for queries, updates and graphs, and one for operators ([apps/nrese-console](../apps/nrese-console)) |
 | `nrese-server` | The server, and the commands `load`, `query`, `convert`, `backup`, `restore`, `prune-archive`, `check-config`, `config-schema` and `print-query` ([server setup](ops/server-setup.md)) |
 | Console CLI | A small TypeScript command-line client of the same API ([getting started](dev/getting-started.md#frontend-cli)) |
-| Errors | Every HTTP error is a problem document (RFC 9457) with the request id the server's log also carries, but for clients that show it as text: a SPARQL parse error under the `plain-text` profile and a refused RDF4J isolation level ([status codes](ops/http-api.md#status-codes), [a worked example](ops/http-api.md#example-a-sparql-syntax-error)); a server that doesn't start says why on standard error ([startup errors](ops/server-setup.md#startup-errors)) |
+| Errors | Every HTTP error is a problem document (RFC 9457) with the request id the server's log also carries, with three exceptions ([status codes](ops/http-api.md#status-codes), [a worked example](ops/http-api.md#example-a-sparql-syntax-error)); a server that doesn't start says why on standard error ([startup errors](ops/server-setup.md#startup-errors)) |
 
 Configuration comes from a TOML file, environment variables or `--set`, with a JSON
 Schema (`nrese-server config-schema`). The [Dockerfile](../Dockerfile) builds images for

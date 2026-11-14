@@ -9,7 +9,7 @@ decisions that still bind. Superseded ones are left out; git history has them.
 | Decision | Since |
 |---|---|
 | **Reasoning leads.** The headline benchmarks are about ontology reasoning; load, storage, query and write speed are the basics that must still match or beat the best system on each measure (QLever for queries, the fastest loader for loads), never traded for reasoning. | 26 Sep (D9, D10) |
-| **Behaviour is configurable, defaults are tuned.** Ruleset, timing, consistency, placement, `sameAs`, maintenance per repository; read model, explanations, freshness per request. Only the stack invariants are fixed. | 26 Sep (D7) |
+| **Behaviour is configurable, defaults are tuned.** Ruleset, timing, consistency, placement, `sameAs`, maintenance per repository; read model, explanations, freshness per request. Only the stack invariants are fixed. (14 Nov 2026: built so far are the ruleset, `sameAs` handling, read model and explanations; timing, consistency, placement and maintenance are not settings yet: [ADR-0003](0003-materialised-reasoning.md).) | 26 Sep (D7) |
 | **Performance is judged on a multi-metric scorecard,** with tuned defaults and configurable presets. Results of licensed systems (GraphDB, RDFox, Stardog, AnzoGraph, AllegroGraph) are never published without the vendor's written permission. | 26 Sep (D8) |
 | **A win counts on the competitor's home turf.** Each competitor is measured on what it does best as well as on our workloads; NRESE runs every case in every profile, competitors only what they support ([benches/PROTOCOL.md](../../benches/PROTOCOL.md) §3). | 5 Oct |
 
