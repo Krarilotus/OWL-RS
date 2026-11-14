@@ -756,57 +756,72 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
     }
 
     /// Reach per component, successors first, each set's growth charged before it grows,
-    /// a tick per successor walked and per entry taken over.
+    /// a tick per successor walked and per run of entries taken over ([`in_runs`]). A set is
+    /// made apart from `reach`, which it reads, and appended whole: with a tick and a charge
+    /// check an entry, `reach` read while it grew, the reach sets of one OWL 2 RL
+    /// rematerialisation of a 1,000-class spine took 4.1 G instructions, where the uncharged
+    /// kernel took 1.7 G in all.
     fn reach(&mut self, pool: &'p Pool<B>, ticker: &Ticker<StopFn<'_>>) -> Result<(), Stop> {
         let components = self.components();
         let mut stamp: Buf<'p, u32, B> = Charged::in_pool(pool);
         stamp.resize(components, u32::MAX)?;
+        let mut set: Buf<'p, u32, B> = Charged::in_pool(pool);
         self.cyclic.reserve_exact(components)?;
         self.reach_starts.reserve_exact(components + 1)?;
         self.rows.reserve_exact(components)?;
         self.reach_starts.push(0)?;
         let size = |starts: &[usize], d: u32| (starts[d as usize + 1] - starts[d as usize]) as u32;
+        // Every tick follows its own work and comes before any work nested in it, as the
+        // entries' runs count theirs: a tick before its work, or after a nested run, let a
+        // run of a whole allowance follow unticked work, 4,097 units between two polls
+        // (sol-loop r1 S1, r2). A component's own setup is its first member's unit.
         for c in 0..components {
-            ticker.tick(1)?;
             let mut cyclic = self.members_of(c).len() > 1;
             let mut row = 0u32;
             for k in self.starts[c]..self.starts[c + 1] {
-                ticker.tick(1)?;
                 let x = self.members[k] as usize;
+                ticker.tick(1)?;
                 for j in self.offsets[x] as usize..self.offsets[x + 1] as usize {
-                    ticker.tick(1)?;
                     let d = self.component[self.targets[j] as usize];
                     if d as usize == c {
                         cyclic = true;
-                        continue;
-                    }
-                    if stamp[d as usize] != c as u32 {
+                        ticker.tick(1)?;
+                    } else if stamp[d as usize] != c as u32 {
                         stamp[d as usize] = c as u32;
-                        self.reach.push(d)?;
-                        row += size(&self.starts, d);
-                        let (from, to) = (
-                            self.reach_starts[d as usize],
-                            self.reach_starts[d as usize + 1],
-                        );
-                        for i in from..to {
+                        let (starts, stamp) = (&self.starts, &mut stamp);
+                        let taken = &self.reach
+                            [self.reach_starts[d as usize]..self.reach_starts[d as usize + 1]];
+                        // `d` and what it reaches: the room for all of them charged before
+                        // the first is written.
+                        set.fill(taken.len() + 1, |room| {
+                            room.push(d);
+                            row += size(starts, d);
                             ticker.tick(1)?;
-                            let e = self.reach[i];
-                            if stamp[e as usize] != c as u32 {
-                                stamp[e as usize] = c as u32;
-                                self.reach.push(e)?;
-                                row += size(&self.starts, e);
-                            }
-                        }
+                            in_runs(ticker, taken.len(), |run| {
+                                for &e in &taken[run] {
+                                    if stamp[e as usize] != c as u32 {
+                                        stamp[e as usize] = c as u32;
+                                        room.push(e);
+                                        row += size(starts, e);
+                                    }
+                                }
+                            })
+                        })??;
+                    } else {
+                        ticker.tick(1)?;
                     }
                 }
             }
             if cyclic {
-                self.reach.push(c as u32)?;
+                set.push(c as u32)?;
                 row += size(&self.starts, c as u32);
             }
+            self.reach.extend_from_slice(&set)?;
+            set.clear();
             self.cyclic.push(cyclic)?;
             self.rows.push(row)?;
             self.reach_starts.push(self.reach.len())?;
+            ticker.tick(1)?;
         }
         Ok(())
     }
