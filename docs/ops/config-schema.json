@@ -623,6 +623,15 @@
             "unlimited"
           ]
         },
+        "outside_profile": {
+          "description": "Under owl2-dl, what a classification answers on an input outside OWL 2 DL: where a procedure proven sound for the input applies, its answer, marked as outside the profile (proven, the default); or the DL engines' answer on the part they read, marked incomplete (dl-part). A repository's outside_profile overrides it.",
+          "enum": [
+            "proven",
+            "dl-part"
+          ],
+          "type": "string",
+          "x-env": "NRESE_DL_OUTSIDE_PROFILE"
+        },
         "threads": {
           "description": "Under owl2-dl, the workers of a classification (default 0: every core).",
           "minimum": 0,

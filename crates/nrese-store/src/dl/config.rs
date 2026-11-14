@@ -59,18 +59,33 @@ impl DlConsistency {
     }
 }
 
-/// What a classification answers on an input outside OWL 2 DL (the setting
-/// `dl.outside_profile`, not yet read: every store has the default).
+/// What a classification answers on an input outside OWL 2 DL (`dl.outside_profile`, or a
+/// repository's `outside_profile`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutsideProfile {
     /// The DL engines' answer on the part they read: sound, marked incomplete, the axioms
     /// left out named. No procedure outside the profile runs.
-    #[default]
     DlPart,
     /// Where a procedure proven sound for the input applies, its answer: today the EL
     /// classifier, where an irregular role hierarchy is all the DL engines leave out
     /// (`crate::dl::classification::el_answer`). Elsewhere as [`Self::DlPart`].
+    #[default]
     Proven,
+}
+
+impl OutsideProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DlPart => "dl-part",
+            Self::Proven => "proven",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::DlPart, Self::Proven]
+            .into_iter()
+            .find(|o| o.as_str() == name)
+    }
 }
 
 /// The `owl2-dl` mode's settings. They apply when the reasoner's mode is `owl2-dl`.

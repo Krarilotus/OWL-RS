@@ -9,6 +9,8 @@ use std::collections::{BTreeSet, HashMap};
 use nrese_dl::classify;
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Make, Term, Vocabulary};
+use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_store::catalog::{Catalog, RepositorySettings};
 use nrese_store::{ReadScope, Refusal, StoreError};
 
 use super::{insert, pipeline};
@@ -340,12 +342,33 @@ fn assert_lower_bound(report: &nrese_store::ClassificationReport) {
     );
 }
 
-/// By default no procedure outside OWL 2 DL runs: the irregular ontology the EL classifier
-/// would answer gets the DL engines' marked lower bound, as before the EL route. (No red
-/// run first: this default keeps today's behaviour, so no tree fails it.)
+/// By default (`dl.outside_profile = proven`) the store answers outside OWL 2 DL by a proven
+/// procedure: the irregular ontology gets the EL classifier's answer.
 #[test]
-fn by_default_an_irregular_el_ontology_gets_the_dl_engines_lower_bound() {
+fn by_default_an_irregular_el_ontology_is_answered_by_the_el_classifier() {
     let dl = pipeline_without_gate();
+    insert(&dl, IRREGULAR).expect("ontology");
+    let report = dl
+        .store()
+        .classify(&ReadScope::All)
+        .expect("classification");
+    assert_eq!(report.engine, "el");
+    assert!(
+        has(&report.subsumptions, "A", "D"),
+        "{:?}",
+        report.subsumptions
+    );
+}
+
+/// Under `dl.outside_profile = dl-part` no procedure outside OWL 2 DL runs: the irregular
+/// ontology gets the DL engines' lower bound, marked incomplete, the axioms left out named.
+#[test]
+fn under_dl_part_an_irregular_el_ontology_gets_the_dl_engines_lower_bound() {
+    let dl = super::pipeline_with(nrese_store::DlConfig {
+        consistency: nrese_store::DlConsistency::Off,
+        outside_profile: nrese_store::OutsideProfile::DlPart,
+        ..nrese_store::DlConfig::default()
+    });
     insert(&dl, IRREGULAR).expect("ontology");
     let report = dl
         .store()
@@ -357,6 +380,80 @@ fn by_default_an_irregular_el_ontology_gets_the_dl_engines_lower_bound() {
         report.subsumptions
     );
     assert_lower_bound(&report);
+}
+
+/// A catalogue whose stores' commit gate is off (as [`pipeline_without_gate`]), with the
+/// server's default `dl.outside_profile`.
+fn catalog(dir: &std::path::Path) -> Catalog {
+    let config = nrese_store::StoreConfig {
+        dl: nrese_store::DlConfig {
+            consistency: nrese_store::DlConsistency::Off,
+            ..nrese_store::DlConfig::default()
+        },
+        ..nrese_store::StoreConfig::on_disk(dir)
+    };
+    let store = nrese_store::StoreService::new(config).expect("store");
+    Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue")
+}
+
+/// Creates repository `id` under `owl2-dl` with `outside_profile` (`None`: the server's),
+/// holding [`IRREGULAR`].
+fn irregular_repository(catalog: &Catalog, id: &str, outside_profile: Option<&str>) {
+    let settings = RepositorySettings {
+        reasoning: Some("owl2-dl".to_owned()),
+        outside_profile: outside_profile.map(str::to_owned),
+        ..RepositorySettings::default()
+    };
+    catalog.create(id, settings).expect("created");
+    insert(
+        &catalog.get(id).expect("created").pipeline.read(),
+        IRREGULAR,
+    )
+    .expect("ontology");
+}
+
+fn classify_in(catalog: &Catalog, id: &str) -> nrese_store::ClassificationReport {
+    let store = std::sync::Arc::clone(catalog.get(id).expect("repository").pipeline.read().store());
+    store.classify(&ReadScope::All).expect("classification")
+}
+
+/// A repository's `outside_profile` overrides the server's: `dl-part` under the server's
+/// `proven` gets the DL engines' marked lower bound; a repository that names none gets the
+/// EL classifier's answer.
+#[test]
+fn a_repository_answers_outside_owl2_dl_as_its_setting_says() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = catalog(dir.path());
+    irregular_repository(&catalog, "own", Some("dl-part"));
+    irregular_repository(&catalog, "server", None);
+    assert_lower_bound(&classify_in(&catalog, "own"));
+    assert_eq!(classify_in(&catalog, "server").engine, "el");
+}
+
+/// A change of a repository's `outside_profile` applies to the next classification and
+/// never serves the other value's answer: the EL classifier's answer, kept for the
+/// revision, is not the answer under `dl-part`; back under `proven`, it is again.
+#[test]
+fn a_change_of_the_outside_profile_never_serves_the_other_values_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = catalog(dir.path());
+    irregular_repository(&catalog, "r", None);
+    assert_eq!(classify_in(&catalog, "r").engine, "el");
+    let set = |profile: Option<&str>| {
+        let profile = profile.map(str::to_owned);
+        catalog
+            .patch("r", |current| {
+                Ok(RepositorySettings {
+                    outside_profile: profile,
+                    ..current.clone()
+                })
+            })
+            .expect("changed");
+    };
+    set(Some("dl-part"));
+    assert_lower_bound(&classify_in(&catalog, "r"));
+    set(None);
+    assert_eq!(classify_in(&catalog, "r").engine, "el");
 }
 
 /// A range on a property above a chain's (`r3 ⊑ r4`) needs applying on the edges the
