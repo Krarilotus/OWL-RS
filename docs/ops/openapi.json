@@ -1,0 +1,6816 @@
+{
+  "components": {
+    "schemas": {
+      "CacheView": {
+        "description": "The result cache's counts and pins.",
+        "properties": {
+          "answers": {
+            "description": "Entries holding a whole answer's serialised bytes, in one format.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "capacity": {
+            "description": "The budget in bytes (`budgets.result_cache`); 0: the cache is off.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entries": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "evicted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "hits": {
+            "description": "Query parts answered from the cache.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "misses": {
+            "description": "Query parts computed that could have been cached.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pinned_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pins": {
+            "items": {
+              "$ref": "#/components/schemas/PinView"
+            },
+            "type": "array"
+          },
+          "rejected": {
+            "description": "Parts not kept: cheaper to recompute than to keep, too large, or worth less than\nwhat they would have evicted.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shared": {
+            "description": "Query parts taken from another query computing them at the same time.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stored": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity",
+          "bytes",
+          "pinned_bytes",
+          "entries",
+          "answers",
+          "hits",
+          "misses",
+          "shared",
+          "stored",
+          "rejected",
+          "evicted",
+          "pins"
+        ],
+        "type": "object"
+      },
+      "ChangeRecord": {
+        "description": "One change of the state, as its history keeps it.",
+        "properties": {
+          "added": {
+            "description": "The statements it added and removed (N-Triples, in the state graph).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "author": {
+            "type": "string"
+          },
+          "number": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "time": {
+            "description": "UTC, as `xsd:dateTime`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "author",
+          "time",
+          "reason",
+          "summary",
+          "added",
+          "removed"
+        ],
+        "type": "object"
+      },
+      "DefaultGraphRight": {
+        "description": "A role's right on the store's default graph.",
+        "enum": [
+          "none",
+          "read",
+          "write",
+          "deny"
+        ],
+        "type": "string"
+      },
+      "DlAxiom": {
+        "properties": {
+          "axiom": {
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/DlSource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "axiom",
+          "sources"
+        ],
+        "type": "object"
+      },
+      "DlJustified": {
+        "description": "A justification under OWL 2 DL.",
+        "properties": {
+          "axioms": {
+            "description": "The axioms, each in the functional-style syntax with the triples it was read from.",
+            "items": {
+              "$ref": "#/components/schemas/DlAxiom"
+            },
+            "type": "array"
+          },
+          "minimal": {
+            "description": "No axiom can be left out (false: a budget ran out first; the set still entails it).",
+            "type": "boolean"
+          },
+          "tests": {
+            "description": "Entailment tests run by the DL engines.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verified": {
+            "description": "A fresh entailment test confirmed the set.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "axioms",
+          "minimal",
+          "verified",
+          "tests"
+        ],
+        "type": "object"
+      },
+      "DlSource": {
+        "properties": {
+          "graph": {
+            "description": "The graph (`null`: the default graph).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triples": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "triples"
+        ],
+        "type": "object"
+      },
+      "DraftCapabilities": {
+        "description": "What this server's draft checks offer.",
+        "properties": {
+          "build_id": {
+            "type": "string"
+          },
+          "max_seconds": {
+            "description": "The longest time limit a request may ask for, in seconds.",
+            "format": "double",
+            "type": "number"
+          },
+          "operations": {
+            "description": "`shacl`, `query`, `reasoning`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "profiles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "protocol": {
+            "description": "`dmw-store-check/1`.",
+            "type": "string"
+          },
+          "semantics": {
+            "description": "What the checks mean; a change of meaning gets a new identifier.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "protocol",
+          "operations",
+          "profiles",
+          "semantics",
+          "build_id",
+          "max_seconds"
+        ],
+        "type": "object"
+      },
+      "DraftCheckReply": {
+        "allOf": [
+          {
+            "type": "object"
+          },
+          {
+            "properties": {
+              "build_id": {
+                "type": "string"
+              },
+              "effective_limits": {
+                "type": "object"
+              },
+              "input_hashes": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "operation": {
+                "type": "string"
+              },
+              "profile": {
+                "type": "string"
+              },
+              "request_sha256": {
+                "type": "string"
+              },
+              "scope": {},
+              "semantics_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation",
+              "request_sha256",
+              "scope",
+              "build_id",
+              "semantics_id",
+              "profile",
+              "input_hashes",
+              "effective_limits"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "The check's terminal answer with the request's identity."
+      },
+      "DraftCheckRequest": {
+        "additionalProperties": false,
+        "description": "One check: its identity, its limits and its pinned inputs (N-Triples; the query as\nSPARQL text).",
+        "properties": {
+          "build_id": {
+            "type": "string"
+          },
+          "input_hashes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "SHA-256 of the inputs: `@active_data`, `@active_schema`, `@active_shapes` and\n`@query` are verified; others are echoed.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "inputs": {
+            "type": "object"
+          },
+          "limits": {
+            "type": "object"
+          },
+          "operation": {
+            "description": "`shacl`, `query` or `reasoning`.",
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string"
+          },
+          "request_sha256": {
+            "type": "string"
+          },
+          "scope": {
+            "description": "The caller's scope, echoed unchanged."
+          },
+          "semantics_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol",
+          "operation",
+          "request_sha256",
+          "scope",
+          "build_id",
+          "semantics_id",
+          "profile",
+          "input_hashes",
+          "limits",
+          "inputs"
+        ],
+        "type": "object"
+      },
+      "Explanation": {
+        "description": "Why a statement holds.",
+        "properties": {
+          "owl2_dl": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DlJustified",
+                "description": "Under `owl2-dl`, for a statement the rules don't derive but OWL 2 DL entails: a\nminimal set of the ontology's axioms it follows from (`steps` is then empty)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "steps": {
+            "description": "The statement first; each premise after the steps that use it.",
+            "items": {
+              "$ref": "#/components/schemas/ExplanationStep"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "steps"
+        ],
+        "type": "object"
+      },
+      "ExplanationStep": {
+        "properties": {
+          "object": {
+            "type": "string"
+          },
+          "origin": {
+            "description": "`asserted`, `inferred`, or `hidden` (asserted in no graph the requester may read).",
+            "type": "string"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "premises": {
+            "description": "The steps (indexes) it is derived from.",
+            "items": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "rule": {
+            "description": "The rule that derives it, for an inferred step.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "description": "The statement's terms; left out for a `hidden` step.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "origin",
+          "premises"
+        ],
+        "type": "object"
+      },
+      "Fallback": {
+        "description": "What a role grants a user no rule names, when enforcement is on.",
+        "enum": [
+          "deny",
+          "allow"
+        ],
+        "type": "string"
+      },
+      "GraphSize": {
+        "properties": {
+          "graph": {
+            "description": "The graph's IRI (a blank node in N-Triples form); absent for the default graph.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "statements": {
+            "description": "Its asserted statements.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "statements"
+        ],
+        "type": "object"
+      },
+      "ImportReport": {
+        "properties": {
+          "deleted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "elapsed_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "examples": {
+            "description": "The first quarantined statements in the files' order: where, and why.",
+            "items": {
+              "$ref": "#/components/schemas/QuarantineExample"
+            },
+            "type": "array"
+          },
+          "inserted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "load": {
+            "description": "The load's id in the quarantine, if it quarantined any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parsed": {
+            "description": "Statements parsed, duplicates included.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "quarantined": {
+            "description": "Statements quarantined for syntax errors (the repository's quarantine).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reasoning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReasoningRun",
+                "description": "The inferences recomputed after the load, where the repository reasons."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "The same count, by its older name.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "parsed",
+          "inserted",
+          "deleted",
+          "quarantined",
+          "skipped",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "Inferred": {
+        "description": "Whether users who may not read every graph see the inferred statements.",
+        "enum": [
+          "hidden",
+          "visible",
+          "supported"
+        ],
+        "type": "string"
+      },
+      "JobStarted": {
+        "properties": {
+          "job": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Where its state is.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job",
+          "path"
+        ],
+        "type": "object"
+      },
+      "JobState": {
+        "description": "Where a job is.",
+        "enum": [
+          "running",
+          "done",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "JobView": {
+        "description": "A job as listed.",
+        "properties": {
+          "description": {
+            "description": "What it works on (the files of an import).",
+            "type": "string"
+          },
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "description": "Why it failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "files_done": {
+            "description": "Files done and in all, statements parsed so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "description": "What it does (`import`).",
+            "type": "string"
+          },
+          "parsed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "phase": {
+            "description": "Its phase while running (`loading`, `reasoning`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "report": {
+            "description": "Its report when done.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "repository": {
+            "type": "string"
+          },
+          "started": {
+            "description": "When it started, in seconds since the Unix epoch, and how long it ran.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "repository",
+          "description",
+          "state",
+          "files_done",
+          "files",
+          "parsed",
+          "started",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "Level": {
+        "description": "A member's level in a workspace.",
+        "enum": [
+          "viewer",
+          "editor",
+          "owner"
+        ],
+        "type": "string"
+      },
+      "LoginBody": {
+        "additionalProperties": false,
+        "properties": {
+          "password": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user",
+          "password"
+        ],
+        "type": "object"
+      },
+      "Me": {
+        "properties": {
+          "admin": {
+            "type": "boolean"
+          },
+          "enforced": {
+            "description": "Whether access is restricted at all.",
+            "type": "boolean"
+          },
+          "personal_space": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceView",
+                "description": "Its personal space, where it has a user name."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reads_everything": {
+            "description": "Whether the requester reads every graph (in the repository asked about).",
+            "type": "boolean"
+          },
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspaces": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "roles",
+          "admin",
+          "enforced",
+          "reads_everything",
+          "workspaces"
+        ],
+        "type": "object"
+      },
+      "MemberBody": {
+        "additionalProperties": false,
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/Level"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "type": "object"
+      },
+      "Overview": {
+        "properties": {
+          "roles": {
+            "items": {
+              "$ref": "#/components/schemas/RoleRule"
+            },
+            "type": "array"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/Settings"
+          },
+          "users": {
+            "items": {
+              "$ref": "#/components/schemas/UserView"
+            },
+            "type": "array"
+          },
+          "workspaces": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "settings",
+          "roles",
+          "users",
+          "workspaces"
+        ],
+        "type": "object"
+      },
+      "PinView": {
+        "description": "A pinned query.",
+        "properties": {
+          "bytes": {
+            "description": "What it takes of the cache's budget.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "query": {
+            "description": "The query, as given.",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The revision its result is held for; absent if it isn't held now (the store\nchanged: the result is pinned again the next time the query runs).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "query",
+          "rows",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "Problem": {
+        "description": "An error, as every endpoint reports one (RFC 9457 problem details,\n`application/problem+json`).",
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "reasoner_reject": {
+            "description": "For a rejected commit (type `reasoner-reject`, `shacl-reject` or `commit-reject`):\nthe violated rule or constraint and the statements it shows, where there are any. The\nname is kept for every kind, so that clients that read it go on working."
+          },
+          "request_id": {
+            "description": "The request's id, as in the `x-request-id` header and the server's log.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "description": "The problem's kind, a URI (`https://nrese.dev/problems/…`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "QuarantineExample": {
+        "description": "A quarantined statement as a load reports it.",
+        "properties": {
+          "column": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "file": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "line": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "file",
+          "line",
+          "column",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "QueryDraft": {
+        "additionalProperties": false,
+        "description": "What a client sends to save a query.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "QueryForm": {
+        "description": "A query sent as a form (`application/x-www-form-urlencoded`): every parameter in the\nbody, none in the URL.",
+        "properties": {
+          "default-graph-uri": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "dl-answers": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "explain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "infer": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "named-graph-uri": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "The query, once.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "ReasoningRun": {
+        "properties": {
+          "asserted": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "elapsed_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inferred": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ruleset": {
+            "type": "string"
+          },
+          "violations": {
+            "description": "The consistency violations found: 0 exactly when the data is consistent.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "violations_at_least": {
+            "description": "Their list stopped at its memory budget: `violations` is a lower bound.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ruleset",
+          "revision",
+          "asserted",
+          "inferred",
+          "violations",
+          "violations_at_least",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "ReplicationStatus": {
+        "description": "`GET /api/v1/replication/status`.",
+        "properties": {
+          "lag_revisions": {
+            "description": "Revisions this replica is behind the primary, as last seen.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_contact_unix": {
+            "description": "When the primary last answered, seconds since 1970.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "What went wrong at the last attempt, if it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`off`, `primary` or `replica`.",
+            "type": "string"
+          },
+          "primary": {
+            "description": "The primary followed (a replica's).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_revision": {
+            "description": "The primary's latest revision when last asked (a replica's).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "records_applied": {
+            "description": "Records applied since this server started.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "revision": {
+            "description": "This server's latest revision.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mode",
+          "revision",
+          "records_applied"
+        ],
+        "type": "object"
+      },
+      "RepositoryEntry": {
+        "properties": {
+          "default": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "path": {
+            "description": "The path of its engine API.",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "unavailable": {
+            "description": "Set when it didn't open at start (its stored settings or files can't be read): it\nanswers 503 until repaired or removed. Operators see why, with the file and the\nrepair; others only that it is unavailable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "path",
+          "default"
+        ],
+        "type": "object"
+      },
+      "RepositoryRules": {
+        "additionalProperties": false,
+        "description": "A repository's user rules: their text, kept with the settings so that a restart needs\nno file.",
+        "properties": {
+          "format": {
+            "description": "`n3` or `pie`.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Shown in errors and diagnostics: the file name, or `configuration`.",
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "format",
+          "text"
+        ],
+        "type": "object"
+      },
+      "RepositorySettings": {
+        "additionalProperties": false,
+        "description": "What a repository is created with besides the server's settings. Unknown fields are\nrefused: a misspelt setting would otherwise be silently ignored.",
+        "properties": {
+          "ql_rewriting": {
+            "description": "When queries get OWL 2 QL answers through existentials (`auto`, `on`, `off`;\ndocs/design/ql-rewriting.md §4); the server's `reasoner.ql_rewriting` when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query_timeout_ms": {
+            "description": "How long one query on this repository may run, in milliseconds; the server's\nquery timeout when absent. Lets one server hold datasets with different budgets,\ne.g. a small one answering an application in seconds beside a large public one.\nApplies to repositories other than the default, which keeps the server's.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reader_corpus_bytes": {
+            "description": "Bytes a `reader` search scope's corpora may take\n([`crate::StoreConfig::reader_corpus_bytes`]); the server's\n`store.reader_corpus_bytes` when absent.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reasoning": {
+            "description": "The repository's reasoning, by mode name; the server's when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rules": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RepositoryRules",
+                "description": "The repository's user rules, if it has any."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search_scope": {
+            "description": "What searches rank and select among (`global`, `reader`;\n[`crate::StoreConfig::search_scope`]); the server's `store.search_scope` when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "Shown in the repository list.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RepositoryView": {
+        "properties": {
+          "default": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "reasoning": {
+            "description": "The reasoning mode in effect.",
+            "type": "string"
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RepositorySettings",
+                "description": "The settings it was created with (none for the default repository: the server's)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "path",
+          "default",
+          "reasoning"
+        ],
+        "type": "object"
+      },
+      "RoleBody": {
+        "additionalProperties": false,
+        "properties": {
+          "default_graph": {
+            "$ref": "#/components/schemas/DefaultGraphRight"
+          },
+          "deny": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "service": {
+            "description": "Whether the role's users may call other endpoints with `SERVICE`.",
+            "type": "boolean"
+          },
+          "write": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "RoleRule": {
+        "additionalProperties": false,
+        "description": "A role's graphs: entries are IRIs, or IRI prefixes ending in `*`.",
+        "properties": {
+          "default_graph": {
+            "$ref": "#/components/schemas/DefaultGraphRight"
+          },
+          "deny": {
+            "description": "Graphs the role's users may neither read nor write, whatever other roles grant.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "service": {
+            "description": "Whether the role's users may call other endpoints with `SERVICE` (a privilege of its\nown: it makes the server fetch URLs). Administrators and unrestricted users may.",
+            "type": "boolean"
+          },
+          "write": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "RunningQuery": {
+        "description": "A query running now.",
+        "properties": {
+          "elapsed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "origin": {
+            "description": "Who sent it, where the caller said.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "Its text (the first 4096 bytes).",
+            "type": "string"
+          },
+          "started": {
+            "description": "When it started, in seconds since the Unix epoch.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "query",
+          "started",
+          "elapsed_ms"
+        ],
+        "type": "object"
+      },
+      "SavedQuery": {
+        "description": "A saved query.",
+        "properties": {
+          "author": {
+            "description": "Who changed it last.",
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Its name in the space: letters, digits, `.`, `_` and `-`.",
+            "type": "string"
+          },
+          "query": {
+            "description": "The SPARQL query or update.",
+            "type": "string"
+          },
+          "repository": {
+            "description": "The repository it is meant for; absent: any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "space": {
+            "description": "Its space: a personal space (`~alice`) or a workspace.",
+            "type": "string"
+          },
+          "time": {
+            "description": "When, UTC, as `xsd:dateTime`.",
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "space",
+          "name",
+          "query",
+          "author",
+          "time"
+        ],
+        "type": "object"
+      },
+      "ServerFile": {
+        "properties": {
+          "bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "Its path in the import directory, with `/`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "ServerImport": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "description": "Paths in the import directory (as listed).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "The graph for triple formats; the default graph without.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "invalid": {
+            "description": "`quarantine` or `strict`; the repository's setting without.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replace": {
+            "type": "boolean"
+          },
+          "skip_errors": {
+            "description": "The older form of `invalid = \"quarantine\"`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      },
+      "Session": {
+        "properties": {
+          "expires_in_seconds": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "token": {
+            "description": "`Authorization: Bearer {token}` on the following requests.",
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user",
+          "token",
+          "expires_in_seconds"
+        ],
+        "type": "object"
+      },
+      "SessionOpened": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "idle_seconds": {
+            "description": "How long it lives untouched.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Where its operations go.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "idle_seconds"
+        ],
+        "type": "object"
+      },
+      "Settings": {
+        "additionalProperties": false,
+        "description": "The state's settings.",
+        "properties": {
+          "enforced": {
+            "default": false,
+            "description": "Whether access is restricted at all; off, everyone reads and writes what its\ncredentials allow.",
+            "type": "boolean"
+          },
+          "fallback": {
+            "$ref": "#/components/schemas/Fallback",
+            "default": "deny"
+          },
+          "inferred": {
+            "$ref": "#/components/schemas/Inferred",
+            "default": "hidden"
+          },
+          "min_password_length": {
+            "default": 10,
+            "description": "The shortest password a local login takes.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_hours": {
+            "default": 12,
+            "description": "How long a local login's session lasts, in hours.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "users_create_workspaces": {
+            "default": true,
+            "description": "Whether users who aren't administrators may create workspaces (they own them).",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "SettingsBody": {
+        "additionalProperties": false,
+        "properties": {
+          "enforced": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "fallback": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Fallback"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inferred": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Inferred"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "users_create_workspaces": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SparqlForm": {
+        "description": "A query or an update sent as a form to the combined endpoint: exactly one of `query`\n(with [`QueryForm`]'s parameters) or `update` (with [`UpdateForm`]'s); both, or neither,\nis a 400.",
+        "properties": {
+          "query": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateForm": {
+        "description": "An update sent as a form: every parameter in the body, none in the URL.",
+        "properties": {
+          "update": {
+            "description": "The update, once.",
+            "type": "string"
+          },
+          "using-graph-uri": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "using-named-graph-uri": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "update"
+        ],
+        "type": "object"
+      },
+      "UserBody": {
+        "additionalProperties": false,
+        "properties": {
+          "admin": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "password": {
+            "description": "A local login's password; empty removes it. Users set their own.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ],
+            "uniqueItems": true
+          }
+        },
+        "type": "object"
+      },
+      "UserView": {
+        "properties": {
+          "admin": {
+            "type": "boolean"
+          },
+          "local_login": {
+            "description": "Whether it has a password for local logins.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "name",
+          "admin",
+          "roles",
+          "local_login"
+        ],
+        "type": "object"
+      },
+      "WorkspaceBody": {
+        "additionalProperties": false,
+        "properties": {
+          "graphs": {
+            "description": "Graphs it takes in besides its prefix (administrators only).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "repository": {
+            "description": "Empty or `*`: every repository.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "description": "Empty: no title.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WorkspaceView": {
+        "properties": {
+          "graphs": {
+            "description": "Graphs it takes in besides its prefix.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Level",
+                "description": "The requester's level, where it is a member."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "members": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Level"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "personal": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "description": "Its graphs' IRI prefix.",
+            "type": "string"
+          },
+          "repository": {
+            "description": "The repository it is in; absent: every repository.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "prefix",
+          "graphs",
+          "personal",
+          "members"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Every capability of the engine, the same for every repository (ADR-0007), and users, workspaces and graph policies (ADR-0008). Errors are problem details (`application/problem+json`). The standard protocols (SPARQL 1.1/1.2 Protocol, Graph Store Protocol, RDF4J REST) are served as well; this describes the engine API's routes.",
+    "license": {
+      "identifier": "MIT OR Apache-2.0",
+      "name": "MIT OR Apache-2.0"
+    },
+    "title": "NRESE engine API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/access": {
+      "get": {
+        "operationId": "overview",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Overview"
+                }
+              }
+            },
+            "description": "The whole state"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "The whole state (administrators): settings, roles, users, workspaces.",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/export": {
+      "get": {
+        "operationId": "export",
+        "responses": {
+          "200": {
+            "content": {
+              "application/toml": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The policy file"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "The role rules and fallbacks as a policy file (TOML; administrators).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/history": {
+      "get": {
+        "operationId": "history",
+        "parameters": [
+          {
+            "description": "How many (100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChangeRecord"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The changes, the latest first"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "The latest changes (`limit`, 100 by default), the latest first (administrators).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/import": {
+      "post": {
+        "operationId": "import",
+        "parameters": [
+          {
+            "description": "Why (required)",
+            "in": "query",
+            "name": "reason",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/toml": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A policy file",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "Replaces the role rules and fallbacks with the policy file in the body (TOML) and\nturns enforcement on (administrators); `reason` as a query parameter.",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/login": {
+      "post": {
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "A session"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Wrong user name or password"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too many failed logins"
+          }
+        },
+        "summary": "Logs a local user in: a session token for the following requests. 401 for a wrong\nuser name or password, 429 after too many; 404 with local logins off.",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/logout": {
+      "post": {
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Ended"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session"
+          }
+        },
+        "summary": "Ends the session whose token the request carries.",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/me": {
+      "get": {
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            },
+            "description": "Who the requester is"
+          }
+        },
+        "summary": "Who the requester is: its user name, roles, personal space and workspaces.",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/roles/{name}": {
+      "delete": {
+        "operationId": "role_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Why (required)",
+            "in": "query",
+            "name": "reason",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such role"
+          }
+        },
+        "summary": "Removes role `name`'s rule (administrators).",
+        "tags": [
+          "access"
+        ]
+      },
+      "put": {
+        "operationId": "role_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "Sets role `name`'s rule (administrators).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/settings": {
+      "put": {
+        "operationId": "settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "Changes the settings given (administrators).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/users/{name}": {
+      "delete": {
+        "operationId": "user_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Why (required)",
+            "in": "query",
+            "name": "reason",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such user"
+          }
+        },
+        "summary": "Removes user `name` with its memberships (administrators).",
+        "tags": [
+          "access"
+        ]
+      },
+      "put": {
+        "operationId": "user_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "Creates or changes user `name` (administrators).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/workspaces": {
+      "get": {
+        "operationId": "workspaces",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WorkspaceView"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The requester's workspaces, its personal space first"
+          }
+        },
+        "summary": "The workspaces the requester is in (administrators: every one recorded).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/workspaces/{name}": {
+      "delete": {
+        "operationId": "workspace_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Why (required)",
+            "in": "query",
+            "name": "reason",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such workspace"
+          }
+        },
+        "summary": "Removes workspace `name` (its owners; for a personal space: who sees it).",
+        "tags": [
+          "access"
+        ]
+      },
+      "get": {
+        "operationId": "workspace",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceView"
+                }
+              }
+            },
+            "description": "The workspace"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "None the requester is in"
+          }
+        },
+        "summary": "One workspace, for its members and administrators.",
+        "tags": [
+          "access"
+        ]
+      },
+      "put": {
+        "operationId": "workspace_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          }
+        },
+        "summary": "Creates workspace `name` (the requester owns it) or changes it (its owners).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/access/workspaces/{name}/members/{user}": {
+      "delete": {
+        "operationId": "member_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Why (required)",
+            "in": "query",
+            "name": "reason",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The workspace would have no owner"
+          }
+        },
+        "summary": "Removes `user` from workspace `name` (its owners).",
+        "tags": [
+          "access"
+        ]
+      },
+      "put": {
+        "operationId": "member_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeRecord"
+                }
+              }
+            },
+            "description": "Applied; its history record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid, or no reason"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester may not make this change"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The workspace would have no owner"
+          }
+        },
+        "summary": "Makes `user` a member of workspace `name` at a level (its owners).",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/v1/ai/query-suggestions": {
+      "post": {
+        "operationId": "ai_query_suggestions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "description": "What the user asks for, in words",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Suggested SPARQL queries"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Suggestions are off"
+          }
+        },
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/api/v1/ai/status": {
+      "get": {
+        "operationId": "ai_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Whether AI query suggestions are on, and their provider"
+          }
+        },
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/api/v1/capabilities": {
+      "get": {
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "What the server offers: protocols, reasoning modes, features"
+          }
+        },
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/api/v1/diagnostics": {
+      "get": {
+        "operationId": "diagnostics",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "How the server runs: memory, caches, query budget, requests"
+          }
+        },
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/api/v1/draft-check": {
+      "post": {
+        "operationId": "check",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DraftCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftCheckReply"
+                }
+              }
+            },
+            "description": "The check's terminal answer, whatever it is"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not a draft-check request"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The request is larger than the upload limit"
+          }
+        },
+        "summary": "Runs one isolated draft check over the inputs in the request.",
+        "tags": [
+          "draft-check"
+        ]
+      }
+    },
+    "/api/v1/draft-check/capabilities": {
+      "get": {
+        "operationId": "capabilities",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftCapabilities"
+                }
+              }
+            },
+            "description": "What the server's draft checks offer"
+          }
+        },
+        "summary": "The operations, profiles and semantics of draft checks, and this build.",
+        "tags": [
+          "draft-check"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Readiness and the state of every part: store, reasoning, access, jobs"
+          }
+        },
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "operationId": "jobs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/JobView"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The jobs"
+          }
+        },
+        "summary": "The jobs (imports) running and the latest finished, the latest first (operators).",
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/jobs/{job}": {
+      "delete": {
+        "operationId": "job_cancel",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cancelling"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such job running"
+          }
+        },
+        "summary": "Cancels a running job (administrators): an import stops before its next file and\ncommits nothing.",
+        "tags": [
+          "data"
+        ]
+      },
+      "get": {
+        "operationId": "job",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            },
+            "description": "The job"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such job"
+          }
+        },
+        "summary": "One job: its state, progress and, when done, its report (operators).",
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "The OpenAPI description"
+          }
+        },
+        "summary": "This description.",
+        "tags": [
+          "repositories"
+        ]
+      }
+    },
+    "/api/v1/queries": {
+      "get": {
+        "deprecated": true,
+        "operationId": "saved_queries_before",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "As `GET /api/v1/saved-queries`"
+          }
+        },
+        "tags": [
+          "queries"
+        ]
+      }
+    },
+    "/api/v1/queries/{space}/{name}": {
+      "delete": {
+        "deprecated": true,
+        "operationId": "saved_query_delete_before",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "space",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "As `DELETE /api/v1/saved-queries/{space}/{name}`"
+          }
+        },
+        "tags": [
+          "queries"
+        ]
+      },
+      "get": {
+        "deprecated": true,
+        "operationId": "saved_query_before",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "space",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "As `GET /api/v1/saved-queries/{space}/{name}`"
+          }
+        },
+        "tags": [
+          "queries"
+        ]
+      },
+      "put": {
+        "deprecated": true,
+        "operationId": "saved_query_put_before",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "space",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "As `PUT /api/v1/saved-queries/{space}/{name}`"
+          }
+        },
+        "tags": [
+          "queries"
+        ]
+      }
+    },
+    "/api/v1/replication/image": {
+      "get": {
+        "operationId": "image",
+        "responses": {
+          "200": {
+            "description": "An image of the latest revision (a checkpoint file); its manifest, as JSON, in `x-nrese-image-manifest`"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "This server isn't a primary"
+          }
+        },
+        "summary": "A replica's start: an image of the latest revision, streamed. Administrators only; a\nprimary's.",
+        "tags": [
+          "replication"
+        ]
+      }
+    },
+    "/api/v1/replication/log": {
+      "get": {
+        "operationId": "log",
+        "parameters": [
+          {
+            "description": "The last revision the replica has.",
+            "in": "path",
+            "name": "after",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "About how many bytes to send at most (at least one record); default 8 MiB.",
+            "in": "path",
+            "name": "max_bytes",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The committed records after `after`, back to back (`application/vnd.nrese.log`); headers `x-nrese-records`, `x-nrese-last-revision`, `x-nrese-latest-revision`"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "This server isn't a primary"
+          },
+          "410": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The log no longer holds the records after `after`: start from an image"
+          }
+        },
+        "summary": "A replica's feed: the committed records after revision `after`, from the write-ahead\nlog. Administrators only; a primary's.",
+        "tags": [
+          "replication"
+        ]
+      }
+    },
+    "/api/v1/replication/status": {
+      "get": {
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatus"
+                }
+              }
+            },
+            "description": "This server's part in replication and, on a replica, how far behind it is"
+          }
+        },
+        "summary": "This server's replication: its mode, its revision and, on a replica, the primary's\nrevision when last asked, the lag, and the last error.",
+        "tags": [
+          "replication"
+        ]
+      }
+    },
+    "/api/v1/repositories": {
+      "get": {
+        "operationId": "repositories",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RepositoryEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The repositories, the default one first, then the others, those unavailable included"
+          }
+        },
+        "summary": "The repositories: the default one first, then the others, with those that didn't open.",
+        "tags": [
+          "repositories"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}": {
+      "delete": {
+        "operationId": "repository_delete",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed with its data"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The default repository stays"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository"
+          }
+        },
+        "summary": "Removes repository `id` and its data; the default repository stays.",
+        "tags": [
+          "repositories"
+        ]
+      },
+      "get": {
+        "operationId": "repository_get",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryView"
+                }
+              }
+            },
+            "description": "The repository"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository"
+          }
+        },
+        "summary": "One repository: its title, reasoning and settings; 404 if there is none.",
+        "tags": [
+          "repositories"
+        ]
+      },
+      "patch": {
+        "operationId": "repository_patch",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RepositorySettings"
+              }
+            }
+          },
+          "description": "The settings to change; absent fields stay",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryView"
+                }
+              }
+            },
+            "description": "Changed"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid settings"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository"
+          }
+        },
+        "summary": "Changes repository `id`'s settings (administrators): the fields given replace the\ncurrent ones (`null` removes one); a change of `reasoning` or `rules` takes effect at\nonce, the inferences recomputed. The repository as it is then.",
+        "tags": [
+          "repositories"
+        ]
+      },
+      "put": {
+        "operationId": "repository_put",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/RepositorySettings"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "description": "Its settings; none for the server's"
+        },
+        "responses": {
+          "201": {
+            "description": "Created; `Location` is its path"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Invalid id or settings"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "It exists already"
+          }
+        },
+        "summary": "Creates repository `id`, empty, with the settings in the JSON body (`title`,\n`reasoning` by mode name, `rules`; an empty body for the server's): 201 with its path,\n409 if it exists.",
+        "tags": [
+          "repositories"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/autocomplete": {
+      "get": {
+        "operationId": "autocomplete",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "What was typed",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Resources whose IRI or label starts so"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/backup": {
+      "get": {
+        "operationId": "backup",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/n-quads": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Every statement"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/cache": {
+      "delete": {
+        "operationId": "cache_delete",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Every result that isn't pinned dropped"
+          }
+        },
+        "summary": "Drops every cached result that isn't pinned (administrators).",
+        "tags": [
+          "sparql"
+        ]
+      },
+      "get": {
+        "operationId": "cache_get",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheView"
+                }
+              }
+            },
+            "description": "The result cache's counts and pinned queries"
+          }
+        },
+        "summary": "The result cache: its budget and use, hits and misses since the start, the pinned\nqueries (operators).",
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/cache/pins/{name}": {
+      "delete": {
+        "operationId": "pin_delete",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The pin's name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unpinned; the result stays cached like any other"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Nothing is pinned under the name"
+          }
+        },
+        "summary": "Unpins `name`'s result (administrators).",
+        "tags": [
+          "sparql"
+        ]
+      },
+      "put": {
+        "operationId": "pin_put",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The pin's name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/sparql-query": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The query",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinView"
+                }
+              }
+            },
+            "description": "Run and pinned: its result is kept while the store doesn't change, and pinned again when it runs after a change"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not a query, a query that can't be cached (RAND, NOW, UUID, STRUUID, BNODE, SERVICE), a result larger than the budget leaves beside the other pins, or the cache is off"
+          }
+        },
+        "summary": "Runs the query in the body with the requester's access and pins its result under\n`name`, replacing what `name` pinned before (administrators).",
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/classification": {
+      "get": {
+        "operationId": "classification",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "The class hierarchy under OWL 2 DL, with whether it is complete"
+          }
+        },
+        "tags": [
+          "reasoning"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/data": {
+      "delete": {
+        "operationId": "data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph's IRI",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The default graph",
+            "in": "query",
+            "name": "default",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A graph (`PUT` replaces, `POST` adds), in any RDF format NRESE reads",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The graph (`GET`), or replaced"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "204": {
+            "description": "Added or removed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such graph"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      },
+      "get": {
+        "operationId": "data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph's IRI",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The default graph",
+            "in": "query",
+            "name": "default",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A graph (`PUT` replaces, `POST` adds), in any RDF format NRESE reads",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The graph (`GET`), or replaced"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "204": {
+            "description": "Added or removed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such graph"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      },
+      "head": {
+        "operationId": "data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph's IRI",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The default graph",
+            "in": "query",
+            "name": "default",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A graph (`PUT` replaces, `POST` adds), in any RDF format NRESE reads",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The graph (`GET`), or replaced"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "204": {
+            "description": "Added or removed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such graph"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      },
+      "post": {
+        "operationId": "data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph's IRI",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The default graph",
+            "in": "query",
+            "name": "default",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A graph (`PUT` replaces, `POST` adds), in any RDF format NRESE reads",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The graph (`GET`), or replaced"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "204": {
+            "description": "Added or removed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such graph"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      },
+      "put": {
+        "operationId": "data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph's IRI",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The default graph",
+            "in": "query",
+            "name": "default",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "A graph (`PUT` replaces, `POST` adds), in any RDF format NRESE reads",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The graph (`GET`), or replaced"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "204": {
+            "description": "Added or removed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such graph"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/explain": {
+      "get": {
+        "operationId": "explain",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "N-Triples term",
+            "in": "query",
+            "name": "subj",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "N-Triples term",
+            "in": "query",
+            "name": "pred",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "N-Triples term",
+            "in": "query",
+            "name": "obj",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Instead of one derivation, minimal sets of asserted statements the statement follows from: `one`, `core` (in every set), `union` (in some set), `top-k` (the `k` smallest), `all` (smallest first)",
+            "in": "query",
+            "name": "justifications",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "For `justifications=top-k`: how many (default 3)",
+            "in": "query",
+            "name": "k",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Explanation"
+                }
+              }
+            },
+            "description": "`{\"steps\": [...]}`: the statement first, each step with its premises; with `justifications`, `{\"mode\", \"justifications\" | \"statements\", \"complete\", \"verified\"}`"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "An unknown `justifications` mode"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The requester doesn't see inferred statements"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The statement doesn't hold, or reasoning is off; under `owl2-dl`, a statement the rules don't derive is explained by `owl2_dl` (a minimal set of axioms) if OWL 2 DL entails it"
+          }
+        },
+        "summary": "Why the statement `subj pred obj` (N-Triples terms, as RDF4J's parameters) holds: a\nderivation from asserted statements, the statement first. 404 if it doesn't hold or\nreasoning is off; 403 for users who don't see inferred statements.",
+        "tags": [
+          "reasoning"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/graphs": {
+      "get": {
+        "operationId": "graphs",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GraphSize"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The graphs"
+          }
+        },
+        "summary": "The graphs with statements the requester may read, each with its number of asserted\nstatements: the default graph first, then the named graphs in IRI order.",
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/image": {
+      "post": {
+        "operationId": "image",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "An image backup written to `backups/` of the data directory"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Administrators only"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/import": {
+      "post": {
+        "operationId": "import",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph for triple formats",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replace the repository's statements",
+            "in": "query",
+            "name": "replace",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Statements with syntax errors: `quarantine` (the rest loads) or `strict` (the load stops); the repository's setting without",
+            "in": "query",
+            "name": "invalid",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "An RDF document (`Content-Type` names its format)",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportReport"
+                }
+              }
+            },
+            "description": "Loaded, inferences recomputed"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unreadable data"
+          }
+        },
+        "summary": "Bulk-loads the RDF document in the body (its format from `Content-Type`): into the\ngraph `graph` for triple formats (the default graph without), replacing the\nrepository's statements with `replace=true`. Statements with syntax errors go into the\nrepository's quarantine, or stop the load with `invalid=strict` (the repository's\n`store.invalid_statements` without). Then the inferences are recomputed. For large loads: the\nloader's parallel path, not one commit's; administrators only, since a bulk load\nreplaces whole indexes and passes no commit gate.",
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/import/files": {
+      "get": {
+        "operationId": "server_files",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ServerFile"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The files"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No import directory"
+          }
+        },
+        "summary": "The files administrators may import from the server's import directory.",
+        "tags": [
+          "data"
+        ]
+      },
+      "post": {
+        "operationId": "import_server_files",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServerImport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStarted"
+                }
+              }
+            },
+            "description": "Started; `Location` is the job"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A file outside the directory, or none"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No import directory, or no such file"
+          }
+        },
+        "summary": "Imports files from the server's import directory as a job (administrators): no upload,\nno size limit; formats from the files' extensions.",
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/info": {
+      "get": {
+        "operationId": "info",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Readiness, sizes and settings; whole-dataset readers or administrators only"
+          }
+        },
+        "tags": [
+          "repositories"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/namespaces": {
+      "get": {
+        "operationId": "namespaces_get",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Prefix to IRI"
+          }
+        },
+        "summary": "The repository's namespace prefixes, as a JSON object of prefix to IRI.",
+        "tags": [
+          "namespaces"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/namespaces/{prefix}": {
+      "delete": {
+        "operationId": "namespace_delete",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "prefix",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unbound"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not bound"
+          }
+        },
+        "summary": "Removes the prefix; 404 if it isn't bound.",
+        "tags": [
+          "namespaces"
+        ]
+      },
+      "put": {
+        "operationId": "namespace_put",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "prefix",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The namespace IRI",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Bound"
+          }
+        },
+        "summary": "Binds the prefix to the IRI in the body (plain text).",
+        "tags": [
+          "namespaces"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/queries": {
+      "get": {
+        "operationId": "running_queries",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RunningQuery"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The running queries"
+          }
+        },
+        "summary": "The queries running on the repository now, the longest-running first (operators).",
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/queries/{query}": {
+      "delete": {
+        "operationId": "cancel_query",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cancelled"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not running"
+          }
+        },
+        "summary": "Cancels running query `query` (administrators): it stops at its next check and answers\nits client with an error.",
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/query": {
+      "get": {
+        "operationId": "query_get",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The query, once",
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "default-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "named-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "Whether inferred statements are read (default true)",
+            "in": "query",
+            "name": "infer",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "`true`, `false` or `plan`",
+            "in": "query",
+            "name": "explain",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`certain-where-complete`, `sound` or `exact`",
+            "in": "query",
+            "name": "dl-answers",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SPARQL results (JSON, XML, CSV, TSV, binary) or RDF, as `Accept` asks"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A syntax error; an empty or repeated query, or one in both the URL and the body; a parameter value it doesn't take"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not allowed: the requester may not do this, or read or write a graph it names"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No format the `Accept` header takes"
+          },
+          "408": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Timed out (`budgets.query_timeout`), or an operator cancelled it"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "`dl-answers=exact`, and the answers can't be proven complete"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rate limited"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again"
+          }
+        },
+        "tags": [
+          "sparql"
+        ]
+      },
+      "post": {
+        "operationId": "query_post",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "default-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "named-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "infer",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "explain",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "dl-answers",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/sparql-query": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryForm"
+              }
+            }
+          },
+          "description": "The query, as a form, or as the body (read as the query whatever its media type)",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SPARQL results (JSON, XML, CSV, TSV, binary) or RDF, as `Accept` asks"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A syntax error; an empty or repeated query, or one in both the URL and the body; a parameter value it doesn't take"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not allowed: the requester may not do this, or read or write a graph it names"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No format the `Accept` header takes"
+          },
+          "408": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Timed out (`budgets.query_timeout`), or an operator cancelled it"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "`dl-answers=exact`, and the answers can't be proven complete"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rate limited"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again"
+          }
+        },
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/realisation": {
+      "get": {
+        "operationId": "realisation",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Each named individual's types under OWL 2 DL, with whether they are complete"
+          }
+        },
+        "tags": [
+          "reasoning"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/reasoning": {
+      "get": {
+        "operationId": "reasoning",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "The ruleset, the last run, consistency, diagnostics"
+          }
+        },
+        "tags": [
+          "reasoning"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/reasoning/rematerialise": {
+      "post": {
+        "operationId": "rematerialise",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReasoningRun"
+                }
+              }
+            },
+            "description": "The run"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Reasoning is off"
+          }
+        },
+        "summary": "Recomputes the repository's inferences from its asserted statements under its\nruleset (after a change of ontology files or rules outside the store, or to leave\nquarantine after a repair). 404 without reasoning.",
+        "tags": [
+          "reasoning"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/restore": {
+      "post": {
+        "operationId": "restore",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/n-quads": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Restored"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/rules": {
+      "delete": {
+        "operationId": "rules_delete",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed; the inferences recomputed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No user rules"
+          }
+        },
+        "summary": "Removes the repository's user rules (administrators); its reasoning stays, but a\n`custom` repository (the rules alone) returns to the server's.",
+        "tags": [
+          "reasoning"
+        ]
+      },
+      "get": {
+        "operationId": "rules_get",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryRules"
+                }
+              }
+            },
+            "description": "The repository's user rules"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No user rules"
+          }
+        },
+        "summary": "The repository's user rules (Notation3 or a GraphDB ruleset), as they were stored.",
+        "tags": [
+          "reasoning"
+        ]
+      },
+      "put": {
+        "operationId": "rules_put",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`n3` or `pie`; else from `name`'s extension, else `n3`",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Shown in errors and diagnostics (default `rules`)",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The rules: a Notation3 document or a GraphDB ruleset (`.pie`)",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryView"
+                }
+              }
+            },
+            "description": "Stored; the inferences recomputed"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rules that don't compile: the first problem, with its line and column; nothing changed"
+          }
+        },
+        "summary": "Replaces the repository's user rules (administrators). They are compiled before they are\nstored, and take effect at once (the inferences recomputed). A GraphDB ruleset is the\nwhole program; Notation3 rules add to the repository's ruleset. A repository without\nreasoning of its own gets what the rules need: `custom` for a ruleset, else the\nreasoning it has now.",
+        "tags": [
+          "reasoning"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/service-description": {
+      "get": {
+        "operationId": "service_description",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/turtle": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The SPARQL service description"
+          }
+        },
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sessions": {
+      "post": {
+        "operationId": "session_begin",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionOpened"
+                }
+              }
+            },
+            "description": "Opened"
+          }
+        },
+        "summary": "Opens a client transaction ([`nrese_store::Sessions`]): writes collected over requests\nand committed as one.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sessions/{session}": {
+      "delete": {
+        "operationId": "session_rollback",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Closed without committing"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session"
+          }
+        },
+        "summary": "Closes the session without committing.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sessions/{session}/commit": {
+      "post": {
+        "operationId": "session_commit",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Committed as one transaction"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rejected (a consistency or SHACL gate), with an explanation"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session"
+          }
+        },
+        "summary": "Commits the session's operations as one transaction, through the same gates as any\nwrite.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sessions/{session}/data": {
+      "delete": {
+        "operationId": "session_data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph (an IRI); else the graphs the data names",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "RDF in any format NRESE reads (`Content-Type`)",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Collected: added (`POST`) or removed (`DELETE`) at the commit"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session, or it expired"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No room in the memory queries and sessions share; the operations collected so far are kept"
+          }
+        },
+        "summary": "RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`\nif given (an IRI), else into the graphs the data names.",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "operationId": "session_data",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The graph (an IRI); else the graphs the data names",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "RDF in any format NRESE reads (`Content-Type`)",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Collected: added (`POST`) or removed (`DELETE`) at the commit"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session, or it expired"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No room in the memory queries and sessions share; the operations collected so far are kept"
+          }
+        },
+        "summary": "RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`\nif given (an IRI), else into the graphs the data names.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sessions/{session}/query": {
+      "get": {
+        "operationId": "session_query",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The results on the data as the session would leave it"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session"
+          }
+        },
+        "summary": "A query on the data as the session's operations would leave it.",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "operationId": "session_query",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The results on the data as the session would leave it"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session"
+          }
+        },
+        "summary": "A query on the data as the session's operations would leave it.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sessions/{session}/update": {
+      "post": {
+        "operationId": "session_update",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The session's id",
+            "in": "path",
+            "name": "session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/sparql-update": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Collected for the commit"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such session, or it expired"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No room in the memory queries and sessions share; the operations collected so far are kept"
+          }
+        },
+        "summary": "A SPARQL update (as the update endpoint takes it), applied at the commit.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/shacl": {
+      "get": {
+        "operationId": "shacl",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Validate this graph only",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "`POST`: shapes to validate with instead of the stored ones",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "A validation report (JSON with `conforms`, `results`; or RDF)"
+          }
+        },
+        "tags": [
+          "shacl"
+        ]
+      },
+      "post": {
+        "operationId": "shacl",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Validate this graph only",
+            "in": "query",
+            "name": "graph",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "`POST`: shapes to validate with instead of the stored ones",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "A validation report (JSON with `conforms`, `results`; or RDF)"
+          }
+        },
+        "tags": [
+          "shacl"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/shapes": {
+      "delete": {
+        "operationId": "shapes_delete",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No shapes"
+          }
+        },
+        "summary": "Removes the repository's shapes.",
+        "tags": [
+          "shacl"
+        ]
+      },
+      "get": {
+        "operationId": "shapes_get",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The shapes graph, in the format the request accepts (Turtle by default)"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No shapes"
+          }
+        },
+        "summary": "The repository's SHACL shapes: its shapes graph (`shacl.shapes_graph`), as the Graph\nStore Protocol reads it.",
+        "tags": [
+          "shacl"
+        ]
+      },
+      "put": {
+        "operationId": "shapes_put",
+        "parameters": [
+          {
+            "description": "The repository's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Shapes in any RDF format NRESE reads (`Content-Type`)",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced"
+          },
+          "201": {
+            "description": "Stored (the graph was empty)"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Shapes that don't compile, one message per problem; nothing stored"
+          }
+        },
+        "summary": "Replaces the repository's shapes. They are checked before they are stored: shapes that\ndon't compile are refused with every problem, and the shapes graph stays as it was (as\nfor every write to it, whatever the protocol).",
+        "tags": [
+          "shacl"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/sparql": {
+      "get": {
+        "operationId": "sparql_get",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The query, once; without it, the service description",
+            "in": "query",
+            "name": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "default-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "named-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "in": "query",
+            "name": "infer",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "explain",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dl-answers",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "With `query`, as `GET …/query`; without, the service description (Turtle)"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A syntax error; an empty or repeated query, or one in both the URL and the body; a parameter value it doesn't take"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not allowed: the requester may not do this, or read or write a graph it names"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No format the `Accept` header takes"
+          },
+          "408": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Timed out (`budgets.query_timeout`), or an operator cancelled it"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "`dl-answers=exact`, and the answers can't be proven complete"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rate limited"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again"
+          }
+        },
+        "tags": [
+          "sparql"
+        ]
+      },
+      "post": {
+        "operationId": "sparql_post",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/sparql-query": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/sparql-update": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/SparqlForm"
+              }
+            }
+          },
+          "description": "A query or an update, by the body's media type or the form's field; with a SPARQL body, the other parameters in the URL, as for `…/query` and `…/update`",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A query's results, as `POST …/query`"
+          },
+          "204": {
+            "description": "An update committed, as `POST …/update`"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "As `…/query` or `…/update`; a form with both `query` and `update`, or neither"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not allowed: the requester may not do this, or read or write a graph it names"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository; for an update, updates off in this deployment"
+          },
+          "406": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No format the `Accept` header takes"
+          },
+          "408": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Timed out, or an operator cancelled the query"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Past the query's or the update's budgets"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Another `Content-Type`, none included"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "`dl-answers=exact`, and the answers can't be proven complete"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rate limited"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again"
+          }
+        },
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/summary": {
+      "get": {
+        "operationId": "summary",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Statistics: statements, graphs, classes, properties"
+          }
+        },
+        "tags": [
+          "repositories"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/tell": {
+      "post": {
+        "operationId": "tell",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Statements to add, as RDF",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Added; what the reasoner derived from them"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
+    "/api/v1/repositories/{id}/update": {
+      "post": {
+        "operationId": "update",
+        "parameters": [
+          {
+            "description": "The repository's id (`nrese` is the default one)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "using-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          {
+            "description": "With a SPARQL body; a form carries it in the body instead",
+            "in": "query",
+            "name": "using-named-graph-uri",
+            "required": false,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/sparql-update": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateForm"
+              }
+            },
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "The update, as the body (`text/plain` or no `Content-Type` read the same) or a form",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Committed and synced"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A syntax error; an empty or repeated update, or one in both the URL and the body; a commit a consistency check or the SHACL gate rejects"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not authenticated"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not allowed: the requester may not do this, or read or write a graph it names"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such repository, or updates are off in this deployment"
+          },
+          "408": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Timed out (`budgets.update_timeout`); nothing committed"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Past `budgets.update_size`"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Another `Content-Type`"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Rate limited"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not ready or unavailable, or `budgets.total_query_memory` taken; try again"
+          }
+        },
+        "tags": [
+          "sparql"
+        ]
+      }
+    },
+    "/api/v1/saved-queries": {
+      "get": {
+        "operationId": "saved_queries",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SavedQuery"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The saved queries the requester may read, by space and name"
+          }
+        },
+        "summary": "The saved queries in the spaces the requester reads: its personal space, those shared\nwith it, its workspaces (administrators: all).",
+        "tags": [
+          "queries"
+        ]
+      }
+    },
+    "/api/v1/saved-queries/{space}/{name}": {
+      "delete": {
+        "operationId": "saved_query_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "space",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not an editor or owner of the space"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "None the requester may read"
+          }
+        },
+        "summary": "Removes a saved query (the space's editors and owners).",
+        "tags": [
+          "queries"
+        ]
+      },
+      "get": {
+        "operationId": "saved_query",
+        "parameters": [
+          {
+            "description": "A personal space (`~alice`) or a workspace",
+            "in": "path",
+            "name": "space",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedQuery"
+                }
+              }
+            },
+            "description": "The saved query"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "None the requester may read"
+          }
+        },
+        "summary": "One saved query.",
+        "tags": [
+          "queries"
+        ]
+      },
+      "put": {
+        "operationId": "saved_query_put",
+        "parameters": [
+          {
+            "description": "A personal space (`~alice`) or a workspace",
+            "in": "path",
+            "name": "space",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Letters, digits, `.`, `_`, `-`",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryDraft"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedQuery"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not a SPARQL query or update, or a bad name"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not an editor or owner of the space"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No such space"
+          }
+        },
+        "summary": "Saves a query (or update) under `name` in `space` (its editors and owners), replacing\none of that name. It is checked to parse first; a prefix it doesn't declare means what\nits repository's namespaces (the default repository's without one) bind it to.",
+        "tags": [
+          "queries"
+        ]
+      }
+    }
+  },
+  "tags": [
+    {
+      "description": "The server: capabilities, health, diagnostics, AI query suggestions",
+      "name": "server"
+    },
+    {
+      "description": "Repositories: each a store with its own data and reasoning",
+      "name": "repositories"
+    },
+    {
+      "description": "SPARQL queries and updates",
+      "name": "sparql"
+    },
+    {
+      "description": "Graphs, imports, backups",
+      "name": "data"
+    },
+    {
+      "description": "Prefixes",
+      "name": "namespaces"
+    },
+    {
+      "description": "Client transactions: writes collected over requests, committed as one",
+      "name": "sessions"
+    },
+    {
+      "description": "Inferences, their explanations, the class hierarchy",
+      "name": "reasoning"
+    },
+    {
+      "description": "Validation",
+      "name": "shacl"
+    },
+    {
+      "description": "Users, workspaces, personal spaces, role rules, logins (ADR-0008)",
+      "name": "access"
+    },
+    {
+      "description": "Saved queries, in personal spaces and workspaces",
+      "name": "queries"
+    },
+    {
+      "description": "Isolated checks of pinned inputs for the Datamodel Workflow (dmw-store-check/1); no repository is read or written",
+      "name": "draft-check"
+    },
+    {
+      "description": "Read replicas: a primary's log and image, a replica's status (docs/ops/replication.md)",
+      "name": "replication"
+    }
+  ]
+}

@@ -101,7 +101,8 @@ the JSON-LD 1.1 toRdf/fromRdf suites. To measure: throughput per format in MB/s
 and triples/s against `oxttl`, `oxrdfxml` and `oxjsonld`, and bulk load end to end.
 
 **Step 3 in detail (`nrese-rdf-io`).** What the code needs today:
-- the six formats, by file extension or media type;
+- the six formats, by file extension or media type (RDF4J's Binary RDF, added later, makes
+  seven);
 - parsers with a base IRI, fresh blank nodes per payload, "no named graphs", a default
   graph, input from `Read` or a byte slice;
 - N-Triples/N-Quads split into chunks for bulk load on all cores;
@@ -165,7 +166,8 @@ The crate is built in five parts, each with its W3C suites and tests before the 
     default).
   - Suites: `toRdf`, `expand` and `fromRdf` from `w3c/json-ld-api`.
 - **3e. RDF 1.2** in `nrese-rdf` and every reader and writer (see "The newest standards"
-  below). Done 1 October with RDFC-1.0 (see Status).
+  below; as built, JSON-LD 1.1 can't express a triple term and Binary RDF a base direction:
+  [capability matrix](../spec/06-target-capability-matrix.md)). Done 1 October with RDFC-1.0 (see Status).
 - **3f. Comparison batch**: the conformance matrix and throughput against `oxttl`,
   `oxrdfxml` and `oxjsonld` (with Oxigraph's `rdf-12` feature) on generated documents (no
   third-party data), the end of step 3.
@@ -173,7 +175,9 @@ The crate is built in five parts, each with its W3C suites and tests before the 
 Suites (fetched by `scripts/fetch-w3c-tests.sh`): RDF 1.1 N-Triples, N-Quads, Turtle,
 TriG, RDF/XML (positive and negative syntax, evaluation compared by isomorphism through
 `nrese-rdf`'s canonicalisation), and JSON-LD 1.1 `toRdf` and `fromRdf`. N3 (a W3C
-Community Group format oxttl reads) is not used here and stays out unless asked for.
+Community Group format oxttl reads) is not used here and stays out unless asked for. (14 Nov
+2026: added since; the library reads and writes it, `nrese_rdf_io::n3`:
+[what it covers](../what-it-covers.md#rdf-syntaxes).)
 
 **The newest standards: RDF 1.2 and SPARQL 1.2** (the owner's request, 2026-10-01: the
 engine must be usable with, and optimised for, the newest versions). W3C status in October
@@ -191,7 +195,7 @@ the migration. Readers keep accepting 1.1 documents unchanged:
   language-tagged strings with a base direction (`rdf:dirLangString`), through `Term`,
   `TermRef`, canonicalisation, `Graph` and `Dataset`.
 - **`nrese-rdf-io`**, as part 3e before the comparison batch: RDF 1.2 in every reader and
-  writer — triple terms `<<( s p o )>>`, reified triples `<< s p o ~ r >>`, annotations
+  writer (as built, but for the two exceptions under 3e) — triple terms `<<( s p o )>>`, reified triples `<< s p o ~ r >>`, annotations
   `{| … |}`, `VERSION`, directional literals `"x"@en--ltr`; in RDF/XML
   `rdf:parseType="Triple"`, `rdf:annotation` and `its:dir`; in JSON-LD, `@direction` as
   a directional literal. The W3C `rdf12` suites (already fetched) must pass. Writers

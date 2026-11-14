@@ -1,13 +1,14 @@
 # Building, running and developing NRESE
 
-The long form of the README's quick start: building from source, the console, the CLI, and where to start in the code. Building without filling the disk, the gate and how to measure are in [CONTRIBUTING.md](../../CONTRIBUTING.md).
+The long form of the README's [quick start](../../README.md#quick-start): building from source, the console, the CLI, and where to start in the code. Building without filling the disk, the gate and how to measure are in [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ## Setup
 
 ### Prerequisites
 
-- Rust toolchain
-- Cargo
+- Rust 1.98 or later (`rust-version` in [Cargo.toml](../../Cargo.toml); the builds here use the
+  version [rust-toolchain.toml](../../rust-toolchain.toml) names), with Cargo
+- for the console: Node.js
 - optional: Docker, to build and run the image
 
 ### Build
@@ -79,6 +80,15 @@ You can also bind at build time with:
 cargo run -p nrese-server
 ```
 
+With only Rust, you get the server and its API on `127.0.0.1:8080`, from memory (nothing
+is written to disk) and with reasoning off; set `NRESE_STORE_MODE=on-disk` and
+`NRESE_REASONING_MODE` to change that ([configuration](../ops/config-reference.md)); `--release`
+builds it optimised. With reasoning off, the quick start's first query answers no rows, as
+`complete`: nothing is inferred. Start the server with `NRESE_REASONING_MODE=owl2-rl` and
+`NRESE_SHACL_GATE=enforce` for the quick start's example and the [tutorial](../tutorial.md). The
+operator page `/ops` is built in; the browser console is embedded only when it was built
+first ([above](#build-the-user-frontend)); without it, `/console` says how.
+
 Run with an explicit config file:
 
 ```powershell
@@ -96,23 +106,34 @@ cargo run -p nrese-server -- --config .\config.toml
 
 ### Frontend CLI
 
-The frontend package also ships a small CLI on top of the same TypeScript client boundary:
+The frontend package also ships a small CLI on top of the same TypeScript client boundary
+(`npm run cli -- help` prints its commands and options):
 
 ```powershell
 Set-Location .\apps\nrese-console
 npm install
-npm run cli -- runtime
 npm run cli -- capabilities
 npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
 ```
 
-Useful options:
+| Command | What it sends ([HTTP interface](../ops/http-api.md)) |
+|---|---|
+| `runtime`, `capabilities`, `reasoning` | `GET /api/v1/health`, `/api/v1/capabilities`, `/api/v1/repositories/nrese/reasoning`; prints the JSON |
+| `query` | the query to `/dataset/query`, asking for `--accept` (default `application/sparql-results+json`) |
+| `update` | the update to `/dataset/update` |
+| `tell` | the RDF to `/dataset/tell`, into `--graph-iri` or the default graph |
+| `graph-read` | `GET /dataset/data` ([Graph Store Protocol](../ops/http-api.md#graph-store-protocol)) of `--graph-iri` or the default graph |
+| `graph-write` | the RDF to `/dataset/data`, `--method PUT` (the default; needs `--graph default` or `--graph-iri`) or `POST` |
+| `graph-delete` | `DELETE /dataset/data`; needs `--graph default` or `--graph-iri` |
 
-- `--base-url <url>` or `NRESE_API_BASE_URL`
-- `--token <token>` or `NRESE_API_TOKEN`
-- repeated `--header name:value`
-- `--file <path>` for query/update/tell/graph payloads
-- `--graph default|named` and `--graph-iri <iri>` for graph operations
+- The text a command sends: `--text <text>` or `--file <path>`.
+- Every command: `--base-url <url>` (else `NRESE_API_BASE_URL`, else `http://127.0.0.1:8080`),
+  `--token <token>` (a bearer token; else `NRESE_API_TOKEN`), repeated `--header name:value`.
+- Output of the commands that send text or graphs: `status=<code>`, then the body, or for an
+  error one line `error: title: detail (request <id>)`.
+- Exit status: 0; 1 for an error status or a wrong argument (refused before any request);
+  3 with `--require-complete` when the answer isn't shown complete
+  (`NRESE-Completeness`; without the option, a warning on stderr).
 
 Optional environment variables:
 

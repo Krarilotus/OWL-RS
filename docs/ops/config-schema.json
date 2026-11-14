@@ -1,0 +1,1249 @@
+{
+  "$id": "https://nrese.dev/schema/config.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "ai": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Whether AI query suggestions are offered (default false).",
+          "type": "boolean",
+          "x-env": "NRESE_AI_ENABLED"
+        },
+        "gemini": {
+          "additionalProperties": false,
+          "properties": {
+            "api_base": {
+              "description": "The Gemini API's base URL.",
+              "type": "string",
+              "x-env": "NRESE_AI_GOOGLE_API_BASE"
+            },
+            "api_key": {
+              "description": "The Gemini API key.",
+              "type": "string",
+              "writeOnly": true,
+              "x-env": "NRESE_AI_GOOGLE_API_KEY"
+            }
+          },
+          "type": "object"
+        },
+        "max_suggestions": {
+          "description": "Suggestions per request.",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_AI_MAX_SUGGESTIONS"
+        },
+        "model": {
+          "description": "The provider's model.",
+          "type": "string",
+          "x-env": "NRESE_AI_MODEL"
+        },
+        "openrouter": {
+          "additionalProperties": false,
+          "properties": {
+            "api_base": {
+              "description": "The OpenRouter API's base URL.",
+              "type": "string",
+              "x-env": "NRESE_AI_OPENROUTER_API_BASE"
+            },
+            "api_key": {
+              "description": "The OpenRouter API key.",
+              "type": "string",
+              "writeOnly": true,
+              "x-env": "NRESE_AI_OPENROUTER_API_KEY"
+            },
+            "app_name": {
+              "description": "The application name sent to OpenRouter.",
+              "type": "string",
+              "x-env": "NRESE_AI_OPENROUTER_APP_NAME"
+            },
+            "site_url": {
+              "description": "The site URL sent to OpenRouter.",
+              "type": "string",
+              "x-env": "NRESE_AI_OPENROUTER_SITE_URL"
+            }
+          },
+          "type": "object"
+        },
+        "provider": {
+          "description": "Who makes the suggestions.",
+          "enum": [
+            "disabled",
+            "gemini",
+            "openrouter"
+          ],
+          "type": "string",
+          "x-env": "NRESE_AI_PROVIDER"
+        },
+        "system_prompt": {
+          "description": "The system prompt of suggestion requests.",
+          "type": "string",
+          "x-env": "NRESE_AI_SYSTEM_PROMPT"
+        },
+        "timeout_ms": {
+          "description": "Per suggestion request, in milliseconds.",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_AI_TIMEOUT_MS"
+        }
+      },
+      "type": "object"
+    },
+    "auth": {
+      "additionalProperties": false,
+      "properties": {
+        "access_policy": {
+          "description": "An access policy file, imported into the access state at the first start.",
+          "type": "string",
+          "x-env": "NRESE_ACCESS_POLICY"
+        },
+        "bearer_jwt": {
+          "additionalProperties": false,
+          "properties": {
+            "admin_role": {
+              "description": "The role that may administer.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_JWT_ADMIN_ROLE"
+            },
+            "audience": {
+              "description": "The audience JWTs must name.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_JWT_AUDIENCE"
+            },
+            "issuer": {
+              "description": "The issuer JWTs must name.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_JWT_ISSUER"
+            },
+            "leeway_seconds": {
+              "description": "Clock leeway for expiry checks, in seconds.",
+              "minimum": 0,
+              "type": "integer",
+              "x-env": "NRESE_AUTH_JWT_LEEWAY_SECS"
+            },
+            "read_role": {
+              "description": "The role that may read.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_JWT_READ_ROLE"
+            },
+            "shared_secret": {
+              "description": "The HMAC secret JWTs are signed with.",
+              "type": "string",
+              "writeOnly": true,
+              "x-env": "NRESE_AUTH_JWT_SECRET"
+            }
+          },
+          "type": "object"
+        },
+        "bearer_static": {
+          "additionalProperties": false,
+          "properties": {
+            "admin_token": {
+              "description": "The static bearer token that may administer.",
+              "type": "string",
+              "writeOnly": true,
+              "x-env": "NRESE_AUTH_ADMIN_TOKEN"
+            },
+            "read_token": {
+              "description": "The static bearer token that may read.",
+              "type": "string",
+              "writeOnly": true,
+              "x-env": "NRESE_AUTH_READ_TOKEN"
+            }
+          },
+          "type": "object"
+        },
+        "local_logins": {
+          "description": "Whether users of the access state log in with passwords (default true).",
+          "type": "boolean",
+          "x-env": "NRESE_AUTH_LOCAL_LOGINS"
+        },
+        "mode": {
+          "description": "How requests are authenticated (default none).",
+          "enum": [
+            "none",
+            "bearer-static",
+            "bearer-jwt",
+            "mtls",
+            "oidc-introspection"
+          ],
+          "type": "string",
+          "x-env": "NRESE_AUTH_MODE"
+        },
+        "mtls": {
+          "additionalProperties": false,
+          "properties": {
+            "admin_subjects": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "description": "The subjects that may administer.",
+              "x-env": "NRESE_AUTH_MTLS_ADMIN_SUBJECTS"
+            },
+            "read_subjects": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "description": "The subjects that may read.",
+              "x-env": "NRESE_AUTH_MTLS_READ_SUBJECTS"
+            },
+            "subject_header": {
+              "description": "The header the TLS-terminating proxy passes the client certificate's subject in.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_MTLS_SUBJECT_HEADER"
+            },
+            "trusted_proxies": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "description": "The peers (addresses or ranges) that may send the subject header (default loopback).",
+              "x-env": "NRESE_AUTH_MTLS_TRUSTED_PROXIES"
+            }
+          },
+          "type": "object"
+        },
+        "oidc_introspection": {
+          "additionalProperties": false,
+          "properties": {
+            "admin_role": {
+              "description": "The role that may administer.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_OIDC_ADMIN_ROLE"
+            },
+            "client_id": {
+              "description": "The client id the server introspects as.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_OIDC_CLIENT_ID"
+            },
+            "client_secret": {
+              "description": "The client secret the server introspects with.",
+              "type": "string",
+              "writeOnly": true,
+              "x-env": "NRESE_AUTH_OIDC_CLIENT_SECRET"
+            },
+            "introspection_url": {
+              "description": "The OAuth 2.0 token introspection endpoint.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_OIDC_INTROSPECTION_URL"
+            },
+            "read_role": {
+              "description": "The role that may read.",
+              "type": "string",
+              "x-env": "NRESE_AUTH_OIDC_READ_ROLE"
+            },
+            "timeout_ms": {
+              "description": "Per introspection request, in milliseconds.",
+              "minimum": 0,
+              "type": "integer",
+              "x-env": "NRESE_AUTH_OIDC_TIMEOUT_MS"
+            }
+          },
+          "type": "object"
+        },
+        "trusted_proxies": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "description": "The proxies (addresses or ranges) whose X-Forwarded-For names the client, for login throttling (default loopback).",
+          "x-env": "NRESE_AUTH_TRUSTED_PROXIES"
+        },
+        "workspace_base": {
+          "description": "What personal space and workspace graph prefixes start with (default urn:nrese:).",
+          "type": "string",
+          "x-env": "NRESE_WORKSPACE_BASE"
+        }
+      },
+      "type": "object"
+    },
+    "budgets": {
+      "additionalProperties": false,
+      "properties": {
+        "bulk_load_memory": {
+          "description": "The quads of a bulk load before they are sorted in chunks and spilled; 0 is unlimited (default 25%).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_BULK_LOAD_MEMORY",
+          "x-unit": "bytes-or-share"
+        },
+        "graph_read_timeout": {
+          "description": "A Graph Store or statements read (default 30s).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_GRAPH_READ_TIMEOUT_MS",
+          "x-older-keys": [
+            "policy.timeouts.graph_read_ms"
+          ],
+          "x-unit": "milliseconds"
+        },
+        "graph_write_timeout": {
+          "description": "A Graph Store write (default 60s).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_GRAPH_WRITE_TIMEOUT_MS",
+          "x-older-keys": [
+            "policy.timeouts.graph_write_ms"
+          ],
+          "x-unit": "milliseconds"
+        },
+        "huge_pages": {
+          "description": "Transparent huge pages for the server's memory (Linux): on is faster over large heaps, off holds less memory while serving, bulk has them only while a bulk load or a materialisation runs (default on).",
+          "enum": [
+            "off",
+            "on",
+            "bulk"
+          ],
+          "type": "string",
+          "x-env": "NRESE_HUGE_PAGES"
+        },
+        "process_memory": {
+          "description": "The memory the server may hold before a materialisation or a commit's reasoning stops with an error instead of taking the machine; 0 is unlimited (default 75%).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_PROCESS_MEMORY_BYTES",
+          "x-unit": "bytes-or-share"
+        },
+        "query_memory": {
+          "description": "Intermediate results of one query; 0 is unlimited (default 4GiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_MAX_QUERY_MEMORY_BYTES",
+          "x-older-keys": [
+            "policy.limits.max_query_memory_bytes"
+          ],
+          "x-unit": "bytes-or-share"
+        },
+        "query_text": {
+          "description": "The text of a query (default 1MiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_MAX_QUERY_BYTES",
+          "x-older-keys": [
+            "policy.limits.max_query_bytes"
+          ],
+          "x-unit": "bytes"
+        },
+        "query_timeout": {
+          "description": "A query, until its last result is sent (default 30s).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_QUERY_TIMEOUT_MS",
+          "x-older-keys": [
+            "policy.timeouts.query_ms"
+          ],
+          "x-unit": "milliseconds"
+        },
+        "reasoning_release": {
+          "description": "Memory given back between a materialisation's rounds: on lowers and steadies its peak (LUBM 100 by 14 %) for more reasoning time (5.6 %); default off.",
+          "enum": [
+            "off",
+            "on"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_RELEASE"
+        },
+        "result_cache": {
+          "description": "Results of query parts (id columns) kept for repeated queries and shared sub-patterns; 0 switches the cache off (default 2% of memory, 64MiB to 8GiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_QUERY_CACHE_BYTES",
+          "x-older-keys": [
+            "store.query_cache_bytes"
+          ],
+          "x-unit": "bytes-or-share"
+        },
+        "result_cache_pins": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "description": "SPARQL query files whose results are pinned in the result cache at startup, each under its file name without the extension (none by default).",
+          "x-env": "NRESE_PINNED_QUERIES"
+        },
+        "total_query_memory": {
+          "description": "Intermediate results of all running queries together; 0 is unlimited (default 50%).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES",
+          "x-unit": "bytes-or-share"
+        },
+        "update_size": {
+          "description": "A SPARQL update request (default 16MiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_MAX_UPDATE_BYTES",
+          "x-older-keys": [
+            "policy.limits.max_update_bytes"
+          ],
+          "x-unit": "bytes"
+        },
+        "update_timeout": {
+          "description": "A SPARQL update, reasoning included (default 60s).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_UPDATE_TIMEOUT_MS",
+          "x-older-keys": [
+            "policy.timeouts.update_ms"
+          ],
+          "x-unit": "milliseconds"
+        },
+        "upload_size": {
+          "description": "An RDF payload (default 128MiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_MAX_RDF_UPLOAD_BYTES",
+          "x-older-keys": [
+            "policy.limits.max_rdf_upload_bytes"
+          ],
+          "x-unit": "bytes"
+        }
+      },
+      "type": "object"
+    },
+    "dl": {
+      "additionalProperties": false,
+      "properties": {
+        "answers": {
+          "description": "Under owl2-dl, which answers a query returns: the certain ones where they can be proven complete and the sound ones otherwise (the default), the sound lower bound alone, or certain answers or an error.",
+          "enum": [
+            "certain-where-complete",
+            "sound",
+            "exact"
+          ],
+          "type": "string",
+          "x-env": "NRESE_DL_ANSWERS"
+        },
+        "consistency": {
+          "description": "Under owl2-dl, whether each commit is checked for consistency and rejected if it makes the data inconsistent (inline, the default) or not checked (off).",
+          "enum": [
+            "inline",
+            "off"
+          ],
+          "type": "string",
+          "x-env": "NRESE_DL_CONSISTENCY"
+        },
+        "explanation_tests": {
+          "description": "Under owl2-dl, the entailment tests one explanation or rejection evidence runs; past them the justification isn't minimal (default none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_EXPLANATION_TESTS",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "lower_bound_timeout": {
+          "description": "Under owl2-dl, the time a classification's Horn lower bound may take, at most half of what is left: a route threshold, past it the hypertableau decides (default 60s; 0 or unlimited: only the half).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_LOWER_BOUND_TIMEOUT_MS",
+          "x-unit": "milliseconds",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "max_branch_points": {
+          "description": "Under owl2-dl, the most branch points one hypertableau run may open: a deterministic budget; past it the run decides nothing (default none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MAX_BRANCH_POINTS",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "max_candidates": {
+          "description": "Under owl2-dl, the candidate answers a query checks with the exact services at most; the rest are reported unresolved (default 1000, so that the answer comes within the query's timeout; 0 or unlimited: none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MAX_CANDIDATES",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "max_join": {
+          "description": "Under owl2-dl, the most conclusions one join of the context core may produce: a route threshold, past it the hypertableau decides (default 1048576).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MAX_JOIN",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "max_join_steps": {
+          "description": "Under owl2-dl, the most steps one Pred join of the context core may take: a route threshold, past it the hypertableau decides (default 65536).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MAX_JOIN_STEPS",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "max_merges": {
+          "description": "Under owl2-dl, the most merges one hypertableau run may make: a deterministic budget (default none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MAX_MERGES",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "max_nodes": {
+          "description": "Under owl2-dl, the most nodes one hypertableau run may hold: a deterministic budget for reproducible runs (default none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MAX_NODES",
+          "x-unit": "count",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "memory": {
+          "description": "Under owl2-dl, what one engine run may hold of its own, checked at work boundaries (default none: a request's runs draw from its memory envelope, budgets.query_memory; 0 or unlimited: none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_MEMORY",
+          "x-unit": "bytes",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "threads": {
+          "description": "Under owl2-dl, the workers of a classification (default 0: every core).",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_DL_THREADS"
+        },
+        "timeout": {
+          "description": "Under owl2-dl, the time one DL task may take: a commit's consistency check, a query's exact services, a classification (default 30min, the server's safety default; 0 or unlimited: none).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_DL_TIMEOUT_MS",
+          "x-unit": "milliseconds",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "federation": {
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "description": "The endpoints SERVICE may call (IRIs or prefixes, * for any); none by default.",
+          "x-env": "NRESE_FEDERATION_ALLOW"
+        },
+        "max_rows": {
+          "description": "Rows one request may return (default 1000000).",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_FEDERATION_MAX_ROWS"
+        },
+        "timeout": {
+          "description": "Per request to an endpoint (default 30s).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_FEDERATION_TIMEOUT_MS",
+          "x-unit": "milliseconds"
+        }
+      },
+      "type": "object"
+    },
+    "policy": {
+      "additionalProperties": false,
+      "properties": {
+        "exposure": {
+          "additionalProperties": false,
+          "properties": {
+            "metrics": {
+              "description": "Whether the Prometheus metrics are served.",
+              "type": "boolean",
+              "x-env": "NRESE_ENABLE_METRICS"
+            },
+            "operator_ui": {
+              "description": "Whether the operator console is served.",
+              "type": "boolean",
+              "x-env": "NRESE_ENABLE_OPERATOR_UI"
+            }
+          },
+          "type": "object"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "max_query_bytes": {
+              "deprecated": true,
+              "description": "Older name of `budgets.query_text`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_MAX_QUERY_BYTES",
+              "x-older-keys": [
+                "policy.limits.max_query_bytes"
+              ],
+              "x-unit": "bytes"
+            },
+            "max_query_memory_bytes": {
+              "deprecated": true,
+              "description": "Older name of `budgets.query_memory`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_MAX_QUERY_MEMORY_BYTES",
+              "x-older-keys": [
+                "policy.limits.max_query_memory_bytes"
+              ],
+              "x-unit": "bytes-or-share"
+            },
+            "max_rdf_upload_bytes": {
+              "deprecated": true,
+              "description": "Older name of `budgets.upload_size`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_MAX_RDF_UPLOAD_BYTES",
+              "x-older-keys": [
+                "policy.limits.max_rdf_upload_bytes"
+              ],
+              "x-unit": "bytes"
+            },
+            "max_update_bytes": {
+              "deprecated": true,
+              "description": "Older name of `budgets.update_size`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_MAX_UPDATE_BYTES",
+              "x-older-keys": [
+                "policy.limits.max_update_bytes"
+              ],
+              "x-unit": "bytes"
+            }
+          },
+          "type": "object"
+        },
+        "rate_limits": {
+          "additionalProperties": false,
+          "properties": {
+            "admin_requests_per_window": {
+              "description": "Administrative requests per client and window.",
+              "minimum": 0,
+              "type": "integer",
+              "x-env": "NRESE_ADMIN_REQUESTS_PER_WINDOW"
+            },
+            "read_requests_per_window": {
+              "description": "Read requests per client and window.",
+              "minimum": 0,
+              "type": "integer",
+              "x-env": "NRESE_READ_REQUESTS_PER_WINDOW"
+            },
+            "window_secs": {
+              "description": "The rate limits' window in seconds.",
+              "minimum": 0,
+              "type": "integer",
+              "x-env": "NRESE_RATE_LIMIT_WINDOW_SECS"
+            },
+            "write_requests_per_window": {
+              "description": "Write requests per client and window.",
+              "minimum": 0,
+              "type": "integer",
+              "x-env": "NRESE_WRITE_REQUESTS_PER_WINDOW"
+            }
+          },
+          "type": "object"
+        },
+        "sparql_parse_error_profile": {
+          "description": "How SPARQL syntax errors are answered (default problem-json).",
+          "enum": [
+            "problem-json",
+            "plain-text",
+            "fuseki-plain-text"
+          ],
+          "type": "string",
+          "x-env": "NRESE_SPARQL_PARSE_ERROR_PROFILE"
+        },
+        "timeouts": {
+          "additionalProperties": false,
+          "properties": {
+            "graph_read_ms": {
+              "deprecated": true,
+              "description": "Older name of `budgets.graph_read_timeout`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_GRAPH_READ_TIMEOUT_MS",
+              "x-older-keys": [
+                "policy.timeouts.graph_read_ms"
+              ],
+              "x-unit": "milliseconds"
+            },
+            "graph_write_ms": {
+              "deprecated": true,
+              "description": "Older name of `budgets.graph_write_timeout`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_GRAPH_WRITE_TIMEOUT_MS",
+              "x-older-keys": [
+                "policy.timeouts.graph_write_ms"
+              ],
+              "x-unit": "milliseconds"
+            },
+            "query_ms": {
+              "deprecated": true,
+              "description": "Older name of `budgets.query_timeout`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_QUERY_TIMEOUT_MS",
+              "x-older-keys": [
+                "policy.timeouts.query_ms"
+              ],
+              "x-unit": "milliseconds"
+            },
+            "update_ms": {
+              "deprecated": true,
+              "description": "Older name of `budgets.update_timeout`.",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "string"
+              ],
+              "x-env": "NRESE_UPDATE_TIMEOUT_MS",
+              "x-older-keys": [
+                "policy.timeouts.update_ms"
+              ],
+              "x-unit": "milliseconds"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "reasoner": {
+      "additionalProperties": false,
+      "properties": {
+        "equality": {
+          "description": "How owl:sameAs is reasoned with and stored (default representatives).",
+          "enum": [
+            "representatives",
+            "compact",
+            "replicate"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_EQUALITY"
+        },
+        "equality_answers": {
+          "description": "With equality = compact: answer with every identity of an owl:sameAs class (strict, the default), or with its representative only (canonical, for analytics).",
+          "enum": [
+            "strict",
+            "canonical"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_EQUALITY_ANSWERS"
+        },
+        "equality_expansion": {
+          "description": "With equality = compact: expand owl:sameAs classes after the joins where the answer can't tell (late, the default) or at every read (early). The same answers.",
+          "enum": [
+            "late",
+            "early"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_EQUALITY_EXPANSION"
+        },
+        "mode": {
+          "description": "The ruleset materialised into the inferred stack (default disabled); owl2-dl materialises OWL 2 RL and adds the OWL 2 DL engines (the dl settings).",
+          "enum": [
+            "disabled",
+            "rdfs",
+            "rdfs-full",
+            "rdfs-plus",
+            "owl-horst",
+            "owl2-ql",
+            "owl2-rl",
+            "owl2-dl",
+            "custom"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_MODE"
+        },
+        "ql_rewriting": {
+          "description": "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto (the default) under owl2-ql, on under owl2-ql and owl2-rl, or off.",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_QL_REWRITING"
+        },
+        "rules": {
+          "description": "A Notation3 (.n3) or GraphDB (.pie) file of user rules: the whole program in the custom mode, added to the ruleset otherwise.",
+          "type": "string",
+          "x-env": "NRESE_REASONING_RULES"
+        },
+        "support_sets": {
+          "description": "Support graph sets kept per inferred statement for inferred = \"supported\" in the access policy (default 16, at least 1): a bound on memory and work; a reader past it is decided by the closure of its graphs, with the same answers.",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_REASONING_SUPPORT_SETS"
+        },
+        "unnamed_classes": {
+          "description": "Whether memberships in unnamed union classes that nothing consumes are derived (default derive).",
+          "enum": [
+            "derive",
+            "skip"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REASONING_UNNAMED_CLASSES"
+        }
+      },
+      "type": "object"
+    },
+    "replication": {
+      "additionalProperties": false,
+      "properties": {
+        "batch_bytes": {
+          "description": "About how much log a replica asks for at once (default 8MiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_REPLICATION_BATCH_BYTES",
+          "x-unit": "bytes"
+        },
+        "image_timeout": {
+          "description": "The longest a replica waits for its primary to prepare an image, until the answer begins (default 1h; 0 or unlimited: no limit); the image then streams as long as its pieces come.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_REPLICATION_IMAGE_TIMEOUT_MS",
+          "x-unit": "milliseconds",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "mode": {
+          "description": "Read replicas (docs/ops/replication.md): a primary ships its log to replicas, which apply it and answer queries; off by default. Both need an on-disk store.",
+          "enum": [
+            "off",
+            "primary",
+            "replica"
+          ],
+          "type": "string",
+          "x-env": "NRESE_REPLICATION_MODE"
+        },
+        "poll": {
+          "description": "How long a replica waits before asking again once caught up (default 500ms).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_REPLICATION_POLL_MS",
+          "x-unit": "milliseconds"
+        },
+        "primary": {
+          "description": "A replica's primary: its base URL (https://primary.example:8080).",
+          "type": "string",
+          "x-env": "NRESE_REPLICATION_PRIMARY"
+        },
+        "round_timeout": {
+          "description": "The longest one round of following the primary's log may take, its answer whole (default 5min; 0 or unlimited: no total limit, the 30 s limits between pieces stay).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_REPLICATION_ROUND_TIMEOUT_MS",
+          "x-unit": "milliseconds",
+          "x-unlimited": [
+            "0",
+            "unlimited"
+          ]
+        },
+        "token": {
+          "description": "The bearer token a replica presents to its primary (an administrator's).",
+          "type": "string",
+          "writeOnly": true,
+          "x-env": "NRESE_REPLICATION_TOKEN"
+        }
+      },
+      "type": "object"
+    },
+    "server": {
+      "additionalProperties": false,
+      "properties": {
+        "bind_addr": {
+          "deprecated": true,
+          "description": "Older name of `server.bind_address`.",
+          "type": "string",
+          "x-env": "NRESE_BIND_ADDR",
+          "x-older-keys": [
+            "server.bind_addr"
+          ]
+        },
+        "bind_address": {
+          "description": "The address and port the server listens on (default 127.0.0.1:8080).",
+          "type": "string",
+          "x-env": "NRESE_BIND_ADDR",
+          "x-older-keys": [
+            "server.bind_addr"
+          ]
+        },
+        "deployment_posture": {
+          "description": "What the deployment is for; read-only-demo disables writes, internal-authenticated needs authentication, replacement-grade also on-disk storage and problem+json parse errors (default open-workbench).",
+          "enum": [
+            "open-workbench",
+            "read-only-demo",
+            "internal-authenticated",
+            "replacement-grade"
+          ],
+          "type": "string",
+          "x-env": "NRESE_DEPLOYMENT_POSTURE"
+        }
+      },
+      "type": "object"
+    },
+    "shacl": {
+      "additionalProperties": false,
+      "properties": {
+        "gate": {
+          "description": "SHACL as a commit gate: report what commits introduce, or reject them (default off).",
+          "enum": [
+            "off",
+            "report",
+            "enforce"
+          ],
+          "type": "string",
+          "x-env": "NRESE_SHACL_GATE"
+        },
+        "gate_severity": {
+          "description": "The least severity an enforcing gate rejects (default violation).",
+          "enum": [
+            "violation",
+            "warning",
+            "info"
+          ],
+          "type": "string",
+          "x-env": "NRESE_SHACL_GATE_SEVERITY"
+        },
+        "shapes_graph": {
+          "description": "The graph of the shapes validation uses (an IRI; default RDF4J's http://rdf4j.org/schema/rdf4j#SHACLShapeGraph).",
+          "type": "string",
+          "x-env": "NRESE_SHACL_SHAPES_GRAPH"
+        }
+      },
+      "type": "object"
+    },
+    "store": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_after_wal": {
+          "description": "Write a checkpoint in the background once the write-ahead log has grown by this much since the last (default 256MiB).",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_CHECKPOINT_AFTER_WAL_BYTES",
+          "x-unit": "bytes"
+        },
+        "data_dir": {
+          "description": "The data directory of an on-disk store (default ./data).",
+          "type": "string",
+          "x-env": "NRESE_DATA_DIR"
+        },
+        "default_graph": {
+          "description": "What a query that names no dataset reads: the default graph, or the union of all graphs (default default).",
+          "enum": [
+            "default",
+            "union"
+          ],
+          "type": "string",
+          "x-env": "NRESE_DEFAULT_GRAPH"
+        },
+        "geosparql_relations": {
+          "description": "What GeoSPARQL relations in triple patterns match: those stated and those computed from the geometries (the query-rewrite extension, default computed), or the stated ones only.",
+          "enum": [
+            "computed",
+            "stated"
+          ],
+          "type": "string",
+          "x-env": "NRESE_GEOSPARQL_RELATIONS"
+        },
+        "import_directory": {
+          "description": "The directory administrators import files from by name; without it there are no server-side imports.",
+          "type": "string",
+          "x-env": "NRESE_IMPORT_DIR"
+        },
+        "index_encoding": {
+          "description": "How index blocks are encoded when they are built (default fast).",
+          "enum": [
+            "fast",
+            "compact"
+          ],
+          "type": "string",
+          "x-env": "NRESE_INDEX_ENCODING"
+        },
+        "invalid_statements": {
+          "description": "What a bulk load does with a statement it can't read: quarantine it and load the rest, or stop (default quarantine).",
+          "enum": [
+            "quarantine",
+            "strict"
+          ],
+          "type": "string",
+          "x-env": "NRESE_INVALID_STATEMENTS"
+        },
+        "map_checkpoints": {
+          "description": "Serve checkpointed data from the mapped file and free its copies in memory (default true).",
+          "type": "boolean",
+          "x-env": "NRESE_MAP_CHECKPOINTS"
+        },
+        "mode": {
+          "description": "Where the store keeps its data.",
+          "enum": [
+            "in-memory",
+            "on-disk"
+          ],
+          "type": "string",
+          "x-env": "NRESE_STORE_MODE"
+        },
+        "ontology_path": {
+          "description": "A file loaded at startup; a missing file is a startup error.",
+          "type": "string",
+          "x-env": "NRESE_ONTOLOGY_PATH"
+        },
+        "query_cache_bytes": {
+          "deprecated": true,
+          "description": "Older name of `budgets.result_cache`.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_QUERY_CACHE_BYTES",
+          "x-older-keys": [
+            "store.query_cache_bytes"
+          ],
+          "x-unit": "bytes-or-share"
+        },
+        "reader_corpus_bytes": {
+          "description": "What the corpora a reader search scope keeps, and their lineage, may take within the queries' memory; the least recently used go first (default 256MiB: a 1M-document corpus takes about 250KB). A repository may set its own.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "string"
+          ],
+          "x-env": "NRESE_READER_CORPUS_BYTES",
+          "x-unit": "bytes"
+        },
+        "reader_documents_per_probe": {
+          "description": "Documents a reader corpus walk visits for the work of one probe: after commits, a kept corpus is derived while the terms touched since are at most its documents over this, else walked again (default 10, measured in work; at least 1). A latency-first store with one tenant may raise it.",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_READER_DOCUMENTS_PER_PROBE"
+        },
+        "reader_walk_slice": {
+          "description": "Words of bits (64 terms each) one slice of a reader corpus walk covers at most; each slice also holds 16 bytes a term (default 1024).",
+          "minimum": 0,
+          "type": "integer",
+          "x-env": "NRESE_READER_WALK_SLICE"
+        },
+        "search_scope": {
+          "description": "What full-text relevance, IRI search and vector selection are computed over: the dictionary's whole indexes (default global, the fastest), or what the reader's snapshot and graphs show alone (reader).",
+          "enum": [
+            "global",
+            "reader"
+          ],
+          "type": "string",
+          "x-env": "NRESE_SEARCH_SCOPE"
+        },
+        "verify_on_open": {
+          "description": "Check the whole newest checkpoint when opening (default false).",
+          "type": "boolean",
+          "x-env": "NRESE_VERIFY_ON_OPEN"
+        },
+        "vocabulary": {
+          "description": "How checkpoints store the dictionary's keys (default plain).",
+          "enum": [
+            "plain",
+            "fsst"
+          ],
+          "type": "string",
+          "x-env": "NRESE_VOCABULARY"
+        },
+        "wal_archive": {
+          "description": "Keep the WAL segments checkpoints cover, for point-in-time restores (default false).",
+          "type": "boolean",
+          "x-env": "NRESE_WAL_ARCHIVE"
+        },
+        "wal_damage": {
+          "description": "Damage in the newest WAL segment that a crash mid-append doesn't leave: refuse to open, or open with the log up to it, the rest copied to wal-cut/ (default refuse).",
+          "enum": [
+            "refuse",
+            "keep-prefix"
+          ],
+          "type": "string",
+          "x-env": "NRESE_WAL_DAMAGE"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "NRESE server configuration (config.toml)",
+  "type": "object"
+}

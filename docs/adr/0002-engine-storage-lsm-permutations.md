@@ -39,6 +39,8 @@ State of the art considered:
 - Write cost is O(d log d) for a delta of d quads, plus amortised compaction.
 - Memory is 6 × 32 bytes per quad while uncompressed. Block compression (delta + bit-packing per block, QLever/RDF-3X style) is the next planned storage step. It's invisible to upper layers, because scans go through the run API.
 - The index is memory-resident in this phase. On-disk memory-mapped runs come after compression.
+- (14 Nov 2026) Both have been built since: bit-packed blocks and memory-mapped checkpoints
+  ([capability matrix](../spec/06-target-capability-matrix.md), compressed indexes).
 
 ## Implementation notes (2026-09-25, E2–E4)
 
@@ -53,7 +55,8 @@ State of the art considered:
 - **Dictionary continuity.** Terms interned by aborted transactions stay in the dictionary and are logged with the next commit. This keeps logged ids one contiguous range, so replay is deterministic. Unused terms are a later GC concern; they're never visible as data.
 - **Platform.** Every name recovery reads is placed by one owner, `durability::place` (revised 7 Nov 2026, DUR-3). On Unix a rename is followed by a directory `fsync`. On Windows the rename is `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, followed by `FlushFileBuffers` on the directory, which is opened with backup semantics. A failed flush fails the placement. Before this, Windows skipped the directory step and relied on NTFS's lazily flushed journal, so an acknowledged bulk load could vanish after a power loss. Restores place their image and segments through the same owner, and an open syncs the segments it replayed before it takes new commits.
 - **Second stack (E6).** A version holds an asserted stack and an inferred stack (decision D2). Both use the same run, merge and compaction code. A stack's `Layout` decides which permutations its runs hold:
-  - The inferred stack holds default-graph quads only, so it keeps SPOG/POSG/OSPG.
+  - The inferred stack holds default-graph quads only, so it keeps SPOG/POSG/OSPG (and PSOG
+    since: [ARCHITECTURE §4](../ARCHITECTURE.md#4-engine-design-l1)).
   - Graph-first plans over the inferred stack are rotated to the matching graph-last permutation, or answered as empty for named graphs.
   - Disjointness of the two stacks keeps the materialised count an O(1) sum, and lets scans concatenate the stacks without deduplication.
 
@@ -67,4 +70,6 @@ Both differences are intentional; they are pinned by tests in `crates/nrese-spar
    - Stored data comes back byte-for-byte as it was written, which ResearchSpace forms and provenance workflows rely on.
 2. **A named graph exists iff it holds a quad** (QLever and RDF4J/GraphDB semantics). Oxigraph keeps an explicit registry, so `CREATE GRAPH` persists an empty graph and a graph stays listed after its last quad is deleted. In NRESE:
    - `CREATE GRAPH` stores nothing.
-   - `CLEAR`/`DROP` of an empty named graph fails without `SILENT`.
+   - `CLEAR`/`DROP` of an empty named graph fails without `SILENT`. (14 Nov 2026: changed
+     since; it succeeds and changes nothing, because RDF4J clients clear a graph before they
+     write it: `clearing_a_graph_that_holds_nothing_succeeds`.)

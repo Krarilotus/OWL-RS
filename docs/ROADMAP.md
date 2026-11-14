@@ -1,23 +1,22 @@
 # Roadmap
 
-The order of work. What is done is in [STATUS.md](STATUS.md); what is left before v2
+The order of work: the detail of the "planned" list of the [scope](what-it-covers.md#scope);
+only a stage marked done here is present. What is done is in [STATUS.md](STATUS.md); what is left before v2
 goes to `main` is the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md); why things are decided as they
 are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions.md).
 
 ## Goal
 
-An RDF database and ontology platform with reasoning at its centre: fast SPARQL over
-large data, writes that are validated, access-controlled and transactional, OWL 2 RL
-materialised and maintained incrementally, and OWL 2 DL with complete answers where the
-plan has a complete path, on every core of one machine and
-across machines where a use case needs it ([vision](spec/00-vision-and-scope.md)).
+An RDF database and ontology platform with reasoning at its centre
+([vision](spec/00-vision-and-scope.md)). What it does today, with its limits, is listed
+in [What it covers](what-it-covers.md). What is still to come is the order
+below; across machines, only read replicas are built so far.
 
 ## The order (owner, 5 October 2026)
 
-1. **Finish v2:** the open items of the merge checklist (DL classification and its
-   outliers, the store's DL mode, the query items, materialisation memory, OWL 2 QL
-   rewriting).
+1. **Finish v2:** the open items of the merge checklist, as its
+   [status table](plan/2026-10-05-v2-merge-checklist.md) lists them.
 2. **Benchmark it:** the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the

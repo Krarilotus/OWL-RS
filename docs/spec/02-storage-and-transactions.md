@@ -10,12 +10,13 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
   - Graph patterns match terms. `FILTER` comparisons compare values.
 - **Named graphs exist iff they contain at least one quad.**
   - `CREATE GRAPH` stores nothing.
-  - `CLEAR`/`DROP` of an empty named graph fails unless `SILENT` is given.
+  - `CLEAR`/`DROP` of an empty named graph succeeds and changes nothing.
 - **Asserted and inferred statements are stored separately** (ADR-0003, roadmap E6).
   - The *asserted* stack holds what clients wrote, in any graph.
   - The *inferred* stack holds what the reasoner derived, always in the default graph.
-  - The two are **disjoint**: a statement that is both asserted and derivable counts as asserted, as in GraphDB.
-  - Backups contain asserted statements only.
+  - The two are **disjoint**: a statement that is both asserted and derivable counts as asserted.
+  - An N-Quads export holds the asserted statements only; an image backup holds the inferred
+    ones too ([backups](../ops/server-setup.md#10-backup-and-recovery-setup)).
 - **Blank nodes are scoped to one payload.** Every write request (update, Graph Store write, `TELL`, restore) gets fresh blank nodes. Within one payload, labels stay consistent. The startup ontology preload keeps the file's labels, so re-preloading is idempotent.
 
 ## Reads
@@ -28,7 +29,7 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
   - `Asserted`: explicit statements only
   - `Inferred`: implicit statements only
 
-  A request-level switch and GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs come with R4.
+  A query picks `Asserted` with `infer=false` ([HTTP interface](../ops/http-api.md#query-parameters)). Naming GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs in `FROM` picks `Asserted` or `Inferred`, and naming both picks `Materialised`.
 - **Pattern cost.** Every triple pattern is a contiguous range in one of a stack's index permutations: O(r·log n + k) for k results over r runs, with r = O(log n). A stack has one of two layouts (`index::Layout`):
   - **Quads:** SPOG, POSG, OSPG, GSPO, GPOS, GOSP and GPSO, seven permutations for quads in any graph.
   - **Default graph:** SPOG, POSG, OSPG and PSOG, four permutations. A graph-first order over one constant graph sorts like the matching graph-last one, so the graph-first ones would be copies. The inferred stack always has it; the asserted stack has it until it holds a quad in a named graph (checkpoint format 9 and later).
@@ -82,7 +83,7 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
 
 - **Memory.** Index runs are packed (compressed keys) in memory and in checkpoints. In on-disk mode a restart, a bulk load and a background checkpoint map the checkpoint and use its dictionary and packed runs in place (`durability/checkpoint.rs`, `crate::mapped`): the OS pages in what queries touch. Runs written since the last checkpoint are on the heap.
 - **Commit size.** One commit holds at most 4 GiB of WAL payload, about 130 M quads. Larger loads go through the bulk loader.
-- **Reasoning cost.** A commit's reasoning is incremental (the delta executor) unless the program changes; the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
+- **Reasoning cost.** A commit's reasoning is incremental (the delta executor) unless the program changes or a compact-equality split falls back to a whole-dataset rebuild, in the commit's transaction and holding the writer ([reasoner design](../design/reasoner-v2.md) §2.1); the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
 
 ## Evidence
 

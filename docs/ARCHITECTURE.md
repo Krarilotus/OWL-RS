@@ -2,16 +2,16 @@
 
 This is the canonical architecture document. It says which layer owns which concern, which way dependencies may point, and — most importantly for day-to-day work — **at which layer a given kind of problem must be fixed**. Specs under `docs/spec/` refine individual concerns; if they contradict this file, this file wins and the spec is updated.
 
-Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
+Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the code of the commit it is in; what NRESE covers today is listed in [what it covers](what-it-covers.md), what is planned in [ROADMAP.md](ROADMAP.md).
 
 ## 1. Product target
 
-NRESE is an RDF database with reasoning built in. It runs as one server that uses every core of its machine, each derived setting configurable; read replicas can follow it. It combines:
+NRESE is an RDF database with reasoning built in. It runs as one server that uses every core of its machine, each derived setting configurable; read replicas can follow it. What is in, left out and planned is the [scope](what-it-covers.md#scope); the parts this page describes are:
 
 - **Query execution** — dictionary-encoded, sorted permutation indexes; merge, hash and worst-case-optimal joins; parallel bulk loading; full-text, vector and geospatial search.
 - **Semantics and data governance** — materialised, incrementally maintained reasoning from RDFS to OWL 2 RL, inferred statements kept apart from asserted ones; SHACL validation on request and, with its gate on, on commit; transactional writes; access control by graph.
 - **Reasoning beyond the materialisable profiles** — OWL 2 DL: consistency, classification, realisation, explanations, and query answers that state their completeness. Reasoning is the centre of the project, built on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
-- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it.
+- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it. That frontend is still to come ([ADR-0007](adr/0007-one-engine-api.md)); the browser console today calls the protocol routes (`/dataset/…`).
 
 Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the benchmark kits in [`benches/`](../benches/README.md) ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
 
@@ -64,17 +64,70 @@ handle. Resource lifetimes, reservations and the kernel boundary are in
 
 ### 2.2 Data flow
 
-**Read:** `server` parses and authorises → `store::query` takes a snapshot (an `Arc` clone of the latest version, read under a lock held only while a commit publishes; nothing waits for a commit, compaction or checkpoint to finish) → `sparql` evaluates against the snapshot with a cancellation token → results are serialised → `server` sends the response.
+**Read:** `server` parses and authorises → `store::query` takes a snapshot (an `Arc` clone of the latest version, read under a lock held only while a commit publishes; nothing waits for a commit, compaction or checkpoint to finish) → `sparql` evaluates against the snapshot with a cancellation token, charging what it holds to the request's memory envelope (`budgets.query_memory`; past it `413`), which draws on all queries' budget (`budgets.total_query_memory`) inside the process's (`budgets.process_memory`; no room in either: `503`) → results are serialised → `server` sends the response.
 
 **Write (mutation pipeline, owned by `nrese-store`):** every public write enters here: the protocols' commands, and `MutationCommand::Delta` with a `DeltaPlanner` for any other front-end (a GQL or Cypher update), which plans its delta into the transaction and is gated like the rest. The store has no public method that commits around the pipeline (`write_path_tests`): its own writes to its system graphs and scratch stores are crate-private (`*_ungated`); bulk loads, rematerialisation and a replica's log are explicit operations of their own.
 1. Acquire the single writer slot and a snapshot of the latest revision.
 2. **Plan:** turn the request into a `Delta` (exact inserts and deletes relative to the snapshot). For SPARQL Update this evaluates `WHERE` clauses against *snapshot + pending delta*, so later operations in a request see earlier ones. Nothing is written.
-3. **Validate:** gates run against `(snapshot, delta)`: the reasoner first derives the inferred delta and checks consistency, then SHACL validates (where its gate is on). Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.
+3. **Validate:** gates run against `(snapshot, delta)`: the reasoner first derives the inferred delta and checks consistency, then SHACL validates (where its gate is on). Reasoning that would take the process past `budgets.process_memory` stops with an error (`500`), and nothing is committed. Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.
 4. **Deadline check:** if the request's deadline has passed or it was cancelled, abort. **Nothing is committed after a timeout.**
 5. **Commit:** the engine writes the asserted and inferred deltas to the WAL (durable mode), appends it as a new immutable run, and publishes the new version atomically. Revisions are persistent and monotonic.
 6. **Post-commit:** background compaction and checkpoints. Reasoning is *not* post-commit: inferences are committed with the write that causes them, under the same revision ([design/reasoner-v2.md](design/reasoner-v2.md) §2.1).
 
-Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any change that reintroduces work proportional to the dataset on the write path must be justified in an ADR.
+Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any change that reintroduces work proportional to the dataset on the write path must be justified in an ADR. One case is open: splitting an equality class can fall back to work over the whole dataset while it holds the writer ([open work](STATUS.md#open-work)).
+
+**Bulk load:** `nrese-server load` bypasses the pipeline: the engine writes the quads,
+then the reasoner recomputes the inferences and runs the rules' consistency checks
+([what a commit does](what-it-covers.md#what-a-commit-does)).
+
+### 2.3 Concepts: where each is explained and where its code is
+
+| Concept | Explained in | Code |
+|---|---|---|
+| Storage, snapshots, durability | [storage contract](spec/02-storage-and-transactions.md), §4 | `crates/nrese-engine/src/lib.rs`, `crates/nrese-engine/src/durability/mod.rs` |
+| A commit and its gates | [what a commit does](what-it-covers.md#what-a-commit-does), §2.2 | `crates/nrese-store/src/mutation/mod.rs` |
+| SPARQL query and update | [HTTP interface](ops/http-api.md#sparql), §5 | `crates/nrese-sparql/src/lib.rs` |
+| What an answer promises | [what it covers](what-it-covers.md#what-an-answer-promises) | `crates/nrese-sparql/src/completeness.rs` |
+| Reasoning modes and rules | [reasoning semantics](spec/reasoning-semantics.md) | `crates/nrese-reasoner/src/lib.rs`; when it runs: `crates/nrese-store/src/reasoning.rs` |
+| OWL 2 DL | [design](design/owl2-dl.md) | `crates/nrese-dl/src/lib.rs`, `crates/nrese-owl/src/lib.rs`, `crates/nrese-store/src/dl/mod.rs` |
+| SHACL | [design](design/shacl.md), [HTTP interface](ops/http-api.md#shacl-validation) | `crates/nrese-shacl/src/lib.rs`, `crates/nrese-store/src/shacl.rs` |
+| Access control | [HTTP interface](ops/http-api.md#graph-level-access-control), [ADR-0008](adr/0008-users-workspaces-policies.md) | `crates/nrese-store/src/access/mod.rs` |
+| Memory limits | [budgets](ops/config-reference.md#budgets) | `crates/nrese-store/src/runtime.rs`, `crates/nrese-exec/src/budget.rs` |
+| Bulk load, quarantine | [server setup](ops/server-setup.md), [quarantine](design/quarantine.md) | `crates/nrese-store/src/bulk_load.rs`, `crates/nrese-store/src/quarantine.rs` |
+| Backups | [backup and recovery](ops/server-setup.md#10-backup-and-recovery-setup) | `crates/nrese-store/src/backup.rs` |
+| Read replicas | [replication](ops/replication.md) | `crates/nrese-server/src/replication.rs` |
+| Configuration | [configuration reference](ops/config-reference.md) | `crates/nrese-server/src/config.rs` |
+| HTTP endpoints and errors | [HTTP interface](ops/http-api.md) | `crates/nrese-server/src/http/mod.rs` |
+| RDF syntaxes | [what it covers](what-it-covers.md#rdf-syntaxes) | `crates/rdf/nrese-rdf-io/src/lib.rs` |
+
+### 2.4 Dependencies, and using a crate on its own
+
+Every direct dependency of each crate (test-only ones left out); the picture in §2 shows the layers,
+and §2.1 what each crate owns. None of the crates is on crates.io
+(`publish = false`), and none promises a stable API yet. "On its own" says whether a
+crate's job stands without the rest of the stack; to use one, take it as a git dependency
+pinned to a commit. Their API reference isn't published: `cargo doc -p CRATE --open` builds
+it from a checkout, and each crate's `lib.rs` opens with what the crate owns.
+
+| Crate | Uses | On its own |
+|---|---|---|
+| [`nrese-xsd`](../crates/rdf/nrese-xsd) | – | Yes |
+| [`nrese-json`](../crates/rdf/nrese-json) | – | Yes |
+| [`nrese-rdf`](../crates/rdf/nrese-rdf) | `nrese-xsd` (optional) | Yes |
+| [`nrese-rdf-io`](../crates/rdf/nrese-rdf-io) | `nrese-rdf`, `nrese-json` | Yes |
+| [`nrese-sparql-syntax`](../crates/rdf/nrese-sparql-syntax) | `nrese-rdf` | Yes |
+| [`nrese-sparql-results`](../crates/rdf/nrese-sparql-results) | `nrese-rdf`, `nrese-json` | Yes |
+| [`nrese-exec`](../crates/nrese-exec) | – | Yes: knows no terms |
+| [`nrese-vector`](../crates/nrese-vector) | `nrese-exec` | Yes |
+| [`nrese-owl`](../crates/nrese-owl) | – | Yes: works over the caller's term ids |
+| [`nrese-dl`](../crates/nrese-dl) | `nrese-owl`, `nrese-exec`, `nrese-xsd` | Yes, with example command-line tools |
+| [`nrese-engine`](../crates/nrese-engine) | `nrese-rdf`, `nrese-exec`, `nrese-vector` | Yes: a quad store without SPARQL |
+| [`nrese-sparql`](../crates/nrese-sparql) | `nrese-engine`, `nrese-exec`, `nrese-owl`, `nrese-rdf`, `nrese-xsd`, `nrese-sparql-syntax`, `nrese-sparql-results` | With `nrese-engine` |
+| [`nrese-reasoner`](../crates/nrese-reasoner) | `nrese-engine`, `nrese-exec`, `nrese-owl`, `nrese-rdf`, `nrese-rdf-io`, `nrese-xsd` | With `nrese-engine` |
+| [`nrese-shacl`](../crates/nrese-shacl) | `nrese-engine`, `nrese-exec`, `nrese-sparql`, `nrese-sparql-syntax`, `nrese-rdf`, `nrese-xsd` | With `nrese-engine` and `nrese-sparql` |
+| [`nrese-store`](../crates/nrese-store) | every crate above | Yes: everything but HTTP |
+| [`nrese-server`](../crates/nrese-server) | `nrese-store`, `nrese-sparql`, `nrese-reasoner`, `nrese-exec`, `nrese-rdf`, `nrese-rdf-io`, `nrese-xsd`, `nrese-sparql-results` | The binary |
+| [`apps/nrese-console`](../apps/nrese-console) | the HTTP API only | With a server |
 
 ## 3. Where to fix what
 
@@ -98,8 +151,8 @@ Each crate's `lib.rs` starts with a short module doc restating its ownership. Wh
 
 See [ADR-0002](adr/0002-engine-storage-lsm-permutations.md) for the full rationale.
 
-- **Terms** are encoded as 64-bit `TermId`s. The top bits carry the term kind: IRI, blank node, literal, and **inline** values for canonical `xsd:integer` and `xsd:boolean`. A value is only inlined if its lexical form is canonical, so `"01"^^xsd:integer` and `"1"^^xsd:integer` stay distinct terms. This is RDF-correct, unlike QLever's value folding. Everything else goes through a dictionary (SwissTable hash index over one string arena).
-- **Quads** are `[TermId; 4]` in **seven permutations**: `SPOG POSG OSPG` answer patterns with an unbound graph, and `GSPO GPOS GOSP` answer patterns with a bound graph (including the default graph, `TermId::DEFAULT_GRAPH`). Every triple pattern is a contiguous range scan in one of them. The seventh, `GPSO`, gives executors `(?s p ?o)` sorted by subject for star joins (XC1). The inferred stack keeps `SPOG POSG OSPG PSOG`. `Snapshot::count_in` is exact: range bounds suffice for tombstone-free runs; tombstones add bitmap counts, and equality expansion or post-filtered access paths can require scanning. `Snapshot::scan_sorted_in` returns a scan in a requested order.
+- **Terms** are encoded as 64-bit `TermId`s. The top bits carry the term kind: IRI, blank node, literal, and **inline** values for canonical `xsd:integer` and the types derived from it, `xsd:boolean`, `xsd:decimal`, `xsd:date` and `xsd:dateTime` (within ranges). A value is only inlined if its lexical form is canonical, so `"01"^^xsd:integer` and `"1"^^xsd:integer` stay distinct terms. This is RDF-correct, unlike QLever's value folding. Everything else goes through a dictionary (SwissTable hash index over one string arena).
+- **Quads** are `[TermId; 4]` in **seven permutations**: `SPOG POSG OSPG` answer patterns with an unbound graph, and `GSPO GPOS GOSP` answer patterns with a bound graph (including the default graph, `TermId::DEFAULT_GRAPH`). Every triple pattern is a contiguous range scan in one of them. The seventh, `GPSO`, gives executors `(?s p ?o)` sorted by subject for star joins (XC1). Data that is all in the default graph keeps four, `SPOG POSG OSPG PSOG`, until a named graph arrives ([storage contract](spec/02-storage-and-transactions.md)). The inferred stack keeps `SPOG POSG OSPG PSOG`. `Snapshot::count_in` is exact: range bounds suffice for tombstone-free runs; tombstones add bitmap counts, and equality expansion or post-filtered access paths can require scanning. `Snapshot::scan_sorted_in` returns a scan in a requested order.
 - **Log-structured runs:** the index is a stack of immutable sorted runs, oldest (largest) first. A commit appends one small run containing inserts and tombstones. Reads k-way merge the runs covering a range (newest wins). A size-tiered compaction policy keeps O(log N) runs, with O(log N) amortised merge work per quad. Large merges run off the write path.
 - **MVCC:** a snapshot is an `Arc` of the run list plus the revision. Readers never block writers or each other. A snapshot stays valid for as long as it's held.
 - **Durability:** a redo-only write-ahead log (length + CRC32 per record, fsync policy configurable) and periodic checkpoints (atomic write-rename). Recovery = latest checkpoint + WAL replay; a torn tail is cut (its bytes kept), other damage refuses to open unless configured otherwise. There's no RocksDB, so there's no native toolchain dependency.

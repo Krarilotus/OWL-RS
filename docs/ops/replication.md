@@ -35,7 +35,7 @@ data must still fit one machine; partitioning across machines is a later step.
 [replication]
 mode = "primary"
 
-[storage]
+[store]
 wal_archive = true          # keep the log for replicas that fall behind (see below)
 
 # A replica
@@ -52,12 +52,12 @@ address (a redirect is reported as the primary's error).
 
 ## Falling behind
 
-The primary's log holds the records since its last checkpoint, unless `storage.wal_archive`
+The primary's log holds the records since its last checkpoint, unless `store.wal_archive`
 keeps them. Bulk loads and rematerialisations write a checkpoint, not records.
 
 A replica that asks for records the log no longer holds gets 410 Gone. It keeps serving
 what it has and reports the error in its status. To catch up, it starts again from an
-empty data directory: it takes a fresh image. With `storage.wal_archive = true` on the
+empty data directory: it takes a fresh image. With `store.wal_archive = true` on the
 primary, only bulk loads and rematerialisations send replicas back to an image.
 `nrese-server prune-archive REVISION` removes archived segments that every replica has.
 
