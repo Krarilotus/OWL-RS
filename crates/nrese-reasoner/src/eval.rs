@@ -357,6 +357,32 @@ impl<'v, 'p> Visit<'v, 'p> {
         );
     }
 
+    /// [`Self::filtered`] for a keep that neither counts nor fails (`Current`'s stale terms):
+    /// the keep and the delivery in one closure, each fact counted once, by the inner source.
+    /// The poller's stopped state is checked before each: a read the callback makes can stop
+    /// it while the inner source still holds a run counted ahead, and after that nothing is
+    /// kept or delivered.
+    #[inline]
+    pub(crate) fn kept(
+        &mut self,
+        keep: impl Fn(Triple) -> bool,
+        read: impl FnOnce(&mut Visit<'_, 'p>),
+    ) {
+        let poll = self.poll;
+        let ahead = std::mem::take(&mut self.ahead);
+        let f = &mut *self.f;
+        let mut deliver = |fact: Triple| {
+            if !poll.stopped() && keep(fact) {
+                f(fact);
+            }
+        };
+        read(&mut Visit {
+            poll,
+            f: &mut deliver,
+            ahead,
+        });
+    }
+
     /// Reads `read` with a visit on the same poller whose deliveries go to `through` with
     /// this visit: each counted by the inner source, so `through` hands them on with
     /// [`Self::counted`] and no second tick. Positions counted ahead go to the inner visit,

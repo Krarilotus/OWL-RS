@@ -534,6 +534,53 @@ fn current_s_scan_keeps_the_stop_contract() {
     verdict(failures);
 }
 
+/// `Current`'s filter checks the poller before each fact: once a lookup made in a delivery
+/// has refused, its scan and its range reads neither filter nor deliver another fact,
+/// though the store still visits the rest of its run counted ahead. The stop refuses at each
+/// of the lookups' asks in turn. This checks only what follows the refusal: that run's
+/// credit, which the lookups' asks void, is the store's to give up (design r3).
+#[test]
+fn current_s_filter_ends_at_a_nested_refusal() {
+    let store = oracle_store();
+    let stale = oracle_stale();
+    let current = Current {
+        store: &store,
+        stale: &stale,
+    };
+    let mut failures = Vec::new();
+    for (pattern, seg) in CASES {
+        let reads: [(&str, &Op<'_>); 2] = [
+            ("scan", &scan(&current, pattern, seg, Some(&store))),
+            ("ranges", &ranges(&current, pattern, seg, Some(&store))),
+        ];
+        for (name, read) in reads {
+            let case = format!("Current's {name} of {pattern:?} in {seg:?}");
+            let whole = traced_run(None, read);
+            if whole.nested < 2 {
+                failures.push(format!("{case}: {} nested asks", whole.nested));
+            }
+            for k in 1..=whole.nested {
+                let refused = traced_run(Some((Nesting::Nested, k)), read);
+                let at = format!("{case}, refused at nested ask {k}");
+                failures.extend(refused.errors.iter().map(|error| format!("{at}: {error}")));
+                let Some(r) = refused.events.iter().position(|&e| e == Event::Ask(true)) else {
+                    failures.push(format!("{at}: never refused"));
+                    continue;
+                };
+                let tail = &refused.events[r + 1..];
+                let filtered = tail.iter().filter(|&&e| e == Event::Keep).count();
+                let delivered = tail.iter().filter(|&&e| e == Event::Enter).count();
+                if filtered + delivered > 0 {
+                    failures.push(format!(
+                        "{at}: {filtered} filter calls and {delivered} deliveries after it"
+                    ));
+                }
+            }
+        }
+    }
+    verdict(failures);
+}
+
 /// The charges of `read` on a poller that never stops, and the facts it delivers.
 fn charges(read: impl FnOnce(&Poller<'_>, &mut dyn FnMut(Triple))) -> (Vec<usize>, usize) {
     let poll = Poller::never();
