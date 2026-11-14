@@ -37,7 +37,7 @@ A suggested graph naming, which the smoke test uses: one graph per module versio
 
 ## What to know
 
-- **Validation on request or on commit.** By default a `PUT` of data that breaks the shapes succeeds, and the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). With `shacl.gate = "enforce"` ([configuration](../ops/config-reference.md)) an export that introduces a violation is refused whole (400, with the validation results), so the store holds only data that keeps the ABox contract; `report` logs instead.
+- **Validation on request or on commit.** By default a `PUT` of data that breaks the shapes succeeds, and the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). With `shacl.gate = "enforce"` ([configuration](../ops/config-reference.md)) an export that introduces a violation is refused whole (400, with the validation results), so no export adds a violation (data stored before the gate was on isn't checked by it: [SHACL](../what-it-covers.md#shacl)); `report` logs instead.
 - **SHACL Core and SHACL-SPARQL** (`sh:sparql` constraints and components) are evaluated.
 - **Updates without `GRAPH`** write to, and delete from, the default graph only, also with `store.default_graph = "union"`. The exporter should name the graph in updates.
 - **The shapes graph is an ordinary graph:** a query over all graphs sees the shapes too. Validation leaves it out of the data by itself.
