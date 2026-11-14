@@ -89,6 +89,14 @@ Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
 `whole_ms`, their telemetry's counters (`branch_points`, `clauses`, `nodes_created`, ...),
 `hash`.
 
+A perf-lab case timed by its load (`load_s`) has a second series, `ready` (per sweep entry,
+`ready ENTRY`): the load plus the planner statistics build the load command runs before it
+returns, where the side has one (the perf lab's `statistics_ms`, timed apart); a side without
+such a step is ready when loaded, its `ready` its load. The release gate compares `ready`
+against main only. Against the release base it is not comparable: base's perf lab leaves out
+the build its server runs at load, so the gate declares no hypothesis there and `load_s`
+compares the load proper.
+
 ## Rules every case keeps
 
 - **Answers before time.** A case checks what it can know (`check`, the generator's

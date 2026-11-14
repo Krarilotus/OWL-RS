@@ -1210,7 +1210,8 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
     phases = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
     peak = process_peak(result.get("peak_mib"), phases)
     levels = client_throughput(result)
-    return {"identity": identity, "samples": samples(case, result), "estimator": estimator(result),
+    return {"identity": identity, "samples": {**samples(case, result), **ready_series(case, result)},
+            "estimator": estimator(result),
             **({"batched": batched} if (batched := {q["name"]: q["batch"] for r in result.get("_repeats", [result])
                                                     for q in r.get("queries", []) if q.get("batch")}) else {}),
             "metric": metric_value(case, result), "counters": counters(case, result),
@@ -1243,6 +1244,45 @@ def timed_metric(case: dict) -> str:
     if " " in metric and not case.get("queries") and case.get("tool", "perf_lab") == "perf_lab":
         return "load_s"
     return metric
+
+
+# "Loaded and ready" (D16-606, the orchestrator's decision of 14 Nov 2026): a load case's load plus
+# the planner statistics the load command builds before it returns (perf_lab's `statistics_ms`,
+# timed apart from `load_s`, which stays as it is), where the side reports such a build; a side
+# without one (main's has no such step) is ready when loaded. Compared against main only: base's
+# perf_lab never builds them while base's server does (a7ef46649), so its `ready` through perf_lab
+# would leave out a step its product runs (release_gate.py family_of, compare_case).
+READY = "ready"
+READY_SIDES = ("main",)
+
+
+def ready_timed(case: dict) -> bool:
+    """A perf-lab case timed by its load: the cases with a `ready` series."""
+    return case.get("tool", "perf_lab") == "perf_lab" and timed_metric(case) == "load_s"
+
+
+def ready_name(case: dict, entry: str | None) -> str:
+    """The `ready` series' name: per sweep entry (`ready ENTRY`) in a sweep."""
+    return f"{READY} {entry or '-'}" if case.get("sweep") else READY
+
+
+def ready_series(case: dict, result: dict) -> dict[str, list[float]]:
+    """A load case's `ready` per process, in ms (per sweep entry, as `ready ENTRY`); none for another case."""
+    if not ready_timed(case):
+        return {}
+    out: dict[str, list[float]] = {}
+    for r in result.get("_repeats", [result]):
+        if isinstance(r.get("load_s"), (int, float)):
+            out.setdefault(ready_name(case, r.get("_sweep")), []).append(r["load_s"] * 1000 + (r.get("statistics_ms") or 0.0))
+    return out
+
+
+def ready_not_compared(dimension: str, side: str) -> str | None:
+    """Why a `ready` dimension isn't compared against `side`; None for any other, or a side it is."""
+    if dimension.split(" ")[0] != f"time/{READY}" or side in READY_SIDES:
+        return None
+    return (f"not comparable against {side}: its perf lab leaves out the statistics build its server runs at load "
+            "(load_s, the case's other series, compares the load proper)")
 
 
 DL_PHASES = ("parse", "read", "normalise", "compile", "saturate", "blocking", "expand", "search", "datatypes")
@@ -1601,12 +1641,15 @@ def case_manifest(catalog: list[dict], root: Path = ROOT) -> dict:
             series[name] = [f"{n} clients p99" for n in levels] if len(levels) > 1 else ["_"]
         elif case.get("tool", "perf_lab") == "perf_lab":
             series[name] = ["_"]
+        if ready_timed(case):
+            series[name] = [*series.get(name, []), *(ready_name(case, " ".join(s)) for s in case.get("sweep", [[]]))]
     fingerprint = hashlib.sha256(json.dumps([catalog, queries, series], sort_keys=True).encode()).hexdigest()
     return {"fingerprint": fingerprint, "series": series, "clients": clients,
             "counters": required_counters, "cache_modes": cache_modes,
             "invocations": {c["name"]: invocation_plan(c) for c in catalog},
             "invocation_series": {c["name"]: [
-                (["_"] if c.get("sweep") else [s for s in series.get(c["name"], [])
+                (["_", *([ready_name(c, " ".join(c["sweep"][i["sweep"]]))] if ready_timed(c) else [])]
+                 if c.get("sweep") else [s for s in series.get(c["name"], [])
                  if c["name"] not in cache_modes or s.startswith(i["cache"] + "/")])
                 for i in invocation_plan(c)] for c in catalog}}
 
