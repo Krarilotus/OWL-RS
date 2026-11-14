@@ -285,13 +285,11 @@ pub(crate) struct El {
     pub consistency: Verdict,
 }
 
-/// What the EL route gave ([`el_answer`]).
+/// What the EL route gave where it was taken ([`el_answer`]).
 pub(crate) enum ElRoute {
     /// Its complete answer (kept for the snapshot's revision).
     Answered(Arc<El>),
-    /// Not taken: the DL engines' answer stands as it is.
-    NotTaken,
-    /// Taken, and stopped before its end (nothing of the run is used): the DL engines'
+    /// Stopped before its end (nothing of the run is used): the DL engines'
     /// answer stands, marked with why. The store's memory error where memory stopped it;
     /// `None`: `dl.timeout` passed.
     Stopped(Option<crate::StoreError>),
@@ -307,8 +305,8 @@ pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<E
 /// classifier is complete for the ontology: no assertion, no range with a chain
 /// ([`el_complete_for`]), nothing it skipped. Its completion rules (CR6) need no regular
 /// hierarchy. Taken only where the store answers outside OWL 2 DL by a proven procedure
-/// ([`crate::dl::OutsideProfile::Proven`], not the default); [`ElRoute::NotTaken`]
-/// everywhere else. It runs under the request's stop:
+/// ([`crate::dl::OutsideProfile::Proven`], not the default); `None` everywhere else, where
+/// the DL engines' answer stands as it is. It runs under the request's stop:
 /// `started` plus `dl.timeout`, and the store's memory watch with the process's limit
 /// ([`StoreService::memory_stop`]), polled as `nrese_reasoner::classify::classify_parallel_within`
 /// says; stopped, or with that time already passed before it would start,
@@ -325,26 +323,7 @@ pub(crate) fn el_answer(
     snapshot: &Snapshot,
     taxonomy: &Taxonomy,
     started: Instant,
-) -> ElRoute {
-    match el_run(store, snapshot, taxonomy, started) {
-        Some(Ok(el)) => {
-            let el = Arc::new(el);
-            keep(&store.dl().classification.el, snapshot.revision(), &el);
-            ElRoute::Answered(el)
-        }
-        Some(Err(stopped)) => ElRoute::Stopped(stopped),
-        None => ElRoute::NotTaken,
-    }
-}
-
-/// [`el_answer`]'s run: `None` where the route isn't taken; `Some(Err(..))` where it was
-/// stopped, with the store's memory error if memory stopped it.
-fn el_run(
-    store: &StoreService,
-    snapshot: &Snapshot,
-    taxonomy: &Taxonomy,
-    started: Instant,
-) -> Option<Result<El, Option<crate::StoreError>>> {
+) -> Option<ElRoute> {
     // Outside OWL 2 DL: only where the store answers by a proven procedure.
     if store.config().dl.outside_profile != crate::dl::OutsideProfile::Proven {
         return None;
@@ -363,9 +342,8 @@ fn el_run(
     let stop = || deadline.is_some_and(|at| Instant::now() >= at) || memory_stop.exceeded();
     let room = || memory_stop.room();
     if stop() {
-        return Some(Err(
-            memory_stop.error(nrese_reasoner::delta::Interrupted::default())
-        ));
+        let interrupted = nrese_reasoner::delta::Interrupted::default();
+        return Some(ElRoute::Stopped(memory_stop.error(interrupted)));
     }
     let mut triples = nrese_exec::ChargedVec::new(memory);
     for q in snapshot.quads_for_pattern_in(ReadModel::Asserted, &source::ANY) {
@@ -410,7 +388,7 @@ fn el_run(
     drop(triples);
     let mut classification = match run {
         Ok(classification) => classification,
-        Err(interrupted) => return Some(Err(memory_stop.error(interrupted))),
+        Err(interrupted) => return Some(ElRoute::Stopped(memory_stop.error(interrupted))),
     };
     if !classification.skipped.is_empty() {
         return None;
@@ -436,10 +414,12 @@ fn el_run(
     {
         return None;
     }
-    Some(Ok(El {
+    let el = Arc::new(El {
         classification,
         consistency,
-    }))
+    });
+    keep(&store.dl().classification.el, snapshot.revision(), &el);
+    Some(ElRoute::Answered(el))
 }
 
 #[cfg(test)]
@@ -513,7 +493,8 @@ mod tests {
             taxonomy.incomplete
         );
         assert!(kept_el(&store, &snapshot).is_none());
-        let ElRoute::Answered(el) = el_answer(&store, &snapshot, &taxonomy, Instant::now()) else {
+        let Some(ElRoute::Answered(el)) = el_answer(&store, &snapshot, &taxonomy, Instant::now())
+        else {
             panic!("the EL route didn't answer in time");
         };
         let kept = kept_el(&store, &snapshot).expect("an answer kept for the revision");
@@ -524,7 +505,7 @@ mod tests {
         let snapshot = late.engine().snapshot();
         assert!(matches!(
             el_answer(&late, &snapshot, &taxonomy, Instant::now()),
-            ElRoute::Stopped(None)
+            Some(ElRoute::Stopped(None))
         ));
         assert!(kept_el(&late, &snapshot).is_none());
 
@@ -548,7 +529,9 @@ mod tests {
         assert!(
             matches!(
                 stopped,
-                ElRoute::Stopped(Some(crate::StoreError::MemoryUnreadable { .. }))
+                Some(ElRoute::Stopped(Some(
+                    crate::StoreError::MemoryUnreadable { .. }
+                )))
             ),
             "the memory stop isn't told apart"
         );

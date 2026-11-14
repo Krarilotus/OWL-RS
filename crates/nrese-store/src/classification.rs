@@ -102,9 +102,9 @@ impl StoreService {
             None => {
                 let taxonomy = dl::taxonomy(self, &snapshot);
                 match dl::el_answer(self, &snapshot, &taxonomy, started) {
-                    ElRoute::Answered(el) => Ok(el),
-                    ElRoute::NotTaken => Err((taxonomy, None)),
-                    ElRoute::Stopped(memory) => {
+                    Some(ElRoute::Answered(el)) => Ok(el),
+                    None => Err((taxonomy, None)),
+                    Some(ElRoute::Stopped(memory)) => {
                         let why = memory
                             .map_or_else(|| "`dl.timeout` passed".to_owned(), |e| e.to_string());
                         Err((taxonomy, Some(format!("the EL classifier stopped: {why}"))))
