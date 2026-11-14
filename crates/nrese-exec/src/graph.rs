@@ -771,17 +771,21 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         self.rows.reserve_exact(components)?;
         self.reach_starts.push(0)?;
         let size = |starts: &[usize], d: u32| (starts[d as usize + 1] - starts[d as usize]) as u32;
-        // Every tick follows its work, as the entries' runs do: a tick before its work, then
-        // a run of a whole allowance, went 4,097 units unpolled (sol-loop r1 S1).
+        // Every tick follows its own work and comes before any work nested in it, as the
+        // entries' runs count theirs: a tick before its work, or after a nested run, let a
+        // run of a whole allowance follow unticked work, 4,097 units between two polls
+        // (sol-loop r1 S1, r2). A component's own setup is its first member's unit.
         for c in 0..components {
             let mut cyclic = self.members_of(c).len() > 1;
             let mut row = 0u32;
             for k in self.starts[c]..self.starts[c + 1] {
                 let x = self.members[k] as usize;
+                ticker.tick(1)?;
                 for j in self.offsets[x] as usize..self.offsets[x + 1] as usize {
                     let d = self.component[self.targets[j] as usize];
                     if d as usize == c {
                         cyclic = true;
+                        ticker.tick(1)?;
                     } else if stamp[d as usize] != c as u32 {
                         stamp[d as usize] = c as u32;
                         let (starts, stamp) = (&self.starts, &mut stamp);
@@ -792,6 +796,7 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
                         set.fill(taken.len() + 1, |room| {
                             room.push(d);
                             row += size(starts, d);
+                            ticker.tick(1)?;
                             in_runs(ticker, taken.len(), |run| {
                                 for &e in &taken[run] {
                                     if stamp[e as usize] != c as u32 {
@@ -802,10 +807,10 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
                                 }
                             })
                         })??;
+                    } else {
+                        ticker.tick(1)?;
                     }
-                    ticker.tick(1)?;
                 }
-                ticker.tick(1)?;
             }
             if cyclic {
                 set.push(c as u32)?;
