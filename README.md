@@ -5,6 +5,9 @@ An [RDF](https://www.w3.org/TR/rdf11-primer/) store with built-in
 the open; not yet for parallel writers, failover or data split across machines
 ([limits, and when to choose another system](docs/limits.md)).
 
+To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
+planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
+
 NRESE stores RDF datasets (statements: subject,
 predicate, object) and answers [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/) queries
 and updates. Given an [ontology](docs/glossary.md#ontology), it derives the statements that
@@ -24,9 +27,6 @@ It may suit you if you:
 - query data together with its ontology and want the inferences to follow every change;
 - need to know when an answer under OWL reasoning may be missing rows;
 - want a store you can read and take apart: small crates in clear layers.
-
-To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
-planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
 
 ## Quick start
 
@@ -94,6 +94,11 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
   SELECT ?x WHERE { ?x a ex:Animal }'
 ```
 
+The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
+`NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
+complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
+([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
+
 The answer: the [HTTP](docs/glossary.md#http-request-response-status) status and headers,
 then the rows as [JSON](docs/glossary.md#json):
 
@@ -107,11 +112,6 @@ nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the
 
 Other headers are left out here, and `…` marks shortened text: compare the status, the
 `regime` and the rows, as [the record of its last run](docs/dev/first-example-record.md) does.
-
-The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
-`NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
-complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
-([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
 
 The [tutorial](docs/tutorial.md) goes on from here: retraction, validation,
 [your own data](docs/tutorial.md#your-own-data), a changed setting, and starting over.
