@@ -1064,7 +1064,8 @@ fn a_limit_over_several_patterns_refused_at_a_morsel_leaves_nothing_charged() {
 }
 
 /// Spec: LIMIT 0 over several patterns, the first with more rows than one morsel, answers no
-/// rows (with no morsel joined there were no parts to take the variables from).
+/// rows with the query's variables, as a client asking for a query's variables sends it.
+/// (With no morsel joined there were no parts to take the variables from: a panic.)
 #[test]
 fn a_limit_of_zero_over_several_patterns_answers_no_rows() {
     use nrese_sparql_syntax::Query;
@@ -1082,6 +1083,9 @@ fn a_limit_of_zero_over_several_patterns_answers_no_rows() {
     let options = QueryOptions::default();
     let ctx = Context::new(&snapshot, &options, None, None);
     let answer = ctx.eval(&pattern).ok().expect("room");
+    let mut vars: Vec<&str> = answer.vars.iter().map(Variable::as_str).collect();
+    vars.sort_unstable();
+    assert_eq!(vars, ["o", "s", "x"], "the query's variables");
     assert_eq!(answer.table.len(), 0);
     ctx.consumed(answer);
 }
