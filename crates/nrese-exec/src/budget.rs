@@ -3512,4 +3512,68 @@ mod tests {
         assert!(request.refused());
         assert_eq!((request.credit(), server.used()), (0, 0));
     }
+
+    /// An optional part charges on its request's credit like any part, and a refusal above
+    /// it, at the server or at the request's own limit, leaves the request as it was: not
+    /// refused, its credit neither spent nor returned, so the request's own charges still
+    /// draw on the credit without writing the server. Only a refusal the request records
+    /// returns the credit.
+    #[test]
+    fn an_optional_refusal_leaves_the_requests_credit_and_flag() {
+        let server = SharedBudget::new(GIB);
+        let request = Envelope::new(Some(1 << 20), Some(Arc::clone(&server)));
+        request.charge(1).unwrap();
+        let credit = credit_cap(&server) / 2;
+        assert_eq!(
+            request.credit(),
+            credit,
+            "a credit taken with the first byte"
+        );
+        let optional = request.optional_part();
+        let mut held = Reservation::new(&optional);
+        let before = writes::made();
+        held.charge(credit / 2).unwrap();
+        assert_eq!(
+            writes::made(),
+            before,
+            "within the credit: the server unwritten"
+        );
+        let credit = credit - credit / 2;
+        assert_eq!(request.credit(), credit);
+        // Another request leaves the server no room.
+        let other = Envelope::exact(None, Some(Arc::clone(&server)));
+        other.charge(GIB - server.used()).unwrap();
+        let err = held.charge(2 * credit).unwrap_err();
+        assert!(err.shared, "the server's refusal: {err}");
+        assert!(optional.refused() && !request.refused());
+        assert_eq!(
+            (request.credit(), server.used()),
+            (credit, GIB),
+            "the credit kept, nothing charged"
+        );
+        let err = held.charge(2 << 20).unwrap_err();
+        assert!(
+            !err.shared && err.limit == 1 << 20,
+            "the request's limit: {err}"
+        );
+        assert!(!request.refused());
+        assert_eq!(request.credit(), credit, "kept at the request's limit too");
+        let before = writes::made();
+        request.charge(credit).unwrap();
+        assert_eq!(
+            writes::made(),
+            before,
+            "the request's own charge on the credit"
+        );
+        assert_eq!(request.credit(), 0);
+        // A refusal the request records returns what credit it holds.
+        request.release(credit);
+        assert_eq!(request.credit(), credit);
+        assert!(request.charge(2 << 20).is_err());
+        assert!(request.refused());
+        assert_eq!(request.credit(), 0, "returned at the request's own refusal");
+        drop(held);
+        drop((optional, request, other));
+        assert_eq!(server.used(), 0);
+    }
 }
