@@ -2641,9 +2641,10 @@ impl Visits for Current<'_> {
         if self.stale.is_empty() {
             return self.store.visit(pattern, seg, visit);
         }
-        visit.filtered(&|fact| Ok(self.keeps(fact)), |inner| {
-            self.store.visit(pattern, seg, inner)
-        });
+        visit.kept(
+            |fact| self.keeps(fact),
+            |inner| self.store.visit(pattern, seg, inner),
+        );
     }
 
     fn size(
@@ -2678,9 +2679,10 @@ impl Visits for Current<'_> {
         if self.stale.is_empty() {
             return self.store.visit_range(pattern, seg, range, visit);
         }
-        visit.filtered(&|fact| Ok(self.keeps(fact)), |inner| {
-            self.store.visit_range(pattern, seg, range, inner)
-        });
+        visit.kept(
+            |fact| self.keeps(fact),
+            |inner| self.store.visit_range(pattern, seg, range, inner),
+        );
     }
 }
 
