@@ -78,9 +78,10 @@ const GREEDY_EFFORT: usize = 1 << 19;
 pub(super) const SET_BUDGET: usize = 1 << 16;
 
 /// The rows a BGP's plain plan (planned without the characteristic sets) must expect for the
-/// sets to be read where its predicates are in many ([`admits`]). Planning effort follows the
-/// work the query expects: a set search on WatDiv's long lists costs about 0.5 ms whether or
-/// not it pays, so only a query that expects millions of rows can repay it. On WatDiv
+/// sets to be read at all ([`admits`]). Planning effort follows the work the query expects: a
+/// set search costs more than a small query can repay, even on short lists (WatDiv's S1,
+/// 13 November 2026: 0.34 ms to plan with the sets against 0.10 without, for an execution
+/// 0.05 ms faster), so only a query that expects millions of rows is searched. On WatDiv
 /// (12 November 2026), the one query whose set plan beats main's, watdiv-100m C3-1 (106 ms
 /// against 394), expects 3.1 M rows; the others whose set plan differs from main's expect at
 /// most 210 k (S2-8, slower with its sets: 5.04 ms against 4.19 without), and every F, S and
@@ -89,15 +90,6 @@ pub(super) const SET_BUDGET: usize = 1 << 16;
 /// sits between it and C3-1, two points only. A tuning signal, not a bound on execution; like
 /// [`SET_BUDGET`], a constant.
 pub(super) const SET_GATE_ROWS: f64 = 2_000_000.0;
-
-/// Set entries any planning may read at its starts, whatever it expects ([`admits`]): where
-/// its predicates are in few sets, the sets are read as before the gate. About 7 µs of
-/// lookups. The join-order identity fixtures' graphs are in few sets, so they keep their plans;
-/// WatDiv's S1 reads 98 and keeps the plan its sets give; WatDiv's other queries read 2,625 to
-/// 96,518 (12 November 2026). It bounds the starts only: a search it admits may read long
-/// lists after them (a chain's links), up to its budget, [`SET_BUDGET`] for a query that
-/// expects little, before the BGP keeps its plain plan. A constant, as [`SET_BUDGET`] is.
-pub(super) const SET_START_ALLOWANCE: usize = 1 << 10;
 
 /// Set entries a planning may spend per row its plain plan expects, above [`SET_BUDGET`]
 /// ([`budget_for`]): a query that expects much work may plan longer. watdiv-100m C3-1's set
@@ -124,28 +116,28 @@ pub(super) fn expected_work(plan: &Plan) -> f64 {
     plan.rows.iter().filter(|rows| !rows.is_nan()).sum()
 }
 
-/// The sets a search reads at its starts: each open star input's predicate's ([`search`]'s
-/// starts, by the sets' index), saturating.
-pub(super) fn start_reads(inputs: &[Input], sets: &CharacteristicSets) -> usize {
+/// The open stars whose predicates' sets a search reads at its starts, in input order: every
+/// input's, or only `first`'s for a fixed order that starts there. A start reads only where
+/// another input follows it, as [`search`]'s steps decide.
+fn start_stars(inputs: &[Input], first: Option<usize>) -> impl Iterator<Item = &Star> {
+    let n = inputs.len();
     inputs
         .iter()
-        .filter_map(|input| input.star)
-        .filter(|star| star.selectivity >= 1.0)
-        .fold(0usize, |reads, star| {
-            reads.saturating_add(sets.sets_having(star.predicate))
-        })
+        .enumerate()
+        .filter(move |&(j, _)| n >= 2 && first.is_none_or(|f| f == j))
+        .filter_map(|(_, input)| input.star.as_ref())
+        .filter(|star| star.open())
 }
 
-/// Whether a BGP whose plain plan expects `expected` rows, and whose set search would read
-/// `reads` entries at its starts, is planned with the sets too: where those reads are within
-/// [`SET_START_ALLOWANCE`], or it expects at least [`SET_GATE_ROWS`] rows (NaN doesn't). A
-/// test's decision ([`ADMIT`]) instead.
-pub(super) fn admits(expected: f64, reads: usize) -> bool {
+/// Whether a BGP whose plain plan expects `expected` rows is refined by the characteristic
+/// sets: where it expects at least [`SET_GATE_ROWS`] (NaN doesn't). A test's decision
+/// ([`ADMIT`]) instead.
+pub(super) fn admits(expected: f64) -> bool {
     #[cfg(test)]
     if let Some(admit) = ADMIT.with(Cell::get) {
         return admit;
     }
-    reads <= SET_START_ALLOWANCE || expected >= SET_GATE_ROWS
+    expected >= SET_GATE_ROWS
 }
 
 /// [`SET_ENTRIES_PER_ROW`] per expected row, in entries: a float cast saturates, NaN to 0 and
@@ -205,6 +197,19 @@ pub(super) struct Star {
     pub predicate: u64,
     /// The share of `p`'s statements the pattern's object keeps (1 for a variable).
     pub selectivity: f64,
+}
+
+impl Star {
+    /// Whether the characteristic sets estimate the pattern: its object keeps all of `p`'s
+    /// statements (a variable). The sets know which predicates subjects have, not their
+    /// objects. A constant object (`?x a C`) is estimated by containment, not as a share of
+    /// the predicate's statements independent of the subject's other predicates (on
+    /// materialised data a type follows from them: LUBM-10 q4 estimated 2 for 34), and
+    /// doesn't stand for "has the predicate" in a later star either: its subjects have it,
+    /// but read so (any subject with a type) LUBM-10's p90 was 30.
+    pub(super) fn open(&self) -> bool {
+        self.selectivity >= 1.0
+    }
 }
 
 /// A join order with the estimated rows after each step.
@@ -276,11 +281,12 @@ struct State {
     distinct: Vec<f64>,
     order: Vec<usize>,
     estimates: Vec<f64>,
-    /// Per subject variable of the state's open star patterns: their predicates and, with
-    /// characteristic sets, the star's rows so far, extended as patterns join (one read of
-    /// each matching set per step, not the star from scratch per candidate).
+    /// Per subject variable of the state's open star patterns: their predicates and the
+    /// star's rows so far, extended as patterns join (one read of each matching set per step,
+    /// not the star from scratch per candidate). Empty in a search without the sets.
     stars: HashMap<usize, Subject>,
-    /// Per variable: the first edge `?x p ?y` in the order whose object it is.
+    /// Per variable: the first edge `?x p ?y` in the order whose object it is. Empty in a
+    /// search without the sets.
     edges_into: HashMap<usize, usize>,
     /// Per pattern with counted common values ([`Input::overlaps`]): the least share of
     /// a joined partner's values it has, kept up to date as partners join (a lookup per
@@ -349,6 +355,18 @@ thread_local! {
     /// Run at every step the orderer asks whether to stop, before it asks: a test's measure
     /// of planning work, and its way to cancel a query after a chosen amount of it.
     pub(super) static STEP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Star predicates and edges the orderer's states took on: the guard that a search
+    /// without the characteristic sets keeps none.
+    pub(super) static STAR_STATE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_star_state() {
+    #[cfg(test)]
+    STAR_STATE.with(|c| c.set(c.get() + 1));
 }
 
 fn note_statistics(_reads: usize, _steps: usize) {
@@ -426,13 +444,7 @@ fn search(
         let reads = sets.links_of(p) * (from.len() + to.len()).max(1);
         work.take(reads).then(|| sets.pair(from, p, to)).flatten()
     };
-    // The characteristic sets know which predicates subjects have, not their objects.
-    // A constant object (`?x a C`) is estimated by containment below, not as a share
-    // of the predicate's statements independent of the subject's other predicates
-    // (on materialised data a type follows from them: LUBM-10 q4 estimated 2 for
-    // 34), and doesn't stand for "has the predicate" in a later star either: its
-    // subjects have it, but read so (any subject with a type) LUBM-10's p90 was 30.
-    let open = |star: &Star| star.selectivity >= 1.0;
+    let open = Star::open;
     // `state` with pattern `j` joined, its `step` estimated already.
     let apply = |mut state: State, j: usize, step: Step| -> State {
         let input = &inputs[j];
@@ -449,25 +461,31 @@ fn search(
                 let known = &mut state.distinct[v];
                 *known = if *known > 0.0 { known.min(d) } else { d };
             }
-            if let Some(star) = input.star.filter(open) {
-                let subject = state.stars.entry(star.subject).or_default();
-                subject.rows = sets.and_then(|sets| match &subject.rows {
-                    Some(rows) => work.take(rows.len()).then(|| {
-                        note_statistics(rows.len(), 0);
-                        sets.star_with(rows, star.predicate)
-                    }),
-                    None => work.take(sets.sets_having(star.predicate)).then(|| {
-                        let rows = sets.star_of(star.predicate);
-                        note_statistics(rows.len(), 0);
-                        rows
-                    }),
-                });
-                subject.predicates.push(star.predicate);
-            }
-            if let (Some(object), Some(star)) = (input.edge_object, input.star)
-                && star.subject != object
-            {
-                state.edges_into.entry(object).or_insert(j);
+            // Stars and edges are read only by the estimates from the sets: a search without
+            // them builds and copies neither.
+            if let Some(sets) = sets {
+                if let Some(star) = input.star.filter(open) {
+                    let subject = state.stars.entry(star.subject).or_default();
+                    subject.rows = match &subject.rows {
+                        Some(rows) => work.take(rows.len()).then(|| {
+                            note_statistics(rows.len(), 0);
+                            sets.star_with(rows, star.predicate)
+                        }),
+                        None => work.take(sets.sets_having(star.predicate)).then(|| {
+                            let rows = sets.star_of(star.predicate);
+                            note_statistics(rows.len(), 0);
+                            rows
+                        }),
+                    };
+                    subject.predicates.push(star.predicate);
+                    note_star_state();
+                }
+                if let (Some(object), Some(star)) = (input.edge_object, input.star)
+                    && star.subject != object
+                {
+                    state.edges_into.entry(object).or_insert(j);
+                    note_star_state();
+                }
             }
             let partner = (input.count as f64).max(1.0);
             for &(i, both) in &input.overlaps {
@@ -626,24 +644,19 @@ fn search(
         });
     }
     // Every start state of an open star reads its predicate's sets (`star_of`) before the
-    // search first checks its work: the exhaustive and greedy searches
-    // build all their starts in input order, a fixed order its first (a start reads only where
-    // another input follows it, as `apply` decides). Where those reads would pass the budget,
-    // the search stops as it would after making them, with the work counted before the one
-    // that passes, having made none: their lengths come from the sets' index.
-    if let Some(sets) = sets
-        && n >= 2
-    {
-        let first = fixed.map(|order| order[0]);
+    // search first checks its work: the exhaustive and greedy searches build all their
+    // starts in input order, a fixed order its first ([`start_stars`]). Where those reads
+    // would pass the budget, the search stops as it would after making them, with the work
+    // counted before the one that passes, having made none: their lengths come from the
+    // sets' index.
+    if let Some(sets) = sets {
         let mut done = 0usize;
-        for j in (0..n).filter(|&j| first.is_none_or(|f| f == j)) {
-            if let Some(star) = inputs[j].star.filter(open) {
-                let next = done.saturating_add(sets.sets_having(star.predicate));
-                if next > budget {
-                    return Err(Stopped::Budget { work: done });
-                }
-                done = next;
+        for star in start_stars(inputs, fixed.map(|order| order[0])) {
+            let next = done.saturating_add(sets.sets_having(star.predicate));
+            if next > budget {
+                return Err(Stopped::Budget { work: done });
             }
+            done = next;
         }
     }
     // Every read and copy of the sets is counted before it is made; past the budget none is
@@ -762,12 +775,13 @@ mod tests {
     /// Spec: the master's order of 12 November 13:53, "enter the set search only when that
     /// plan's own estimate says the query is expensive enough", with "effort follows expected
     /// work", and its doubt review: a plan's expected work is its steps' estimates summed, NaN
-    /// left out and infinity kept; a BGP is planned with the sets where its starts' reads are
-    /// within [`SET_START_ALLOWANCE`] or it expects at least [`SET_GATE_ROWS`] rows, not else;
-    /// its budget is [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`] per expected row where that is
-    /// more, saturating (NaN to the floor); a test's budget and decision replace the planner's.
+    /// left out and infinity kept; a BGP is planned with the sets where it expects at least
+    /// [`SET_GATE_ROWS`] rows, not else (the master's decision of 13 November 23:58: no
+    /// allowance for short lists); its budget is [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`]
+    /// per expected row where that is more, saturating (NaN to the floor); a test's budget and
+    /// decision replace the planner's.
     #[test]
-    fn the_sets_are_read_only_where_their_lists_are_short_or_the_query_expects_much_work() {
+    fn the_sets_are_read_only_where_the_query_expects_much_work() {
         let plan = |rows: Vec<f64>| Plan {
             order: (0..rows.len()).collect(),
             rows,
@@ -778,16 +792,15 @@ mod tests {
             expected_work(&plan(vec![1.0, f64::INFINITY])),
             f64::INFINITY
         );
-        let many = SET_START_ALLOWANCE + 1;
         assert_eq!(
             [
-                admits(0.0, SET_START_ALLOWANCE),
-                admits(SET_GATE_ROWS - 1.0, many),
-                admits(SET_GATE_ROWS, many),
-                admits(f64::NAN, many),
-                admits(f64::INFINITY, usize::MAX),
+                admits(0.0),
+                admits(SET_GATE_ROWS - 1.0),
+                admits(SET_GATE_ROWS),
+                admits(f64::NAN),
+                admits(f64::INFINITY),
             ],
-            [true, false, true, false, true]
+            [false, false, true, false, true]
         );
         let large = SET_BUDGET as f64 / SET_ENTRIES_PER_ROW;
         assert_eq!(budget_for(0.0), SET_BUDGET);
@@ -796,11 +809,11 @@ mod tests {
         assert_eq!(budget_for(4.0 * large), 4 * SET_BUDGET);
         assert_eq!(budget_for(f64::INFINITY), usize::MAX);
         BUDGET.set(Some(2));
-        ADMIT.set(Some(false));
-        let (budget, admit) = (budget_for(4.0 * large), admits(0.0, 0));
+        ADMIT.set(Some(true));
+        let (budget, admit) = (budget_for(4.0 * large), admits(0.0));
         BUDGET.set(None);
         ADMIT.set(None);
-        assert_eq!((budget, admit), (2, false));
+        assert_eq!((budget, admit), (2, true));
     }
 
     #[test]
