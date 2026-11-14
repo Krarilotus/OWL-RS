@@ -3,6 +3,8 @@ tens of milliseconds is read, and a case without a reading fails at once. F2, 13
 ql-memberships-reuse (0.05 s) had none in four of six passes, sampled every 50 ms, and its memory
 series came out incomplete only in the report."""
 import os
+import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -88,16 +90,109 @@ class Sampler(unittest.TestCase):
         self.assertIn(mine[0], os.sched_getaffinity(0), "the harness's own thread moved")
 
 
+class HugePages(unittest.TestCase):
+    """Reported only (14 Nov 2026: F2's slower clients-lookups, the host's state unrecorded): a
+    process's transparent huge pages, from the scope's memory.stat the sampler reads anyway."""
+
+    def run_scope(self, stop_s, procs):
+        """The sampler on a fake clock until `stop_s`; the scope holds 6 MiB of huge pages until
+        0.1 s and 2 MiB after, having faulted 3, then 5 in all; `procs(t)`: the processes in the
+        scope at t, (pid, name). The sampler and each look for new processes: (t, known pids)."""
+        fast = load_fast()
+        clock, looks = [0.0], []
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary)
+            stat = group / "memory.stat"
+            write = lambda thp, faults: stat.write_text(
+                f"anon 8388608\nanon_thp {thp}\nkernel 4096\nthp_fault_alloc {faults}\nthp_collapse_alloc 1\n")
+            write(6 << 20, 3)
+            (group / "where").write_text(str(group))
+
+            class Halt:
+                def is_set(self):
+                    return clock[0] >= stop_s
+
+                def wait(self, seconds):
+                    clock[0] += seconds
+                    if clock[0] >= 0.1:
+                        write(2 << 20, 5)
+
+            def modes(where, known):
+                self.assertEqual(where, group)
+                looks.append((clock[0], set(known)))
+                return [{"pid": pid, "name": name, "thp_enabled": 1} for pid, name in procs(clock[0])
+                        if (pid, name) not in known]
+
+            with patch.object(fast, "time", types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(fast, "thp_modes", modes):
+                sampler = fast.AnonKernelSampler(group / "where")
+                sampler.halt = Halt()
+                sampler.run()
+        return sampler.thp, looks
+
+    def test_the_scope_s_huge_pages_at_their_peak_and_its_faults_and_collapses_so_far(self):
+        # Spec (cgroup v2 memory.stat): anon_thp is the anonymous huge pages charged now;
+        # thp_fault_alloc and thp_collapse_alloc count events since the cgroup began.
+        thp, _ = self.run_scope(0.5, lambda t: [(7, "perf_lab")])
+        self.assertEqual({k: v for k, v in thp.items() if k != "thp_enabled"},
+                         {"anon_thp_peak_bytes": 6 << 20, "thp_fault_alloc": 5, "thp_collapse_alloc": 1})
+
+    def test_each_process_new_in_the_scope_has_its_thp_enabled_with_its_pid(self):
+        # Spec (Sol r1, 14 Nov 2026; fast.py's setup cases): a shell runs `setup && case` in one
+        # scope; the setup (a perf_lab, its child) comes first, then the shell execs the case's
+        # perf_lab under its own pid. Each process (pid and name) is kept, with when it was first
+        # seen. The looks start after the dense first quarter second and come once a second.
+        procs = lambda t: [(6, "perf_lab"), (7, "bash")] if t < 1.0 else [(7, "perf_lab")]
+        thp, looks = self.run_scope(2.6, procs)
+        self.assertEqual([(m["pid"], m["name"], m["thp_enabled"]) for m in thp["thp_enabled"]],
+                         [(6, "perf_lab", 1), (7, "bash", 1), (7, "perf_lab", 1)])
+        self.assertTrue(0.25 <= thp["thp_enabled"][0]["seen_s"] < 0.35, thp)
+        self.assertTrue(1.0 <= thp["thp_enabled"][2]["seen_s"] < 1.4, thp)
+        self.assertEqual(len(looks), 3, looks)
+        self.assertGreaterEqual(looks[0][0], 0.25)
+        self.assertTrue(all(b[0] - a[0] >= 1.0 for a, b in zip(looks, looks[1:])), looks)
+        self.assertEqual(looks[-1][1], {(6, "perf_lab"), (7, "bash"), (7, "perf_lab")})
+
+    @unittest.skipUnless(Path("/proc/self/status").exists()
+                         and "THP_enabled" in Path("/proc/self/status").read_text(), "Linux 5.0+")
+    def test_a_process_under_prctl_thp_disable_reads_thp_enabled_0(self):
+        # Spec (proc(5), PR_SET_THP_DISABLE): a process that disabled THP for itself shows THP_enabled 0.
+        fast = load_fast()
+        child = subprocess.Popen([sys.executable, "-c", "import ctypes, time\n"
+                                  "assert ctypes.CDLL(None).prctl(41, 1, 0, 0, 0) == 0\n"
+                                  "print(flush=True)\ntime.sleep(5)"], stdout=subprocess.PIPE)
+        try:
+            child.stdout.readline()
+            with tempfile.TemporaryDirectory() as temporary:
+                (Path(temporary) / "cgroup.procs").write_text(f"{child.pid}\n")
+                modes = fast.thp_modes(Path(temporary), set())
+                again = fast.thp_modes(Path(temporary), {(m["pid"], m["name"]) for m in modes})
+        finally:
+            child.kill()
+            child.wait()
+        self.assertEqual([(m["pid"], m["thp_enabled"]) for m in modes], [(child.pid, 0)], modes)
+        self.assertEqual(again, [], "a process already known (pid and name) is not recorded again")
+
+    def test_a_case_s_record_carries_them(self):
+        thp = {"anon_thp_peak_bytes": 6 << 20, "thp_fault_alloc": 5,
+               "thp_enabled": [{"pid": 7, "name": "perf_lab", "thp_enabled": 1, "seen_s": 0.26}]}
+        code, _, error, _ = Process().run_case(1 << 20, thp=thp)
+        self.assertEqual(code, 0)
+        fast = load_fast()
+        observation = fast.invocation_observation({"name": "c", "metric": "whole_ms"}, {}, error, {})
+        self.assertEqual(observation["thp"], thp)
+
+
 class Process(unittest.TestCase):
-    def run_case(self, peak, measured=True):
+    def run_case(self, peak, measured=True, thp=None):
         fast = load_fast()
         done = types.SimpleNamespace(returncode=0, stdout="answer", stderr="")
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.multiple(fast, native_dirs=lambda: {}, FAST_DATA=Path(temporary),
                                scope_argv=lambda *_: ["scope", "--"], native=lambda command, _: command,
                                end_scope=lambda *_: None, pinned_cpus=lambda: None,
-                               AnonKernelSampler=lambda where, **_: types.SimpleNamespace(start=lambda: None,
-                                                                                          stop=lambda: peak)), \
+                               AnonKernelSampler=lambda where, **_: types.SimpleNamespace(
+                                   start=lambda: None, stop=lambda: peak, thp=thp or {})), \
                 patch.object(fast.subprocess, "run", return_value=done):
             return fast.process("case", 1, ["command"], measured=measured)
 

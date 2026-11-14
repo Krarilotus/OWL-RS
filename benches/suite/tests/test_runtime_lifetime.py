@@ -114,7 +114,7 @@ class ScopeLifetime(unittest.TestCase):
                                scope_argv=lambda *_: ["scope", "--"], native=lambda command, _: command,
                                end_scope=lambda *_: None, pinned_cpus=lambda: None,
                                AnonKernelSampler=lambda where, **_: types.SimpleNamespace(start=lambda: None,
-                                                                                     stop=lambda: 1 << 20),
+                                                                                     stop=lambda: 1 << 20, thp={}),
                                subprocess=types.SimpleNamespace(**{**vars(subprocess), "run": run})):
             for descriptors in ("", "9 14"):
                 with patch.dict(os.environ, {"SUITE_LEASE_FDS": descriptors}):

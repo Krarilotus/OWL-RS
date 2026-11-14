@@ -52,7 +52,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
-from suitekit.runtime import anon_kernel_bytes, end_scope, scope_argv  # noqa: E402
+from suitekit.runtime import anon_kernel_bytes, end_scope, scope_argv, stat_fields  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
@@ -268,6 +268,32 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
 # ql-memberships-reuse, 0.05 s, none in four of six passes). The reading itself
 # (anon_kernel_bytes) is suitekit/runtime.py's, which the suite's Docker runtime reads too.
 SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
+# The process's transparent huge pages, reported only (no hypothesis; 14 Nov 2026: a slower
+# clients-lookups in F2 that no later run reproduced, and the host's state then unrecorded). From
+# the same memory.stat reads, without walking a process's mappings under its mmap lock as
+# smaps_rollup does: the anonymous huge pages charged to the scope, at their sampled peak, and the
+# huge pages faulted and collapsed into it. That is the scope's, not one process's AnonHugePages
+# near its end: it holds the wrapper's and a setup's charges too (a setup's peak stays the peak),
+# and leaves out what a process was charged before it entered the scope. A case's process
+# allocates after its exec, inside the scope, so for it the two are close. After the scope's
+# first quarter second, once a second: each process new in the scope, its THP_enabled. A process
+# is its pid and name: a shell that execs its last command (a setup's `setup && case`) becomes the
+# case's process under the same pid.
+SCOPE_THP = re.compile(r"^fast-scope-thp (\{.*\})$", re.M)
+
+
+def thp_modes(group: Path, known: set) -> list[dict]:
+    """Each process in a cgroup not in `known` ((pid, name)): its pid, name and THP_enabled
+    (/proc/PID/status; 0 under prctl(PR_SET_THP_DISABLE), which its children inherit and an exec
+    keeps). A process gone before its status is read, or a kernel without the field: none."""
+    out = []
+    for pid in (group / "cgroup.procs").read_text().split():
+        with contextlib.suppress(OSError, ValueError):
+            status = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
+            name = status.get("Name", "").strip()
+            if "THP_enabled" in status and (int(pid), name) not in known:
+                out.append({"pid": int(pid), "name": name, "thp_enabled": int(status["THP_enabled"])})
+    return out
 
 
 class AnonKernelSampler(threading.Thread):
@@ -279,8 +305,9 @@ class AnonKernelSampler(threading.Thread):
     def __init__(self, where: Path, period_s: float = 0.05, dense_period_s: float = 0.001, dense_s: float = 0.25,
                  avoid: str | None = None):
         super().__init__(daemon=True)
-        self.where, self.period_s, self.peak = where, period_s, None
+        self.where, self.period_s, self.peak, self.thp = where, period_s, None, {}
         self.dense_period_s, self.dense_s, self.avoid = dense_period_s, dense_s, avoid
+        self.modes_period_s = 1.0
         self.halt = threading.Event()
 
     def run(self):
@@ -291,19 +318,28 @@ class AnonKernelSampler(threading.Thread):
                            for c in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)}
                 if others := os.sched_getaffinity(0) - avoided:
                     os.sched_setaffinity(0, others)
-        stat, found = None, None
+        stat, found, looked = None, None, -math.inf
         while not self.halt.is_set():
             try:
                 if stat is None:
                     group = self.where.read_text().strip() if self.where.is_file() else ""
                     stat = Path(group) / "memory.stat" if group else None
                     found = time.monotonic() if stat else None
-                value = anon_kernel_bytes(stat.read_text()) if stat else None
+                fields = stat_fields(stat.read_text()) if stat else {}
+                value = anon_kernel_bytes(fields) if stat else None
             except OSError:
                 value = None
             if value is not None:
                 self.peak = max(self.peak or 0, value)
+                if "anon_thp" in fields:
+                    self.thp["anon_thp_peak_bytes"] = max(self.thp.get("anon_thp_peak_bytes", 0), int(fields["anon_thp"]))
+                self.thp.update({k: int(fields[k]) for k in ("thp_fault_alloc", "thp_collapse_alloc") if k in fields})
             dense = found is None or time.monotonic() - found < self.dense_s
+            if value is not None and not dense and time.monotonic() - looked >= self.modes_period_s:
+                looked = time.monotonic()
+                with contextlib.suppress(OSError, ValueError):
+                    for mode in thp_modes(stat.parent, {(m["pid"], m["name"]) for m in self.thp.get("thp_enabled", [])}):
+                        self.thp.setdefault("thp_enabled", []).append({**mode, "seen_s": round(looked - found, 2)})
             self.halt.wait(self.dense_period_s if dense else self.period_s)
 
     def stop(self) -> int | None:
@@ -362,7 +398,8 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     err = SCOPE_PRESSURE.sub("", SCOPE_PEAK.sub("", done.stderr)).rstrip("\n")
     err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
            + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "")
-           + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "") + err)
+           + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "")
+           + (f"fast-scope-thp {json.dumps(sampler.thp, separators=(',', ':'))}\n" if sampler.thp else "") + err)
     # A command that succeeded has its scope's anon + kernel peak, or its case fails here, at once,
     # not as an incomplete memory series in the report.
     unread = "" if anon_kernel or done.returncode or not measured else "no anon+kernel reading of the case's scope"
@@ -1144,6 +1181,7 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
             "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr),
             **({"anon_kernel_peak_bytes": int(found[-1])} if (found := SCOPE_ANON_KERNEL.findall(stderr or "")) else {}),
+            **({"thp": json.loads(found[-1])} if (found := SCOPE_THP.findall(stderr or "")) else {}),
             **({"peak_live_requested_bytes": result["peak_live_requested_bytes"]}
                if isinstance(result.get("peak_live_requested_bytes"), int) else {}),
             **({"peak_kind": result["peak_kind"]} if result.get("peak_kind") else {}),
