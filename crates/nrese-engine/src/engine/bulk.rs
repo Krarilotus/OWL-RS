@@ -262,6 +262,10 @@ impl<'e> BulkLoad<'e> {
             }
         });
         renumbered?;
+        // The shards' arrays, freed as their texts moved into the segment's arena, go back
+        // before the sort's and the index's buffers: held, the text would count twice at the
+        // load's peak.
+        crate::memory::release_all();
         if let Some(spill) = spilled {
             return publish_spilled(engine, spill, current, started);
         }
