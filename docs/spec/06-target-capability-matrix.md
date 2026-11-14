@@ -4,7 +4,7 @@ What NRESE can do, capability by capability: its state, the work package that ow
 the evidence behind it: the developers' status per capability; what is in, left out and
 planned, for a reader, is the [scope](../what-it-covers.md#scope).
 
-**Status values** (defined 30 September 2026). Every row was checked against the code on
+The status values were defined on 30 September 2026. Every row was checked against the code on
 14 November 2026 (commit `5009ce9bd`): what it says the code does, and that the tests and
 benchmarks it names exist. Counts, timings and suite results are as recorded on the dates
 given, not re-run.
@@ -14,7 +14,7 @@ given, not re-run.
 
 What reasoning computes is stated precisely in [reasoning-semantics.md](reasoning-semantics.md).
 
-The **Evidence** column names the test or benchmark that moves a row to `done`.
+The Evidence column names the test or benchmark that moves a row to `done`.
 
 | Capability | Status | WP | Evidence |
 |---|---|---|---|
@@ -50,7 +50,8 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Graph-level access control | delivered: an access policy file names per role the graphs (by IRI or IRI prefix) it may read and write, and the default graph; each user queries its own dataset, restricted before evaluation (others absent, not forbidden), inferred statements hidden unless configured; a write that would change a graph the role may not write is refused as a whole (403), an explicit insert there even when the statement is already stored, while a delete that matches nothing the role may not write changes nothing and succeeds; covers SPARQL, the Graph Store Protocol, RDF4J statements and transactions; role names from JWT/OIDC claims, static tokens and client certificates; inferred statements by the graphs they came from (`inferred = "supported"`: visible when one of their support graph sets is readable, `nrese-store/src/support.rs`); open: inferences placed per graph, and support sets kept durably rather than recomputed after a restart | O1 | `nrese-server/tests/it/access_control_tests.rs` |
 | Metrics and tracing | delivered: readiness, revision, counts, modes, query-cache and query-memory metrics; request outcomes by kind and status class, latency histograms and requests in flight; index and dictionary bytes (heap and mapped) and resident memory; WAL bytes since the last checkpoint, compactions and checkpoints; backups and restores by outcome with the last success's time, duration and size; request ids and `tracing` spans | O3 | dashboards |
 
-**Evidence notes (2026-09-25; the v1 notes are historical):**
+## Evidence notes (2026-09-25; the v1 notes are historical)
+
 - v1 reasoning fixtures now run against vendored copies of the published vocabularies (`benches/nrese-bench-harness/fixtures/catalog-cache/`). Earlier SOSA evidence was invalid: the catalog URL served the SSN document, so the "SOSA" test asserted an SSN axiom. It now asserts SOSA's own `sosa:observes owl:inverseOf sosa:isObservedBy`.
 - (Historical, until 1 October 2026, when spareval left the runtime.) The general evaluator (spareval), which ran what the native executor didn't, differs from the specification in two cases found on 30 September 2026 while testing filter pushdown. The native executor follows the specification in both; the tests that pin them are `a_filter_sees_a_variable_a_subquery_hides_as_unbound` and the note in `filtered_group` (`native_differential_tests.rs`):
   - a filter on a variable that a subquery binds but doesn't project is moved into the subquery, so rows pass that should be dropped;

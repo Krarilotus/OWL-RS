@@ -1,4 +1,4 @@
-# Reasoner v2: design and plan to state-of-the-art reasoning
+# Reasoner v2: design and plan
 
 Status: **plan** (2026-09-25). Decision record: [ADR-0003](../adr/0003-materialised-reasoning.md). Roadmap: Milestone 3 in [ROADMAP.md](../ROADMAP.md). The v1 reasoner this replaces is described in [spec/03](../spec/reasoning-semantics.md).
 
@@ -273,7 +273,7 @@ The owlrl oracle doesn't finish within an hour. The equivalence and transitive m
 
 - **Insert:** semi-naive evaluation seeded with Δ⁺ (plus the facts Δ⁺ implies through modules).
 - **Delete**, in two stages. Both are required to agree with rematerialisation (T6).
-  1. **DRed** (Gupta, Mumick, Subrahmanian, SIGMOD 1993) comes first, as the simple, robust baseline. It overdeletes everything derivable from Δ⁻, then rederives what still has support.
+  1. **DRed** (Gupta, Mumick, Subrahmanian, SIGMOD 1993) comes first, as the simple baseline. It overdeletes everything derivable from Δ⁻, then rederives what still has support.
   2. **B/F and FBF** (Motik et al., AAAI 2015; AIJ 2019) are the default for non-module strata. Each deleted fact first gets a backward check for an alternative proof, and only unsupported facts propagate forward. This avoids DRed's overdeletion blow-up when facts have many derivations, which is typical for type hierarchies.
 - **The maintenance policy** (`delta::policy`, B3a of ADR-0011) estimates, before a deletion is maintained and again when overdeletion meets an equality, the work of each plan in facts touched, and takes the cheapest: DRed with B/F; recomputing the part the change touches; or rebuilding the whole state in the commit. Recomputing overdeletes a region's facts (those that mention its terms) and their consequences at once, and derives them again from what remains: the region's facts in bulk (what the other rules derive in one step, and every copy of a remaining fact within the classes the remaining equalities make, to a fixpoint), the rest by phase 3. A rebuild is offered only to a change that inserts nothing (deletions introduce no violations); the delta executor then stops before any work, and the store's maintenance materialises the state after the change and applies the difference to the stack. The one region kind so far is an `owl:sameAs` class a deletion may split, where DRed copies every member's facts through every other member. Other cases (large deletes, long chains) add their regions and estimates there.
 - **Counting** (per-fact derivation counts) is the AIJ 2019 winner for non-recursive strata, but it needs persistent per-fact state. It is **evaluated in R5** against FBF on the benchmark mix, and adopted only if FBF misses T5 on non-recursive strata.
@@ -307,7 +307,7 @@ The owlrl oracle doesn't finish within an hour. The equivalence and transitive m
 
 ### 6.2 Graph semantics
 
-- **Default (`placement = default-graph`):** rules match over the **union of all graphs**, and inferences go to the default graph, as in the common materialising stores.
+- **Default (`placement = default-graph`):** rules match over the **union of all graphs**, and inferences go to the default graph.
 - **`graph:<IRI>`** is the same, with inferences in a dedicated named graph.
 - **`source-graph`:** rules are evaluated per named graph, and inferences stay in the graph whose statements derived them. Schema statements can be shared from a configured set of graphs. The IR's atoms carry a graph term for this (R9).
 

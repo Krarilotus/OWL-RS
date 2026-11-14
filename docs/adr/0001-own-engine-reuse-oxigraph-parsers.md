@@ -31,6 +31,6 @@ Oxigraph is also published as separate, well-tested crates:
 ## Consequences
 
 - Full SPARQL 1.1 query/update and the protocol dataset parameters are available immediately on the new engine.
-- Performance work concentrates where it matters: indexes, the commit path, joins.
+- Performance work concentrates on indexes, the commit path and joins.
 - We depend on the Oxigraph crate family's release cadence. Versions are pinned and upgraded deliberately.
 - The `durable-storage` Cargo feature and the RocksDB dependency are removed.
