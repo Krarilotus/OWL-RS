@@ -47,7 +47,8 @@ Besides a repository's settings, only the result cache's pins and the access sta
 ## Validation
 
 - Unknown keys in the TOML file are a startup error that names the key (for example a misspelt `mdoe`). Known aliases such as `server.bind_addr` still work.
-- `nrese-server config-schema` prints the JSON Schema of the configuration file (2020-12): every key with its type, allowed values, description, environment variable (`x-env`), older keys (`x-older-keys`), and `writeOnly` for credentials. Editors and the console can validate and complete `config.toml` with it.
+- `nrese-server config-schema` prints the JSON Schema of the configuration file (2020-12; of the commit it is built from): every key with its type, allowed values, description, environment variable (`x-env`), older keys (`x-older-keys`), and `writeOnly` for credentials. Editors and the console can validate and complete `config.toml` with it.
+- The schema's allowed values are each choice's canonical names. The aliases a row names (such as `store.mode`'s `durable`) are accepted as well, from the file, the environment and `--set` alike; an editor that validates against the schema flags them.
 - A value of the wrong kind (text for a flag, a negative number) is a startup error that names the key.
 - `nrese-server check-config [--config FILE]` loads and validates the configuration (file, then environment overrides), prints the main effective settings and exits ([commands](server-setup.md#commands)). It doesn't print every setting: `budgets.process_memory`, `budgets.huge_pages`, `budgets.reasoning_release`, the `dl.*` settings and the `store.reader_*` settings are among those it leaves out. Credentials are never printed: authentication and AI show their mode and provider only. `reasoner.semantics` shows the ruleset and its semantic fingerprint (the stored inferences are rebuilt when it changes).
 
