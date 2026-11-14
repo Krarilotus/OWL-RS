@@ -671,6 +671,15 @@ fn publish_streamed(
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
     let mut committed_micros = None;
+    // The checkpoint's sections (the dictionary, its text order, each permutation) each
+    // allocate and free buffers of their own. What the load freed goes back here, before the
+    // checkpoint; what the sections freed, before each asserted permutation is asked for (the
+    // first after both the dictionary and its text order: the shared writer doesn't release
+    // between them). Held, it stacked up to the load's peak: on DBpedia core the median of
+    // five peaks fell from 6.37 to 6.23 GiB, the load time within the runs' spread
+    // (14 Nov 2026). Only a load's checkpoint releases: a serving store's
+    // ([`checkpoint::write_stamped`]) doesn't.
+    crate::memory::release_all();
     let path = commit_image(durable, revision, || {
         checkpoint::write_parts(
             durable.root(),
@@ -687,6 +696,10 @@ fn publish_streamed(
             &mut |stack, permutation| {
                 Ok(match stack {
                     Stack::Asserted => {
+                        // What the sections before freed (the dictionary and its text
+                        // order, or the last permutation written), back before this one is
+                        // asked for.
+                        crate::memory::release_all();
                         let packed = source.packed(permutation)?;
                         if permutation == Permutation::Spog {
                             len = packed.len() as u64;
