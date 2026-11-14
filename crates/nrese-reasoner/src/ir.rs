@@ -19,6 +19,8 @@
 
 use std::fmt;
 
+use crate::eval::Poller;
+
 pub const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 pub const OWL: &str = "http://www.w3.org/2002/07/owl#";
@@ -71,8 +73,11 @@ pub enum Guard {
 }
 
 impl Guard {
-    /// Whether the guard holds for the terms' values (`None`: unbound, decided later).
-    pub fn holds(&self, value: impl Fn(Term) -> Option<u64>) -> bool {
+    /// Whether the guard holds for the terms' values (`None`: unbound, decided later). The
+    /// search over members of `owl:sameAs` classes ([`Guard::OverClasses`]) counts each
+    /// choice on `poll`; once that has stopped it answers false, and the run around it
+    /// answers [`Stopped`](crate::eval::Stopped).
+    pub fn holds(&self, value: impl Fn(Term) -> Option<u64>, poll: &Poller<'_>) -> bool {
         match self {
             Guard::NotEqual(a, b) => match (value(*a), value(*b)) {
                 (Some(a), Some(b)) => a != b,
@@ -100,8 +105,8 @@ impl Guard {
                 let value: &dyn Fn(Term) -> Option<u64> = &value;
                 // The representatives are members of their classes: where they satisfy
                 // the guards, members do.
-                guards.iter().all(|guard| guard.holds(value))
-                    || super::representatives::members_satisfy(guards, value, classes)
+                guards.iter().all(|guard| guard.holds(value, poll))
+                    || super::representatives::members_satisfy(guards, value, classes, poll)
             }
         }
     }

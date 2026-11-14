@@ -505,12 +505,14 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
 
 
 def describe(r: dict) -> str:
+    missing = (r.get("shapes") or {}).get("missing")
+    lacking = f"; {missing} blocks without readings on one side" if missing else ""
     if r.get("ratio") is None:
-        return f"{r.get('blocks', 0)} blocks with values on both sides"
+        return f"{r.get('blocks', 0)} blocks with values on both sides{lacking}"
     ci = f" [{r['ci'][0]:.4f}, {r['ci'][1]:.4f}]" if r.get("ci") else ""
     flip = f", sign-flip p {r['p_sign_flip']:.3g}" if r.get("p_sign_flip") is not None else ""
     return (f"{fmt(r['base'])} -> {fmt(r['new'])} {r['unit']}, ratio {r['ratio']:.4f}{ci}, one-sided p {r['p']:.3g}"
-            f"{flip}, {r['units']} units of {r['blocks']} blocks")
+            f"{flip}, {r['units']} units of {r['blocks']} blocks{lacking}")
 
 
 def worse_end(r: dict) -> float | None:
@@ -521,44 +523,80 @@ def worse_end(r: dict) -> float | None:
 
 
 def block_contrasts(base: list[list[float]], base_blocks: list, new: list[list[float]], new_blocks: list,
-                    layouts: dict) -> tuple[list[float], list, float, float]:
+                    layouts: dict, step: float = 0.0) -> tuple[list[float], list, float, float, Counter]:
     """Per block present on both sides: log(median of the candidate's values in it / median of the
-    baseline's); the blocks' layouts; the medians of all the baseline's and candidate's values."""
+    baseline's); the blocks' layouts; the medians of all the baseline's and candidate's values; and
+    how many blocks had a median below the counter's step (`step`), on which side.
+
+    A median below one step is a reading below the counter's resolution, never a missing one (the
+    below-resolution design, 14 Nov 2026: dropping such blocks dropped exactly those where a cost
+    appeared on one side). It stands for the middle of [0, step), step / 2, so a block where the
+    baseline reads 0.0 and the candidate 5.0 counts as a loss and one where both read 0.0 as none.
+    A median of 0 where the counter has no step (qps) is no reading: `zero`. A block of either side
+    without a finite reading on both is `missing`, and its series incomplete: a missing reading
+    never passes (below-resolution review: an empty list kept as the series' key left the other
+    blocks to decide it, by its readings or by the test)."""
     def by_block(values, blocks):
         out: dict = {}
         for vs, b in zip(values, blocks):
             out.setdefault(b, []).extend(v for v in vs if isinstance(v, (int, float)) and math.isfinite(v))
         return out
     b_, n_ = by_block(base, base_blocks), by_block(new, new_blocks)
-    contrasts, lays = [], []
+    contrasts, lays, shapes = [], [], Counter()
+    shapes["missing"] = sum(1 for block in set(b_) | set(n_) if not (b_.get(block) and n_.get(block)))
     for block in sorted(set(b_) & set(n_), key=str):
         if b_[block] and n_[block]:
             mb, mn = statistics.median(b_[block]), statistics.median(n_[block])
-            if mb > 0 and mn > 0:
-                contrasts.append(math.log(mn / mb))
-                lays.append(layouts.get(block, 1))
+            below_b, below_n = mb < step, mn < step
+            if (mb <= 0 or mn <= 0) and step <= 0:
+                shapes["zero"] += 1
+                continue
+            shapes[{(True, True): "both below", (True, False): "base below",
+                    (False, True): "new below", (False, False): "measured"}[(below_b, below_n)]] += 1
+            contrasts.append(math.log((step / 2 if below_n else mn) / (step / 2 if below_b else mb)))
+            lays.append(layouts.get(block, 1))
     every_b = [v for vs in b_.values() for v in vs]
     every_n = [v for vs in n_.values() for v in vs]
     return contrasts, lays, (statistics.median(every_b) if every_b else None), \
-        (statistics.median(every_n) if every_n else None)
+        (statistics.median(every_n) if every_n else None), shapes
 
 
 # The counters' own resolution (research round 8: not a tolerance; a difference within it the test
 # doesn't reject is `unresolved`, never neutral): times to the reported step (quantum(), batches
 # dividing it), peaks in bytes where reported, else whole MiB.
 COUNTER_STEP = {"ms": 0.001, "MiB": 1.0, "bytes": 1.0, "qps": 0.0}
+# Verdicts below the counter's resolution, decided by the readings themselves and kept out of the
+# Holm family (an untestable hypothesis there would only lower every other's alpha / m), each
+# reported (the below-resolution design, 14 Nov 2026): every block below one step on both sides,
+# covered by the case's whole run (COVER) or blocking; every block below it on the candidate alone,
+# a gain; every block below it on the baseline alone, `emerged`: a cost appearing where there was
+# none to time, which blocks unless the owner's [[emerged]] entry accepts it (no round can confirm
+# it statistically in time: 2^-blocks over a family of about 1,200 needs 15 blocks).
+OUTSIDE_FAMILY = ("below resolution", "vanished", "emerged")
+# The timed series holding every other time series of its case: a classifier process's whole run.
+COVER = f"time/{cases_registry.WHOLE_RUN}"
+
+
+def uncovered(side: str, case: str, d: str, row: dict, declared) -> bool:
+    """A series below resolution (both sides below the step in every block) that no measured,
+    declared whole run of its case covers: it blocks (gate(); the A/A probe counts it too)."""
+    cover = row["dimensions"].get(COVER)
+    return row["dimensions"][d]["status"] == "below resolution" and not (
+        d.startswith("time/") and d != COVER and hypothesis(side, case, COVER) in declared
+        and cover is not None and cover["status"] not in OUTSIDE_FAMILY + ("incomplete",))
 
 
 def dimension(base: list[list[float]], base_blocks: list, new: list[list[float]], new_blocks: list,
               layouts: dict, unit: str, higher_is_better: bool = False, step: float | None = None,
               floor: float = 0.0) -> dict:
     """One dimension: its block contrasts and the one-sided test of a loss (gatestats.loss_test),
-    its spread at least the host's A-A' floor."""
-    contrasts, lays, b, n = block_contrasts(base, base_blocks, new, new_blocks, layouts)
+    its spread at least the host's A-A' floor; or, every block below the counter's step on both
+    sides or on the candidate alone, its verdict below resolution (OUTSIDE_FAMILY)."""
     step = COUNTER_STEP[unit] if step is None else step
+    contrasts, lays, b, n, shapes = block_contrasts(base, base_blocks, new, new_blocks, layouts, step)
     r = gatestats.loss_test(contrasts, lays, higher_is_better, resolution=step, scale=b or 0, floor=floor)
     out = {"unit": unit, "higher_is_better": higher_is_better, "base": b, "new": n, "step": step, **r,
-           "contrasts": [round(c, 6) for c in contrasts],
+           "contrasts": [round(c, 6) for c in contrasts], "shapes": dict(shapes),
            "ratio": math.exp(r["mean_log"]) if r["mean_log"] is not None else None}
     if r["ci"]:
         # The interval of new/base (gatestats tests the worse direction: undo its sign).
@@ -566,11 +604,20 @@ def dimension(base: list[list[float]], base_blocks: list, new: list[list[float]]
         out["ci"] = [math.exp(-hi), math.exp(-lo)] if higher_is_better else [math.exp(lo), math.exp(hi)]
         if higher_is_better:
             out["ratio"] = math.exp(-r["mean_log"])
-    if r["verdict"] == "incomplete":
+    below = shapes["both below"] + shapes["base below"] + shapes["new below"]
+    if shapes["zero"] or shapes["missing"]:
+        out["status"] = "incomplete"         # a zero where the counter has no step, or a block without readings
+    elif contrasts and shapes["both below"] == len(contrasts):
+        out["status"] = "below resolution"   # OUTSIDE_FAMILY: covered, or it blocks
+    elif contrasts and shapes["new below"] == len(contrasts):
+        out["status"] = "vanished"           # OUTSIDE_FAMILY: a gain
+    elif contrasts and shapes["base below"] == len(contrasts):
+        out["status"] = "emerged"            # OUTSIDE_FAMILY: blocks unless the owner accepts it
+    elif r["verdict"] == "incomplete":
         out["status"] = "incomplete"
     elif r["p"] <= gatestats.ALPHA * gatestats.PAIR_WEIGHTS[0]:
         out["status"] = "loss shown"         # this round: a confirmation is due (rounds_needed)
-    elif r.get("below_resolution"):
+    elif r.get("below_resolution") or below:
         out["status"] = "unresolved"         # within the counter's step, no loss shown
     else:
         out["status"] = "no loss shown"
@@ -587,9 +634,9 @@ def hypothesis(side: str, case: str, dimension_: str) -> str:
     return f"{side}|{case}|{dimension_}"
 
 
-# The phases each classifier tool times (fast.py's samples(): the profile's fields it reports).
-DL_TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
-                  "classify-horn": ("read", "owl", "write")}
+# The phases each classifier tool times (fast.py's samples(): the profile's fields it reports);
+# a case's `phases` declares fewer where the tool can't resolve the others (benches/cases/README.md).
+DL_TOOL_PHASES = cases_registry.TOOL_PHASES
 
 
 def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] = ("base", "main")) -> list[str]:
@@ -606,8 +653,11 @@ def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] 
         if case.get("outcome", "ok") != "ok":
             continue
         tool = case.get("tool", "perf_lab")
+        # A classifier's phases and its process's whole run, their cover (COVER).
         series = manifest_["series"].get(name) or (list(fast.DL_PHASES) if tool == "tableau" else
-                                                   list(DL_TOOL_PHASES.get(tool, ["_"])))
+                                                   list(case.get("phases") or (
+                                                       [*DL_TOOL_PHASES[tool], cases_registry.WHOLE_RUN]
+                                                       if tool in DL_TOOL_PHASES else ["_"])))
         dims = [f"time/{s}" for s in series]
         dims += [f"qps/{n}" for n in manifest_["clients"].get(name, [])]
         dims.append("memory/anon_kernel")
@@ -651,7 +701,7 @@ def decide(parts: list[list[dict]]) -> dict:
     round 3 could still get rejected, whether or not round 1 flagged it: a loss first seen while
     confirming another is confirmed too, not dropped); everything else passes at the end of its
     budget."""
-    family, rounds_p, where, untested = [], {}, {}, {}
+    family, rounds_p, where, untested, resolution = [], {}, {}, {}, {}
     for rounds in parts:
         declared = rounds[0].get("family") or list(rounds[0].get("pvalues", {}))
         family += [h for h in declared if h not in where]
@@ -660,6 +710,9 @@ def decide(parts: list[list[dict]]) -> dict:
         for k, report in enumerate(rounds[:3]):
             for h, p in (report.get("pvalues") or {}).items():
                 rounds_p.setdefault(h, [None, None, None])[k] = p
+        for report in rounds:
+            for h, status in (report.get("resolution") or {}).items():
+                resolution.setdefault(h, set()).add(status)
         # A declared hypothesis any round given didn't test, for the reason the gate gave
         # (compare_case), the statistical slots or not: not part of a pass however the rest comes
         # out (review abba-not-compared r1 W-OUT1; release-not-compared r1 W1: a fourth round's).
@@ -667,6 +720,12 @@ def decide(parts: list[list[dict]]) -> dict:
             for h, why in (report.get("not_compared") or {}).items():
                 if h in declared:
                     untested.setdefault(h, why)
+    # Decided below the counter's resolution in every round that ran it, tested in none and
+    # compared in all (OUTSIDE_FAMILY): out of Holm, where its p of 1 would only lower every
+    # other's alpha / m. One that a round tested, or didn't compare, stays in.
+    outside = {h: sorted(resolution[h]) for h in family
+               if h in resolution and h not in untested and all(p is None for p in rounds_p.get(h, [None]))}
+    family = [h for h in family if h not in outside]
     combined = {h: gatestats.combine_rounds(rounds_p.get(h, [None, None, None])) for h in family}
     rejected = gatestats.holm(combined)
     # Round 3 where it could still decide: Holm rejects it if every hypothesis measured in round 2
@@ -687,7 +746,7 @@ def decide(parts: list[list[dict]]) -> dict:
             pending.append(h)
     return {"family": family, "m": len(family), "combined": combined, "rounds": rounds_p,
             "losses": sorted(rejected, key=lambda h: combined[h]), "pending": pending,
-            "not_compared": {h: untested[h] for h in family if h in untested}}
+            "not_compared": {h: untested[h] for h in family if h in untested}, "outside": outside}
 
 
 # --- the owner's policy: trade-offs and exceptions (benches/release-tradeoffs.toml) -------------
@@ -702,6 +761,7 @@ AUTHORITY_KEYS = {"approved", "by", "reason", "quote", "source"}
 TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
 EXCEPTION_KEYS = {"case", "outcome"} | AUTHORITY_KEYS
 ABSENCE_KEYS = {"side", "port"} | AUTHORITY_KEYS  # and its scope: `cases` or `pattern`, one of them
+EMERGED_KEYS = {"case", "dimension", "max"} | AUTHORITY_KEYS
 # The outcomes the bar forbids, which only an owner exception accepts: a wrong answer. A declared
 # limit (memory-limit, gave-up, timeout, unsupported) blocks where a baseline completes (compare_case)
 # and is named where none does; it is neither a wrong answer nor a loss.
@@ -715,6 +775,7 @@ class Policy(NamedTuple):
     exceptions: list[dict]
     errors: list[str]
     absences: tuple[dict, ...] = ()
+    emerged: tuple[dict, ...] = ()
 
 
 NO_POLICY = Policy([], [], [])
@@ -735,17 +796,20 @@ def load_policy(text: str) -> Policy:
     and the win that pays for it (`pays_with`: case and dimension, which must show as better in
     the same report). An exception names a case and the outcome it accepts there. An absence names
     the cases (`cases`, or a `pattern` of their names) a baseline (`side`) isn't compared on, why,
-    and the `port` planned to compare them. Each carries the owner's approval: `approved` (date),
-    `by`, `reason`, `quote` (his words) and `source`."""
+    and the `port` planned to compare them. An emerged entry names a case, a dimension, optionally
+    the baseline (`against`), and the largest candidate median (`max`, in the dimension's unit) a
+    cost appearing from below the counter's step may reach. Each carries the owner's approval:
+    `approved` (date), `by`, `reason`, `quote` (his words) and `source`."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         return Policy([], [], [f"not TOML: {error}"])
-    tables = {"tradeoff", "exception", "absence"}
-    errors = [f"unknown table {k!r} (tradeoff, exception, absence)" for k in sorted(set(data) - tables)]
+    tables = {"tradeoff", "exception", "absence", "emerged"}
+    errors = [f"unknown table {k!r} (tradeoff, exception, absence, emerged)" for k in sorted(set(data) - tables)]
     tradeoffs, exceptions = data.get("tradeoff", []), data.get("exception", [])
-    absences = data.get("absence", [])
-    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences)):
+    absences, emerged = data.get("absence", []), data.get("emerged", [])
+    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences),
+                         ("emerged", emerged)):
         if not (isinstance(entries, list) and all(isinstance(e, dict) for e in entries)):
             errors.append(f"{key}: an array of tables ([[{key}]]), not {type(entries).__name__}")
     if errors:
@@ -780,7 +844,25 @@ def load_policy(text: str) -> Policy:
                 isinstance(e.get("pattern"), str) and e["pattern"].strip() or
                 isinstance(e.get("cases"), list) and e["cases"] and all(isinstance(c, str) for c in e["cases"]))):
             errors.append(f"absence {i}: its cases: a list (`cases`) or a pattern of their names (`pattern`), one")
-    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences))
+    for i, e in enumerate(emerged, start=1):
+        if missing := EMERGED_KEYS - set(e):
+            errors.append(f"emerged {i}: missing {', '.join(sorted(missing))}")
+        elif error := authority_error(f"emerged {i}", e):
+            errors.append(error)
+        elif (isinstance(e["max"], bool) or not isinstance(e["max"], (int, float))
+              or not (math.isfinite(e["max"]) and e["max"] > 0)):   # TOML true is no limit
+            errors.append(f"emerged {i}: max must be a finite number above 0")
+        elif "against" in e and e["against"] not in cases_registry.BASELINES:
+            errors.append(f"emerged {i}: against: a baseline (base, main)")
+    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences), tuple(emerged))
+
+
+def emerged_accepted(policy: Policy, e: dict) -> dict | None:
+    """The owner's emerged entry covering this cost (its case, dimension and baseline, the
+    candidate's median at most its `max`), if one does."""
+    return next((t for t in policy.emerged if (t["case"], t["dimension"]) == (e["case"], e["dimension"])
+                 and t.get("against", e["side"]) == e["side"] and e["new"] is not None and e["new"] <= t["max"]),
+                None)
 
 
 def absence_of(policy: Policy, side: str, case: str) -> dict | None:
@@ -919,7 +1001,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                            "run": p["report"].get("run"), "layout": p["report"].get("layout")}
                           for p in sorted(passes, key=lambda p: p["n"])],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
-               "context": context, "flagged": [], "other_blocking": [], "pvalues": {},
+               "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {}, "emerged": [],
                "not_run": not_run, "elsewhere": elsewhere, "errors": [],
                "candidate_failures": {}, "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
     if missing := [s for s in required if s not in baselines]:
@@ -988,13 +1070,22 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 if h not in declared:
                     row["notes"].append(f"{d}: not in the declared family, reported only")
                     continue
+                if r["status"] in OUTSIDE_FAMILY:
+                    summary["resolution"][h] = r["status"]
+                    if uncovered(side, case, d, row, declared):
+                        summary["blocking"].append(f"{case} against {side}: {d}: below the counter's step on both "
+                                                   f"sides in every block, and no measured {COVER} covers it")
+                    if r["status"] == "emerged":
+                        summary["emerged"].append({"side": side, "case": case, "dimension": d, "base": r["base"],
+                                                   "new": r["new"], "unit": r["unit"], "step": r["step"]})
+                    continue
                 summary["pvalues"][h] = r["p"]
                 if r["status"] == "incomplete":
                     summary["blocking"].append(f"{case} against {side}: {d}: incomplete ({describe(r)})")
                 elif r["status"] == "loss shown":
                     summary["flagged"].append({"side": side, "case": case, "dimension": d,
                                                **{k: r.get(k) for k in ("p", "ratio", "ci", "units", "blocks", "unit")}})
-    summary["untested"] = sorted(set(declared) - set(summary["pvalues"]))
+    summary["untested"] = sorted(set(declared) - set(summary["pvalues"]) - set(summary["resolution"]))
     # Fail closed: a declared hypothesis of a case this round ran that has no test and no stated
     # reason (the candidate failing the case, a baseline that can't run it or doesn't support the
     # metric, evidence lost on the candidate, which blocks) has lost its candidate evidence.
@@ -1017,7 +1108,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     # own only when nothing is flagged, failed or missing.
     # A wrong answer the case declares passes no round alone: only the verdict's policy accepts one.
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
-                         and not summary["flagged"]
+                         and not summary["flagged"] and not summary["emerged"]
                          and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
     return summary
 
@@ -1078,6 +1169,14 @@ def render(summary: dict) -> str:
                       if r["status"] == "unresolved"]
         if unresolved:
             lines += [f"Unresolved (within the counter's step, no loss shown): {', '.join(unresolved)}", ""]
+        for status, what in (("below resolution", f"below the counter's step on both sides; {COVER} covers each, or it blocks"),
+                             ("vanished", "below the counter's step on the candidate alone, a gain"),
+                             ("emerged", "below the counter's step on the baseline alone: blocks unless the owner "
+                                         "accepts it")):
+            named = [f"{case} {d}" for case, row in rows.items() for d, r in row["dimensions"].items()
+                     if r["status"] == status]
+            if named:
+                lines += [f"{status.capitalize()} ({what}; outside the Holm family): {', '.join(named)}", ""]
         not_compared = {k: v["reason"] for k, v in rows.items() if not v["comparable"]}
         if not_compared:
             lines += [f"Not compared against {side} ({len(not_compared)}):", ""] + \
@@ -1586,8 +1685,10 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_bl
                 for (rev, s), m in e["series"].items() if len(m) >= 2 and min(m) > 0]
         seconds = {rev: statistics.mean(v) for rev, v in e["seconds"].items()}
         # One execution of every query (a DL tool's file: its phases), on the slowest side that
-        # ran the case (a baseline that can't run it has no times).
-        per_run = max((sum(r["median_ms"] for r in rows if r["rev"] == rev) for rev in revs), default=0.0)
+        # ran the case (a baseline that can't run it has no times). A classifier process's whole
+        # run (its phases and every --repeat run) is no part of one execution.
+        once = [r for r in rows if r["series"] != cases_registry.WHOLE_RUN]
+        per_run = max((sum(r["median_ms"] for r in once if r["rev"] == rev) for rev in revs), default=0.0)
         added = 0.0  # a process's added measured time, on every side
         entry = {}
         measured_runs = e["measured"].get("runs")
@@ -1612,10 +1713,10 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_bl
                 if len(short) < len({r["series"] for r in rows}):
                     entry["batch_queries"] = short
             added = (new_runs - (measured_runs or runs)) * per_run / 1000
-        elif case.get("tool") in ("tableau", "classify-horn") and "ok" in e["status"] and rows:
+        elif case.get("tool") in ("tableau", "classify-horn") and "ok" in e["status"] and once:
             # Files a process (the tableau's), or classifications whose median it reports
             # (the context classifier's).
-            whole = per_run if case["tool"] == "tableau" else max(r["median_ms"] for r in rows)
+            whole = per_run if case["tool"] == "tableau" else max(r["median_ms"] for r in once)
             repeat = int(case.get("repeat", 1))
             limit = 0.4 * float(case.get("timeout_s", 300)) * 1000 / max(whole, 1e-3)
             new = int(min(MAX_REPEAT, limit, max(repeat, math.ceil(DL_MS / max(whole, 1e-3)))))
@@ -2846,7 +2947,11 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
     d = decide(parts)
     lines = ["# Release verdict", "",
              f"Family: {d['m']} hypotheses declared (case x series or metric x baseline, every timed part); "
-             f"Holm at {gatestats.ALPHA} over p = min(max(p1, p2) / 0.9, max(p2, p3) / 0.1).", ""]
+             f"Holm at {gatestats.ALPHA} over p = min(max(p1, p2) / 0.9, max(p2, p3) / 0.1)"
+             + (f"; {len(d['outside'])} more decided below the counter's resolution, outside it" if d["outside"] else "")
+             + ".", ""]
+    lines += [f"- decided below the counter's step: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: "
+              f"{', '.join(s)}" for h, s in d["outside"].items()]
     evidence = list(evidence or [])
     lines += [f"- **not the candidate's**: {e}" for e in evidence]
     lines += [f"- **policy**: {POLICY_FILE}: {e}" for e in policy.errors]
@@ -2873,6 +2978,17 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
         else:
             blocking_losses.append(text)
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
+    # A cost appearing from below the counter's step, in any round: no statistics to wait for.
+    blocking_emerged = []
+    for e in (e for rounds in parts for r in rounds for e in r.get("emerged", [])):
+        text = (f"{e['case']} against {e['side']}: {e['dimension']}: {fmt(e['base'])} -> {fmt(e['new'])} {e['unit']} "
+                f"(below its step of {e['step']:g} on {e['side']} in every block)")
+        if t := emerged_accepted(policy, e):
+            lines.append(f"- accepted emerged cost: {text} (at most {t['max']}, approved {t['approved']} by {t['by']}, "
+                         f"{t['source']})")
+        else:
+            blocking_emerged.append(text)
+    lines += [f"- **emerged**: {t}" for t in blocking_emerged]
     lines += [f"- **pending** (a round that could reject it hasn't run): {h}" for h in d["pending"]]
     # A baseline absent by product (the harness's catalogue, in each report) declared no hypothesis;
     # one the owner's absence entry names (the candidate's policy) is not compared by his decision;
@@ -2921,7 +3037,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
                  f"({'; '.join(map(str, w3c.get('errors') or [])) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
                  f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not d["pending"] and not not_compared and not other and not errors
+    passed = (not blocking_losses and not blocking_emerged and not d["pending"] and not not_compared and not other
+              and not errors
               and not diagnostic and not missing and not empty and w3c_ok and guards_ok
               and not evidence and not policy.errors and not wrong)
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]

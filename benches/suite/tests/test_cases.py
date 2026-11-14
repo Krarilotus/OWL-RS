@@ -61,6 +61,8 @@ class Mistakes(unittest.TestCase):
     def test_a_good_case_has_no_problem(self):
         self.assertEqual(self.problems(), [])
         self.assertEqual(self.problems(absent={"main": "supported inference"}), [])
+        self.assertEqual(self.problems(tool="classify-el", phases=["read", "normalise", "wall"]), [])
+        self.assertEqual(self.problems(tool="classify-horn", phases=["read", "owl", "write"]), [])
 
     def test_each_mistake_is_named(self):
         for changes, words in [
@@ -79,6 +81,14 @@ class Mistakes(unittest.TestCase):
             # The master's decision of 11 Nov on IB1347, 1a: a baseline (base or main) and the capability it lacks.
             ({"absent": {"cand": "supported inference"}}, "absent: a baseline (base, main) and the capability"),
             ({"absent": {"main": ""}}, "absent: a baseline (base, main) and the capability"),
+            # A case declares only phases its classifier tool prints (README.md, what the tool can resolve).
+            ({"phases": ["read"]}, "phases: only a classifier tool's case"),
+            ({"tool": "classify-el", "phases": ["read", "parse"]}, "phases: a non-empty list of what classify-el prints"),
+            ({"tool": "classify-el", "phases": []}, "phases: a non-empty list of what classify-el prints"),
+            # A phase left out still counts in the whole process (master, 14 Nov 2026 08:12: nothing
+            # unobserved after the drop).
+            ({"tool": "classify-el", "phases": ["read", "normalise", "saturate", "assemble", "write"]},
+             "phases: leaving out prepare, it declares wall"),
         ]:
             with self.subTest(changes=changes):
                 found = self.problems(**changes)

@@ -333,3 +333,158 @@ fn class_build_units(n: usize) -> u64 {
     );
     units.get()
 }
+
+/// Spec (`CountedSnapshot::count_up_to`): asked up to `limit`, a count answers at least the
+/// smaller of the count and `limit` and never more than the count: [`Count::AtLeast`] where
+/// an expanded count reached the limit, the whole count wherever it didn't, and a held count
+/// exactly at every limit. Once its visitor has stopped it answers `Stopped`. On a compact snapshot
+/// (expanded counts) and on a layered one (held counts), for every pattern and model asked,
+/// at limits 0, 1, either side of the count, at it, and past it.
+#[test]
+fn a_count_up_to_a_limit_answers_at_least_the_limit_or_the_whole_count() {
+    let go = |_: u64| true;
+    let halt = |_: u64| false;
+    for (snapshot, equality) in [(compact(50, 400), true), (layered(400), false)] {
+        let counted = snapshot.counted();
+        for pattern in patterns(&snapshot) {
+            for model in [
+                ReadModel::Materialised,
+                ReadModel::Asserted,
+                ReadModel::Inferred,
+            ] {
+                let whole = snapshot.count_in(model, &pattern);
+                let n = whole.at_least();
+                // Expanded only under equality, in a model with inferred statements, where the
+                // pattern can match the default graph; every other count is held.
+                let held = !equality
+                    || model == ReadModel::Asserted
+                    || pattern.graph == GraphSelector::AnyNamed;
+                for limit in [0, 1, 2, n.saturating_sub(1), n, n + 1, u64::MAX] {
+                    let at = format!("{model:?} {pattern:?}, count {n}, limit {limit}");
+                    let bounded = counted
+                        .count_up_to(model, &pattern, limit, &go)
+                        .expect("never stopped");
+                    let answer = bounded.at_least();
+                    assert!(answer >= n.min(limit), "{bounded:?} under the limit, {at}");
+                    assert!(answer <= n, "{bounded:?} more than the count, {at}");
+                    if held {
+                        assert_eq!(bounded, whole, "a held count answers exactly, {at}");
+                    } else if limit > n {
+                        assert_eq!(bounded, whole, "the whole count below the limit, {at}");
+                    } else {
+                        assert!(
+                            bounded == whole || bounded == Count::AtLeast(answer),
+                            "{bounded:?}: the count, or at least the limit, {at}"
+                        );
+                    }
+                    assert_eq!(
+                        counted.count_up_to(model, &pattern, limit, &halt),
+                        Err(Stopped),
+                        "stopped, {at}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Spec (`CountedSnapshot::count_up_to`): an expanded count stops at its limit. On a compact
+/// snapshot, `? p ?` (20,000 stored matches of 50 copies each, and as many in a named graph)
+/// asked up to 1,000 (above one match's copies) and up to 1 answers [`Count::AtLeast`] and
+/// tells its visitor of less than half the units the whole count does; asked up to one past
+/// the count, it answers the whole count.
+#[test]
+fn an_expanded_count_up_to_a_limit_stops_there() {
+    let snapshot = compact(50, 20_000);
+    let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
+    let pattern = QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    };
+    let counted = snapshot.counted();
+    let units = |limit: u64| {
+        let units = std::cell::Cell::new(0u64);
+        let count = counted
+            .count_up_to(ReadModel::Materialised, &pattern, limit, &|k| {
+                units.set(units.get() + k);
+                true
+            })
+            .expect("never stopped");
+        (count, units.get())
+    };
+    let whole = snapshot.count_in(ReadModel::Materialised, &pattern);
+    let n = whole.at_least();
+    assert!(n > 20_000, "{whole:?}: the copies are counted");
+    let (all, all_units) = units(u64::MAX);
+    assert_eq!(all, whole);
+    let (past, _) = units(n + 1);
+    assert_eq!(past, whole, "a limit past the count: the whole count");
+    // Above one stored match's 50 copies, far below the whole count.
+    let limit = 1_000;
+    let (some, some_units) = units(limit);
+    assert!(
+        matches!(some, Count::AtLeast(k) if (limit..=n).contains(&k)),
+        "{some:?}: stopped at the limit {limit}"
+    );
+    assert!(
+        2 * some_units < all_units,
+        "{some_units} units asked up to {limit}, {all_units} for the whole count: it didn't stop"
+    );
+    let (first, first_units) = units(1);
+    assert!(
+        matches!(first, Count::AtLeast(k) if (1..=n).contains(&k)),
+        "{first:?}: stopped at the limit"
+    );
+    assert!(
+        2 * first_units < all_units,
+        "{first_units} units asked up to 1, {all_units} for the whole count: it didn't stop"
+    );
+}
+
+/// Spec (`nrese_engine::visit`: once `visit` answers false the read does no more work and
+/// answers `Stopped`): a count asked up to a limit it would reach only near its end, its
+/// visitor refusing once half its units are counted, answers `Stopped` and asks for no unit
+/// after the refusal.
+#[test]
+fn a_count_up_to_a_limit_stops_with_its_visitor() {
+    let snapshot = compact(50, 20_000);
+    let all = QuadPattern::all();
+    let counted = snapshot.counted();
+    let limit = snapshot.count_in(ReadModel::Materialised, &all).at_least() - 1;
+    let whole = std::cell::Cell::new(0u64);
+    let unstopped = counted
+        .count_up_to(ReadModel::Materialised, &all, limit, &|k| {
+            whole.set(whole.get() + k);
+            true
+        })
+        .expect("never stopped");
+    assert!(
+        unstopped.at_least() >= limit,
+        "{unstopped:?}: unstopped, it reaches the limit"
+    );
+    let stop_at = whole.get() / 2;
+    let (seen, refused, after) = (
+        std::cell::Cell::new(0u64),
+        std::cell::Cell::new(false),
+        std::cell::Cell::new(0u64),
+    );
+    let stopped = counted.count_up_to(ReadModel::Materialised, &all, limit, &|k| {
+        if refused.get() {
+            after.set(after.get() + u64::from(k > 0));
+            return false;
+        }
+        if seen.get() >= stop_at {
+            refused.set(true);
+            return false;
+        }
+        seen.set(seen.get() + k);
+        true
+    });
+    assert_eq!(
+        stopped,
+        Err(Stopped),
+        "a count its visitor stopped answers nothing"
+    );
+    assert!(refused.get(), "the visitor refused part-way");
+    assert_eq!(after.get(), 0, "units asked for after the refusal");
+}

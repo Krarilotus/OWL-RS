@@ -52,7 +52,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
-from suitekit.runtime import anon_kernel_bytes, end_scope, scope_argv  # noqa: E402
+from suitekit.runtime import anon_kernel_bytes, end_scope, scope_argv, stat_fields  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
@@ -233,15 +233,15 @@ def quiet_slot(what: str):
 
 
 def container(kind: str, cap_gb: float, command: list[str], env: dict | None = None,
-              timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+              timeout: float | None = CASE_TIMEOUT_S, measured: bool = True) -> tuple[int, str, str, float]:
     """Runs `command` under a memory cap without swap, in the Rust image or natively; (exit
     code, stdout, stderr, wall seconds). Exit 137: killed at the cap. Its name: `kind` in the
-    job's namespace."""
+    job's namespace. `measured`: a case's invocation, whose memory reading is required (process)."""
     name = ns.name(f"fast-{kind}", ROOT)
     cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
     if RUNTIME == "native":
-        return process(name, cap_gb, command, env, timeout)
+        return process(name, cap_gb, command, env, timeout, measured)
     argv = ["run", "--rm", *ns.name_args(name, ROOT, OWNER), f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             *quiet_label(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
@@ -262,33 +262,102 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
 # The scope's anonymous and kernel memory at its peak (research round 8: the gate's Linux memory
 # metric; memory.peak also counts the file cache the case's reads were charged, which depends on
 # what the host had cached). cgroup v2 keeps no such peak: a thread outside the measured process
-# samples memory.stat every 50 ms, so a spike shorter than that can be missed. The reading itself
+# samples memory.stat, every millisecond for the scope's first quarter second and every 50 ms
+# after, so a spike shorter than the period can be missed. At 50 ms throughout, a case of a few
+# tens of milliseconds got one reading at a random moment or none (F2, 13 Nov 2026: main's
+# ql-memberships-reuse, 0.05 s, none in four of six passes). The reading itself
 # (anon_kernel_bytes) is suitekit/runtime.py's, which the suite's Docker runtime reads too.
 SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
+# The process's transparent huge pages, reported only (no hypothesis; 14 Nov 2026: a slower
+# clients-lookups in F2 that no later run reproduced, and the host's state then unrecorded). From
+# the same memory.stat reads, without walking a process's mappings under its mmap lock as
+# smaps_rollup does: the anonymous huge pages charged to the scope, at their sampled peak, and the
+# huge pages faulted and collapsed into it. That is the scope's, not one process's AnonHugePages
+# near its end: it holds the wrapper's and a setup's charges too (a setup's peak stays the peak),
+# and leaves out what a process was charged before it entered the scope. A case's process
+# allocates after its exec, inside the scope, so for it the two are close. After the scope's
+# first quarter second, once a second: each process new in the scope, its THP_enabled. A process
+# is its pid and name: a shell that execs its last command (a setup's `setup && case`) becomes the
+# case's process under the same pid.
+SCOPE_THP = re.compile(r"^fast-scope-thp (\{.*\})$", re.M)
+# A classifier process's wall time (series `wall`, ms), from the shell's clock just before and
+# after it in the case's scope: its whole run, its start, its --repeat runs and its exit included,
+# without the tool's own timers. A phase too short for the tool's 0.1 ms step is left out of the
+# case's comparison (`phases`) and still counts here (14 Nov 2026: nothing unobserved). bash 5's
+# EPOCHREALTIME: the realtime clock in microseconds, its decimal point the locale's.
+PROCESS_WALL = re.compile(r"^fast-process-wall (\S+) (\S+)\n?", re.M)
+
+
+def process_wall_ms(stderr: str) -> tuple[str, float | None]:
+    """`stderr` without the shell's clock line, and the process's wall time in ms between its two
+    readings (None without both, or with a clock that went back)."""
+    found = PROCESS_WALL.findall(stderr)
+    try:
+        start, end = (float(x.replace(",", ".")) for x in found[-1])
+    except (IndexError, ValueError):
+        return PROCESS_WALL.sub("", stderr), None
+    return PROCESS_WALL.sub("", stderr), round((end - start) * 1000, 3) if end > start else None
+
+
+def thp_modes(group: Path, known: set) -> list[dict]:
+    """Each process in a cgroup not in `known` ((pid, name)): its pid, name and THP_enabled
+    (/proc/PID/status; 0 under prctl(PR_SET_THP_DISABLE), which its children inherit and an exec
+    keeps). A process gone before its status is read, or a kernel without the field: none."""
+    out = []
+    for pid in (group / "cgroup.procs").read_text().split():
+        with contextlib.suppress(OSError, ValueError):
+            status = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
+            name = status.get("Name", "").strip()
+            if "THP_enabled" in status and (int(pid), name) not in known:
+                out.append({"pid": int(pid), "name": name, "thp_enabled": int(status["THP_enabled"])})
+    return out
 
 
 class AnonKernelSampler(threading.Thread):
     """Samples a scope's anon + kernel memory until stopped; `peak`: the largest seen. The scope's
-    cgroup directory is what the command's wrapper writes to `where` once it runs in it."""
+    cgroup directory is what the command's wrapper writes to `where` once it runs in it. Until it
+    is found and for `dense_s` after, it looks every `dense_period_s`; then every `period_s`. It
+    keeps off `avoid`, the case's pinned CPUs (taskset notation), where it can run elsewhere."""
 
-    def __init__(self, where: Path, period_s: float = 0.05):
+    def __init__(self, where: Path, period_s: float = 0.05, dense_period_s: float = 0.001, dense_s: float = 0.25,
+                 avoid: str | None = None):
         super().__init__(daemon=True)
-        self.where, self.period_s, self.peak = where, period_s, None
+        self.where, self.period_s, self.peak, self.thp = where, period_s, None, {}
+        self.dense_period_s, self.dense_s, self.avoid = dense_period_s, dense_s, avoid
+        self.modes_period_s = 1.0
         self.halt = threading.Event()
 
     def run(self):
-        stat = None
+        if self.avoid and hasattr(os, "sched_setaffinity"):
+            # Linux: pid 0 is the calling thread, so this thread alone moves.
+            with contextlib.suppress(OSError, ValueError):
+                avoided = {c for part in self.avoid.split(",")
+                           for c in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)}
+                if others := os.sched_getaffinity(0) - avoided:
+                    os.sched_setaffinity(0, others)
+        stat, found, looked = None, None, -math.inf
         while not self.halt.is_set():
             try:
                 if stat is None:
                     group = self.where.read_text().strip() if self.where.is_file() else ""
                     stat = Path(group) / "memory.stat" if group else None
-                value = anon_kernel_bytes(stat.read_text()) if stat else None
+                    found = time.monotonic() if stat else None
+                fields = stat_fields(stat.read_text()) if stat else {}
+                value = anon_kernel_bytes(fields) if stat else None
             except OSError:
                 value = None
             if value is not None:
                 self.peak = max(self.peak or 0, value)
-            self.halt.wait(self.period_s if stat else 0.005)
+                if "anon_thp" in fields:
+                    self.thp["anon_thp_peak_bytes"] = max(self.thp.get("anon_thp_peak_bytes", 0), int(fields["anon_thp"]))
+                self.thp.update({k: int(fields[k]) for k in ("thp_fault_alloc", "thp_collapse_alloc") if k in fields})
+            dense = found is None or time.monotonic() - found < self.dense_s
+            if value is not None and not dense and time.monotonic() - looked >= self.modes_period_s:
+                looked = time.monotonic()
+                with contextlib.suppress(OSError, ValueError):
+                    for mode in thp_modes(stat.parent, {(m["pid"], m["name"]) for m in self.thp.get("thp_enabled", [])}):
+                        self.thp.setdefault("thp_enabled", []).append({**mode, "seen_s": round(looked - found, 2)})
+            self.halt.wait(self.dense_period_s if dense else self.period_s)
 
     def stop(self) -> int | None:
         self.halt.set()
@@ -297,11 +366,12 @@ class AnonKernelSampler(threading.Thread):
 
 
 def process(name: str, cap_gb: float, command: list[str], env: dict | None = None,
-            timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+            timeout: float | None = CASE_TIMEOUT_S, measured: bool = True) -> tuple[int, str, str, float]:
     """`container` natively: the command, its container paths mapped (native_dirs), in a user
     scope capped at `cap_gb` without swap (as Docker's --memory and --memory-swap). A wrapper
     shell in the scope prints the scope's memory.peak after the command (`fast-scope-peak`
-    on stderr), also after a kill at the cap."""
+    on stderr), also after a kill at the cap. A `measured` command that succeeds without an
+    anon + kernel reading fails."""
     dirs = native_dirs()
     FAST_DATA.mkdir(parents=True, exist_ok=True)
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
@@ -320,7 +390,7 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     started = time.monotonic()
     cleanup_error = ""
     where = FAST_DATA / f".scope-{unit}"
-    sampler = AnonKernelSampler(where)
+    sampler = AnonKernelSampler(where, avoid=cpus)
     sampler.start()
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
@@ -345,10 +415,15 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     err = SCOPE_PRESSURE.sub("", SCOPE_PEAK.sub("", done.stderr)).rstrip("\n")
     err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
            + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "")
-           + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "") + err)
-    if cleanup_error:
-        err += "\n" + cleanup_error
-    return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
+           + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "")
+           + (f"fast-scope-thp {json.dumps(sampler.thp, separators=(',', ':'))}\n" if sampler.thp else "") + err)
+    # A command that succeeded has its scope's anon + kernel peak, or its case fails here, at once,
+    # not as an incomplete memory series in the report.
+    unread = "" if anon_kernel or done.returncode or not measured else "no anon+kernel reading of the case's scope"
+    for note in (cleanup_error, unread):
+        if note:
+            err += "\n" + note
+    return done.returncode or (1 if cleanup_error or unread else 0), done.stdout, err, time.monotonic() - started
 
 
 def scope_peak_mib(stderr: str) -> int | None:
@@ -595,7 +670,7 @@ def ensure_data(spec: str) -> dict:
                   f" && for f in {stage}/{name}.*; do case $f in *.expect.json) ;; *) mv -f $f {folder}/ ;; esac; done"
                   f" && mv -f {stage}/{name} {path} && mv -f {stage}/{name}.expect.json {path}.expect.json"
                   f" && rm -rf {stage} && cat {path}.expect.json")
-        code, out, err, _ = container("gen", 8, ["bash", "-c", script])
+        code, out, err, _ = container("gen", 8, ["bash", "-c", script], measured=False)
     if code != 0:
         raise RuntimeError(f"generating {spec} failed: {err[-500:]}")
     return json.loads(out)["expect"]
@@ -985,7 +1060,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             for report_nt in made:  # only the paths this measurement named, each its own invocation's
                 report_nt.unlink(missing_ok=True)
         if "setup" in case:
-            container(name, 1, ["rm", "-rf", scratch])
+            container(name, 1, ["rm", "-rf", scratch], measured=False)
         if samples_runs:
             result = samples_runs[-1]
             if len(samples_runs) > 1:
@@ -1035,14 +1110,19 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     elif tool in ("classify-el", "classify-horn"):
         binary = "classify" if tool == "classify-el" else "context_classify"
         out_tsv = f"/out/{case['name']}.tsv"
-        command = ["bash", "-c", f"/target/release/examples/{binary} --out {out_tsv} --repeat {repeat} {data}"
-                                 f" && sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
+        # The shell reads its clock just before and after the classifier process (PROCESS_WALL).
+        command = ["bash", "-c", f"s=$EPOCHREALTIME; /target/release/examples/{binary} --out {out_tsv} --repeat {repeat}"
+                                 f" {data}; c=$?; echo \"fast-process-wall $s $EPOCHREALTIME\" >&2; [ $c = 0 ] || exit $c;"
+                                 f" sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
         # Fresh processes (`processes`): each one's profile, pooled below; the last one's answer.
         profiles, wall = [], 0.0
         for _ in range(int(case.get("processes", 1))):
             code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
-            profiles.append(profile_line(err, out))
+            err, process_wall = process_wall_ms(err)
+            profiles.append({**profile_line(err, out), **({"wall": process_wall} if process_wall else {})})
             wall += w
+            if code == 0 and not process_wall:
+                code, err = 1, f"{err}\nno wall time of the classifier process (fast-process-wall)"
             if code != 0:
                 break
         result = profiles[-1]
@@ -1060,8 +1140,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         result["samples_ms"] = [x for x in totals if x is not None]
         result["whole_ms"] = statistics.median(result["samples_ms"]) if result["samples_ms"] else total
         result["phase_samples"] = {k: [pr[k] for pr in profiles if isinstance(pr.get(k), float)] for k in
-                                   ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
-                                   if isinstance(result.get(k), float)}
+                                   ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write",
+                                    "wall") if isinstance(result.get(k), float)}
         record["wall_s"] = round(wall, 2)
         if code != 0:
             record["status"] = classify_failure(code, err, result)
@@ -1123,6 +1203,7 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
             "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr),
             **({"anon_kernel_peak_bytes": int(found[-1])} if (found := SCOPE_ANON_KERNEL.findall(stderr or "")) else {}),
+            **({"thp": json.loads(found[-1])} if (found := SCOPE_THP.findall(stderr or "")) else {}),
             **({"peak_live_requested_bytes": result["peak_live_requested_bytes"]}
                if isinstance(result.get("peak_live_requested_bytes"), int) else {}),
             **({"peak_kind": result["peak_kind"]} if result.get("peak_kind") else {}),

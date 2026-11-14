@@ -2,7 +2,8 @@
 # benches/fast/release_gate.py load_policy): the one place that accepts what the bar forbids. The
 # gate tolerates no loss in time or memory and no wrong answer. A loss is accepted only when a
 # trade-off here covers it; a wrong answer only when an exception here names its case and outcome;
-# a baseline left uncompared only when an absence here names its cases. Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
+# a baseline left uncompared only when an absence here names its cases; a cost appearing where the
+# baseline read below the counter's step only when an emerged entry here names it. Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
 # `known` issue explain evidence, they grant nothing.
 #
 # `release-gate.sh verdict CAND ...` reads this file at the candidate's commit, never from a timed
@@ -53,6 +54,22 @@
 # port = "<the package planned to compare them>"
 # approved = "2026-11-11"
 # by = "Johannes"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
+#
+# An emerged entry accepts a cost appearing in a series the baseline reads below the counter's step
+# in every block (the gate's `emerged`: a phase printing 0.0 on the baseline and a measurable time
+# on the candidate). Without one it blocks. `max` is the largest candidate median it covers, in the
+# dimension's unit; a larger one blocks again.
+#
+# [[emerged]]
+# case = "el-classify"
+# dimension = "time/prepare"
+# against = "base"                      # optional: base or main; omitted, either
+# max = 2.0                             # ms
+# approved = "2026-11-14"
+# by = "Johannes"
+# reason = "<the check that costs it, and why it ships>"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
 
