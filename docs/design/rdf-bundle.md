@@ -101,7 +101,8 @@ the JSON-LD 1.1 toRdf/fromRdf suites. To measure: throughput per format in MB/s
 and triples/s against `oxttl`, `oxrdfxml` and `oxjsonld`, and bulk load end to end.
 
 **Step 3 in detail (`nrese-rdf-io`).** What the code needs today:
-- the six formats, by file extension or media type;
+- the six formats, by file extension or media type (RDF4J's Binary RDF, added later, makes
+  seven);
 - parsers with a base IRI, fresh blank nodes per payload, "no named graphs", a default
   graph, input from `Read` or a byte slice;
 - N-Triples/N-Quads split into chunks for bulk load on all cores;
