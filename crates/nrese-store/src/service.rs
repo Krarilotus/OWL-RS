@@ -1333,9 +1333,11 @@ impl StoreService {
         Ok(planned)
     }
 
-    /// Bytes of intermediate results the running queries hold now, the most they held at
-    /// once, and the limit; `None` without a limit
-    /// ([`StoreConfig::total_query_memory_bytes`]).
+    /// Bytes the running queries have reserved now, the most reserved at once, and the
+    /// limit; `None` without a limit ([`StoreConfig::total_query_memory_bytes`]). A
+    /// reservation is what a query's intermediate results hold plus what it took ahead and
+    /// hasn't used yet: its credit (at most 64 KiB) and its operators' spare, both bounded
+    /// per query and returned when it ends.
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
         let budget = self.settings.runtime.query_pool()?;
         Some((budget.used(), budget.peak(), budget.limit()))

@@ -370,7 +370,7 @@ Monitoring that needs figures or DL diagnostics should authenticate to `/api/v1/
 | `nrese_query_cache_hits_total`, `nrese_query_cache_misses_total`, `nrese_query_cache_bytes` | The result cache: query parts answered from it, parts computed that could have been, bytes held |
 | `nrese_query_cache_entries{kind}` | Entries of the result cache: `parts` (id columns), `answers` (serialised bytes) |
 | `nrese_sessions_open`, `nrese_queries_running` | Client transactions open (expired ones until a call or a begin drops them), queries running |
-| `nrese_query_memory_bytes`, `nrese_query_memory_peak_bytes`, `nrese_query_memory_limit_bytes` | Intermediate results of running queries, against `budgets.total_query_memory` |
+| `nrese_query_memory_bytes`, `nrese_query_memory_peak_bytes`, `nrese_query_memory_limit_bytes` | What running queries have reserved (their intermediate results plus credit and operator spare taken ahead, bounded per query), against `budgets.total_query_memory` |
 | `nrese_http_responses_total{kind, status}` | Responses by kind of request (`query`, `update`, `sparql` for the single endpoint, `graph_store`, `shacl`, `other`) and status class (`2xx` … `5xx`) |
 | `nrese_http_request_duration_seconds{kind}` | Histogram of the time to the response's start, by kind |
 | `nrese_http_requests_in_flight{kind}` | Requests begun and not yet answered (active and queued work), by kind |

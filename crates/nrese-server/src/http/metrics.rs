@@ -99,10 +99,10 @@ nrese_queries_running {}
     ));
     if let Some((used, peak, limit)) = state.store().query_memory() {
         body.push_str(&format!(
-            "# HELP nrese_query_memory_bytes Intermediate results the running queries hold.
+            "# HELP nrese_query_memory_bytes What the running queries have reserved: their intermediate results plus what each took ahead and hasn't used yet (its credit, at most 64 KiB, and its operators' spare).
 # TYPE nrese_query_memory_bytes gauge
 nrese_query_memory_bytes {used}
-# HELP nrese_query_memory_peak_bytes The most the running queries held at once.
+# HELP nrese_query_memory_peak_bytes The most the running queries had reserved at once.
 # TYPE nrese_query_memory_peak_bytes gauge
 nrese_query_memory_peak_bytes {peak}
 # HELP nrese_query_memory_limit_bytes The budget for all running queries together.
