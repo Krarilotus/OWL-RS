@@ -29,7 +29,9 @@ The keys' dependency graph (body key → head key) is condensed into strongly co
 
 ## What is recorded, by level
 
-`reasoner.provenance` (a repository setting):
+`reasoner.provenance` (proposed as a repository setting. 14 Nov 2026: no such setting exists;
+support graph sets are kept when the access policy asks for `inferred = "supported"`, as many
+as [`reasoner.support_sets`](../ops/config-reference.md#reasoner.support_sets) allows):
 
 | Level | Recorded per inferred fact | Serves |
 |---|---|---|
