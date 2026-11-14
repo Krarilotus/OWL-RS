@@ -614,11 +614,12 @@ fn a_directory_that_may_be_searched_but_not_listed_is_passed() {
     assert_eq!(read.ok().as_deref(), Some("1073741824\n"));
 }
 
-/// The walk opens each name on the way to the group once, however deep the group: the group's
-/// ancestors are directories on that way. A group 32 names below the root of a v2 hierarchy at
-/// /sys/fs/cgroup takes 3 + 32 opens to reach, 2 for its `cgroup.procs` and `cgroup.controllers`,
-/// and one `memory.max` for each of its 33 groups (the root's isn't there); the least limit,
-/// 2 GiB ten names down, is read. A walk from the root for each ancestor opened about 660.
+/// The walk's opens grow with the group's depth, not its square: the group's ancestors are
+/// directories on the way to it. A group 32 names below the root of a v2 hierarchy at
+/// /sys/fs/cgroup needs at most 3 + 32 opens to reach, 2 for its `cgroup.procs` and
+/// `cgroup.controllers`, and one `memory.max` for each of its 33 groups (the root's isn't there);
+/// the least limit, 2 GiB ten names down, is read. A walk from the root for each ancestor opened
+/// about 660. Counted are names opened, not the mount readings beside them.
 #[test]
 fn the_walk_opens_each_name_on_the_way_once() {
     let depth = 32;
@@ -650,14 +651,17 @@ fn the_walk_opens_each_name_on_the_way_once() {
         .collect();
     let kernel = system(&files, "");
     assert_eq!(cgroup::limit(&kernel), Ok(Some(2 * G)));
-    assert_eq!(kernel.opens.get(), 3 + depth + 2 + (depth + 1));
+    let budget = 3 + depth + 2 + (depth + 1);
+    let opens = kernel.opens.get();
+    assert!(opens <= budget, "{opens} opens, more than {budget}");
 }
 
 /// Both of the kernel's mount readings name the mount a handle is on, a directory's and a
-/// file's, across a mount (the root's file system, then /proc): `statx`'s `STATX_MNT_ID` (Linux
-/// 5.8) and `/proc/self/fdinfo/N`, which the reading falls back to where `statx` leaves the
-/// mount out of its answer's mask. A handle past a mount carries that mount's id, which is how a
-/// mount over a group's point, over part of the way or over a single file is told apart.
+/// file's, across a mount (the root's file system, then /proc), the id `/proc/self/mountinfo`
+/// lists for it: `statx`'s `STATX_MNT_ID`, which a kernel from 5.8 fills in, and
+/// `/proc/self/fdinfo/N`, which the reading takes where `statx` gives none. A handle past a
+/// mount carries that mount's id, which is how a mount over a group's point, over part of the
+/// way or over a single file is told apart.
 #[cfg(all(target_os = "linux", not(miri)))]
 #[test]
 fn both_mount_readings_name_the_mount_a_handle_is_on() {
@@ -666,19 +670,77 @@ fn both_mount_readings_name_the_mount_a_handle_is_on() {
     let root = kernel.root().expect("/");
     let proc = kernel.open_at(&root, "proc").expect("/proc");
     let meminfo = kernel.open_at(&proc, "meminfo").expect("/proc/meminfo");
-    for (name, handle) in [("/", &root), ("/proc", &proc), ("/proc/meminfo", &meminfo)] {
-        let fdinfo = cgroup::Kernel::mount_in_fdinfo(handle).expect("fdinfo's mnt_id");
-        assert_eq!(kernel.mount(handle).ok(), Some(fdinfo), "{name}");
-    }
-    let (root_mount, proc_mount) = (kernel.mount(&root).unwrap(), kernel.mount(&proc).unwrap());
+    // mountinfo's id for a mount point: the last line names the mount on top.
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let listed = |point: &str| -> Option<u64> {
+        let line = mountinfo
+            .lines()
+            .rfind(|line| line.split(' ').nth(4) == Some(point));
+        line.and_then(|line| line.split(' ').next()?.parse().ok())
+    };
+    let (root_mount, proc_mount) = (listed("/").expect("/"), listed("/proc").expect("/proc"));
     assert_ne!(root_mount, proc_mount, "/proc is a mount of its own");
-    assert_eq!(kernel.mount(&meminfo).ok(), Some(proc_mount));
+    // A host may bind a file of its own over /proc/meminfo; then that is its mount.
+    let meminfo_mount = listed("/proc/meminfo").unwrap_or(proc_mount);
+    #[cfg(target_env = "gnu")]
+    let statx_fills = {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        let mut parts = release.split(|c: char| !c.is_ascii_digit());
+        let mut next = || parts.next().and_then(|part| part.parse::<u32>().ok());
+        (next().unwrap(), next().unwrap()) >= (5, 8)
+    };
+    for (name, handle, mount) in [
+        ("/", &root, root_mount),
+        ("/proc", &proc, proc_mount),
+        ("/proc/meminfo", &meminfo, meminfo_mount),
+    ] {
+        assert_eq!(kernel.mount(handle).ok(), Some(mount), "{name}");
+        let fdinfo = cgroup::Kernel::mount_in_fdinfo(handle).ok();
+        assert_eq!(fdinfo, Some(mount), "{name}: fdinfo");
+        // The reading where `statx` gives none: fdinfo's.
+        let without = cgroup::Kernel::mount_from(handle, None).ok();
+        assert_eq!(without, Some(mount), "{name}: without statx");
+        #[cfg(target_env = "gnu")]
+        {
+            let statx = cgroup::Kernel::mount_in_statx(handle);
+            assert_eq!(statx, statx_fills.then_some(mount), "{name}: statx");
+        }
+    }
     #[cfg(target_env = "gnu")]
     {
-        // A kernel before 5.8 leaves the bit out of the mask: fdinfo is asked then.
+        // The id is taken only where the answer's mask has the bit, whatever else it has.
+        let basic = libc::STATX_BASIC_STATS;
         assert_eq!(cgroup::mount_filled(0, 7), None);
+        assert_eq!(cgroup::mount_filled(basic, 7), None);
         assert_eq!(cgroup::mount_filled(libc::STATX_MNT_ID, 7), Some(7));
+        assert_eq!(cgroup::mount_filled(basic | libc::STATX_MNT_ID, 7), Some(7));
     }
+}
+
+/// A held directory stays the directory it was opened as: renamed, and another directory put
+/// under its old name, a name opened through it is its own, not the newcomer's.
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn a_held_directory_is_the_one_opened_after_a_rename() {
+    use cgroup::Fs;
+    let base = std::env::temp_dir().join(format!("nrese-exec-held-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("group")).unwrap();
+    std::fs::write(base.join("group").join("memory.max"), "1073741824\n").unwrap();
+    let canonical = std::fs::canonicalize(&base).unwrap();
+    let kernel = cgroup::Kernel;
+    let read = (|| {
+        let mut dir = kernel.root()?;
+        for name in canonical.iter().skip(1) {
+            dir = kernel.open_at(&dir, &name.to_string_lossy())?;
+        }
+        let held = kernel.open_at(&dir, "group")?;
+        std::fs::rename(base.join("group"), base.join("moved"))?;
+        std::fs::create_dir(base.join("group"))?;
+        std::fs::write(base.join("group").join("memory.max"), "max\n")?;
+        kernel.read(&kernel.open_at(&held, "memory.max")?)
+    })();
+    std::fs::remove_dir_all(&base).unwrap();
+    assert_eq!(read.ok().as_deref(), Some("1073741824\n"));
 }
 
 /// A symbolic link on the way isn't followed: opened, a name is the link itself, and a name

@@ -281,7 +281,9 @@ impl<F: Fs> Walk<'_, F> {
 
     /// Each view's way to `group` ([`Trail`]), in the views' order: the opens and checks of
     /// [`Self::places`] for `group`, every directory on the way kept. A way the kernel refuses
-    /// or fails to open is `Unknown`, as there.
+    /// or fails to open is `Unknown`, as there. The kept directories stay open until the reading
+    /// ends, one descriptor for each name on each view's way: a process
+    /// short of descriptors gets `EMFILE`, and its limit is unknown, not absent.
     fn trails(&self, group: &Path) -> Result<Vec<Trail<F::Handle>>, Unknown> {
         let mut trails = Vec::new();
         for (at, view) in self.views.iter().enumerate() {
@@ -549,9 +551,9 @@ impl Kernel {
 
     /// The mount id `statx` gives for a descriptor, where the kernel fills it in (`STATX_MNT_ID`
     /// in the answer's mask: Linux 5.8; the same ids `/proc/self/mountinfo` lists). `None`
-    /// before 5.8, or where the C library has no `statx`: the caller asks `fdinfo`.
+    /// before 5.8 (the bit left out of the mask) or where the call fails: `fdinfo` is asked.
     #[cfg(target_env = "gnu")]
-    fn mount_in_statx(handle: &std::fs::File) -> Option<u64> {
+    pub(super) fn mount_in_statx(handle: &std::fs::File) -> Option<u64> {
         use std::os::fd::AsRawFd;
         let mut answer = std::mem::MaybeUninit::<libc::statx>::zeroed();
         // SAFETY: an empty path with `AT_EMPTY_PATH` asks about the open descriptor itself,
@@ -583,6 +585,14 @@ impl Kernel {
             .find_map(|line| line.strip_prefix("mnt_id:"))
             .and_then(|id| id.trim().parse().ok())
             .ok_or_else(|| ErrorKind::Unsupported.into())
+    }
+
+    /// The mount id: `statx`'s where it gave one, else `fdinfo`'s.
+    pub(super) fn mount_from(handle: &std::fs::File, statx: Option<u64>) -> io::Result<u64> {
+        match statx {
+            Some(id) => Ok(id),
+            None => Self::mount_in_fdinfo(handle),
+        }
     }
 }
 
@@ -628,10 +638,10 @@ impl Fs for Kernel {
 
     fn mount(&self, handle: &std::fs::File) -> io::Result<u64> {
         #[cfg(target_env = "gnu")]
-        if let Some(id) = Self::mount_in_statx(handle) {
-            return Ok(id);
-        }
-        Self::mount_in_fdinfo(handle)
+        let statx = Self::mount_in_statx(handle);
+        #[cfg(not(target_env = "gnu"))]
+        let statx = None;
+        Self::mount_from(handle, statx)
     }
 
     fn read(&self, handle: &std::fs::File) -> io::Result<String> {
