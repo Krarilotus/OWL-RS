@@ -328,7 +328,9 @@ fn planned(ctx: &Context<'_>, patterns: &[&str], links: &Links) -> Steps {
         .iter()
         .map(|s| ctx.snapshot.estimate_in(ctx.model, &s.quad_pattern()))
         .collect();
-    let plan = ctx.join_order(&scans, &counts, links, true);
+    let plan = ctx
+        .join_order(&scans, &counts, links, true, true)
+        .map(|(plan, _)| plan);
     steps(&plan.map_err(QueryEvaluationError::from).unwrap())
 }
 
@@ -347,8 +349,8 @@ const FROM_THE_STORE_WITH_SETS: &Table = &[
     ("chain", &[3, 2, 1, 0], &[0x4008000000000000, 0x4038000000000000, 0x4045000000000000, 0x4051800000000000]),
     // [5.0, 40.0, 40.0]
     ("edge-after-star", &[0, 1, 2], &[0x4014000000000000, 0x4044000000000000, 0x4044000000000000]),
-    // [8.0, 2.0, 3.0]
-    ("common-values", &[1, 0, 2], &[0x4020000000000000, 0x4000000000000000, 0x4008000000000000]),
+    // [2.0, 1.0, 1.5]
+    ("common-values", &[0, 1, 2], &[0x4000000000000000, 0x3ff0000000000000, 0x3ff8000000000000]),
     // [90.0, 150.0, 4.166666666666667]
     ("cycle", &[0, 1, 2], &[0x4056800000000000, 0x4062c00000000000, 0x4010aaaaaaaaaaab]),
     // [15.0, 22.5, 22.5]
@@ -379,8 +381,8 @@ const FROM_THE_STORE: &Table = &[
     ("chain", &[3, 2, 1, 0], &[0x4008000000000000, 0x4038000000000000, 0x4042000000000000, 0x404b000000000000]),
     // [5.0, 40.0, 40.0]
     ("edge-after-star", &[0, 1, 2], &[0x4014000000000000, 0x4044000000000000, 0x4044000000000000]),
-    // [8.0, 2.0, 3.0]
-    ("common-values", &[1, 0, 2], &[0x4020000000000000, 0x4000000000000000, 0x4008000000000000]),
+    // [2.0, 1.0, 1.5]
+    ("common-values", &[0, 1, 2], &[0x4000000000000000, 0x3ff0000000000000, 0x3ff8000000000000]),
     // [90.0, 135.0, 3.375]
     ("cycle", &[0, 1, 2], &[0x4056800000000000, 0x4060e00000000000, 0x400b000000000000]),
     // [15.0, 22.5, 22.5]
@@ -401,7 +403,8 @@ const FROM_THE_STORE: &Table = &[
 /// these small BGPs expect too few rows for the sets, so each gets its plain plan) and
 /// admitted to the store's characteristic sets and pairs: q02's shape, one and two
 /// patterns, a star, a chain, an edge after a star on its object, two small patterns on
-/// one variable, a cycle (EXPLAIN plans it), constant objects, stars of 12 (exhaustive)
+/// one variable (a pair within the BGP's allowance), a cycle (EXPLAIN plans it), constant
+/// objects, stars of 12 (exhaustive)
 /// and 13 (greedy) patterns, and two patterns with a path after them, the path the last
 /// input: its estimate needs what the second pattern binds.
 #[test]
@@ -410,22 +413,20 @@ fn store_patterns_plan_as_before() {
     let snapshot = engine.snapshot();
     let options = QueryOptions::default();
     let ctx = Context::new(&snapshot, &options, None, None);
-    // What the cases are for: the store has characteristic pairs, and two of its small
-    // patterns on one variable get their common values counted.
+    // What the cases are for: the store has characteristic pairs, and two of its patterns
+    // on one variable (2 values each, sharing 1) get their common values counted, within
+    // the cost of the plan their counts give without them.
     let sets = snapshot.characteristic_sets_in(ctx.model);
     assert!(
         sets.is_some_and(|s| s.has_pairs()),
         "no characteristic pairs"
     );
-    let small = [
-        scan(&snapshot, "?x type Student"),
-        scan(&snapshot, "?x city c1"),
-    ];
+    let small = [scan(&snapshot, "?x p0 o0"), scan(&snapshot, "?x p2 o0")];
     let counts: Vec<u64> = small
         .iter()
         .map(|s| snapshot.estimate_in(ctx.model, &s.quad_pattern()))
         .collect();
-    let inputs = ctx.plan_inputs(&small, &counts, &[], &mut Vec::new());
+    let (inputs, _) = ctx.plan_inputs(&small, &counts, &[], &mut Vec::new(), true);
     assert!(
         inputs.iter().all(|i| !i.overlaps.is_empty()),
         "no common values"
@@ -460,7 +461,7 @@ fn store_patterns_plan_as_before() {
         ),
         (
             "common-values",
-            vec!["?x type Student", "?x city c1", "?x knows ?y"],
+            vec!["?x p0 o0", "?x p2 o0", "?x knows ?y"],
             none,
         ),
         (
