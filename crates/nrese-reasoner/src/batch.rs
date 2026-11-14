@@ -2245,8 +2245,22 @@ impl Equality {
         let poll = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
         // A read its poller stopped ends the module (fix check r1, rule 2).
         let stopped = |Stopped| operation.interrupted();
+        // The equalities are asked only as far as the two decisions below need (an estimate
+        // of `limit` or more reads as more): whether there are any, and, while the partners
+        // aren't kept, whether there are at most eight per delta fact (`threshold`). Both
+        // answer as with the whole estimate.
+        let threshold = match self.partners {
+            None => Some(
+                store
+                    .estimate([None, None, None], Seg::Delta, &poll)
+                    .map_err(stopped)?
+                    .saturating_mul(8),
+            ),
+            Some(_) => None,
+        };
+        let limit = threshold.map_or(1, |threshold| threshold.saturating_add(1));
         let equalities = store
-            .estimate([None, Some(self.same_as), None], Seg::All, &poll)
+            .estimate_up_to([None, Some(self.same_as), None], Seg::All, limit, &poll)
             .map_err(stopped)?;
         if equalities == 0 {
             self.produced.clear();
@@ -2258,13 +2272,7 @@ impl Equality {
         // commit's, beside a store's many equalities) each term of it is looked up; for
         // a large one (the batch executor's rounds) they are collected once from all
         // `sameAs` facts and then kept current from each round's.
-        if self.partners.is_none()
-            && store
-                .estimate([None, None, None], Seg::Delta, &poll)
-                .map_err(stopped)?
-                * 8
-                >= equalities
-        {
+        if threshold.is_some_and(|threshold| threshold >= equalities) {
             let mut all = TermSet::default();
             store
                 .scan(
@@ -4358,5 +4366,140 @@ mod room_tests {
         });
         assert!(made.is_err(), "admitted");
         assert_eq!(room.used(), 0, "nothing charged");
+    }
+}
+
+#[cfg(test)]
+mod equality_threshold_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    const SAME_AS: u64 = 50;
+
+    /// A store whose estimate up to a limit answers the least it may (the smaller of its
+    /// whole estimate and the limit), recording the limits it was asked for and the scans
+    /// it was asked to make.
+    struct Least {
+        store: Store,
+        limits: Mutex<Vec<usize>>,
+        scans: Mutex<Vec<([Option<u64>; 3], Seg)>>,
+    }
+
+    impl Visits for Least {
+        fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
+            self.scans.lock().unwrap().push((pattern, seg));
+            self.store.visit(pattern, seg, visit);
+        }
+
+        fn size(
+            &self,
+            pattern: [Option<u64>; 3],
+            seg: Seg,
+            probe: Probe<'_, '_>,
+        ) -> Result<usize, Stopped> {
+            self.store.size(pattern, seg, probe)
+        }
+
+        fn size_up_to(
+            &self,
+            pattern: [Option<u64>; 3],
+            seg: Seg,
+            limit: usize,
+            probe: Probe<'_, '_>,
+        ) -> Result<usize, Stopped> {
+            self.limits.lock().unwrap().push(limit);
+            Ok(self.store.size(pattern, seg, probe)?.min(limit))
+        }
+
+        fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+            self.store.holds(fact, probe)
+        }
+    }
+
+    /// `equalities` stored `sameAs` facts (no two the same term), then `delta` other facts
+    /// as the delta; its whole estimates checked to be those counts.
+    fn least(equalities: u64, delta: u64) -> Least {
+        let mut store = Store::new((0..equalities).map(|i| [i, SAME_AS, 1_000 + i]).collect());
+        store.advance((0..delta).map(|i| [2_000 + i, 7, 3_000 + i]).collect());
+        let poll = Poller::new(NEVER).expect("never stops");
+        let whole = |pattern, seg| store.estimate(pattern, seg, &poll).unwrap();
+        assert_eq!(
+            whole([None, Some(SAME_AS), None], Seg::All),
+            equalities as usize
+        );
+        assert_eq!(whole([None, None, None], Seg::Delta), delta as usize);
+        Least {
+            store,
+            limits: Mutex::new(Vec::new()),
+            scans: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn module(partners: Option<TermSet>) -> Equality {
+        Equality {
+            same_as: SAME_AS,
+            produced: HashSet::new(),
+            member_scans: 0,
+            partners,
+        }
+    }
+
+    /// Spec (`Equality::run`): the equalities are asked only up to what its two decisions
+    /// need, and each decision is the one the whole estimate gives. While the partners aren't
+    /// kept: asked up to eight per delta fact plus one; with no equality it ends without
+    /// reading the delta, and it collects every term with a partner exactly where there are
+    /// at most eight equalities per delta fact. For 1 and 3 delta facts, and no equality,
+    /// one fewer than eight per delta fact, as many, and one more, on a store that answers
+    /// the least a limit allows.
+    #[test]
+    fn the_equalities_are_asked_only_as_far_as_the_decisions_need() {
+        for delta in [1, 3] {
+            for equalities in [0, 8 * delta - 1, 8 * delta, 8 * delta + 1] {
+                let at = format!("{delta} delta facts, {equalities} equalities");
+                let store = least(equalities, delta);
+                let mut equality = module(None);
+                equality
+                    .run(&store, &OperationStop::new(NEVER))
+                    .expect("never stopped");
+                assert_eq!(
+                    *store.limits.lock().unwrap(),
+                    [8 * delta as usize + 1],
+                    "the limits asked, {at}"
+                );
+                let read_delta = store
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .contains(&([None, None, None], Seg::Delta));
+                assert_eq!(read_delta, equalities > 0, "the delta read, {at}");
+                assert_eq!(
+                    equality.partners.is_some(),
+                    equalities > 0 && 8 * delta >= equalities,
+                    "the partners collected, {at}"
+                );
+            }
+        }
+    }
+
+    /// Spec (`Equality::run`): once the partners are kept, the equalities are asked up to 1,
+    /// whether there are any: with none it ends without reading the delta, with one it reads
+    /// it (and keeps the delta's partners).
+    #[test]
+    fn with_the_partners_kept_the_equalities_are_asked_up_to_one() {
+        for equalities in [0, 1, 2] {
+            let at = format!("{equalities} equalities");
+            let store = least(equalities, 1);
+            let mut equality = module(Some(TermSet::default()));
+            equality
+                .run(&store, &OperationStop::new(NEVER))
+                .expect("never stopped");
+            assert_eq!(*store.limits.lock().unwrap(), [1], "the limits asked, {at}");
+            let read_delta = store
+                .scans
+                .lock()
+                .unwrap()
+                .contains(&([None, None, None], Seg::Delta));
+            assert_eq!(read_delta, equalities > 0, "the delta read, {at}");
+        }
     }
 }

@@ -104,6 +104,16 @@ pub trait Source: Sync + sealed::Read {
         seg: Seg,
         poll: &Poller<'_>,
     ) -> Result<usize, Stopped>;
+    /// [`Source::estimate`], asked only up to `limit`: at least the smaller of the two,
+    /// never more than the whole estimate. For a caller that needs only whether the
+    /// estimate reaches `limit` (`batch::Equality::run`'s two decisions).
+    fn estimate_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        limit: usize,
+        poll: &Poller<'_>,
+    ) -> Result<usize, Stopped>;
     /// Whether `fact` is in [`Seg::All`].
     fn contains(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped>;
     /// The number of positions of `seg`'s matches of `pattern` in a fixed order, if the
@@ -144,6 +154,17 @@ pub trait Visits: Sync {
         seg: Seg,
         probe: Probe<'_, '_>,
     ) -> Result<usize, Stopped>;
+    /// [`Source::estimate_up_to`], the call already counted; further work on `probe`. By
+    /// default the whole estimate.
+    fn size_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        _limit: usize,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
+        self.size(pattern, seg, probe)
+    }
     /// [`Source::contains`], the call already counted; further work on `probe`.
     fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped>;
     /// [`Source::matches_len`], the call already counted.
@@ -212,6 +233,20 @@ impl<T: Visits + ?Sized> Source for T {
             return Err(Stopped);
         }
         self.size(pattern, seg, Probe(poll))
+    }
+
+    #[inline]
+    fn estimate_up_to(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        limit: usize,
+        poll: &Poller<'_>,
+    ) -> Result<usize, Stopped> {
+        if poll.tick() {
+            return Err(Stopped);
+        }
+        self.size_up_to(pattern, seg, limit, Probe(poll))
     }
 
     #[inline]
