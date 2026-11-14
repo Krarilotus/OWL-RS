@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 try:
@@ -110,18 +111,69 @@ def declared_memory(environ: dict | None = None) -> str | None:
     return f"{round(gb * 2**30)}b"
 
 
+def declared_cpus(environ: dict | None = None) -> str | None:
+    """In a fleet job that declares its containers, every suite container's CPU limit (NRESE_SUITE_CPUS):
+    a job that shares its host must declare one, and the fleet's watcher matches a container by it. None
+    elsewhere. It is given in Docker's own unit, the nearest whole nano-CPUs (_nano_cpus), written exactly:
+    1.234567 stays 1.234567 (never rounded coarser), 0.10000000000000001 is 0.1 (Docker refuses a finer value
+    as "too precise"). A value _nano_cpus can't hold is refused before anything starts."""
+    env = os.environ if environ is None else environ
+    value = env.get("NRESE_SUITE_CPUS", "") if env.get("FLEET_JOB") else ""
+    if not value:
+        return None
+    nano = _nano_cpus(value)
+    if nano is None:
+        raise ValueError(f"NRESE_SUITE_CPUS={value}: not a CPU count Docker can hold (see ns._nano_cpus)")
+    whole, part = divmod(nano, 10**9)
+    return f"{whole}.{part:09d}".rstrip("0") if part else str(whole)
+
+
+NANO_CPUS_MAX = 2**63 - 1  # Docker holds a CPU limit as a signed 64-bit count of nano-CPUs
+
+
+def _nano_cpus(value) -> int | None:
+    """A CPU count in Docker's unit, as `docker run --cpus` reads it (docker/cli opts.ParseCPUs: an exact
+    rational number, in whole nano-CPUs, held in a signed 64-bit integer): the exact number's nearest whole
+    nano-CPUs, ties to even. Spellings: a decimal (an exponent allowed), a ratio `a/b`, or an integer with a
+    base prefix (`0x10`). None for anything else, for a count below one nano-CPU (Docker refuses it as too
+    precise; rounded, it could become 0, which is no limit) and for one past NANO_CPUS_MAX (Docker would wrap
+    it). Declared and asked counts are compared in this unit: the same Docker limit is the same count."""
+    text = str(value).strip()
+    try:
+        exact = Fraction(text)
+    except (ValueError, ZeroDivisionError):
+        try:
+            exact = Fraction(int(text, 0))
+        except ValueError:
+            return None
+    scaled = exact * 10**9
+    nano = round(scaled) if scaled >= 1 else 0
+    return nano if 1 <= nano <= NANO_CPUS_MAX else None
+
+
+def _bytes(size: str) -> int | None:
+    """A Docker memory size in bytes (`2g`, `2gb`, `512m`, `2147483648b`), None when it isn't one."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kmg]?)b?", str(size).strip().lower())
+    return round(float(match[1]) * 1024 ** " kmg".index(match[2] or " ")) if match else None
+
+
 def run_args(root: Path | str, owner: str, name: str | None = None, memory: str | None = None,
-             environ: dict | None = None) -> list[str]:
+             environ: dict | None = None, cpus: str | None = None) -> list[str]:
     """`docker run` for every container the suite starts: its name (none: Docker's), the labels (in a
-    fleet job, its `fleet.job`) and its hard memory cap without swap. In a fleet job declaring its
-    containers, the declared memory; a caller asking any other is refused (ValueError) before anything
-    starts, since the fleet's watcher would stop the step at it (fleet Spec 9)."""
+    fleet job, its `fleet.job`), its hard memory cap without swap and its CPU limit. In a fleet job declaring its
+    containers, the declared memory; a caller asking any other size (in any unit) is refused (ValueError)
+    before anything starts, since the fleet's watcher would stop the step at it (fleet Spec 9). The same for
+    its CPUs, where the job declares them (NRESE_SUITE_CPUS)."""
     declared = declared_memory(environ)
-    if declared and memory not in (None, declared):
+    if declared and memory is not None and _bytes(memory) != _bytes(declared):
         raise ValueError(f"a container asking {memory} in a fleet job that declares {declared} for its containers")
     memory = declared or memory
+    declared_c = declared_cpus(environ)
+    if declared_c and cpus is not None and _nano_cpus(cpus) != _nano_cpus(declared_c):
+        raise ValueError(f"a container asking {cpus} CPUs in a fleet job that declares {declared_c} for its containers")
+    cpus = declared_c or cpus
     return ["run", *(name_args(name, root, owner, environ) if name else labels(root, owner, environ)),
-            *(["--memory", memory, "--memory-swap", memory] if memory else [])]
+            *(["--memory", memory, "--memory-swap", memory] if memory else []), *(["--cpus", str(cpus)] if cpus else [])]
 
 
 def volume(action: str, volume_name: str, root: Path | str | None = None, owner: str = "",

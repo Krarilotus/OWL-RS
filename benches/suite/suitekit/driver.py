@@ -419,8 +419,10 @@ class Suite:
                 ns.docker(ns.volume("create", nrese.target_volume, self.root, "suite"))
                 self.made_volumes.append(nrese.target_volume)
             # Built in the pinned Rust image, as the scorecards do: the binary runs in it.
-            # Half the cores, like scripts/cargo-guarded.sh: the machine stays usable.
-            cpus = str(max(1, (os.cpu_count() or 2) // 2))
+            # Half the cores, like scripts/cargo-guarded.sh: the machine stays usable; in a fleet job
+            # that declares its containers' CPUs, those, set once by ns.run_args (fleet Spec 9).
+            cpus = ns.declared_cpus() or str(max(1, (os.cpu_count() or 2) // 2))
+            jobs = str(max(1, int(float(cpus))))
             # Code for the CPU build_settings names (NRESE_TARGET_CPU; native unset), where the
             # containers run: docker_rustflags, the flags suite.py coverage expects of a default build.
             rustflags = docker_rustflags(build_settings(os.environ)["target_cpu"])
@@ -437,13 +439,13 @@ class Suite:
             toolchain = toolchain_in(image, tree) if not self.args.dry_run else receipts.unknown("a dry run")
             self.built[nrese.key].update(toolchain=toolchain,
                                          controlled=controlled(tree, None, toolchain, declared_toolchain(tree)))
-            rc = self.host_command([ns.executable(), *ns.run_args(self.root, "suite"), "--rm", "--cpus", cpus,
+            rc = self.host_command([ns.executable(), *ns.run_args(self.root, "suite", cpus=cpus), "--rm",
                                     "-v", f"{tree.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
                                     "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
                                     "-w", "/src", image,
-                                    "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
+                                    "cargo", "build", "--release", "--locked", "-j", jobs, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
         else:
             # Its own toolchain, budget and target directory, in the controlled environment (r4 F15).

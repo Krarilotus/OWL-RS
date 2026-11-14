@@ -26,6 +26,7 @@ import sys
 from rdflib import Graph, Literal, Namespace, RDF, URIRef
 
 TEST = Namespace("http://www.w3.org/2007/OWL/testOntology#")
+NOT_RUN = "not-run"  # nrese.py: a task whose step did not run; never a result
 TYPES = {
     TEST.ConsistencyTest: ("consistency", "consistent"),
     TEST.InconsistencyTest: ("consistency", "inconsistent"),
@@ -143,7 +144,9 @@ def compare(args):
             tid, reasoner, task, status, ms, detail = (line.rstrip("\n").split("\t") + [""])[:6]
             r = rows[tid]
             expected = r["expected"]
-            if status == expected:
+            if status == NOT_RUN:
+                verdict = NOT_RUN
+            elif status == expected:
                 verdict = "pass"
             elif status in ("unsupported", "timeout", "parse-error", "error"):
                 verdict = status
@@ -175,7 +178,10 @@ def compare(args):
             w.writerow(["test", "status", "task", "expected", "reasoner", "result", "ms",
                         "verdict", "detail"])
             w.writerows(sorted(out))
-    return 1 if unexpected else 0
+    not_run = sum(counts[NOT_RUN] for counts in tally.values())
+    if not_run:
+        print(f"NOT RUN (no result; the step did not run): {not_run}")
+    return 1 if unexpected else 2 if not_run else 0
 
 
 TYPE_NAMES = {
@@ -227,6 +233,8 @@ def against(args):
         if reasoner == args.reasoner:
             r = rows[tid]
             ours[(r["page"], task, r["expected"])] = status
+    not_run = sum(s == NOT_RUN for s in ours.values())
+    ours = {k: s for k, s in ours.items() if s != NOT_RUN}  # not run here: no result to set against it
     counts = collections.Counter()
     lost = []
     with open(args.published, encoding="utf-8") as f:
@@ -245,7 +253,9 @@ def against(args):
         print(f"{args.reasoner}: {k}: {v}")
     for item in lost:
         print("PUBLISHED PASS NOT REPRODUCED:", *item, sep="\t")
-    return 1 if lost else 0
+    if not_run:
+        print(f"{args.reasoner}: NOT RUN (no result; the step did not run): {not_run}")
+    return 1 if lost else 2 if not_run else 0
 
 
 def main():
