@@ -125,6 +125,22 @@ impl CountedSnapshot {
             .ok_or(Stopped)
     }
 
+    /// [`Self::count`], asked only up to `limit`: at least `min(count, limit)`, never more
+    /// than the count, and [`Count::AtLeast`] where an expanded count stopped at `limit` (a
+    /// held count answers exactly). For a caller that needs only whether the count reaches
+    /// `limit`.
+    pub fn count_up_to(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        limit: u64,
+        visit: Visitor<'_>,
+    ) -> Result<Count, Stopped> {
+        self.snapshot
+            .count_with(model, pattern, limit, visit)
+            .ok_or(Stopped)
+    }
+
     /// [`Snapshot::estimate_in`], counted.
     pub fn estimate(
         &self,
