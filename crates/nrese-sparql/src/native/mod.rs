@@ -3695,7 +3695,7 @@ impl<'a> Context<'a> {
             let along = |sets: Option<&CharacteristicSets>, budget: usize| {
                 plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &order)
             };
-            return self.with_sets(&inputs, Some(order[0]), &along);
+            return self.with_sets(&inputs, &along);
         }
         self.order_inputs(&inputs, vars.len())
     }
@@ -3713,26 +3713,22 @@ impl<'a> Context<'a> {
         let order = |sets: Option<&CharacteristicSets>, budget: usize| {
             plan::order(inputs, variables, PROBE_FACTOR, sets, budget, &cancelled)
         };
-        self.with_sets(inputs, None, &order)
+        self.with_sets(inputs, &order)
     }
 
-    /// `planning` of `inputs`: without the characteristic sets (the plain plan), and, where an
-    /// input is part of an open star ([`plan::Star::open`]) and the reads the set search would
-    /// make at its starts (all of them, or only `first`'s where `planning` is a fixed order
-    /// that starts there) cost little against the work the plain plan expects
-    /// ([`plan::admits`]), with them, within a budget that follows that work
-    /// ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
-    /// paths). A BGP the gate keeps from the sets, or whose set search passes its budget, gets
-    /// the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]): which planner a BGP got shows.
-    /// Plain first, but where the starts' reads alone admit the sets ([`plan::short_starts`]):
-    /// those are searched with the least budget first, and planned without the sets only if
-    /// that search passes it, with the plans and notes of plain first. A query cancelled in or
-    /// between its plannings fails (a fixed order's planning doesn't ask, so each is checked
-    /// after), and isn't planned again.
+    /// `planning` of `inputs`: the plain plan (without the characteristic sets) first, and a
+    /// BGP is refined by the sets only where the work that plan expects admits it
+    /// ([`plan::admits`]): every other BGP keeps its plain plan and never asks for the
+    /// statistics. Admitted, it is searched with the sets within a budget that follows that
+    /// work ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
+    /// paths), and only where an input is part of an open star ([`plan::Star::open`]): without
+    /// one, the search would make the plain plan again. A BGP kept from the sets, or whose set
+    /// search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
+    /// which planner a BGP got shows. A query cancelled in or between its plannings fails (a
+    /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
-        first: Option<usize>,
         planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
         // Read only by EXPLAIN's notes: no clock for a query that isn't explained.
@@ -3742,38 +3738,9 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        // A cancelled query plans nothing and doesn't ask for the statistics: asking may
-        // build them, or wait for a build, and takes no cancellation of its own.
+        // A cancelled query plans nothing.
         if cancelled() {
             return Err(QueryEvaluationError::Cancelled.into());
-        }
-        // Only an open star's patterns are estimated from the sets: with none, a search with
-        // them would make the plain plan again.
-        let sets = if inputs.iter().any(|i| i.star.is_some_and(|s| s.open())) {
-            self.snapshot.characteristic_sets_in(self.model)
-        } else {
-            None
-        };
-        if cancelled() {
-            return Err(QueryEvaluationError::Cancelled.into());
-        }
-        let reads = sets
-            .as_ref()
-            .map(|sets| plan::start_reads(inputs, first, sets));
-        // Admitted whatever the plain plan expects: the set search with the least budget
-        // first. One that completes within it plans as within any larger budget (a budget
-        // only stops a search), so the plain plan isn't needed; one that passes it does the
-        // same work before it as plain first would with that budget.
-        let least = plan::budget_for(0.0);
-        let mut tried = None;
-        if let (Some(sets), Some(reads)) = (&sets, reads)
-            && plan::short_starts(reads)
-        {
-            match planning(Some(&**sets), least) {
-                Ok(planned) if !cancelled() => return Ok(planned),
-                Err(plan::Stopped::Budget { work }) if !cancelled() => tried = Some(work),
-                Ok(_) | Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
-            }
         }
         let mut plain = match planning(None, 0) {
             Ok(planned) if !cancelled() => planned,
@@ -3782,34 +3749,39 @@ impl<'a> Context<'a> {
             }
             Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
         };
-        let (Some(sets), Some(reads)) = (sets, reads) else {
+        // Only an open star's patterns are estimated from the sets.
+        if !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())) {
             return Ok(plain);
-        };
+        }
         let expected = plan::expected_work(&plain);
-        if !plan::admits(expected, reads) {
+        if !plan::admits(expected) {
             if let Some(start) = start {
                 let detail = format!(
-                    "{} patterns planned without characteristic sets: {reads} set entries at \
-                     its starts against {expected:.0} rows expected",
+                    "{} patterns planned without characteristic sets: {expected:.0} rows \
+                     expected, fewer than {:.0}",
                     inputs.len(),
+                    plan::SET_GATE_ROWS,
                 );
                 self.note(WITHOUT_SETS, detail, None, 0, start);
             }
             return Ok(plain);
         }
+        // Asking for the statistics may build them, or wait for a build, and takes no
+        // cancellation of its own: a cancelled query doesn't ask.
+        let Some(sets) = self.snapshot.characteristic_sets_in(self.model) else {
+            return Ok(plain);
+        };
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
         let budget = plan::budget_for(expected);
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.
         // A fixed order's planning doesn't ask: a query cancelled while it planned fails too.
-        // Tried with the least budget already and this one no more: it passes it again, after
-        // the same work.
-        let work = match tried {
-            Some(work) if budget <= least => work,
-            _ => match planning(Some(&*sets), budget) {
-                Ok(planned) if !cancelled() => return Ok(planned),
-                Err(plan::Stopped::Budget { work }) if !cancelled() => work,
-                Ok(_) | Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
-            },
+        let work = match planning(Some(&*sets), budget) {
+            Ok(planned) if !cancelled() => return Ok(planned),
+            Err(plan::Stopped::Budget { work }) if !cancelled() => work,
+            Ok(_) | Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
         };
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
