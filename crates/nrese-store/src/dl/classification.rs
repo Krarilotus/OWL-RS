@@ -10,7 +10,7 @@
 //! to disable its watch; opening another store cannot change that policy.
 //!
 //! Where an irregular role hierarchy is all the DL engines leave out, the EL classifier
-//! may answer instead ([`el_answer`]).
+//! may answer instead ([`el_answer`]); its complete answers are kept per revision too.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -26,11 +26,16 @@ use nrese_reasoner::classify::Classification;
 use super::source;
 use crate::StoreService;
 
-/// The latest complete results, by revision.
+/// The latest complete results, by revision. Kept, not charged to any envelope: each is
+/// one revision's answer, replaced by the next.
 #[derive(Debug, Default)]
 pub(crate) struct Cache {
     taxonomy: Slot<Taxonomy>,
     realisation: Slot<Realisation>,
+    /// The EL classifier's answer ([`el_answer`]), complete: a request on the same revision
+    /// runs neither the DL engines nor the EL classifier again. Simultaneous first requests
+    /// each run both (nothing coalesces them).
+    el: Slot<El>,
 }
 
 type Slot<T> = Mutex<Option<(u64, Arc<T>)>>;
@@ -110,12 +115,17 @@ fn cached<T>(
     }
     let result = Arc::new(compute());
     if complete(&result) {
-        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_none_or(|(at, _)| *at < revision) {
-            *slot = Some((revision, Arc::clone(&result)));
-        }
+        keep(slot, revision, &result);
     }
     result
+}
+
+/// Keeps `result` as `revision`'s unless the slot holds a newer revision's or one already.
+fn keep<T>(slot: &Slot<T>, revision: u64, result: &Arc<T>) {
+    let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.as_ref().is_none_or(|(at, _)| *at < revision) {
+        *slot = Some((revision, Arc::clone(result)));
+    }
 }
 
 fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
@@ -275,25 +285,64 @@ pub(crate) struct El {
     pub consistency: Verdict,
 }
 
+/// What the EL route gave ([`el_answer`]).
+pub(crate) enum ElRoute {
+    /// Its complete answer (kept for the snapshot's revision).
+    Answered(Arc<El>),
+    /// Not taken: the DL engines' answer stands as it is.
+    NotTaken,
+    /// Taken, and stopped before its end (nothing of the run is used): the DL engines'
+    /// answer stands, marked with why. The store's memory error where memory stopped it;
+    /// `None`: `dl.timeout` passed.
+    Stopped(Option<crate::StoreError>),
+}
+
+/// The EL classifier's answer kept for `snapshot`'s revision, if there is one.
+pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<El>> {
+    latest(&store.dl().classification.el, snapshot.revision())
+}
+
 /// The EL classifier's classification of `snapshot`'s asserted statements, where `taxonomy`
 /// (the DL engines') left out an irregular role hierarchy and nothing else, and the EL
 /// classifier is complete for the ontology: no assertion, no range with a chain
 /// ([`el_complete_for`]), nothing it skipped. Its completion rules (CR6) need no regular
-/// hierarchy. `None` everywhere else, or where `started` plus `dl.timeout` has passed
-/// before it would start: the DL engines' answer stands.
+/// hierarchy. [`ElRoute::NotTaken`] everywhere else. It runs under the request's stop:
+/// `started` plus `dl.timeout`, and the store's memory watch with the process's limit
+/// ([`StoreService::memory_stop`]), polled as `nrese_reasoner::classify::classify_parallel_within`
+/// says; stopped, or with that time already passed before it would start,
+/// [`ElRoute::Stopped`].
 ///
 /// Its consistency: with no assertion, `owl:Thing`'s satisfiability, read from a fresh class
 /// that no axiom names (unsatisfiable iff `owl:Thing` is), left out of the answer.
 ///
-/// The classifier (`nrese_reasoner::classify::classify_parallel`) takes no stop and no
-/// budget: once started it runs to its end, polynomial in the ontology; the triples it
-/// reads are charged.
+/// The triples it reads are charged to the classification's envelope; the classifier's
+/// own structures are bounded by the stop's memory watch, a soft bound (seen at the next
+/// poll, not refused in advance).
 pub(crate) fn el_answer(
     store: &StoreService,
     snapshot: &Snapshot,
     taxonomy: &Taxonomy,
     started: Instant,
-) -> Option<El> {
+) -> ElRoute {
+    match el_run(store, snapshot, taxonomy, started) {
+        Some(Ok(el)) => {
+            let el = Arc::new(el);
+            keep(&store.dl().classification.el, snapshot.revision(), &el);
+            ElRoute::Answered(el)
+        }
+        Some(Err(stopped)) => ElRoute::Stopped(stopped),
+        None => ElRoute::NotTaken,
+    }
+}
+
+/// [`el_answer`]'s run: `None` where the route isn't taken; `Some(Err(..))` where it was
+/// stopped, with the store's memory error if memory stopped it.
+fn el_run(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    taxonomy: &Taxonomy,
+    started: Instant,
+) -> Option<Result<El, Option<crate::StoreError>>> {
     // The driver's lower bound, where an irregular role hierarchy is all it left out.
     if !taxonomy.left_out.only(Unsupported::IrregularRoleHierarchy) {
         return None;
@@ -303,11 +352,14 @@ pub(crate) fn el_answer(
     if !el_complete_for(&source::read_snapshot(snapshot, memory.clone()).ok()?) {
         return None;
     }
-    if options
-        .timeout
-        .is_some_and(|limit| started.elapsed() >= limit)
-    {
-        return None;
+    let deadline = options.timeout.map(|limit| started + limit);
+    let memory_stop = store.memory_stop();
+    let stop = || deadline.is_some_and(|at| Instant::now() >= at) || memory_stop.exceeded();
+    let room = || memory_stop.room();
+    if stop() {
+        return Some(Err(
+            memory_stop.error(nrese_reasoner::delta::Interrupted::default())
+        ));
     }
     let mut triples = nrese_exec::ChargedVec::new(memory);
     for q in snapshot.quads_for_pattern_in(ReadModel::Asserted, &source::ANY) {
@@ -341,13 +393,19 @@ pub(crate) fn el_answer(
     }
     triples.truncate(kept);
     let named = |id: u64| id == probe || TermId::from_raw(id).kind() == TermKind::Iri;
-    let mut classification = nrese_reasoner::classify::classify_parallel(
+    let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+    let run = nrese_reasoner::classify::classify_parallel_within(
         &triples,
         &mut vocabulary,
         &named,
         options.workers.width(),
+        &operation,
     );
     drop(triples);
+    let mut classification = match run {
+        Ok(classification) => classification,
+        Err(interrupted) => return Some(Err(memory_stop.error(interrupted))),
+    };
     if !classification.skipped.is_empty() {
         return None;
     }
@@ -372,10 +430,10 @@ pub(crate) fn el_answer(
     {
         return None;
     }
-    Some(El {
+    Some(Ok(El {
         classification,
         consistency,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -404,6 +462,85 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// The irregular chain of the store's tests (`tests/it/dl/classification.rs`), with
+    /// nothing else: the EL route's input.
+    const IRREGULAR: &str = "PREFIX : <urn:el:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { :r3 owl:propertyChainAxiom ( :r1 :r2 ) . :r3 rdfs:subPropertyOf :r1 .
+            :r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :r3 a owl:ObjectProperty .
+            :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+            :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] .
+            :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C ] .
+            [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :C ] rdfs:subClassOf :D . }";
+
+    fn el_config(timeout: Duration) -> StoreConfig {
+        StoreConfig {
+            process_memory_bytes: crate::ProcessMemory::Bytes(0),
+            dl: DlConfig {
+                timeout: Some(timeout),
+                threads: 1,
+                ..DlConfig::default()
+            },
+            ..StoreConfig::in_memory()
+        }
+    }
+
+    /// An EL run answers in time and is kept: a later request on the revision gets that
+    /// answer. One stopped (by a `dl.timeout` of zero, by the memory unread) answers no
+    /// classification and keeps nothing, and a memory stop is told apart from the deadline
+    /// by the store's memory error. (The stopped stores get the first one's taxonomy: their
+    /// own DL engines would stop too.)
+    #[test]
+    fn a_stopped_el_run_answers_nothing_and_keeps_nothing() {
+        let store = StoreService::new(el_config(Duration::from_secs(3600))).unwrap();
+        store.update_str_ungated(IRREGULAR).unwrap();
+        let snapshot = store.engine().snapshot();
+        let taxonomy = taxonomy(&store, &snapshot);
+        assert!(
+            taxonomy
+                .left_out
+                .only(nrese_owl::Unsupported::IrregularRoleHierarchy),
+            "{:?}",
+            taxonomy.incomplete
+        );
+        assert!(kept_el(&store, &snapshot).is_none());
+        let ElRoute::Answered(el) = el_answer(&store, &snapshot, &taxonomy, Instant::now()) else {
+            panic!("the EL route didn't answer in time");
+        };
+        let kept = kept_el(&store, &snapshot).expect("an answer kept for the revision");
+        assert!(Arc::ptr_eq(&el, &kept));
+
+        let late = StoreService::new(el_config(Duration::ZERO)).unwrap();
+        late.update_str_ungated(IRREGULAR).unwrap();
+        let snapshot = late.engine().snapshot();
+        assert!(matches!(
+            el_answer(&late, &snapshot, &taxonomy, Instant::now()),
+            ElRoute::Stopped(None)
+        ));
+        assert!(kept_el(&late, &snapshot).is_none());
+
+        fn unread() -> nrese_exec::memory::Reading {
+            Err(nrese_exec::memory::Unread::Failed)
+        }
+        let unreadable = StoreService::with_runtime(
+            el_config(Duration::from_secs(3600)),
+            Arc::new(crate::Runtime::new(0, 0)),
+        )
+        .unwrap()
+        .with_capacity(unread);
+        unreadable.update_str_ungated(IRREGULAR).unwrap();
+        let snapshot = unreadable.engine().snapshot();
+        let stopped = el_answer(&unreadable, &snapshot, &taxonomy, Instant::now());
+        assert!(
+            matches!(
+                stopped,
+                ElRoute::Stopped(Some(crate::StoreError::MemoryUnreadable { .. }))
+            ),
+            "the memory stop isn't told apart"
+        );
+        assert!(kept_el(&unreadable, &snapshot).is_none());
     }
 
     /// D2, A-902: where the process's limit can't be found (its memory unread), no engine
