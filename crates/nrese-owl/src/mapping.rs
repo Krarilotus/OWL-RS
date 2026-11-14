@@ -357,6 +357,8 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
 
 struct Reader<'a> {
     v: Vocabulary,
+    /// [`DECLARATION_KINDS`] by the source's ids.
+    declaration_kinds: [(Option<Term>, EntityKind); 8],
     terms: &'a dyn Terms,
     statements: &'a [Statement],
     /// Per subject: (predicate, object, graph).
@@ -382,20 +384,32 @@ struct Reader<'a> {
     annotations: usize,
 }
 
-/// The classes whose instances are declared entities: OWL 2's, and the RDFS and OWL 1
-/// synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`).
-fn declaration_kinds(v: &Vocabulary) -> [(Option<Term>, EntityKind); 8] {
-    [
-        (v.owl_class, EntityKind::Class),
-        (v.rdfs_class, EntityKind::Class),
-        (v.owl_object_property, EntityKind::ObjectProperty),
-        (v.owl_datatype_property, EntityKind::DataProperty),
-        (v.owl_annotation_property, EntityKind::AnnotationProperty),
-        (v.rdfs_datatype, EntityKind::Datatype),
-        (v.owl_data_range, EntityKind::Datatype),
-        (v.owl_named_individual, EntityKind::NamedIndividual),
-    ]
-}
+/// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
+/// OWL 1 synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`). [`read`]
+/// declares by this table, and a reader of RDF elsewhere that tells what a name is from its
+/// declarations reads by it too, so that both read a declaration as the same kind.
+pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
+    (Vocabulary::iri("owl_class"), EntityKind::Class),
+    (Vocabulary::iri("rdfs_class"), EntityKind::Class),
+    (
+        Vocabulary::iri("owl_object_property"),
+        EntityKind::ObjectProperty,
+    ),
+    (
+        Vocabulary::iri("owl_datatype_property"),
+        EntityKind::DataProperty,
+    ),
+    (
+        Vocabulary::iri("owl_annotation_property"),
+        EntityKind::AnnotationProperty,
+    ),
+    (Vocabulary::iri("rdfs_datatype"), EntityKind::Datatype),
+    (Vocabulary::iri("owl_data_range"), EntityKind::Datatype),
+    (
+        Vocabulary::iri("owl_named_individual"),
+        EntityKind::NamedIndividual,
+    ),
+];
 
 /// `Some(id) == Some(x)` without matching an absent term.
 fn is(id: Term, term: Option<Term>) -> bool {
@@ -420,6 +434,7 @@ impl<'a> Reader<'a> {
         }
         Self {
             v,
+            declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
             terms,
             statements,
             by_subject,
@@ -499,7 +514,7 @@ impl<'a> Reader<'a> {
 
     fn declarations(&mut self) {
         let v = self.v;
-        let kinds = declaration_kinds(&v);
+        let kinds = self.declaration_kinds;
         // Characteristics other than functional make an object property.
         let object_only = [
             v.owl_inverse_functional,
@@ -1278,8 +1293,7 @@ impl<'a> Reader<'a> {
     /// An `rdf:type` statement: a declaration, a characteristic, or a class assertion.
     fn typing(&mut self, s: Term, o: Term, triple: [Term; 3]) {
         let v = self.v;
-        let declarations = declaration_kinds(&v);
-        if let Some(&(_, kind)) = declarations.iter().find(|(c, _)| is(o, *c)) {
+        if let Some(&(_, kind)) = self.declaration_kinds.iter().find(|(c, _)| is(o, *c)) {
             if self.kind(s) == TermKind::Iri {
                 self.add(Axiom::Declaration(kind, s), triple);
             }
