@@ -1,11 +1,13 @@
 # Status
 
-The one place for the state of the work. Each item is **done** (implemented, tested,
+What works today, capability by capability, with the tests behind it: the
+[capability matrix](spec/06-target-capability-matrix.md); what doesn't, and what to do
+instead: [limits](limits.md).
+
+Below, the one place for the state of the work. Each item is **done** (implemented, tested,
 in the branch), **deferred** (not done, with the reason and where it went), or **open**.
 "Done" means done: what isn't, says so here.
 
-- What the product can do, capability by capability: the
-  [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
 What is left before v2 goes to `main`, with owners and state, is the status table of the
