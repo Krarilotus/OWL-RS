@@ -21,9 +21,9 @@ pub(super) fn parse_ai_config(source: &dyn ConfigSource) -> Result<AiConfig> {
         .unwrap_or_else(|| "gemini-2.5-flash".to_owned());
     let request_timeout = Duration::from_millis(parse_u64(source, names::AI_TIMEOUT_MS, 20_000)?);
     let max_suggestions = parse_usize(source, names::AI_MAX_SUGGESTIONS, 4)?;
-    let system_prompt = source.get(names::AI_SYSTEM_PROMPT).unwrap_or_else(|| {
-        "You generate concise SPARQL query ideas for an RDF and OWL knowledge graph. Return strict JSON only. Prefer safe read queries. Use prefixes only when you can justify them from the prompt or context. If uncertain, use full IRIs.".to_owned()
-    });
+    let system_prompt = source
+        .get(names::AI_SYSTEM_PROMPT)
+        .unwrap_or_else(|| crate::ai::DEFAULT_SYSTEM_PROMPT.to_owned());
 
     let provider = match provider_name.as_str() {
         "disabled" => AiProviderConfig::Disabled,
