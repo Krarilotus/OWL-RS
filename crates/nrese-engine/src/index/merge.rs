@@ -113,6 +113,20 @@ const fn levels(len: usize) -> u64 {
     (usize::BITS - len.leading_zeros()) as u64
 }
 
+/// What [`SignedMerge::add`] counts for an input added to `heads` others: reading its first
+/// key, and pushing its head onto theirs, or building the heap at the input after the
+/// [`LINEAR_UP_TO`]th.
+pub(crate) const fn add_cost(heads: usize) -> u64 {
+    let push = if heads < LINEAR_UP_TO {
+        0
+    } else if heads == LINEAR_UP_TO {
+        HEAP_BUILD
+    } else {
+        levels(heads)
+    };
+    1 + push
+}
+
 impl<'a> Cursor<'a> {
     /// At the start of `run`'s range `pos..end`, its first key read.
     #[inline]
@@ -262,14 +276,12 @@ impl<'a> SignedMerge<'a> {
             "a merge's inputs come before its steps"
         );
         let cursor = self.cursors.len();
-        let push = if self.heaped {
-            levels(self.heads.len())
-        } else if cursor == LINEAR_UP_TO {
-            HEAP_BUILD
+        let heads = if self.heaped {
+            self.heads.len()
         } else {
-            0
+            cursor
         };
-        if self.stopped || !account.take(1 + push) {
+        if self.stopped || !account.take(add_cost(heads)) {
             self.stopped = true;
             return false;
         }

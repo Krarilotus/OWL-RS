@@ -54,18 +54,19 @@ impl<'a> EngineBase<'a> {
         if poll.tick() {
             return Err(Stopped);
         }
-        let [s, p, o] = fact.map(Some);
-        // Its work in the engine counted too (REAS-3, SW016).
-        let first = self
+        // Its work in the engine counted too (REAS-3, SW016), a deleted copy found as any.
+        let visit = |n| poll.visit(n);
+        let first = match self
             .snapshot
-            .quads(
-                ReadModel::Materialised,
-                &pattern([s, p, o], GraphSelector::Any),
-                &|n| poll.visit(n),
-            )
-            .next()
-            .transpose()?;
-        Ok(first.is_some())
+            .point_quads(ReadModel::Materialised, ids(fact), &visit)
+        {
+            Some(mut quads) => quads.next(),
+            None => self
+                .snapshot
+                .quads(ReadModel::Materialised, &point(fact), &visit)
+                .next(),
+        };
+        Ok(first.transpose()?.is_some())
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
@@ -77,13 +78,21 @@ impl<'a> EngineBase<'a> {
         fact: Triple,
         probe: Probe<'_, '_>,
     ) -> Result<bool, Stopped> {
-        let [s, p, o] = fact.map(Some);
         // The engine's work below each copy counted too (REAS-3, SW017).
         let visit = |n| probe.visited(n);
-        for quad in self
-            .snapshot
-            .quads(model, &pattern([s, p, o], GraphSelector::Any), &visit)
-        {
+        match self.snapshot.point_quads(model, ids(fact), &visit) {
+            Some(quads) => self.kept(quads, probe),
+            None => self.kept(self.snapshot.quads(model, &point(fact), &visit), probe),
+        }
+    }
+
+    /// Whether `quads` hold one the change doesn't delete, each counted on `probe`.
+    fn kept(
+        &self,
+        quads: impl Iterator<Item = Result<EncodedQuad, Stopped>>,
+        probe: Probe<'_, '_>,
+    ) -> Result<bool, Stopped> {
+        for quad in quads {
             let quad = quad?;
             if !probe.units(1) {
                 return Err(Stopped);
@@ -94,6 +103,16 @@ impl<'a> EngineBase<'a> {
         }
         Ok(false)
     }
+}
+
+/// `fact`'s terms.
+fn ids(fact: Triple) -> [TermId; 3] {
+    fact.map(TermId::from_raw)
+}
+
+/// `fact` in any graph.
+fn point(fact: Triple) -> QuadPattern {
+    pattern(fact.map(Some), GraphSelector::Any)
 }
 
 /// Reads count as [`Base`] says: each quad a scan visits is a position, the deleted ones it
@@ -938,6 +957,46 @@ mod tests {
             largest <= LARGEST_GAP,
             "{largest} merge steps between two asks of the probe's stop: at most {LARGEST_GAP}"
         );
+    }
+
+    /// D16-543, test 1's deletion cases. Spec (`EngineBase`: the committed state without the
+    /// pending deletes; `known_before`: the state before the transaction): a fact committed in
+    /// two graphs, one copy deleted by the change, is still held and asserted; with both copies
+    /// deleted it is neither, and was still known before. The point read's quads keep their
+    /// graphs, so the change's deletes are matched per copy.
+    #[test]
+    fn an_engine_base_probe_holds_a_fact_while_the_change_leaves_a_copy() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into());
+        let [s, p, o, g] = ["s", "p", "o", "g"].map(|t| iri(&format!("http://example.com/{t}")));
+        let copies = [TermId::DEFAULT_GRAPH, g].map(|graph| EncodedQuad::new(s, p, o, graph));
+        for copy in copies {
+            tx.insert_encoded(copy);
+        }
+        tx.commit().unwrap();
+        let fact = [s.raw(), p.raw(), o.raw()];
+        let stop = || false;
+        let poll = Poller::new(&stop).expect("never stops");
+        for deleted in [&copies[..1], &copies[..]] {
+            let mut tx = engine.transaction();
+            for &copy in deleted {
+                tx.remove_encoded(copy);
+            }
+            let base = EngineBase::new(&tx, &[]);
+            let left = deleted.len() < copies.len();
+            assert_eq!(base.contains(fact, &poll), Ok(left), "held: {left}");
+            assert_eq!(base.is_asserted(fact, &poll), Ok(left), "asserted: {left}");
+            assert_eq!(
+                base.known_before(fact, &poll),
+                Ok(true),
+                "known before the change"
+            );
+        }
     }
 
     /// REAS-3, group E (sweep SW006, SW007, SW009). Spec (design note's invariant: a unit is

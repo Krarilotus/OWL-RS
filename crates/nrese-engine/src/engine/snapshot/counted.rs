@@ -5,11 +5,11 @@
 //! `2026-11-09-p2-reas3-design.md` §1). The uncounted reads are left as they were: what an
 //! uncounted reader runs is not this code.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{CopyVisibility, Either, Snapshot};
 use crate::engine::equality::{Classes as EqualityClasses, Expand, Merged, OnMeter, Read, Step};
-use crate::engine::{ReadModel, Stack};
+use crate::engine::{ReadModel, Stack, Version};
 use crate::index::{IndexVersion, QuadScan};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::visit::{Account, Ledger, Stopped, Visitor};
@@ -24,6 +24,9 @@ use crate::{Count, SnapshotIdentity, TermId};
 #[derive(Clone)]
 pub struct CountedSnapshot {
     snapshot: Snapshot,
+    /// What making a point read's scans counts, by read model ([`Self::point_quads`]): worked
+    /// out at the first point read in that model.
+    point_costs: [OnceLock<u64>; 3],
 }
 
 impl Snapshot {
@@ -31,6 +34,7 @@ impl Snapshot {
     pub fn counted(&self) -> CountedSnapshot {
         CountedSnapshot {
             snapshot: self.clone(),
+            point_costs: Default::default(),
         }
     }
 }
@@ -91,6 +95,61 @@ impl CountedSnapshot {
             .snapshot
             .scan_sorted_visited(model, pattern, permutation, visit)?;
         Some(Ended::new(quads, visit))
+    }
+
+    /// The quads of `[s, p, o]` in any graph, as [`Self::quads`] reads them, with the making of
+    /// their scans charged up front: before the first quad, one visit of what
+    /// [`Self::quads`] would count making them at most (each run's range search and its cursor
+    /// in a merge whose every range is taken), worked out once per read model. Each merge step
+    /// is then counted on one [`Ledger`] as in [`Self::quads`], and every refusal answers
+    /// [`Stopped`].
+    ///
+    /// `None` where that charge is over [`nrese_exec::POLL_UNITS`] or the read expands
+    /// equality classes: read with [`Self::quads`] instead (design note
+    /// `2026-11-14-d16-543-point-reads-design.md`).
+    pub fn point_quads<'a>(
+        &'a self,
+        model: ReadModel,
+        [s, p, o]: [TermId; 3],
+        visit: Visitor<'a>,
+    ) -> Option<impl Iterator<Item = Result<EncodedQuad, Stopped>> + use<'a>> {
+        let snapshot = &self.snapshot;
+        let pattern = QuadPattern {
+            subject: Some(s),
+            predicate: Some(p),
+            object: Some(o),
+            graph: GraphSelector::Any,
+        };
+        let pattern = *snapshot.read_pattern(model, &pattern);
+        let plan = AccessPlan::for_pattern(&pattern);
+        let data = snapshot.data(model);
+        // Every point plan reads one permutation, so its cost is the model's.
+        let cost = *self.point_costs[model as usize].get_or_init(|| {
+            Stack::ALL
+                .into_iter()
+                .filter(|&stack| model.includes(stack))
+                .map(|stack| data.stack(stack).scan_cost(&plan))
+                .sum()
+        });
+        if cost > u64::from(nrese_exec::POLL_UNITS) {
+            return None;
+        }
+        let charge = match snapshot.expanding_with(model, &pattern, visit) {
+            Ok(Some(_)) => return None,
+            Ok(None) => Ok(cost),
+            Err(Stopped) => Err(Stopped),
+        };
+        Some(PointQuads {
+            data,
+            model,
+            plan,
+            charge: Some(charge),
+            visit,
+            stacks: Stack::ALL.into_iter(),
+            scan: None,
+            ledger: Ledger::new(visit),
+            done: false,
+        })
     }
 
     /// [`Snapshot::contains_in`], counted.
@@ -166,6 +225,59 @@ impl<I: Iterator<Item = EncodedQuad>> Iterator for Ended<'_, I> {
             None => {
                 self.done = true;
                 crate::visit::stopped(self.visit).then_some(Err(Stopped))
+            }
+        }
+    }
+}
+
+/// [`CountedSnapshot::point_quads`]'s quads: its charge asked at the first `next`, then each
+/// stack's scan made as the one before ends, uncounted as charged, and stepped on the read's
+/// one ledger.
+struct PointQuads<'a> {
+    data: &'a Version,
+    model: ReadModel,
+    plan: AccessPlan,
+    /// The charge still to ask, or the class build's refusal; `None` once asked.
+    charge: Option<Result<u64, Stopped>>,
+    visit: Visitor<'a>,
+    stacks: std::array::IntoIter<Stack, 2>,
+    scan: Option<QuadScan<'a>>,
+    ledger: Ledger<'a>,
+    done: bool,
+}
+
+impl Iterator for PointQuads<'_> {
+    type Item = Result<EncodedQuad, Stopped>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.charge.take() {
+            Some(Ok(cost)) if (self.visit)(cost) => {}
+            None => {}
+            Some(_) => {
+                self.done = true;
+                return Some(Err(Stopped));
+            }
+        }
+        loop {
+            if self.scan.is_none() {
+                let model = self.model;
+                let Some(stack) = self.stacks.find(|&stack| model.includes(stack)) else {
+                    self.done = true;
+                    return None;
+                };
+                self.scan = Some(self.data.stack(stack).scan_plan(&self.plan));
+            }
+            let scan = self.scan.as_mut().expect("made above");
+            match scan.step_with(&mut self.ledger) {
+                Ok(Some(quad)) => return Some(Ok(quad)),
+                Ok(None) => self.scan = None,
+                Err(Stopped) => {
+                    self.done = true;
+                    return Some(Err(Stopped));
+                }
             }
         }
     }
