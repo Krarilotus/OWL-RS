@@ -24,12 +24,13 @@
 //! other class or property axiom is skipped and counted (OWL 2 Profiles §2.2):
 //! - outside OWL 2 EL: unions and disjoint unions, universal restrictions, complements,
 //!   cardinalities, inverse properties, nominals of more than one individual, disjoint
-//!   properties, functional, inverse-functional, irreflexive, symmetric and asymmetric
-//!   properties, and the data ranges EL lacks (complements, facet restrictions);
+//!   properties, functional object properties, inverse-functional, irreflexive, symmetric
+//!   and asymmetric properties, and the data ranges EL lacks (complements, facet
+//!   restrictions);
 //! - inside OWL 2 EL but not read here: nominals of one individual (`owl:oneOf` with one
-//!   member, `owl:hasValue`), self restrictions, reflexive properties, restrictions on data
-//!   properties, EL's data ranges (its datatypes, their intersections, one-literal
-//!   enumerations), and the top and bottom properties;
+//!   member, `owl:hasValue`), self restrictions, reflexive properties, functional data
+//!   properties, restrictions on data properties, EL's data ranges (its datatypes, their
+//!   intersections, one-literal enumerations), and the top and bottom properties;
 //! - neither, but how the triples state them: named class expressions, datatypes where a
 //!   class is read, nodes that state two expressions.
 //!
