@@ -226,18 +226,25 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
 
 /// The class expressions an axiom holds directly.
 fn expressions_of(axiom: &Axiom) -> Vec<u32> {
+    let mut out = Vec::new();
+    push_expressions(axiom, &mut out);
+    out
+}
+
+/// [`expressions_of`], pushed onto `out`.
+fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
     match axiom {
-        Axiom::SubClassOf(a, b) => vec![a.0, b.0],
+        Axiom::SubClassOf(a, b) => out.extend([a.0, b.0]),
         Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) => {
-            xs.iter().map(|x| x.0).collect()
+            out.extend(xs.iter().map(|x| x.0))
         }
-        Axiom::DisjointUnion(_, xs) => xs.iter().map(|x| x.0).collect(),
+        Axiom::DisjointUnion(_, xs) => out.extend(xs.iter().map(|x| x.0)),
         Axiom::ObjectPropertyDomain(_, x)
         | Axiom::ObjectPropertyRange(_, x)
         | Axiom::DataPropertyDomain(_, x)
         | Axiom::HasKey(x, _, _)
-        | Axiom::ClassAssertion(x, _) => vec![x.0],
-        _ => Vec::new(),
+        | Axiom::ClassAssertion(x, _) => out.push(x.0),
+        _ => {}
     }
 }
 
@@ -300,20 +307,21 @@ pub fn reserved_name(iri: &str) -> bool {
 /// follows from the rest still follows. Terms whose IRI the source doesn't give
 /// ([`Terms::iri_text`]) aren't checked.
 pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
-    let mut cache: HashMap<Term, bool> = HashMap::new();
+    let mut cache: HashMap<Term, bool, foldhash::fast::RandomState> = HashMap::default();
     let mut reserved = |t: Term| -> bool {
         *cache
             .entry(t)
             .or_insert_with(|| terms.iri_text(t).is_some_and(|iri| reserved_name(&iri)))
     };
+    let mut walk = Walk::new(ontology.classes.len());
     let mut kept = Vec::with_capacity(ontology.axioms.len());
     let mut sources = Vec::with_capacity(ontology.axioms.len());
     let mut found = Vec::new();
     let axioms = std::mem::take(&mut ontology.axioms);
     let all_sources = std::mem::take(&mut ontology.sources);
     for (axiom, source) in axioms.into_iter().zip(all_sources) {
-        let names = entities_of(ontology, &axiom);
-        match names.into_iter().find(|&t| reserved(t)) {
+        let names = entities_of(ontology, &axiom, &mut walk);
+        match names.iter().copied().find(|&t| reserved(t)) {
             Some(term) => found.push(Diagnostic::Reserved { term }),
             None => {
                 kept.push(axiom);
@@ -330,10 +338,44 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     }
 }
 
+/// [`entities_of`]'s lists, kept from one axiom to the next so that the walk over every
+/// axiom allocates nothing per axiom: the names found, the expressions left to visit, and
+/// per expression the round of the axiom that last visited it.
+struct Walk {
+    names: Vec<Term>,
+    stack: Vec<u32>,
+    seen: Vec<u32>,
+    round: u32,
+}
+
+impl Walk {
+    /// A walk over an ontology of `expressions` class expressions.
+    fn new(expressions: usize) -> Self {
+        Self {
+            names: Vec::new(),
+            stack: Vec::new(),
+            seen: vec![0; expressions],
+            round: 0,
+        }
+    }
+}
+
 /// The classes, properties and individuals an axiom names (datatypes, literals and
-/// facets aside).
-fn entities_of(o: &Ontology, axiom: &Axiom) -> Vec<Term> {
-    let mut out: Vec<Term> = Vec::new();
+/// facets aside), in `walk`'s list.
+fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term] {
+    if walk.round == u32::MAX {
+        walk.seen.fill(0);
+        walk.round = 0;
+    }
+    walk.round += 1;
+    let Walk {
+        names: out,
+        stack,
+        seen,
+        round,
+    } = walk;
+    out.clear();
+    stack.clear();
     let p = |q: &ObjProp| q.named();
     match axiom {
         Axiom::Declaration(kind, t) => {
@@ -377,12 +419,12 @@ fn entities_of(o: &Ontology, axiom: &Axiom) -> Vec<Term> {
         Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => out.extend(xs),
         _ => {}
     }
-    let mut stack: Vec<u32> = expressions_of(axiom);
-    let mut seen = HashSet::new();
+    push_expressions(axiom, stack);
     while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
+        if seen[id as usize] == *round {
             continue;
         }
+        seen[id as usize] = *round;
         match o.classes.get(id) {
             ClassExpr::Class(t) => out.push(*t),
             ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
