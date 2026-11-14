@@ -531,8 +531,13 @@ mod tests {
         fn unread() -> nrese_exec::memory::Reading {
             Err(nrese_exec::memory::Unread::Failed)
         }
+        // The process limit by default (not off, as `el_config` sets it): found by the
+        // capacity reader, which can't read.
         let unreadable = StoreService::with_runtime(
-            el_config(Duration::from_secs(3600)),
+            StoreConfig {
+                process_memory_bytes: crate::ProcessMemory::Default,
+                ..el_config(Duration::from_secs(3600))
+            },
             Arc::new(crate::Runtime::new(0, 0)),
         )
         .unwrap()
