@@ -73,7 +73,7 @@ it, with its limits beside it; nothing in them is a plan.
 | Read [Notation3](https://w3c.github.io/N3/spec/) data, in the library | Only what RDF can hold; rules are read by the reasoner. Not offered over HTTP. W3C N3 group's parser tests, one known failure listed ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_n3)) |
 | RDF4J Binary RDF, versions 1 and 2 | Read in both versions, written as version 2; as a payload and a result format |
 | [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | W3C suite ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc)) |
-| Bulk loading, N-Triples and N-Quads on all cores ([server setup](ops/server-setup.md)); statements that don't parse are quarantined, not fatal | Strict mode stops at the first error instead ([quarantine](design/quarantine.md)) |
+| Bulk loading, N-Triples and N-Quads on all cores ([server setup](ops/server-setup.md)); statements that don't parse are quarantined, not fatal (malformed XML or JSON and read errors still stop the load: [bulk loading](ops/server-setup.md#54-bulk-loading)) | Strict mode stops at the first error instead ([quarantine](design/quarantine.md)) |
 
 ## Reasoning
 

@@ -12,7 +12,7 @@ store whose asserted data is inconsistent. This one holds statements that are no
 
 1. A bulk load loads every valid statement. Each invalid one goes into the repository's
    quarantine: its text verbatim (within the limits of §2), file, the document's line, the
-   reason, and the load.
+   reason, and the load. Malformed XML or JSON and read errors still stop the load.
 2. Quarantined statements are not data: queries, reasoning, exports and statistics don't
    see them. By construction: they never reach the engine.
 3. The load warns: its report carries the count, the load's id and the first examples
