@@ -14,8 +14,9 @@
 # without them makes the file an error, and the verdict NOT PASSED.
 #
 # A trade-off covers a loss when its case and dimension match (and its baseline, if `against` names
-# one), the worse end of the loss's interval is at most `max_ratio`, and the paying win shows as
-# `better` against the same baseline in the same report. Dimensions are as the report names them:
+# one), and in every round that showed the loss the worse end of its interval is at most `max_ratio`
+# and the paying win shows as `better` against the same baseline in the same report. A round that
+# showed no loss neither needs nor gives cover. Dimensions are as the report names them:
 # time/<series>, memory/lifetime, memory/phase/<phase>, qps/<clients>, ...
 #
 # [[tradeoff]]
@@ -85,8 +86,9 @@
 #   medians of every pass of the last release run).
 # - max_ratio 1.20: the row's interval as the gate computes it (t over the block contrasts), over every
 #   round drawn from the runs above. The landed code's runs spread by 1.0 % (sd); main's by 0.3 %, plus
-#   one load in six at 5.76. At 1.20, about 1 % of 3-block rounds and no 6-block round would flag the
-#   row past it. At 1.19, 2 % of 3-block rounds would, and 6-block rounds end within 0.002 of it. The
+#   one load in six at 5.76. The gate judges the bound in the rounds that showed the loss. At 1.20, about
+#   1 % of 3-block rounds (2 % of those that show it) and no 6-block round would show it past the bound.
+#   At 1.19, 2 % of 3-block rounds would, and 6-block rounds end within 0.002 of it. The
 #   states before the fixes stay above 1.20 in every round: engine-v2 before both (6.37 GiB, x1.23) and
 #   with the release alone (6.23, x1.21).
 [[tradeoff]]
