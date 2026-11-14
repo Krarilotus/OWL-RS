@@ -2,6 +2,9 @@
 
 Status: accepted (2026-09-25)
 
+Amended 14 Nov 2026: shapes are compiled for each validation, not kept per shapes revision
+([architecture](../ARCHITECTURE.md#4-engine-design-l1)).
+
 ## Context
 
 GraphDB validates SHACL on commit. The main downstream user, the datamodel workflow feeding ResearchSpace, versions SHACL shapes next to its ontology modules and needs a store-side safety net. QLever has no SHACL.
