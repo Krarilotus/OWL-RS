@@ -9,11 +9,12 @@
 //! the chunks and batches are, since a loader numbers its chunks in input order. The
 //! quads get provisional ids meanwhile ([`provisional`]).
 //!
-//! At the end, [`Pending::number`] sorts each shard by first occurrence and merges them:
+//! At the end, [`Gathered::number`] sorts each shard by first occurrence and merges them:
 //! the terms take the next dense ids in the order they first occur in the input, the same
-//! at any thread count. The shards' texts move once, into one arena in shard order (see
-//! [`Pending::number`]); the shards, with that arena, become a segment of the dictionary
-//! ([`Adopted`]), and the quads are renumbered through the shards ([`Adopted::renumber`]).
+//! at any thread count. The shards' texts move once before that, into one arena in shard
+//! order ([`Pending::gather`]); the shards, with that arena, become a segment of the
+//! dictionary ([`Adopted`]), and the quads are renumbered through the shards
+//! ([`Adopted::renumber`]).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -198,6 +199,77 @@ impl Pending {
         self.shards.iter().all(|shard| shard.lock().len() == 0)
     }
 
+    /// Moves the shards' texts into one arena, in shard order, before the dictionary's
+    /// adoption guard is taken: a step of [`GATHER_STEP`] bytes at a time, copied in
+    /// parallel, whose freed arrays go back before the next. A shard's array was grown by
+    /// doubling among what the other threads freed, and the release after interning splits
+    /// the huge pages under that memory. Over 256 arrays on 4 KiB pages the substring scan
+    /// ran 1.33 times as long as over one arena, with the same instructions
+    /// (q06-label-prefix over entities-10m at one thread: 3.3 M dTLB misses in 401 runs
+    /// against 3 K; 14 Nov 2026). One arena allocated whole, after that release, lies on
+    /// huge pages where the kernel gives them. Copied whole and given back after, the
+    /// arrays and the arena were both resident: DBpedia core's store load peaked 0.25 GiB
+    /// higher (phuoc-yu, 14 Nov 2026).
+    pub(crate) fn gather(self) -> Gathered {
+        self.gather_by(GATHER_STEP)
+    }
+
+    /// [`Pending::gather`], `step` bytes at a time.
+    fn gather_by(self, step: usize) -> Gathered {
+        let mut shards: Vec<Shard> = self
+            .shards
+            .into_vec()
+            .into_iter()
+            .map(Mutex::into_inner)
+            .collect();
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(shards.iter().scan(0, |end, shard| {
+                *end += shard.bytes.len();
+                Some(*end)
+            }))
+            .collect();
+        let mut text = vec![0u8; starts[shards.len()]];
+        let mut from = 0;
+        while from < shards.len() {
+            let to = (from + 1..shards.len())
+                .find(|&to| starts[to] - starts[from] >= step)
+                .unwrap_or(shards.len());
+            let mut parts: Vec<(&mut Shard, &mut [u8])> = Vec::with_capacity(to - from);
+            let mut rest = &mut text[starts[from]..starts[to]];
+            for shard in &mut shards[from..to] {
+                let (part, tail) = std::mem::take(&mut rest).split_at_mut(shard.bytes.len());
+                parts.push((shard, part));
+                rest = tail;
+            }
+            parts.into_par_iter().for_each(|(shard, part)| {
+                part.copy_from_slice(&shard.bytes);
+                shard.bytes = Vec::new();
+            });
+            // The last step's arrays go back with the load's release after the adoption.
+            if to < shards.len() {
+                crate::memory::release_all();
+            }
+            from = to;
+        }
+        Gathered {
+            text,
+            starts,
+            shards,
+        }
+    }
+}
+
+/// The most text [`Pending::gather`] copies before the arrays it emptied go back.
+const GATHER_STEP: usize = 256 << 20;
+
+/// A bulk load's new terms, their texts in one arena ([`Pending::gather`]), to be numbered.
+pub(crate) struct Gathered {
+    text: Vec<u8>,
+    starts: Vec<usize>,
+    shards: Vec<Shard>,
+}
+
+impl Gathered {
     /// Numbers the pending terms from `start` in the order of their first occurrence; a
     /// term `existing` finds (interned meanwhile by another path: a triple term's
     /// components) keeps that id and takes no new one. Each shard is sorted on its own
@@ -217,61 +289,32 @@ impl Pending {
         start: u64,
         existing: impl Fn(&[u8]) -> Option<u64> + Sync,
     ) -> Adopted {
-        let mut shards: Vec<Shard> = self
-            .shards
-            .into_vec()
-            .into_iter()
-            .map(Mutex::into_inner)
-            .collect();
+        let Gathered {
+            text,
+            starts,
+            mut shards,
+        } = self;
         // Lanes beside the caller: one per 16 K entries, up to the pool's width.
         let lanes = nrese_exec::slices::lanes_for(shards.iter().map(Shard::len).sum(), 1 << 14);
-        // The shards' texts go into one arena, in shard order: each shard's is copied by the
-        // slice that numbers it, then freed. A shard's array was grown by doubling among what
-        // the other threads freed, and the release after interning splits the huge pages
-        // under that memory. Over 256 arrays on 4 KiB pages the substring scan ran 1.33 times
-        // as long as over one arena, with the same instructions (q06-label-prefix over
-        // entities-10m at one thread: 3.3 M dTLB misses in 401 runs against 3 K; 14 Nov 2026).
-        // One arena allocated whole, after that release, lies on huge pages where the kernel
-        // gives them.
-        let starts: Vec<usize> = std::iter::once(0)
-            .chain(shards.iter().scan(0, |end, shard| {
-                *end += shard.bytes.len();
-                Some(*end)
-            }))
-            .collect();
-        let mut text = vec![0u8; starts[shards.len()]];
-        let mut parts: Vec<(&mut Shard, &mut [u8])> = Vec::with_capacity(shards.len());
-        let mut rest = &mut text[..];
-        for shard in &mut shards {
-            let (part, tail) = std::mem::take(&mut rest).split_at_mut(shard.bytes.len());
-            parts.push((shard, part));
-            rest = tail;
-        }
         // Per shard: its new entries by first position; known ones take their ids.
-        let orders: Vec<Vec<u32>> =
-            nrese_exec::slices::map_mut(&mut parts, lanes, |_, (shard, part)| {
-                part.copy_from_slice(&shard.bytes);
-                shard.bytes = Vec::new();
-                let part: &[u8] = part;
-                let mut order: Vec<u32> = Vec::with_capacity(shard.len());
-                for local in 0..shard.len() {
-                    match existing(entry(part, &shard.ends, local)) {
-                        Some(id) => *shard.slots[local].get_mut() = id,
-                        None => order.push(local as u32),
-                    }
+        let orders: Vec<Vec<u32>> = nrese_exec::slices::map_mut(&mut shards, lanes, |s, shard| {
+            let part = &text[starts[s]..starts[s + 1]];
+            let mut order: Vec<u32> = Vec::with_capacity(shard.len());
+            for local in 0..shard.len() {
+                match existing(entry(part, &shard.ends, local)) {
+                    Some(id) => *shard.slots[local].get_mut() = id,
+                    None => order.push(local as u32),
                 }
-                order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
-                // The arrays shed what growing by doubling left over (a shard at a time,
-                // so the copies are small).
-                shard.ends.shrink_to_fit();
-                shard.slots.shrink_to_fit();
-                let Shard { table, ends, .. } = &mut **shard;
-                table.shrink_to_fit(|&local| {
-                    super::hash::key_hash(entry(part, ends, local as usize))
-                });
-                order
-            });
-        drop(parts);
+            }
+            order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
+            // The arrays shed what growing by doubling left over (a shard at a time,
+            // so the copies are small).
+            shard.ends.shrink_to_fit();
+            shard.slots.shrink_to_fit();
+            let Shard { table, ends, .. } = shard;
+            table.shrink_to_fit(|&local| super::hash::key_hash(entry(part, ends, local as usize)));
+            order
+        });
         let total: usize = orders.iter().map(Vec::len).sum();
         let first = |s: usize, local: u32| shards[s].slots[local as usize].load(Relaxed);
         // Ranges of first positions, a few per thread, from a sample of each shard.
@@ -469,7 +512,7 @@ mod tests {
                 });
                 assert!(indexes.iter().all(|&index| split(index).is_some()));
             }
-            let adopted = pending.number(10, |_| None);
+            let adopted = pending.gather().number(10, |_| None);
             (0..adopted.len())
                 .map(|i| {
                     let key = adopted.key(i);
@@ -499,7 +542,8 @@ mod tests {
         pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
             (words[k], hash(words[k]))
         });
-        let adopted = pending.number(0, |_| None);
+        // A step of one byte: the texts move in as many steps as shards hold any.
+        let adopted = pending.gather_by(1).number(0, |_| None);
         let keys: Vec<&[u8]> = (0..adopted.len()).map(|i| adopted.key(i)).collect();
         assert_eq!(keys, words);
     }
