@@ -327,7 +327,8 @@ fn a_guard_search_over_equality_members_stops_within_its_poll_interval() {
 /// `batch::list` cuts its copies by: `mo.chunks(RUN)`). So the listing asks its stop at least once
 /// every `POLL_UNITS` plus one run's worth of copies, a stop that fires while a product is
 /// made is seen within that, and the materialisation ends `Interrupted` (a whole product
-/// counted at once was one ask for all its copies).
+/// counted at once was one ask for all its copies). The invariant is one read's; under nested
+/// reads the bound is [`crate::Poller`]'s.
 #[test]
 fn an_expanded_listing_stops_within_its_poll_interval() {
     use crate::rulesets::Ruleset;
