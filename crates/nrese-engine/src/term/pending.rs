@@ -200,8 +200,8 @@ impl Pending {
     }
 
     /// Moves the shards' texts into one arena, in shard order, before the dictionary's
-    /// adoption guard is taken: a step of [`GATHER_STEP`] bytes at a time, copied in
-    /// parallel, whose freed arrays go back before the next. A shard's array was grown by
+    /// adoption guard is taken: a step of whole shards at a time, copied in parallel, whose
+    /// freed arrays go back before the next ([`GATHER_STEP`]). A shard's array was grown by
     /// doubling among what the other threads freed, and the release after interning splits
     /// the huge pages under that memory. Over 256 arrays on 4 KiB pages the substring scan
     /// ran 1.33 times as long as over one arena, with the same instructions
@@ -214,7 +214,8 @@ impl Pending {
         self.gather_by(GATHER_STEP)
     }
 
-    /// [`Pending::gather`], `step` bytes at a time.
+    /// [`Pending::gather`], each step ending at the first shard that brings it to `step`
+    /// bytes.
     fn gather_by(self, step: usize) -> Gathered {
         let mut shards: Vec<Shard> = self
             .shards
@@ -259,7 +260,9 @@ impl Pending {
     }
 }
 
-/// The most text [`Pending::gather`] copies before the arrays it emptied go back.
+/// The text a step of [`Pending::gather`] copies before the arrays it emptied go back: a
+/// step ends at the first shard that brings it to this, so it holds less than this plus
+/// that shard's text.
 const GATHER_STEP: usize = 256 << 20;
 
 /// A bulk load's new terms, their texts in one arena ([`Pending::gather`]), to be numbered.
