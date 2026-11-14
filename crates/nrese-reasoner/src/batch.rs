@@ -1205,6 +1205,8 @@ fn in_runs<F: FnMut(At) -> bool>(
             return false;
         }
         for &pair in run {
+            #[cfg(test)]
+            crate::witness::trace(crate::witness::Event::Position);
             if !f(read(pair)) {
                 return false;
             }
@@ -1470,6 +1472,8 @@ impl Relation {
                     return;
                 }
                 let old = |s: u64, o: u64| {
+                    #[cfg(test)]
+                    crate::witness::trace(crate::witness::Event::Probe);
                     self.old_checks
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     !self.delta.contains(s, o)
@@ -2143,7 +2147,13 @@ impl Visits for Store {
                     if !going {
                         return;
                     }
+                    #[cfg(test)]
+                    crate::witness::trace(crate::witness::Event::Position);
                     let (s, o) = if slice.swapped { (b, a) } else { (a, b) };
+                    #[cfg(test)]
+                    if slice.old {
+                        crate::witness::trace(crate::witness::Event::Probe);
+                    }
                     going = match slice.old && relation.delta.contains(s, o) {
                         true => visit.skip(),
                         false => visit.fact([s, p, o]),
@@ -2622,6 +2632,16 @@ struct Current<'a> {
     stale: &'a TermSet,
 }
 
+impl Current<'_> {
+    /// Whether `fact` is current: no stale term in it.
+    #[inline]
+    fn keeps(&self, fact: Triple) -> bool {
+        #[cfg(test)]
+        crate::witness::trace(crate::witness::Event::Keep);
+        !self.stale.mentioned(fact)
+    }
+}
+
 /// Reads are the store's ([`Visits for Store`](Store)): its positions are this source's,
 /// the stale ones it filters out included.
 impl Visits for Current<'_> {
@@ -2629,9 +2649,10 @@ impl Visits for Current<'_> {
         if self.stale.is_empty() {
             return self.store.visit(pattern, seg, visit);
         }
-        visit.filtered(&|fact| Ok(!self.stale.mentioned(fact)), |inner| {
-            self.store.visit(pattern, seg, inner)
-        });
+        visit.kept(
+            |fact| self.keeps(fact),
+            |inner| self.store.visit(pattern, seg, inner),
+        );
     }
 
     fn size(
@@ -2666,9 +2687,10 @@ impl Visits for Current<'_> {
         if self.stale.is_empty() {
             return self.store.visit_range(pattern, seg, range, visit);
         }
-        visit.filtered(&|fact| Ok(!self.stale.mentioned(fact)), |inner| {
-            self.store.visit_range(pattern, seg, range, inner)
-        });
+        visit.kept(
+            |fact| self.keeps(fact),
+            |inner| self.store.visit_range(pattern, seg, range, inner),
+        );
     }
 }
 
@@ -3859,6 +3881,9 @@ pub(crate) fn check<S: Source + ?Sized>(
     found.finish();
     Ok(())
 }
+
+#[cfg(test)]
+mod reads_tests;
 
 #[cfg(test)]
 mod counted_tests {
