@@ -889,6 +889,11 @@ thread_local! {
     /// The plannings planned again without the characteristic sets on this thread
     /// ([`Context::with_sets`]).
     static REPLANS: Cell<usize> = const { Cell::new(0) };
+    /// Run where an admitted BGP has asked for the statistics ([`Context::with_sets`]), as
+    /// part of that call, which builds them or waits for a build: true keeps its answer,
+    /// false makes it none (a build that failed or wasn't kept). A test's way to cancel a
+    /// query while it asks.
+    static STATISTICS_ASKED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
 }
 
 /// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
@@ -3716,25 +3721,33 @@ impl<'a> Context<'a> {
         self.with_sets(inputs, &order)
     }
 
-    /// `planning` of `inputs`: first without the characteristic sets (the plain plan), then,
-    /// where an input is part of a star and the reads the set search would make at its starts
-    /// cost little against the work the plain plan expects ([`plan::admits`]), with them,
-    /// within a budget that follows that work ([`plan::budget_for`]; one policy for every path
-    /// that plans: scans, and scans with paths). A BGP the gate keeps from the sets, or whose
-    /// set search passes its budget, gets the plain plan, noted for EXPLAIN ([`WITHOUT_SETS`]):
-    /// which planner a BGP got shows. A query cancelled in or between its plannings fails (a
+    /// `planning` of `inputs`: the plain plan (without the characteristic sets) first, and a
+    /// BGP is refined by the sets only where the work that plan expects admits it
+    /// ([`plan::admits`]): every other BGP keeps its plain plan and never asks for the
+    /// statistics. Admitted, it is searched with the sets within a budget that follows that
+    /// work ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
+    /// paths), and only where an input is part of an open star ([`plan::Star::open`]): without
+    /// one, the search would make the plain plan again. A BGP kept from the sets gets its plain
+    /// plan without a note: that is the normal case. One whose set search passes its budget gets
+    /// the plain plan too, noted for EXPLAIN ([`WITHOUT_SETS`]): the sets were wanted and the
+    /// budget stopped them. A query cancelled in or between its plannings fails (a
     /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
     fn with_sets(
         &self,
         inputs: &[plan::Input],
         planning: &Planning<'_>,
     ) -> NativeResult<plan::Plan> {
-        let start = Instant::now();
+        // Read only by EXPLAIN's notes: no clock for a query that isn't explained.
+        let start = self.trace.is_some().then(Instant::now);
         let cancelled = || {
             self.cancellation
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
+        // A cancelled query plans nothing.
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
         let mut plain = match planning(None, 0) {
             Ok(planned) if !cancelled() => planned,
             Ok(_) | Err(plan::Stopped::Cancelled) => {
@@ -3742,25 +3755,28 @@ impl<'a> Context<'a> {
             }
             Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
         };
-        if !inputs.iter().any(|i| i.star.is_some()) {
+        // Only an open star's patterns are estimated from the sets.
+        if !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())) {
             return Ok(plain);
         }
-        let Some(sets) = self.snapshot.characteristic_sets_in(self.model) else {
+        let expected = plan::expected_work(&plain);
+        if !plan::admits(expected) {
+            return Ok(plain);
+        }
+        // Asking for the statistics may build them, or wait for a build, and takes no
+        // cancellation of its own: a cancelled query doesn't ask, and one cancelled while it
+        // asked fails, whether the statistics came back or not.
+        let sets = self.snapshot.characteristic_sets_in(self.model);
+        #[cfg(test)]
+        let sets = sets.filter(|_| {
+            STATISTICS_ASKED.with_borrow(|asked| asked.as_ref().is_none_or(|asked| asked()))
+        });
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
+        let Some(sets) = sets else {
             return Ok(plain);
         };
-        let expected = plan::expected_work(&plain);
-        let reads = plan::start_reads(inputs, &sets);
-        if !plan::admits(expected, reads) {
-            if self.trace.is_some() {
-                let detail = format!(
-                    "{} patterns planned without characteristic sets: {reads} set entries at \
-                     its starts against {expected:.0} rows expected",
-                    inputs.len(),
-                );
-                self.note(WITHOUT_SETS, detail, None, 0, start);
-            }
-            return Ok(plain);
-        }
         let budget = plan::budget_for(expected);
         // The search asks for the cancellation at its steps, and can pass the budget before
         // its first (a greedy search's starts): the query's cancellation comes first.
@@ -3773,7 +3789,7 @@ impl<'a> Context<'a> {
         #[cfg(test)]
         REPLANS.set(REPLANS.get() + 1);
         plain.work = work;
-        if self.trace.is_some() {
+        if let Some(start) = start {
             let detail = format!(
                 "{} patterns planned without characteristic sets: \
                  estimate budget of {budget} passed after {work}",
