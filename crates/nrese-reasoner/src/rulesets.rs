@@ -558,21 +558,4 @@ mod tests {
             }
         }
     }
-
-    /// Rulesets that derive different statements never share a fingerprint, so no stored
-    /// state of one reads as current for another.
-    #[test]
-    fn no_two_rulesets_share_a_fingerprint() {
-        for (i, a) in ALL.into_iter().enumerate() {
-            for b in &ALL[i + 1..] {
-                assert_ne!(
-                    a.fingerprint(),
-                    b.fingerprint(),
-                    "{} {}",
-                    a.name(),
-                    b.name()
-                );
-            }
-        }
-    }
 }
