@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::eval::Poller;
 use super::ir::{Atom, Head, Rule, Term};
 use super::lists::{Facts, ListVocabulary, instantiate};
 
@@ -103,7 +104,7 @@ fn matches(rule: &Rule, index: &Index, emit: &mut dyn FnMut(&[Option<u64>])) {
             let guards_hold = rule
                 .guards
                 .iter()
-                .all(|guard| guard.holds(|term| value(term, bindings)));
+                .all(|guard| guard.holds(|term| value(term, bindings), &Poller::never()));
             if guards_hold {
                 emit(bindings);
             }
