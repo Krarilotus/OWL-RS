@@ -54,8 +54,11 @@ docker version --format '{{.Server.Version}}'  # 23 or later; fails if the engin
 docker buildx version                          # BuildKit, which the build needs
 curl --version                                 # 7.71 or later
 docker info --format '{{.MemTotal}}'           # memory Docker can use, in bytes: at least 3 GB
-/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3  # amd64 on Linux: says supported
+/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3  # optional: amd64 Linux, glibc 2.33 or later
 ```
+
+The last line, on amd64 Linux with glibc 2.33 or later, says `supported` on an x86-64-v3 CPU. Where that
+loader is absent or older (musl, an older glibc, another system), skip it: it proves nothing about the CPU.
 
 Rust and Node.js aren't needed: the image builds the server and its console. The commands
 below fetch the code, build the [image](docs/glossary.md#image-container-volume) `nrese`
@@ -126,7 +129,7 @@ Other headers are left out here, and `…` marks shortened text: compare the sta
 `regime` and the rows, as [the record of its last run](docs/dev/first-example-record.md) does.
 
 `/dataset/query` takes queries only and never refuses a body for its media type; `/dataset/sparql`
-takes queries and updates on one URL and refuses an unknown media type with `415`
+takes queries and updates on one URL and refuses a missing or unknown media type with `415`
 ([endpoints](docs/ops/http-api.md#endpoint-contracts)).
 
 The [tutorial](docs/tutorial.md) goes on from here: retraction, validation,
