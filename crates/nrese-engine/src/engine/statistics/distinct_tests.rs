@@ -290,14 +290,7 @@ fn a_view_keeps_no_distinct_count() {
     assert!(view.shared_state().is_some(), "the view admits");
     let pattern = of(&view, "p");
     let model = ReadModel::Materialised;
-    assert_eq!(
-        view.distinct_estimate_in(model, &pattern, Permutation::Gpso, &|_| true),
-        Ok(Some(300))
-    );
-    assert_eq!(
-        view.distinct_in(model, &pattern, Permutation::Gpso, &|_| true),
-        Ok(Some(301))
-    );
+    let estimate = view.distinct_estimate_in(model, &pattern, Permutation::Gpso, &|_| true);
     assert_eq!(
         view.statistics().distinct_entries(),
         0,
@@ -307,6 +300,11 @@ fn a_view_keeps_no_distinct_count() {
         published.statistics().distinct_entries(),
         0,
         "nor the engine's for it"
+    );
+    assert_eq!(estimate, Ok(Some(300)));
+    assert_eq!(
+        view.distinct_in(model, &pattern, Permutation::Gpso, &|_| true),
+        Ok(Some(301))
     );
 }
 
@@ -381,4 +379,26 @@ fn several_runs_and_deletions_give_todays_numbers() {
     assert_eq!(visible(&snapshot, ReadModel::Asserted), 2500);
     assert_eq!(visible(&snapshot, ReadModel::Materialised), 3000);
     assert_eq!(counts(&snapshot), [3000, 3500]);
+}
+
+/// - Spec: a merge step's comparisons are counted before they are done, however many runs
+///   merge (I1; review r1, S1): a step over more heads than a portion holds stops on the
+///   visitor's refusal, never compares uncounted.
+/// - Input: 300 walks holding the one value 7 (one group in each of 300 runs); a visitor that
+///   refuses past 256 units, then one that never refuses.
+/// - Expected: `Stopped`; unstopped, the count 1, with the units asked covering the step's
+///   600 comparisons (each head, for the least and for the advance).
+#[test]
+fn a_merge_over_many_runs_counts_every_comparison() {
+    let walks = || {
+        (0..300)
+            .map(|_| crate::index::ValueWalk::One(Some(7)))
+            .collect()
+    };
+    let (visit, _) = refusing_after(256);
+    assert_eq!(crate::index::count_distinct(walks(), &visit), Err(Stopped));
+    let mut count = None;
+    let units = units_of(|visit| count = Some(crate::index::count_distinct(walks(), visit)));
+    assert_eq!(count, Some(Ok(1)));
+    assert!(units >= 600, "asked {units} units for 600 comparisons");
 }

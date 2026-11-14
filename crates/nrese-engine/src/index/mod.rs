@@ -1451,13 +1451,26 @@ pub(crate) fn count_distinct(
         }
         return Ok(count);
     }
-    while let Some(least) = heads.iter().map(|&(value, _)| value).min() {
-        if !account.take((heads.len() as u64).min(crate::visit::PORTION)) {
-            return Err(Stopped);
+    while !heads.is_empty() {
+        // A step compares every head twice, for the least and to advance, however many runs
+        // merge: each comparison counted before it is made, and each portion's comparisons
+        // made before the next portion is taken (the `Ledger`'s rule).
+        let mut least = u64::MAX;
+        for portion in heads.chunks(crate::visit::PORTION as usize) {
+            if !account.take(portion.len() as u64) {
+                return Err(Stopped);
+            }
+            least = portion
+                .iter()
+                .fold(least, |least, &(value, _)| least.min(value));
         }
         count += 1;
         let mut k = 0;
         while k < heads.len() {
+            // One at a time: an advance takes its block's own portions.
+            if !account.take(1) {
+                return Err(Stopped);
+            }
             if heads[k].0 != least {
                 k += 1;
                 continue;
