@@ -3576,4 +3576,48 @@ mod tests {
         drop((optional, request, other));
         assert_eq!(server.used(), 0);
     }
+
+    /// A credit an optional part's charge adds late, while a sibling is refused: kept when
+    /// the refusal was the request's own optional one (unrecorded), returned when the
+    /// request recorded it. Either way the server holds exactly what the request holds.
+    #[test]
+    fn a_credit_added_late_by_an_optional_part_follows_the_requests_refusal() {
+        for recorded in [true, false] {
+            let server = SharedBudget::new(GIB);
+            let request = Envelope::new(Some(2), Some(Arc::clone(&server)));
+            // Ends on this thread: its release adds no credit where the seam holds.
+            let optional = request.optional_part();
+            let (at, arrived) = std::sync::mpsc::channel();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            std::thread::scope(|scope| {
+                let (request, optional) = (&request, &optional);
+                let worker = scope.spawn(move || {
+                    seam::set(move || {
+                        at.send(()).unwrap();
+                        wait.recv().unwrap();
+                    });
+                    // Takes a new credit for the request, held before adding it.
+                    optional.charge(1).unwrap();
+                });
+                arrived.recv().unwrap();
+                // Past the request's own limit of 2: recorded by the request itself, not
+                // above an optional part.
+                let refused = match recorded {
+                    true => request.charge(2),
+                    false => request.optional_part().charge(2),
+                };
+                assert!(refused.is_err());
+                go.send(()).unwrap();
+                worker.join().unwrap();
+            });
+            assert_eq!(request.refused(), recorded);
+            match recorded {
+                true => assert_eq!(request.credit(), 0, "returned after the refusal"),
+                false => assert!(request.credit() > 0, "kept: the request goes on"),
+            }
+            assert_eq!(server.used(), request.used() + request.credit());
+            drop((optional, request));
+            assert_eq!(server.used(), 0);
+        }
+    }
 }
