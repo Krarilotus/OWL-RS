@@ -46,17 +46,37 @@ use std::time::{Duration, Instant};
 use hashbrown::{HashMap, HashSet};
 use nrese_xsd::owl::Datatype;
 
-use nrese_exec::stop::Ticker;
-
 use super::delta::Interrupted;
-use super::eval::OperationStop;
+use super::eval::{OperationStop, Poller};
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
 
 type Triple = [u64; 3];
 
-/// The countdown of one loop to its stop's next poll ([`classify_parallel_within`]): every
-/// [`nrese_exec::stop::POLL_UNITS`] units it asks [`OperationStop::fired`].
-type Poll<'a> = Ticker<&'a (dyn Fn() -> bool + Sync)>;
+/// A run's stop and the calling thread's countdown to its next poll
+/// ([`classify_parallel_within`]): every [`nrese_exec::stop::POLL_UNITS`] units it asks
+/// [`OperationStop::fired`]. A unit is counted before it is done.
+struct Checkpoint<'a> {
+    poll: Poller<'a>,
+    stop: &'a OperationStop<'a>,
+}
+
+impl Checkpoint<'_> {
+    /// One unit of work: `Err` once the stop has fired.
+    fn tick(&self) -> Result<(), Interrupted> {
+        match self.poll.tick() {
+            true => Err(self.stop.interrupted()),
+            false => Ok(()),
+        }
+    }
+
+    /// The closing check of a run's phase: `Err` if the stop has fired, asked now.
+    fn finish(&self) -> Result<(), Interrupted> {
+        match self.poll.stopped() || self.stop.fired() {
+            true => Err(self.stop.interrupted()),
+            false => Ok(()),
+        }
+    }
+}
 
 /// A classification's result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -732,16 +752,16 @@ impl Graph<'_> {
     }
 
     /// The class expression `node` is; `Err` names what EL lacks.
-    /// Each node read is a unit of `poll`'s; once it fires, `Err` (the caller sees the stop
-    /// latched).
+    /// Each node read is a unit of `checkpoint`'s; once it has fired, `Err` (the caller's
+    /// next tick sees it).
     fn expr(
         &self,
         node: u64,
         named: &dyn Fn(u64) -> bool,
         depth: usize,
-        poll: &Poll<'_>,
+        checkpoint: &Checkpoint<'_>,
     ) -> Result<Expr, &'static str> {
-        if poll.tick(1).is_err() {
+        if checkpoint.tick().is_err() {
             return Err("stopped");
         }
         if depth > 64 {
@@ -766,7 +786,7 @@ impl Graph<'_> {
             }
             return members
                 .into_iter()
-                .map(|m| self.expr(m, named, depth + 1, poll))
+                .map(|m| self.expr(m, named, depth + 1, checkpoint))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Expr::And);
         }
@@ -780,7 +800,7 @@ impl Graph<'_> {
             }
             return Ok(Expr::Some(
                 role,
-                Box::new(self.expr(filler, named, depth + 1, poll)?),
+                Box::new(self.expr(filler, named, depth + 1, checkpoint)?),
             ));
         }
         Err("unknown class expression")
@@ -853,10 +873,12 @@ pub fn classify_profiled_within(
     stop: &OperationStop<'_>,
 ) -> Result<(Classification, Profile), Interrupted> {
     let fired = || stop.fired();
-    let poll: Poll<'_> =
-        Ticker::new(&fired as &(dyn Fn() -> bool + Sync)).map_err(|_| stop.interrupted())?;
+    let checkpoint = Checkpoint {
+        poll: Poller::new(&fired).ok_or_else(|| stop.interrupted())?,
+        stop,
+    };
     let started = Instant::now();
-    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named, &poll, stop)?;
+    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named, &checkpoint)?;
     let mut profile = Profile {
         normalise: started.elapsed(),
         concepts: tbox.named.len(),
@@ -870,8 +892,7 @@ pub fn classify_profiled_within(
             nothing,
             skipped,
             &mut profile,
-            &poll,
-            stop,
+            &checkpoint,
         )
     } else {
         parallel::saturate(
@@ -881,8 +902,7 @@ pub fn classify_profiled_within(
             skipped,
             threads,
             &mut profile,
-            &poll,
-            stop,
+            &checkpoint,
         )
     }?;
     Ok((result, profile))
@@ -891,13 +911,13 @@ pub fn classify_profiled_within(
 type Built = (Tbox, Concept, Concept, Vec<(u64, &'static str)>);
 
 /// The normalised TBox of `triples`, with `owl:Thing`, `owl:Nothing` and what was skipped;
-/// polling `stop` per triple, per class expression node read and per expansion step.
+/// counting per triple, per class expression node read, per disjoint pair and per
+/// expansion step.
 fn build(
     triples: &[Triple],
     vocabulary: &mut impl Vocabulary,
     named: &dyn Fn(u64) -> bool,
-    poll: &Poll<'_>,
-    stop: &OperationStop<'_>,
+    checkpoint: &Checkpoint<'_>,
 ) -> Result<Built, Interrupted> {
     let names = Names::new(vocabulary);
     let graph = Graph::new(triples, &names, named);
@@ -906,7 +926,7 @@ fn build(
     let nothing = tbox.concept(Some(names.nothing));
     let mut skipped = Vec::new();
     let expr = |node: u64, predicate: u64, skipped: &mut Vec<(u64, &'static str)>| match graph
-        .expr(node, named, 0, poll)
+        .expr(node, named, 0, checkpoint)
     {
         Ok(e) => Some(e),
         Err(kind) => {
@@ -914,22 +934,17 @@ fn build(
             None
         }
     };
-    // A poll that fires, or fired since (an expression's read reports it as a skip): the
-    // run stops, what was read discarded.
-    let stopped = |units: u32| poll.tick(units).is_err() || stop.latched();
+    // Once the checkpoint has fired (an expression's read reports it as a skip), every
+    // tick answers the stop: the run stops, what was read discarded.
     // Every declared class is classified, also one no axiom names.
     for &[s, p, o] in triples {
-        if stopped(1) {
-            return Err(stop.interrupted());
-        }
+        checkpoint.tick()?;
         if p == names.rdf_type && named(s) && (o == names.class || o == names.rdfs_class) {
             let _ = tbox.concept(Some(s));
         }
     }
     for &[s, p, o] in triples {
-        if stopped(1) {
-            return Err(stop.interrupted());
-        }
+        checkpoint.tick()?;
         let Some(disposition) = names.disposition(p, o) else {
             continue;
         };
@@ -969,10 +984,10 @@ fn build(
                     .map(|e| tbox.name(&e))
                     .collect();
                 for (i, &a) in concepts.iter().enumerate() {
-                    if stopped(concepts.len() as u32) {
-                        return Err(stop.interrupted());
-                    }
                     for &b in &concepts[i + 1..] {
+                        checkpoint.tick()?;
+                        #[cfg(test)]
+                        tests::unit(checkpoint.stop);
                         tbox.and_sub(a, b, nothing);
                     }
                 }
@@ -1010,9 +1025,7 @@ fn build(
                     let mut roles: Vec<Role> = links.iter().map(|&l| tbox.role(Some(l))).collect();
                     // r1 ∘ r2 ∘ … ∘ rn ⊑ s as (((r1 ∘ r2) ∘ r3) …) with fresh roles.
                     while roles.len() > 2 {
-                        if stopped(1) {
-                            return Err(stop.interrupted());
-                        }
+                        checkpoint.tick()?;
                         let fresh = tbox.role(None);
                         tbox.chains.push((roles[0], roles[1], fresh));
                         roles.splice(0..2, [fresh]);
@@ -1056,9 +1069,7 @@ fn build(
             Disposition::Expression(..) => {}
         }
     }
-    if stop.latched() {
-        return Err(stop.interrupted());
-    }
+    checkpoint.finish()?;
     Ok((tbox, thing, nothing, skipped))
 }
 
@@ -1122,17 +1133,22 @@ fn prepare(tbox: &mut Tbox) -> Prepared {
     }
 }
 
-/// The classification from every concept's subsumers, polling `stop` per class and pair.
+/// The classification from every concept's subsumers, counting per class and pair.
 fn assemble(
     tbox: &Tbox,
     subsumers: &[HashSet<Concept>],
     thing: Concept,
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
-    poll: &Poll<'_>,
-    stop: &OperationStop<'_>,
+    checkpoint: &Checkpoint<'_>,
 ) -> Result<Classification, Interrupted> {
-    let stopped = |_| stop.interrupted();
+    // A class or a pair looked at.
+    let unit = || -> Result<(), Interrupted> {
+        checkpoint.tick()?;
+        #[cfg(test)]
+        tests::unit(checkpoint.stop);
+        Ok(())
+    };
     let mut result = Classification {
         skipped,
         ..Classification::default()
@@ -1145,7 +1161,7 @@ fn assemble(
         .collect();
     let top = &subsumers[thing as usize];
     for &(d, id) in &named_ids {
-        poll.tick(1).map_err(stopped)?;
+        unit()?;
         if d != thing && d != nothing && top.contains(&d) {
             result.top.push(id);
         }
@@ -1155,13 +1171,14 @@ fn assemble(
             continue;
         }
         let set = &subsumers[c as usize];
-        poll.tick(set.len().max(1) as u32).map_err(stopped)?;
+        unit()?;
         if set.contains(&nothing) {
             result.unsatisfiable.push(id);
             continue;
         }
         // Its own subsumers, not every named class: linear in the taxonomy's size.
         for &d in set {
+            unit()?;
             if d != c
                 && d != thing
                 && let Some(super_id) = tbox.named[d as usize]
@@ -1170,7 +1187,7 @@ fn assemble(
             }
         }
     }
-    poll.finish().map_err(stopped)?;
+    checkpoint.finish()?;
     result.subsumptions.sort_unstable();
     result.unsatisfiable.sort_unstable();
     result.top.sort_unstable();
@@ -1190,8 +1207,8 @@ mod parallel {
     use std::time::Instant;
 
     use super::{
-        Classification, Concept, Interrupted, OperationStop, Poll, Prepared, Profile, Role, Tbox,
-        assemble, prepare,
+        Checkpoint, Classification, Concept, Interrupted, OperationStop, Prepared, Profile, Role,
+        Tbox, assemble, prepare,
     };
 
     thread_local! {
@@ -1248,7 +1265,6 @@ mod parallel {
         stop: &'a OperationStop<'a>,
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn saturate(
         tbox: &mut Tbox,
         thing: Concept,
@@ -1256,8 +1272,7 @@ mod parallel {
         skipped: Vec<(u64, &'static str)>,
         threads: usize,
         profile: &mut Profile,
-        poll: &Poll<'_>,
-        stop: &OperationStop<'_>,
+        checkpoint: &Checkpoint<'_>,
     ) -> Result<Classification, Interrupted> {
         let started = Instant::now();
         let prepared = prepare(tbox);
@@ -1270,24 +1285,27 @@ mod parallel {
             contexts: (0..n).map(|_| Context::default()).collect(),
             thing,
             nothing,
-            stop,
+            stop: checkpoint.stop,
         };
         let run = || {
             rayon::scope(|scope| {
-                for c in 0..n as Concept {
-                    saturation.tick(1);
-                    if saturation.stop.latched() {
-                        break;
-                    }
+                // A concept looked at and a message delivered are units; stopped, no more.
+                let _ = (0..n as Concept).try_for_each(|c| {
+                    saturation.tick()?;
                     if saturation.tbox.named[c as usize].is_some()
                         && !saturation.contexts[c as usize]
                             .initialised
                             .swap(true, SeqCst)
                     {
-                        saturation.deliver(scope, c, Message::Sub(c));
-                        saturation.deliver(scope, c, Message::Sub(thing));
+                        for message in [Message::Sub(c), Message::Sub(thing)] {
+                            saturation.tick()?;
+                            #[cfg(test)]
+                            super::tests::unit(saturation.stop);
+                            saturation.deliver(scope, c, message);
+                        }
                     }
-                }
+                    Ok::<_, Interrupted>(())
+                });
             });
         };
         match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
@@ -1315,11 +1333,11 @@ mod parallel {
         profile.subsumers = subsumers.iter().map(HashSet::len).sum();
         // Every worker has joined: a stop that fired left the saturation partial, and
         // nothing of it is assembled.
-        if stop.latched() {
-            return Err(stop.interrupted());
+        if checkpoint.stop.latched() {
+            return Err(checkpoint.stop.interrupted());
         }
         let started = Instant::now();
-        let result = assemble(tbox, &subsumers, thing, nothing, skipped, poll, stop)?;
+        let result = assemble(tbox, &subsumers, thing, nothing, skipped, checkpoint)?;
         profile.assemble = started.elapsed();
         Ok(result)
     }
@@ -1332,18 +1350,21 @@ mod parallel {
     }
 
     impl Saturation<'_> {
-        /// Counts `units` of this worker's work; polls the stop when its allowance runs out
-        /// (which latches it once it fires).
-        fn tick(&self, units: u32) {
-            LEFT.with(|left| {
-                let rest = left.get().saturating_sub(units);
-                if rest == 0 {
+        /// One unit of this worker's work; polls the stop when its allowance runs out (which
+        /// latches it once it fires). `Err` once the stop has latched, on any worker: the
+        /// activation ends, and nothing more is sent.
+        fn tick(&self) -> Result<(), Interrupted> {
+            LEFT.with(|left| match left.get() {
+                1 => {
                     left.set(POLL_UNITS);
                     self.stop.fired();
-                } else {
-                    left.set(rest);
                 }
+                rest => left.set(rest - 1),
             });
+            match self.stop.latched() {
+                true => Err(self.stop.interrupted()),
+                false => Ok(()),
+            }
         }
 
         /// A message into `to`'s inbox; `to` gets a worker unless it has one.
@@ -1361,13 +1382,16 @@ mod parallel {
             own: &mut Own<'_>,
             to: Concept,
             message: Message,
-        ) {
-            self.tick(1);
+        ) -> Result<(), Interrupted> {
+            self.tick()?;
+            #[cfg(test)]
+            super::tests::unit(self.stop);
             if to == own.context {
                 own.local.push(message);
             } else {
                 self.deliver(scope, to, message);
             }
+            Ok(())
         }
 
         /// `from →t to`: a backward link to `to`, a forward link to `from`; `to` starts
@@ -1379,13 +1403,13 @@ mod parallel {
             from: Concept,
             t: Role,
             to: Concept,
-        ) {
+        ) -> Result<(), Interrupted> {
             if !self.contexts[to as usize].initialised.swap(true, SeqCst) {
-                self.send(scope, own, to, Message::Sub(to));
-                self.send(scope, own, to, Message::Sub(self.thing));
+                self.send(scope, own, to, Message::Sub(to))?;
+                self.send(scope, own, to, Message::Sub(self.thing))?;
             }
-            self.send(scope, own, to, Message::Backward(from, t));
-            self.send(scope, own, from, Message::Forward(t, to));
+            self.send(scope, own, to, Message::Backward(from, t))?;
+            self.send(scope, own, from, Message::Forward(t, to))
         }
 
         /// Processes a context's messages until its inbox stays empty.
@@ -1404,18 +1428,20 @@ mod parallel {
                 }
                 let mut state = lock(&context.state);
                 while let Some(message) = batch.pop() {
-                    // Stopped: what this context holds is dropped; its inbox empties the same
-                    // way, and the worker returns.
-                    if self.stop.latched() {
-                        batch.clear();
-                        break;
-                    }
-                    self.tick(1);
                     let mut own = Own {
                         context: c,
                         local: &mut batch,
                     };
-                    self.handle(scope, &mut own, &mut state, message);
+                    // Stopped, here or on another worker: what this context holds is dropped;
+                    // its inbox empties the same way, and the worker returns.
+                    if self
+                        .tick()
+                        .and_then(|()| self.handle(scope, &mut own, &mut state, message))
+                        .is_err()
+                    {
+                        batch.clear();
+                        break;
+                    }
                 }
             }
         }
@@ -1426,33 +1452,35 @@ mod parallel {
             own: &mut Own<'_>,
             state: &mut State,
             message: Message,
-        ) {
+        ) -> Result<(), Interrupted> {
+            #[cfg(test)]
+            super::tests::unit(self.stop);
             let (tbox, p, c) = (self.tbox, &self.prepared, own.context);
             state.handled += 1;
             match message {
                 Message::Sub(d) => {
                     if !state.subsumers.insert(d) {
                         state.repeated += 1;
-                        return;
+                        return Ok(());
                     }
                     for &e in &tbox.told[d as usize] {
-                        self.send(scope, own, c, Message::Sub(e));
+                        self.send(scope, own, c, Message::Sub(e))?;
                     }
                     for &(b, e) in &tbox.conjunctions[d as usize] {
                         if state.subsumers.contains(&b) {
-                            self.send(scope, own, c, Message::Sub(e));
+                            self.send(scope, own, c, Message::Sub(e))?;
                         }
                     }
                     for &(r, b) in &tbox.existentials[d as usize] {
-                        self.link(scope, own, c, r, b);
+                        self.link(scope, own, c, r, b)?;
                     }
                     for &(from, r) in &state.pred {
                         if d == self.nothing {
-                            self.send(scope, own, from, Message::Sub(self.nothing));
+                            self.send(scope, own, from, Message::Sub(self.nothing))?;
                         }
                         for &(s, f) in &tbox.filler_of[d as usize] {
                             if p.supers[r as usize].contains(&s) {
-                                self.send(scope, own, from, Message::Sub(f));
+                                self.send(scope, own, from, Message::Sub(f))?;
                             }
                         }
                     }
@@ -1460,16 +1488,16 @@ mod parallel {
                 Message::Backward(from, r) => {
                     if !state.pred_seen.insert((from, r)) {
                         state.repeated += 1;
-                        return;
+                        return Ok(());
                     }
                     state.pred.push((from, r));
                     for &e in &state.subsumers {
                         if e == self.nothing {
-                            self.send(scope, own, from, Message::Sub(self.nothing));
+                            self.send(scope, own, from, Message::Sub(self.nothing))?;
                         }
                         for &(s, f) in &tbox.filler_of[e as usize] {
                             if p.supers[r as usize].contains(&s) {
-                                self.send(scope, own, from, Message::Sub(f));
+                                self.send(scope, own, from, Message::Sub(f))?;
                             }
                         }
                     }
@@ -1478,7 +1506,7 @@ mod parallel {
                         for &(r2, t) in &p.chains_first[s1 as usize] {
                             for &(r2_edge, e) in &state.succ {
                                 if p.supers[r2_edge as usize].contains(&r2) {
-                                    self.link(scope, own, from, t, e);
+                                    self.link(scope, own, from, t, e)?;
                                 }
                             }
                         }
@@ -1487,7 +1515,7 @@ mod parallel {
                 Message::Forward(r, to) => {
                     if !state.succ_seen.insert((r, to)) {
                         state.repeated += 1;
-                        return;
+                        return Ok(());
                     }
                     state.succ.push((r, to));
                     // ... and second: b →r1 c →r to.
@@ -1495,13 +1523,14 @@ mod parallel {
                         for &(r1, t) in &p.chains_second[s2 as usize] {
                             for &(b, r1_edge) in &state.pred {
                                 if p.supers[r1_edge as usize].contains(&r1) {
-                                    self.link(scope, own, b, t, to);
+                                    self.link(scope, own, b, t, to)?;
                                 }
                             }
                         }
                     }
                 }
             }
+            Ok(())
         }
     }
 }
@@ -1512,8 +1541,7 @@ fn saturate(
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
     profile: &mut Profile,
-    poll: &Poll<'_>,
-    stop: &OperationStop<'_>,
+    checkpoint: &Checkpoint<'_>,
 ) -> Result<Classification, Interrupted> {
     let started = Instant::now();
     let Prepared {
@@ -1535,20 +1563,34 @@ fn saturate(
         Link(Concept, Role, Concept),
     }
     let mut todo: Vec<Item> = Vec::new();
-    let init = |c: Concept, initialised: &mut Vec<bool>, todo: &mut Vec<Item>| {
-        if !initialised[c as usize] {
-            initialised[c as usize] = true;
-            todo.push(Item::Sub(c, c));
-            todo.push(Item::Sub(c, thing));
+    // A message queued is a unit, as one handled is.
+    let queue = |todo: &mut Vec<Item>, item: Item| -> Result<(), Interrupted> {
+        checkpoint.tick()?;
+        #[cfg(test)]
+        tests::unit(checkpoint.stop);
+        todo.push(item);
+        Ok(())
+    };
+    let init = |c: Concept,
+                initialised: &mut Vec<bool>,
+                todo: &mut Vec<Item>|
+     -> Result<(), Interrupted> {
+        if initialised[c as usize] {
+            return Ok(());
         }
+        initialised[c as usize] = true;
+        queue(todo, Item::Sub(c, c))?;
+        queue(todo, Item::Sub(c, thing))
     };
     for c in 0..n as Concept {
         if tbox.named[c as usize].is_some() {
-            init(c, &mut initialised, &mut todo);
+            init(c, &mut initialised, &mut todo)?;
         }
     }
     while let Some(item) = todo.pop() {
-        poll.tick(1).map_err(|_| stop.interrupted())?;
+        checkpoint.tick()?;
+        #[cfg(test)]
+        tests::unit(checkpoint.stop);
         conclusions += 1;
         match item {
             Item::Sub(c, d) => {
@@ -1557,23 +1599,23 @@ fn saturate(
                     continue;
                 }
                 for &e in &tbox.told[d as usize] {
-                    todo.push(Item::Sub(c, e));
+                    queue(&mut todo, Item::Sub(c, e))?;
                 }
                 for &(b, e) in &tbox.conjunctions[d as usize] {
                     if subsumers[c as usize].contains(&b) {
-                        todo.push(Item::Sub(c, e));
+                        queue(&mut todo, Item::Sub(c, e))?;
                     }
                 }
                 for &(r, b) in &tbox.existentials[d as usize] {
-                    todo.push(Item::Link(c, r, b));
+                    queue(&mut todo, Item::Link(c, r, b))?;
                 }
                 for &(from, r) in &pred[c as usize] {
                     if d == nothing {
-                        todo.push(Item::Sub(from, nothing));
+                        queue(&mut todo, Item::Sub(from, nothing))?;
                     }
                     for &(s, f) in &tbox.filler_of[d as usize] {
                         if supers[r as usize].contains(&s) {
-                            todo.push(Item::Sub(from, f));
+                            queue(&mut todo, Item::Sub(from, f))?;
                         }
                     }
                 }
@@ -1583,16 +1625,16 @@ fn saturate(
                     duplicates += 1;
                     continue;
                 }
-                init(d, &mut initialised, &mut todo);
+                init(d, &mut initialised, &mut todo)?;
                 succ[c as usize].push((r, d));
                 pred[d as usize].push((c, r));
                 for &e in &subsumers[d as usize] {
                     if e == nothing {
-                        todo.push(Item::Sub(c, nothing));
+                        queue(&mut todo, Item::Sub(c, nothing))?;
                     }
                     for &(s, f) in &tbox.filler_of[e as usize] {
                         if supers[r as usize].contains(&s) {
-                            todo.push(Item::Sub(c, f));
+                            queue(&mut todo, Item::Sub(c, f))?;
                         }
                     }
                 }
@@ -1601,7 +1643,7 @@ fn saturate(
                     for &(r2, t) in &chains_first[s1 as usize] {
                         for &(r2_edge, e) in &succ[d as usize] {
                             if supers[r2_edge as usize].contains(&r2) {
-                                todo.push(Item::Link(c, t, e));
+                                queue(&mut todo, Item::Link(c, t, e))?;
                             }
                         }
                     }
@@ -1611,7 +1653,7 @@ fn saturate(
                     for &(r1, t) in &chains_second[s2 as usize] {
                         for &(b, r1_edge) in &pred[c as usize] {
                             if supers[r1_edge as usize].contains(&r1) {
-                                todo.push(Item::Link(b, t, d));
+                                queue(&mut todo, Item::Link(b, t, d))?;
                             }
                         }
                     }
@@ -1626,7 +1668,7 @@ fn saturate(
     profile.conclusions = conclusions;
     profile.duplicates = duplicates;
     let started = Instant::now();
-    let result = assemble(tbox, &subsumers, thing, nothing, skipped, poll, stop)?;
+    let result = assemble(tbox, &subsumers, thing, nothing, skipped, checkpoint)?;
     profile.assemble = started.elapsed();
     Ok(result)
 }
@@ -1750,6 +1792,122 @@ mod tests {
                 }),
                 "{threads} workers"
             );
+        }
+    }
+
+    /// `n` classes in one `owl:AllDisjointClasses` axiom: a first row of n − 1 pairs.
+    fn disjoint_row(n: usize) -> String {
+        let mut text = String::from("_:d rdf:type owl:AllDisjointClasses\n_:d owl:members _:l0\n");
+        for i in 0..n {
+            let rest = match i + 1 < n {
+                true => format!("_:l{}", i + 1),
+                false => "rdf:nil".to_owned(),
+            };
+            text += &format!("_:l{i} rdf:first ex:C{i}\n_:l{i} rdf:rest {rest}\n");
+        }
+        text
+    }
+
+    /// One class below `n` others: one message's fan-out of n.
+    fn fan_out(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("ex:A rdfs:subClassOf ex:B{i}\n"))
+            .collect()
+    }
+
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+
+    /// The run a bound test probes ([`probe`]): its stop's address (0: none), the units of work
+    /// it has done ([`unit`]), the units after which its stop turns true, the run's number, and
+    /// the most units one thread did after that.
+    static PROBED: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    static AT: AtomicU64 = AtomicU64::new(0);
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    static MOST: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// This thread's units after the probed stop turned true: (run, units).
+        static AFTER: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// A unit of work done under `stop`, counted where it is done (a message handled or
+    /// sent, a disjoint pair made, a class or pair assembled) if `stop` is the probed run's.
+    pub(super) fn unit(stop: &OperationStop<'_>) {
+        if PROBED.load(SeqCst) != std::ptr::from_ref(stop) as usize
+            || DONE.fetch_add(1, SeqCst) < AT.load(SeqCst)
+        {
+            return;
+        }
+        let run = RUN.load(SeqCst);
+        let after = AFTER.with(|after| {
+            let units = match after.get() {
+                (r, units) if r == run => units + 1,
+                _ => 1,
+            };
+            after.set((run, units));
+            units
+        });
+        MOST.fetch_max(after, SeqCst);
+    }
+
+    /// `text` classified on `threads` workers under a stop that turns true once the run has
+    /// done `at` units of work: the answer, the most units one worker did after that, and the
+    /// units the run did. One probed run at a time.
+    fn probe(
+        text: &str,
+        threads: usize,
+        at: u64,
+    ) -> (Result<Classification, Interrupted>, u64, u64) {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut v = LocalVocabulary::default();
+        let triples = load(&mut v, text);
+        let snapshot = v.clone();
+        let named = move |id: u64| snapshot.text(id).starts_with('<');
+        let caller = || DONE.load(SeqCst) >= AT.load(SeqCst);
+        let no_memory = || -> Option<nrese_exec::memory::MemoryStopCause> { None };
+        let stop = OperationStop::with_poll(&caller, &no_memory);
+        DONE.store(0, SeqCst);
+        AT.store(at, SeqCst);
+        MOST.store(0, SeqCst);
+        RUN.fetch_add(1, SeqCst);
+        PROBED.store(std::ptr::from_ref(&stop) as usize, SeqCst);
+        let answer = classify_parallel_within(&triples, &mut v, &named, threads, &stop);
+        PROBED.store(0, SeqCst);
+        (answer, MOST.load(SeqCst), DONE.load(SeqCst))
+    }
+
+    /// Once its stop turns true, a run does at most `POLL_UNITS` more units of work, also
+    /// where one step holds more: a disjointness row of 4999 pairs, its stop turning true
+    /// at the first.
+    #[test]
+    fn a_disjointness_row_longer_than_a_poll_stops_within_one() {
+        let (answer, most, _) = probe(&disjoint_row(5000), 1, 1);
+        assert_eq!(answer, Err(Interrupted { memory: None }));
+        let poll = u64::from(nrese_exec::stop::POLL_UNITS);
+        assert!(most <= poll, "{most} units after the stop");
+    }
+
+    /// Once its stop turns true, each worker does at most `POLL_UNITS` more units of work,
+    /// also where one message fans out to more (10,000 subsumers of one class), wherever in
+    /// the run the stop turns true (every 2048th unit), on one worker and on four.
+    #[test]
+    fn a_fan_out_longer_than_a_poll_stops_within_one_on_every_worker() {
+        let text = fan_out(10_000);
+        let poll = u64::from(nrese_exec::stop::POLL_UNITS);
+        for threads in [1, 4] {
+            let (whole, _, done) = probe(&text, threads, u64::MAX);
+            assert!(whole.is_ok(), "{threads} workers");
+            for at in (1..done).step_by(2048) {
+                let (_, most, _) = probe(&text, threads, at);
+                assert!(
+                    most <= poll,
+                    "{threads} workers, stop at unit {at}: {most} units after it"
+                );
+            }
         }
     }
 
