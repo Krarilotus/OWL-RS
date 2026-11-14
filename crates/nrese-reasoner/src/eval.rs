@@ -743,7 +743,7 @@ pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>], poll: &Poller<'_>
 /// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Its
 /// scans count on `poll` ([`Source`]: each scan and each fact it visits, bound or not);
 /// once its stop has fired, a scan that begins reads nothing (RSH-18), but a scan already
-/// running still delivers the positions it counted ahead. How far a driver's fan-out can
+/// running can still deliver positions it counted ahead. How far a driver's fan-out can
 /// outlive the stop is [`Poller`]'s bound under nested reads.
 #[allow(clippy::too_many_arguments)]
 pub fn walk<S: Source + ?Sized>(
