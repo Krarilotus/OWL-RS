@@ -1309,6 +1309,22 @@ reference = "/fast/ref/el-classes20000-roles12.elk.tax"
 # equals NRESE's. The chain is regular now (r1 ∘ r2 ⊑ r1), so HermiT and Openllet run it.
 
 [[case]]
+name = "el-classify-endpoint"
+area = "dl"
+what = "el-classify's ontology classified as a user asks for it: loaded into a fresh server (PUT /dataset/data?default), then GET /dataset/classification. The time is that request alone; the memory is the server's scope's peak, the load included, not the classification's alone"
+semantics = "el"
+data = "el classes=20000 roles=12"
+tool = "endpoint-classify"
+metric = "whole_ms"
+phases = ["request"]
+# An answer marked incomplete, undecided or refused, or not 200, fails the case as not answered
+# (fast.py endpoint_answer), never as a wrong answer. Its comparators are el-classify's.
+check = { "taxonomy_equal" = "true" }
+cap_gb = 6
+systems = []
+reference = "/fast/ref/el-classes20000-roles12.elk.tax"
+
+[[case]]
 name = "el-classify-irregular"
 area = "dl"
 what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL, inside OWL 2 EL"
