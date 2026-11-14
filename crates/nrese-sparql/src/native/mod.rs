@@ -3470,26 +3470,40 @@ impl<'a> Context<'a> {
         if result.table.len() <= MIN_MORSEL {
             return join_rest(result, filters, joined, false);
         }
+        // Caller-side steps (D16-579): each morsel is charged before it is copied, and the
+        // first table and every part are released on each way out; a table that carries its
+        // own charge (the ownership change after the cut) makes these steps go.
         let sorted = result.table.sorted_by().to_vec();
         let mut parts: Vec<Solutions> = Vec::new();
         let (mut rows, mut from, mut size) = (0, 0, MIN_MORSEL);
         let mut applied = None;
-        while from < result.table.len() && rows < limit {
+        let mut failed = None;
+        // At least one morsel, LIMIT 0 too: the parts' variables come from its joins.
+        while from < result.table.len() && (parts.is_empty() || rows < limit) {
             let to = (from + size).min(result.table.len());
-            let columns = result
-                .table
-                .columns()
-                .iter()
-                .map(|column| column[from..to].to_vec())
-                .collect();
-            let morsel = Solutions {
-                vars: result.vars.clone(),
-                table: IdTable::from_columns(columns).assume_sorted_by(sorted.clone()),
-                ordered: false,
-            };
+            // The copy lives beside the first table: charged before it is made.
+            let morsel = self.made(result.table.bytes_for_rows(to - from), || {
+                let columns = result
+                    .table
+                    .columns()
+                    .iter()
+                    .map(|column| column[from..to].to_vec())
+                    .collect();
+                Ok(Solutions {
+                    vars: result.vars.clone(),
+                    table: IdTable::from_columns(columns).assume_sorted_by(sorted.clone()),
+                    ordered: false,
+                })
+            });
             // Each morsel applies the same conjuncts at the same steps.
             let mut left = filters.clone();
-            let part = join_rest(morsel, &mut left, joined, false)?;
+            let part = match morsel.and_then(|morsel| join_rest(morsel, &mut left, joined, false)) {
+                Ok(part) => part,
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            };
             applied = Some(left);
             rows += part.table.len();
             parts.push(part);
@@ -3502,28 +3516,53 @@ impl<'a> Context<'a> {
             };
             size = wanted.clamp(MIN_MORSEL, size.saturating_mul(8));
         }
+        let first_rows = result.table.len();
+        // Its rows are in the morsels or not wanted: the first table goes, and its charge.
+        self.consumed(result);
+        if let Some(error) = failed {
+            for part in parts {
+                self.consumed(part);
+            }
+            return Err(error);
+        }
         if let Some(applied) = applied {
             *filters = applied;
         }
         let detail = format!(
-            "{limit} wanted: {} morsel(s), {from} of {} rows of the first pattern joined",
+            "{limit} wanted: {} morsel(s), {from} of {first_rows} rows of the first pattern joined",
             parts.len(),
-            result.table.len()
         );
         limited(detail, rows, start);
         let vars = parts[0].vars.clone();
-        let tables = parts
-            .into_iter()
-            .map(|part| {
-                Ok(if part.vars == vars {
-                    part.table
-                } else {
-                    self.project(part, &vars)?.table
-                })
-            })
-            .collect::<NativeResult<_>>()?;
-        Ok(Solutions {
-            table: IdTable::concat(vars.len(), tables),
+        let mut same = Vec::with_capacity(parts.len());
+        let mut failed = None;
+        for part in parts {
+            if failed.is_some() {
+                self.consumed(part);
+                continue;
+            }
+            match if part.vars == vars {
+                Ok(part)
+            } else {
+                self.project(part, &vars)
+            } {
+                Ok(part) => same.push(part),
+                Err(error) => failed = Some(error),
+            }
+        }
+        if let Some(error) = failed {
+            for part in same {
+                self.consumed(part);
+            }
+            return Err(error);
+        }
+        // The parts' charge carries over to the one table, its copy charged first.
+        let growth = concat_growth(&same);
+        self.reshaped(same, growth, |same| Solutions {
+            table: IdTable::concat(
+                vars.len(),
+                same.into_iter().map(|part| part.table).collect(),
+            ),
             vars,
             ordered: false,
         })
