@@ -49,7 +49,7 @@ pub mod expression {
     pub use crate::native::expr::Evaluator;
 }
 
-pub use completeness::{Completeness, Regime};
+pub use completeness::{Completeness, Outside, Regime};
 pub use native::typed_results::{AlignedSolutions, SolutionTable, TypedResults};
 pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};

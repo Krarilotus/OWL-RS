@@ -467,6 +467,29 @@ fn an_irregular_ontology_with_a_range_above_a_chain_is_not_answered_by_the_el_cl
     ));
 }
 
+/// The EL classifier's completeness with an object-property range is not proven outside
+/// OWL 2 DL (the cited calculus has no ranges): with a range away from the chain, it
+/// answers, marked incomplete, the reason naming the range's property.
+#[test]
+fn an_irregular_el_answer_where_the_input_states_a_range_is_marked_incomplete() {
+    let report = irregular(":r4 a owl:ObjectProperty . :X a owl:Class . :r4 rdfs:range :X .");
+    assert_eq!(report.engine, "el");
+    assert!(
+        has(&report.subsumptions, "A", "D"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert!(!report.complete());
+    assert!(
+        report
+            .incomplete
+            .iter()
+            .any(|why| why.contains("object-property range") && why.contains(&format!("<{EX}r4>"))),
+        "{:?}",
+        report.incomplete
+    );
+}
+
 /// The EL classifier doesn't read assertions: with one, the answer stays the DL engines'
 /// marked lower bound.
 #[test]

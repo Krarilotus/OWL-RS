@@ -24,10 +24,24 @@ pub struct Completeness {
     /// What `complete` refers to: the semantics whose certain answers the answers are
     /// measured against, set by whoever produces the status.
     pub regime: Option<Regime>,
+    /// Set where a procedure outside the regime's profile gave the answers.
+    pub outside: Option<Outside>,
+}
+
+/// Answers a procedure gave on an input outside the regime's profile, and what they
+/// guarantee (docs/design/owl2-dl.md §16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outside {
+    /// What in the input is outside the profile: `an irregular role hierarchy`.
+    pub what: Vec<&'static str>,
+    /// The procedure that answered: `el`.
+    pub by: &'static str,
+    pub guaranteed: &'static str,
+    pub not_guaranteed: &'static str,
 }
 
 // The store's output cache keys on this form: an assessment prints as it did before
-// `certification_withheld`.
+// `certification_withheld` and `outside`.
 impl fmt::Debug for Completeness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("Completeness");
@@ -38,6 +52,9 @@ impl fmt::Debug for Completeness {
             .field("regime", &self.regime);
         if self.certification_withheld {
             out.field("certification_withheld", &true);
+        }
+        if let Some(outside) = &self.outside {
+            out.field("outside", outside);
         }
         out.finish()
     }
@@ -121,6 +138,7 @@ impl Default for Completeness {
             reasons: Vec::new(),
             bounds: None,
             regime: None,
+            outside: None,
         }
     }
 }
@@ -139,6 +157,7 @@ impl Completeness {
             reasons: Vec::new(),
             bounds: None,
             regime: None,
+            outside: None,
         }
     }
 
@@ -200,12 +219,15 @@ impl Completeness {
         }
         self.bounds = self.bounds.or(other.bounds);
         self.regime = self.regime.or(other.regime);
+        self.outside = self.outside.take().or(other.outside);
     }
 
-    /// The value of the `NRESE-Completeness` header: the status, its regime, then the
-    /// bounds and the first reasons, ASCII only (other characters escaped as `\u{…}`,
-    /// quotes and backslashes with a backslash): `complete; regime=owl2-ql`, or
+    /// The value of the `NRESE-Completeness` header: the status, its regime, what is
+    /// outside its profile and by which procedure, then the bounds and the first reasons,
+    /// ASCII only (other characters escaped as `\u{…}`, quotes and backslashes with a
+    /// backslash): `complete; regime=owl2-ql`, or
     /// `sound-only; regime=owl2-rl; reasons="ql: …; ql: …"`, with
+    /// `; outside="…"; by=…` where a procedure outside the profile answered and
     /// `; lower=…; upper=…; unresolved=…` where bounds are known.
     pub fn header(&self) -> String {
         if self.certification_withheld {
@@ -215,6 +237,12 @@ impl Completeness {
         if let Some(regime) = self.regime {
             out.push_str("; regime=");
             out.push_str(regime.as_str());
+        }
+        if let Some(outside) = &self.outside {
+            out.push_str("; outside=");
+            quoted(&mut out, &outside.what.join(", "));
+            out.push_str("; by=");
+            out.push_str(outside.by);
         }
         if let Some(b) = self.bounds {
             out.push_str(&format!(
@@ -234,20 +262,26 @@ impl Completeness {
         if self.reasons.len() > SHOWN {
             text.push(format!("and {} more", self.reasons.len() - SHOWN));
         }
-        out.push_str("; reasons=\"");
-        for c in text.join("; ").chars() {
-            match c {
-                '"' | '\\' => {
-                    out.push('\\');
-                    out.push(c);
-                }
-                c if c.is_ascii_graphic() || c == ' ' => out.push(c),
-                c => out.extend(c.escape_unicode()),
-            }
-        }
-        out.push('"');
+        out.push_str("; reasons=");
+        quoted(&mut out, &text.join("; "));
         out
     }
+}
+
+/// `text` in quotes, ASCII only (as [`Completeness::header`] says).
+fn quoted(out: &mut String, text: &str) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            c => out.extend(c.escape_unicode()),
+        }
+    }
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -298,5 +332,36 @@ mod tests {
         assert_eq!(right, withheld);
         right.unsound("transaction", "private detail".to_owned());
         assert_eq!(right, withheld);
+    }
+
+    /// An answer inside the profile has the header and the Debug form it had before the
+    /// `outside` record (the output cache keys on the Debug form); one a procedure outside
+    /// the profile gave names what is outside and the procedure, before the reasons.
+    #[test]
+    fn an_answer_inside_the_profile_prints_as_before_and_one_outside_says_so() {
+        let inside = Completeness::under(Regime::Owl2Dl);
+        assert_eq!(inside.header(), "complete; regime=owl2-dl");
+        assert_eq!(
+            format!("{inside:?}"),
+            "Completeness { sound: true, complete: true, reasons: [], bounds: None, regime: Some(Owl2Dl) }"
+        );
+        let mut outside = Completeness {
+            outside: Some(Outside {
+                what: vec!["an irregular role hierarchy"],
+                by: "el",
+                guaranteed: "",
+                not_guaranteed: "",
+            }),
+            ..inside
+        };
+        assert_eq!(
+            outside.header(),
+            "complete; regime=owl2-dl; outside=\"an irregular role hierarchy\"; by=el"
+        );
+        outside.incomplete("dl", "a range".to_owned());
+        assert_eq!(
+            outside.header(),
+            "sound-only; regime=owl2-dl; outside=\"an irregular role hierarchy\"; by=el; reasons=\"dl: a range\""
+        );
     }
 }
