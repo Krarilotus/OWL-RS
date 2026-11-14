@@ -1230,7 +1230,7 @@ impl Dictionary {
             Part::Shard(adopted, s, slice) => {
                 let shard = &adopted.shards[s];
                 let from = out.len();
-                let tested = matcher.slice(&shard.bytes, &shard.ends[..], slice, 0, out);
+                let tested = matcher.slice(adopted.text_of(s), &shard.ends[..], slice, 0, out);
                 let mut kept = from;
                 for i in from..out.len() {
                     let found = out[i];
