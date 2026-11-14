@@ -1000,3 +1000,75 @@ fn a_limit_over_several_patterns_holds_nothing_uncharged_per_row() {
         many.saturating_sub(few) / (more - rows)
     );
 }
+
+/// Spec (D16-579): the same LIMIT, refused for memory wherever its limit falls, the charge
+/// of its first morsel among the places, answers the refusal and leaves the query's budget
+/// where it started: the first table, the morsel and the parts made so far all released.
+#[test]
+fn a_limit_over_several_patterns_refused_anywhere_leaves_nothing_charged() {
+    use nrese_sparql_syntax::Query;
+    const ROWS: usize = 4 * MIN_MORSEL;
+    let engine = default_store((0..ROWS).flat_map(|i| {
+        [
+            (format!("s{i}"), "p".to_owned(), format!("o{i}")),
+            (format!("s{i}"), "q".to_owned(), format!("x{i}")),
+        ]
+    }));
+    let snapshot = engine.snapshot();
+    let text = "SELECT * WHERE { ?s <urn:p> ?o . ?s <urn:q> ?x } LIMIT 10";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    // The first morsel: `MIN_MORSEL` rows of the first pattern's two columns.
+    let morsel = MIN_MORSEL * 2 * 8;
+    let own = own_bytes(&snapshot);
+    let (mut refused, mut failures) = (Vec::new(), Vec::new());
+    // From nothing beyond the reader's state to room for every table eight times over.
+    for limit in (own..own + 8 * ROWS * 2 * 8).step_by(1024) {
+        let mut options = QueryOptions::default();
+        options.resources.memory = Envelope::new(Some(limit), None);
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let before = ctx.budget.used();
+        match ctx.eval(&pattern).map_err(QueryEvaluationError::from) {
+            Ok(answer) => ctx.consumed(answer),
+            Err(QueryEvaluationError::MemoryLimit(exceeded)) => refused.push(exceeded.requested),
+            Err(other) => failures.push(format!("at {limit} bytes: {other:?}, not a refusal")),
+        }
+        let held = ctx.budget.used() as i64 - before as i64;
+        if held != 0 {
+            failures.push(format!(
+                "at {limit} bytes the budget holds {held} bytes after"
+            ));
+        }
+    }
+    refused.sort_unstable();
+    refused.dedup();
+    assert!(
+        refused.contains(&morsel),
+        "no limit refused the first morsel's {morsel} bytes; refused: {refused:?}"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// Spec: LIMIT 0 over several patterns, the first with more rows than one morsel, answers no
+/// rows (with no morsel joined there were no parts to take the variables from).
+#[test]
+fn a_limit_of_zero_over_several_patterns_answers_no_rows() {
+    use nrese_sparql_syntax::Query;
+    let engine = default_store((0..2 * MIN_MORSEL).flat_map(|i| {
+        [
+            (format!("s{i}"), "p".to_owned(), format!("o{i}")),
+            (format!("s{i}"), "q".to_owned(), format!("x{i}")),
+        ]
+    }));
+    let snapshot = engine.snapshot();
+    let text = "SELECT * WHERE { ?s <urn:p> ?o . ?s <urn:q> ?x } LIMIT 0";
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let answer = ctx.eval(&pattern).ok().expect("room");
+    assert_eq!(answer.table.len(), 0);
+    ctx.consumed(answer);
+}
