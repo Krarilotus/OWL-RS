@@ -569,8 +569,10 @@ COUNTER_STEP = {"ms": 0.001, "MiB": 1.0, "bytes": 1.0, "qps": 0.0}
 # Holm family (an untestable hypothesis there would only lower every other's alpha / m), each
 # reported (the below-resolution design, 14 Nov 2026): every block below one step on both sides,
 # covered by the case's whole run (COVER) or blocking; every block below it on the candidate alone,
-# a gain.
-OUTSIDE_FAMILY = ("below resolution", "vanished")
+# a gain; every block below it on the baseline alone, `emerged`: a cost appearing where there was
+# none to time, which blocks unless the owner's [[emerged]] entry accepts it (no round can confirm
+# it statistically in time: 2^-blocks over a family of about 1,200 needs 15 blocks).
+OUTSIDE_FAMILY = ("below resolution", "vanished", "emerged")
 # The timed series holding every other time series of its case: a classifier process's whole run.
 COVER = f"time/{cases_registry.WHOLE_RUN}"
 
@@ -609,6 +611,8 @@ def dimension(base: list[list[float]], base_blocks: list, new: list[list[float]]
         out["status"] = "below resolution"   # OUTSIDE_FAMILY: covered, or it blocks
     elif contrasts and shapes["new below"] == len(contrasts):
         out["status"] = "vanished"           # OUTSIDE_FAMILY: a gain
+    elif contrasts and shapes["base below"] == len(contrasts):
+        out["status"] = "emerged"            # OUTSIDE_FAMILY: blocks unless the owner accepts it
     elif r["verdict"] == "incomplete":
         out["status"] = "incomplete"
     elif r["p"] <= gatestats.ALPHA * gatestats.PAIR_WEIGHTS[0]:
@@ -757,6 +761,7 @@ AUTHORITY_KEYS = {"approved", "by", "reason", "quote", "source"}
 TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
 EXCEPTION_KEYS = {"case", "outcome"} | AUTHORITY_KEYS
 ABSENCE_KEYS = {"side", "port"} | AUTHORITY_KEYS  # and its scope: `cases` or `pattern`, one of them
+EMERGED_KEYS = {"case", "dimension", "max"} | AUTHORITY_KEYS
 # The outcomes the bar forbids, which only an owner exception accepts: a wrong answer. A declared
 # limit (memory-limit, gave-up, timeout, unsupported) blocks where a baseline completes (compare_case)
 # and is named where none does; it is neither a wrong answer nor a loss.
@@ -770,6 +775,7 @@ class Policy(NamedTuple):
     exceptions: list[dict]
     errors: list[str]
     absences: tuple[dict, ...] = ()
+    emerged: tuple[dict, ...] = ()
 
 
 NO_POLICY = Policy([], [], [])
@@ -790,17 +796,20 @@ def load_policy(text: str) -> Policy:
     and the win that pays for it (`pays_with`: case and dimension, which must show as better in
     the same report). An exception names a case and the outcome it accepts there. An absence names
     the cases (`cases`, or a `pattern` of their names) a baseline (`side`) isn't compared on, why,
-    and the `port` planned to compare them. Each carries the owner's approval: `approved` (date),
-    `by`, `reason`, `quote` (his words) and `source`."""
+    and the `port` planned to compare them. An emerged entry names a case, a dimension, optionally
+    the baseline (`against`), and the largest candidate median (`max`, in the dimension's unit) a
+    cost appearing from below the counter's step may reach. Each carries the owner's approval:
+    `approved` (date), `by`, `reason`, `quote` (his words) and `source`."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         return Policy([], [], [f"not TOML: {error}"])
-    tables = {"tradeoff", "exception", "absence"}
-    errors = [f"unknown table {k!r} (tradeoff, exception, absence)" for k in sorted(set(data) - tables)]
+    tables = {"tradeoff", "exception", "absence", "emerged"}
+    errors = [f"unknown table {k!r} (tradeoff, exception, absence, emerged)" for k in sorted(set(data) - tables)]
     tradeoffs, exceptions = data.get("tradeoff", []), data.get("exception", [])
-    absences = data.get("absence", [])
-    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences)):
+    absences, emerged = data.get("absence", []), data.get("emerged", [])
+    for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences),
+                         ("emerged", emerged)):
         if not (isinstance(entries, list) and all(isinstance(e, dict) for e in entries)):
             errors.append(f"{key}: an array of tables ([[{key}]]), not {type(entries).__name__}")
     if errors:
@@ -835,7 +844,25 @@ def load_policy(text: str) -> Policy:
                 isinstance(e.get("pattern"), str) and e["pattern"].strip() or
                 isinstance(e.get("cases"), list) and e["cases"] and all(isinstance(c, str) for c in e["cases"]))):
             errors.append(f"absence {i}: its cases: a list (`cases`) or a pattern of their names (`pattern`), one")
-    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences))
+    for i, e in enumerate(emerged, start=1):
+        if missing := EMERGED_KEYS - set(e):
+            errors.append(f"emerged {i}: missing {', '.join(sorted(missing))}")
+        elif error := authority_error(f"emerged {i}", e):
+            errors.append(error)
+        elif (isinstance(e["max"], bool) or not isinstance(e["max"], (int, float))
+              or not (math.isfinite(e["max"]) and e["max"] > 0)):   # TOML true is no limit
+            errors.append(f"emerged {i}: max must be a finite number above 0")
+        elif "against" in e and e["against"] not in cases_registry.BASELINES:
+            errors.append(f"emerged {i}: against: a baseline (base, main)")
+    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences), tuple(emerged))
+
+
+def emerged_accepted(policy: Policy, e: dict) -> dict | None:
+    """The owner's emerged entry covering this cost (its case, dimension and baseline, the
+    candidate's median at most its `max`), if one does."""
+    return next((t for t in policy.emerged if (t["case"], t["dimension"]) == (e["case"], e["dimension"])
+                 and t.get("against", e["side"]) == e["side"] and e["new"] is not None and e["new"] <= t["max"]),
+                None)
 
 
 def absence_of(policy: Policy, side: str, case: str) -> dict | None:
@@ -974,7 +1001,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                            "run": p["report"].get("run"), "layout": p["report"].get("layout")}
                           for p in sorted(passes, key=lambda p: p["n"])],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
-               "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {},
+               "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {}, "emerged": [],
                "not_run": not_run, "elsewhere": elsewhere, "errors": [],
                "candidate_failures": {}, "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
     if missing := [s for s in required if s not in baselines]:
@@ -1048,6 +1075,9 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                     if uncovered(side, case, d, row, declared):
                         summary["blocking"].append(f"{case} against {side}: {d}: below the counter's step on both "
                                                    f"sides in every block, and no measured {COVER} covers it")
+                    if r["status"] == "emerged":
+                        summary["emerged"].append({"side": side, "case": case, "dimension": d, "base": r["base"],
+                                                   "new": r["new"], "unit": r["unit"], "step": r["step"]})
                     continue
                 summary["pvalues"][h] = r["p"]
                 if r["status"] == "incomplete":
@@ -1078,7 +1108,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     # own only when nothing is flagged, failed or missing.
     # A wrong answer the case declares passes no round alone: only the verdict's policy accepts one.
     summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
-                         and not summary["flagged"]
+                         and not summary["flagged"] and not summary["emerged"]
                          and not any(set(v.split(", ")) & BAR_OUTCOMES for v in summary["known_issues"].values()))
     return summary
 
@@ -1140,7 +1170,9 @@ def render(summary: dict) -> str:
         if unresolved:
             lines += [f"Unresolved (within the counter's step, no loss shown): {', '.join(unresolved)}", ""]
         for status, what in (("below resolution", f"below the counter's step on both sides; {COVER} covers each, or it blocks"),
-                             ("vanished", "below the counter's step on the candidate alone, a gain")):
+                             ("vanished", "below the counter's step on the candidate alone, a gain"),
+                             ("emerged", "below the counter's step on the baseline alone: blocks unless the owner "
+                                         "accepts it")):
             named = [f"{case} {d}" for case, row in rows.items() for d, r in row["dimensions"].items()
                      if r["status"] == status]
             if named:
@@ -2918,7 +2950,7 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
              f"Holm at {gatestats.ALPHA} over p = min(max(p1, p2) / 0.9, max(p2, p3) / 0.1)"
              + (f"; {len(d['outside'])} more decided below the counter's resolution, outside it" if d["outside"] else "")
              + ".", ""]
-    lines += [f"- below resolution: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: "
+    lines += [f"- decided below the counter's step: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: "
               f"{', '.join(s)}" for h, s in d["outside"].items()]
     evidence = list(evidence or [])
     lines += [f"- **not the candidate's**: {e}" for e in evidence]
@@ -2946,6 +2978,17 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
         else:
             blocking_losses.append(text)
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
+    # A cost appearing from below the counter's step, in any round: no statistics to wait for.
+    blocking_emerged = []
+    for e in (e for rounds in parts for r in rounds for e in r.get("emerged", [])):
+        text = (f"{e['case']} against {e['side']}: {e['dimension']}: {fmt(e['base'])} -> {fmt(e['new'])} {e['unit']} "
+                f"(below its step of {e['step']:g} on {e['side']} in every block)")
+        if t := emerged_accepted(policy, e):
+            lines.append(f"- accepted emerged cost: {text} (at most {t['max']}, approved {t['approved']} by {t['by']}, "
+                         f"{t['source']})")
+        else:
+            blocking_emerged.append(text)
+    lines += [f"- **emerged**: {t}" for t in blocking_emerged]
     lines += [f"- **pending** (a round that could reject it hasn't run): {h}" for h in d["pending"]]
     # A baseline absent by product (the harness's catalogue, in each report) declared no hypothesis;
     # one the owner's absence entry names (the candidate's policy) is not compared by his decision;
@@ -2994,7 +3037,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
                  f"({'; '.join(map(str, w3c.get('errors') or [])) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards_ok else 'NOT passed'} "
                  f"({'; '.join(map(str, (guards.get('errors') or [])[:5])) or str(guards.get('guards')) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not d["pending"] and not not_compared and not other and not errors
+    passed = (not blocking_losses and not blocking_emerged and not d["pending"] and not not_compared and not other
+              and not errors
               and not diagnostic and not missing and not empty and w3c_ok and guards_ok
               and not evidence and not policy.errors and not wrong)
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]

@@ -234,8 +234,8 @@ def aa_splits(rounds: list[list[Path]], splits: int,
         primary: dict[str, float] = {}
         blocks = list(range(1, len(reports) // 2 + 1))
         # Series the readings decide below the counter's step (rg.OUTSIDE_FAMILY): out of the
-        # test, and those the gate blocks on by their readings alone (below resolution with no
-        # measured whole run) beside it.
+        # test, and those the gate blocks on by their readings alone (emerged; below resolution
+        # with no measured whole run) beside it.
         readings: dict = {"resolution": {}, "blocking": set()}
         for case in planned:
             cand, base = rg.evidence(sides["cand"], case), rg.evidence(sides["base"], case)
@@ -245,7 +245,7 @@ def aa_splits(rounds: list[list[Path]], splits: int,
                 h = rg.hypothesis("base", case, dim)
                 if r.get("status") in rg.OUTSIDE_FAMILY:
                     readings["resolution"][h] = r["status"]
-                    if rg.uncovered("base", case, dim, row, mine):
+                    if r["status"] == "emerged" or rg.uncovered("base", case, dim, row, mine):
                         readings["blocking"].add(h)
                     continue
                 ps[h] = r.get("p", 1.0)

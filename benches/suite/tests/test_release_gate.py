@@ -428,14 +428,16 @@ class Layouts(unittest.TestCase):
 
     def test_the_a_a_probe_counts_what_the_readings_block(self):
         """Sol, below-resolution r1: gate-power.py aa kept only p-values, so a series the gate blocks
-        on by its readings (below resolution without a measured whole run) counted as no false
-        block. Six passes of one build, one round, q06 at 0.0 in all and no wall: every split
-        blocks (one round rejects nothing by Holm), with no series left to test (Sol r2: the shares
-        divided by zero)."""
+        on by its readings (below resolution without a measured whole run, or emerged) counted as no
+        false block. Six passes of one build, one round: q06 at 0.0 in all, and no wall, blocks every
+        split; q06 at 0.0 in three and 5.0 in three has emerged where every block's baseline is a 0.0
+        and its candidate a 5.0, 3! 3! of 6! orders, 0.05 (one round rejects nothing by Holm). With
+        no series left to test, the shares divided by zero (Sol r2)."""
         spec_ = importlib.util.spec_from_file_location("gate_power", ROOT / "benches/probes/gate-power.py")
         probe = importlib.util.module_from_spec(spec_)
         spec_.loader.exec_module(probe)
-        for case, q06, low, high in (("all below", [0.0] * 6, 1.0, 1.0),):
+        for case, q06, low, high in (("all below", [0.0] * 6, 1.0, 1.0),
+                                     ("half below", [0.0, 5.0] * 3, 0.025, 0.075)):
             with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
                 paths = []
                 for n, v in enumerate(q06, start=1):
@@ -1679,10 +1681,6 @@ class BelowResolution(unittest.TestCase):
         self.assertEqual(r["blocks"], 8)
         self.assertAlmostEqual(r["ratio"], 10.0, places=9)
         self.assertAlmostEqual(r["p"], 1 / 4 - 11 / (15 * math.pi), places=6)
-        # Every block so (six): tied, p = 2^-6.
-        r = self.dim([0.0] * 6, [5.0] * 6)
-        self.assertEqual(r["status"], "loss shown", r)
-        self.assertEqual(r["blocks"], 6)
 
     def test_a_phase_falling_below_one_step_on_the_candidate_alone_has_vanished(self):
         self.assertEqual(self.dim([5.0] * 6, [0.0] * 6)["status"], "vanished")
@@ -1711,6 +1709,39 @@ class BelowResolution(unittest.TestCase):
         self.assertFalse(passed, text)
         self.assertTrue([b for b in summary["blocking"] if "against base: time/prepare: incomplete" in b],
                         summary["blocking"])
+
+    def test_a_cost_appearing_from_below_one_step_in_every_block_has_emerged(self):
+        # Decided by the readings, not by a test that can't confirm it: three blocks of 0.0 -> 5.0
+        # tie at p = 2^-3, and Holm over about 1,200 hypotheses would need 15 such blocks.
+        self.assertEqual(self.dim([0.0] * 3, [5.0] * 3)["status"], "emerged")
+
+    def test_an_emerged_cost_blocks_the_verdict_unless_the_owner_s_entry_covers_it(self):
+        # Spec (master, 14 Nov 09:15: a blocking verdict of its own, which the owner may take out):
+        # a phase at 0.0 on both baselines in every block and 5.0 on the candidate, its case's
+        # whole run alike, blocks the release; an [[emerged]] entry for its case and dimension whose
+        # `max` reaches the candidate's 5.0 accepts it, one below 5.0 doesn't.
+        def records_of(side, n):
+            prepare = [5.0] * 5 if side == "cand" else [0.0] * 5
+            return [record(samples={"read": [10.0, 10.1, 9.9, 10.0, 10.2], "prepare": prepare,
+                                    "wall": [300.0, 301.0, 299.5, 300.2, 300.4]})]
+        summary = run_gate(passes(records_of, blocks=3))
+        passed, text = gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS)
+        self.assertFalse(passed, text)
+        self.assertIn("**emerged**: lab-olympics against base: time/prepare: 0 -> 5 ms", text)
+
+        def entry(limit):
+            return gate_module.load_policy(
+                f'[[emerged]]\ncase = "lab-olympics"\ndimension = "time/prepare"\nmax = {limit}\n'
+                'approved = "2026-11-14"\nby = "Johannes"\nreason = "r"\nquote = "q"\nsource = "s"\n')
+        # TOML `true` is Python's 1: no limit the owner wrote (Sol, below-resolution r1).
+        for bad in ("true", "0", "-1.0", "nan", "inf"):
+            with self.subTest(max=bad):
+                self.assertEqual(entry(bad).errors, ["emerged 1: max must be a finite number above 0"])
+        self.assertEqual(entry(5.0).errors, [])
+        passed, text = gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS, entry(5.0))
+        self.assertTrue(passed, text)
+        self.assertIn("accepted emerged cost: lab-olympics against base: time/prepare", text)
+        self.assertFalse(gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS, entry(4.9))[0])
 
     def test_a_series_below_resolution_is_out_of_the_holm_family_unless_a_round_tested_it(self):
         # Its p of 1 in the family would only lower every other's alpha / m.
