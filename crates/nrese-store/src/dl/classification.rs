@@ -295,8 +295,13 @@ pub(crate) enum ElRoute {
     Stopped(Option<crate::StoreError>),
 }
 
-/// The EL classifier's answer kept for `snapshot`'s revision, if there is one.
+/// The EL classifier's answer kept for `snapshot`'s revision, if there is one and the store
+/// answers outside OWL 2 DL by a proven procedure now: a change of that setting never
+/// serves the other value's answer.
 pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<El>> {
+    if store.outside_profile() != crate::dl::OutsideProfile::Proven {
+        return None;
+    }
     latest(&store.dl().classification.el, snapshot.revision())
 }
 
@@ -305,7 +310,7 @@ pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<E
 /// classifier is complete for the ontology: no assertion, no range with a chain
 /// ([`el_complete_for`]), nothing it skipped. Its completion rules (CR6) need no regular
 /// hierarchy. Taken only where the store answers outside OWL 2 DL by a proven procedure
-/// ([`crate::dl::OutsideProfile::Proven`], not the default); `None` everywhere else, where
+/// ([`crate::dl::OutsideProfile::Proven`], the default); `None` everywhere else, where
 /// the DL engines' answer stands as it is. It runs under the request's stop:
 /// `started` plus `dl.timeout`, and the store's memory watch with the process's limit
 /// ([`StoreService::memory_stop`]), polled as `nrese_reasoner::classify::classify_parallel_within`
@@ -325,7 +330,7 @@ pub(crate) fn el_answer(
     started: Instant,
 ) -> Option<ElRoute> {
     // Outside OWL 2 DL: only where the store answers by a proven procedure.
-    if store.config().dl.outside_profile != crate::dl::OutsideProfile::Proven {
+    if store.outside_profile() != crate::dl::OutsideProfile::Proven {
         return None;
     }
     // The driver's lower bound, where an irregular role hierarchy is all it left out.

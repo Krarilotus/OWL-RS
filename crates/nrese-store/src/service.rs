@@ -48,6 +48,9 @@ pub struct StoreService {
     /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
     /// repository's own, [`Self::set_ql_rewriting`]).
     ql_mode: std::sync::Arc<std::sync::RwLock<crate::QlRewritingMode>>,
+    /// What a classification answers outside OWL 2 DL ([`crate::DlConfig::outside_profile`],
+    /// or the repository's own, [`Self::set_outside_profile`]).
+    outside_profile: std::sync::Arc<std::sync::RwLock<crate::OutsideProfile>>,
     /// The latest full materialisation's report (startup, load, ruleset change).
     last_materialisation:
         std::sync::Arc<std::sync::Mutex<Option<crate::reasoning::MaterialisationReport>>>,
@@ -235,6 +238,7 @@ impl StoreService {
         )?;
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
+        let outside_profile = config.dl.outside_profile;
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
             geosparql_stated_only: config.geosparql_stated_only,
@@ -287,6 +291,7 @@ impl StoreService {
             materialised: std::sync::Arc::default(),
             certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
+            outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
         };
         // The planner's statistics are the store's, shared by its requests: an envelope of
@@ -365,6 +370,23 @@ impl StoreService {
     /// When queries are rewritten for OWL 2 QL.
     pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
         *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What a classification answers on an input outside OWL 2 DL.
+    pub fn outside_profile(&self) -> crate::OutsideProfile {
+        *self
+            .outside_profile
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Changes what a classification answers outside OWL 2 DL (a repository's setting): the
+    /// classifications that start from now on read it.
+    pub fn set_outside_profile(&self, profile: crate::OutsideProfile) {
+        *self
+            .outside_profile
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = profile;
     }
 
     /// What searches rank and select among ([`crate::StoreConfig::search_scope`]).

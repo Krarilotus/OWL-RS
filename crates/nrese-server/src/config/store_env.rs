@@ -174,7 +174,7 @@ pub(super) fn parse_store_config(
 
 /// The `owl2-dl` mode's settings (`dl.*`).
 fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
-    use nrese_store::{DlAnswers, DlConsistency};
+    use nrese_store::{DlAnswers, DlConsistency, OutsideProfile};
     let defaults = nrese_store::DlConfig::default();
     let answers = match choice(
         source,
@@ -191,6 +191,10 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
     let consistency = match choice(source, names::DL_CONSISTENCY, &["inline", "off"])? {
         None => defaults.consistency,
         Some(at) => [DlConsistency::Inline, DlConsistency::Off][at],
+    };
+    let outside_profile = match choice(source, names::DL_OUTSIDE_PROFILE, &["proven", "dl-part"])? {
+        None => defaults.outside_profile,
+        Some(at) => [OutsideProfile::Proven, OutsideProfile::DlPart][at],
     };
     // Every budget: a value, or 0 or `unlimited` for none.
     use super::env_values::parse_limit;
@@ -240,8 +244,7 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
             defaults.max_join_steps,
             count,
         )?,
-        // Not a setting until the outside-profile setting lands; the route stays off.
-        outside_profile: nrese_store::OutsideProfile::default(),
+        outside_profile,
     })
 }
 
@@ -528,9 +531,11 @@ mod tests {
         source.insert(names::DL_MEMORY, "1GiB");
         source.insert(names::DL_MAX_CANDIDATES, "50");
         source.insert(names::DL_THREADS, "2");
+        source.insert(names::DL_OUTSIDE_PROFILE, "dl-part");
         let dl = parse_dl(&source).unwrap();
         assert_eq!(dl.answers, DlAnswers::Exact);
         assert_eq!(dl.consistency, DlConsistency::Off);
+        assert_eq!(dl.outside_profile, nrese_store::OutsideProfile::DlPart);
         assert_eq!(dl.timeout, Some(std::time::Duration::from_secs(90)));
         assert_eq!(dl.memory_bytes, Some(1 << 30));
         assert_eq!((dl.max_candidates, dl.threads), (Some(50), 2));
