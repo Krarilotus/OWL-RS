@@ -38,11 +38,11 @@ A suggested graph naming, which the smoke test uses: one graph per module versio
 ## What to know
 
 - Validation runs on request or on commit. By default a `PUT` of data that breaks the shapes succeeds, and the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). With `shacl.gate = "enforce"` ([configuration](../ops/config-reference.md)) an export that introduces a violation is refused whole (400, with the validation results), so no export adds a violation (data stored before the gate was on isn't checked by it: [SHACL](../what-it-covers.md#shacl)); `report` logs instead.
-- **SHACL Core and SHACL-SPARQL** (`sh:sparql` constraints and components) are evaluated.
-- **Updates without `GRAPH`** write to, and delete from, the default graph only, also with `store.default_graph = "union"`. The exporter should name the graph in updates.
+- SHACL Core and SHACL-SPARQL (`sh:sparql` constraints and components) are evaluated.
+- Updates without `GRAPH` write to, and delete from, the default graph only, also with `store.default_graph = "union"`. The exporter should name the graph in updates.
 - The shapes graph is an ordinary graph: a query over all graphs sees the shapes too. Validation leaves it out of the data by itself.
-- **Inferred statements** live in the default graph. `GET /dataset/data?graph=…` returns what was exported, not what was inferred from it; queries see both unless they say `infer=false`.
-- **A consistency rejection** (with `owl2-rl`) is a 400 with an explanation: the violated rule, the statements that clash, and the likely trigger in the export.
+- Inferred statements live in the default graph. `GET /dataset/data?graph=…` returns what was exported, not what was inferred from it; queries see both unless they say `infer=false`.
+- A consistency rejection (with `owl2-rl`) is a 400 with an explanation: the violated rule, the statements that clash, and the likely trigger in the export.
 
 ## Trying it
 

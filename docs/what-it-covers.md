@@ -94,12 +94,12 @@ default, or only the asserted ones with `infer=false`. The contract for every mo
 
 Also:
 
-- **Explanations,** with reasoning on: why a statement holds, as a derivation or as
+- Explanations, with reasoning on: why a statement holds, as a derivation or as
   minimal sets of asserted statements it follows from; under `owl2-dl`, minimal sets of
   axioms (`/explain`, [HTTP interface](ops/http-api.md#engine-api-apiv1)).
-- **Classification and realisation** of the ontology by the DL engines, in any mode
+- Classification and realisation of the ontology by the DL engines, in any mode
   ([HTTP interface](ops/http-api.md#classification)).
-- **Incremental maintenance,** tested against full recomputation on random changes
+- Incremental maintenance, tested against full recomputation on random changes
   ([maintenance](spec/reasoning-semantics.md#maintenance)).
 - Conformance, checked by the W3C OWL 2 test cases for RL ([runner](../crates/nrese-store/tests/w3c_owl2_rl)),
   QL ([runner](../crates/nrese-store/tests/w3c_owl2_ql), 9 failures listed with reasons) and DL
