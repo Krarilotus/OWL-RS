@@ -1296,6 +1296,11 @@ data = "el classes=20000 roles=12"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
+# Compared by five of the tool's six phases. prepare takes microseconds here and prints 0.0 at the
+# tool's 0.1 ms step: on all 30 samples of the baseline in a release run (13 Nov 2026), and of the
+# candidate, so no run can compare it. The other five hold the case's time (about 560 ms). All six
+# stay in each record and report.
+phases = ["read", "normalise", "saturate", "assemble", "write"]
 check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
@@ -1316,6 +1321,10 @@ data = "el classes=20000 roles=12 irregular=1"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
+# Compared by five of the tool's six phases, as el-classify: prepare printed 0.0 on all 30 samples
+# of the baseline in a release run (13 Nov 2026), and of the candidate. The other five hold the
+# case's time (about 700 ms). All six stay in each record and report.
+phases = ["read", "normalise", "saturate", "assemble", "write"]
 check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
