@@ -19,6 +19,7 @@ import copy
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -424,6 +425,31 @@ class Layouts(unittest.TestCase):
             rows = {r["binary"]: r["layout_sd"] for r in probe.layout_components(paths, 0.001)}
         self.assertLess(rows["aaaaaaaa"], 0.001)
         self.assertGreater(rows["bbbbbbbb"], 0.3)
+
+    def test_the_a_a_probe_counts_what_the_readings_block(self):
+        """Sol, below-resolution r1: gate-power.py aa kept only p-values, so a series the gate blocks
+        on by its readings (below resolution without a measured whole run, or emerged) counted as no
+        false block. Six passes of one build, one round: q06 at 0.0 in all, and no wall, blocks every
+        split; q06 at 0.0 in three and 5.0 in three has emerged where every block's baseline is a 0.0
+        and its candidate a 5.0, 3! 3! of 6! orders, 0.05 (one round rejects nothing by Holm). With
+        no series left to test, the shares divided by zero (Sol r2)."""
+        spec_ = importlib.util.spec_from_file_location("gate_power", ROOT / "benches/probes/gate-power.py")
+        probe = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(probe)
+        for case, q06, low, high in (("all below", [0.0] * 6, 1.0, 1.0),
+                                     ("half below", [0.0, 5.0] * 3, 0.025, 0.075)):
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
+                paths = []
+                for n, v in enumerate(q06, start=1):
+                    path = Path(tmp) / f"pass-{n}.json"
+                    path.write_text(json.dumps(report("base", n, [record(samples={"q06": [v] * 3})])),
+                                    encoding="utf-8")
+                    paths.append(path)
+                out = probe.aa([paths], 1000, 1)
+                self.assertEqual(out["family-wise false losses (gates with any)"], 0.0, out)
+                share = out["family-wise false blocks (losses, or readings below the step that block)"]
+                self.assertGreaterEqual(share, low, out)
+                self.assertLessEqual(share, high, out)
 
 
 class Rounds(unittest.TestCase):
@@ -1626,6 +1652,121 @@ class Memory(unittest.TestCase):
         self.assertEqual(unresolved["status"], "unresolved")
         self.assertGreater(unresolved["p"], 0.045)
 
+
+class BelowResolution(unittest.TestCase):
+    """The below-resolution design (14 Nov 2026, master's GO): a block median below the counter's
+    step is a reading, standing for half a step, never dropped. Below it on both sides in every
+    block: `below resolution`, outside the Holm family, covered by the case's measured whole run or
+    blocking; on the candidate alone: `vanished`, a gain."""
+
+    STEP = 0.1  # the EL classifier's printed step, in ms
+
+    def dim(self, base, cand):
+        blocks = list(range(1, len(base) + 1))
+        return gate_module.dimension([[v] * 5 for v in base], blocks, [[v] * 5 for v in cand], blocks, {}, "ms",
+                                     step=self.STEP)
+
+    def test_a_phase_below_one_step_on_both_sides_is_below_resolution_not_incomplete(self):
+        # Before: every block dropped, the hypothesis `incomplete`, blocking the release under the
+        # wrong name (el-classify's prepare, 0.0 on every pass of both sides).
+        self.assertEqual(self.dim([0.0] * 6, [0.0] * 6)["status"], "below resolution")
+
+    def test_a_cost_appearing_where_the_base_read_below_one_step_is_a_loss(self):
+        # Before: the blocks where the baseline read 0.0 were dropped, exactly those where the cost
+        # appeared. Four blocks alike at 10 ms and four where the baseline reads 0.0 and the
+        # candidate 5.0: contrasts 0 x 4 and log(5 / 0.05) x 4, mean log(100) / 2 (a ratio of 10),
+        # t = sqrt(7) on 7 degrees of freedom, one-sided p = 1/4 - 11 / (15 pi), about 0.016573.
+        r = self.dim([10.0] * 4 + [0.0] * 4, [10.0] * 4 + [5.0] * 4)
+        self.assertEqual(r["status"], "loss shown", r)
+        self.assertEqual(r["blocks"], 8)
+        self.assertAlmostEqual(r["ratio"], 10.0, places=9)
+        self.assertAlmostEqual(r["p"], 1 / 4 - 11 / (15 * math.pi), places=6)
+
+    def test_a_phase_falling_below_one_step_on_the_candidate_alone_has_vanished(self):
+        self.assertEqual(self.dim([5.0] * 6, [0.0] * 6)["status"], "vanished")
+
+    def test_a_block_without_readings_makes_the_series_incomplete(self):
+        # Spec (fail closed: a missing reading never passes). The baseline at 5.0 in three blocks,
+        # the candidate at 0.0 where it has readings: one block left made it `vanished`, two left it
+        # `unresolved` (Sol, below-resolution r1 and r2), both passing.
+        base = [[5.0]] * 3
+        for case, new, new_blocks in (("two empty", [[0.0], [], []], [1, 2, 3]), ("two absent", [[0.0]], [1]),
+                                      ("one empty", [[0.0], [0.0], []], [1, 2, 3])):
+            with self.subTest(case):
+                r = gate_module.dimension(base, [1, 2, 3], new, new_blocks, {}, "ms", step=self.STEP)
+                self.assertEqual(r["status"], "incomplete", r)
+
+    def test_a_block_without_readings_fails_the_verdict(self):
+        # The gate: the candidate's prepare at 0.0 in blocks 1 and 2 and empty in block 3, the
+        # baselines' at 5.0, its whole run alike: the release doesn't pass.
+        def records_of(side, n):
+            block = (n - 1) // 6 + 1  # six passes a block: three sides, twice each
+            prepare = ([0.0] * 5 if block < 3 else []) if side == "cand" else [5.0] * 5
+            return [record(samples={"read": [10.0, 10.1, 9.9, 10.0, 10.2], "prepare": prepare,
+                                    "wall": [300.0, 301.0, 299.5, 300.2, 300.4]})]
+        summary = run_gate(passes(records_of, blocks=3))
+        passed, text = gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS)
+        self.assertFalse(passed, text)
+        self.assertTrue([b for b in summary["blocking"] if "against base: time/prepare: incomplete" in b],
+                        summary["blocking"])
+
+    def test_a_cost_appearing_from_below_one_step_in_every_block_has_emerged(self):
+        # Decided by the readings, not by a test that can't confirm it: three blocks of 0.0 -> 5.0
+        # tie at p = 2^-3, and Holm over about 1,200 hypotheses would need 15 such blocks.
+        self.assertEqual(self.dim([0.0] * 3, [5.0] * 3)["status"], "emerged")
+
+    def test_an_emerged_cost_blocks_the_verdict_unless_the_owner_s_entry_covers_it(self):
+        # Spec (master, 14 Nov 09:15: a blocking verdict of its own, which the owner may take out):
+        # a phase at 0.0 on both baselines in every block and 5.0 on the candidate, its case's
+        # whole run alike, blocks the release; an [[emerged]] entry for its case and dimension whose
+        # `max` reaches the candidate's 5.0 accepts it, one below 5.0 doesn't.
+        def records_of(side, n):
+            prepare = [5.0] * 5 if side == "cand" else [0.0] * 5
+            return [record(samples={"read": [10.0, 10.1, 9.9, 10.0, 10.2], "prepare": prepare,
+                                    "wall": [300.0, 301.0, 299.5, 300.2, 300.4]})]
+        summary = run_gate(passes(records_of, blocks=3))
+        passed, text = gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS)
+        self.assertFalse(passed, text)
+        self.assertIn("**emerged**: lab-olympics against base: time/prepare: 0 -> 5 ms", text)
+
+        def entry(limit):
+            return gate_module.load_policy(
+                f'[[emerged]]\ncase = "lab-olympics"\ndimension = "time/prepare"\nmax = {limit}\n'
+                'approved = "2026-11-14"\nby = "Johannes"\nreason = "r"\nquote = "q"\nsource = "s"\n')
+        # TOML `true` is Python's 1: no limit the owner wrote (Sol, below-resolution r1).
+        for bad in ("true", "0", "-1.0", "nan", "inf"):
+            with self.subTest(max=bad):
+                self.assertEqual(entry(bad).errors, ["emerged 1: max must be a finite number above 0"])
+        self.assertEqual(entry(5.0).errors, [])
+        passed, text = gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS, entry(5.0))
+        self.assertTrue(passed, text)
+        self.assertIn("accepted emerged cost: lab-olympics against base: time/prepare", text)
+        self.assertFalse(gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS, entry(4.9))[0])
+
+    def test_a_series_below_resolution_is_out_of_the_holm_family_unless_a_round_tested_it(self):
+        # Its p of 1 in the family would only lower every other's alpha / m.
+        tested, below = "base|c|time/read", "base|c|time/prepare"
+        rnd = {"family": [tested, below], "pvalues": {tested: 0.01}, "resolution": {below: "below resolution"}}
+        d = gate_module.decide([[rnd]])
+        self.assertEqual(d["m"], 1, d)
+        self.assertEqual(d["outside"], {below: ["below resolution"]})
+        second = {"family": [tested, below], "pvalues": {tested: 0.01, below: 0.5}, "resolution": {}}
+        self.assertEqual(gate_module.decide([[rnd, second]])["m"], 2)
+
+    def test_a_series_below_resolution_needs_its_case_s_measured_whole_run(self):
+        # The cover is the classifier process's whole run, `time/wall`: with it the phase blocks
+        # nothing and counts nowhere as untested; without it, the phase blocks.
+        def run(samples):
+            summary = run_gate(passes(lambda side, n: [record(samples=dict(samples, prepare=[0.0] * 5))], blocks=3))
+            return summary, [b for b in summary["blocking"] if "against base: time/prepare" in b]
+        summary, blocks = run({"wall": [300.0, 301.0, 299.5, 300.2, 300.4]})
+        self.assertEqual(blocks, [], summary["blocking"])
+        self.assertEqual(summary["resolution"].get("base|lab-olympics|time/prepare"), "below resolution")
+        self.assertNotIn("base|lab-olympics|time/prepare", summary["untested"] + list(summary["pvalues"]))
+        summary, blocks = run({"read": [10.0, 10.1, 9.9, 10.0, 10.2]})
+        self.assertEqual(len(blocks), 1, summary["blocking"])
+        self.assertIn("no measured time/wall covers it", blocks[0])
+
     def test_only_a_case_counting_live_bytes_declares_the_live_peak(self):
         # Spec (master, 12 Nov 10:36): --count-allocations alone counts calls and bytes, as the
         # baselines' perf labs do, and declares no live peak, so the three counted cases are
@@ -1640,6 +1781,32 @@ class Memory(unittest.TestCase):
         live = dict(next(c for c in catalog if c["name"] == "alloc-load"), name="alloc-load-live",
                     args=["--count-allocations", "--count-live"])
         self.assertIn("base|alloc-load-live|memory/live", gate_module.family_of([live], ["alloc-load-live"]))
+
+
+class ToolPhases(unittest.TestCase):
+    def test_a_classifier_case_declares_every_phase_and_its_whole_run(self):
+        # Spec (benches/cases/README.md, what the tool can resolve; the below-resolution design,
+        # 14 Nov 2026): a phase printing 0.0 at the tool's 0.1 ms step is a reading below its
+        # resolution, judged as such and covered by the process's whole run (`wall`), never left
+        # out: el-shallow-existentials' prepare and write and el-classify's and
+        # el-classify-irregular's prepare are in their families with every other phase and `wall`,
+        # against each baseline; horn-classify has read, owl, write and `wall` against base (main
+        # lacks the Horn classifier: absent).
+        catalog = fast.load_cases()
+        cases = ["el-shallow-existentials", "el-classify", "el-classify-irregular", "horn-classify"]
+        family = gate_module.family_of(catalog, cases)
+        times = lambda case, side: sorted(h.split("|")[2] for h in family
+                                          if h.startswith(f"{side}|{case}|time/"))
+        el = ["time/assemble", "time/normalise", "time/prepare", "time/read", "time/saturate", "time/wall",
+              "time/write"]
+        for side in ("base", "main"):
+            with self.subTest(side=side):
+                self.assertEqual(times("el-shallow-existentials", side), el)
+                self.assertEqual(times("el-classify", side), el)
+                self.assertEqual(times("el-classify-irregular", side), el)
+                self.assertIn(f"{side}|el-shallow-existentials|memory/anon_kernel", family)
+        self.assertEqual(times("horn-classify", "base"), ["time/owl", "time/read", "time/wall", "time/write"])
+        self.assertEqual(times("horn-classify", "main"), [])
 
 
 class Evidence(unittest.TestCase):
@@ -2311,6 +2478,67 @@ class Measurement(unittest.TestCase):
         import tomllib
         self.assertEqual(tomllib.loads(gate_module.write_measure(rich, "a test"))["case"]["q-paths"]["blocks"],
                          rich["cases"]["q-paths"]["blocks"])
+
+    def test_calibrate_sizes_a_horn_case_by_one_classification_not_by_its_whole_process(self):
+        # Spec (calibrate: a context classifier's process repeats its classification `repeat` times,
+        # its time DL_MS = 3000 ms at most; Sol, classifier-wall r1): its largest phase, 300 ms, is
+        # one classification, so 3000 ms buys ten; the process's whole run (910 ms for three
+        # classifications and the process around them) is no classification.
+        def records_of(side, n):
+            r = record(case="horn-x", samples={"read": [100.0] * 5, "owl": [300.0] * 5, "write": [50.0] * 5,
+                                               "wall": [910.0] * 5})
+            r["case_s"] = 5.0
+            return [r]
+        catalog = [{"name": "horn-x", "tool": "classify-horn", "metric": "whole_ms", "repeat": 3, "args": []}]
+        plan = gate_module.calibrate(catalog, passes(records_of), budget_min=240, m=10, batch=False)
+        self.assertEqual(plan["cases"]["horn-x"].get("repeat"), 10)
+
+    def test_compare_keeps_a_classifier_s_whole_process_out_of_its_phases_sum(self):
+        # Spec (Sol, classifier-wall r1): the whole process holds its phases. A case whose phases
+        # fell from 100 to 50 ms while its process grew from 300 to 350 ms (+17 %, above the 10 %
+        # floor and 2 ms) is timed 100 -> 50 by its phases, and its whole process is a slowdown
+        # (exit 1); summed, both sides were 400 ms and nothing showed.
+        def report(phase_ms, wall_ms):
+            records = [{"case": "el-x", "rep": rep, "status": "ok", "checks": [], "routes": [], "inputs": {},
+                        "metric": 2 * phase_ms, "samples": {"read": [phase_ms] * 5, "saturate": [phase_ms] * 5,
+                                                            "wall": [wall_ms] * 5}} for rep in (1, 2)]
+            return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-14T08:00:00", "records": records}
+        code, text = DeclaredMetric.compared(self, report(50.0, 300.0), report(25.0, 350.0))
+        self.assertEqual(code, 1, text)
+        self.assertIn("whole process: 300 -> 350 ms", text)
+        self.assertIn("SLOWER", text.split("whole process:")[1].splitlines()[0])
+        line = next(l for l in text.splitlines() if l.lstrip().startswith("el-x"))
+        self.assertEqual([float(x) for x in line.split()[1:3]], [100.0, 50.0], line)
+
+    def test_compare_refuses_a_whole_process_line_from_part_of_its_evidence(self):
+        # Spec (compare.py's order, 1. Missing: series and repetitions one side has and the other
+        # doesn't; Sol, classifier-wall r2): a repetition of either side without a valid wall reading,
+        # while the other side has it, makes the whole process not comparable (exit 1), never a line
+        # from the rest and never silence. Neither side with it: an older report, phases only.
+        def report(*walls):
+            records = []
+            for rep, wall in enumerate(walls, 1):
+                samples = {"read": [50.0] * 5, "saturate": [50.0] * 5}
+                if wall != "absent":
+                    samples["wall"] = wall
+                records.append({"case": "el-x", "rep": rep, "status": "ok", "checks": [], "routes": [],
+                                "inputs": {}, "metric": 100.0, "samples": samples})
+            return {"reps": len(walls), "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-14T08:00:00", "records": records}
+        full = report([300.0] * 5, [300.0] * 5)
+        for label, base, new in (("the new run without it", full, report("absent", "absent")),
+                                 ("an empty reading", full, report([], [])),
+                                 ("only nulls", full, report([None] * 5, [None] * 5)),
+                                 ("one repetition without it", full, report([300.0] * 5, "absent")),
+                                 ("an older base without it", report("absent", "absent"), full)):
+            with self.subTest(label):
+                code, text = DeclaredMetric.compared(self, base, new)
+                self.assertEqual(code, 1, text)
+                self.assertIn("whole process NOT COMPARABLE", text)
+        code, text = DeclaredMetric.compared(self, report("absent", "absent"), report("absent", "absent"))
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("whole process", text)
 
     def test_fast_applies_the_calibration_alike_and_pools_repeated_processes(self):
         case = {"name": "x", "tool": "perf_lab", "args": ["--runs", "5", "--qerror"], "repeat": 1}
