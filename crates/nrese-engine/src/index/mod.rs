@@ -651,6 +651,28 @@ impl IndexVersion {
         ))
     }
 
+    /// The most [`Self::scan_plan_with`] counts making a scan in `plan`'s permutation: each
+    /// run's range search, and its cursor added to a merge whose every range is taken
+    /// ([`merge::add_cost`]). From the runs' sizes and the permutation the layout reads alone,
+    /// a run at a time: `None` once it is over `most`, the runs after that left unread. So it
+    /// reads at most `most / 22 + 1` runs' metadata (a run costs at least 22: its two searches
+    /// at one level, `levels()`'s least, and its cursor), and searches, decodes and allocates nothing. The
+    /// plain scan's making ([`Self::scan_plan`]) does no more than this: the same searches,
+    /// and a heap built at once compares no more than its pushes one by one.
+    pub(crate) fn scan_cost(&self, plan: &AccessPlan, most: u64) -> Option<u64> {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return Some(0);
+        };
+        let mut cost = 0;
+        for (added, run) in self.runs.iter().enumerate() {
+            cost += run.permutation(adapted.permutation).keys.range_cost() + merge::add_cost(added);
+            if cost > most {
+                return None;
+            }
+        }
+        Some(cost)
+    }
+
     /// [`Self::scan`] for a counted read: made and stepped counted on `visit`
     /// ([`Self::scan_plan_counted`], [`QuadScan::next_counted`]), ending at once where `visit`
     /// had stopped (the stop is the visitor's to tell).
