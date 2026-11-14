@@ -25,10 +25,8 @@ It may suit you if you:
 - need to know when an answer under OWL reasoning may be missing rows;
 - want a store you can read and take apart: small crates in clear layers.
 
-To try it: [Quick start](#quick-start), below. What it does today:
-[What it covers](docs/what-it-covers.md); what it leaves out, and when to
-choose another system: [limits](docs/limits.md); what is planned:
-[ROADMAP](docs/ROADMAP.md); how it works: [How it is built](#how-it-is-built).
+To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
+planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
 
 ## Quick start
 

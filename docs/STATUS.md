@@ -1,8 +1,7 @@
 # Status
 
-What works today, capability by capability, with the tests behind it: the
-[capability matrix](spec/06-target-capability-matrix.md); what doesn't, and what to do
-instead: [limits](limits.md).
+What is in, left out and planned: the [scope](what-it-covers.md#scope); each capability's state
+of work with its evidence: the [capability matrix](spec/06-target-capability-matrix.md).
 
 Below, the one place for the state of the work. Each item is **done** (implemented, tested,
 in the branch), **deferred** (not done, with the reason and where it went), or **open**.

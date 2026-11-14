@@ -2,9 +2,9 @@
 
 What NRESE doesn't do, and where it departs from a standard on purpose, for the code of
 the commit this page is in. Each item is stated in the document it links to; this page only gathers them, each
-with what to do instead, or "none known" where there is nothing. What is in:
-[What it covers](what-it-covers.md); what is planned: [ROADMAP.md](ROADMAP.md),
-and nothing here is a promise about it.
+with what to do instead, or "none known" where there is nothing. It is the detail of the
+"left out" list of the [scope](what-it-covers.md#scope), which also says what is in and what is
+planned.
 
 ## Choose another system when
 
