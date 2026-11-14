@@ -51,7 +51,8 @@ Rust and Node.js aren't needed: the image builds the server and its console. The
 below fetch the code, build the [image](docs/glossary.md#image-container-volume) `nrese`
 and start it as the container `nrese`:
 
-- its data on disk (the image sets `NRESE_STORE_MODE=on-disk`), on the volume `nrese-data`,
+- its data on disk (the image sets `NRESE_STORE_MODE=on-disk`; its other settings:
+  [container](docs/ops/server-setup.md#72-example-docker-run)), on the volume `nrese-data`,
   so it outlives the container;
 - its port bound to this machine only, since no authentication is on (set
   `NRESE_AUTH_MODE` before you expose it: [access control](#access-control-and-operations));
