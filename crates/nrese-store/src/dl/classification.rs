@@ -8,12 +8,20 @@
 //! The query lower bound owns its separate schema-lifetime cache (`bounds.rs`).
 //! The context core receives the store's explicit process-memory policy, including zero
 //! to disable its watch; opening another store cannot change that policy.
+//!
+//! Where an irregular role hierarchy is all the DL engines leave out, the EL classifier
+//! may answer instead ([`el_answer`]).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nrese_dl::classify::{self, Realisation, Taxonomy};
-use nrese_engine::Snapshot;
+use nrese_dl::verdict::Verdict;
+use nrese_engine::{ReadModel, Snapshot, TermId, TermKind};
+use nrese_owl::{Axiom, Characteristic, Ontology, Term};
+use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
+use nrese_reasoner::classify::Classification;
 
 use super::source;
 use crate::StoreService;
@@ -152,6 +160,226 @@ fn run<T>(
             none
         }
     }
+}
+
+/// What the DL engines say where an irregular role hierarchy is the only part they leave
+/// out (`nrese_dl::tableau::left_out` over nrese-owl's `IRREGULAR`, normalise.rs).
+const IRREGULAR_ONLY: &str = "axioms left out: an irregular role hierarchy";
+
+/// Whether `taxonomy` is the driver's lower bound for an ontology whose only part left out
+/// is an irregular role hierarchy: its verdict and the reasons it writes on that path
+/// (`nrese_dl` classify/driver.rs). `Taxonomy` carries them as text only; reworded there,
+/// this holds for nothing and the lower bound stays the answer.
+fn irregular_only(taxonomy: &Taxonomy) -> bool {
+    let consistency = format!("consistency not decided (unsupported): {IRREGULAR_ONLY}");
+    let thing = format!("owl:Thing not decided (unsupported): {IRREGULAR_ONLY}");
+    let classes = format!(" classes not decided (unsupported: {IRREGULAR_ONLY})");
+    taxonomy.profile.path == "tableau"
+        && taxonomy.classification.consistency
+            == Verdict::Unknown(format!("unsupported: {IRREGULAR_ONLY}"))
+        && taxonomy.incomplete.contains(&consistency)
+        && taxonomy.incomplete.iter().all(|why| {
+            *why == consistency
+                || *why == thing
+                || why
+                    .strip_suffix(&classes)
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// Whether the EL classifier's completion rules are complete for `o`, given that it reads
+/// all of it: no assertion (the ontology then has a model iff `owl:Thing` is satisfiable),
+/// and no object-property range on a property of a chain or a transitivity, or above or
+/// below one through the property hierarchy. The classifier applies a range on the edges
+/// class axioms create, not on those a chain composes; the EL++ update's condition on the
+/// ranges above a chain's superproperty is taken conservatively, refusing every such range.
+/// O(axioms + property inclusions).
+fn el_complete_for(o: &Ontology) -> bool {
+    if o.axioms.iter().any(Axiom::is_assertion) {
+        return false;
+    }
+    let mut chained: Vec<Term> = Vec::new();
+    let mut ranged: Vec<Term> = Vec::new();
+    // Property inclusions by named property (inverses merged: wider, so safer), both ways.
+    let mut up: HashMap<Term, Vec<Term>> = HashMap::new();
+    let mut down: HashMap<Term, Vec<Term>> = HashMap::new();
+    let mut include = |r: Term, s: Term| {
+        up.entry(r).or_default().push(s);
+        down.entry(s).or_default().push(r);
+    };
+    for axiom in &o.axioms {
+        match axiom {
+            Axiom::SubObjectPropertyOf(chain, sup) if chain.len() > 1 => {
+                chained.extend(chain.iter().chain([sup]).map(|p| p.named()));
+            }
+            Axiom::SubObjectPropertyOf(chain, sup) => {
+                for r in chain {
+                    include(r.named(), sup.named());
+                }
+            }
+            Axiom::EquivalentObjectProperties(ps) => {
+                for pair in ps.windows(2) {
+                    include(pair[0].named(), pair[1].named());
+                    include(pair[1].named(), pair[0].named());
+                }
+            }
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, p) => chained.push(p.named()),
+            Axiom::ObjectPropertyRange(p, _) => ranged.push(p.named()),
+            _ => {}
+        }
+    }
+    if chained.is_empty() || ranged.is_empty() {
+        return true;
+    }
+    let mut related: HashSet<Term> = chained.iter().copied().collect();
+    for edges in [&up, &down] {
+        let mut todo = chained.clone();
+        while let Some(p) = todo.pop() {
+            for &q in edges.get(&p).into_iter().flatten() {
+                if related.insert(q) {
+                    todo.push(q);
+                }
+            }
+        }
+    }
+    !ranged.iter().any(|p| related.contains(p))
+}
+
+/// The EL classifier's vocabulary in a snapshot's dictionary. A term the store doesn't hold
+/// gets an id of its own, once per term, counted down from `u64::MAX`: the top four bits
+/// all set are no `TermKind`'s tag, so no stored term has such an id.
+struct Lookup<'a> {
+    snapshot: &'a Snapshot,
+    missing: HashMap<String, u64>,
+    next: u64,
+}
+
+impl Lookup<'_> {
+    fn id(&mut self, term: TermRef<'_>) -> u64 {
+        if let Some(id) = self.snapshot.lookup(term) {
+            return id.raw();
+        }
+        let next = &mut self.next;
+        *self.missing.entry(term.to_string()).or_insert_with(|| {
+            *next -= 1;
+            *next
+        })
+    }
+
+    /// An id no term has.
+    fn fresh(&mut self) -> u64 {
+        self.next -= 1;
+        self.next
+    }
+}
+
+impl nrese_reasoner::ir::Vocabulary for Lookup<'_> {
+    fn iri(&mut self, iri: &str) -> u64 {
+        self.id(NamedNodeRef::new_unchecked(iri).into())
+    }
+
+    fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
+        self.id(
+            LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype)).into(),
+        )
+    }
+
+    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
+        self.id(LiteralRef::new_language_tagged_literal_unchecked(lexical, language).into())
+    }
+}
+
+/// The EL classifier's answer over a snapshot's term ids, with the consistency it decides.
+#[derive(Debug)]
+pub(crate) struct El {
+    pub classification: Classification,
+    pub consistency: Verdict,
+}
+
+/// The EL classifier's classification of `snapshot`'s asserted statements, where `taxonomy`
+/// (the DL engines') left out an irregular role hierarchy and nothing else, and the EL
+/// classifier is complete for the ontology: no assertion, no range with a chain
+/// ([`el_complete_for`]), nothing it skipped. Its completion rules (CR6) need no regular
+/// hierarchy. `None` everywhere else, or where `started` plus `dl.timeout` has passed
+/// before it would start: the DL engines' answer stands.
+///
+/// Its consistency: with no assertion, `owl:Thing`'s satisfiability, read from a fresh class
+/// that no axiom names (unsatisfiable iff `owl:Thing` is), left out of the answer.
+///
+/// The classifier takes no stop and no budget (docs/architecture/contracts.md): once
+/// started it runs to its end, polynomial in the ontology; the triples it reads are charged.
+pub(crate) fn el_answer(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    taxonomy: &Taxonomy,
+    started: Instant,
+) -> Option<El> {
+    if !irregular_only(taxonomy) {
+        return None;
+    }
+    let options = options(store);
+    let memory = options.tableau.memory.clone().unwrap_or_default();
+    if !el_complete_for(&source::read_snapshot(snapshot, memory.clone()).ok()?) {
+        return None;
+    }
+    if options
+        .timeout
+        .is_some_and(|limit| started.elapsed() >= limit)
+    {
+        return None;
+    }
+    let mut triples = nrese_exec::ChargedVec::new(memory);
+    for q in snapshot.quads_for_pattern_in(ReadModel::Asserted, &source::ANY) {
+        triples
+            .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
+            .ok()?;
+    }
+    let mut vocabulary = Lookup {
+        snapshot,
+        missing: HashMap::new(),
+        next: u64::MAX,
+    };
+    use nrese_reasoner::ir::Vocabulary as _;
+    let probe = vocabulary.fresh();
+    let declaration = [
+        probe,
+        vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        vocabulary.iri("http://www.w3.org/2002/07/owl#Class"),
+    ];
+    triples.push(declaration).ok()?;
+    triples.sort_unstable();
+    let mut kept = 0;
+    for i in 0..triples.len() {
+        if kept == 0 || triples[i] != triples[kept - 1] {
+            triples[kept] = triples[i];
+            kept += 1;
+        }
+    }
+    triples.truncate(kept);
+    let named = |id: u64| id == probe || TermId::from_raw(id).kind() == TermKind::Iri;
+    let mut classification = nrese_reasoner::classify::classify_parallel(
+        &triples,
+        &mut vocabulary,
+        &named,
+        options.workers.width(),
+    );
+    drop(triples);
+    if !classification.skipped.is_empty() {
+        return None;
+    }
+    let consistency = match classification.unsatisfiable.contains(&probe) {
+        true => Verdict::Inconsistent,
+        false => Verdict::Consistent,
+    };
+    classification.unsatisfiable.retain(|&c| c != probe);
+    classification.top.retain(|&c| c != probe);
+    classification
+        .subsumptions
+        .retain(|&(a, b)| a != probe && b != probe);
+    Some(El {
+        classification,
+        consistency,
+    })
 }
 
 #[cfg(test)]

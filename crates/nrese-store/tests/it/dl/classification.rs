@@ -233,3 +233,125 @@ fn pipeline_without_gate() -> nrese_store::MutationPipeline {
         ..nrese_store::DlConfig::default()
     })
 }
+
+/// An EL ontology whose role hierarchy is irregular (`r1 ∘ r2 ⊑ r3` with `r3 ⊑ r1`,
+/// *OWL 2 Structural Specification* §11.2): outside OWL 2 DL and OWL 2 EL, so the DL
+/// engines leave its chain out; the EL classifier's completion rules (CR6) need no
+/// regular hierarchy.
+const IRREGULAR: &str = ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . \
+     :r3 a owl:ObjectProperty . :r3 owl:propertyChainAxiom ( :r1 :r2 ) . \
+     :r3 rdfs:subPropertyOf :r1 . \
+     :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . \
+     :E a owl:Class . :F a owl:Class . :G a owl:Class . \
+     :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] . \
+     :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C ] . \
+     :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :F ] . \
+     [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :C ] rdfs:subClassOf :D . \
+     [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :C ] rdfs:subClassOf :E . \
+     [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :F ] rdfs:subClassOf :G .";
+
+/// The reason the DL engines give for leaving the irregular chain out.
+const LEFT_OUT: &str = "axioms left out: an irregular role hierarchy";
+
+fn irregular(extra: &str) -> nrese_store::ClassificationReport {
+    let dl = pipeline_without_gate();
+    insert(&dl, &format!("{IRREGULAR} {extra}")).expect("ontology");
+    dl.store()
+        .classify(&ReadScope::All)
+        .expect("classification")
+}
+
+/// Where the irregular hierarchy is the only part the DL engines leave out, and the EL
+/// classifier reads the whole ontology, the EL classifier's answer is the report's: complete,
+/// and saying it gave it.
+#[test]
+fn an_irregular_el_ontology_is_answered_completely_by_the_el_classifier() {
+    let report = irregular("");
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert_eq!(report.consistency, nrese_store::dl::Verdict::Consistent);
+    let expected: Vec<(String, String)> = [
+        // A r1 B, B r2 C: the chain gives A r3 C, and ∃r3.C ⊑ D.
+        ("A", "D"),
+        // A r3 C with r3 ⊑ r1 is an r1 edge, and ∃r1.C ⊑ E.
+        ("A", "E"),
+        // That r1 edge chains again with C r2 F: A r3 F, and ∃r3.F ⊑ G (irregularity's step).
+        ("A", "G"),
+    ]
+    .iter()
+    .map(|(sub, sup)| (format!("{EX}{sub}"), format!("{EX}{sup}")))
+    .collect();
+    // B, C and F have no r1 edge: nothing else holds.
+    assert_eq!(report.subsumptions, expected);
+    assert!(
+        report.unsatisfiable.is_empty(),
+        "{:?}",
+        report.unsatisfiable
+    );
+    assert!(report.equivalent_to_thing.is_empty());
+}
+
+/// Without assertions, the ontology has a model iff `owl:Thing` is satisfiable: where the
+/// chain makes it unsatisfiable, the EL classifier's answer is "inconsistent", complete,
+/// listing nothing (the DL engines' Horn part, without the chain, can't find it).
+#[test]
+fn an_irregular_el_ontology_whose_thing_is_unsatisfiable_is_inconsistent() {
+    let dl = pipeline_without_gate();
+    insert(
+        &dl,
+        ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :r3 a owl:ObjectProperty . \
+         :r3 owl:propertyChainAxiom ( :r1 :r2 ) . :r3 rdfs:subPropertyOf :r1 . \
+         :B a owl:Class . :C a owl:Class . \
+         owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] . \
+         :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C ] . \
+         [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :C ] rdfs:subClassOf owl:Nothing .",
+    )
+    .expect("ontology");
+    let report = dl
+        .store()
+        .classify(&ReadScope::All)
+        .expect("classification");
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert_eq!(report.consistency, nrese_store::dl::Verdict::Inconsistent);
+    assert!(report.subsumptions.is_empty() && report.unsatisfiable.is_empty());
+}
+
+/// The answer the DL engines give when they leave the irregular chain out: their lower
+/// bound, marked incomplete for that reason (the EL classifier didn't answer).
+fn assert_lower_bound(report: &nrese_store::ClassificationReport) {
+    assert_eq!(report.engine, "tableau");
+    assert!(!report.complete());
+    assert!(
+        report.incomplete.contains(&format!(
+            "consistency not decided (unsupported): {LEFT_OUT}"
+        )),
+        "{:?}",
+        report.incomplete
+    );
+}
+
+/// A range on a property above a chain's (`r3 ⊑ r4`) needs applying on the edges the
+/// chain composes, which the EL classifier doesn't (the EL++ update's condition): the
+/// answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_with_a_range_above_a_chain_is_not_answered_by_the_el_classifier() {
+    assert_lower_bound(&irregular(
+        ":r4 a owl:ObjectProperty . :X a owl:Class . :r3 rdfs:subPropertyOf :r4 . \
+         :r4 rdfs:range :X .",
+    ));
+}
+
+/// The EL classifier doesn't read assertions: with one, the answer stays the DL engines'
+/// marked lower bound.
+#[test]
+fn an_irregular_ontology_with_an_assertion_is_not_answered_by_the_el_classifier() {
+    assert_lower_bound(&irregular(":a a :A ."));
+}
+
+/// An axiom the EL classifier skips (a single-individual nominal) leaves its answer
+/// incomplete: the answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_with_an_axiom_the_el_classifier_skips_is_not_answered_by_it() {
+    assert_lower_bound(&irregular(":F owl:equivalentClass [ owl:oneOf ( :o ) ] ."));
+}

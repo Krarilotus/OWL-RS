@@ -1,6 +1,7 @@
 //! `GET /dataset/classification` and `GET /dataset/realisation`: the class hierarchy and
 //! the individuals' types of the asserted ontology under OWL 2 DL, computed on request by
-//! the DL engines (kept per revision). JSON by default, with the consistency verdict
+//! the DL engines (kept per revision), or by the EL classifier where an irregular role
+//! hierarchy is all the DL engines leave out (`engine` `el`). JSON by default, with the consistency verdict
 //! (`consistent`: `true`, `false` or `null` where undecided) and whether the result is
 //! complete; N-Triples on request (`rdfs:subClassOf` statements with `owl:Nothing` as the
 //! superclass of unsatisfiable classes; `rdf:type` statements; an inconsistent ontology
