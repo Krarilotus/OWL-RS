@@ -125,10 +125,29 @@ impl Dl {
     /// wouldn't: one read of its asserted ontology, charged to the bounds' budget. A read
     /// refused there leaves it undecided too, and says so.
     pub(crate) fn undecided(&self, snapshot: &nrese_engine::Snapshot) -> Option<WhyUndecided> {
-        match source::read_snapshot(snapshot, std::sync::Arc::clone(self.bounds.kept())) {
-            Ok(o) => nrese_owl::profile::rules_read_differently(&o)
-                .then_some(WhyUndecided::ReadsDifferently),
-            Err(_) => Some(WhyUndecided::Unchecked),
+        why(source::read_snapshot(
+            snapshot,
+            std::sync::Arc::clone(self.bounds.kept()),
+        ))
+    }
+
+    /// [`Self::undecided`] for the data a commit `tx` leaves.
+    pub(crate) fn undecided_after(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+    ) -> Option<WhyUndecided> {
+        why(source::read_pending(
+            tx,
+            std::sync::Arc::clone(self.bounds.kept()),
+        ))
+    }
+}
+
+fn why<E>(read: Result<nrese_owl::Ontology, E>) -> Option<WhyUndecided> {
+    match read {
+        Ok(o) => {
+            nrese_owl::profile::rules_read_differently(&o).then_some(WhyUndecided::ReadsDifferently)
         }
+        Err(_) => Some(WhyUndecided::Unchecked),
     }
 }

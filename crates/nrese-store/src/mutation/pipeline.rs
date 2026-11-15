@@ -317,17 +317,24 @@ impl MutationPipeline {
                     explanation.clone(),
                     attribution.clone(),
                 ));
+                // Under `owl2-dl`, where OWL 2 DL may read the data otherwise, the rules'
+                // clash isn't stated as an inconsistency (`WhyUndecided`).
+                let dl = self.store.dl();
+                let undecided = dl.active().then(|| dl.undecided_after(&tx)).flatten();
                 let full = || {
                     let count = match violations.complete() {
                         true => violations.at_least().to_string(),
                         false => format!("at least {}", violations.at_least()),
                     };
-                    let mut detail = match &explanation {
-                        Some(explanation) => format!(
+                    let mut detail = match (undecided, &explanation) {
+                        (Some(why), _) => {
+                            format!("{}; the write is refused", why.text(violations.at_least()))
+                        }
+                        (None, Some(explanation)) => format!(
                             "mutation violates {count} consistency check(s); first: {}",
                             explanation.summary
                         ),
-                        None => format!("mutation violates {count} consistency check(s)"),
+                        (None, None) => format!("mutation violates {count} consistency check(s)"),
                     };
                     if !violations.complete() {
                         detail.push_str(
