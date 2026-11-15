@@ -94,7 +94,7 @@ captured runs again, without running.
 | One command on the fleet, by capability: a change timed (`abba.py run`, the family from the registry, nothing committed for it) and the release gate (`release_gate.py jobs --plan`, `--submit`), each one set, its data made by the job | done (2 Nov 2026) |
 | the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
 | One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
-| `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on Phuoc-Yu, 12 Oct 2026) and the one `compare` | done |
+| `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on the timed host, 12 Oct 2026) and the one `compare` | done |
 | `fast/compete.py` folds into the suite, the suite running comparators on any case | next |
 | Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
 | The result row's answer and memory-kind fields | next |
