@@ -1210,7 +1210,7 @@ impl StoreService {
                  bounds; certain answers under OWL 2 DL may be missing"
                     .to_owned(),
             );
-            crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
+            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
             return Some(status);
         }
         let ruleset = self
@@ -1230,7 +1230,7 @@ impl StoreService {
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
-        crate::dl::query::certify_closure(&mut status, prepared.query(), "rules");
+        crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules");
         Some(status)
     }
 
@@ -1388,7 +1388,8 @@ impl StoreService {
         // regime, as the rewriting's run sets it for the RL closure, and its composition.
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
-            crate::dl::query::certify_closure(completeness, &query, "ql");
+            let reads = crate::dl::query::Reads::default();
+            crate::dl::query::certify_closure(completeness, (&query, &reads), "ql");
         }
         Ok(printed)
     }
@@ -1573,7 +1574,7 @@ impl StoreService {
                          over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
-                            crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
+                            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
                             Some(status)
                         }
                         false => self.status_outside_dl(prepared, ql),
