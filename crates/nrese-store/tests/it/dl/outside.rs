@@ -25,7 +25,7 @@ use nrese_store::{DlConfig, MutationPipeline, SparqlQueryRequest};
 use serde_json::Value;
 
 use super::queries::Table;
-use super::{pipeline_with, run_dl, update};
+use super::{Status, pipeline_with, run_dl, update};
 
 const F: &str = "http://example.org/fuzz#";
 const INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -122,6 +122,10 @@ struct Case {
     shape: &'static str,
     groups: Vec<Group>,
     queries: Vec<Query>,
+    /// Per group, its commit: 0 or 1; the declarations are in the first.
+    commits: Vec<usize>,
+    /// A group without blank nodes deleted in a third commit.
+    deleted: Option<usize>,
 }
 
 fn n(kind: &str, i: u64) -> String {
@@ -183,12 +187,37 @@ fn generate(seed: u64) -> Case {
         }
     }
     let queries = queries(&mut r);
+    // Drawn after the queries, so a seed keeps the ontology and queries of the runs before.
+    if r.one_in(8) {
+        add("long-chain", long_chain(260), Vec::new());
+    }
+    let commits = (0..groups.len())
+        .map(|g| (g > 0 && r.one_in(2)) as usize)
+        .collect();
+    let blank = |g: &Group| ["_:", "[", "("].iter().any(|b| g.turtle.contains(b));
+    let deletable: Vec<usize> = (1..groups.len()).filter(|&g| !blank(&groups[g])).collect();
+    let deleted = (!deletable.is_empty() && r.one_in(2))
+        .then(|| deletable[r.below(deletable.len() as u64) as usize]);
     Case {
         seed,
         shape,
         groups,
         queries,
+        commits,
+        deleted,
     }
+}
+
+/// `f:p3` as a chain of `n` fresh properties, along a path of blank nodes from `f:a0` to `f:a1`.
+fn long_chain(n: usize) -> String {
+    let chain: Vec<String> = (0..n).map(|i| format!("f:c{i}")).collect();
+    let mut turtle = format!("f:p3 owl:propertyChainAxiom ( {} ) .", chain.join(" "));
+    for (i, c) in chain.iter().enumerate() {
+        turtle += &format!(" {c} a owl:ObjectProperty . _:l{i} {c} _:l{} .", i + 1);
+    }
+    turtle
+        .replace("_:l0 ", "f:a0 ")
+        .replace(&format!("_:l{n} "), "f:a1 ")
 }
 
 /// `texts` with each placeholder of [`TEMPLATES`] replaced, the same way in each.
@@ -350,33 +379,53 @@ struct Answer {
     rows: BTreeSet<Vec<String>>,
 }
 
-type Answers = Result<Vec<Result<Answer, String>>, (bool, String)>;
+/// The answers and the state the reference reads; or a failed commit: whether it was refused,
+/// why, and the state it would have made.
+type Answers = Result<(Vec<Result<Answer, String>>, String), (bool, String, String)>;
 
-/// The store's answers to `texts` over `turtle`; `Err((refused, why))` where the write failed.
-fn store(turtle: &str, texts: &[String]) -> Answers {
+/// The store's answers to `texts` after `commits` (each an update and the state after it).
+fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
     let dl = pipeline_with(DlConfig {
         timeout: Some(Duration::from_secs(5)),
         max_nodes: Some(100_000),
         max_branch_points: Some(100_000),
         ..DlConfig::default()
     });
-    let write = format!("PREFIX f: <{F}> PREFIX rdf: <{RDF}> INSERT DATA {{ {turtle} }}");
-    if let Err(e) = update(&dl, &write) {
-        let why = e.to_string();
-        let refused = why.contains("inconsisten") || why.contains("consistency check");
-        return Err((refused, why));
+    for (write, state) in commits {
+        if let Err(e) = update(&dl, &format!("PREFIX f: <{F}> PREFIX rdf: <{RDF}> {write}")) {
+            let why = e.to_string();
+            let refused = why.contains("inconsisten") || why.contains("consistency check");
+            return Err((refused, why, state.clone()));
+        }
     }
-    Ok(texts.iter().map(|q| answer(&dl, q)).collect())
+    // After a deletion the reference reads what the store holds: a triple the deleted group
+    // shares with another is gone, as it should be. So a deletion left undone is not seen.
+    let mut state = commits.last().map(|(_, s)| s.clone()).unwrap_or_default();
+    if commits.last().is_some_and(|(w, _)| w.starts_with("DELETE")) {
+        let mut held = SparqlQueryRequest::all("CONSTRUCT WHERE { ?s ?p ?o }");
+        held.read_model = Some(nrese_store::ReadModel::Asserted);
+        let (_, out) = run(&dl, held).map_err(|e| (false, e, String::new()))?;
+        state = String::from_utf8_lossy(&out).into_owned();
+    }
+    Ok((texts.iter().map(|q| answer(&dl, q)).collect(), state))
+}
+
+/// Runs `request`: the answers' status and the output.
+fn run(
+    dl: &MutationPipeline,
+    request: SparqlQueryRequest,
+) -> Result<(Option<Status>, Vec<u8>), String> {
+    let s = dl.store();
+    let prepared = s.prepare_query(&request).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let status = run_dl(s, &prepared, &mut out).map_err(|e| e.to_string())?;
+    Ok((status, out))
 }
 
 /// The store's answer to `q`; `none` is the label where no reasoning path can leave
 /// answers out.
 fn answer(dl: &MutationPipeline, q: &str) -> Result<Answer, String> {
-    let s = dl.store();
-    let prepared = s.prepare_query(&SparqlQueryRequest::all(q.to_owned()));
-    let mut out = Vec::new();
-    let status = run_dl(s, &prepared.map_err(|e| e.to_string())?, &mut out);
-    let status = status.map_err(|e| e.to_string())?;
+    let (status, out) = run(dl, SparqlQueryRequest::all(q.to_owned()))?;
     let json: Value = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
     let (label, paths) = status.map_or(("none".into(), String::new()), |s| {
         (s.shared.as_str().to_owned(), s.paths.join("+"))
@@ -473,9 +522,28 @@ impl Case {
             .map(move |i| &self.groups[i])
     }
 
-    fn turtle(&self, skip: &BTreeSet<usize>) -> String {
-        let kept: Vec<&str> = self.kept(skip).map(|g| g.turtle.as_str()).collect();
-        kept.join(" ")
+    /// The commits under `skip`, each an update and the state after it as Turtle: the groups
+    /// of the first commit, those of the second, then the deletion of `deleted`.
+    fn commits(&self, skip: &BTreeSet<usize>) -> Vec<(String, String)> {
+        let turtle = |keep: &dyn Fn(usize) -> bool| {
+            let kept = (0..self.groups.len()).filter(|&g| !skip.contains(&g) && keep(g));
+            kept.map(|g| self.groups[g].turtle.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut out = Vec::new();
+        for c in 0..2 {
+            let write = turtle(&|g| self.commits[g] == c);
+            if !write.is_empty() {
+                let state = turtle(&|g| self.commits[g] <= c);
+                out.push((format!("INSERT DATA {{ {write} }}"), state));
+            }
+        }
+        if let Some(d) = self.deleted.filter(|d| !skip.contains(d)) {
+            let write = format!("DELETE DATA {{ {} }}", self.groups[d].turtle);
+            out.push((write, turtle(&|g| g != d)));
+        }
+        out
     }
 
     /// Query `i`: the case's queries, then the read of the inferred statements; one more
@@ -543,19 +611,18 @@ impl Case {
         reasoner: &str,
     ) -> Vec<(usize, String, String)> {
         let write = self.queries.len() + 1;
-        let turtle = self.turtle(skip);
-        let answers = match got {
-            Err((false, why)) => return vec![(write, "load-error".into(), why.clone())],
-            Err((true, why)) => {
-                let class = match reference.ask(reasoner, &turtle, &BTreeSet::new()) {
-                    Reply::Inconsistent => "agree",
-                    Reply::Answers(_) => "wrong-refusal",
-                    Reply::Undecided(_) => "reference-undecided",
+        let (answers, turtle) = match got {
+            Err((false, why, _)) => return vec![(write, "load-error".into(), why.clone())],
+            Err((true, why, state)) => {
+                let (class, said) = match reference.ask(reasoner, state, &BTreeSet::new()) {
+                    Reply::Inconsistent => ("agree", "inconsistent".to_owned()),
+                    Reply::Answers(_) => ("wrong-refusal", "consistent".to_owned()),
+                    Reply::Undecided(why) => ("reference-undecided", why),
                 };
-                let detail = format!("store: refused ({why}); {reasoner}: {class}");
+                let detail = format!("store: refused ({why}); {reasoner}: {said}");
                 return vec![(write, class.into(), detail)];
             }
-            Ok(answers) => answers,
+            Ok((answers, state)) => (answers, state),
         };
         let names = self.kept(skip).flat_map(|g| g.names.clone());
         let individuals: BTreeSet<String> = names.collect();
@@ -649,7 +716,7 @@ impl Case {
             let before = skip.len();
             for g in 1..self.groups.len() {
                 if skip.insert(g) {
-                    let got = store(&self.turtle(&skip), &texts);
+                    let got = store(&self.commits(&skip), &texts);
                     let v = self.verdicts(&skip, &picked, &got, reference, "hermit");
                     if !v.iter().any(|(j, c, _)| *j == i && c == class) {
                         skip.remove(&g);
@@ -667,10 +734,10 @@ impl Case {
     fn report(&self, out: &Path, i: usize, skip: &BTreeSet<usize>, reference: &mut Reference) {
         let picked = self.picked(i);
         let texts: Vec<String> = picked.iter().map(|&k| self.text(k)).collect();
-        let got = store(&self.turtle(skip), &texts);
+        let got = store(&self.commits(skip), &texts);
         let (seed, shape, name) = (self.seed, self.shape, self.name(i));
         let query = match i > self.queries.len() {
-            true => "the write of these triples, in one commit".into(),
+            true => "the commits of these triples".into(),
             false => self.text(i),
         };
         let mut ttl = format!("# seed {seed}, shape {shape}, {name} (query {i}): {query}\n");
@@ -694,8 +761,11 @@ impl Case {
                 x.replace(&format!("<{iri}"), p)
             })
         };
-        for g in self.kept(skip) {
-            ttl += &format!("# {}\n{}\n", g.tag, short(&g.turtle).replace(" . ", " .\n"));
+        for g in (0..self.groups.len()).filter(|g| !skip.contains(g)) {
+            let gone = [", deleted in the last commit", ""][(self.deleted != Some(g)) as usize];
+            let (tag, turtle) = (self.groups[g].tag, short(&self.groups[g].turtle));
+            let turtle = turtle.replace(" . ", " .\n");
+            ttl += &format!("# {tag}, commit {}{gone}\n{turtle}\n", self.commits[g] + 1);
         }
         std::fs::write(out.join(format!("fail-{seed}-{i}.ttl")), ttl).expect("the case");
     }
@@ -731,7 +801,7 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let case = generate(seed);
                     let (none, picked) = (BTreeSet::new(), case.picked(case.queries.len() + 1));
                     let texts: Vec<String> = picked.iter().map(|&k| case.text(k)).collect();
-                    let got = store(&case.turtle(&none), &texts);
+                    let got = store(&case.commits(&none), &texts);
                     let hermit = case.verdicts(&none, &picked, &got, &mut reference, "hermit");
                     let openllet = match hermit.iter().any(|(_, c, _)| FAILS.contains(&c.as_str()))
                     {
@@ -753,13 +823,20 @@ fn dl_answers_agree_with_outside_reasoners() {
                         writeln!(summary.lock().expect("summary"), "{row}").expect("summary.tsv");
                         if outcome == "FAIL" {
                             failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let mut seen = shrunk.lock().expect("shrunk");
-                            let key = format!("{class} {name}");
-                            let n = *seen.entry(key).and_modify(|n| *n += 1).or_insert(1);
-                            drop(seen);
-                            if n <= 3 {
+                            // Up to 20 shrinks per verdict and query, and the first 3 cases
+                            // per template set left are written: each cause keeps its own.
+                            let count = |key: String| {
+                                let mut seen = shrunk.lock().expect("shrunk");
+                                *seen.entry(key).and_modify(|n| *n += 1).or_insert(1)
+                            };
+                            if count(format!("{class} {name}")) <= 20 {
                                 let skip = case.shrink(*i, class, &mut reference);
-                                case.report(out, *i, &skip, &mut reference);
+                                let left = case.kept(&skip).map(|g| g.tag);
+                                let left = left.filter(|t| !["axiom", "declarations"].contains(t));
+                                let left: Vec<&str> = left.collect();
+                                if count(format!("{class} {name} {}", left.join(","))) <= 3 {
+                                    case.report(out, *i, &skip, &mut reference);
+                                }
                             }
                         }
                     }
