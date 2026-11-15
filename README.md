@@ -53,52 +53,10 @@ is in [features and standards](docs/what-it-covers.md), and where it stops is in
 
 ## How it fits together
 
-```mermaid
-flowchart TB
-  client["<b>Client</b><br/>[software]<br/>your application, the browser<br/>console or an RDF4J tool"]
-
-  subgraph server["NRESE server, one process"]
-    tell["<b>Tell</b><br/>[HTTP: SPARQL Update, Graph Store,<br/>transactions, /dataset/tell]<br/>takes a write"]
-    ask["<b>Ask</b><br/>[HTTP: SPARQL Query]<br/>answers a query"]
-    commit["<b>Commit pipeline</b><br/>[nrese-store]<br/>runs a write through its checks,<br/>commits it as one revision"]
-    query["<b>Query service</b><br/>[nrese-store, nrese-sparql]<br/>evaluates on a snapshot,<br/>gives the answer its status"]
-    reasoner["<b>Reasoner</b><br/>[nrese-reasoner]<br/>rules from RDFS to OWL 2 RL"]
-    dl["<b>OWL 2 DL engines</b><br/>[nrese-dl]<br/>consistency, classification,<br/>proven answers"]
-    shacl["<b>SHACL validator</b><br/>[nrese-shacl]"]
-    storage["<b>Storage engine</b><br/>[nrese-engine]<br/>asserted and inferred statements,<br/>snapshots, write-ahead log"]
-  end
-
-  disk[("<b>Data directory</b><br/>[files]<br/>checkpoints and log")]
-
-  client -- "tells" --> tell
-  client -- "asks" --> ask
-  tell --> commit
-  ask --> query
-  commit -- "derives inferences,<br/>checks consistency" --> reasoner
-  commit -- "under owl2-dl,<br/>checks consistency" --> dl
-  commit -- "validates<br/>(gate on)" --> shacl
-  commit -- "writes asserted and<br/>inferred together" --> storage
-  query -- "under owl2-dl,<br/>proves answers" --> dl
-  query -- "reads a snapshot" --> storage
-  storage -- "logs, checkpoints<br/>(on disk)" --> disk
-
-  classDef person fill:#08427b,stroke:#052e56,color:#ffffff
-  classDef iface fill:#1168bd,stroke:#0b4884,color:#ffffff
-  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000000
-  classDef store fill:#438dd5,stroke:#2e6295,color:#ffffff
-  class client person
-  class tell,ask iface
-  class commit,query,reasoner,dl,shacl,storage component
-  class disk store
-```
-
-The picture follows the [C4 model](https://c4model.com/)'s component view: each box gives its
-name, in brackets its interface or crate, and what it does, and each arrow points from the part
-that calls to the part it calls. A client tells NRESE something by writing, and asks it something
-by querying. A write is refused whole if a check fails, and a query reads a snapshot, so it doesn't
-wait for a write to finish. The steps of a commit, in order, are on
-[what a commit does](docs/what-it-covers.md#what-a-commit-does), and
-[architecture](docs/ARCHITECTURE.md) has the layers, every crate and which you can use on their own.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/overview-dark.svg">
+  <img src="docs/img/overview-light.svg" width="720" alt="Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write goes through one commit, where the reasoner infers and checks consistency, SHACL validates when its gate is on, and under owl2-dl the OWL 2 DL engines check it too; if a check fails, the write is refused with the reason. Storage keeps asserted and inferred statements apart, one revision per commit, logged to the data directory. A query runs on a snapshot, the DL engines prove answers under owl2-dl, and the answer comes back with its status.">
+</picture>
 
 ## Quick start
 

@@ -8,7 +8,7 @@ Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
 
 NRESE is an RDF database with reasoning built in, run as one server that uses every core of its
 machine. What it does is in [features and standards](what-it-covers.md), and the
-[README's picture](../README.md#how-it-fits-together) shows the crates a write and a query pass
+[README's picture](../README.md#how-it-fits-together) shows the parts a write and a query pass
 through. This page is for changing it: who owns what, which way dependencies point, and where a
 problem is fixed.
 
@@ -19,23 +19,10 @@ benchmark kits in [`benches/`](../benches/README.md).
 
 Dependencies point downwards only. A crate may use the public API of a crate below it in this picture (a lower layer, or a lower row of its own layer), but never another crate's internals and never one above. The picture is the order of the manifests' `[dependencies]`, and test-only dev-dependencies aren't shown.
 
-```
-L5  apps/nrese-console            browser UI + CLI (TypeScript), talks HTTP only
-L4  nrese-server                  HTTP transport, auth, policy, posture, UI hosting, AI assistant
-L3  nrese-store                   application service: operations, mutation pipeline, validation gates, backup
-L2  nrese-shacl                   shape validation (through nrese-sparql's read view and value semantics)
-    nrese-sparql  nrese-reasoner  query/update evaluation · materialisation & consistency
-L1  nrese-engine  nrese-dl        term dictionary, quad indexes, MVCC snapshots, transactions, durability
-                                  · the DL engines
-    nrese-vector                  vector indexes
-    nrese-exec  nrese-owl         id tables, joins, grouping, closures, memory budgets
-                                  · the OWL 2 structural model and normaliser
-L0  crates/rdf/:
-    nrese-rdf-io  nrese-sparql-syntax  nrese-sparql-results
-                                  RDF syntaxes, SPARQL syntax and results
-    nrese-rdf                     the RDF model
-    nrese-json  nrese-xsd         JSON, XSD and OWL datatypes
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/layers-dark.svg">
+  <img src="img/layers-light.svg" width="792" alt="Crates by layer, dependencies pointing down. L5: apps/nrese-console. L4: nrese-server. L3: nrese-store. L2: nrese-shacl above nrese-sparql and nrese-reasoner. L1: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.">
+</picture>
 
 Outside the layer model are `nrese-sparql-reference` (the SPARQL evaluator written from the specification, the oracle of the differential tests, used by tests only), `nrese-fuzz` (fuzz targets for every parser of untrusted input) and `benches/` (the benchmark kits).
 
@@ -125,7 +112,7 @@ it from a checkout, and each crate's `lib.rs` opens with what the crate owns.
 | [`nrese-sparql`](../crates/nrese-sparql) | `nrese-engine`, `nrese-exec`, `nrese-owl`, `nrese-rdf`, `nrese-xsd`, `nrese-sparql-syntax`, `nrese-sparql-results` | With `nrese-engine` |
 | [`nrese-reasoner`](../crates/nrese-reasoner) | `nrese-engine`, `nrese-exec`, `nrese-owl`, `nrese-rdf`, `nrese-rdf-io`, `nrese-xsd` | With `nrese-engine` |
 | [`nrese-shacl`](../crates/nrese-shacl) | `nrese-engine`, `nrese-exec`, `nrese-sparql`, `nrese-sparql-syntax`, `nrese-rdf`, `nrese-xsd` | With `nrese-engine` and `nrese-sparql` |
-| [`nrese-store`](../crates/nrese-store) | every crate above | Yes: everything but HTTP |
+| [`nrese-store`](../crates/nrese-store) | every crate above but `nrese-vector` and `nrese-json`, which it reaches through others | Yes: everything but HTTP |
 | [`nrese-server`](../crates/nrese-server) | `nrese-store`, `nrese-sparql`, `nrese-reasoner`, `nrese-exec`, `nrese-rdf`, `nrese-rdf-io`, `nrese-xsd`, `nrese-sparql-results` | The binary |
 | [`apps/nrese-console`](../apps/nrese-console) | the HTTP API only | With a server |
 
