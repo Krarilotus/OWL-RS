@@ -279,6 +279,9 @@ pub struct Program {
     /// contradiction they hold derives no clash. Their answers are all in U1; only
     /// [`Program::proves_consistency`] depends on this.
     pub unchecked: Vec<(usize, &'static str)>,
+    /// Whether the reader left part of the source out (a fatal diagnostic): U1 is of
+    /// what is left, so it proves nothing about the source's consistency.
+    pub left_out: bool,
     /// U1's own terms, for [`Program::is_internal`].
     internal: HashSet<Term>,
     /// [`Program::compared_predicates`], read once the rules are complete.
@@ -372,9 +375,9 @@ impl Program {
     }
 
     /// Whether a clash-free U1 proves the ontology consistent (PAGOdA, Theorem 5.5 (i)):
-    /// U1 covers every axiom and checks every clause's `⊥`.
+    /// U1 covers every axiom and checks every clause's `⊥`, and nothing was left out.
     pub fn proves_consistency(&self) -> bool {
-        self.incomplete.is_empty() && self.unchecked.is_empty()
+        self.incomplete.is_empty() && self.unchecked.is_empty() && !self.left_out
     }
 
     /// The rules of an origin.
