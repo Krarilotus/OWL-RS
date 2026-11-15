@@ -4,10 +4,12 @@ NRESE is an RDF database with OWL reasoning, written in Rust. It reasons as part
 keeps what it inferred apart from what you stored, and says with every SPARQL answer whether
 rows may be missing or wrong.
 
-We started it for our own ontology work. We wanted the store itself to follow the ontology, so
-that a write is checked against it, an inference changes with the data, and an answer says how
-far it can be trusted. It is a hobby project, built part by part from the research literature,
-with the W3C test suites as its floor.
+Most work with data comes down to organising and standardising it, and an ontology is where
+that is written down. We wanted a store that follows the ontology itself, so that a write is
+checked against it, an inference changes with the data, and an answer says how far it can be
+trusted. NRESE is a hobby project, built part by part from the research literature with the W3C
+test suites as its floor, and where a standard could go further for a use case, we want to help
+move it.
 
 ## What it does
 
