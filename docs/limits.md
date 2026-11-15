@@ -1,7 +1,7 @@
 # Limits and deviations
 
 This page lists what NRESE doesn't do, and where it departs from a standard on purpose, in the
-code of the commit it is in. Most items are stated in the page they link to and gathered here,
+version it comes with, not in a plan or another version. Most items are stated in the page they link to and gathered here,
 and an item without a link is stated only here. Each one says what to do instead, or "none known"
 where we know of nothing. It is the detail of the "left out" list in the
 [scope](what-it-covers.md#scope), which also says what is in and what is planned.
@@ -15,9 +15,9 @@ where we know of nothing. It is the detail of the "left out" list in the
   ([replication](ops/replication.md)).
 - You need named graphs as separate reasoning contexts. Rules read every graph, and
   inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)).
-- You need every OWL 2 DL answer proven complete. Some answers are `sound-only` and say
-  so, and if you ask for exact answers, those become an error instead of a guess
-  ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+- You need every OWL 2 DL answer proven complete. Some answers are `sound-only`, which
+  means rows may be missing, and if you ask for exact answers, a request whose answer can't be
+  proven complete fails with an error ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
 - You need SHACL rules (SHACL Advanced Features) or `sh:entailment`. Neither is
   supported ([SHACL limits](ops/http-api.md#shacl-validation)).
 - You need property-graph query languages (openCypher, Gremlin, GQL). Only SPARQL is
