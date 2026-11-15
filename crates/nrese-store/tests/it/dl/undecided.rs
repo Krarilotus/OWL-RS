@@ -32,13 +32,11 @@ fn rules() -> RuleProgram {
         .expect("owl2-dl maintains the OWL 2 RL closure")
 }
 
-/// `data` written past the commit gates and the closure rebuilt, as a load or a start
-/// does: the store's consistency.
+/// `data` loaded past the commit gates and the closure rebuilt, as a load or a start
+/// does, the store keeping the mode `pipeline` runs: the store's consistency.
 fn loaded(pipeline: &MutationPipeline, data: &str) -> ConsistencyStatus {
     let store = pipeline.store();
-    store
-        .execute_update_str(&format!("{PREFIXES}INSERT DATA {{ {data} }}"))
-        .expect("written past the gates");
+    crate::support::load_past_the_pipeline(store, &format!("{PREFIXES}{data}"));
     store.rematerialise(rules()).expect("rebuilt");
     store.consistency()
 }
