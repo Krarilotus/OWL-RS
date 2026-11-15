@@ -728,4 +728,47 @@ mod tests {
         assert!(Arc::ptr_eq(&classes, &taxonomy(&store, &current)));
         assert!(Arc::ptr_eq(&types, &realisation(&store, &current)));
     }
+
+    /// Two requests on one revision while nothing is kept run one computation: the second
+    /// gets the first's result (D16-655: a client asking again after a 408 started a second
+    /// classification beside the first). Counted, not timed: the first computation holds
+    /// until the second request has computed too, or for 2 s, ample for it to be waiting.
+    #[test]
+    fn two_requests_on_one_revision_run_one_computation() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let slot = Slot::<usize>::default();
+        let calls = AtomicUsize::new(0);
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                cached(
+                    &slot,
+                    7,
+                    |_| true,
+                    || {
+                        calls.fetch_add(1, SeqCst);
+                        started.wait();
+                        let until = Instant::now() + Duration::from_secs(2);
+                        while calls.load(SeqCst) < 2 && Instant::now() < until {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        1
+                    },
+                )
+            });
+            started.wait();
+            let second = cached(
+                &slot,
+                7,
+                |_| true,
+                || {
+                    calls.fetch_add(1, SeqCst);
+                    2
+                },
+            );
+            let first = first.join().unwrap();
+            assert_eq!(calls.load(SeqCst), 1, "computations for one revision");
+            assert!(Arc::ptr_eq(&first, &second));
+        });
+    }
 }
