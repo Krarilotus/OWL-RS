@@ -7,6 +7,7 @@
 | How do I run it and send a first query? | the [quick start](../README.md#quick-start), then the [tutorial](tutorial.md); from source: [getting started](dev/getting-started.md); the example's test and last run: [record](dev/first-example-record.md) |
 | What can it do, and with which limits? | [what it covers](what-it-covers.md) |
 | What doesn't it do, and when should I choose another system? | [Limits and deviations](limits.md) |
+| What changed since `main`, and what is slower? | [release notes, 1.5 (prerelease)](releases/v1.5.md) |
 | How do I load my own data? | [your own data](tutorial.md#your-own-data); large files: [bulk loading](ops/server-setup.md#54-bulk-loading) |
 | How do I change a setting, or switch reasoning? | [change a setting](tutorial.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
 | How do I run it as a service? | [server setup](ops/server-setup.md), its [commands](ops/server-setup.md#commands) |

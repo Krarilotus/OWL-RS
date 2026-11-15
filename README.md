@@ -1,9 +1,11 @@
 # NRESE
 
 An [RDF](https://www.w3.org/TR/rdf11-primer/) store with built-in
-[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust. A hobby project, developed in
+[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust.
+It runs as one server binary with a browser console, or as a set of Rust crates. A hobby project, developed in
 the open; not yet for parallel writers, failover or data split across machines
-([limits, and when to choose another system](docs/limits.md)).
+([limits, and when to choose another system](docs/limits.md)). These pages describe the code of the commit they
+are in, package version 0.1.0, which is not a release.
 
 To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
 planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
@@ -20,7 +22,6 @@ inconsistent is rejected, with the reason (under OWL 2 DL a check that can't dec
 (complete, or sound with rows possibly missing, and why) and warns where it can promise
 neither. [SHACL](https://www.w3.org/TR/shacl/) validation, full-text and vector search,
 graph-level access control and the SPARQL, Graph Store and RDF4J protocols are built in.
-It runs as one server binary with a browser console, or as a set of Rust crates.
 
 It may suit you if you:
 
@@ -154,6 +155,7 @@ each kind of problem is fixed; the decisions behind it, with their reasons, are 
 |---|---|
 | Go on from the quick start | [tutorial](docs/tutorial.md) |
 | Know what it does, with each part's limits | [what it covers](docs/what-it-covers.md) |
+| Know what changed since `main`, and what is slower | [release notes, 1.5 (prerelease)](docs/releases/v1.5.md) |
 | Build, run and develop | [getting-started.md](docs/dev/getting-started.md), [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Deploy, load data, back up | [server-setup.md](docs/ops/server-setup.md) |
 | Look up an endpoint or a setting | [http-api.md](docs/ops/http-api.md), [config-reference.md](docs/ops/config-reference.md) |
@@ -164,8 +166,7 @@ each kind of problem is fixed; the decisions behind it, with their reasons, are 
 
 ## State and limits
 
-These pages describe the code of the commit they are in, package version 0.1.0, which is
-not a release. Which commit that is: `git log -1` in your clone, or the commit GitHub shows
+Which commit these pages describe: `git log -1` in your clone, or the commit GitHub shows
 beside the file. A running server names its build at `/version`: `version`, the package version, and with reasoning on `reasoning_semantics`,
 the ruleset with its semantics version and a fingerprint of what it derives
 ([reasoning-semantics.md](docs/spec/reasoning-semantics.md)).
