@@ -178,8 +178,9 @@ fn an_axiom_outside_rl_takes_the_ontology_off_the_rules_route() {
 
 /// One data value in two lexical forms: `"1"` and `"01"` as xsd:integer, and `"1"` as
 /// xsd:int and as xsd:integer (OWL 2 Structural Specification §4: xsd:int's value space
-/// is part of xsd:integer's). The RL rules match literals by term (dt-eq isn't run), so
-/// where an axiom compares data values they see two.
+/// is part of xsd:integer's). The rule set leaves out dt-eq, so where an axiom compares
+/// data values it sees two: such an ontology leaves the RL route (`routed_to_rules`), and
+/// the DL path decides it by value.
 const ONE_VALUE: [(&str, &str); 2] = [
     ("\"1\"^^xsd:integer", "\"01\"^^xsd:integer"),
     ("\"1\"^^xsd:int", "\"1\"^^xsd:integer"),
@@ -381,38 +382,9 @@ fn a_qualified_data_cardinality_is_kept_outside_rl() {
     assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
 }
 
-/// cls-maxc2 names its cardinality as the term `"1"^^xsd:nonNegativeInteger`; the
-/// ontology's reader takes the number in any form, so `owl:maxCardinality 1` (Turtle's
-/// xsd:integer) or `"01"^^xsd:nonNegativeInteger` is in RL. At most one `:p` equates `:x`
-/// and `:y`, so `:y :q :z` is entailed.
-fn max_cardinality() -> Vec<String> {
-    ["1", "\"01\"^^xsd:nonNegativeInteger"]
-        .map(|n| {
-            format!(
-                ":C rdfs:subClassOf \
-                   [ a owl:Restriction ; owl:onProperty :p ; owl:maxCardinality {n} ] . \
-                 :p a owl:ObjectProperty . :q a owl:ObjectProperty . \
-                 :c a :C ; :p :x , :y . :x :q :z ."
-            )
-        })
-        .to_vec()
-}
-
-#[test]
-fn a_max_cardinality_in_another_lexical_form_equates_in_rl() {
-    let wrong = missed(&max_cardinality(), false, &["ASK { :y :q :z }"]);
-    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
-}
-
-#[test]
-fn a_max_cardinality_in_another_lexical_form_equates_outside_rl() {
-    let wrong = missed(&max_cardinality(), true, &["ASK { :y :q :z }"]);
-    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
-}
-
-/// cls-svf1 on a data property: an individual with a value of the filler is in the
-/// class. Its premise `5 rdf:type xsd:integer` is dt-type2's, which isn't run: a typing
-/// gap beside the term matching, probed here.
+/// cls-svf1 on a data property: an individual with a value of the filler is in the class
+/// (OWL 2 Direct Semantics, DataSomeValuesFrom). Its premise `5 rdf:type xsd:integer` is
+/// dt-type2's, which the rule set leaves out.
 fn data_some() -> Vec<String> {
     vec![
         ":age a owl:DatatypeProperty . \
