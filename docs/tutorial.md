@@ -19,8 +19,9 @@ The same query now answers no rows: `{"head":{"vars":["x"]},"results":{"bindings
 
 ## Validate on commit
 
-Now add a [shape](glossary.md#shape-shapes-graph-shacl-gate) to the shapes graph that says every
-animal needs a name. A cat without a name is an animal by inference, so the gate rejects it:
+Now add a [shape](glossary.md#shape-shapes-graph-shacl-gate) that says every animal needs a name,
+in the shapes graph NRESE reads by default, the one [RDF4J](https://rdf4j.org/documentation/programming/shacl/)
+uses. A cat without a name is an animal by inference, so the gate rejects it:
 
 ```bash
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
@@ -48,21 +49,6 @@ answers `ex:felix`. [What a commit does](what-it-covers.md#what-a-commit-does) e
 part of a commit becomes visible and what the checks see. The shape stays in the store, so to run
 the example again, [start over](#change-a-setting-start-over) first.
 
-## This example is a test
-
-You can skip this part. The quick start's first query and the steps above are also a test,
-[first-example.toml](../scripts/verify/scenarios/first-example.toml), which sends each of them and
-checks the answer. To run it you also need [Python](https://www.python.org/downloads/) 3.11 or
-later. Start a fresh server as the [quick start](../README.md#quick-start) says, then run this from
-the repository's root:
-
-```bash
-python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml
-```
-
-[The record](dev/first-example-record.md) says when it last ran, on which commit, and what each
-step sent, expected and got.
-
 ## Your own data
 
 Next, load your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
@@ -80,9 +66,8 @@ curl http://localhost:8080/dataset/query --data-urlencode infer=false \
 
 - The `PUT` answers `204 No Content` and replaces the [default graph](glossary.md#graph) with your file.
 - `infer=false` reads the asserted statements only, so the count is the number of statements in
-  your file (for a file of three, `"value":"3"`). Without it the inferred ones count too, and under
-  `owl2-rl` 32 of them are in every store, even an empty one, because each datatype the profile
-  supports is an `rdfs:Datatype` ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+  your file (for a file of three, `"value":"3"`). Without it the inferred ones count too, 32 of
+  them even in an empty store ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
 - After the restart the count is the same. On Docker's stop signal the server lets the
   requests in flight finish, closes the store and exits
   ([stopping](ops/server-setup.md#stopping)). Every commit is synced to the log
@@ -128,6 +113,21 @@ in the data directory, so it holds after a restart and wins over `NRESE_REASONIN
 
 To start over with no data, run `docker rm -f nrese && docker volume rm nrese-data`, then
 `docker run` as in the [quick start](../README.md#quick-start).
+
+## This example is a test
+
+The quick start's first query, the retraction and the refused write are also a test,
+[first-example.toml](../scripts/verify/scenarios/first-example.toml), which sends each of them and
+checks the answer. To run it you also need [Python](https://www.python.org/downloads/) 3.11 or
+later. Start a fresh server as the [quick start](../README.md#quick-start) says, then run this from
+the repository's root:
+
+```bash
+python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml
+```
+
+[The record](dev/first-example-record.md) says when it last ran, on which commit, and what each
+step sent, expected and got.
 
 ## Next
 
