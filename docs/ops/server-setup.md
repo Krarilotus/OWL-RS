@@ -171,6 +171,15 @@ NRESE_STORE_MODE=on-disk NRESE_DATA_DIR=/var/lib/nrese/data \
   nrese-server load [--replace] [--graph IRI] [--strict | --quarantine] data.nt more.nq ...
 ```
 
+With the quick start's container, stop it and load in a second container on the same volume,
+with your files mounted. The image runs as uid 10001, which must be able to read them:
+
+```bash
+docker stop nrese
+docker run --rm -v nrese-data:/var/lib/nrese/data -v "$PWD":/in:ro nrese load /in/data.nt
+docker start nrese
+```
+
 - Each file's format comes from its extension. Triple formats load into the default graph, or
   into `--graph`, and quad formats keep their graphs. Blank nodes are fresh for each load.
 - `--replace` replaces the dataset instead of adding to it.
