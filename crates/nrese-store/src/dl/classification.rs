@@ -141,6 +141,8 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
 /// take it, the engine's result over no axioms with its consistency unknown, `incomplete`
 /// saying why (never kept: a result kept is complete). Over no axioms the engine would say
 /// consistent, which nothing read decided.
+/// When the engine returns, what the shared workers freed is offered back
+/// ([`nrese_engine::memory::release_idle`]), before the answer is built from the result.
 fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
@@ -162,14 +164,16 @@ fn run<T>(
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
-    match read {
+    let result = match read {
         Ok(ontology) => engine(&ontology, &options),
         Err(_) => {
             let mut none = engine(&nrese_owl::Ontology::default(), &options);
             incomplete(&mut none, source::refused("the revision"));
             none
         }
-    }
+    };
+    nrese_engine::memory::release_idle();
+    result
 }
 
 /// Whether the EL classifier's completion rules are complete for `o`, given that it reads
