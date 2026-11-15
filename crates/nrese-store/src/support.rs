@@ -9,7 +9,7 @@
 //!   ([`nrese_reasoner::graph_sets`]); readers of that revision wait for one
 //!   computation. Once there are sets, the mutation pipeline reports what each commit
 //!   touched, and the next revision's sets are the last ones updated for the facts that
-//!   can follow from those ([`SupportSets::updated`]): a base shared between revisions,
+//!   can follow from those (`SupportSets::updated`): a base shared between revisions,
 //!   with the recomputed facts on top until they are folded in. A write it didn't report
 //!   (a bulk load, a rematerialisation), a change of the schema, or a change reaching too
 //!   many facts computes them afresh.
@@ -24,7 +24,7 @@
 //!   most): every read path (counts, sorted scans, equality, the query cache keyed by
 //!   access) sees the subset alone. Views are kept per revision and access set; the next
 //!   revision's view is the last one's list corrected for the facts the update recomputed.
-//!   [`Reading`] is the one place that decides which data a read sees, of a revision or of
+//!   `Reading` is the one place that decides which data a read sees, of a revision or of
 //!   a transaction's pending state, for every read and every update's `WHERE`.
 //! - **Not computable** (no reasoner v2 rules registered, or the stack over
 //!   representatives of `reasoner.equality = "compact"`): the reader sees no inferred
@@ -33,7 +33,7 @@
 //!   store's support budget (the memory the queries draw on, as the canonical views'),
 //!   and stays charged while it lives: a view's by the view itself, released when its
 //!   last reader lets it go; a part shared between revisions, readers and the cells they
-//!   are computed once in, with its box ([`Shared`]). What computing them reads and builds
+//!   are computed once in, with its box (`Shared`). What computing them reads and builds
 //!   is charged to the reading query's envelope; the evaluation's own working set reports
 //!   its size at its rounds and is charged there as it goes (an exemption until the
 //!   reasoner's working set is charged before it is allocated:

@@ -1,5 +1,5 @@
 //! The dataset of a query (`FROM`, `FROM NAMED`, the protocol's parameters), resolved
-//! against a view ([`ResolvedDataset`]). The default graph of several `FROM` graphs is their
+//! against a view (`ResolvedDataset`). The default graph of several `FROM` graphs is their
 //! merge: a statement two of them hold counts once. Blank nodes keep their identity across
 //! graphs, as in Jena, GraphDB and Oxigraph: a deliberate deviation from the RDF merge of
 //! SPARQL 1.1 §13.2, which keeps them apart (docs/ops/http-api.md, the owner's decision).

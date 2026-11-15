@@ -44,7 +44,7 @@ impl ReadScope {
 
     /// The statements a read in this scope reads at most: the inferred ones too where it sees
     /// them, else the asserted ones only. Queries, statement reads and updates' `WHERE` clauses
-    /// take their model from here ([`crate::support::Reading::of`]).
+    /// take their model from here (`crate::support::Reading::of`).
     pub fn model(&self) -> nrese_engine::ReadModel {
         match self.sees_inferred() {
             true => nrese_engine::ReadModel::Materialised,
@@ -84,7 +84,7 @@ impl ReadScope {
 /// every entry point.
 macro_rules! entry_points {
     ($($(#[doc = $doc:literal])+ $name:ident,)+) => {
-        /// The read and update entry points that return through [`ReadScope::told`], each
+        /// The read and update entry points that return through `ReadScope::told`, each
         /// naming itself there. The test of that boundary (`scope_tests`,
         /// `memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes`) builds its
         /// rows by a match over these, so one without a row doesn't compile.

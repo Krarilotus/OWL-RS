@@ -20,7 +20,7 @@
 //! some `N` has `F` on a neighbour, `P`'s other head atoms are concepts. The resolvents
 //! never outnumber the clauses they replace.
 //!
-//! **Then the polarities** ([`rename`]): a fresh name may stand for its complement (it
+//! **Then the polarities** (`rename`): a fresh name may stand for its complement (it
 //! occurs in no query), and the context core's renaming (`context::horn`, Lewis's
 //! renamable Horn) finds which to flip so that no clause keeps two positive literals.
 //! Here it is applied for the hypertableau too, on the clauses that can become Horn:

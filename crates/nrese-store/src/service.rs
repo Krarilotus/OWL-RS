@@ -540,7 +540,7 @@ impl StoreService {
 
     /// Forgets what the inferred stack is exact for, taking the writer slot to do so: no
     /// rematerialisation certifies it meanwhile. Never call it under the slot (it isn't
-    /// reentrant): a holder calls [`Self::invalidate_held`].
+    /// reentrant): a holder calls `Self::invalidate_held`.
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
         let tx = self.engine.transaction();
         self.invalidate_held(tx.writer().expect("a transaction holds the writer slot"))
@@ -881,7 +881,7 @@ impl StoreService {
         &self.dl
     }
 
-    /// The `owl2-dl` mode's bounds at the latest revision ([`crate::dl::bounds`]): the
+    /// The `owl2-dl` mode's bounds at the latest revision (`crate::dl::bounds`): the
     /// upper bound U1 built afresh if it doesn't describe that revision.
     pub fn dl_bounds(&self) -> crate::dl::BoundsReport {
         crate::dl::bounds::report(self)
@@ -1158,7 +1158,7 @@ impl StoreService {
     /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
     /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
     /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
-    /// rules' closure without the bounds ([`Self::dl_mode`]): sound only, never complete
+    /// rules' closure without the bounds (`Self::dl_mode`): sound only, never complete
     /// (SYN-72 slice 2 r1 F1).
     pub fn status_without_dl(
         &self,
@@ -1221,7 +1221,7 @@ impl StoreService {
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
     /// the executor, each operator with estimated and actual rows, and times. To a reader
-    /// who may not read every graph, only what is its own ([`for_its_reader`]).
+    /// who may not read every graph, only what is its own (`for_its_reader`).
     pub fn explain_query(
         &self,
         prepared: &PreparedQuery,
@@ -1291,7 +1291,7 @@ impl StoreService {
     /// running it (EXPLAIN without ANALYZE), within the query's memory envelope. Planning
     /// stops with [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is
     /// cancelled. To a reader who may not read every graph, only what is its own
-    /// ([`for_its_reader`]).
+    /// (`for_its_reader`).
     pub fn plan_query(
         &self,
         prepared: &PreparedQuery,

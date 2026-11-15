@@ -204,7 +204,7 @@ impl UpdateContext<'_> {
     /// The options of a SPARQL update for `requester` over the `using` dataset: what a
     /// write lowered to SPARQL Update's algebra runs [`nrese_sparql::apply_update`] with,
     /// the requester's graph access included, and what its `WHERE` clauses read: the data as
-    /// its queries read it, model and view ([`crate::support::Reading::of`]), its views
+    /// its queries read it, model and view (`crate::support::Reading::of`), its views
     /// charged to the request's envelope and stopped by its cancellation.
     pub fn update_options(
         &self,

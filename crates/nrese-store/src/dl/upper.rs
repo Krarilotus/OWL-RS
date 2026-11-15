@@ -6,16 +6,16 @@
 //! materialised view (asserted and inferred statements, every graph) plus the program's
 //! own facts, so U1 ⊇ L by construction. Only what it derives beyond that input is kept
 //! here, in [`Stack`]: never in the engine's inferred stack, so never visible as inferred
-//! data. Queries read it through a snapshot of their own ([`super::query`]).
+//! data. Queries read it through a snapshot of their own (`super::query`).
 //!
 //! **Maintained per commit** by the reasoner's delta executor (`nrese_reasoner::delta`),
-//! an ordinary incremental datalog materialisation: [`Upper::maintain`] takes the
+//! an ordinary incremental datalog materialisation: [`Upper::change`] (applied by [`Upper::apply`]) takes the
 //! commit's changes to the materialised view (asserted and inferred) as the change of
 //! U1's input. A commit that changes the ontology's schema (anything but assertions over
 //! the signature U1 was compiled for) recompiles U1 and evaluates it afresh
-//! ([`is_assertion`]): its rules are the TBox's.
+//! ([`Upper::is_assertion`]): its rules are the TBox's.
 //!
-//! **Data values by value** ([`Values`]): U1 reads every literal as its value's
+//! **Data values by value** (`Values`): U1 reads every literal as its value's
 //! representative, so keys, `hasValue` and joins over data values match equal values
 //! written differently, as OWL 2 DL's identity of data values has it.
 //!
@@ -79,7 +79,7 @@ impl Stack {
         }
     }
 
-    /// [`Self::insert`], charging what the fact takes first; nothing is inserted where the
+    /// `Self::insert`, charging what the fact takes first; nothing is inserted where the
     /// budget can't take it.
     pub fn try_insert(&mut self, t: Triple) -> Result<bool, nrese_exec::BudgetExceeded> {
         if self.spo.contains(&t) {
@@ -97,7 +97,7 @@ impl Stack {
         Ok(self.insert(t))
     }
 
-    /// [`Self::remove`], releasing the fact's share of the trees once they have freed it.
+    /// `Self::remove`, releasing the fact's share of the trees once they have freed it.
     pub fn remove_charged(&mut self, t: Triple) -> bool {
         let removed = self.remove(t);
         if removed && let Some(held) = &mut self.held {
@@ -1081,7 +1081,7 @@ impl Upper {
         self.same_as
     }
 
-    /// How many literals U1 reads by value ([`Values`]).
+    /// How many literals U1 reads by value (`Values`).
     pub fn literals_by_value(&self) -> usize {
         self.values.seen.len()
     }

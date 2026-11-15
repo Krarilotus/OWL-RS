@@ -126,8 +126,8 @@ fn deprecated(
 
 /// Every route. The public ones (health, version, the console's files, the API
 /// description, logging in and out, RDF4J's protocol version) answer anyone; every other
-/// request is authenticated first ([`super::authentication`]), before its handler and its
-/// body are read, and its handler checks its action ([`super::guard`]).
+/// request is authenticated first (`super::authentication`), before its handler and its
+/// body are read, and its handler checks its action (`super::guard`).
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/", get(handlers::root_redirect))

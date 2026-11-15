@@ -57,7 +57,7 @@ pub struct StoreConfig {
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
     /// The memory the process may hold before a long operation (a materialisation, the
-    /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
+    /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`]
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
     /// process may use ([`ProcessMemory::Default`]); a limit set by hand is never more than
     /// that capacity. The capacity is read once per process, at the limit's first need,

@@ -16,7 +16,7 @@
 //! commit (L3 mutation pipeline), endpoints and formats (L4).
 //!
 //! Supported: SHACL Core and SHACL-SPARQL (`sh:sparql` constraints and SPARQL-based
-//! constraint components, with pre-binding by substitution: [`sparql`]).
+//! constraint components, with pre-binding by substitution: `sparql`).
 
 mod compile;
 mod datatype;
