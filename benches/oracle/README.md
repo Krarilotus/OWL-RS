@@ -22,8 +22,8 @@ The oracle workflow (`.github/workflows/oracle.yml`, run at milestones with `gh 
 
 ## How Jena is run
 
-- **Without ARQ's optimiser.** An oracle should give the standard's algebra, not an optimiser's rewrites of it.
-- **On a graph that matches terms** (`GraphMemFactory.createDefaultGraphSameTerm`), not values.
+- It runs without ARQ's optimiser. An oracle should give the standard's algebra, not an optimiser's rewrites of it.
+- It runs on a graph that matches terms (`GraphMemFactory.createDefaultGraphSameTerm`), not values.
 
 ## What the differences are
 
@@ -44,9 +44,9 @@ The last run (2 October 2026): 9,390 queries, 9,077 agree, 313 differ for a know
 | `date-timezones` | 3 | `=` and `!=` between a date or dateTime with a timezone and one without: NRESE's answer has every row of the reference's, and its extra rows all compare the two kinds |
 | `jena-exists-literal-predicate` | 1 | `FILTER NOT EXISTS { ?d ?c <o> . ?d <p> "x" }` with a variable predicate (`?c`) bound to a literal: NRESE's answer has every row of the reference's, and more |
 
-**Found and fixed (2 October):** an integer-derived literal outside its datatype's range (`"300"^^xsd:byte`) is ill-typed, but NRESE's executor and its reference evaluator took it for the number 300, so `?b * 1.5`, `?b + 1`, `SUM`, `MIN`, `MAX` and comparisons computed with it where the standard (and Jena) have an error. The value ranges of the thirteen derived types are checked now.
+Found and fixed on 2 October: an integer-derived literal outside its datatype's range (`"300"^^xsd:byte`) is ill-typed, but NRESE's executor and its reference evaluator took it for the number 300, so `?b * 1.5`, `?b + 1`, `SUM`, `MIN`, `MAX` and comparisons computed with it where the standard (and Jena) have an error. The value ranges of the thirteen derived types are checked now.
 
-**Found and fixed (30 September):** decimal multiplication and division with a zero operand (`0 * 1.5`, `0 / 1.5`) were errors in NRESE's executor and its reference evaluator, so `BIND(?x * 1.5 AS ?k)` left `?k` unbound and joined it with everything. Fixed then; the current workspace computes them in `crates/rdf/nrese-xsd`.
+Found and fixed on 30 September: decimal multiplication and division with a zero operand (`0 * 1.5`, `0 / 1.5`) were errors in NRESE's executor and its reference evaluator, so `BIND(?x * 1.5 AS ?k)` left `?k` unbound and joined it with everything. Fixed then; the current workspace computes them in `crates/rdf/nrese-xsd`.
 
 The three NRESE deviations are on the completion plan (4.3, 4.6). Once one is fixed, its rule goes, and with the lexical forms fixed, the canonical copy goes too. A rule that explains a difference only says the difference is one of a known kind; `compare.py` applies the narrowest test it can (the rows of one engine contained in the other's, the columns of MIN and MAX masked). The report lists every explained query, for review.
 

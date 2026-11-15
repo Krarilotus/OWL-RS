@@ -34,11 +34,11 @@ Where this directory sits among the kits, and the life of a run from plan to rec
 
 For every workload tier and every system that can run it, `--runs` times (default 3), each from a fresh store, the repetitions interleaved across the systems (every system's first run, then every system's second, in a rotated order):
 
-1. **load**, and reasoning where the system reasons at load (NRESE, Nemo, owlrl, licensed stores); wall time and peak memory
-2. **size** of the store on disk; **restart**: the server on the loaded store, until it answers
-3. **count** of every statement it answers with; lazy reasoners (Jena's rule reasoners) do their work here
-4. **queries** through the harness's `query-mix`: one warm-up, then `--query-runs` measured runs each (default 3); answer counts checked against the expected ones where the workload has them, and cross-checked between systems within one regime at the end. Each query's first execution on the fresh server is reported apart (`repeat` 0)
-5. **serve**: the server's peak memory over the run
+1. load, and reasoning where the system reasons at load (NRESE, Nemo, owlrl, licensed stores); wall time and peak memory
+2. size of the store on disk; restart: the server on the loaded store, until it answers
+3. count of every statement it answers with; lazy reasoners (Jena's rule reasoners) do their work here
+4. queries through the harness's `query-mix`: one warm-up, then `--query-runs` measured runs each (default 3); answer counts checked against the expected ones where the workload has them, and cross-checked between systems within one regime at the end. Each query's first execution on the fresh server is reported apart (`repeat` 0)
+5. serve: the server's peak memory over the run
 
 Then its containers, store and scratch are removed. The run's `manifest.json` records what it was measured with (`suitekit/manifest.py`). At the end of the run, what the run made is removed too: the datasets it prepared, the NRESE build volume, images it pulled or built. `--keep` (or `NRESE_BENCH_KEEP=1`) keeps them for the next run of a batch; installed tools (`install-tools.sh`) always stay. A dry run prints every command and writes nothing that stays.
 
@@ -60,15 +60,15 @@ preparation). The interval includes preparation, measurement and shutdown; the r
 reserves four stop allowances, and worker scopes bind to the outer scope without renewing
 its deadline.
 
-**Caches and order: every system's strengths count.** No system's advantage is switched off to level the field. Systems with a result cache (QLever, NRESE) run the queries twice: with the cache off (repeated runs measure evaluation), then, after a restart that empties it, with the system's default cache (repeated runs measure what a user sending the same query again sees). Both lines are reported (`--cache off,on`, the default; `off` or `on` alone). Queries run in rounds over the whole mix, each round shuffled (`--order shuffled`, the default; `--order fixed` runs each query's runs back to back). Repetition r uses seed `seed·1000 + r` (`--seed`, default 1), the same orders for every system, recorded in the `order` column. The first execution of each query is reported apart: on a fresh server, the cold case.
+With caches and order, every system's strengths count. No system's advantage is switched off to level the field. Systems with a result cache (QLever, NRESE) run the queries twice: with the cache off (repeated runs measure evaluation), then, after a restart that empties it, with the system's default cache (repeated runs measure what a user sending the same query again sees). Both lines are reported (`--cache off,on`, the default; `off` or `on` alone). Queries run in rounds over the whole mix, each round shuffled (`--order shuffled`, the default; `--order fixed` runs each query's runs back to back). Repetition r uses seed `seed·1000 + r` (`--seed`, default 1), the same orders for every system, recorded in the `order` column. The first execution of each query is reported apart: on a fresh server, the cold case.
 
-**Regimes.** A reasoning workload names the regimes it accepts, in order of preference (LUBM: OWL 2 RL, else OWL-Horst); each system runs the first it has. Results are compared within one regime only.
+A reasoning workload names the regimes it accepts, in order of preference (LUBM: OWL 2 RL, else OWL-Horst); each system runs the first it has. Results are compared within one regime only.
 
-**NRESE on Oxigraph** (`nrese-oxigraph`) is the same server built from the branch `baseline/pre-oxigraph-migration`, the last commit before the migration to the own RDF libraries. The suite builds it from a checkout beside the repository (`git worktree add ../OWL-RS-baseline baseline/pre-oxigraph-migration`, or `NRESE_OXIGRAPH_SRC`) into its own build volume. Next to `nrese` it shows what the migration changed.
+NRESE on Oxigraph (`nrese-oxigraph`) is the same server built from the branch `baseline/pre-oxigraph-migration`, the last commit before the migration to the own RDF libraries. The suite builds it from a checkout beside the repository (`git worktree add ../OWL-RS-baseline baseline/pre-oxigraph-migration`, or `NRESE_OXIGRAPH_SRC`) into its own build volume. Next to `nrese` it shows what the migration changed.
 
-**Systems without SPARQL** (Nemo, the owlrl reference closure) have their closure answered by Oxigraph: their answer counts check the others, their query times aren't theirs and are left empty.
+Systems without SPARQL (Nemo, the owlrl reference closure) have their closure answered by Oxigraph: their answer counts check the others, their query times aren't theirs and are left empty.
 
-**Licensed systems** run only with their licence files in the licences directory (`~/nrese-bench/licenses`, outside the repository; `NRESE_LICENSES` elsewhere), or one by one through each adapter's licence variable. Their rows carry `publish = permission`; `suite.py report` leaves them out unless `--include-restricted`, and they may not leave the machine without the vendor's written consent ([../competitors/README.md](../competitors/README.md)). An adapter that hasn't run with a licence yet has its commands confirmed by its first licensed run.
+Licensed systems run only with their licence files in the licences directory (`~/nrese-bench/licenses`, outside the repository; `NRESE_LICENSES` elsewhere), or one by one through each adapter's licence variable. Their rows carry `publish = permission`; `suite.py report` leaves them out unless `--include-restricted`, and they may not leave the machine without the vendor's written consent ([../competitors/README.md](../competitors/README.md)). An adapter that hasn't run with a licence yet has its commands confirmed by its first licensed run.
 
 ## The result schema
 
@@ -99,4 +99,4 @@ next to this directory keep their own drivers for what they do beyond the suite
 ([../README.md](../README.md), "Kits"), and they write their run records by hand
 ([../runs/README.md](../runs/README.md)).
 
-**The order of work** (owner decision, 30 September 2026): NRESE implements and tunes every capability first; the comparison runs come after.
+The order of work (owner decision, 30 September 2026) is this: NRESE implements and tunes every capability first; the comparison runs come after.

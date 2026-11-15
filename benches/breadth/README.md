@@ -31,27 +31,27 @@ the backlog.
 
 ## How a benchmark is run
 
-1. **Prepare** (`prepare.sh`): the sources as their authors publish them, checked against the
+1. Prepare (`prepare.sh`): the sources as their authors publish them, checked against the
    publisher's checksum, into `$NRESE_BREADTH/data/<benchmark>` (default `~/nrese-breadth`);
    each file's SHA-256 is frozen in [datasets.toml](../datasets.toml). Heavy preparation runs
    inside `scripts/quiet-slot.sh`, so no measurement shares the disk with it.
-2. **Images**: each contender as its benchmark builds it, at the pinned commit; NRESE from
+2. Images: each contender as its benchmark builds it, at the pinned commit; NRESE from
    this worktree in the pinned Rust image ([kit.py](kit.py), binaries recorded by SHA-256).
    Builds wait for the quiet slot (at most as long as `cargo-guarded.sh` does).
-3. **Qualify** (`jobs/*-qualify.toml`, any window): every answer checked against the
+3. Qualify (`jobs/*-qualify.toml`, any window): every answer checked against the
    reference before a time counts.
-4. **Measure** (`jobs/*-timed.toml`, the quiet window): three interleaved repetitions, every
+4. Measure (`jobs/*-timed.toml`, the quiet window): three interleaved repetitions, every
    system on one host under one memory cap, then `suite.py report` and `compare` and a run
    record in [runs/](../runs/).
 
-> **Superseded (2 Nov 2026):** these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
+> Superseded on 2 Nov 2026: these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
 
 Licensed systems run on our machines only; their rows carry
 `publish = permission` and their numbers are never committed ([competitors/README.md](../competitors/README.md)).
 
 ## Findings so far
 
-- **Vector search, filtered recall (defect, fixed 12 October):** `vector-knn-filtered`'s
+- Vector search, filtered recall (defect, fixed 12 October): `vector-knn-filtered`'s
   0.40–0.60 came from `vector_join`'s probe-first route asking the index for unfiltered
   neighbours with a beam not widened for the filter (`accepted: None`); the candidate route
   widened it by 1/share. 200,000 uniform 64-d vectors, one kind in ten: 0.50 → 0.98
@@ -60,21 +60,21 @@ Licensed systems run on our machines only; their rows carry
   costs about what the exact scan does (runs/2026-10-12-vector-recall-phuoc.toml: beam 1024
   11.1 ms against 10.7 ms for the five queries): the graph's own recall at the default beam
   (0.44–0.48 unfiltered) is the next cause, for the index's owner.
-- **Vector search, no index status:** the server doesn't say when a vector graph is built
+- Vector search, no index status: the server doesn't say when a vector graph is built
   (only its log does), where Qdrant reports a collection status; the HNSW parameters
   (M 16, ef_construction 200) can't be set.
-- **Federation:** NRESE answers `SERVICE` queries, but has no source selection: FedShop's
+- Federation: NRESE answers `SERVICE` queries, but has no source selection: FedShop's
   federation engines answer the unannotated queries; NRESE can run only the reference
   source assignments.
-- **LUBMft:** the generator (UBAft), tester and query template are gone (the L3S page answers
+- LUBMft: the generator (UBAft), tester and query template are gone (the L3S page answers
   404 since April 2024; the Internet Archive kept only the page and the paper).
-- **Docs:** `docs/ops/http-api.md` says SHACL validation is "SHACL Core only", while
+- Docs: `docs/ops/http-api.md` says SHACL validation is "SHACL Core only", while
   `systems.toml` and the fast suite's `shacl-lubm` case run SHACL-SPARQL.
 
 ## Decisions (the owner, 12 October 2026)
 
-- **LUBMft** stays in the backlog with its note: the generator and the query template are lost.
-- **The interface changes** (the tasks `validate` and `index`, `Plan.inputs_for` and
+- LUBMft stays in the backlog with its note: the generator and the query template are lost.
+- The interface changes (the tasks `validate` and `index`, `Plan.inputs_for` and
   `Plan.services`, the capabilities `rdf12` and `vector`, a recall field for approximate
   search) are the framework thread's to integrate into `v2/bench`; this kit follows what it
   changes.

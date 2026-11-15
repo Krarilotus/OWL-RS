@@ -2,9 +2,9 @@
 
 A real-world reasoning workload for the benchmark suite: the data integration of the HisQu project, which links persons of the Repertorium Germanicum (RG, vol. 5), the Germania Sacra person database (GS) and the GND authority files by `owl:sameAs`, aligns the three vocabularies on the GND ontology, and answers ten competency questions over the result.
 
-- **Source:** <https://github.com/HisQu/rgonline-gs-data-integration> (D. Motz, P. Stahl), read at commit `0efe44f` (17 April 2026).
-- **Why it is here:** it is what reasoning stores are used for, and it is hard in a way the synthetic benchmarks are not. Every identity link replicates the statements of the linked resources, so the closure and the query results grow with the size of the identity groups. The project ran it on Fuseki with Jena's OWL rule reasoner over an in-memory model, and only with a large heap.
-- **Not vendored.** The repository has no licence, and the RG source data is not public. Nothing of it is copied here: the scripts take a checkout (`RGGS_REPO`) and read queries and data from it. Publishing results that name the project needs its authors' agreement.
+- The source is <https://github.com/HisQu/rgonline-gs-data-integration> (D. Motz, P. Stahl), read at commit `0efe44f` (17 April 2026).
+- It is here because it is what reasoning stores are used for, and it is hard in a way the synthetic benchmarks are not. Every identity link replicates the statements of the linked resources, so the closure and the query results grow with the size of the identity groups. The project ran it on Fuseki with Jena's OWL rule reasoner over an in-memory model, and only with a large heap.
+- It is not vendored. The repository has no licence, and the RG source data is not public. Nothing of it is copied here: the scripts take a checkout (`RGGS_REPO`) and read queries and data from it. Publishing results that name the project needs its authors' agreement.
 
 The task definitions (RT1 materialisation, RT3 queries under entailment) and the fairness rules are those of the [reasoning benchmark](../../docs/design/reasoning-benchmark.md) (§7 there describes this workload and what was found on it).
 
@@ -71,7 +71,7 @@ The competency questions are written for the second regime: they follow `(owl:sa
 
 ## Known about the queries
 
-- **CQ01** is an empty file (prefixes and comments). Every system answers it with a syntax error.
-- **CQ05** joins a person's dates, places, affiliations and co-mentioned persons as independent OPTIONALs. Under full equality that is a product of about 10¹⁰ rows on the example tier (477 × 318 × 417 × 5 × 31). NRESE stops it at the query memory budget, and Fuseki didn't answer it in 120 s; see the reasoning benchmark design, §7.
-- **An abandoned query keeps running in Fuseki.** The project's configuration sets no query timeout, so after the client gives up on a question, the questions after it share the machine with it.
-- **CQ10** uses a `SELECT` alias in `HAVING`, which the standard doesn't define. NRESE reads it as Jena does.
+- CQ01 is an empty file (prefixes and comments). Every system answers it with a syntax error.
+- CQ05 joins a person's dates, places, affiliations and co-mentioned persons as independent OPTIONALs. Under full equality that is a product of about 10¹⁰ rows on the example tier (477 × 318 × 417 × 5 × 31). NRESE stops it at the query memory budget, and Fuseki didn't answer it in 120 s; see the reasoning benchmark design, §7.
+- An abandoned query keeps running in Fuseki. The project's configuration sets no query timeout, so after the client gives up on a question, the questions after it share the machine with it.
+- CQ10 uses a `SELECT` alias in `HAVING`, which the standard doesn't define. NRESE reads it as Jena does.

@@ -44,11 +44,11 @@ rm -rf ../../../tmp/dlw3c
 - **W3C, direct semantics, species DL** (411 tasks of 311 tests; 20 s per task, and a
   rerun at 120 s of the tasks the 2009 results list as passes that ran out of time;
   the per-task results are kept locally in `results/`, which is git-ignored).
-  - **HermiT** was run on every task; its result on each is in the results file.
-  - **Openllet** was run on every task; its result on each is in the results file.
-  - **Konclude 0.7.0-1138** was run on every task; its result on each is in the results
+  - HermiT was run on every task; its result on each is in the results file.
+  - Openllet was run on every task; its result on each is in the results file.
+  - Konclude 0.7.0-1138 was run on every task; its result on each is in the results
     file.
-  - **ELK:** 93 pass of the 114 EL-profile tasks; the rest use constructs outside the
+  - ELK: 93 pass of the 114 EL-profile tasks; the rest use constructs outside the
     fragment it supports (keys, `Self`, negative assertions, datatypes).
   - Results that differ from a test's type are settled by hand as under Adjudication
     below.
@@ -86,17 +86,17 @@ on any JDK 21+ (`DL_RUNNER_JAR`, `DL_RUNNER_CLASSES`). Each case is answered wit
 | scope `3,3` (the gate's) | 35,505 | 35,454 | 3 | 48 | 0 |
 | covering array of triples (`cover:3`, 3 to 6 axioms of up to size 4; every one of the 47,905 triples of the 67 features) | 3,354 | 3,312 | 3 | 38 | 0; 1 NRESE gave up at the campaign's 20 s |
 
-**Every case with differing answers is settled by hand from the semantics with a minimised
-witness (Adjudication below); the gate's 51 are in `scope-adjudicated.tsv`, one line each.**
+Every case with differing answers is settled by hand from the semantics with a minimised
+witness (Adjudication below); the gate's 51 are in `scope-adjudicated.tsv`, one line each.
 
-**What the campaign found in NRESE** (each fixed with a guard, 12 October): operands of a
+The campaign found these in NRESE (each fixed with a guard, 12 October): operands of a
 disjointness the U rewriting made equal were dropped (cases 623, 677, 732, 786: answered
 consistent, inconsistent); keys over a transitive property read asserted edges only
 (found by the review the campaign prompted); the context core took keys to need role
 assertions, and the classifier called an ontology with a key over U alone consistent (1219488); realisation took an individual no
 assertion mentions for a fresh element, past a key (1267640).
 
-**References run** (scope `4,4,4`): HermiT and Openllet, each with the campaign's time
+The references run (scope `4,4,4`) are HermiT and Openllet, each with the campaign's time
 limit; the cases neither answered are the table's last column.
 
 ## Inputs outside OWL 2 DL (13 October 2026, queue jobs)
@@ -115,7 +115,9 @@ ontologies with random DL-safe rules over the small-scope names, NRESE's answers
 | `beyond/probes.py` | minimal probes of how a reasoner reads SWRL's corner cases (empty heads, `x ≠ x`, declared individuals, equality-only variables, inverse property atoms) |
 | `beyond/abba-run.sh` | one run of the A-B-B-A over the DL and QL cases (a queue chunk) |
 
-**The ORE 2015 corpus** (1,920 ontologies; `dl_beyond --survey`): 22 have reader
+### The ORE 2015 corpus
+
+Of its 1,920 ontologies (`dl_beyond --survey`), 22 have reader
 diagnostics, every one a DL-safe rule (SWRL); the engines leave nothing else out of any
 ontology but datatype definitions in one (which they decide). Of the 22:
 
@@ -138,8 +140,10 @@ So of the 22: consistency decided for 21 (12 consistent, 9 inconsistent), classi
 exact for 20. Jobs `dl-beyond-runs-1` to `-3` (release binaries of
 `v15/dl-beyond`).
 
-**The rule campaigns** (`rules_campaign`, 1,000 cases each, 20 s per decision; HermiT and
-Openllet by `nrese.dl.Scope`):
+### The rule campaigns
+
+The campaigns ran `rules_campaign`, 1,000 cases each, 20 s per decision, with HermiT and
+Openllet by `nrese.dl.Scope`:
 
 | Campaign | NRESE decided | agree with every answering reference | disagreements | none answered |
 |---|---|---|---|---|
