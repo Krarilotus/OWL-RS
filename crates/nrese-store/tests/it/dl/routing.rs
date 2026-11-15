@@ -349,6 +349,38 @@ fn disjoint_data_properties_share_no_value_in_two_lexical_forms_outside_rl() {
     assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
 }
 
+/// A maximum qualified data cardinality (OWL 2 Direct Semantics, DataMaxCardinality with a
+/// data range, `owl:onDataRange`): at most 0, or at most 1, integers of `:age`, and `:c`
+/// has two. The rule set reads `owl:onClass` (cls-maxqc1-4), not `owl:onDataRange`, and
+/// checking the range would type the values (dt-type2, which it leaves out).
+fn qualified_data_cardinality() -> Vec<String> {
+    [
+        "\"0\"^^xsd:nonNegativeInteger",
+        "\"1\"^^xsd:nonNegativeInteger",
+    ]
+    .map(|n| {
+        format!(
+            ":age a owl:DatatypeProperty . \
+                 :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :age ; \
+                   owl:maxQualifiedCardinality {n} ; owl:onDataRange xsd:integer ] . \
+                 :c a :C ; :age 5 , 6 ."
+        )
+    })
+    .to_vec()
+}
+
+#[test]
+fn a_qualified_data_cardinality_is_kept_in_rl() {
+    let wrong = accepted(&qualified_data_cardinality(), false);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+#[test]
+fn a_qualified_data_cardinality_is_kept_outside_rl() {
+    let wrong = accepted(&qualified_data_cardinality(), true);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
 /// cls-maxc2 names its cardinality as the term `"1"^^xsd:nonNegativeInteger`; the
 /// ontology's reader takes the number in any form, so `owl:maxCardinality 1` (Turtle's
 /// xsd:integer) or `"01"^^xsd:nonNegativeInteger` is in RL. At most one `:p` equates `:x`
