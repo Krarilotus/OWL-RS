@@ -95,7 +95,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nrese-fuzz"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-json"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "thiserror",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash",
  "rand",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf-io"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash",
  "memchr",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-results"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "nrese-json",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-syntax"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-rdf",
  "smallvec",

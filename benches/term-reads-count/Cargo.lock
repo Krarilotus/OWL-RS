@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-engine"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "aho-corasick",
  "crc32fast",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-exec"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "nrese-xsd",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-vector"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-exec",
  "parking_lot",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-xsd"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "iri-string",
  "regex-syntax",
