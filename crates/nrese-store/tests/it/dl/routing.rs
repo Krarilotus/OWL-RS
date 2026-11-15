@@ -520,8 +520,8 @@ fn an_equality_of_punned_property_names_does_not_equate_their_properties() {
 /// An annotation property's domain, range and subproperties have no meaning for the
 /// annotations under the OWL 2 Direct Semantics (annotations carry none), and theorem
 /// PR1 of the OWL 2 Profiles excludes such axioms. So `:x a :C`, `:v a :C` and `:x :sup
-/// "v"` aren't entailed: an answer `true` may only come labelled `unsound`. Checked on
-/// the RL route and off it (a union superclass).
+/// "v"` aren't entailed: an answer `true` may only come labelled `unsound`, and the plan
+/// says so too. Checked on the RL route and off it (a union superclass).
 #[test]
 fn annotation_property_axioms_entail_nothing_about_annotated_terms() {
     let mut wrong = Vec::new();
@@ -532,12 +532,24 @@ fn annotation_property_axioms_entail_nothing_about_annotated_terms() {
         let route = dl.store().dl_bounds().last;
         for read in ANNOTATION_READS {
             let (rows, status) = query(&dl, read);
+            let store = dl.store();
+            let request =
+                nrese_store::SparqlQueryRequest::all(format!("{}{read}", super::PREFIXES));
+            let planned = store
+                .plan_query(
+                    &store.prepare_query(&request).expect("prepared"),
+                    &nrese_store::CancellationToken::new(),
+                )
+                .expect("planned")
+                .completeness
+                .expect("a status");
             let line = format!(
-                "route {route}: {read} answers {rows:?}, status {}",
-                status.shared.as_str()
+                "route {route}: {read} answers {rows:?}, status {} / plan {}",
+                status.shared.as_str(),
+                planned.as_str()
             );
             eprintln!("{line}");
-            if rows == ["true"] && status.shared.as_str() != "unsound" {
+            if rows == ["true"] && (status.shared.as_str() != "unsound" || planned.sound) {
                 wrong.push(line);
             }
         }

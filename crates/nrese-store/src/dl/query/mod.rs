@@ -259,7 +259,70 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
     let analysis = analyse(prepared.query());
     let mut completeness = plan_status_built(store, prepared, &analysis).completeness;
     certify(&mut completeness, prepared.query(), "dl", true);
+    mark(store, &mut completeness);
     completeness
+}
+
+/// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
+/// ([`reads_differently`]): composed last by both DL entry points.
+fn mark(store: &StoreService, completeness: &mut Completeness) {
+    let (snapshot, view) = super::bounds::view(store);
+    if let Some(reason) = reads_differently(store, &snapshot, &view) {
+        completeness.unsound("dl", reason);
+    }
+}
+
+/// Why L may hold what OWL 2 DL doesn't entail, where it may: theorem PR1 of OWL 2
+/// Profiles, by which L's statements are entailed, needs no annotation-property axioms
+/// (OWL 2 DL gives them no meaning for the terms annotated; the rules use them) and no
+/// punning, of which only an equality reaching a class or property name reads otherwise
+/// (OWL 2 DL equates the individuals only; the rules the names too). Off the RL route only,
+/// which both leave: one read of the revision's ontology ([`ontology_at`]), whose refusal
+/// leaves it unknown.
+fn reads_differently(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<String> {
+    const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
+                        answers are read from their closure; use the owl2-rl mode, whose \
+                        promise is the rules' reading";
+    if view.rules {
+        return None;
+    }
+    let Ok(ontology) = ontology_at(store, snapshot) else {
+        return Some(format!(
+            "whether OWL 2 DL reads the ontology otherwise than the OWL 2 RL rules isn't known \
+             ({}): {ONLY}",
+            source::refused("the revision")
+        ));
+    };
+    let name = |t: u64| {
+        let term = snapshot.decode(TermId::from_raw(t));
+        term.map_or_else(|| format!("term {t}"), |term| term.to_string())
+    };
+    if let Some(&property) = ontology.value().annotation_schema.first() {
+        return Some(format!(
+            "{} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
+             it annotates: {ONLY}, or remove them",
+            name(property)
+        ));
+    }
+    let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_SAME_AS).into())?;
+    let equated = nrese_owl::profile::punned(ontology.value())
+        .into_iter()
+        .find(|&t| {
+            let equal = nrese_engine::QuadPattern {
+                subject: Some(TermId::from_raw(t)),
+                predicate: Some(same_as),
+                object: None,
+                graph: nrese_engine::GraphSelector::Any,
+            };
+            snapshot
+                .quads_for_pattern_in(ReadModel::Materialised, &equal)
+                .any(|q| q.object.raw() != t)
+        })?;
+    Some(format!(
+        "{} is a class or property name and an individual equal to another, which OWL 2 DL \
+         equates as individuals only: {ONLY}, or give the individual its own IRI",
+        name(equated)
+    ))
 }
 
 /// Why a read [`denied`] names may miss rows.
@@ -359,7 +422,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
-            certify(status, prepared.query(), "dl", true)
+            certify(status, prepared.query(), "dl", true);
+            mark(store, status);
         }
     }
     let status = match &outcome {
