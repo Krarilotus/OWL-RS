@@ -778,14 +778,22 @@ fn data_existential(filler: &str) -> String {
 /// a union too. 5 is an integer and a decimal.
 #[test]
 fn owl2_rl_calls_no_answer_an_undeclared_data_existential_misses_complete() {
-    for filler in [
+    let wrong: Vec<String> = [
         "xsd:integer",
         "[ a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
         "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
         "[ owl:unionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:string ) ]",
-    ] {
-        no_place_complete(&data_existential(filler), "ASK { :a a :Aged }");
-    }
+    ]
+    .iter()
+    .flat_map(|filler| {
+        eprintln!("filler {filler}:");
+        let wrong = complete_anywhere(&data_existential(filler), "ASK { :a a :Aged }");
+        wrong
+            .into_iter()
+            .map(move |line| format!("{filler}: {line}"))
+    })
+    .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// cls-int1 and cls-svf1: `:x` is `:B` and `:C`, so `:a :knows :x` makes `:a` `:Social`,
@@ -842,6 +850,12 @@ fn never_complete(declaration: &str) {
 /// `data` under owl2-rl, and `read`, entailed but `false` over the closure: no place calls
 /// it complete, with the rewriting on or not.
 fn no_place_complete(data: &str, read: &str) {
+    let wrong = complete_anywhere(data, read);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// [`no_place_complete`]'s check, its wrong answers as lines.
+fn complete_anywhere(data: &str, read: &str) -> Vec<String> {
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         let (text, line, complete, reported) = places(data, read, ql);
@@ -850,7 +864,7 @@ fn no_place_complete(data: &str, read: &str) {
             wrong.push(line);
         }
     }
-    assert!(wrong.is_empty(), "{wrong:#?}");
+    wrong
 }
 
 /// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
