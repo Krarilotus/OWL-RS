@@ -1,84 +1,89 @@
 # NRESE
 
 NRESE is an [RDF](https://www.w3.org/TR/rdf11-primer/) database with
-[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust, for data you query
-together with its ontology. It runs as one server with SPARQL endpoints and a browser console.
+[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust, that runs as one
+server with SPARQL endpoints and a browser console. It is built for applications that need
+to know what an answer rests on: what was asserted, what was inferred from it, and whether
+anything may be missing.
 
 What it does that is its own:
 
-- **Reasoning is part of the write.** With reasoning on, the statements your chosen rules
-  derive from a write are computed in the write's own transaction and committed with it, as
-  one revision. A bulk load recomputes them after loading instead.
-- **Writes are checked before they commit.** Under OWL 2 QL, RL and DL, a write that fails
-  a consistency check is refused, and nothing of it is committed. With the SHACL gate set to
-  `enforce`, so is a write that introduces a shape violation.
-- **Each answer says whether it is complete.** Every SPARQL query answer over HTTP has an
-  `NRESE-Completeness` header: `complete`, or a status saying rows may be missing, with the
-  reasons where the store knows them.
-- **OWL 2 DL engines of its own.** In the `owl2-dl` mode, a hypertableau and a
-  consequence-based engine check writes for consistency, classify the ontology, and add the
-  query answers they can prove beyond what the rules derive.
+- **Inferences are committed with the write.** With reasoning on, a write and the statements
+  your rules derive from it become visible together, and a deleted statement takes along the
+  inferences that no longer follow. A bulk load recomputes them afterwards.
+- **Writes are checked before they commit.** Under OWL 2 QL, RL and DL, a write that fails a
+  consistency check is refused whole, and so is one that breaks a SHACL shape when the SHACL
+  gate is set to `enforce`.
+- **Each answer says whether it is complete.** Every SPARQL query answer over HTTP has a
+  header: `complete`, or a status saying rows may be missing, with the reasons where known.
+- **Inferences explain themselves.** With reasoning on, ask why a statement holds, and it
+  returns the statement's derivation from asserted statements, rule by rule.
+- **OWL 2 DL engines of its own.** In the `owl2-dl` mode they check writes for consistency,
+  classify the ontology and prove query answers beyond what the rules derive. They are a
+  hypertableau and a consequence-based engine.
 
-A hobby project. Try it: [quick start](#quick-start). When to choose another system:
-[limits](docs/limits.md).
+A hobby project. Try it with the [quick start](#quick-start); see also [Limits](docs/limits.md).
 
-## How a write becomes queryable
-
-Where inferred statements come from, and when a query sees them (reasoning on):
+## Architecture overview
 
 ```mermaid
-flowchart TD
-  W["<b>Write</b><br/>a SPARQL update, a Graph Store write,<br/>or the commit of a client transaction"]
-  P["<b>Plan</b><br/>the statements to insert and delete,<br/>against the latest revision"]
-  R["<b>Reason</b><br/>the rules derive the inferred statements<br/>the change adds or removes, and run<br/>their consistency checks; under owl2-dl,<br/>by default, the DL engines check too"]
-  S["<b>Validate</b><br/>with the SHACL gate on, shapes check<br/>the nodes the change can affect,<br/>inferred statements included"]
-  C["<b>Commit</b><br/>both changes go to the log<br/>(synced, on disk) and are published<br/>as one new revision"]
-  X["<b>Refused</b><br/>nothing of the write is committed"]
-  subgraph REV["New revision"]
-    A[("asserted<br/>statements")]
-    I[("inferred<br/>statements")]
+flowchart TB
+  C["Clients<br/>your applications, the browser console"]
+  subgraph SRV["One NRESE server"]
+    E["Endpoints<br/>SPARQL, Graph Store, RDF4J, engine API"]
+    Q["Query engine<br/>SPARQL, with text, vector and geo search"]
+    W["Write pipeline<br/>checks each write, then commits it"]
+    R["Rule reasoner<br/>RDFS to OWL 2 RL, or your own rules"]
+    V["SHACL validation<br/>shapes, on request or on each write"]
+    D["DL engines<br/>OWL 2 DL consistency, classification, answers"]
+    T["Storage engine<br/>asserted and inferred statements, named graphs"]
   end
-  Q["<b>Query</b><br/>reads both together (default),<br/>or one of them alone"]
-  H["<b>Answer</b><br/>the rows, and the NRESE-Completeness<br/>header"]
-  W --> P --> R --> S --> C
-  R -- "a consistency check fails" --> X
-  S -- "a shape is violated (enforce)" --> X
-  C --> A
-  C --> I
-  A --> Q
-  I --> Q
-  Q --> H
-  classDef refused stroke-dasharray: 6 4
-  class X refused
+  L[("Disk<br/>write-ahead log and checkpoints")]
+  C -- "HTTP" --> E
+  E -- "queries" --> Q
+  E -- "writes" --> W
+  E -- "validation requests" --> V
+  W -- "derive and check" --> R
+  W -- "validate the change" --> V
+  W -- "check consistency (owl2-dl)" --> D
+  Q -- "prove answers (owl2-dl)" --> D
+  E -- "classification requests" --> D
+  W -- "commit one revision" --> T
+  Q -- "read a snapshot" --> T
+  T -- "log each commit (on-disk mode)" --> L
 ```
 
-Dashed: where a write ends without a commit; a write that times out before its commit ends
-there too. One write runs at a time; until it commits, queries read the revision before it.
-The steps in detail: [what a commit does](docs/what-it-covers.md#what-a-commit-does).
+Everything in the frame is one process. What happens to a write, step by step:
+[what a commit does](docs/what-it-covers.md#what-a-commit-does).
 
-## What you can choose
+## What NRESE offers
 
-| Feature | What it does | How you set or use it (default in **bold**) |
-|---|---|---|
-| [Reasoning](docs/what-it-covers.md#reasoning) | Derives statements from your data and ontology | `NRESE_REASONING_MODE`: **`disabled`**, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl`; or `custom`, your own rules in Notation3 or `.pie`, which can also be added to any other mode but `disabled` |
-| [Inferred statements](docs/ops/http-api.md#queries) | Kept apart from asserted ones, updated in each write's commit; a bulk load recomputes them afterwards | A query reads **both**, asserted only (`infer=false`), or inferred only (`FROM <http://www.ontotext.com/implicit>`) |
-| [Consistency](docs/what-it-covers.md#what-a-commit-does) | Under `owl2-ql`, `owl2-rl` and `owl2-dl`, refuses a write that fails a consistency check | Under `owl2-dl`, `NRESE_DL_CONSISTENCY`: **`inline`** or `off`. A DL check that can't decide lets the write through, and the store's status says so |
-| [Answer status](docs/what-it-covers.md#what-an-answer-promises) | `NRESE-Completeness` on every SPARQL query answer over HTTP: `complete`, `sound-only`, `unsound` or `not-certified` | Under `owl2-dl`, `dl-answers=exact` turns an answer that can't be proven complete into an error (422) |
-| [Explanations](docs/ops/http-api.md#engine-api-apiv1) | Why a statement holds: the rules and premises that derive it | `GET /api/v1/repositories/{id}/explain` |
-| [SHACL](docs/what-it-covers.md#shacl) | SHACL Core and SHACL-SPARQL, inferred statements included | On request: `/dataset/shacl`. On each write, `NRESE_SHACL_GATE`: **`off`**, `report` or `enforce` |
-| [Named graphs](docs/what-it-covers.md#reasoning) | Statements live in named graphs or the default graph; rules read every graph and put inferences in the default graph | The default graph of a query, `NRESE_DEFAULT_GRAPH`: **`default`**, or `union` of all graphs |
-| [Search](docs/what-it-covers.md#sparql) | Full-text (BM25), vector, and in part GeoSPARQL, inside SPARQL queries | Vectors are literals you supply; the store computes no embeddings |
-| [Storage](docs/what-it-covers.md#storage-transactions-and-durability) | Its own engine: snapshots for readers, a write-ahead log, one writer at a time, read replicas | `NRESE_STORE_MODE`: **`in-memory`** or `on-disk` (the Docker image sets `on-disk`) |
-| [Access](docs/what-it-covers.md#access-control-and-operations) | Authentication, and access per named graph | `NRESE_AUTH_MODE`: **`none`**, `bearer-static`, `bearer-jwt`, `oidc-introspection` or `mtls` |
-| [Interfaces](docs/what-it-covers.md#interfaces) | SPARQL 1.1 Protocol, Graph Store Protocol, the RDF4J REST protocol (without `SNAPSHOT` and `SERIALIZABLE` isolation), an engine API described in OpenAPI | Several repositories per server, each with its own reasoning mode and rules |
+| Feature | What you get |
+|---|---|
+| [Reasoning](docs/what-it-covers.md#reasoning) | Modes from none to OWL 2 DL: RDFS, RDFS-Plus, OWL-Horst, OWL 2 QL, RL and DL; or your own rules, alone or added to one of these |
+| [Inferred statements](docs/ops/http-api.md#queries) | Stored apart from asserted ones; a query reads both, asserted only, or inferred only |
+| [Consistency checks](docs/what-it-covers.md#what-a-commit-does) | Under OWL 2 QL, RL and DL, on each write; the OWL 2 DL engines' check can be switched off |
+| [Answer status](docs/what-it-covers.md#what-an-answer-promises) | A completeness status on every SPARQL answer over HTTP; under OWL 2 DL, you can ask for an answer proven complete, or else an error |
+| [Explanations](docs/ops/http-api.md#engine-api-apiv1) | Why a statement holds, as a derivation; under OWL 2 DL, for one the rules don't derive, the axioms it follows from |
+| [Classification](docs/ops/http-api.md#classification) | The ontology's class hierarchy, and the classes of each individual |
+| [SHACL](docs/what-it-covers.md#shacl) | SHACL Core and SHACL-SPARQL, inferred statements included; on request, or on each write as a report or a refusal |
+| [SPARQL and search](docs/what-it-covers.md#sparql) | SPARQL 1.1 query and update, with the deviations in Limits; full-text, vector and, in part, GeoSPARQL search |
+| [Named graphs](docs/ops/config-reference.md#store.default_graph) | Statements in named graphs; a query's default graph is the default graph, or the union of all graphs |
+| [Storage](docs/what-it-covers.md#storage-transactions-and-durability) | Its own storage engine, in memory or on disk; backups and restores; read replicas |
+| [Access control](docs/what-it-covers.md#access-control-and-operations) | Sign-in by tokens, OIDC or client certificates; read and write rights per named graph |
+| [Interfaces](docs/what-it-covers.md#interfaces) | SPARQL 1.1 and Graph Store protocols, the RDF4J REST protocol (not its `SNAPSHOT` or `SERIALIZABLE` isolation), an engine API with an OpenAPI description, a browser console; several repositories per server |
 
 ## Quick start
 
-You need git, Docker with BuildKit, curl, and port 8080 free. Rust and Node.js aren't
-needed: the image builds the server and its console. The image's server needs an x86-64-v3
-CPU (amd64) or a Neoverse N1 level CPU (arm64); for an older one, add
-`--build-arg NRESE_TARGET_CPU=portable` to `docker build`. The commands are for a POSIX
-shell: Linux, macOS, or Git Bash or WSL on Windows.
+You need:
+
+- git
+- Docker with BuildKit (the image builds the server and its console, so no Rust or Node.js)
+- curl
+- port 8080 free
+- a POSIX shell: Linux, macOS, or Git Bash or WSL on Windows
+
+The image's server runs on an x86-64-v3 (amd64) or Neoverse N1 level (arm64) CPU; for an older one, build with `--build-arg NRESE_TARGET_CPU=portable`.
 
 ```bash
 git clone https://github.com/Krarilotus/OWL-RS.git
