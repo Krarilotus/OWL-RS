@@ -413,17 +413,35 @@ fn an_irregular_ontology_with_a_range_below_a_chains_equivalent_is_not_answered_
     ));
 }
 
-/// The EL classifier reads an annotation property's domain as a class the DL engines don't
-/// have: the two read the ontology differently, and the answer stays the DL engines' marked
-/// lower bound.
+/// An annotation property's domain says nothing about classes, and neither reader reads it:
+/// the EL classifier answers, complete, and the domain is no class in its answer.
 #[test]
-fn an_irregular_ontology_whose_annotation_domain_the_el_classifier_reads_as_a_class_is_not_answered_by_it()
- {
+fn an_irregular_el_answer_leaves_an_annotation_propertys_domain_out() {
     let report = irregular(
         ":ap a owl:AnnotationProperty ; rdfs:domain :X . :T a owl:Class . \
          owl:Thing rdfs:subClassOf :T .",
     );
-    // X is no class: an annotation property's domain has no logical meaning.
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert!(
+        !has(&report.subsumptions, "X", "T"),
+        "{:?}",
+        report.subsumptions
+    );
+}
+
+/// An axiom's reification (`owl:Axiom`) states no axiom for the DL engines, but the EL
+/// classifier reads the class axiom its node carries (`X ⊓ Y ⊑ Z`): its answer names
+/// classes the DL engines' signature lacks, so neither reading is trusted, and the answer
+/// stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_answered_by_the_el_classifier()
+ {
+    let report = irregular(
+        ":T a owl:Class . owl:Thing rdfs:subClassOf :T . \
+         _:ax a owl:Axiom ; owl:intersectionOf ( :X :Y ) ; rdfs:subClassOf :Z .",
+    );
+    // X is no class to the DL engines: the reification asserts nothing.
     assert!(
         !has(&report.subsumptions, "X", "T"),
         "{:?}",
@@ -432,11 +450,11 @@ fn an_irregular_ontology_whose_annotation_domain_the_el_classifier_reads_as_a_cl
     assert_lower_bound(&report);
 }
 
-/// The EL classifier reads datatypes declared `owl:DataRange` as classes, the DL engines as
-/// a datatype definition: the answer stays the DL engines' marked lower bound.
+/// The EL classifier skips a datatype declared `owl:DataRange` where it reads a class (a
+/// data range): it skipped part of the ontology, so the answer stays the DL engines' marked
+/// lower bound.
 #[test]
-fn an_irregular_ontology_whose_data_ranges_the_el_classifier_reads_as_classes_is_not_answered_by_it()
- {
+fn an_irregular_ontology_whose_data_ranges_the_el_classifier_skips_is_not_answered_by_it() {
     let report =
         irregular(":Dt a owl:DataRange . :Et a owl:DataRange . :Dt owl:equivalentClass :Et .");
     // Dt and Et are datatypes, no classes: no pair between them.
