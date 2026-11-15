@@ -1,10 +1,8 @@
 # Limits and deviations
 
-This page lists what NRESE doesn't do, and where it departs from a standard on purpose, in the
-version it comes with, not in a plan or another version. Most items are stated in the page they link to and gathered here,
-and an item without a link is stated only here. Each one says what to do instead, or "none known"
-where we know of nothing. It is the detail of the "left out" list in the
-[scope](what-it-covers.md#scope), which also says what is in and what is planned.
+Where NRESE stops, and where it departs from a standard on purpose, in the commit these pages
+come with. Each item says what to do instead, or "none known". What is in is on
+[features and standards](what-it-covers.md).
 
 ## Choose another system when
 

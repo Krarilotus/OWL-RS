@@ -2,6 +2,13 @@
 
 This is the contract for what NRESE's reasoning computes, for the code of the commit this page is in (`SEMANTICS_VERSION` 4 since 7 November 2026: the datatype checks read literals as OWL 2's datatype map does, so a consistency verdict version 3 recorded is rechecked once; 3 since 28 October 2026: closures version 2's maintenance wrote are rebuilt once). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
 
+The standards behind the modes are [RDF 1.1 Semantics](https://www.w3.org/TR/rdf11-mt/) (RDFS
+entailment), the [OWL 2 Profiles](https://www.w3.org/TR/owl2-profiles/) (OWL 2 QL, and OWL 2 RL
+with its RDF rules), the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) and
+[RDF-Based Semantics](https://www.w3.org/TR/owl2-rdf-based-semantics/), and, for what a query
+answers under them, [SPARQL 1.1 Entailment Regimes](https://www.w3.org/TR/sparql11-entailment/).
+This page says where NRESE follows them and where it stops.
+
 ## Modes
 
 `reasoner.mode` / `NRESE_REASONING_MODE`: `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl` or `custom`. The profiles between `rdfs` and `owl2-rl` are the RDFS rules plus named OWL 2 RL rules, as GraphDB's rulesets of the same names are. User rules in Notation3 (`reasoner.rules`) are added to any of them, or are the whole program with `custom` (see "User rules" below).
