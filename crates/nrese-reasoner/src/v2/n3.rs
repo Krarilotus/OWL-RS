@@ -196,12 +196,16 @@ impl Compiler {
         if compiled.is_empty() {
             return Err("a rule whose premises are only builtins".to_owned());
         }
-        Ok(Some(Rule {
+        let rule = Rule {
             name: name.to_owned(),
             body: compiled,
             guards,
             head,
-        }))
+        };
+        if !rule.fits() {
+            return Err(too_many_atoms());
+        }
+        Ok(Some(rule))
     }
 
     /// A term with the substitutions so far applied.
@@ -302,6 +306,14 @@ fn formula<'a>(
 }
 
 /// A fact outside formulas, as ids.
+/// A user rule past the rule format ([`Rule::fits`]): a parse error.
+pub(crate) fn too_many_atoms() -> String {
+    format!(
+        "more than {} atoms in a rule's premises or conclusion",
+        super::eval::MAX_RULE_ATOMS
+    )
+}
+
 fn fact(quad: &N3Quad, vocabulary: &mut impl Vocabulary) -> Result<[u64; 3], String> {
     let mut ids = [0; 3];
     for (slot, term) in ids

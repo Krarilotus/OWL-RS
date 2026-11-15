@@ -181,6 +181,16 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Whether the rule format holds it: at most [`super::eval::MAX_RULE_ATOMS`] atoms in its
+    /// body, and in its conclusion beside a body.
+    pub fn fits(&self) -> bool {
+        let heads = match &self.head {
+            Head::Facts(heads) if !self.body.is_empty() => heads.len(),
+            _ => 0,
+        };
+        self.body.len().max(heads) <= super::eval::MAX_RULE_ATOMS
+    }
+
     /// Number of distinct variables (they are numbered densely from 0).
     pub fn variables(&self) -> usize {
         let mut max = None;
