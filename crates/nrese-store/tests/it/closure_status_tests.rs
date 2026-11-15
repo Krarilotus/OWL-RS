@@ -734,9 +734,25 @@ fn owl2_dl_same_as_of_a_term_the_upper_bound_doesnt_type_is_never_complete() {
 /// [`every_place_gives_a_query_the_answers_status`]'s. Each status is printed.
 #[test]
 fn owl2_rl_calls_no_answer_a_key_misses_by_term_complete() {
-    let data = ":Person owl:hasKey ( :ssn ) . :ssn a owl:DatatypeProperty . \
-                :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
-                :b a :Person ; :ssn \"01\"^^xsd:integer .";
+    never_complete(":ssn a owl:DatatypeProperty .");
+}
+
+/// As [`owl2_rl_calls_no_answer_a_key_misses_by_term_complete`], with `:ssn` undeclared: the
+/// rewriting's schema reads no assertions, so it can't tell `:ssn` carries data values.
+#[test]
+fn owl2_rl_calls_no_answer_a_key_on_an_undeclared_property_misses_complete() {
+    never_complete("");
+}
+
+/// The key's case, `:ssn` declared by `declaration`: no place calls `ASK { :b :p :x }`
+/// complete, with the rewriting on or not.
+fn never_complete(declaration: &str) {
+    let data = format!(
+        ":Person owl:hasKey ( :ssn ) . {declaration} \
+         :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
+         :b a :Person ; :ssn \"01\"^^xsd:integer ."
+    );
+    let data = data.as_str();
     let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :b :p :x }}"));
     let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let mut wrong = Vec::new();
