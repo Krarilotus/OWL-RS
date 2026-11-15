@@ -10,7 +10,7 @@ What it puts first:
 - **Inferences are committed with the write.** With reasoning on, a write and the statements
   the rules derive from it become visible together, and a deleted statement takes along the
   inferences that no longer follow.
-- **Writes can be checked before they commit.** Under OWL 2 QL, RL and DL, a write found to
+- **Checks before the commit.** Under OWL 2 QL, RL and DL, a write found to
   introduce an inconsistency is refused whole, and so is one that introduces a SHACL
   violation when the SHACL gate is set to `enforce`.
 - **Every SPARQL answer over HTTP carries a status:** `complete`, `sound-only` (rows may be
