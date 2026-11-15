@@ -31,18 +31,18 @@ Everything runs in Docker on the same host. The data lives in the volume `nrese-
 
 ## Reading the results
 
-- **Oracle validation.** On LUBM(1), the oracle's closure answers all 14 queries with the published counts. That's what makes it usable as the reference.
-- **precision / recall** are instance-level (facts about individuals, which queries see). Normalisation removes facts that are trivially true for everything: `x a owl:Thing`, `x sameAs x`, `p rdfs:domain owl:Thing`, and axiomatic vocabulary triples.
-- **explained** counts extra facts that are entailed but aren't in the OWL 2 RL/RDF rules. Two structural checks against the input verify them:
+- Oracle validation: on LUBM(1), the oracle's closure answers all 14 queries with the published counts. That's what makes it usable as the reference.
+- precision / recall are instance-level (facts about individuals, which queries see). Normalisation removes facts that are trivially true for everything: `x a owl:Thing`, `x sameAs x`, `p rdfs:domain owl:Thing`, and axiomatic vocabulary triples.
+- explained counts extra facts that are entailed but aren't in the OWL 2 RL/RDF rules. Two structural checks against the input verify them:
   - `owl:differentFrom` between members of an `owl:AllDifferent`
   - `x p x` where p is an `owl:ReflexiveProperty`
-- **schema_precision / schema_recall** cover subClassOf, domain, inverseOf, disjointWith and meta-typing. Systems differ here by design: Jena, for example, states `inverseOf` and `disjointWith` symmetrically, and the RL rules don't.
-- **queries_correct** is `k/n` against the published answers where they exist (LUBM(1)). Everywhere else, the answer counts are cross-checked across systems at the end of each dataset.
+- schema_precision / schema_recall cover subClassOf, domain, inverseOf, disjointWith and meta-typing. Systems differ here by design: Jena, for example, states `inverseOf` and `disjointWith` symmetrically, and the RL rules don't.
+- queries_correct is `k/n` against the published answers where they exist (LUBM(1)). Everywhere else, the answer counts are cross-checked across systems at the end of each dataset.
 
 ## Data quirks fixed on the way in (documented, reproducible)
 
-- **LUBM:** the ontology is published under `swat.cse.lehigh.edu`, but UBA data and the queries use `www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#`. The ontology is rewritten to match. The `<> owl:imports` header lines aren't valid N-Triples and are dropped.
-- **OWL2Bench:** the generator (since commit 1539dad, 2022) writes `https://kracr.iiitd.edu.in/OWL2Bench#`, but the TBoxes at the repository root still use `http://benchmark/OWL2Bench#`. With those TBoxes, no axiom touches the ABox. The kit uses the matching TBoxes from `OWL2Bench/`, and the queries use the generator's namespace.
+- LUBM: the ontology is published under `swat.cse.lehigh.edu`, but UBA data and the queries use `www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#`. The ontology is rewritten to match. The `<> owl:imports` header lines aren't valid N-Triples and are dropped.
+- OWL2Bench: the generator (since commit 1539dad, 2022) writes `https://kracr.iiitd.edu.in/OWL2Bench#`, but the TBoxes at the repository root still use `http://benchmark/OWL2Bench#`. With those TBoxes, no axiom touches the ABox. The kit uses the matching TBoxes from `OWL2Bench/`, and the queries use the generator's namespace.
 
 ## Cleaning up after a run
 

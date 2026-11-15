@@ -20,13 +20,17 @@ with `--reference` answers the 31 queries with Ontop's endpoint over the databas
 its existential reasoning (OWL 2 QL certain answers). Containers and network are removed
 afterwards.
 
-**Answers.** NRESE under `owl2-ql` (the closure: 2,741,156 inferred statements in
+### Answers
+
+NRESE under `owl2-ql` (the closure: 2,741,156 inferred statements in
 0.6-0.8 s) with the rewriting on: all 31 queries give Ontop's row counts, every one
 `complete`. With the rewriting off, three miss answers: q28 538 of 600, q29 983 of 1,096,
 q30 260 of 288. Twelve queries are rewritten (q17, q20-q30), each with one tree witness
 and two branches, 4-17 atoms; none reaches a bound.
 
-**Times** (main PC, `benches/probes/ql-rewriting-ab.sh npd owl2-ql`, 4 ABBA pairs of 5
+### Times
+
+On the main PC (`benches/probes/ql-rewriting-ab.sh npd owl2-ql`, 4 ABBA pairs of 5
 measured runs, medians; sum of the 31 medians 77.7 ms off, 103.8 ms on):
 - the 19 queries not rewritten: 0.75-1.26x, noise around equal;
 - q28-q30, which gain answers: 1.8-1.9x (+0.5-0.9 ms);
@@ -35,7 +39,9 @@ measured runs, medians; sum of the 31 medians 77.7 ms off, 103.8 ms on):
   doesn't already state: q22-q27 (`DISTINCT`) pay for the branch, q17, q20 and q21
   (aggregates) for the bag form's second evaluation too.
 
-**No cost where nothing is added** (7 October, design §3): a witness whose tree the data
+### No cost where nothing is added
+
+Since 7 October (design §3), a witness whose tree the data
 has at every individual it folds to is left out. The nine are now run as written (EXPLAIN:
 `realised` 1, `patterns` 0); q28-q30 keep their witness and their answers. Same protocol,
 on the branch's base and then with the change (main PC, both runs on 7 October):

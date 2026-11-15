@@ -48,7 +48,7 @@ VLog and GLog print no count of what they derived: every run stores the material
 (`--storemat`) and the files are counted afterwards; the storing time VLog logs comes off the
 wall time.
 
-**RDFox doesn't run here, now or later**: its evaluation licence was refused (owner, 12 Oct
+RDFox doesn't run here, now or later: its evaluation licence was refused (owner, 12 Oct
 2026). On its home turf NRESE runs against VLog and GLog on RDFox's own programs, matched to
 the setups RDFox's papers report (the `*-noeq` variants, LUBM(1000), the papers' thread
 counts), and RDFox's published numbers are reported rows in [../reported](../reported/README.md),
@@ -60,21 +60,27 @@ Every engine runs in a container capped at the same CPUs (`--threads`, as `DOCKE
 memory (`DOCKER_MEMORY`, default 28g), as the invoking user, from fresh scratch; the
 repetitions are interleaved across the engines, each round in an order rotated by one.
 
-**What is timed.** `load` is the wall time from the input files to the complete
+### What is timed
+
+`load` is the wall time from the input files to the complete
 materialisation, as each engine is used: for NRESE that includes parsing, the bulk load
 into its on-disk store and writing the closure there; for Soufflé running the compiled
 program (reading CSV included). `reason` is the time the engine reports for reasoning
 alone (NRESE's rematerialisation, Nemo's "Reasoning", VLog's "Runtime materialization").
 Peak memory is sampled from `docker stats`.
 
-**What is checked.** `--qualify` (a run before the timed ones) counts every derived
+### What is checked
+
+`--qualify` (a run before the timed ones) counts every derived
 relation: NRESE by a SPARQL count over its closure, Soufflé by `.printsize`, Nemo and VLog
 by the exported relation. Each count is a `query` row `count:REL`, compared with the
 published count where there is one and across the engines (the suite's disputes). A timed
 run's total of derived facts must equal the published total or the engine's own qualified
 one (`qualified.json`); otherwise the row is `wrong`, never a time.
 
-**What an engine can't express is reported, never approximated.** NRESE's user rules are
+### What an engine can't express is reported, never approximated
+
+NRESE's user rules are
 over triples, so relations of arity 3 or more (Galen, Doop) and negation (Doop) are `not
 expressible`; VLog has no comparisons (same generation's `x != y`), and the wildcard in
 Doop is left out until a run confirms its negation. Each such pair is a `skipped` row with
