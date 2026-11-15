@@ -45,6 +45,10 @@ mod token_tests;
 #[path = "bounds_lock_tests.rs"]
 mod lock_tests;
 
+#[cfg(test)]
+#[path = "bounds_kinds_tests.rs"]
+mod kinds_tests;
+
 /// Where the lock tests hold U1's work mid-way: a hook run once, on the thread doing that
 /// work, for the store whose bounds it names.
 #[cfg(test)]
@@ -61,6 +65,8 @@ pub(crate) mod seam {
         Taxonomy,
         /// A revision's read view, not begun.
         View,
+        /// A commit's ontology read again, not begun.
+        Read,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -397,6 +403,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         }
     }
     source::intern_vocabulary(tx);
+    #[cfg(test)]
+    seam::at(&store.dl().bounds, seam::Point::Read);
     let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept())) else {
         return Preparation {
             base,
