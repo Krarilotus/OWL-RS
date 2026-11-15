@@ -340,6 +340,8 @@ impl Compiler<'_> {
                     body.push(self.type_atom(x, *c));
                     body.push(self.type_atom(y, *c));
                 }
+                // `next` saturates only past 253 properties, whose rule (over 506 atoms) the
+                // store refuses before evaluation (`ir::Rule::fits`), U1 then incomplete.
                 let mut next = 2u8;
                 for &r in objects {
                     // Over `owl:topObjectProperty` the shared value can be `x` itself.
