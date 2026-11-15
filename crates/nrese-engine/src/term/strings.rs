@@ -76,7 +76,7 @@ const SLICE: usize = 1 << 16;
 
 /// What a dictionary string scan did (EXPLAIN's `dictionary string test`; the guard of
 /// performance.md §0): a bulk load's terms are 256 arenas, one per shard of
-/// [`super::pending`], and searching them one after another, each with searchers of its
+/// `super::pending`, and searching them one after another, each with searchers of its
 /// own, made Olympics q06 4.3 → 18 ms (36704d9).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StringScan {
@@ -86,7 +86,7 @@ pub struct StringScan {
     pub parallel_loops: usize,
     /// Arenas searched (the base, heaps and shards).
     pub arenas: usize,
-    /// Slices searched: at most [`SLICE`] entries of one arena each.
+    /// Slices searched: at most `SLICE` entries of one arena each.
     pub slices: usize,
     /// Keys the test read: each hit's (once per pass), or every one where the needle is
     /// empty (a language alone), or each candidate of a prefix's range.

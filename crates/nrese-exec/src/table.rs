@@ -239,7 +239,7 @@ impl IdTable {
     }
 
     /// Bytes held by the column buffers (by capacity), for memory budgets. A table without
-    /// columns counts one id a row after the first ([`ROW_WITHOUT_COLUMNS_BYTES`]) of the
+    /// columns counts one id a row after the first (`ROW_WITHOUT_COLUMNS_BYTES`) of the
     /// rows it has room for: what was reserved, and the most it held, which doesn't drop as
     /// rows go.
     pub fn memory_bytes(&self) -> usize {

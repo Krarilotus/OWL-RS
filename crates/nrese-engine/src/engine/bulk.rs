@@ -807,8 +807,8 @@ fn release_covered(wal: &mut crate::durability::wal::Wal, root: &std::path::Path
 
 /// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the
 /// complete inferred set, and [`finish`](Self::finish) replaces the inferred stack with it
-/// as one revision. The batch counterpart of [`Transaction::insert_inferred`]
-/// (crate::Transaction::insert_inferred), for initial reasoning after a bulk load and for
+/// as one revision. The batch counterpart of [`Transaction::insert_inferred`](crate::Transaction::insert_inferred),
+/// for initial reasoning after a bulk load and for
 /// ruleset changes; durable the way bulk loads are.
 ///
 /// It holds the writer slot for its lifetime, so the base can't change underneath. Dropping
