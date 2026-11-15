@@ -764,10 +764,31 @@ impl<'a> Reader<'a> {
         }))
     }
 
+    /// Whether the restriction `node` says its undeclared property is a data property, where
+    /// no literal use does (a schema read alone): its value a literal, or its filler a
+    /// datatype (declared, or of OWL 2's datatype map, whose names no class may take).
+    fn says_data(&self, node: Term) -> bool {
+        let first = |p| self.objects(node, p).first().copied();
+        if let Some(value) = first(self.v.owl_has_value) {
+            return self.kind(value) == TermKind::Literal;
+        }
+        let filler = first(self.v.owl_some_values_from);
+        let Some(filler) = filler.or_else(|| first(self.v.owl_all_values_from)) else {
+            return false;
+        };
+        self.declared_as(filler, EntityKind::Datatype)
+            || crate::vocab::DATA_IRIS
+                .iter()
+                .any(|&iri| self.terms.iri(iri) == Some(filler))
+    }
+
     /// A restriction on `property`.
     fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
         let v = self.v;
-        let data = self.kind(property) == TermKind::Iri && self.is_data_property(property);
+        let data = self.kind(property) == TermKind::Iri
+            && (self.is_data_property(property)
+                || (!self.declared_as(property, EntityKind::ObjectProperty)
+                    && self.says_data(node)));
         let number = |reader: &mut Self, predicate: Option<Term>| -> Option<Option<u32>> {
             let literal = reader.one(node, predicate)?;
             let parsed = reader
