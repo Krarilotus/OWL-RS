@@ -307,20 +307,35 @@ fn owl2_dl_doesnt_call_a_universal_statement_complete() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Off the RL route (an existential superclass is outside OWL 2 RL), the upper bound
-/// holds `:ann a owl:Thing` and the bounds prove it: the answer is `complete`, and
-/// `dl-answers=exact` gives it.
-#[test]
-fn owl2_dl_off_the_rl_route_proves_an_owl_thing_read_complete() {
+/// [`DATA`] off the RL route: an existential superclass is outside OWL 2 RL.
+fn off_the_rl_route() -> nrese_store::MutationPipeline {
     let dl = pipeline();
     let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :owns ; \
                        owl:someValuesFrom :Dog ] .";
     insert(&dl, &format!("{DATA} {existential}")).expect("data");
+    dl
+}
+
+/// Off the RL route the upper bound holds `:ann a owl:Thing` and the bounds prove it: the
+/// answer is `complete`, and `dl-answers=exact` gives it.
+#[test]
+fn owl2_dl_off_the_rl_route_proves_an_owl_thing_read_complete() {
+    let dl = off_the_rl_route();
     let mut request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :ann a owl:Thing }}"));
     request.dl_answers = Some(nrese_store::DlAnswers::Exact);
     let result = dl.store().execute_query(&request).expect("proved");
     assert!(String::from_utf8(result.payload).unwrap().contains("true"));
     assert_eq!(result.completeness.map(|c| c.as_str()), Some("complete"));
+}
+
+/// Off the RL route U1 types only the data's individuals: `:fresh a owl:Thing` is
+/// entailed, but no term of the data, so in neither bound. Not `complete`, run or planned.
+#[test]
+fn owl2_dl_off_the_rl_route_doesnt_call_an_owl_thing_read_of_another_term_complete() {
+    let dl = off_the_rl_route();
+    let (answer_, status) = answer(dl.store(), "ASK { :fresh a owl:Thing }");
+    assert!(answer_.contains("false"), "{answer_}");
+    assert!(!status.contains(&"complete"), "{status:?}");
 }
 
 /// DESCRIBE reads every predicate of what it names, `:ann owl:sameAs :ann` and its

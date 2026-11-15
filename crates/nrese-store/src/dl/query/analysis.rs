@@ -393,6 +393,38 @@ fn universal_read(predicate: &str, t: Option<&TriplePattern>) -> Option<&'static
     reads.then_some(name)
 }
 
+/// Whether U1 can hold `x rdf:type owl:Thing` for every `x` that `query` reads it of: U1
+/// types the data's individuals, so a variable is covered, a named node only if it is a
+/// term of `snapshot`, and a blank node or literal never. A dictionary lookup: a term of
+/// the data U1 doesn't type (a class or property name alone) passes it.
+pub(super) fn thing_covered(query: &Query, snapshot: &Snapshot) -> bool {
+    let covered = |term: &TermPattern| match term {
+        TermPattern::Variable(_) => true,
+        TermPattern::NamedNode(n) => snapshot
+            .lookup(NamedNodeRef::new_unchecked(n.as_str()).into())
+            .is_some(),
+        _ => false,
+    };
+    let mut uncovered = false;
+    pattern_of(query).find(&mut |node| {
+        uncovered = match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => patterns.iter().any(|t| {
+                matches!(&t.predicate, NamedNodePattern::NamedNode(p)
+                    if universal_read(p.as_str(), Some(t)) == Some(THING))
+                    && !covered(&t.subject)
+            }),
+            Node::Pattern(GraphPattern::Path {
+                subject,
+                path,
+                object,
+            }) => universal_path(path) == Some(THING) && !(covered(subject) && covered(object)),
+            _ => false,
+        };
+        uncovered
+    });
+    !uncovered
+}
+
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
 /// first rows, which a missing row can change.
 fn ordered(mut pattern: &GraphPattern) -> bool {
