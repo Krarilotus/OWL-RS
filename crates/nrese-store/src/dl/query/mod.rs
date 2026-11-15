@@ -131,16 +131,8 @@ fn consistency_at(
     if cancellation.is_cancelled() {
         return Verdict::Unknown("cancelled".to_owned());
     }
-    if let Some(DlStatus {
-        revision,
-        consistency,
-    }) = store.dl().status()
-        && revision == snapshot.revision()
-    {
-        return consistency.verdict;
-    }
-    if view.proves_consistency {
-        return Verdict::Consistent;
+    if let Some(known) = consistency_known(store, snapshot, view) {
+        return known;
     }
     let stopped = || {
         if cancellation.is_cancelled() {
@@ -177,6 +169,37 @@ fn consistency_at(
     });
     checked.verdict
 }
+
+/// The data's consistency at `snapshot`'s revision where it is known without a check:
+/// recorded by its commit, or proved by U1.
+fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<Verdict> {
+    match store.dl().status() {
+        Some(DlStatus {
+            revision,
+            consistency,
+        }) if revision == snapshot.revision() => Some(consistency.verdict),
+        _ => view.proves_consistency.then_some(Verdict::Consistent),
+    }
+}
+
+/// Why an answer isn't complete for the data's consistency, if it isn't.
+fn consistency_reason(verdict: Verdict) -> Option<String> {
+    match verdict {
+        Verdict::Consistent => None,
+        Verdict::Inconsistent => {
+            Some("the data is inconsistent under OWL 2 DL, so it entails every answer".to_owned())
+        }
+        Verdict::Unknown(why) => Some(format!(
+            "the data's consistency under OWL 2 DL isn't known ({why})"
+        )),
+    }
+}
+
+/// The rules run over the RL closure only (DL-safe in effect: their variables bind to the
+/// store's terms), never over what OWL 2 DL entails beyond it nor over U1: a conclusion
+/// they'd draw from such a fact is missing from both bounds.
+const USER_RULES: &str = "user rules run with OWL 2 DL: their conclusions from what only OWL 2 \
+                          DL entails aren't computed, so no answer is claimed complete";
 
 /// The bounds' counts as a query's evaluation finds them: the shared status keeps lower,
 /// upper and unresolved; [`DlDetail`] the proved and refuted.
@@ -320,26 +343,44 @@ fn plan_status_built(
         );
     }
     let (snapshot, view) = super::bounds::view(store);
+    // What the run adds whatever path decides ([`decide_answers`]); a consistency the run
+    // would check is not known yet.
+    let mut status = Status::complete();
+    let consistency = match consistency_known(store, &snapshot, &view) {
+        Some(known) => consistency_reason(known),
+        None => Some(
+            "the data's consistency under OWL 2 DL isn't checked yet: decided when it runs"
+                .to_owned(),
+        ),
+    };
+    if let Some(why) = consistency {
+        status.add(why);
+    }
+    if store.dl().user_rules() {
+        status.add(USER_RULES.to_owned());
+    }
     if let Some(what) = unbounded(analysis) {
-        return Status::sound_only(format!(
+        status.add(format!(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
+        return status;
     }
     if let Some(what) = untyped_same_as(prepared.query(), &view) {
-        return Status::sound_only(format!("the query reads {what}: {DENIED}"));
+        status.add(format!("the query reads {what}: {DENIED}"));
+        return status;
     }
     // Answered over L alone; [`certify_closure`] says what that misses.
     if analysis.reflexive_same_as {
-        return Status::complete();
+        return status;
     }
     if closed(analysis, &view, &snapshot) {
-        let mut status = Status::complete();
         status.path("closed-predicates");
         return status;
     }
-    Status::sound_only(
-        "the upper bound has candidates for what the query reads: decided when it runs",
-    )
+    status.add(
+        "the upper bound has candidates for what the query reads: decided when it runs".to_owned(),
+    );
+    status
 }
 
 /// The certain answers of `prepared` as far as they can be proven, and their status.
@@ -435,23 +476,11 @@ fn decide_answers(
     let mut status = Status::complete();
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
     cancellation.check()?;
-    match consistency {
-        Verdict::Consistent => {}
-        Verdict::Inconsistent => status
-            .add("the data is inconsistent under OWL 2 DL, so it entails every answer".to_owned()),
-        Verdict::Unknown(why) => status.add(format!(
-            "the data's consistency under OWL 2 DL isn't known ({why})"
-        )),
+    if let Some(why) = consistency_reason(consistency) {
+        status.add(why);
     }
     if store.dl().user_rules() {
-        // The rules run over the RL closure only (DL-safe in effect: their variables bind
-        // to the store's terms), never over what OWL 2 DL entails beyond it nor over U1:
-        // a conclusion they'd draw from such a fact is missing from both bounds.
-        status.add(
-            "user rules run with OWL 2 DL: their conclusions from what only OWL 2 DL entails \
-             aren't computed, so no answer is claimed complete"
-                .to_owned(),
-        );
+        status.add(USER_RULES.to_owned());
     }
     if let Some(what) = unbounded(analysis) {
         status.add(format!(
