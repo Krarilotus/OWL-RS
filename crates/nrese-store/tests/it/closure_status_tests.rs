@@ -512,28 +512,58 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// `owl:sameAs` between two different constant IRIs is the one reserved read that may be
-/// `complete`, on the DL path only: the bounds decide equality between the data's
-/// individuals as they decide their other facts. :x has one :p, so :a = :b is entailed;
-/// nothing makes :a = :x. Off the RL route (an existential outside OWL 2 RL) and on it.
-/// The same read over the rules' closure stays denied.
+/// `print-query` prints a query with the status this store gives it under `owl2-rl` with
+/// the rewriting on, its answer's: a denied read isn't `complete` there either, and under
+/// NOT EXISTS it is `unsound` in both. Guard: a read of a user class stays `complete`.
 #[test]
-fn owl2_dl_decides_same_as_between_two_different_constants() {
+fn a_printed_query_carries_the_stores_status() {
+    use nrese_sparql::ql::{PrintForm, Printed};
+    let store = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
+    for (query, expected) in [
+        ("ASK { :fresh a owl:Thing }", "sound-only"),
+        (
+            "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x a owl:Thing } }",
+            "unsound",
+        ),
+        ("ASK { :rex a :Animal }", "complete"),
+    ] {
+        let printed = match store.print_query(&format!("{PREFIXES}{query}"), PrintForm::Paths) {
+            Ok(Printed::Query { completeness, .. }) => completeness.as_str(),
+            other => panic!("{query}: not printed: {other:?}"),
+        };
+        assert_eq!(
+            [printed, answer(&store, query).1[0]],
+            [expected; 2],
+            "{query}"
+        );
+    }
+}
+
+/// An existential outside OWL 2 RL: a store with it is off the RL route.
+const EXISTENTIAL: &str = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :q ; \
+                           owl:someValuesFrom :Dog ] .";
+
+/// `owl:sameAs` between two different constant IRIs is the one reserved read that may be
+/// `complete`, off the RL route only, where the upper bound types both as individuals: the
+/// bounds decide equality between them as they decide their other facts. :x has one :p,
+/// so :a = :b is entailed; nothing makes :a = :x. On the RL route no upper bound is built,
+/// so the same reads are denied, right but not `complete`; and so over the rules' closure.
+#[test]
+fn owl2_dl_decides_same_as_between_two_constants_the_upper_bound_types() {
     let data = ":p a owl:ObjectProperty , owl:FunctionalProperty . :x :p :a , :b . \
                 :a a :Dog . :x a :Dog .";
-    let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :q ; \
-                       owl:someValuesFrom :Dog ] .";
     let mut wrong = Vec::new();
     for off_the_rl_route in [false, true] {
         let dl = pipeline();
-        let extra = if off_the_rl_route { existential } else { "" };
+        let extra = if off_the_rl_route { EXISTENTIAL } else { "" };
         insert(&dl, &format!("{data} {extra}")).expect("data");
         for (read, holds) in [
             ("ASK { :a owl:sameAs :b }", "true"),
             ("ASK { :a owl:sameAs :x }", "false"),
         ] {
             let (text, status) = answer(dl.store(), read);
-            if !text.contains(holds) || status != ["complete"; 2] {
+            let decided = status == ["complete"; 2];
+            if !text.contains(holds) || decided != off_the_rl_route {
                 wrong.push(format!("off {off_the_rl_route}: {read}: {text} {status:?}"));
             }
         }
@@ -546,13 +576,15 @@ fn owl2_dl_decides_same_as_between_two_different_constants() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// What the `owl:sameAs` entry leaves denied on the DL path: one term at both ends (eq-ref,
-/// in neither bound: `:x owl:sameAs :x` and `:fresh owl:sameAs :fresh` are entailed, and
-/// the store answers `false`), and a variable end (`:a`'s own pair is missing).
+/// What the `owl:sameAs` entry leaves denied off the RL route, where it applies: one term
+/// at both ends (eq-ref, in neither bound: `:x owl:sameAs :x` and `:fresh owl:sameAs
+/// :fresh` are entailed, and the store answers `false`), and a variable end (`:a`'s own
+/// pair is missing).
 #[test]
 fn owl2_dl_denies_same_as_of_one_term_or_a_variable() {
     let dl = pipeline();
-    insert(&dl, ":p a owl:FunctionalProperty . :x :p :a , :b .").expect("data");
+    let data = format!(":p a owl:FunctionalProperty . :x :p :a , :b . :x a :Dog . {EXISTENTIAL}");
+    insert(&dl, &data).expect("data");
     for read in [
         "ASK { :x owl:sameAs :x }",
         "ASK { :fresh owl:sameAs :fresh }",
@@ -566,35 +598,36 @@ fn owl2_dl_denies_same_as_of_one_term_or_a_variable() {
     assert!(!status.contains(&"complete"), "{status:?}");
 }
 
-/// A constant outside the data isn't one of the individuals U1 bounds, and where the
-/// ontology allows one individual only (`owl:Thing ⊑ {:a}`) it is entailed equal to every
-/// other, which neither bound says. So the entry holds only for terms of the data: there
-/// every term is entailed equal to :a, and the store answers `false` for those outside the
-/// data. In data with no such axiom the same reads are `false` and right, but not
-/// `complete` either.
+/// A term the upper bound doesn't type as an individual (outside the data, or only a class
+/// name) is one it doesn't reason about: where the ontology allows one individual only
+/// (`owl:Thing ⊑ {:a}`) every term is entailed equal to :a, which neither bound says for
+/// such a term. So its `owl:sameAs` reads are never `complete`, off the RL route too.
+/// Without such an axiom the reads of terms outside the data are `false`, and right.
 #[test]
-fn owl2_dl_same_as_of_a_term_outside_the_data_is_never_complete() {
+fn owl2_dl_same_as_of_a_term_the_upper_bound_doesnt_type_is_never_complete() {
     let mut wrong = Vec::new();
-    for (data, entailed) in [
-        (":x a :Dog .", false),
+    for (data, one_individual) in [
+        (format!(":x a :Dog . {EXISTENTIAL}"), false),
         (
-            "owl:Thing rdfs:subClassOf [ owl:oneOf ( :a ) ] . :a a :Dog . :b a :Dog .",
+            "owl:Thing rdfs:subClassOf [ owl:oneOf ( :a ) ] . :a a :Dog . :b a :Dog .".to_owned(),
             true,
         ),
     ] {
         let dl = pipeline();
-        insert(&dl, data).expect("data");
+        insert(&dl, &data).expect("data");
         for read in [
             "ASK { :fresh owl:sameAs :new }",
             "ASK { :x owl:sameAs :fresh }",
+            // :Dog occurs only as a class.
+            "ASK { :Dog owl:sameAs :a }",
         ] {
             let (text, status) = answer(dl.store(), read);
-            if !text.contains("false") || status.contains(&"complete") {
+            if (!one_individual && !text.contains("false")) || status.contains(&"complete") {
                 wrong.push(format!("{data}: {read}: {text} {status:?}"));
             }
         }
-        // Between two terms of the data the bounds decide, the one domain element included.
-        if entailed {
+        // Two individuals of the data: the bounds decide, the one individual included.
+        if one_individual {
             let (text, status) = answer(dl.store(), "ASK { :a owl:sameAs :b }");
             if !(text.contains("true") || !status.contains(&"complete")) {
                 wrong.push(format!("{data}: :a = :b: {text} {status:?}"));
