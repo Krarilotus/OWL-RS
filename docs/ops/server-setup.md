@@ -56,6 +56,9 @@ The image's entrypoint is `nrese-server`, so a [command](#commands) runs as
 
 ## Under systemd
 
+There is no published binary yet: `cargo build --release -p nrese-server` builds it as
+`target/release/nrese-server` ([building](../dev/getting-started.md#build), with the browser
+console [built first](../dev/getting-started.md#build-the-user-frontend) if you want it).
 Put the binary in `/opt/nrese/bin/`, the settings in `/etc/nrese/` and the data in
 `/var/lib/nrese/data`, owned by a non-login user `nrese`. The server logs to standard output, so
 the journal has its log. `/etc/nrese/nrese.env` is as above, with `NRESE_STORE_MODE=on-disk` and
