@@ -67,8 +67,7 @@ its manual.
 [config-reference.md](ops/config-reference.md) every setting and
 [http-api.md](ops/http-api.md) every endpoint, and there are
 [replication.md](ops/replication.md) and [backups.md](ops/backups.md).
-The integrations are [ResearchSpace](integration/researchspace.md) and
-[the Datamodel Workflow](integration/datamodel-workflow.md).
+The integration with [ResearchSpace](integration/researchspace.md) has its own page.
 To contribute, there are [CONTRIBUTING.md](../CONTRIBUTING.md), [AGENTS.md](../AGENTS.md) for
 agents and the [code rules](dev/code-structure-guidelines.md), and for the console the
 [frontend contract](dev/frontend-backend-contract.md) and [extending it](dev/frontend-extension-guide.md).

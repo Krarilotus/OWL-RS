@@ -292,20 +292,34 @@ These are its limits.
 
 ## Draft checks (`/api/v1/draft-check`)
 
-These are isolated checks of pinned inputs, for the Datamodel Workflow and any other client of its store-check protocol (`dmw-store-check/1`, see [the DMW guide](../integration/datamodel-workflow.md#draft-checks)). Each check runs in a throwaway in-memory store, and no repository is read or written. The permission asked is the one to query.
+A draft check validates, queries or reasons over inputs sent with the request, before they are stored anywhere: data, a schema, SHACL shapes and a query, each pinned by its SHA-256. Each check runs in a throwaway in-memory store, and no repository is read or written. The permission asked is the one to query.
 
 | Method and URL | What |
 |---|---|
-| `GET /api/v1/draft-check/capabilities` | The protocol, operations (`shacl`, `query`, `reasoning`), profiles, semantics, this build's id, and the longest time limit a request may ask for |
-| `POST /api/v1/draft-check` | One check: a JSON request with the check's identity, limits and inputs (N-Triples; the query as SPARQL text); the answer is JSON |
+| `GET /api/v1/draft-check/capabilities` | `protocol`, `operations` (`shacl`, `query`, `reasoning`), `profiles`, `semantics`, `build_id` and `max_seconds`, the longest time limit a request may ask for |
+| `POST /api/v1/draft-check` | One check, as JSON, answered as JSON |
 
-Every answer is 200 with a terminal status (`completed`, `failed`, `timeout`, `unsupported`) and echoes the request's identity. A request that isn't a draft-check request is 400, and one larger than the upload limit is 413.
+A request names:
 
-These are its limits.
+- `protocol` (`dmw-store-check/1`) and `operation`;
+- the check's identity, echoed unchanged in the answer: `request_sha256`, `scope`, `build_id`, `semantics_id`, `profile`, `input_hashes`;
+- `limits`: `max_seconds`, `max_results`, `max_triples`;
+- `inputs`: `data`, `schema` and `shapes` as N-Triples, and `query` as SPARQL, as the operation needs them.
 
-- One profile, `owl2-rl`, under the semantics `nrese:draft-check/2`: `logical_consistent` is `false` where the OWL 2 RL rules or the OWL 2 DL engines find no model, `true` where neither does and both decided, and `null` where it isn't decided; unsatisfiable classes by the OWL 2 DL classification, none listed for an inconsistent input. Axioms either skipped, and an undecided verdict, are reported as unsupported, and the answer is then not complete. (`/1`'s `logical_consistent` was the RL rules' alone; it is no longer served.)
-- SHACL Core only; SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported as unsupported.
-- A time limit above the server's query timeout is refused, not shortened.
+Every answer is 200, with the identity as asked, `effective_limits` (never lowered without saying so) and the outcome:
+
+- `terminal_status` (`completed`, `failed`, `timeout`, `unsupported`), `complete`, `unsupported` and `detail`;
+- SHACL: `shacl_conforms`, `shacl_applicable` (some targeted shape had a focus node and a constraint) and `shacl_meta_validated`;
+- a query: `observed_ask`, or `observed_rows` with each term's `kind` (`uri`, `literal`, `bnode`), `value`, `datatype` and `language`;
+- reasoning: `logical_consistent` and `unsatisfiable_classes`.
+
+The answer refuses a request for another build, semantics or profile, a time limit above the server's query timeout, and inputs that don't match their pinned SHA-256. A request that isn't a draft check is 400, and one larger than the upload limit is 413.
+
+What a check means, under the semantics `nrese:draft-check/2` and the one profile, `owl2-rl`:
+
+- SHACL checks the data and the schema together, asserted statements only, with SHACL Core. SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported as unsupported.
+- A query reads the data alone, asserted statements only, `ASK` and `SELECT`. More rows than `max_results` is a failure, never a cut answer.
+- Reasoning gives `logical_consistent: false` where the OWL 2 RL rules or the OWL 2 DL engines find no model, `true` where neither does and both decided, and `null` where it isn't decided, which means the check couldn't run, not that it passed. The OWL 2 DL classification lists the unsatisfiable classes, none for an inconsistent input. Axioms either engine skipped, and an undecided verdict, are reported as unsupported, and the answer is then not complete.
 
 ## Engine API (`/api/v1`)
 

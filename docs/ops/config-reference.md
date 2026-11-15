@@ -155,7 +155,7 @@ These settings need more than their row.
 - **`store.default_graph`**: what a query, or an update's `WHERE`, reads when it names no dataset:
   - `default`: only the default graph, as the SPARQL specification describes a plain dataset;
   - `union`: the merge of all graphs, as GraphDB, RDF4J stores and Blazegraph do. A statement counts once, however many graphs hold it.
-  - use `union` for clients that write into named graphs and query without naming them (ResearchSpace, the Datamodel Workflow's exports)
+  - use `union` for clients that write into named graphs and query without naming them (ResearchSpace, or exporters that write one graph per module)
   - `GRAPH` patterns, `FROM` clauses and the protocol's dataset parameters mean the same in both modes
   - an update without `GRAPH` still writes to, and deletes from, the default graph only
   - cost: `union` runs on the native executor like `default`, but reads graph-last index orders and drops repeated statements, and the shortcuts that answer from index counts alone (`COUNT(*)` of one pattern, range filters, the worst-case-optimal join) don't apply. How much slower that is hasn't been measured yet

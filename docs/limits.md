@@ -96,6 +96,9 @@ leave something out.
   ([completeness](spec/reasoning-semantics.md#completeness)). Under `owl2-rl`, turn the
   rewriting on with `reasoner.ql_rewriting = "on"`. Under `owl2-dl`, raise the `dl.*` budgets
   where they leave answers `sound-only`, or ask `dl-answers=exact` to get an error instead.
+- Over a ruleset's closure, an answer under `OPTIONAL`, `MINUS`, `NOT EXISTS` or an aggregate also
+  says `sound-only`, though a missing inference can make one of its rows wrong there, and the status
+  doesn't say so yet. Read such answers as `unsound`.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
