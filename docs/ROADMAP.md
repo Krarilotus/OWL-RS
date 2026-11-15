@@ -15,39 +15,39 @@ below; across machines, only read replicas are built so far.
 
 ## The order (owner, 5 October 2026)
 
-1. **Finish v2:** the open items of the merge checklist, as its
+1. Finish v2 with the open items of the merge checklist, as its
    [status table](plan/2026-10-05-v2-merge-checklist.md) lists them.
-2. **Benchmark it:** the fast regression suite, the core workloads with a real
+2. Benchmark it with the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the
    best-configuration track ([benches/PROTOCOL.md](../benches/PROTOCOL.md)).
-3. **Merge v2 into `main`** when every guard is green and nothing regressed.
-4. **Concise docs and a major refactoring:** the README and docs short enough to
+3. Merge v2 into `main` when every guard is green and nothing regressed.
+4. Concise docs and a major refactoring: the README and docs short enough to
    contribute from; files over about 600 lines split; Miri over the unsafe code; measured
    test coverage; duplicate dependency versions; the last typed errors.
-5. **v3.**
-6. **The new goals G8–G13** (STATUS): property graphs (ISO GQL, openCypher) over the same
+5. v3.
+6. The new goals G8–G13 (STATUS): property graphs (ISO GQL, openCypher) over the same
    store, enterprise operations, data integration, AI integration, exploration and
    history, ontology work and publishing.
 
 ## How work is checked
 
-- **Correctness first:** differential tests against an oracle for every optimisation
+- Correctness comes first: differential tests against an oracle for every optimisation
   (the reference SPARQL evaluator, the naive rule evaluator, HermiT and Konclude for DL),
   the fuzz campaign, the W3C suites.
-- **Each win keeps its guard:** a cheap deterministic test (counts, plan shapes, bounds)
+- Each win keeps its guard, a cheap deterministic test (counts, plan shapes, bounds)
   in the same commit as the win ([design/performance.md](design/performance.md) §0), so a
   regression fails where it happens, not in a large benchmark run.
-- **Benchmarks in bulk** at the end of a batch, interleaved, with confidence intervals.
-- **Milestones** end with an independent review of the diff and a perf-lab check against
+- Benchmarks run in bulk at the end of a batch, interleaved, with confidence intervals.
+- Milestones end with an independent review of the diff and a perf-lab check against
   the previous milestone before they go to `main`; bug and security fixes go to `main` as
   hotfixes once CI is green.
-- **One paper, at the end,** about the complete store including DL.
+- One paper comes at the end, about the complete store including DL.
 
 ## Reasoning that leads, on every level
 
 Every reasoning component starts from the state of the art and is then worked top-down
-(method, plan, operators, data layout, machine code), using what a reasoner built into
+(method, plan, operators, data layout, machine code). At each level it uses what a reasoner built into
 its own store can do that a reasoner bolted onto a store can't.
 
 | Level | The state of the art to reach | What NRESE's full stack adds |

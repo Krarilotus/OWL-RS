@@ -32,7 +32,7 @@ for `9d5a65fd`; where the code has moved on, this table says so.
 
 **What carries over.** Inline values (integers, decimals, dates, booleans) are globally
 canonical and need no dictionary (`term/mod.rs:42-71`). A `Snapshot` is a cheap, immutable
-`Arc` of the runs plus revision (`snapshot.rs:30-39`), so it already serves as a read epoch on one
+`Arc` of the runs plus revision (`snapshot.rs:30-39`), so it already is a read epoch on one
 node. The reasoner reads through traits (`nrese-reasoner/src/eval.rs:52` `Source`,
 `delta.rs:51` `Base`), so a partitioned source is possible without touching the rules. The
 WAL ships byte-identical frames to replicas (`engine/replication.rs:44,112`), so failover and

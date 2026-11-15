@@ -5,10 +5,10 @@ What is in today, left out and planned: the [scope](../what-it-covers.md#scope).
 
 ## Product vision
 
-NRESE is an RDF database and ontology platform that **reads like QLever and governs data like GraphDB**, and means to lead in reasoning:
+NRESE is an RDF database and ontology platform that reads like QLever and governs data like GraphDB, and means to lead in reasoning:
 - QLever-class query speed and scale: dictionary-encoded permutation indexes, merge and worst-case-optimal joins, integrated text search, fast bulk loading.
 - GraphDB-class semantics and governance: queryable RDFS/OWL 2 RL materialisation with incremental maintenance, SHACL validation on commit, transactional updates whose cost follows the change, not the dataset.
-- Reasoning as the lead feature: from the materialisable profiles to OWL 2 DL (classification, consistency, explanation), drawing on the widest research field there is for it.
+- Reasoning as the lead feature: from the materialisable profiles to OWL 2 DL (classification, consistency, explanation); its design draws on the widest research field there is for it.
 - Hardware-aware and scalable: it uses every core, the memory, the CPU features and GPUs of the machine it runs on, and scales out to clusters where a use case gains from it; each derived setting can be overridden.
 - One consolidated engine API: the protocols and the one frontend are thin translations of the core's operations.
 

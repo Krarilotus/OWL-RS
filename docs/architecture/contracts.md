@@ -8,9 +8,11 @@ Line numbers refer to the baseline above; proposed APIs and guards are not imple
 
 ## Cancellation
 
-**Owner:** `nrese_exec::stop::{StopSource, StopCheck, Ticker, Stop}` in `crates/nrese-exec/src/stop.rs:65`, :104, :126 and :28; contract at :1. Use one
+The owner is `nrese_exec::stop::{StopSource, StopCheck, Ticker, Stop}` in `crates/nrese-exec/src/stop.rs:65`, :104, :126 and :28; contract at :1. Use one
 source per request and one ticker per sequential loop or parallel task. Tick attempted work, check before and after opaque calls, and finish before
-accepting results. The interval is 4096 work units per executing task; one large tick does not bound the opaque work inside it. Retain the original
+accepting results. The interval is 4096 work units per executing task; one large tick does not bound the opaque work inside it. Under nested counted
+reads (a read suspended while another runs inside its callback), with d suspended levels, up to 4096 plus one run plus d × 4096
+units run between two asks, and up to d × 4096 after a refusal: the bound is stated at `nrese_reasoner::Poller` (`crates/nrese-reasoner/src/eval.rs`). Retain the original
 stop reason when adapting bool callbacks. See [execution-core](../design/execution-core.md).
 
 Known bypasses:
@@ -44,7 +46,7 @@ At this baseline no production loop uses `Ticker`; `Resources::stop` at `crates/
 
 ## Memory
 
-**Owner:** `nrese_exec::budget::{SharedBudget, Envelope, Budget, Reservation, ChargedVec, Gauge}` (`crates/nrese-exec/src/budget.rs:8`); `MemoryWatch`
+The owner is `nrese_exec::budget::{SharedBudget, Envelope, Budget, Reservation, ChargedVec, Gauge}` (`crates/nrese-exec/src/budget.rs:8`); `MemoryWatch`
 observes process memory (`crates/nrese-exec/src/memory.rs:297`). Reserve before allocation, retain the reservation with memory, free before release,
 and account old-plus-new transient buffers and nested owned payloads. Request parts share one envelope under the shared root. `Gauge` estimates and
 sampled `MemoryWatch` are not exact pre-allocation admission. See [resource lifetimes](../design/execution-core.md#execution-and-resource-lifetime).
@@ -76,7 +78,7 @@ A dropped transaction does not undo dictionary interning (`crates/nrese-engine/s
 
 ## Lock order
 
-**Owners:** `Engine`, `Transaction`, `Versions` in `crates/nrese-engine/src/engine/mod.rs:21`; `Dictionary` in
+The owners are `Engine`, `Transaction`, `Versions` in `crates/nrese-engine/src/engine/mod.rs:21`; `Dictionary` in
 `crates/nrese-engine/src/term/dictionary.rs:24`. Follow writer → checkpoint → compaction → WAL → current version → dictionary; inside the dictionary,
 one index → inner → order → derived bookkeeping, never two locks of one level. Rayon workers use fallible slot admission rather than waiting;
 compaction holders run serial work. Vector filters use `SearchInput` after index locks are released (`crates/nrese-engine/src/term/vectors.rs:480`).
@@ -85,12 +87,12 @@ commit converts the stack, the compaction slot held: it takes no lock and calls 
 compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
 `WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
-**A version's own slots** (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
+A version's own slots (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
 value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
 the snapshot and its other slots. The engine takes it under none of its own locks: an installed version is a value no snapshot held
 (`Versions::install`), so nothing drains it.
 
-**The `owl2-dl` bounds (U1):** `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145` (P2-C6b). Its `state` and `view` mutexes guard
+The `owl2-dl` bounds (U1) are `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145` (P2-C6b). Its `state` and `view` mutexes guard
 serial work only: taking what a read or a commit needs, a revision check, publishing, applying a computed change. The engine's writer slot and
 the mutation pipeline's ground cache (`crates/nrese-store/src/mutation/pipeline.rs:227`) come before the mutation-side `state`, which `install`
 takes after the commit returns (:363). A build cell's `building` mutex (`crates/nrese-exec/src/cell.rs:145`) comes before the `state`/`view`
@@ -110,7 +112,7 @@ Known bypasses and gaps:
 
 ## Durability
 
-**Owners:** `Durable` (`crates/nrese-engine/src/durability/mod.rs:105`), `Transaction::commit` (`crates/nrese-engine/src/engine/transaction.rs:477`),
+The owners are `Durable` (`crates/nrese-engine/src/durability/mod.rs:105`), `Transaction::commit` (`crates/nrese-engine/src/engine/transaction.rs:477`),
 `BulkLoad` (`crates/nrese-engine/src/engine/bulk.rs:3`), and application `MutationPipeline`/`MutationTicket`
 (`crates/nrese-store/src/mutation/pipeline.rs:36`; `crates/nrese-store/src/mutation/ticket.rs:21`). Ordinary commit builds, appends/syncs WAL, then
 publishes. A journal beside the log that must agree with it (the quarantine's resolutions) is written as the commit's note, before the record,
@@ -128,7 +130,7 @@ Known bypasses:
 
 ## HTTP errors
 
-**Owners:** `StoreError` cause classification (`crates/nrese-store/src/error.rs:161`, :172, :183) and `ApiError` response rendering
+The owners are `StoreError` cause classification (`crates/nrese-store/src/error.rs:161`, :172, :183) and `ApiError` response rendering
 (`crates/nrese-server/src/error.rs:138`). Preserve typed causes and operation context. Query/mutation adapters distinguish shared memory (503), request
 memory (413), forbidden (403), request fault (400) and internal fault (500); cancellation and incomplete answers have dedicated meanings. Do not
 classify formatted error strings. Transport ownership follows [ARCHITECTURE.md](../ARCHITECTURE.md#3-where-to-fix-what).
@@ -145,7 +147,7 @@ No universal transport classifier exists at this baseline; operation semantics m
 
 ## Work admission and limits
 
-**Owners:** `Resources` (`crates/nrese-sparql/src/query.rs:14`), `RowLimit` (`crates/nrese-exec/src/join.rs:60`), `Workers`
+The owners are `Resources` (`crates/nrese-sparql/src/query.rs:14`), `RowLimit` (`crates/nrese-exec/src/join.rs:60`), `Workers`
 (`crates/nrese-exec/src/workers.rs:9`), checked narrowing (`crates/nrese-exec/src/narrow.rs:9`), and `RequestLimits`
 (`crates/nrese-server/src/policy.rs:83`). Pass one request envelope and cancellation through evaluations; apply row bounds across parallel outputs and
 refuse at exact representation boundaries. `Workers::limited` narrows a handle, not nested kernels. QL `Work` (`crates/nrese-owl/src/ql/witness.rs:33`)
@@ -160,7 +162,7 @@ No general admission `Work` type exists; QL, solver and kernel units remain dist
 
 ## Datatypes
 
-**Owner:** `nrese-xsd`, especially `owl::{Datatype, Value, ValueSet, Rational}` (`crates/rdf/nrese-xsd/src/owl/mod.rs:20`); `Value::parse` is at
+The owner is `nrese-xsd`, especially `owl::{Datatype, Value, ValueSet, Rational}` (`crates/rdf/nrese-xsd/src/owl/mod.rs:20`); `Value::parse` is at
 `crates/rdf/nrese-xsd/src/owl/value.rs:56`. Reuse lexical parsers and datatype facts; preserve exact OWL identity and ill-typed versus unsupported
 distinctions. The DL caller is `crates/nrese-dl/src/datatypes/ranges.rs:217`. Keep SPARQL promotion and canonical-only inline packing/RDF term identity
 separate. See [RDF bundle](../design/rdf-bundle.md) and [DL design](../design/owl2-dl.md).
@@ -184,7 +186,7 @@ Known bypasses:
 
 ## Reasoner verdicts
 
-**Owners:** nrese-dl `Verdict` (`crates/nrese-dl/src/verdict.rs:8`), re-exported as store `dl::Verdict`; store `Checked`
+The owners are nrese-dl `Verdict` (`crates/nrese-dl/src/verdict.rs:8`), re-exported as store `dl::Verdict`; store `Checked`
 (`crates/nrese-store/src/dl/consistency.rs:18`); query `Completeness/Regime` (`crates/nrese-sparql/src/completeness.rs:12`, :50), tableau `Answer`
 (`crates/nrese-dl/src/tableau/mod.rs:229`) and beyond `Verdict` (`crates/nrese-dl/src/beyond/mod.rs:65`, converted by `consistency()`). The verdict has
 no default: classification states `Consistent`, `Inconsistent` or `Unknown(why)`, and its reports (`crates/nrese-store/src/classification.rs`) list
@@ -196,7 +198,7 @@ and refuse exact answers without completeness. See [reasoning semantics](../spec
 
 ## Dataset and bench inputs
 
-**Owners:** Python case registry `suitekit.cases::{load, load_at, problems}` (`benches/suite/suitekit/cases.py:63`, :79, :97), frozen dataset `Store`
+The owners are the Python case registry `suitekit.cases::{load, load_at, problems}` (`benches/suite/suitekit/cases.py:63`, :79, :97), frozen dataset `Store`
 (`benches/suite/suitekit/datasets.py:58`), result `Result` (`benches/suite/suitekit/schema.py:38`), and prepared-run inputs
 (`benches/fast/fast.py:1486`). Load common case identities, use `load_at` for historical jobs, retain frozen bytes/hash/provenance/source version,
 prepare once with sidecars, and verify each pass. Size checks are not full hash verification. See [case schema](../../benches/cases/README.md) and

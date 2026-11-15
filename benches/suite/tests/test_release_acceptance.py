@@ -1079,23 +1079,31 @@ class Tradeoffs(Scratch):
     candidate's tree). Moved from test_release_gate.py: the verdict reads its policy from the
     candidate commit, no longer from what each timed report embedded."""
 
-    def rounds(self, candidate: str, losses: tuple[float, float] = (1.08, 1.08)) -> list[dict]:
-        """Two rounds, round k's q06 LOSSES[k] times the baselines', the paying win in both."""
-        def records_of(loss):
+    def rounds(self, candidate: str, losses: tuple = (1.08, 1.08), wins: tuple | None = None) -> list[dict]:
+        """One round per LOSSES entry, round k's q06 LOSSES[k] times the baselines' (a tuple: one
+        factor per block, so that round's interval is as broad as they differ), and its paying win
+        WINS[k] (default 0.36: the triangles 2.8x faster; 1.0: none)."""
+        wins = wins or (0.36,) * len(losses)
+
+        def factor(loss, n):
+            # n: the pass number, six a block (three sides, two runs each; fixtures.passes).
+            return loss[(n - 1) // 6] if isinstance(loss, tuple) else fixtures.worse(loss, n)
+
+        def records_of(loss, win):
             def records(side, n):
                 cand = side == "cand"
                 return [fixtures.record(samples={"q01": [10.0, 10.1, 9.9],
-                                                 "q06": [v * (fixtures.worse(loss, n) if cand else 1)
+                                                 "q06": [v * (factor(loss, n) if cand else 1)
                                                          for v in [4.8, 4.85, 4.8]]}),
                         fixtures.record(case="kernel-intersect",
-                                        samples={"triangles": [v * (fixtures.worse(0.36, n) if cand else 1)
+                                        samples={"triangles": [v * (fixtures.worse(win, n) if cand else 1)
                                                                for v in [140.0, 140.5]]})]
             return records
         # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
         # 0.0083), and which runs a side got in the block's order decided it.
         out = []
-        for k in (0, 1):
-            summary = fixtures.run_gate(fixtures.passes(records_of(losses[k]), blocks=3),
+        for k, (loss, win) in enumerate(zip(losses, wins)):
+            summary = fixtures.run_gate(fixtures.passes(records_of(loss, win), blocks=3),
                                         context={**fixtures.CONTEXT, "round": k})
             summary["candidate"]["revision"] = candidate
             out.append(summary)
@@ -1115,9 +1123,33 @@ class Tradeoffs(Scratch):
             lines.append(f"{key} = {value}")
         return "\n".join(lines) + "\n"
 
-    def verdict(self, policy: str = "", losses: tuple[float, float] = (1.08, 1.08)) -> subprocess.CompletedProcess:
+    def verdict(self, policy: str = "", losses: tuple = (1.08, 1.08), wins: tuple | None = None) -> subprocess.CompletedProcess:
         a = self.repo.commit(policy=policy)
-        return verdict(self.repo.path, a, self.rounds(a, losses), *checks(a, self.repo.tree(a)))
+        return verdict(self.repo.path, a, self.rounds(a, losses, wins), *checks(a, self.repo.tree(a)))
+
+    # A first round too broad to show the loss: its blocks 0 %, 8 % and 30 % slower (p about 0.14,
+    # its interval reaching 1.56, past the 1.12 bound); the rounds after show 8 % within it.
+    BROAD = (1.00, 1.08, 1.30)
+
+    def test_a_round_that_showed_no_loss_neither_needs_nor_gives_cover(self):
+        # Spec: release-tradeoffs.toml, review load-peak-tradeoff r1 P-1: the bound is judged in the
+        # rounds that showed the loss. An early broad round that didn't show it no longer sinks an
+        # approval the later rounds confirm within its bound.
+        done = self.verdict(self.entry(), losses=(self.BROAD, 1.08, 1.08))
+        self.assertEqual(done.returncode, 0, f"SPEC a broad round that showed no loss sank the approval\n{done.stdout}")
+        self.assertIn("accepted trade-off", done.stdout)
+
+    def test_every_round_that_showed_the_loss_must_lie_within_the_bound_and_show_the_win(self):
+        # Spec: the rounds that showed the loss each need the bound and the win, a fourth confirmation
+        # round included; a broad round before them changes none of that.
+        for label, losses, wins in (
+                ("a later round beyond the bound", (self.BROAD, 1.08, 1.50), None),
+                ("a round that showed it without the win", (self.BROAD, 1.08, 1.08), (0.36, 1.0, 0.36)),
+                ("a fourth round beyond the bound", (1.08, 1.08, 1.08, 1.50), None)):
+            with self.subTest(label):
+                done = self.verdict(self.entry(), losses=losses, wins=wins)
+                self.assertEqual(done.returncode, 1, f"SPEC {label} was accepted\n{done.stdout}")
+                self.assertIn("**confirmed loss**: lab-olympics against", done.stdout)
 
     def test_a_trade_off_covers_a_loss_only_within_its_bound_in_every_round(self):
         # Spec: review r1 R3, probe real-reports-tradeoff-8-percent-then-50-percent: an approval bounded
@@ -1145,9 +1177,18 @@ class Tradeoffs(Scratch):
                       self.entry(dimension="time/q01"), self.entry(by="the owner")):
             self.assertEqual(self.verdict(entry).returncode, 1, entry)
 
-    def test_the_list_starts_empty_and_a_malformed_entry_is_refused(self):
+    def test_the_trees_policy_names_gated_rows_and_a_malformed_entry_is_refused(self):
+        # A malformed file makes every verdict NOT PASSED; a trade-off whose loss or win names no
+        # row the gate judges covers nothing, and the loss it was approved for blocks.
         policy = gate_module.load_policy((ROOT / POLICY).read_text(encoding="utf-8"))
-        self.assertEqual((policy.tradeoffs, policy.exceptions, policy.errors), ([], [], []))
+        self.assertEqual((policy.exceptions, policy.errors), ([], []))
+        catalog = gate_module.cases_registry.load()
+        for t in policy.tradeoffs:
+            sides = [t["against"]] if "against" in t else ["base", "main"]
+            for case, dimension_ in ((t["case"], t["dimension"]), (t["pays_with"]["case"], t["pays_with"]["dimension"])):
+                family = gate_module.family_of(catalog, [case])
+                self.assertTrue(any(gate_module.hypothesis(s, case, dimension_) in family for s in sides),
+                                f"{case} {dimension_}: no row the gate judges ({t['reason']})")
         bad = gate_module.load_policy('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n')
         self.assertEqual(bad.tradeoffs, [])
         self.assertIn("missing approved, by, pays_with, quote, reason, source", bad.errors[0])

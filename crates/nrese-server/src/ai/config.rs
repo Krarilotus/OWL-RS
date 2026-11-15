@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+/// The system prompt of suggestion requests unless `ai.system_prompt` sets one.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You generate concise SPARQL query ideas for an RDF and OWL knowledge graph. Return strict JSON only. Prefer safe read queries. Use prefixes only when you can justify them from the prompt or context. If uncertain, use full IRIs.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiConfig {
     pub enabled: bool,
     pub provider: AiProviderConfig,
@@ -18,12 +21,12 @@ impl Default for AiConfig {
             model: "gemini-2.5-flash".to_owned(),
             request_timeout: Duration::from_secs(20),
             max_suggestions: 4,
-            system_prompt: "You generate concise SPARQL query ideas for an RDF and OWL knowledge graph. Return strict JSON only. Prefer safe read queries. Use prefixes only when you can justify them from the prompt or context. If uncertain, use full IRIs.".to_owned(),
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiProviderConfig {
     Disabled,
     Gemini(GeminiConfig),
@@ -40,13 +43,13 @@ impl AiProviderConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeminiConfig {
     pub api_key: String,
     pub api_base: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRouterConfig {
     pub api_key: String,
     pub api_base: String,
