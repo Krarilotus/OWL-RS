@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::native::cache_key::Encoder;
+
 /// A query's completeness. The default: sound and complete, nothing to say.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Completeness {
@@ -168,10 +170,10 @@ impl Completeness {
         }
     }
 
-    /// Writes every field to `out` as the result cache's keys are written
+    /// Writes every field to `out` with the result cache's own key writers
     /// (`native::cache_key::Encoder`): a byte per bool and tag, a count before a list, a
-    /// presence byte before an option, each text as its length (u64, little-endian) and its
-    /// bytes. Injective, so two statuses share bytes exactly when they are equal.
+    /// presence byte before an option, each text as its length and its bytes. Injective, so
+    /// two statuses share bytes exactly when they are equal.
     pub fn write_cache_context(&self, out: &mut Vec<u8>) {
         let Self {
             sound,
@@ -182,18 +184,17 @@ impl Completeness {
             regime,
             outside,
         } = self;
-        let number = |out: &mut Vec<u8>, n: u64| out.extend_from_slice(&n.to_le_bytes());
-        let text = |out: &mut Vec<u8>, t: &str| {
-            number(out, t.len() as u64);
-            out.extend_from_slice(t.as_bytes());
-        };
-        out.extend([*sound, *complete, *certification_withheld].map(u8::from));
-        number(out, reasons.len() as u64);
-        for Reason { source, text: said } in reasons {
-            text(out, source);
-            text(out, said);
+        let mut e = Encoder::default();
+        e.bytes = std::mem::take(out);
+        for flag in [*sound, *complete, *certification_withheld] {
+            e.tag(u8::from(flag));
         }
-        out.push(u8::from(bounds.is_some()));
+        e.number(reasons.len() as u64);
+        for Reason { source, text: said } in reasons {
+            e.text(source);
+            e.text(said);
+        }
+        e.tag(u8::from(bounds.is_some()));
         if let Some(Bounds {
             lower,
             upper,
@@ -201,10 +202,10 @@ impl Completeness {
         }) = bounds
         {
             for n in [*lower, *upper, *unresolved] {
-                number(out, n);
+                e.number(n);
             }
         }
-        out.push(match regime {
+        e.tag(match regime {
             None => 0,
             Some(Regime::Owl2Ql) => 1,
             Some(Regime::Owl2Rl) => 2,
@@ -212,7 +213,7 @@ impl Completeness {
             Some(Regime::Rdfs) => 4,
             Some(Regime::Custom) => 5,
         });
-        out.push(u8::from(outside.is_some()));
+        e.tag(u8::from(outside.is_some()));
         if let Some(Outside {
             what,
             by,
@@ -220,11 +221,12 @@ impl Completeness {
             not_guaranteed,
         }) = outside
         {
-            number(out, what.len() as u64);
+            e.number(what.len() as u64);
             for t in what.iter().chain([by, guaranteed, not_guaranteed]) {
-                text(out, *t);
+                e.text(t);
             }
         }
+        *out = e.bytes;
     }
 
     /// `complete`, `sound-only`, `unsound` or `not-certified`.
