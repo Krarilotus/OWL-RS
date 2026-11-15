@@ -430,7 +430,7 @@ pub(crate) fn run_query(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     out: impl Write,
-    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> String,
+    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> Vec<u8>,
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
