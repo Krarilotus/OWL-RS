@@ -1,6 +1,7 @@
 description = """The first example (README.md, "A first answer: inference", and docs/tutorial.md),
 as written there: under owl2-rl with the SHACL gate enforcing, an instance of a
-subclass is an instance of its superclass by inference, with a sound-only answer; deleting the
+subclass is an instance of its superclass by inference, with a sound-only answer, and reading
+asserted statements only (infer=false) finds none, with a complete answer; deleting the
 premise takes the inference with it; a shape in the shapes graph makes the gate reject an unnamed
 cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes."""
 
@@ -30,6 +31,17 @@ status = 200
 headers = { nrese-completeness = { contains = "sound-only; regime=owl2-rl" } }
 rows = 1
 json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/tom" } }
+
+[[step]]
+name = "asserted statements only: no animal, complete"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}", infer = "false" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = "complete" }
+rows = 0
 
 [[step]]
 name = "delete the premise"
