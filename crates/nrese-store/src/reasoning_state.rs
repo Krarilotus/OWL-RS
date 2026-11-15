@@ -78,7 +78,7 @@ pub enum WhyUndecided {
 }
 
 impl WhyUndecided {
-    /// What is known, and the two ways out: the one text for each place that says it.
+    /// What is known, and the ways out: the one text for each place that says it.
     pub fn text(self, violations: usize) -> String {
         let why = match self {
             Self::ReadsDifferently => {
@@ -92,8 +92,9 @@ impl WhyUndecided {
         };
         format!(
             "the OWL 2 RL rules find {violations} clash(es), and {why}; this release doesn't \
-             decide whether the data is consistent under OWL 2 DL. Remove the clash's \
-             premises, or use the owl2-rl mode, whose promise is the rules' reading"
+             decide whether the data is consistent under OWL 2 DL. Remove the statements \
+             behind the clash, remove the annotation property's domain, range or \
+             super-property, or give the individual its own IRI"
         )
     }
 }

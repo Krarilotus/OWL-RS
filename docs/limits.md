@@ -110,7 +110,9 @@ planned.
   real clash beside an unrelated punned name reads `undecided` too, and a DL engine's later
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
-  `undecided` from `inconsistent`. Remove the clash's premises, or use `owl2-rl`.
+  `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
+  annotation property's domain, range or super-property, or give the individual its own
+  IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
 - An undeclared property used with literal values is read as a data property. Declare
   annotation properties such as `skos:prefLabel` (`skos:prefLabel a owl:AnnotationProperty`);
   otherwise a labelled class reads as punned, and under `owl2-dl` it leaves the rules-only

@@ -328,7 +328,7 @@ impl MutationPipeline {
                     };
                     let mut detail = match (undecided, &explanation) {
                         (Some(why), _) => {
-                            format!("{}; the write is refused", why.text(violations.at_least()))
+                            format!("{}; the write is refused.", why.text(violations.at_least()))
                         }
                         (None, Some(explanation)) => format!(
                             "mutation violates {count} consistency check(s); first: {}",
