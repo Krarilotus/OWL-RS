@@ -84,6 +84,22 @@ fn a_later_assertion_that_puns_a_class_reads_again() {
     assert!(commit(&store, &pipeline, ":Dog a :Species ."));
 }
 
+/// A class, then a known property's statement about it: it makes it an individual too.
+#[test]
+fn a_later_statement_about_a_class_reads_again() {
+    let (store, pipeline) =
+        on_the_route(":Dog a owl:Class . :owns a owl:ObjectProperty . :ann :owns :rex .");
+    assert!(commit(&store, &pipeline, ":Dog :owns :rex ."));
+}
+
+/// A class, then a known property's value that is the class: it makes it an individual too.
+#[test]
+fn a_later_value_that_is_a_class_reads_again() {
+    let (store, pipeline) =
+        on_the_route(":Dog a owl:Class . :owns a owl:ObjectProperty . :ann :owns :rex .");
+    assert!(commit(&store, &pipeline, ":ann :owns :Dog ."));
+}
+
 /// A key on an undeclared property, then literal values of it: they make it a data
 /// property, so the key compares data values, which the RL rules don't do by value
 /// (`nrese_owl::ql::reads_data_values`): the ontology leaves the route.
@@ -118,7 +134,7 @@ fn an_ordinary_assertion_keeps_the_short_cut() {
 #[test]
 fn the_commit_after_a_property_s_first_use_keeps_the_short_cut() {
     let (store, pipeline) = on_the_route(":Dog rdfs:subClassOf :Animal . :rex a :Dog .");
-    commit(&store, &pipeline, ":rex :likes :bone .");
+    assert!(commit(&store, &pipeline, ":rex :likes :bone ."));
     assert!(!commit(
         &store,
         &pipeline,
