@@ -439,6 +439,57 @@ x-request-id: <id>
 
 Under `policy.sparql_parse_error_profile = "plain-text"` the same error is `400` with `Content-Type: text/plain` and the `detail` text as the body ([configuration](config-reference.md#sparql-parse-error-profile)).
 
+### Example: a commit refused as inconsistent
+
+On the [quick start](../../README.md#quick-start)'s server, after its first answer, a write that
+makes Felix both a cat and a dog, which the same write declares disjoint:
+
+```bash
+curl -i http://localhost:8080/dataset/update --data-urlencode 'update=
+  PREFIX ex: <http://example.org/>
+  PREFIX owl: <http://www.w3.org/2002/07/owl#>
+  INSERT DATA { ex:Cat owl:disjointWith ex:Dog . ex:felix a ex:Cat , ex:Dog }'
+```
+```text
+HTTP/1.1 400 Bad Request
+content-type: application/problem+json
+x-request-id: 4b995dc4-5b73-4ed0-93cf-7e860841ea22
+content-length: 2563
+date: Sun, 15 Nov 2026 22:45:17 GMT
+```
+```json
+{
+  "type": "https://nrese.dev/problems/reasoner-reject",
+  "title": "Reasoner Reject",
+  "status": 400,
+  "detail": "mutation violates 1 consistency check(s); first: cax-dw (an instance of two disjoint classes): http://example.org/Cat http://www.w3.org/2002/07/owl#disjointWith http://example.org/Dog (asserted); http://example.org/felix http://www.w3.org/1999/02/22-rdf-syntax-ns#type http://example.org/Cat (asserted); http://example.org/felix http://www.w3.org/1999/02/22-rdf-syntax-ns#type http://example.org/Dog (asserted) Likely commit-local trigger: <http://example.org/felix> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Cat>.",
+  "reasoner_reject": {
+    "violated_constraint": "cax-dw",
+    "focus_resource": "http://example.org/felix",
+    "evidence": [
+      {"subject": "http://example.org/Cat", "predicate": "http://www.w3.org/2002/07/owl#disjointWith", "object": "http://example.org/Dog", "origin": "asserted", "role": "premise"},
+      {"subject": "http://example.org/felix", "predicate": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "object": "http://example.org/Cat", "origin": "asserted", "role": "premise"},
+      {"subject": "http://example.org/felix", "predicate": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "object": "http://example.org/Dog", "origin": "asserted", "role": "premise"}
+    ],
+    "likely_commit_trigger": ["http://example.org/felix", "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "http://example.org/Cat"],
+    "summary": "…",
+    "commit_attribution": {"candidates": […], "heuristic": "reasoner-evidence-plus-commit-delta-scoring"}
+  },
+  "request_id": "4b995dc4-5b73-4ed0-93cf-7e860841ea22"
+}
+```
+
+(Formatted and shortened: `summary` repeats `detail`'s rule and premises, and
+`commit_attribution` scores each of the write's statements as the trigger.)
+
+- It means the write would make the data inconsistent: `cax-dw` is the
+  [OWL 2 RL rule](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules)
+  for an instance of two disjoint classes, and `evidence` lists its premises, each `asserted` or
+  `inferred`. Nothing of the write is committed: `SELECT ?x WHERE { ?x a ex:Dog }` still answers
+  no rows.
+- To fix it, drop the premise that is wrong (here, one of Felix's two classes) and send the write
+  again.
+
 ## Service and operations
 
 | URL | What |
