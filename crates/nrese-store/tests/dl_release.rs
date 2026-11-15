@@ -10,10 +10,11 @@
 //! binary of its own and its tests run one at a time.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, ThreadId};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
@@ -24,8 +25,9 @@ use nrese_store::{
 /// The global pool's width in this binary.
 const WORKERS: usize = 2;
 
-/// How long a pool thread's release may take to arrive once the thread is free.
-const ARRIVAL: Duration = Duration::from_secs(10);
+/// A watchdog only, never what a test asserts: a wait that would otherwise hang ends after
+/// it, and the test fails saying what never happened.
+const WATCHDOG: Duration = Duration::from_secs(30);
 
 /// Every release asked of the allocator: whether forced, and on which thread.
 static RELEASES: Mutex<Vec<(bool, ThreadId)>> = Mutex::new(Vec::new());
@@ -45,11 +47,11 @@ fn releases() -> Vec<(bool, ThreadId)> {
 }
 
 /// The releases recorded so far, cleared, once every thread of `threads` has an unforced one
-/// among them or `ARRIVAL` has passed.
+/// among them, or when the watchdog ends the wait.
 fn releases_once_offered_on(threads: &HashSet<ThreadId>) -> Vec<(bool, ThreadId)> {
     let all = RELEASES.lock().unwrap_or_else(|p| p.into_inner());
     let (mut all, _) = RECORDED
-        .wait_timeout_while(all, ARRIVAL, |all| {
+        .wait_timeout_while(all, WATCHDOG, |all| {
             let offered: HashSet<ThreadId> = all
                 .iter()
                 .filter(|(force, _)| !force)
@@ -127,6 +129,48 @@ fn realise(dl: &MutationPipeline) {
     assert!(report.complete(), "{:?}", report.incomplete);
 }
 
+/// A pool worker held on other work, a job that waits on a channel, until it is freed: by
+/// the test, by its watchdog, or when the last handle goes (the sender dropped ends the
+/// wait), so a failing test never leaves it held.
+#[derive(Clone)]
+struct Held(Arc<Holding>);
+
+struct Holding {
+    free: Mutex<Option<mpsc::Sender<()>>>,
+    by_watchdog: AtomicBool,
+}
+
+impl Held {
+    fn new() -> Self {
+        let (free, freed) = mpsc::channel::<()>();
+        let (holding, holds) = mpsc::channel::<()>();
+        rayon::spawn(move || {
+            let _ = holding.send(());
+            let _ = freed.recv();
+        });
+        holds
+            .recv_timeout(WATCHDOG)
+            .expect("a pool worker takes the job that holds it");
+        Self(Arc::new(Holding {
+            free: Mutex::new(Some(free)),
+            by_watchdog: AtomicBool::new(false),
+        }))
+    }
+
+    /// Frees the worker; only the first call does, and records whether it was the watchdog's.
+    fn free(&self, by_watchdog: bool) {
+        let mut free = self.0.free.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(free) = free.take() {
+            self.0.by_watchdog.store(by_watchdog, Ordering::SeqCst);
+            let _ = free.send(());
+        }
+    }
+
+    fn freed_by_watchdog(&self) -> bool {
+        self.0.by_watchdog.load(Ordering::SeqCst)
+    }
+}
+
 #[test]
 fn a_dl_operation_offers_the_unused_memory_of_its_caller_and_every_pool_thread_back_unforced() {
     let _serial = serial();
@@ -155,7 +199,7 @@ fn a_dl_operation_offers_the_unused_memory_of_its_caller_and_every_pool_thread_b
         assert_eq!(
             missed, 0,
             "{name}: {missed} of the {WORKERS} pool threads were not asked to give back what \
-             they hold unused within {ARRIVAL:?} ({after:?})"
+             they hold unused before the watchdog ({WATCHDOG:?}) ended the wait ({after:?})"
         );
     }
 }
@@ -165,26 +209,30 @@ fn a_dl_operation_returns_while_a_pool_worker_is_busy_with_other_work() {
     let _serial = serial();
     let dl = ontology();
     let pool = pool();
-    // One worker blocks until it is freed, or by itself after `HELD`: the other work a
-    // finished operation must not wait for. The operation's own work has the other worker.
-    const HELD: Duration = Duration::from_secs(6);
-    let (free, freed) = mpsc::channel::<()>();
-    let (holding, held) = mpsc::channel::<()>();
-    rayon::spawn(move || {
-        let _ = holding.send(());
-        let _ = freed.recv_timeout(HELD);
-    });
-    held.recv_timeout(HELD)
-        .expect("a pool worker took the blocking job");
+    // One worker is held on other work until the classification has returned; the
+    // operation's own work has the other worker. The test frees it, on every way out.
+    let held = Held::new();
     releases();
-    let started = Instant::now();
+    // A watchdog only: if the classification hasn't returned by then, it frees the worker,
+    // and the test fails.
+    let (returned, watched) = mpsc::channel::<()>();
+    let watchdog = {
+        let held = held.clone();
+        thread::spawn(move || {
+            if watched.recv_timeout(WATCHDOG).is_err() {
+                held.free(true);
+            }
+        })
+    };
     classify(&dl);
-    let took = started.elapsed();
-    let _ = free.send(());
+    let _ = returned.send(());
+    watchdog.join().expect("the watchdog ends");
+    let freed_by_watchdog = held.freed_by_watchdog();
+    held.free(false);
     assert!(
-        took < HELD / 2,
-        "the classification returned after {took:?}, with a pool worker busy elsewhere for \
-         up to {HELD:?}: it waited for that worker"
+        !freed_by_watchdog,
+        "the classification returned only once the watchdog ({WATCHDOG:?}) freed the pool \
+         worker held on other work: it waited for that worker"
     );
     // Once free, the busy worker gives back what it holds too.
     let after = releases_once_offered_on(&pool);
