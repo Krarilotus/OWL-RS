@@ -662,10 +662,9 @@ impl Case {
             .filter(|r| asked(r) && !expected.contains(r))
             .collect();
         let missing: Vec<_> = expected.iter().filter(|r| !a.rows.contains(**r)).collect();
+        // Every read by its label, the inferred statements' too: `unsound` and `not-certified`
+        // are counted, with what was wrong in the detail.
         let class = match (a.label.as_str(), wrong.is_empty(), missing.is_empty()) {
-            // L's facts are entailed, whatever the label of a read of them.
-            (_, false, _) if inferred => "wrong",
-            (_, true, _) if inferred => "agree",
             ("complete" | "none" | "sound-only", false, _) => "wrong",
             ("complete" | "none", true, false) => "missing",
             ("sound-only", true, false) => "sound-only-missing",
@@ -824,27 +823,37 @@ fn dl_answers_agree_with_outside_reasoners() {
     assert_eq!(failures, 0, "{failures} {why}: {}", out.display());
 }
 
-/// A refusal is read by its kind, here planted, with a reference that calls all data
-/// consistent: one declined as undecided is counted as such, neither a pass nor a wrong
-/// verdict; one of a kind the check doesn't know fails the run.
+/// Planted answers, with a stand-in reference that calls all data consistent and entails
+/// nothing. A refusal is read by its kind: one declined as undecided is counted as such,
+/// neither a pass nor a wrong verdict; one of a kind the check doesn't know fails the run.
+/// A read is judged by its label, the inferred statements' too: a wrong row is counted
+/// under `unsound` and fails under `sound-only`.
 #[test]
 #[cfg(unix)]
-fn refusals_are_read_by_their_kind() {
-    let command = "while read -r l; do echo c; done".to_owned();
+fn planted_answers_are_judged_by_kind_and_label() {
+    let command = r#"awk -F'\t' '{ printf "c"; for (i = 3; i <= NF; i++) if ($i != "") printf "0"
+        print ""; fflush() }'"#;
     let wait = Duration::from_secs(10);
-    let mut consistent = Reference {
-        command,
+    let mut nothing = Reference {
+        command: command.to_owned(),
         wait,
         child: None,
     };
     let (case, none) = (generate(0), BTreeSet::new());
-    let mut class = |kind: &str| {
-        let refused = Err((kind.to_owned(), "planted".to_owned(), String::new()));
-        case.verdicts(&none, &[], &refused, &mut consistent, "hermit")
-            .remove(0)
-            .1
+    let mut verdict = |picked: &[usize], got: &Answers| {
+        let v = case.verdicts(&none, picked, got, &mut nothing, "hermit");
+        v[0].1.clone()
     };
-    assert_eq!(class("Undecided"), "declined-consistent");
-    assert_eq!(class("Inconsistent"), "wrong-refusal");
-    assert!(fails(&class("Planted")));
+    let refused = |kind: &str| Err((kind.to_owned(), "planted".to_owned(), String::new()));
+    assert_eq!(verdict(&[], &refused("Undecided")), "declined-consistent");
+    assert_eq!(verdict(&[], &refused("Inconsistent")), "wrong-refusal");
+    assert!(fails(&verdict(&[], &refused("Planted"))));
+    let rows = BTreeSet::from([vec![n("a", 0), format!("{RDF}type"), n("C", 0)]]);
+    let read = |label: &str| {
+        let (label, paths, rows) = (label.to_owned(), String::new(), rows.clone());
+        Ok((vec![Ok(Answer { label, paths, rows })], String::new()))
+    };
+    let inferred = [case.queries.len()];
+    assert_eq!(verdict(&inferred, &read("unsound")), "unsound");
+    assert_eq!(verdict(&inferred, &read("sound-only")), "wrong");
 }
