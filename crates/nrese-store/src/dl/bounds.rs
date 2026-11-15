@@ -383,11 +383,10 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     };
     // U1 at the base, taken under the state and changed without it (U1-I): readers never
     // wait for a commit's (parallel) change.
-    let current: Option<(Option<Arc<Kinds>>, Result<Arc<Upper>, GaveUp>)> =
-        lock(&store.dl().bounds.state)
-            .as_ref()
-            .filter(|s| s.revision == base)
-            .map(|s| (s.kinds.clone(), s.upper.clone()));
+    let current = lock(&store.dl().bounds.state)
+        .as_ref()
+        .filter(|s| s.revision == base)
+        .map(|s| (s.kinds.clone(), s.upper.clone()));
     // The commit's asserted changes, read from the transaction each time: no copy of them.
     let asserted = || tx.inserted().chain(tx.deleted()).map(quad_triple);
     // On the RL route, a commit that gives no term a new kind leaves what the reader reads,
@@ -404,7 +403,9 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
             ontology: None,
         };
     }
-    if let Some((_, upper)) = current {
+    // Off the route only: on it there is no U1, and "nothing U1 is compiled from changed"
+    // would keep a route the commit may change.
+    if let Some((None, upper)) = current {
         match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
