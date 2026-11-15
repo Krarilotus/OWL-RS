@@ -135,4 +135,5 @@ To start over with no data, run `docker rm -f nrese && docker volume rm nrese-da
   and queries included, and the console's own command-line client is described under
   [console CLI](dev/getting-started.md#frontend-cli).
 - [Features and standards](what-it-covers.md) says what NRESE does, with the limits of each part.
-- [Running a server](ops/server-setup.md) is about running it for others, and [backups](ops/backups.md) about keeping its data.
+- [Running a server](ops/server-setup.md) is about running it for others, and
+  [backups](ops/backups.md) about keeping its data.

@@ -167,8 +167,8 @@ and a changed setting. To build from source instead, see
 - [Features and standards](docs/what-it-covers.md) and [limits](docs/limits.md): what it does and
   where it stops.
 - [Reasoning](docs/spec/reasoning-semantics.md): each mode, and what an answer's status promises.
-- [HTTP interface](docs/ops/http-api.md), [settings](docs/ops/config-reference.md) and
-  [running a server](docs/ops/server-setup.md).
+- [HTTP interface](docs/ops/http-api.md), [settings](docs/ops/config-reference.md),
+  [running a server](docs/ops/server-setup.md) and [backups](docs/ops/backups.md).
 - [Architecture](docs/ARCHITECTURE.md) and [contributing](CONTRIBUTING.md).
 - [Release notes](docs/releases/v1.5.md), and [everything else](docs/README.md).
 

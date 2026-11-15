@@ -72,6 +72,28 @@ Known bypasses:
 - `crates/nrese-exec/src/graph.rs:118`: Plain closure produces a growing IdTable with no budget argument.
 - `crates/nrese-exec/src/graph.rs:148`: Transitive closure produces a plain Vec of potentially quadratic pairs without reservation; :155 constructs the output.
 
+What stays outside a request's envelope in v1.5, by design (users read the short form in
+[limits](../limits.md#memory-and-stopping)):
+
+- Charged only after it is built: a join's output, and the rows a query produces.
+- Outside: the full-text index and the text order, built at first need and kept; operators' working state
+  (`OPTIONAL`'s keys, `ORDER BY`'s decoded terms, `GROUP BY`'s ids, the aggregates' members, the table of `MINUS`
+  and `NOT EXISTS`, `CONTAINS`'s view of the dictionary, `BIND`'s copy, `FILTER`'s mask); a cyclic count's working
+  state; the sample of `EXPLAIN`'s cyclic estimate; the range hints' counts; the per-query cache of compiled regular
+  expressions, and `REPLACE`'s output; a vector charged only after it was allocated (`adopt_vec`); the keys and
+  values a charged map holds apart from its table; the request's and its parts' bookkeeping; the planner's small
+  temporaries (a few words per pattern of a basic graph pattern, at most 4,096 states of the join order's exact
+  search, the characteristic-set search's copies, bounded at 2¹⁶ steps); cache entries still held after the cache
+  released their charge; reasoning's `owl:sameAs` copies; and everything else reasoning allocates, polled rather
+  than charged.
+- The planner's distinct-value counts live in a table of 16,384 entries charged to the engine's budget, not the
+  request's, and a count stops when its query does. What a characteristic-set build holds isn't charged, a view of
+  the data builds sets of its own that no budget limits, and closing the store doesn't stop a rebuild.
+- A join's cap, half the room left at its start, is checked every 1,024 rows, and the capacity of its vectors and
+  the joining of its parts can exceed it.
+- Reservations are taken ahead, in grants and credit; the unused part has no stated bound yet. A cached decoding
+  near the limit can refuse while the cache holds memory it could give back.
+
 DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not exact pre-allocation admission.
 
 A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`, open row, owner engine/transaction). Uploads insert each statement as it is read, their pending growth charged (D16-039); one that fails part-way is discarded with its transaction, and the new terms it interned stay, as stated limit L3 accepts for v1.5 (`crates/nrese-store/src/rdf_io.rs`).
