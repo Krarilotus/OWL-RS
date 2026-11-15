@@ -225,7 +225,14 @@ fn member_wrongs(store: &StoreService) -> Vec<String> {
 /// [`DATA`] under `owl2-dl`, on the RL route ([`DATA`] is in OWL 2 RL) or off it (an
 /// existential superclass is outside OWL 2 RL).
 fn dl(off_the_rl_route: bool) -> nrese_store::MutationPipeline {
-    let dl = pipeline();
+    dl_in(pipeline(), off_the_rl_route)
+}
+
+/// [`dl`] in `dl`'s configuration.
+fn dl_in(
+    dl: nrese_store::MutationPipeline,
+    off_the_rl_route: bool,
+) -> nrese_store::MutationPipeline {
     let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :owns ; \
                        owl:someValuesFrom :Dog ] .";
     let data = format!("{DATA} {}", if off_the_rl_route { existential } else { "" });
@@ -493,7 +500,8 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// decides, saying so (docs/spec/reasoning-semantics.md, "A plan's status"). One read per
 /// status and reason kind: a plain read, a denied one (an annotation, the one part of the
 /// reserved vocabulary print prints), that under NOT EXISTS, an ordered slice, and the
-/// `owl:sameAs` entry, on and off the RL route.
+/// `owl:sameAs` entry, on and off the RL route; under OWL 2 DL also with user rules and
+/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
     use nrese_sparql::Completeness;
@@ -514,12 +522,42 @@ fn every_place_gives_a_query_the_answers_status() {
     let ql = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let rl = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto);
     let (on, off) = (dl(false), dl(true));
+    // The two reasons the DL run adds whatever path decides: user rules (one that reads
+    // nothing of DATA) and a consistency that isn't checked.
+    let rules = || {
+        let rule = "{ ?x a <http://example.com/Special> } => { ?x a <http://example.com/Rare> } .";
+        crate::user_rules_tests::pipeline(nrese_reasoner::ReasoningMode::Owl2Dl, rule)
+    };
+    let unchecked = || {
+        pipeline_with(DlConfig {
+            consistency: nrese_store::DlConsistency::Off,
+            ..DlConfig::default()
+        })
+    };
+    let (rules_on, rules_off) = (dl_in(rules(), false), dl_in(rules(), true));
+    let (unchecked_on, unchecked_off) = (dl_in(unchecked(), false), dl_in(unchecked(), true));
     let stores = [
         ("owl2-rl with the rewriting", &printed_for, true),
         ("owl2-ql", &ql, false),
         ("owl2-rl", &rl, false),
         ("owl2-dl on the RL route", on.store(), false),
         ("owl2-dl off it", off.store(), false),
+        (
+            "owl2-dl with user rules on the RL route",
+            rules_on.store(),
+            false,
+        ),
+        ("owl2-dl with user rules off it", rules_off.store(), false),
+        (
+            "owl2-dl, consistency off, on the RL route",
+            unchecked_on.store(),
+            false,
+        ),
+        (
+            "owl2-dl, consistency off, off it",
+            unchecked_off.store(),
+            false,
+        ),
     ];
     fn report(r: &Option<nrese_sparql::ql::QlReport>) -> Option<&nrese_sparql::Completeness> {
         r.as_ref().map(|r| &r.completeness)
