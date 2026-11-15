@@ -13,7 +13,7 @@ This page is the long form of the README's [quick start](../../README.md#quick-s
 
 ### Build
 
-```powershell
+```bash
 cargo build
 ```
 
@@ -21,25 +21,25 @@ cargo build
 
 The server embeds the console it finds in `apps/nrese-console/dist` when it is compiled, so build the console first if you want `/console` (the API works without it).
 
-```powershell
-Set-Location .\apps\nrese-console
+```bash
+cd apps/nrese-console
 npm install
 npm run build
-Set-Location ..\..
+cd ../..
 ```
 
 ### Run the user frontend in dev mode
 
 Start the Rust server first, so that the frontend's dev proxy has a backend to forward API calls to:
 
-```powershell
+```bash
 cargo run -p nrese-server
 ```
 
 Then, in a second terminal:
 
-```powershell
-Set-Location .\apps\nrese-console
+```bash
+cd apps/nrese-console
 npm install
 npm run dev
 ```
@@ -48,9 +48,8 @@ npm run dev
 - The frontend's requests to `/dataset/*`, `/ops/*` and `/api/*` are proxied to `http://127.0.0.1:8080`.
 - If your backend runs elsewhere, set `VITE_API_PROXY_TARGET`, for example like this:
 
-```powershell
-$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:9090"
-npm run dev
+```bash
+VITE_API_PROXY_TARGET=http://127.0.0.1:9090 npm run dev
 ```
 
 ### Run the frontend against a separate backend
@@ -68,7 +67,7 @@ with `VITE_NRESE_API_BASE_URL` and `VITE_CONSOLE_BASE_PATH`.
 
 ### Run the server
 
-```powershell
+```bash
 cargo run -p nrese-server
 ```
 
@@ -84,8 +83,8 @@ embedded only when it was built first ([above](#build-the-user-frontend)). Witho
 
 Run with an explicit config file:
 
-```powershell
-cargo run -p nrese-server -- --config .\config.toml
+```bash
+cargo run -p nrese-server -- --config ./config.toml
 ```
 
 ### Frontend routes
@@ -100,8 +99,8 @@ cargo run -p nrese-server -- --config .\config.toml
 The frontend package also ships a small CLI on top of the same TypeScript client boundary
 (`npm run cli -- help` prints its commands and options):
 
-```powershell
-Set-Location .\apps\nrese-console
+```bash
+cd apps/nrese-console
 npm install
 npm run cli -- capabilities
 npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
@@ -154,10 +153,8 @@ and compares the answers. It is run by hand
 
 ### Run with durable storage
 
-```powershell
-$env:NRESE_STORE_MODE = "on-disk"
-$env:NRESE_DATA_DIR = "./data"
-cargo run -p nrese-server
+```bash
+NRESE_STORE_MODE=on-disk NRESE_DATA_DIR=./data cargo run -p nrese-server
 ```
 
 On-disk mode is always available. It writes a write-ahead log and checkpoints under

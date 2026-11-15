@@ -21,7 +21,8 @@ current snapshot while writes go on. It goes into `backups/` of the data directo
 seconds since 1970 (`backups/1794787200/`), and for another repository than the default by its
 id and the seconds (`backups/films-1794787200/`). Beside the store's checkpoint file is
 `manifest.json`, with the revision, the statement counts, the size and the SHA-256. The older
-`POST /ops/api/admin/dataset/image`, with `?repository=ID`, still answers.
+`POST /ops/api/admin/dataset/image`, with `?repository=ID`, still answers. An image in `backups/`
+is on the same disk as the data it protects, so copy it elsewhere.
 
 Offline, `nrese-server backup DIR` writes the same into `DIR`.
 

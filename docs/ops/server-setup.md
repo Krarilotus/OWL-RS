@@ -133,7 +133,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/sparql.example.org/privkey.pem;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
-    client_max_body_size 16m;
+    client_max_body_size 385m;  # the server's own body limit, with the default budgets
     proxy_read_timeout 120s;
     proxy_send_timeout 120s;
 
@@ -180,8 +180,10 @@ docker run --rm -v nrese-data:/var/lib/nrese/data -v "$PWD":/in:ro nrese load /i
 docker start nrese
 ```
 
-- Each file's format comes from its extension. Triple formats load into the default graph, or
-  into `--graph`, and quad formats keep their graphs. Blank nodes are fresh for each load.
+- Each file's format comes from its extension: `.nt`, `.nq`, `.ttl`, `.trig`, `.rdf`, `.owl`,
+  `.xml`, `.jsonld`, `.json`, `.n3` or `.brf`. A compressed file (`.gz`) isn't read, so unpack
+  it first. Triple formats load into the default graph, or into `--graph`, and quad formats keep
+  their graphs. Blank nodes are fresh for each load.
 - `--replace` replaces the dataset instead of adding to it.
 - A statement that can't be read goes to the repository's [quarantine](../design/quarantine.md),
   and the load goes on (`store.invalid_statements = "quarantine"`, the default). There it is kept
@@ -192,9 +194,10 @@ docker start nrese
 - A load isn't refused the way a write is: the SHACL gate doesn't run, and a load that leaves
   the data inconsistent under the ruleset exits `1` with the count of violations, the data stays
   loaded, and the server starts in quarantine.
-- N-Triples and N-Quads are read on all cores and load fastest, about 2.7 million statements a
-  second on our reference machine (100 million in 37 s, [baselines](../../benches/baselines/README.md)).
-  `nrese-server convert data.ttl data.nt` turns other formats into N-Triples first.
+- N-Triples, N-Quads, Turtle and TriG are read on all cores; N-Triples loads about 2.7 million
+  statements a second on our reference machine (100 million in 37 s,
+  [baselines](../../benches/baselines/README.md)). The other formats are read on one core, and
+  `nrese-server convert data.rdf data.nt` turns them into N-Triples first.
 
 ### From another store
 
