@@ -771,12 +771,41 @@ fn data_existential(filler: &str) -> String {
 }
 
 /// cls-svf1 on `:age`, which is undeclared and carries a literal: `:a` is `:Aged` (OWL 2
-/// Direct Semantics, DataSomeValuesFrom), whose premise `5 rdf:type xsd:integer` is
-/// dt-type2's, which the rule set leaves out. The rewriting's schema reads no assertions,
-/// so only the filler, a datatype, says `:age` is a data property.
+/// Direct Semantics, DataSomeValuesFrom), whose premise (`5` in the filler) is dt-type2's,
+/// which the rule set leaves out. The rewriting's schema reads no assertions, so only the
+/// filler says `:age` is a data property: a datatype, or an anonymous data range (OWL 2 RL
+/// admits data intersections, Profiles §4.2.4), typed `rdfs:Datatype` or not, nested in
+/// a union too. 5 is an integer and a decimal.
 #[test]
 fn owl2_rl_calls_no_answer_an_undeclared_data_existential_misses_complete() {
-    no_place_complete(&data_existential("xsd:integer"), "ASK { :a a :Aged }");
+    for filler in [
+        "xsd:integer",
+        "[ a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+        "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+        "[ owl:unionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:string ) ]",
+    ] {
+        no_place_complete(&data_existential(filler), "ASK { :a a :Aged }");
+    }
+}
+
+/// cls-int1 and cls-svf1: `:x` is `:B` and `:C`, so `:a :knows :x` makes `:a` `:Social`,
+/// and the rules derive it. `:knows` is undeclared and the filler an intersection of
+/// classes, no data range: the restriction is an object one, and with the rewriting on
+/// every place calls the `true` complete (a data reading would call it so in none).
+#[test]
+fn owl2_rl_reads_an_undeclared_object_intersection_existential_as_object() {
+    let data = ":B a owl:Class . :C a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :knows ; \
+           owl:someValuesFrom [ owl:intersectionOf ( :B :C ) ] ] rdfs:subClassOf :Social . \
+         :a :knows :x . :x a :B , :C .";
+    let mut wrong = Vec::new();
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let (text, line, complete, _) = places(data, "ASK { :a a :Social }", ql);
+        if !text.contains("true") || (ql == QlRewritingMode::On && complete != 4) {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// `:a :age 5` and ∃age.rdfs:Literal ⊑ :Aged entail `:a a :Aged` (every literal is in
@@ -791,7 +820,7 @@ fn owl2_rl_answers_an_undeclared_data_existential_over_any_literal() {
         let (text, line, complete, _) = places(&data, "ASK { :a a :Aged }", ql);
         let right = match ql {
             QlRewritingMode::On => text.contains("true"),
-            _ => text.contains("false") && !complete,
+            _ => text.contains("false") && complete == 0,
         };
         if !right {
             wrong.push(line);
@@ -817,7 +846,7 @@ fn no_place_complete(data: &str, read: &str) {
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
         let (text, line, complete, reported) = places(data, read, ql);
         // With the rewriting on, its report is one of the places.
-        if !text.contains("false") || complete || (ql == QlRewritingMode::On && !reported) {
+        if !text.contains("false") || complete > 0 || (ql == QlRewritingMode::On && !reported) {
             wrong.push(line);
         }
     }
@@ -826,8 +855,8 @@ fn no_place_complete(data: &str, read: &str) {
 
 /// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
 /// with what each place (the run, its rewriting, the plan, the plan's rewriting) calls it,
-/// whether any place calls it complete, and whether the run has the rewriting's report.
-fn places(data: &str, read: &str, ql: QlRewritingMode) -> (String, String, bool, bool) {
+/// how many places call it complete, and whether the run has the rewriting's report.
+fn places(data: &str, read: &str, ql: QlRewritingMode) -> (String, String, usize, bool) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
     let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let store = closure(data, Ruleset::Owl2Rl, ql);
@@ -848,6 +877,9 @@ fn places(data: &str, read: &str, ql: QlRewritingMode) -> (String, String, bool,
         places.map(|(p, c)| (p, name(c)))
     );
     eprintln!("{line}");
-    let complete = places.iter().any(|(_, c)| name(*c) == "complete");
+    let complete = places
+        .iter()
+        .filter(|(_, c)| name(*c) == "complete")
+        .count();
     (text, line, complete, run.ql.is_some())
 }
