@@ -458,3 +458,37 @@ fn snapshots_alive_at_once_each_get_their_own() {
         assert_eq!(ask(snapshot), Ok(Some(expected)), "ask {k}");
     }
 }
+
+/// - Spec: a kept count is served by the asking snapshot's whole identity, not its revision: a
+///   transaction's pending state at the published revision, with fewer matches, gets its own
+///   estimate, and its ask records nothing over the published snapshot's (review r1, F2).
+/// - Input: 3000 subjects of `p`, published and asked once; a transaction removing subjects
+///   `0..1000`, its pending snapshot (the same revision, 2000 matches) asked; the published
+///   snapshot asked again.
+/// - Expected: 3000; 2000 for the pending snapshot (the kept 3000 would give 3000); 3000 again
+///   for the published snapshot, without counting.
+#[test]
+fn a_pending_snapshot_at_the_same_revision_gets_its_own() {
+    let engine = Engine::new(config()).unwrap();
+    commit(&engine, "p", 0..3000);
+    let published = engine.snapshot();
+    let ask = |snapshot: &Snapshot, visit: Visitor<'_>| {
+        let pattern = of(snapshot, "p");
+        snapshot.distinct_estimate_in(MODEL, &pattern, Permutation::Gpso, visit)
+    };
+    assert_eq!(ask(&published, &|_| true), Ok(Some(3000)));
+    let mut tx = engine.transaction();
+    for i in 0..1000 {
+        assert!(tx.remove(quad("p", i, "").as_ref()));
+    }
+    let pending = tx.pending_snapshot();
+    assert_eq!(pending.identity().revision, published.identity().revision);
+    assert_eq!(ask(&pending, &|_| true), Ok(Some(2000)));
+    let mut again = None;
+    let units = units_of(|visit| again = Some(ask(&published, visit)));
+    assert_eq!(again, Some(Ok(Some(3000))));
+    assert_eq!(
+        units, 0,
+        "the pending ask left the published snapshot's count in place"
+    );
+}
