@@ -1,55 +1,56 @@
 # What it covers
 
-What NRESE does today, in the code of the commit this page is in, starting with its scope: what
-is in, what is left out, and what is planned, one line each, each linking to the page that holds
-the detail.
+This page says what NRESE does in the code of the commit it is in. It starts with the scope, what
+is in, what is left out and what is planned, one line each with a link to the page that has the
+detail.
 
 ## Scope
 
-What is in: the sections below. Each item there links the specification, document or test that backs
-it, with its limits beside it; nothing in them is a plan.
+What is in is in the sections below. Each item there links the specification, document or test
+that backs it and gives its limits beside it, and none of it is a plan.
 
-- SPARQL 1.1 query, update and federation; SPARQL 1.2 drafts; full-text, vector and, in part,
-  GeoSPARQL search: [SPARQL](#sparql)
-- The W3C RDF syntaxes, JSON-LD 1.1, Notation3 data in the library, canonicalisation, parallel
-  bulk loads: [RDF syntaxes](#rdf-syntaxes)
-- Reasoning from RDFS to OWL 2 DL, materialised and kept up to date by every commit, and the
-  status every answer carries: [reasoning](#reasoning)
-- SHACL Core and SHACL-SPARQL, on request and as a commit gate: [SHACL](#shacl)
-- Its own storage engine: atomic commits, durability, client transactions, backups, read
-  replicas, several repositories: [storage](#storage-transactions-and-durability)
-- Authentication, graph-level access control, deployment postures, budgets, metrics:
-  [access control and operations](#access-control-and-operations)
-- The SPARQL, Graph Store, RDF4J and engine HTTP interfaces, the browser console, the server's
-  commands, the console CLI: [interfaces](#interfaces)
+- [SPARQL](#sparql): SPARQL 1.1 query, update and federation, the SPARQL 1.2 drafts, and
+  full-text, vector and, in part, GeoSPARQL search
+- [RDF syntaxes](#rdf-syntaxes): the W3C RDF syntaxes, JSON-LD 1.1, Notation3 data in the
+  library, canonicalisation and parallel bulk loads
+- [Reasoning](#reasoning): from RDFS to OWL 2 DL, materialised and kept up to date by every
+  commit, and the status every answer carries
+- [SHACL](#shacl): SHACL Core and SHACL-SPARQL, on request and as a commit gate
+- [Storage](#storage-transactions-and-durability): its own storage engine, with atomic commits,
+  durability, client transactions, backups, read replicas and several repositories
+- [Access control and operations](#access-control-and-operations): authentication, graph-level
+  access control, deployment postures, budgets and metrics
+- [Interfaces](#interfaces): the SPARQL, Graph Store, RDF4J and engine HTTP interfaces, the
+  browser console, the server's commands and the console CLI
 
-What is left out today, each with what to do instead in [limits](limits.md):
+What is left out today is below, and [limits](limits.md) says what to do instead:
 
-- Several writers at once; automatic failover; data split across machines:
-  [choose another system](limits.md#choose-another-system-when)
-- Named graphs as separate reasoning contexts (planned for v2.0); every OWL 2 DL answer proven
-  complete: [choose another system](limits.md#choose-another-system-when)
-- SHACL Advanced Features (rules) and `sh:entailment`: [SHACL](limits.md#shacl)
-- Embeddings computed by the store; a released Rust library; property-graph query languages
-  (planned, below): [choose another system](limits.md#choose-another-system-when)
-- The deviations from the standards, such as SPARQL Update's `LOAD`:
-  [SPARQL](limits.md#sparql), [RDF syntaxes](limits.md#rdf-syntaxes),
-  [reasoning](limits.md#reasoning), [storage](limits.md#storage-and-transactions)
+- several writers at once, automatic failover and data split across machines
+  ([choose another system](limits.md#choose-another-system-when))
+- named graphs as separate reasoning contexts (planned for v2.0), and every OWL 2 DL answer
+  proven complete ([choose another system](limits.md#choose-another-system-when))
+- SHACL Advanced Features (rules) and `sh:entailment` ([SHACL](limits.md#shacl))
+- embeddings computed by the store, a released Rust library, and property-graph query languages
+  (planned, below) ([choose another system](limits.md#choose-another-system-when))
+- the deviations from the standards, such as SPARQL Update's `LOAD`
+  ([SPARQL](limits.md#sparql), [RDF syntaxes](limits.md#rdf-syntaxes),
+  [reasoning](limits.md#reasoning), [storage](limits.md#storage-and-transactions))
 
-What is planned, in order: [roadmap](ROADMAP.md); of it, only the stages it marks done are present.
+What is planned is in the [roadmap](ROADMAP.md), in order, and only the stages it marks done are
+in the code:
 
-- The open items before v2 goes to `main`, then benchmarks, the merge into `main`, concise docs
-  and a refactoring, v3: [the order](ROADMAP.md#the-order-owner-5-october-2026)
-- Property graphs (ISO GQL, openCypher) over the same store, enterprise operations, data
-  integration, AI integration, exploration and history, ontology work and publishing:
-  [the order](ROADMAP.md#the-order-owner-5-october-2026), item 6
-- OWL 2 DL: classification speed and tighter answer bounds: [DL](ROADMAP.md#dl)
-- With a version named: one snapshot for a whole RDF4J transaction, v1.6
-  ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)); named graphs as reasoning boundaries,
-  v2.0 ([engine gaps](STATUS.md#engine-gaps)); a CRS database with units and conversions for
-  every system, v2.0 ([requests in detail](ops/http-api.md#requests-in-detail))
-- Not yet ordered: an audit log, SBOM and signed releases, a threat model, the frontend on the
-  engine API, scaling across machines: [not yet ordered](ROADMAP.md#not-yet-ordered)
+- the open items before v2 goes to `main`, then benchmarks, the merge into `main`, concise docs
+  and a refactoring, then v3 ([the order](ROADMAP.md#the-order-owner-5-october-2026))
+- property graphs (ISO GQL, openCypher) over the same store, enterprise operations, data
+  integration, AI integration, exploration and history, ontology work and publishing
+  ([the order](ROADMAP.md#the-order-owner-5-october-2026), item 6)
+- for OWL 2 DL, classification speed and tighter answer bounds ([DL](ROADMAP.md#dl))
+- with a version named: one snapshot for a whole RDF4J transaction in v1.6
+  ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)), named graphs as reasoning boundaries in
+  v2.0 ([engine gaps](STATUS.md#engine-gaps)), and a CRS database with units and conversions for
+  every system in v2.0 ([requests in detail](ops/http-api.md#requests-in-detail))
+- not yet ordered: an audit log, SBOM and signed releases, a threat model, the frontend on the
+  engine API, and scaling across machines ([not yet ordered](ROADMAP.md#not-yet-ordered))
 
 ## SPARQL
 
@@ -77,56 +78,66 @@ What is planned, in order: [roadmap](ROADMAP.md); of it, only the stages it mark
 
 ## Reasoning
 
-Inferences are materialised: computed when data is loaded, kept up to date by every commit
-in the same revision, and stored apart from asserted statements. A query reads both by
-default, or only the asserted ones with `infer=false`. The contract for every mode is
-[reasoning-semantics.md](spec/reasoning-semantics.md).
+Inferences are materialised. They are computed when data is loaded, kept up to date by every
+commit in the same revision, and stored apart from the asserted statements. A query reads both
+by default, or only the asserted ones with `infer=false`.
 
-| Mode | What it computes | Limits |
-|---|---|---|
-| `disabled` (default) | Nothing | |
-| `rdfs` | Six RDFS rules: domain, range, sub-class and sub-property | No axiomatic triples; `rdfs-full` has the RDFS rules and axioms but `rdfD1` and those about `rdf:_1`, `rdf:_2`, … ([modes](spec/reasoning-semantics.md#modes)) |
-| `rdfs-plus`, `owl-horst` | RDFS with equality, inverse, symmetric, transitive and functional properties; `owl-horst` adds `hasValue`, `someValuesFrom`, `allValuesFrom` | Named subsets of the OWL 2 RL rules ([rules](spec/reasoning-semantics.md#modes)) |
-| `owl2-ql` | The OWL 2 QL rules, plus answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)); a commit that violates a disjointness, irreflexivity or asymmetry axiom is rejected | Answers say `sound-only` where an axiom outside QL could add an answer the query reads, where a pattern reaches a rewriting bound or runs without the rewriting (a variable predicate or class, a property path, a pattern inside an aggregate), and for queries the rewriting doesn't apply to, such as those with a dataset of their own |
-| `owl2-rl` | The W3C OWL 2 RL/RDF rules; a commit that violates a consistency rule is rejected, naming the rule and its premises | Answers are `sound-only`, since the rules are complete only for ontologies inside the profile, unless `reasoner.ql_rewriting = "on"`, which checks each query as under `owl2-ql`. `owl:sameAs` reflexivity isn't stored; datatype rules in part ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)) |
-| `owl2-dl` | `owl2-rl` as a lower bound, plus OWL 2 DL engines (a hypertableau and a consequence-based core): consistency checked on commit (`dl.consistency`, on by default; an undecided check lets the commit through and the status says so), classification, realisation, and certain answers where they can be proven ([design](design/owl2-dl.md)) | Some answers are `sound-only`, for example because a budget ran out or a candidate stayed undecided. A query that uses `OPTIONAL`, `MINUS`, `NOT EXISTS` or another operator that isn't monotone is `unsound` instead wherever its answers aren't complete, as rows may be wrong as well as missing. A reader of only some graphs, or a query with a dataset of its own, gets the lower bound as `sound-only` (`unsound` under those operators) |
-| `custom` | Your rules alone, in Notation3 or the `.pie` rule format; they can also be added to any mode above | No built-ins but `log:equalTo` and `log:notEqualTo`; no new blank nodes in conclusions ([user rules](spec/reasoning-semantics.md#user-rules-notation3)) |
+The modes, from none to OWL 2 DL, are below in a line each. What each one computes, what it
+leaves out and what its answers promise is in [the reasoning contract](spec/reasoning-semantics.md#modes).
 
-Also:
+- `disabled`, the default, computes nothing.
+- `rdfs` has six RDFS rules, for domain, range, sub-class and sub-property, and `rdfs-full`
+  has the RDFS rules and axioms but some that the contract lists.
+- `rdfs-plus` and `owl-horst` add equality and inverse, symmetric, transitive and functional
+  properties to RDFS, and `owl-horst` adds `hasValue`, `someValuesFrom` and `allValuesFrom`.
+- `owl2-ql` has the OWL 2 QL rules, and gives answers through existential axioms by query
+  rewriting ([design](design/ql-rewriting.md)). A query with a dataset of its own doesn't get
+  the rewriting, so its answers say `sound-only`.
+- `owl2-rl` has the W3C OWL 2 RL/RDF rules.
+- `owl2-dl` takes `owl2-rl` as a lower bound and adds OWL 2 DL engines of its own, a
+  hypertableau and a consequence-based core, for consistency, classification, realisation and
+  the certain answers they can prove ([design](design/owl2-dl.md)).
+- `custom` runs your rules alone, in Notation3 or the `.pie` rule format, and you can add such
+  rules to any mode above as well.
 
-- Explanations, with reasoning on: why a statement holds, as a derivation or as
-  minimal sets of asserted statements it follows from; under `owl2-dl`, minimal sets of
-  axioms (`/explain`, [HTTP interface](ops/http-api.md#engine-api-apiv1)).
-- Classification and realisation of the ontology by the DL engines, in any mode
+A commit that, with its inferences, breaks a consistency rule of the mode is refused, and the
+response names the rule and its premises ([consistency](spec/reasoning-semantics.md#consistency)).
+
+Beside the modes:
+
+- With reasoning on, you can ask why a statement holds and get its derivation, or the minimal
+  sets of asserted statements it follows from, and under `owl2-dl` the minimal sets of axioms (`/explain`,
+  [HTTP interface](ops/http-api.md#engine-api-apiv1)).
+- The DL engines classify and realise the ontology in any mode
   ([HTTP interface](ops/http-api.md#classification)).
-- Incremental maintenance, tested against full recomputation on random changes
-  ([maintenance](spec/reasoning-semantics.md#maintenance)).
-- Conformance, checked by the W3C OWL 2 test cases for RL ([runner](../crates/nrese-store/tests/w3c_owl2_rl)),
-  QL ([runner](../crates/nrese-store/tests/w3c_owl2_ql), 9 failures listed with reasons) and DL
-  ([runner](../crates/nrese-dl/tests/tableau_w3c), the undecided and disputed cases listed).
-- On an upgrade, stored inferences carry a fingerprint of the rules that made them; a build
+- The inferences are maintained incrementally, and this is tested against full recomputation on
+  random changes ([maintenance](spec/reasoning-semantics.md#maintenance)).
+- The W3C OWL 2 test cases check conformance for RL ([runner](../crates/nrese-store/tests/w3c_owl2_rl)),
+  for QL ([runner](../crates/nrese-store/tests/w3c_owl2_ql), with 9 failures listed with their
+  reasons) and for DL ([runner](../crates/nrese-dl/tests/tableau_w3c), with the undecided and
+  disputed cases listed).
+- Stored inferences carry a fingerprint of the rules that made them, so after an upgrade a build
   that changes what a ruleset derives recomputes them once at start
   ([freshness](spec/reasoning-semantics.md#freshness)).
-- One limit is that rules read every graph, and inferences go to the default graph. A named graph
-  isn't a reasoning boundary yet ([graph scope](spec/reasoning-semantics.md#graph-scope)).
+- Rules read every graph, and inferences go to the default graph, so a named graph isn't a
+  reasoning boundary yet ([graph scope](spec/reasoning-semantics.md#graph-scope)).
 
 ### What an answer promises
 
-Every SPARQL query answer, of every query form and over every protocol, carries an
-`NRESE-Completeness` header; `EXPLAIN` shows the same status, and classification and
-realisation carry it too ([details](ops/http-api.md#sparql)). Graph and statement
-downloads (Graph Store, RDF4J `/statements`) carry none.
+Every SPARQL query answer carries its status in an `NRESE-Completeness` header, whatever the
+query form and the protocol. `EXPLAIN` shows the same status, and classification and realisation
+carry it too ([details](ops/http-api.md#sparql)). Graph and statement downloads (Graph Store,
+RDF4J `/statements`) carry none.
 
-| Status | Means |
-|---|---|
-| `complete; regime=…` | Every answer the regime entails is there. Under `owl2-dl`, `owl2-ql` and `owl2-rl` that is every certain answer under the OWL 2 Direct Semantics; under `owl2-ql` and `owl2-rl` it is given only where the QL rewriting ran on the query. Without reasoning, or with `infer=false`, the header says `complete` with no regime |
-| `sound-only; regime=…; reasons="…"` | Every row is entailed, but rows may be missing; the reasons say why. Without the QL rewriting, every answer over a ruleset's closure is `sound-only`, because the rules are complete only for ontologies inside their profile. Where the rewriting runs, each query is checked against the schema, and `complete` is withheld when an axiom outside the profile, or an individual the axioms imply, could add an answer the query reads |
-| `unsound` | Rows may be wrong as well as missing: inside a transaction whose pending changes delete statements (their inferences stay until the commit), or where answers that may be missing sit under `MINUS`, `NOT EXISTS` or another operator that can turn a missing row into a wrong one |
-| `not-certified` | No status can be given, so rows may be missing or wrong. This is the case for a reader of only some graphs with `inferred = "visible"`, where the QL rewriting runs ([HTTP interface](ops/http-api.md#requests-in-detail)) |
+The status is one of the four the README names: `complete`, `sound-only`, `unsound` and
+`not-certified`. What each promises under each mode is in
+[the reasoning contract](spec/reasoning-semantics.md#what-complete-refers-to), and the header's
+form, with its regime and reasons, in the [HTTP interface](ops/http-api.md#sparql). Inside a
+transaction whose pending changes delete statements, answers are `unsound`, because those
+statements' inferences stay until the commit.
 
-Under `owl2-dl` you can ask for exact answers only (`dl-answers=exact`): an answer that
-can't be proven complete is then a 422 error naming the undecided candidates. With user
-rules, no answer is claimed complete.
+Under `owl2-dl` you can ask for exact answers only (`dl-answers=exact`), and an answer that
+can't be proven complete is then a 422 error naming the undecided candidates.
 
 ## SHACL
 
@@ -150,28 +161,30 @@ rules, no answer is claimed complete.
 
 ### What a commit does
 
-A write (a SPARQL update, a Graph Store write, the commit of a client transaction) is
-one commit, and its operations apply in order, each seeing the ones before it. Before
-anything is visible:
+A write (a SPARQL update, a Graph Store write or the commit of a client transaction) is one
+commit, and its operations apply in order, each one seeing the ones before it. Before anything
+becomes visible:
 
-1. the reasoner updates the inferred statements from the change, in the same
-   transaction, and checks consistency (under `owl2-dl` also with the DL engines; a check
-   they don't decide lets the commit through, and the status says `unknown`);
-2. with the SHACL gate on, the shapes validate the focus nodes the change can affect,
-   inferred statements included. Only what the commit introduces counts: data that was
-   invalid before doesn't block it.
+1. With reasoning on, the reasoner updates the inferred statements from the change, in the same
+   transaction, and checks consistency. Under `owl2-dl` the DL engines check it too, and a check
+   they don't decide lets the commit through, with the status `unknown`.
+2. With the SHACL gate on, the shapes validate the focus nodes the change can affect, inferred
+   statements included. Only what the commit introduces counts, so data that was invalid before
+   doesn't block it.
 
-If a check fails, or the request times out, nothing of the request is committed: no
-asserted statement, no inference, and the response says why. Otherwise the asserted and
-the inferred changes are written to the log (synced, on disk) and published together as
-one revision, so a query sees all of the commit or none of it. A deleted statement's
-inferences go in the same commit, unless they still follow from what remains. The
-gate's result isn't stored (`report` logs it); `GET /dataset/shacl` validates the current
-data on request. Bulk loads (`nrese-server load`) don't go through these gates. With
-reasoning on, a load recomputes the inferences afterwards and fails when the rules'
-consistency checks find a violation (under `owl2-dl`, those of OWL 2 RL: the DL check
-doesn't run); the data stays, and the store is quarantined. With reasoning off, nothing
-is checked
+If a check refuses the write, or the request times out, nothing of the request is committed,
+neither an asserted statement nor an inference, and the response says why. Otherwise the
+asserted and the inferred changes are written to the log (synced, on disk) and published
+together as one revision, so a query sees all of the commit or none of it. When you delete a
+statement, its inferences go in the same commit, unless they still follow from what remains.
+The gate's result isn't stored (`report` logs it), and `GET /dataset/shacl` validates the
+current data on request.
+
+Bulk loads (`nrese-server load` and the import endpoint) and the ontology file loaded at
+start-up don't go through these checks. With reasoning on, `nrese-server load` recomputes the
+inferences afterwards and fails when the rules' consistency checks find a violation. Under
+`owl2-dl` those are the OWL 2 RL rules' checks, because the DL check doesn't run. The data
+stays, and the store is quarantined. With reasoning off, nothing is checked
 ([storage contract](spec/02-storage-and-transactions.md#writes),
 [consistency](spec/reasoning-semantics.md#consistency),
 [SHACL gate](ops/config-reference.md)).
