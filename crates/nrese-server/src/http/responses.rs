@@ -19,10 +19,14 @@ pub struct ReadyResponse {
     /// `ready`, `starting`, or `quarantined` (inconsistent data under the configured
     /// reasoning).
     pub status: &'static str,
-    /// `consistent`, `inconsistent` or `unknown` (no current reasoning state).
+    /// `consistent`, `inconsistent`, `undecided` (the rules' violations, which `owl2-dl`
+    /// doesn't decide: see `consistency_reason`) or `unknown` (no current reasoning state).
     pub consistency: &'static str,
-    /// Consistency violations in the materialised data, when inconsistent.
+    /// Consistency violations in the materialised data, when inconsistent or undecided.
     pub violations: Option<usize>,
+    /// When undecided: why, and the ways out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consistency_reason: Option<String>,
     pub revision: u64,
     pub quad_count: u64,
     pub named_graph_count: usize,
@@ -203,7 +207,14 @@ pub fn build_ready_response(
         status: build_readiness_response(state).status,
         consistency: consistency.as_str(),
         violations: match consistency {
-            nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
+            nrese_store::ConsistencyStatus::Inconsistent { violations }
+            | nrese_store::ConsistencyStatus::Undecided { violations, .. } => Some(violations),
+            _ => None,
+        },
+        consistency_reason: match consistency {
+            nrese_store::ConsistencyStatus::Undecided { violations, why } => {
+                Some(why.text(violations))
+            }
             _ => None,
         },
         revision: state.store().current_revision(),

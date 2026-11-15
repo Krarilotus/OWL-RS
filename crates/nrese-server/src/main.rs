@@ -306,6 +306,11 @@ async fn run() -> Result<()> {
             if report.violations > 0 {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
+                if default_reasoner.mode() == nrese_reasoner::ReasoningMode::Owl2Dl
+                    && let Some(why) = store.undecided_under_dl()
+                {
+                    anyhow::bail!("the loaded data: {}", why.text(report.violations));
+                }
                 anyhow::bail!(
                     "the loaded data is inconsistent under {}: {}{} violation(s)",
                     program.name(),

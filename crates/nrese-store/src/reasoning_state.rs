@@ -24,6 +24,9 @@ pub struct ReasoningState {
     pub fingerprint: u64,
     /// Consistency violations in the materialised closure.
     pub violations: usize,
+    /// Why `owl2-dl` doesn't decide the violations, where it doesn't: derived when the state
+    /// is recorded or read at open (`dl::undecided`), never written.
+    pub(crate) undecided: Option<WhyUndecided>,
     /// The inferred stack holds the closure over representatives of the `owl:sameAs`
     /// classes, which reads expand (`reasoner.equality = "compact"`).
     pub compact_equality: bool,
@@ -45,6 +48,12 @@ pub enum ConsistencyStatus {
     Inconsistent {
         violations: usize,
     },
+    /// The rules' violations, which `owl2-dl` doesn't decide, for `why`: in quarantine as
+    /// [`Self::Inconsistent`] is, but not said to be inconsistent.
+    Undecided {
+        violations: usize,
+        why: WhyUndecided,
+    },
 }
 
 impl ConsistencyStatus {
@@ -53,7 +62,39 @@ impl ConsistencyStatus {
             Self::Unknown => "unknown",
             Self::Consistent => "consistent",
             Self::Inconsistent { .. } => "inconsistent",
+            Self::Undecided { .. } => "undecided",
         }
+    }
+}
+
+/// Why the OWL 2 RL rules' violations aren't decided under OWL 2 DL in this release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhyUndecided {
+    /// The ontology has annotation-property axioms or a punned name
+    /// (`nrese_owl::profile::rules_read_differently`).
+    ReadsDifferently,
+    /// The check whether it has didn't finish within its budget.
+    Unchecked,
+}
+
+impl WhyUndecided {
+    /// What is known, and the two ways out: the one text for each place that says it.
+    pub fn text(self, violations: usize) -> String {
+        let why = match self {
+            Self::ReadsDifferently => {
+                "the ontology has annotation-property axioms or a punned name, which OWL 2 DL \
+                 reads differently"
+            }
+            Self::Unchecked => {
+                "the check whether OWL 2 DL reads this ontology differently did not finish \
+                 within its budget"
+            }
+        };
+        format!(
+            "the OWL 2 RL rules find {violations} clash(es), and {why}; this release doesn't \
+             decide whether the data is consistent under OWL 2 DL. Remove the clash's \
+             premises, or use the owl2-rl mode, whose promise is the rules' reading"
+        )
     }
 }
 
@@ -123,6 +164,7 @@ impl ReasoningState {
             ruleset: program.name(),
             fingerprint: fingerprint(program, hide_unnamed_classes, compact_equality),
             violations,
+            undecided: None,
             compact_equality,
             nil_lists: !compact_equality,
         }
@@ -151,9 +193,10 @@ impl ReasoningState {
     }
 
     pub fn consistency(&self) -> ConsistencyStatus {
-        match self.violations {
-            0 => ConsistencyStatus::Consistent,
-            violations => ConsistencyStatus::Inconsistent { violations },
+        match (self.violations, self.undecided) {
+            (0, _) => ConsistencyStatus::Consistent,
+            (violations, Some(why)) => ConsistencyStatus::Undecided { violations, why },
+            (violations, None) => ConsistencyStatus::Inconsistent { violations },
         }
     }
 
@@ -192,6 +235,7 @@ impl ReasoningState {
             ruleset: ruleset?,
             fingerprint: fingerprint?,
             violations: violations?,
+            undecided: None,
             compact_equality,
             nil_lists,
         })
