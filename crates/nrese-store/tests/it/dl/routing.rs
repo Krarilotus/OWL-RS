@@ -411,23 +411,27 @@ fn a_data_some_values_class_holds_a_value_of_its_filler_outside_rl() {
     assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
 }
 
+/// A store running `owl2-rl`, the closure's own promise.
+fn owl2_rl() -> nrese_store::MutationPipeline {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use std::sync::Arc;
+    nrese_store::MutationPipeline::new(
+        Arc::new(
+            nrese_store::StoreService::new(crate::support::in_memory_store_config())
+                .expect("store"),
+        ),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    )
+}
+
 /// prp-fp on a functional data property with one value in two lexical forms: the rule
 /// equates the two terms, and dt-diff compares their values, which are one: consistent
 /// (OWL 2 Direct Semantics, FunctionalDataProperty). Two values are not. Under owl2-dl in
 /// RL and outside it, and under owl2-rl; every outcome is printed.
 #[test]
 fn a_functional_data_property_with_one_value_in_two_lexical_forms_commits() {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    use nrese_store::{MutationPipeline, StoreService};
-    use std::sync::Arc;
-    let owl2_rl = || {
-        MutationPipeline::new(
-            Arc::new(StoreService::new(crate::support::in_memory_store_config()).expect("store")),
-            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-                ReasoningMode::Owl2Rl,
-            ))),
-        )
-    };
     let mut wrong = Vec::new();
     let pairs = ONE_VALUE
         .map(|pair| (pair, true))
@@ -454,6 +458,174 @@ fn a_functional_data_property_with_one_value_in_two_lexical_forms_commits() {
             );
             eprintln!("{line}");
             if result.is_ok() != consistent {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Two property names, also individuals, equated; `:p` functional; an existential.
+const PUNNED_EQUALITY: &str = ":p a owl:ObjectProperty , owl:NamedIndividual , owl:FunctionalProperty ; owl:sameAs :q . \
+     :q a owl:ObjectProperty , owl:NamedIndividual . :x :q :a , :b . :a a :D . :b a :D . \
+     :r a owl:ObjectProperty . :D a owl:Class ; \
+     rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :D ] .";
+
+const PUNNED_READS: [&str; 3] = [
+    "ASK { :x :p :a }",
+    "ASK { :a owl:sameAs :b }",
+    "SELECT ?y { :x :p ?y }",
+];
+
+/// An annotation property with a domain, a range and a super-property.
+const ANNOTATION_AXIOMS: &str = ":note a owl:AnnotationProperty ; rdfs:domain :C ; rdfs:range :C ; \
+     rdfs:subPropertyOf :sup . :sup a owl:AnnotationProperty . \
+     :C a owl:Class . :x a owl:NamedIndividual ; :note :v . \
+     :v a owl:NamedIndividual .";
+
+const ANNOTATION_READS: [&str; 3] = ["ASK { :x a :C }", "ASK { :v a :C }", "ASK { :x :sup :v }"];
+
+/// Under the OWL 2 Direct Semantics, `:p owl:sameAs :q` equates the individuals `:p` and
+/// `:q` (punning), not the properties of the same names: a model may give `:p` no pairs
+/// while `:q` relates `:x` to two distinct individuals. So neither `:x :p :a` nor `:a
+/// owl:sameAs :b` (by `:p` being functional) is entailed, and an answer `true` is a wrong
+/// row: it may only come labelled `unsound`. The existential keeps it off the RL route.
+#[test]
+fn an_equality_of_punned_property_names_does_not_equate_their_properties() {
+    let dl = pipeline();
+    insert(&dl, PUNNED_EQUALITY).expect("an ontology with punned property names");
+    let route = dl.store().dl_bounds().last;
+    let mut wrong = Vec::new();
+    for read in PUNNED_READS {
+        let (rows, status) = query(&dl, read);
+        let line = format!(
+            "route {route}: {read} answers {rows:?}, status {} ({:?})",
+            status.shared.as_str(),
+            status.reasons()
+        );
+        eprintln!("{line}");
+        let says_yes = rows == ["true"] || rows.iter().any(|r| r == "a" || r == "b");
+        if says_yes && status.shared.as_str() != "unsound" {
+            wrong.push(line);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "wrong rows not labelled unsound: {wrong:#?}"
+    );
+}
+
+/// An annotation property's domain, range and subproperties have no meaning for the
+/// annotations under the OWL 2 Direct Semantics (annotations carry none), and theorem
+/// PR1 of the OWL 2 Profiles excludes such axioms. So `:x a :C`, `:v a :C` and `:x :sup
+/// "v"` aren't entailed: an answer `true` may only come labelled `unsound`. Checked on
+/// the RL route and off it (a union superclass).
+#[test]
+fn annotation_property_axioms_entail_nothing_about_annotated_terms() {
+    let mut wrong = Vec::new();
+    for extra in ["", OUTSIDE_RL] {
+        let dl = pipeline();
+        insert(&dl, &format!("{ANNOTATION_AXIOMS} {extra}"))
+            .expect("an ontology with annotation property axioms");
+        let route = dl.store().dl_bounds().last;
+        for read in ANNOTATION_READS {
+            let (rows, status) = query(&dl, read);
+            let line = format!(
+                "route {route}: {read} answers {rows:?}, status {}",
+                status.shared.as_str()
+            );
+            eprintln!("{line}");
+            if rows == ["true"] && status.shared.as_str() != "unsound" {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "wrong rows not labelled unsound: {wrong:#?}"
+    );
+}
+
+/// An annotation property's domain says nothing about the subjects it annotates under the
+/// OWL 2 Direct Semantics, so a subject of a class disjoint with that domain is consistent:
+/// the commit must go through. The route is printed.
+fn annotation_domain_disjoint_with_the_subject_commits(extra: &str) {
+    let dl = pipeline();
+    let result = insert(
+        &dl,
+        &format!(
+            ":note a owl:AnnotationProperty ; rdfs:domain :C . \
+             :C a owl:Class ; owl:disjointWith :D . :D a owl:Class . \
+             :x a owl:NamedIndividual , :D ; :note \"a note\" . {extra}"
+        ),
+    );
+    let route = dl.store().dl_bounds().last;
+    eprintln!("route {route}: {result:?}");
+    assert!(result.is_ok(), "rejected, route {route}: {result:?}");
+}
+
+#[test]
+fn an_annotation_domain_disjoint_with_the_subject_commits_in_rl() {
+    annotation_domain_disjoint_with_the_subject_commits("");
+}
+
+#[test]
+fn an_annotation_domain_disjoint_with_the_subject_commits_outside_rl() {
+    annotation_domain_disjoint_with_the_subject_commits(OUTSIDE_RL);
+}
+
+/// A class name that is also an individual (punning, OWL 2 Structural Specification §5.9)
+/// with no equality reaching it: PR1 needs no punning, so the ontology leaves the RL
+/// route, and `:rex a :Dog`, entailed, keeps the status the DL path gives it.
+#[test]
+fn a_punned_class_with_no_equality_stays_sound_off_the_rules_route() {
+    let dl = pipeline();
+    insert(&dl, ":Dog a owl:Class . :Dog a :Species . :rex a :Dog .").expect("a punned class name");
+    let route = dl.store().dl_bounds().last;
+    let (rows, status) = query(&dl, "ASK { :rex a :Dog }");
+    eprintln!(
+        "route {route}: answers {rows:?}, status {} ({:?})",
+        status.shared.as_str(),
+        status.reasons()
+    );
+    assert_ne!(route, "rules", "a punning ontology stayed on the RL route");
+    assert_eq!(rows, ["true"]);
+    assert_ne!(status.shared.as_str(), "unsound", "{:?}", status.reasons());
+}
+
+/// Under `owl2-rl` the answer is the closure's: the punning and the annotation inputs give
+/// `true` for each read (eq-rep-p, prp-fp; prp-dom, prp-rng, prp-spo1). The answer's and
+/// the plan's status, printed.
+#[test]
+fn owl2_rl_answers_the_punning_and_annotation_reads_from_the_closure() {
+    use nrese_store::{CancellationToken, SparqlQueryRequest};
+    let mut wrong = Vec::new();
+    for (data, reads) in [
+        (PUNNED_EQUALITY, &PUNNED_READS[..2]),
+        (ANNOTATION_AXIOMS, &ANNOTATION_READS[..]),
+    ] {
+        let rl = owl2_rl();
+        insert(&rl, data).expect("committed under owl2-rl");
+        let store = rl.store();
+        for read in reads {
+            let request = SparqlQueryRequest::all(format!("{super::PREFIXES}{read}"));
+            let result = store.execute_query(&request).expect("answered");
+            let planned = store
+                .plan_query(
+                    &store.prepare_query(&request).expect("prepared"),
+                    &CancellationToken::new(),
+                )
+                .expect("planned");
+            let status = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+            let answer = String::from_utf8(result.payload).expect("utf8");
+            let line = format!(
+                "{read}: true {}, status {} / plan {}",
+                answer.contains("true"),
+                status(result.completeness),
+                status(planned.completeness)
+            );
+            eprintln!("{line}");
+            if !answer.contains("true") {
                 wrong.push(line);
             }
         }
