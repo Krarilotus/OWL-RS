@@ -725,3 +725,23 @@ fn owl2_dl_same_as_of_a_term_the_upper_bound_doesnt_type_is_never_complete() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// A key on one data value in two lexical forms (`1` and `"01"` as xsd:integer) equates
+/// `:a` and `:b` (OWL 2 Direct Semantics, HasKey), so `:b :p :x` is entailed; the owl2-rl
+/// closure matches literals by term and lacks it. Its `false` must not be labelled
+/// complete, with the rewriting or without; each status is printed.
+#[test]
+fn owl2_rl_calls_no_answer_a_key_misses_by_term_complete() {
+    let data = ":Person owl:hasKey ( :ssn ) . :ssn a owl:DatatypeProperty . \
+                :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
+                :b a :Person ; :ssn \"01\"^^xsd:integer .";
+    let mut wrong = Vec::new();
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let (text, status) = answer(&closure(data, Ruleset::Owl2Rl, ql), "ASK { :b :p :x }");
+        eprintln!("owl2-rl, rewriting {ql:?}: {text} {status:?}");
+        if text.contains("false") && status.contains(&"complete") {
+            wrong.push(format!("rewriting {ql:?}: {text} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
