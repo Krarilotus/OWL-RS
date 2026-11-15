@@ -1,6 +1,6 @@
 # The first example: test and last run
 
-The first example, the README's [first answer](../../README.md#a-first-answer-inference) and the
+The first example, the README's [first answer](../../README.md#a-first-answer) and the
 [tutorial](../tutorial.md)'s retraction and validation, is also a test: `scripts/verify/scenarios/first-example.toml` sends each of its steps to a
 running server and checks the answer. This page records what it sends, what it expects, and what
 the last run got.

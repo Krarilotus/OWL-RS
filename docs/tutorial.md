@@ -2,7 +2,7 @@
 
 This page picks up where the README's [quick start](../README.md#quick-start) ends. The server
 `nrese` runs as started there, with OWL 2 RL reasoning and the SHACL gate on, and the [first
-query](../README.md#a-first-answer-inference) answered `ex:tom`. Every step here runs against that
+query](../README.md#a-first-answer) answered `ex:tom`. Every step here runs against that
 server, and `ex:` stands for `http://example.org/`.
 
 ## Retract, and the inference goes
@@ -134,5 +134,5 @@ To start over with no data, run `docker rm -f nrese && docker volume rm nrese-da
 - [Commands](ops/server-setup.md#commands) lists every command of `nrese-server`, offline loads
   and queries included, and the console's own command-line client is described under
   [console CLI](dev/getting-started.md#frontend-cli).
-- [What it covers](what-it-covers.md) says what NRESE does, with the limits of each part.
+- [Features and standards](what-it-covers.md) says what NRESE does, with the limits of each part.
 - [Server setup](ops/server-setup.md) is about running it as a service.
