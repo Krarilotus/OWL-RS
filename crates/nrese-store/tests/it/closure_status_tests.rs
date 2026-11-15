@@ -513,21 +513,24 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 }
 
 /// `print-query` prints a query with the status this store gives it under `owl2-rl` with
-/// the rewriting on, its answer's: a denied read isn't `complete` there either, and under
-/// NOT EXISTS it is `unsound` in both. Guard: a read of a user class stays `complete`.
+/// the rewriting on, its answer's: a denied read (an annotation, the one part of the
+/// reserved vocabulary print prints) isn't `complete` there either, and under NOT EXISTS
+/// it is `unsound` in both. Guard: a read of a user class stays `complete`. What print
+/// can't print carries no status of its own: `owl:Thing` is of the schema vocabulary.
 #[test]
 fn a_printed_query_carries_the_stores_status() {
     use nrese_sparql::ql::{PrintForm, Printed};
     let store = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let print = |query: &str| store.print_query(&format!("{PREFIXES}{query}"), PrintForm::Paths);
     for (query, expected) in [
-        ("ASK { :fresh a owl:Thing }", "sound-only"),
+        ("SELECT ?l { :rex rdfs:label ?l }", "sound-only"),
         (
-            "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x a owl:Thing } }",
+            "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x rdfs:label ?l } }",
             "unsound",
         ),
         ("ASK { :rex a :Animal }", "complete"),
     ] {
-        let printed = match store.print_query(&format!("{PREFIXES}{query}"), PrintForm::Paths) {
+        let printed = match print(query) {
             Ok(Printed::Query { completeness, .. }) => completeness.as_str(),
             other => panic!("{query}: not printed: {other:?}"),
         };
@@ -537,6 +540,11 @@ fn a_printed_query_carries_the_stores_status() {
             "{query}"
         );
     }
+    let refused = print("ASK { :fresh a owl:Thing }");
+    assert!(
+        matches!(refused, Ok(Printed::NotExpressible(_))),
+        "{refused:?}"
+    );
 }
 
 /// An existential outside OWL 2 RL: a store with it is off the RL route.
@@ -545,9 +553,10 @@ const EXISTENTIAL: &str = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProp
 
 /// `owl:sameAs` between two different constant IRIs is the one reserved read that may be
 /// `complete`, off the RL route only, where the upper bound types both as individuals: the
-/// bounds decide equality between them as they decide their other facts. :x has one :p,
-/// so :a = :b is entailed; nothing makes :a = :x. On the RL route no upper bound is built,
-/// so the same reads are denied, right but not `complete`; and so over the rules' closure.
+/// bounds decide equality between them as they decide their other facts, when the query
+/// runs (its plan says `sound-only` until then). :x has one :p, so :a = :b is entailed;
+/// nothing makes :a = :x. On the RL route no upper bound is built, so the same reads are
+/// denied, right but not `complete`, planned or run; and so over the rules' closure.
 #[test]
 fn owl2_dl_decides_same_as_between_two_constants_the_upper_bound_types() {
     let data = ":p a owl:ObjectProperty , owl:FunctionalProperty . :x :p :a , :b . \
@@ -562,8 +571,12 @@ fn owl2_dl_decides_same_as_between_two_constants_the_upper_bound_types() {
             ("ASK { :a owl:sameAs :x }", "false"),
         ] {
             let (text, status) = answer(dl.store(), read);
-            let decided = status == ["complete"; 2];
-            if !text.contains(holds) || decided != off_the_rl_route {
+            let decided = if off_the_rl_route {
+                status == ["complete", "sound-only"]
+            } else {
+                !status.contains(&"complete")
+            };
+            if !text.contains(holds) || !decided {
                 wrong.push(format!("off {off_the_rl_route}: {read}: {text} {status:?}"));
             }
         }
