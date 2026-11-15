@@ -187,6 +187,10 @@ fn generate(seed: u64) -> Case {
         }
     }
     let queries = queries(&mut r);
+    // One case in eight, by a draw of its own: `f:p3` as a chain of 260 fresh properties (C2).
+    if Rng::new(!seed).one_in(8) {
+        add("long-chain", long_chain(260), Vec::new());
+    }
     // Drawn after the queries, so a seed keeps the ontology and queries of the runs before.
     let commits = (0..groups.len())
         .map(|g| (g > 0 && r.one_in(2)) as usize)
@@ -203,6 +207,18 @@ fn generate(seed: u64) -> Case {
         commits,
         deleted,
     }
+}
+
+/// `f:p3` as a chain of `n` fresh properties, along a path of blank nodes from `f:a0` to `f:a1`.
+fn long_chain(n: usize) -> String {
+    let chain: Vec<String> = (0..n).map(|i| format!("f:c{i}")).collect();
+    let mut turtle = format!("f:p3 owl:propertyChainAxiom ( {} ) .", chain.join(" "));
+    for (i, c) in chain.iter().enumerate() {
+        turtle += &format!(" {c} a owl:ObjectProperty . _:l{i} {c} _:l{} .", i + 1);
+    }
+    turtle
+        .replace("_:l0 ", "f:a0 ")
+        .replace(&format!("_:l{n} "), "f:a1 ")
 }
 
 /// `texts` with each placeholder of [`TEMPLATES`] replaced, the same way in each.
@@ -921,4 +937,19 @@ fn planted_deletion_left_undone() {
     assert_eq!(verdict(case.commits(&none))[0].1, "agree");
     let v = verdict(undone);
     assert_eq!(v[0].1, "wrong", "{v:?}");
+}
+
+/// A long chain's clash the store accepted (planted: a `complete` answer over the chain of
+/// 260 properties and a negative assertion it contradicts) is a wrong acceptance.
+#[test]
+#[ignore = "needs the DL kit's reference reasoners: benches/reasoning/dl/outside.sh"]
+fn planted_long_chain_clash_accepted() {
+    let clash = "f:p3 a owl:ObjectProperty . [] a owl:NegativePropertyAssertion ; \
+        owl:sourceIndividual f:a0 ; owl:assertionProperty f:p3 ; owl:targetIndividual f:a1 .";
+    let (label, paths, rows) = ("complete".to_owned(), String::new(), BTreeSet::new());
+    let state = format!("{} {clash}", long_chain(260));
+    let accepted = Ok((vec![Ok(Answer { label, paths, rows })], state));
+    let (case, none) = (generate(0), BTreeSet::new());
+    let v = case.verdicts(&none, &[0], &accepted, &mut references(), "hermit");
+    assert_eq!(v[0].1, "wrong-acceptance", "{v:?}");
 }
