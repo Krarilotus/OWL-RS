@@ -744,16 +744,55 @@ fn owl2_rl_calls_no_answer_a_key_on_an_undeclared_property_misses_complete() {
     never_complete("");
 }
 
-/// The key's case, `:ssn` declared by `declaration`: no place calls `ASK { :b :p :x }`
-/// complete, with the rewriting on or not.
+/// A maximum qualified by `owl:onDataRange rdfs:Literal`: at most no value of `:age`, and
+/// `:c` has one, so the data has no model and every statement is entailed. No owl2-rl rule
+/// reads `owl:onDataRange` (cls-maxqc1-4 read `owl:onClass`), so the closure misses the
+/// clash: no place may call `ASK { :c a :Z }`'s `false` complete.
+#[test]
+fn owl2_rl_calls_no_answer_a_qualified_data_maximum_misses_complete() {
+    no_place_complete(
+        ":age a owl:DatatypeProperty . \
+         :C a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :age ; \
+           owl:maxQualifiedCardinality \"0\"^^xsd:nonNegativeInteger ; \
+           owl:onDataRange rdfs:Literal ] . \
+         :c a :C ; :age 5 .",
+        "ASK { :c a :Z }",
+    );
+}
+
+/// cls-svf1 on `:age`, which is undeclared and carries a literal: `:a` is `:Aged` (OWL 2
+/// Direct Semantics, DataSomeValuesFrom), whose premise `5 rdf:type xsd:integer` is
+/// dt-type2's, which the rule set leaves out. The rewriting's schema reads no assertions,
+/// so only the filler, a datatype, says `:age` is a data property. As over `rdfs:Literal`.
+#[test]
+fn owl2_rl_calls_no_answer_an_undeclared_data_existential_misses_complete() {
+    for filler in ["xsd:integer", "rdfs:Literal"] {
+        no_place_complete(
+            &format!(
+                ":Aged a owl:Class . \
+                 [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom {filler} ] \
+                   rdfs:subClassOf :Aged . \
+                 :a :age 5 ."
+            ),
+            "ASK { :a a :Aged }",
+        );
+    }
+}
+
+/// The key's case, `:ssn` declared by `declaration`: see [`no_place_complete`].
 fn never_complete(declaration: &str) {
     let data = format!(
         ":Person owl:hasKey ( :ssn ) . {declaration} \
          :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
          :b a :Person ; :ssn \"01\"^^xsd:integer ."
     );
-    let data = data.as_str();
-    let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :b :p :x }}"));
+    no_place_complete(&data, "ASK { :b :p :x }");
+}
+
+/// `data` under owl2-rl, and `read`, entailed but `false` over the closure: no place calls
+/// it complete, with the rewriting on or not.
+fn no_place_complete(data: &str, read: &str) {
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
     let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
