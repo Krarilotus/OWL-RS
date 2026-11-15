@@ -234,7 +234,10 @@ as "not compared by the owner's decision"; without one it stays not compared and
 block never runs a side declared absent either way (its record says `absent`), and the verdict
 then counts, per baseline, the cases compared and those absent by product and by decision. The
 head failing a case blocks; so does the head stopping at its declared limit where a baseline
-completed.
+completed. A pass that reaches its time limit with its scope held at its memory cap stopped at a
+declared `memory-limit` as much as one killed there: the kernel can postpone that kill for many
+minutes (`fast.py held_at_cap`). Its record still says `timeout`, and a timeout away from the
+cap, or with no reading of the scope at its end, still fails.
 
 **The inference** (`suitekit/gatestats.py`; research round 8, 19 Oct 2026). One question per
 hypothesis, all of them declared before any result, the *family*: does the head lose on this
