@@ -96,9 +96,10 @@ leave something out.
   ([completeness](spec/reasoning-semantics.md#completeness)). Under `owl2-rl`, turn the
   rewriting on with `reasoner.ql_rewriting = "on"`. Under `owl2-dl`, raise the `dl.*` budgets
   where they leave answers `sound-only`, or ask `dl-answers=exact` to get an error instead.
-- Over a ruleset's closure, an answer under `OPTIONAL`, `MINUS`, `NOT EXISTS` or an aggregate also
-  says `sound-only`, though a missing inference can make one of its rows wrong there, and the status
-  doesn't say so yet. Read such answers as `unsound`.
+- Over a ruleset's closure, an answer under `OPTIONAL`, `MINUS`, `EXISTS`, `NOT EXISTS`, an
+  aggregate, or `LIMIT` or `OFFSET` after `ORDER BY` also says `sound-only`, though a missing
+  inference can make one of its rows wrong there, and the status doesn't say so yet. Read such
+  answers as `unsound`.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
@@ -144,8 +145,8 @@ leave something out.
   - Outside the limits: the full-text index, built by the first text search and kept; operators' working state
     (the keys of `OPTIONAL`, `ORDER BY`, `GROUP BY`, `MINUS` and `NOT EXISTS`, and the like) and a join's output
     while it is built; the working state of a cyclic count (triangles, four-cycles); and what reasoning allocates,
-    which is watched rather than charged, so an overshoot is seen within 10 ms. The full list is in the
-    [memory contract](architecture/contracts.md#memory).
+    which is watched rather than charged, so an overshoot is seen within 10 ms. The full list is on
+    [contracts](architecture/contracts.md#memory).
   - A join may take half the room left when it starts. That is a reading, not a reservation: it is checked every
     1,024 rows, and joins running at once can read the same room.
   - A design that bounds the rest follows this release.
