@@ -41,10 +41,11 @@ What is planned is in the [roadmap](ROADMAP.md), in order, and only the stages i
 in the code:
 
 - the open items before v2 goes to `main`, then benchmarks, the merge into `main`, concise docs
-  and a refactoring, then v3 ([the order](ROADMAP.md#the-order-owner-5-october-2026))
-- property graphs (ISO GQL, openCypher) over the same store, enterprise operations, data
-  integration, AI integration, exploration and history, ontology work and publishing
-  ([the order](ROADMAP.md#the-order-owner-5-october-2026), item 6)
+  and a refactoring, then v3 ([the order](ROADMAP.md#the-order-of-work))
+- property-graph queries (ISO GQL, openCypher) over the same store, failover and a write
+  cluster, mappings from relational, CSV and JSON sources, questions in natural language turned
+  into SPARQL, versioned graphs and an ontology editor with Linked Data publishing
+  ([the order](ROADMAP.md#the-order-of-work), item 6)
 - for OWL 2 DL, classification speed and tighter answer bounds ([DL](ROADMAP.md#dl))
 - with a version named: one snapshot for a whole RDF4J transaction in v1.6
   ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)), named graphs as reasoning boundaries in
