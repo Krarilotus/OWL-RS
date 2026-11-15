@@ -39,6 +39,11 @@ fn on_the_route(data: &str) -> (Arc<StoreService>, MutationPipeline) {
 
 /// Commits `INSERT DATA { data }`: whether it read the ontology again.
 fn commit(store: &StoreService, pipeline: &MutationPipeline, data: &str) -> bool {
+    update(store, pipeline, &format!("INSERT DATA {{ {data} }}"))
+}
+
+/// Commits the update `text`: whether it read the ontology again.
+fn update(store: &StoreService, pipeline: &MutationPipeline, text: &str) -> bool {
     let read = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&read);
     seam::set(&store.dl().bounds, Point::Read, move || {
@@ -46,9 +51,7 @@ fn commit(store: &StoreService, pipeline: &MutationPipeline, data: &str) -> bool
     });
     pipeline
         .apply(
-            MutationCommand::Update(SparqlUpdateRequest::new(format!(
-                "{PREFIXES}INSERT DATA {{ {data} }}"
-            ))),
+            MutationCommand::Update(SparqlUpdateRequest::new(format!("{PREFIXES}{text}"))),
             &Requester::all(),
             &MutationTicket::new(),
         )
@@ -115,11 +118,11 @@ fn a_later_value_that_is_a_class_reads_again() {
 #[test]
 fn a_later_literal_of_an_undeclared_key_property_leaves_the_route() {
     let (store, pipeline) = on_the_route(":P owl:hasKey ( :ssn ) . :a a :P . :b a :P .");
-    commit(
+    assert!(commit(
         &store,
         &pipeline,
         ":a :ssn \"1\"^^xsd:integer . :b :ssn \"01\"^^xsd:integer .",
-    );
+    ));
     assert_ne!(store.dl_bounds().last, "rules");
 }
 
@@ -129,14 +132,7 @@ fn a_later_literal_of_an_undeclared_key_property_leaves_the_route() {
 #[test]
 fn deleting_the_literal_that_makes_a_property_data_valued_leaves_the_route() {
     let (store, pipeline) = on_the_route(":p rdfs:range xsd:integer . :a :p 1 .");
-    let deleted = format!("{PREFIXES}DELETE DATA {{ :a :p 1 . }}");
-    pipeline
-        .apply(
-            MutationCommand::Update(SparqlUpdateRequest::new(deleted)),
-            &Requester::all(),
-            &MutationTicket::new(),
-        )
-        .expect("the deletion is consistent");
+    assert!(update(&store, &pipeline, "DELETE DATA { :a :p 1 . }"));
     assert_ne!(store.dl_bounds().last, "rules");
 }
 
