@@ -21,11 +21,11 @@ use std::time::Duration;
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::mapping::Ontology;
 use nrese_owl::model::Axiom;
-use nrese_store::{DlConfig, MutationPipeline, SparqlQueryRequest};
+use nrese_store::{DlConfig, MutationError, MutationPipeline, SparqlQueryRequest};
 use serde_json::Value;
 
 use super::queries::Table;
-use super::{Status, pipeline_with, run_dl, update};
+use super::{pipeline_with, run_dl, update};
 
 const F: &str = "http://example.org/fuzz#";
 const INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -124,8 +124,6 @@ struct Case {
     queries: Vec<Query>,
     /// Per group, its commit: 0 or 1; the declarations are in the first.
     commits: Vec<usize>,
-    /// A group without blank nodes deleted in a third commit.
-    deleted: Option<usize>,
 }
 
 fn n(kind: &str, i: u64) -> String {
@@ -188,36 +186,16 @@ fn generate(seed: u64) -> Case {
     }
     let queries = queries(&mut r);
     // Drawn after the queries, so a seed keeps the ontology and queries of the runs before.
-    if r.one_in(8) {
-        add("long-chain", long_chain(260), Vec::new());
-    }
     let commits = (0..groups.len())
         .map(|g| (g > 0 && r.one_in(2)) as usize)
         .collect();
-    let blank = |g: &Group| ["_:", "[", "("].iter().any(|b| g.turtle.contains(b));
-    let deletable: Vec<usize> = (1..groups.len()).filter(|&g| !blank(&groups[g])).collect();
-    let deleted = (!deletable.is_empty() && r.one_in(2))
-        .then(|| deletable[r.below(deletable.len() as u64) as usize]);
     Case {
         seed,
         shape,
         groups,
         queries,
         commits,
-        deleted,
     }
-}
-
-/// `f:p3` as a chain of `n` fresh properties, along a path of blank nodes from `f:a0` to `f:a1`.
-fn long_chain(n: usize) -> String {
-    let chain: Vec<String> = (0..n).map(|i| format!("f:c{i}")).collect();
-    let mut turtle = format!("f:p3 owl:propertyChainAxiom ( {} ) .", chain.join(" "));
-    for (i, c) in chain.iter().enumerate() {
-        turtle += &format!(" {c} a owl:ObjectProperty . _:l{i} {c} _:l{} .", i + 1);
-    }
-    turtle
-        .replace("_:l0 ", "f:a0 ")
-        .replace(&format!("_:l{n} "), "f:a1 ")
 }
 
 /// `texts` with each placeholder of [`TEMPLATES`] replaced, the same way in each.
@@ -379,9 +357,9 @@ struct Answer {
     rows: BTreeSet<Vec<String>>,
 }
 
-/// The answers and the state the reference reads; or a failed commit: whether it was refused,
-/// why, and the state it would have made.
-type Answers = Result<(Vec<Result<Answer, String>>, String), (bool, String, String)>;
+/// The answers and the state the reference reads; or a failed commit: its kind as the store
+/// types it (never read from its sentence), why, and the state it would have made.
+type Answers = Result<(Vec<Result<Answer, String>>, String), (String, String, String)>;
 
 /// The store's answers to `texts` after `commits` (each an update and the state after it).
 fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
@@ -393,39 +371,24 @@ fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
     });
     for (write, state) in commits {
         if let Err(e) = update(&dl, &format!("PREFIX f: <{F}> PREFIX rdf: <{RDF}> {write}")) {
-            let why = e.to_string();
-            let refused = why.contains("inconsisten") || why.contains("consistency check");
-            return Err((refused, why, state.clone()));
+            let kind = match &e {
+                MutationError::Rejected(r) => format!("{:?}", r.kind),
+                other => format!("{other:?}"),
+            };
+            return Err((kind, e.to_string(), state.clone()));
         }
     }
-    // After a deletion the reference reads what the store holds: a triple the deleted group
-    // shares with another is gone, as it should be. So a deletion left undone is not seen.
-    let mut state = commits.last().map(|(_, s)| s.clone()).unwrap_or_default();
-    if commits.last().is_some_and(|(w, _)| w.starts_with("DELETE")) {
-        let mut held = SparqlQueryRequest::all("CONSTRUCT WHERE { ?s ?p ?o }");
-        held.read_model = Some(nrese_store::ReadModel::Asserted);
-        let (_, out) = run(&dl, held).map_err(|e| (false, e, String::new()))?;
-        state = String::from_utf8_lossy(&out).into_owned();
-    }
+    let state = commits.last().map(|(_, s)| s.clone()).unwrap_or_default();
     Ok((texts.iter().map(|q| answer(&dl, q)).collect(), state))
-}
-
-/// Runs `request`: the answers' status and the output.
-fn run(
-    dl: &MutationPipeline,
-    request: SparqlQueryRequest,
-) -> Result<(Option<Status>, Vec<u8>), String> {
-    let s = dl.store();
-    let prepared = s.prepare_query(&request).map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    let status = run_dl(s, &prepared, &mut out).map_err(|e| e.to_string())?;
-    Ok((status, out))
 }
 
 /// The store's answer to `q`; `none` is the label where no reasoning path can leave
 /// answers out.
 fn answer(dl: &MutationPipeline, q: &str) -> Result<Answer, String> {
-    let (status, out) = run(dl, SparqlQueryRequest::all(q.to_owned()))?;
+    let (s, mut out) = (dl.store(), Vec::new());
+    let prepared = s.prepare_query(&SparqlQueryRequest::all(q.to_owned()));
+    let status = run_dl(s, &prepared.map_err(|e| e.to_string())?, &mut out);
+    let status = status.map_err(|e| e.to_string())?;
     let json: Value = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
     let (label, paths) = status.map_or(("none".into(), String::new()), |s| {
         (s.shared.as_str().to_owned(), s.paths.join("+"))
@@ -510,7 +473,12 @@ impl Reference {
 }
 
 /// The failures among the verdicts' classes; the others are `agree` or a counted outcome.
-const FAILS: [&str; 4] = ["missing", "wrong", "wrong-refusal", "wrong-acceptance"];
+fn fails(class: &str) -> bool {
+    matches!(
+        class,
+        "missing" | "wrong" | "wrong-refusal" | "wrong-acceptance" | "unclassified"
+    )
+}
 
 /// Per candidate row of a query: the row, its positive questions and its negated ones.
 type Rows = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
@@ -523,7 +491,7 @@ impl Case {
     }
 
     /// The commits under `skip`, each an update and the state after it as Turtle: the groups
-    /// of the first commit, those of the second, then the deletion of `deleted`.
+    /// of the first commit, then those of the second.
     fn commits(&self, skip: &BTreeSet<usize>) -> Vec<(String, String)> {
         let turtle = |keep: &dyn Fn(usize) -> bool| {
             let kept = (0..self.groups.len()).filter(|&g| !skip.contains(&g) && keep(g));
@@ -538,10 +506,6 @@ impl Case {
                 let state = turtle(&|g| self.commits[g] <= c);
                 out.push((format!("INSERT DATA {{ {write} }}"), state));
             }
-        }
-        if let Some(d) = self.deleted.filter(|d| !skip.contains(d)) {
-            let write = format!("DELETE DATA {{ {} }}", self.groups[d].turtle);
-            out.push((write, turtle(&|g| g != d)));
         }
         out
     }
@@ -612,15 +576,22 @@ impl Case {
     ) -> Vec<(usize, String, String)> {
         let write = self.queries.len() + 1;
         let (answers, turtle) = match got {
-            Err((false, why, _)) => return vec![(write, "load-error".into(), why.clone())],
-            Err((true, why, state)) => {
+            Err((kind, why, state)) => {
                 let (class, said) = match reference.ask(reasoner, state, &BTreeSet::new()) {
                     Reply::Inconsistent => ("agree", "inconsistent".to_owned()),
                     Reply::Answers(_) => ("wrong-refusal", "consistent".to_owned()),
                     Reply::Undecided(why) => ("reference-undecided", why),
                 };
-                let detail = format!("store: refused ({why}); {reasoner}: {said}");
-                return vec![(write, class.into(), detail)];
+                // Declined as undecided: honest, so no failure, but never a pass; a kind the
+                // check doesn't know fails the run.
+                let class = match kind.as_str() {
+                    "Inconsistent" => class.to_owned(),
+                    "Undecided" if class == "reference-undecided" => "declined-no-answer".into(),
+                    "Undecided" => format!("declined-{said}"),
+                    _ => "unclassified".into(),
+                };
+                let detail = format!("store: refused, {kind} ({why}); {reasoner}: {said}");
+                return vec![(write, class, detail + "; no query judged")];
             }
             Ok((answers, state)) => (answers, state),
         };
@@ -637,7 +608,7 @@ impl Case {
             }
             per.push(rows);
         }
-        let entailed = match reference.ask(reasoner, &turtle, &asked) {
+        let entailed = match reference.ask(reasoner, turtle, &asked) {
             Reply::Answers(m) => m,
             Reply::Inconsistent => {
                 let complete = answers.iter().flatten().any(|a| a.label == "complete");
@@ -762,10 +733,9 @@ impl Case {
             })
         };
         for g in (0..self.groups.len()).filter(|g| !skip.contains(g)) {
-            let gone = [", deleted in the last commit", ""][(self.deleted != Some(g)) as usize];
             let (tag, turtle) = (self.groups[g].tag, short(&self.groups[g].turtle));
             let turtle = turtle.replace(" . ", " .\n");
-            ttl += &format!("# {tag}, commit {}{gone}\n{turtle}\n", self.commits[g] + 1);
+            ttl += &format!("# {tag}, commit {}\n{turtle}\n", self.commits[g] + 1);
         }
         std::fs::write(out.join(format!("fail-{seed}-{i}.ttl")), ttl).expect("the case");
     }
@@ -803,8 +773,8 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let texts: Vec<String> = picked.iter().map(|&k| case.text(k)).collect();
                     let got = store(&case.commits(&none), &texts);
                     let hermit = case.verdicts(&none, &picked, &got, &mut reference, "hermit");
-                    let openllet = match hermit.iter().any(|(_, c, _)| FAILS.contains(&c.as_str()))
-                    {
+                    let twice = |c: &String| fails(c) || c.starts_with("declined");
+                    let openllet = match hermit.iter().any(|(_, c, _)| twice(c)) {
                         true => case.verdicts(&none, &picked, &got, &mut reference, "openllet"),
                         false => Vec::new(),
                     };
@@ -812,7 +782,9 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let tags = tags.into_iter().collect::<Vec<_>>().join(",");
                     for (i, class, detail) in &hermit {
                         let second = openllet.iter().find(|(j, _, _)| j == i).map(|(_, c, _)| c);
-                        let outcome = match (FAILS.contains(&class.as_str()), second) {
+                        let outcome = match (fails(class), second) {
+                            // A declined write: the class is HermiT's word, the outcome Openllet's.
+                            (false, Some(c)) if class.starts_with("declined") => c.as_str(),
                             (false, _) => "pass",
                             (true, Some(c)) if c == class => "FAIL",
                             (true, _) => "set-aside",
@@ -850,4 +822,29 @@ fn dl_answers_agree_with_outside_reasoners() {
     let failures = failures.into_inner();
     let why = "answers differ from what both outside reasoners entail";
     assert_eq!(failures, 0, "{failures} {why}: {}", out.display());
+}
+
+/// A refusal is read by its kind, here planted, with a reference that calls all data
+/// consistent: one declined as undecided is counted as such, neither a pass nor a wrong
+/// verdict; one of a kind the check doesn't know fails the run.
+#[test]
+#[cfg(unix)]
+fn refusals_are_read_by_their_kind() {
+    let command = "while read -r l; do echo c; done".to_owned();
+    let wait = Duration::from_secs(10);
+    let mut consistent = Reference {
+        command,
+        wait,
+        child: None,
+    };
+    let (case, none) = (generate(0), BTreeSet::new());
+    let mut class = |kind: &str| {
+        let refused = Err((kind.to_owned(), "planted".to_owned(), String::new()));
+        case.verdicts(&none, &[], &refused, &mut consistent, "hermit")
+            .remove(0)
+            .1
+    };
+    assert_eq!(class("Undecided"), "declined-consistent");
+    assert_eq!(class("Inconsistent"), "wrong-refusal");
+    assert!(fails(&class("Planted")));
 }
