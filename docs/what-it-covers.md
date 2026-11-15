@@ -1,8 +1,9 @@
 # Features and standards
 
 <a id="scope"></a>
-What NRESE does in the commit these pages come with, by area. Each row links the standard it
-follows, the page with the detail and the tests that back it, and gives its limits beside it.
+What NRESE does in the commit these pages come with, by area, with each part's limits beside it
+and a link to its detail. The standards it follows and the tests behind each are in the README's
+[standards table](../README.md#standards), and this page adds only what the table can't hold.
 What it leaves out, and where it departs from a standard with what to do instead, is in
 [limits](limits.md), which starts with [when to choose another system](limits.md#choose-another-system-when).
 
@@ -10,45 +11,47 @@ What it leaves out, and where it departs from a standard with what to do instead
 
 | Capability | Limits and notes |
 |---|---|
-| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/) and [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | The W3C query, update, syntax and results suites, with no known failure listed ([evaluation](../crates/nrese-sparql/tests/w3c_sparql11), [syntax](../crates/rdf/nrese-sparql-syntax/tests/w3c_syntax)). Every test also runs on a second evaluator written plainly from the specification's algebra ([`nrese-sparql-reference`](../crates/nrese-sparql-reference)). Deviations, each with what to do: [limits](limits.md#sparql) |
-| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts: triple terms, directional strings | The W3C SPARQL 1.2 suite, with no known failure listed. Results announce `version 1.2` when they may use them ([HTTP interface](ops/http-api.md#sparql)) |
+| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/) and [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | Every W3C test also runs on a second evaluator written plainly from the specification's algebra ([`nrese-sparql-reference`](../crates/nrese-sparql-reference)). Deviations, each with what to do: [limits](limits.md#sparql) |
+| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts: triple terms, directional strings | Results announce `version 1.2` when they may use them ([HTTP interface](ops/http-api.md#sparql)) |
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), [Service Description](https://www.w3.org/TR/sparql11-service-description/) | [HTTP interface](ops/http-api.md) |
 | Results in [JSON](https://www.w3.org/TR/sparql11-results-json/), [XML](https://www.w3.org/TR/rdf-sparql-XMLres/), [CSV and TSV](https://www.w3.org/TR/sparql11-results-csv-tsv/), and graphs in seven RDF syntaxes ([which](ops/http-api.md#requests-in-detail)) | Chosen by `Accept` ([formats](ops/http-api.md#sparql)). The library reads results back in every format but CSV |
 | `EXPLAIN`: the plan with estimated rows, or the run with actual rows and times | A reader of only some graphs gets no plan steps (they would reveal statistics of the others) |
 | Full-text search (BM25) through the `bds:` and Jena `text:query` vocabularies, with phrases, prefixes, fuzzy words and stemming in 18 languages | One index over every string literal, built at the first search; an on-disk store keeps it across restarts ([full-text](ops/http-api.md#sparql)) |
 | Vector search: vectors as literals (`"[…]"^^nrv:vector`), `SERVICE nrv:search` with cosine, dot product or Euclidean distance, exact or through HNSW, filtered by the rest of the query | You bring the vectors; the store computes no embeddings. Approximate search trades recall for speed through `nrv:searchBudget` ([vector search](ops/http-api.md#sparql)) |
-| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html), in part: functions and relations over WKT, GeoJSON and simple GML, with an R-tree | Measures in metres only in CRS84 and a listed set of projected systems; no GML arcs or 3D solids ([GeoSPARQL](ops/http-api.md#sparql), [compliance runner](../crates/nrese-sparql/tests/geosparql_compliance)) |
+| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html), in part: functions and relations over WKT, GeoJSON and simple GML, with an R-tree | Measures in metres only in CRS84 and a listed set of projected systems; no GML arcs or 3D solids ([GeoSPARQL](ops/http-api.md#sparql)) |
 
 ## RDF syntaxes
 
 | Capability | Limits and notes |
 |---|---|
-| Read and write [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | W3C RDF 1.1 and 1.2 suites, each document also read one byte at a time and written back ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf)) |
-| Read and write [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Remote contexts aren't fetched: a library caller supplies a document loader. W3C `toRdf`, `expand`, `fromRdf` suites; tests for JSON-LD 1.0 processors only and for generalised RDF are not run ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_jsonld)) |
+| Read and write [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | In the W3C suites, each document is also read one byte at a time and written back |
+| Read and write [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Remote contexts aren't fetched: a library caller supplies a document loader. The W3C tests for JSON-LD 1.0 processors only, and for generalised RDF, are not run |
 | Read [Notation3](https://w3c.github.io/N3/spec/) data, in the library | Only what RDF can hold; rules are read by the reasoner. Not offered over HTTP. W3C N3 group's parser tests, one known failure listed ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_n3)) |
 | RDF4J Binary RDF, versions 1 and 2 | Read in both versions, written as version 2; as a payload and a result format |
-| [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | W3C suite ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc)) |
+| [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | |
 | Bulk loading, N-Triples and N-Quads read on all cores; statements that don't parse are quarantined, not fatal ([loading data](ops/server-setup.md#loading-data)) | Malformed XML or JSON and read errors still stop the load, and strict mode stops at the first bad statement ([quarantine](design/quarantine.md)) |
 
 ## Reasoning
 
 Inferences are materialised. They are computed when data is loaded, kept up to date by every
-commit in the same revision, and stored apart from the asserted statements. A query reads both
+write in the same revision (by a bulk load or an import, in the next one), and stored apart from
+the asserted statements. A query reads both
 by default, or only the asserted ones with `infer=false`.
 
 Reasoning is chosen per repository with [`reasoner.mode`](ops/config-reference.md#reasoner.mode). What each mode computes, what it leaves
-out and what its answers promise is in [the reasoning contract](spec/reasoning-semantics.md#modes).
+out and what its answers promise is in [the reasoning contract](spec/reasoning-semantics.md#modes), and
+the W3C tests of each profile are in the [standards table](../README.md#standards).
 
-| Mode | Follows | Tests |
-|---|---|---|
-| `disabled` (the default) | No reasoning | |
-| `rdfs` | Six rules of [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/), for domain, range, sub-class and sub-property | |
-| `rdfs-full` | The RDFS entailment rules and axioms of [RDF 1.1 Semantics](https://www.w3.org/TR/rdf11-mt/), but the few the contract lists | |
-| `rdfs-plus`, `owl-horst` | RDFS plus equality and inverse, symmetric, transitive and functional properties, and for `owl-horst` also `hasValue`, `someValuesFrom` and `allValuesFrom` | |
-| `owl2-ql` | The [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) rules, and answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)). A query with a dataset of its own doesn't get the rewriting, so its answers say `sound-only` | [OWL 2 QL test cases](../crates/nrese-store/tests/w3c_owl2_ql), 9 known failures listed with their reasons |
-| `owl2-rl` | The [OWL 2 RL/RDF rules](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules) | [OWL 2 RL test cases](../crates/nrese-store/tests/w3c_owl2_rl), none listed |
-| `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency, classification, realisation and the certain answers they can prove ([design](design/owl2-dl.md)) | [OWL 2 DL test cases](../crates/nrese-dl/tests/tableau_w3c), every one decided, the disputed ones listed with a witness model |
-| `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every mode above as well | |
+| Mode | Follows |
+|---|---|
+| `disabled` (the default) | No reasoning |
+| `rdfs` | Six rules of [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/), for domain, range, sub-class and sub-property |
+| `rdfs-full` | The RDFS entailment rules and axioms of [RDF 1.1 Semantics](https://www.w3.org/TR/rdf11-mt/), but the few the contract lists |
+| `rdfs-plus`, `owl-horst` | RDFS plus equality and inverse, symmetric, transitive and functional properties, and for `owl-horst` also `hasValue`, `someValuesFrom` and `allValuesFrom` |
+| `owl2-ql` | The [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) rules, and answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)). A query with a dataset of its own doesn't get the rewriting, so its answers say `sound-only` |
+| `owl2-rl` | The [OWL 2 RL/RDF rules](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules) |
+| `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency, classification, realisation and the certain answers they can prove ([design](design/owl2-dl.md)) |
+| `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every mode above as well |
 
 A commit that, with its inferences, breaks a consistency rule of the mode is refused, and the
 response names the rule and its premises ([consistency](spec/reasoning-semantics.md#consistency)).
@@ -91,7 +94,7 @@ can't be proven complete is then a 422 error naming the undecided candidates.
 
 | Capability | Limits and notes |
 |---|---|
-| [SHACL](https://www.w3.org/TR/shacl/) (W3C Recommendation, 2017): Core and SHACL-SPARQL | W3C suite for both, with no known failure listed ([runner](../crates/nrese-shacl/tests/w3c_shacl)). Data is validated with its inferred statements unless `infer=false`. Not supported: SHACL Advanced Features (rules), and `sh:entailment`, which is reported as a failure |
+| [SHACL](https://www.w3.org/TR/shacl/) (W3C Recommendation, 2017): Core and SHACL-SPARQL | Data is validated with its inferred statements unless `infer=false`. Not supported: SHACL Advanced Features (rules), and `sh:entailment`, which is reported as a failure |
 | Validation on request (`/dataset/shacl`), against stored shapes or shapes sent with the request | Sent shapes live in a transaction that is never committed, and count against the request's memory ([HTTP interface](ops/http-api.md#shacl-validation)) |
 | Validation on commit (`shacl.gate`: `report` or `enforce`), only for the focus nodes the commit can affect | Off by default. `enforce` refuses results of [`shacl.gate_severity`](ops/config-reference.md#shacl.gate_severity) or above, `violation` by default |
 

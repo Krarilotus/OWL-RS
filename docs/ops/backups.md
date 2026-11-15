@@ -113,7 +113,7 @@ head -n -1 export.nq | sha256sum        # the same <hex>
 # 2. Restore it into a fresh server.
 docker run -d --name nrese-drill -p 127.0.0.1:8081:8080 -v nrese-drill:/var/lib/nrese/data \
   -e NRESE_REASONING_MODE=owl2-rl nrese
-curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8081/readyz
+until curl -sf http://localhost:8081/readyz; do sleep 1; done
 curl -sS -X POST -H 'Content-Type: application/n-quads' --data-binary @export.nq \
   http://localhost:8081/api/v1/repositories/nrese/restore
 
