@@ -1,7 +1,9 @@
 # Backups
 
 NRESE backs up in three ways. No setting schedules them, so take them from your own scheduler,
-and prove now and then that they restore, with the [drill](#a-complete-drill) below.
+and prove now and then that they restore, with the [drill](#a-complete-drill) below. The offline
+commands run in a container the way an offline load does
+([loading data](server-setup.md#loading-data)).
 
 | | Holds | Taken | Restored |
 |---|---|---|---|

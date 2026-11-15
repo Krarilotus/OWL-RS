@@ -134,7 +134,7 @@ and a changed setting. To build from source instead, see
 | Learn it step by step | the [tutorial](docs/tutorial.md) |
 | See all it does, and the standards it follows | [features and standards](docs/what-it-covers.md) |
 | Know where it stops, and what to do instead | [limits](docs/limits.md) |
-| Know what reasoning computes, and what an answer promises | [reasoning](docs/spec/reasoning-semantics.md) |
+| Choose how it reasons, and know what an answer promises | [reasoning modes](docs/what-it-covers.md#reasoning), [what an answer promises](docs/what-it-covers.md#what-an-answer-promises) |
 | Load your own data | [your own data](docs/tutorial.md#your-own-data), and large files [offline](docs/ops/server-setup.md#loading-data) |
 | Call it over HTTP | [the HTTP interface](docs/ops/http-api.md) |
 | Change a setting | [every setting](docs/ops/config-reference.md) |

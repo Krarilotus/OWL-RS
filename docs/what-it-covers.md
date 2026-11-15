@@ -75,6 +75,12 @@ the W3C tests of each profile are under [standards](#standards).
 | `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency, classification, realisation and the certain answers they can prove ([design](design/owl2-dl.md)) |
 | `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every other mode that reasons |
 
+To choose: `rdfs` for class and property hierarchies with domains and ranges, `owl2-rl` for most
+OWL ontologies, where every inference is made at the write and a query only reads, and `owl2-dl`
+when the ontology says what rules can't follow, such as that every pet is a cat or a dog, and you
+want such answers proven. It can add the DL engines' work to a commit and to a query the rules
+don't settle, within the [`dl.*` budgets](ops/config-reference.md#reasoner).
+
 A commit that, with its inferences, breaks a consistency rule of the mode is refused, and the
 response names the rule and its premises, as far as the writer may read them
 ([consistency](spec/reasoning-semantics.md#consistency)).
