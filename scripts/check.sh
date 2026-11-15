@@ -12,7 +12,9 @@
 #                                  when its push tier passed for that exact tree, and its
 #                                  Windows inputs passed the Windows check (below).
 #        scripts/check.sh push     pre-push hook (.githooks/pre-push): the crates a pushed
-#                                  commit changes in the pushed range, on the fleet only
+#                                  commit changes in the pushed range (every crate when the
+#                                  root manifest, lock file or toolchain changed:
+#                                  changed_crates, below), on the fleet only
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
 #                                  tests, the dependents' fast tests; random tests on new
 #                                  seeds; the lock check; nrese-exec's unsafe code under Miri
@@ -36,6 +38,9 @@
 #                                  for refactor/engine-v2 is a merge gate, a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
+#        scripts/check.sh crates FILE...
+#                                  the workspace crates the push tier lints and tests for
+#                                  these changed files, one per line; nothing else runs.
 #
 # Tests run under cargo-nextest when it is installed (every test of every binary in
 # parallel; `cargo install --locked cargo-nextest`), else under cargo test, crate by
@@ -79,6 +84,25 @@ python() {
   else echo "the gate needs python (or python3)" >&2; return 127; fi
 }
 
+# The workspace crates a change reaches, which the push tier lints and tests
+# (benches/suite/tests/test_changed_crates.py). A file under a crate's directory (crates/) reaches
+# that crate. The root manifest (its [workspace.package], [workspace.dependencies], profiles and
+# lints), the root lock file, the toolchain file, Cargo's build configuration and clippy's
+# configuration reach every crate of the workspace: a change to one of them is every crate
+# changed. (D16-637: a version bump changed only such files, and the push tier printed "changed:
+# none" and ran no crate's clippy or tests.) The lock files of the other Cargo projects (fuzz/,
+# benches/*) pin only those projects' builds. It stays in this file: check.sh needs no other file
+# to start, and the suite's fixtures copy it alone or stub the scripts it names.
+EVERY_CRATE='^(Cargo\.toml|Cargo\.lock|rust-toolchain(\.toml)?|\.cargo/config(\.toml)?|clippy\.toml)$'
+
+changed_crates() {
+  if printf '%s\n' "$@" | grep -qE "$EVERY_CRATE"; then
+    workspace_packages
+  else
+    crates_of "$@"
+  fi
+}
+
 # The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
 crates_of() {
   local file dir name
@@ -96,6 +120,15 @@ crates_of() {
   done
 }
 
+# The workspace's packages, by name.
+workspace_packages() {
+  cargo metadata --no-deps --format-version 1 --offline \
+    | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
+    | tr -d '\r'
+}
+
+if [ "$mode" = crates ]; then shift; changed_crates "$@"; exit; fi
+
 # The workspace crates depending on any of the given ones (directly or not, dev-
 # dependencies included: their tests must still compile), the given ones excluded.
 dependents_of() {
@@ -111,13 +144,6 @@ dependents_of() {
 }
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
-
-# The workspace's packages, by name.
-workspace_packages() {
-  cargo metadata --no-deps --format-version 1 --offline \
-    | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
-    | tr -d '\r'
-}
 
 # Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
 # read without carriage returns: Windows writes them, and cargo rejects names with them.
@@ -219,7 +245,9 @@ side_steps() {
     # No test-only feature in a product build (scripts/check-features.sh, DUR-4).
     step features bash scripts/check-features.sh
   fi
-  if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
+  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
+  # test_commit_tier, ...): a change to them runs the contracts.
+  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
   fi
   # Names the changed Python can't resolve, which a test replacing a whole function never runs
@@ -440,7 +468,7 @@ case "$mode" in
       exit 2
     fi
     mapfile -t files < "$NRESE_FILES_FROM"
-    mapfile -t changed < <(crates_of "${files[@]}")
+    mapfile -t changed < <(changed_crates "${files[@]}")
     mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
