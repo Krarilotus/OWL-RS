@@ -186,3 +186,40 @@ fn incremental_consistency_on_commit_is_the_cold_check() {
         "{engines:?}"
     );
 }
+
+/// A property declared both an object and a data property isn't OWL 2 DL: the reader
+/// leaves it out (a fatal diagnostic), and an engine's "consistent" for what is left
+/// becomes `unknown` ("`Consistent` only if nothing of the source was left out"). U1's
+/// proof must give the same verdict on the same left-out part, and no answer is then
+/// `complete`. The engine path is taken with a U1 that clashes (`⊥` blocks a disjunct:
+/// the strengthening derives both), so a DL engine decides.
+#[test]
+fn a_left_out_part_leaves_consistency_unknown_whoever_decides() {
+    const LEFT_OUT: &str = ":d a owl:ObjectProperty , owl:DatatypeProperty . :y :d :z .";
+    let verdict = |data: &str| {
+        let dl = pipeline();
+        insert(&dl, &format!("{data} {LEFT_OUT}")).expect("accepted");
+        let status = dl.store().dl().status().expect("a DL status");
+        let (_, answer) = super::queries::query(&dl, "SELECT ?x { ?x a :B }");
+        (
+            status.consistency.verdict.as_str().to_owned(),
+            status.consistency.engine,
+            dl.store().dl_bounds().last,
+            answer.shared.as_str(),
+        )
+    };
+    let engine = verdict(
+        ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B owl:disjointWith :E . \
+         :C rdfs:subClassOf :D . :y a :A , :E .",
+    );
+    let upper = verdict(":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :y a :B .");
+    let mut wrong = Vec::new();
+    // Guard: the engine path leaves it unknown.
+    if engine.0 != "unknown" || engine.1 == "upper-bound" {
+        wrong.push(format!("guard, the engine path: {engine:?}"));
+    }
+    if upper.0 != engine.0 || upper.3 == "complete" {
+        wrong.push(format!("U1's path {upper:?}, the engine's {engine:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
