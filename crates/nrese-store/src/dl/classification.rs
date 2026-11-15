@@ -151,11 +151,11 @@ pub(crate) fn realisation(
 /// panics, or the request is on a Rayon worker (which must not wait for it), the request
 /// computes its own. Publishing never lets an older in-flight request evict a newer
 /// revision; same-revision races keep the first complete result. No solver runs locked.
-/// `None`: `_stop` fired while the request waited (not yet: it waits to the end).
+/// `None`: `stop` fired while the request waited; the computation goes on and is kept.
 fn cached<T>(
     slot: &Slot<T>,
     revision: u64,
-    _stop: Stop<'_>,
+    stop: Stop<'_>,
     complete: impl Fn(&T) -> bool,
     compute: impl FnOnce() -> T,
 ) -> Option<Arc<T>> {
@@ -178,9 +178,10 @@ fn cached<T>(
             }
             Some(result)
         }
-        Claim::Wait(build) => match build.wait() {
-            Ok(Some(result)) => Some(result),
-            Ok(None) | Err(Busy) => Some(own()),
+        Claim::Wait(build) => match build.wait_until(stop) {
+            Some(Ok(Some(result))) => Some(result),
+            Some(Ok(None) | Err(Busy)) => Some(own()),
+            None => None,
         },
     }
 }

@@ -77,14 +77,20 @@ impl<V> Build<V> {
     /// helped with until then; [`Busy`] at once on a pool thread for an opaque build that
     /// isn't over.
     pub fn wait(&self) -> Result<Option<Arc<V>>, Busy> {
+        self.wait_until(&|| false).unwrap_or(Err(Busy)) // never given up
+    }
+
+    /// [`Self::wait`], given up (`None`) when `stop` fires, which an asleep waiter asks
+    /// every 50 ms; the build goes on.
+    pub fn wait_until(&self, stop: &dyn Fn() -> bool) -> Option<Result<Option<Arc<V>>, Busy>> {
         loop {
             let work = {
                 let state = lock(&self.state);
                 if let Some(done) = &state.done {
-                    return Ok(done.clone());
+                    return Some(Ok(done.clone()));
                 }
                 if self.kind == Kind::Opaque && rayon::current_thread_index().is_some() {
-                    return Err(Busy);
+                    return Some(Err(Busy));
                 }
                 state.work.clone()
             };
@@ -93,7 +99,10 @@ impl<V> Build<V> {
             }
             let mut state = lock(&self.state);
             if let Some(done) = &state.done {
-                return Ok(done.clone());
+                return Some(Ok(done.clone()));
+            }
+            if stop() {
+                return None;
             }
             let same = match (&state.work, &work) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -104,8 +113,9 @@ impl<V> Build<V> {
                 self.waiting.fetch_add(1, Ordering::SeqCst);
                 state = self
                     .changed
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
+                    .wait_timeout(state, std::time::Duration::from_millis(50))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
                 self.waiting.fetch_sub(1, Ordering::SeqCst);
             }
             drop(state);
