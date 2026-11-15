@@ -68,9 +68,9 @@ pub fn release_all() {
 /// operation's freed memory, so the next one's peak starts above it.
 ///
 /// The caller pays for its own release and for queuing the pool threads' releases, nothing
-/// more: each pool thread releases when it is next free, after this has returned, so a
-/// worker busy with other work (another request's operation, a materialisation) is not
-/// waited for.
+/// more: each pool thread releases when it is next free, before or after this returns, and
+/// none is waited for, so a worker busy with other work (another request's operation, a
+/// materialisation) doesn't hold the caller up.
 ///
 /// Unforced, the allocator gives back what it can without waiting. A forced release
 /// ([`release_all`]) took about 8 ms on an EL classification of 20,000 classes through the
