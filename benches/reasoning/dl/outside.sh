@@ -21,6 +21,11 @@ export NRESE_DL_OUT="$OUT" NRESE_DL_REFERENCE="exec docker run --rm -i --init \
 # 101: the test ran and found failures (summary.tsv, fail-*.ttl); anything else is the harness's.
 "$BIN" --ignored --exact --nocapture dl::outside::dl_answers_agree_with_outside_reasoners \
   > "$OUT/test.log" 2>&1 || rc=$?
-[ ! -f "$OUT/summary.tsv" ] ||
-  awk -F'\t' '{n[$6]++} END {for (k in n) print k, n[k]}' "$OUT/summary.tsv" | sort > "$OUT/counts.txt"
+# Per outcome; the cases, and those with a query judged (an inconsistent case tests the write
+# alone); the rows set aside, where the two references differ, to be read by hand.
+S=$OUT/summary.tsv
+[ ! -f "$S" ] || { awk -F'\t' '{n[$6]++} END {for (k in n) print k, n[k]}' "$S" | sort
+  awk -F'\t' '!c[$1]++ {all++} $4 != "write" && $5 !~ /^(reference-undecided|not-judged)$/ && !q[$1]++ {n++}
+    END {print "cases", all; print "cases with a query judged", n + 0}' "$S"
+  awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"; } > "$OUT/counts.txt"
 exit "${rc:-0}"
