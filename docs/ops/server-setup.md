@@ -1,39 +1,41 @@
-# NRESE Server Setup and Deployment Guide
+# NRESE server setup and deployment guide
 
 ## 1. Purpose
-This document defines how to deploy and operate `nrese-server` in production.
-It covers native binary deployment, container deployment, TLS/reverse proxy setup, and production readiness checks.
 
-## 1.1 Local Test-Server Profile
+This page says how to deploy and run `nrese-server` in production. It covers deployment as a
+native binary or in a container, a reverse proxy with TLS and the checks before the server goes
+into use.
 
-For local validation we run `nrese-server` as a test server with ontology preloading enabled.
-The test profile is intended to validate:
+## 1.1 Local test-server profile
 
-- startup and readiness behavior
-- ontology load success and failure semantics
-- basic query path availability before full production hardening
+For local checks we run `nrese-server` as a test server with the ontology preloaded. The test
+profile checks the start-up and readiness behaviour, how the ontology load succeeds or fails,
+and that the basic query path works before the server is hardened for production.
 
-## 2. Deployment Targets
-- Linux `x86_64` and `aarch64` are primary production targets.
-- Deployment modes:
-- `systemd` managed native binary.
-- OCI container with orchestrator or standalone runtime.
+## 2. Deployment targets
 
-## 3. Runtime Topology
-- One `nrese-server` instance manages one data directory: the default repository in it, and each repository created over the API in its `repositories/<id>/` ([HTTP interface](http-api.md#rdf4j-protocol)).
-- Scale-out: read replicas follow a primary's log ([replication](replication.md)); nothing partitions the data across machines.
-- Place reverse proxy in front of NRESE for TLS termination and edge controls.
+- Linux `x86_64` and `aarch64` are the main production targets.
+- The server runs as a native binary under `systemd`, or as an OCI container under an
+  orchestrator or a standalone runtime.
 
-### 3.1 Operator UI Endpoint
-- `GET /ops` serves a lightweight operator console from the same server process.
-- `GET /ui` remains as a compatibility alias.
-- `GET /console` serves the user-facing console from the same server process.
-- `GET /` redirects to `/console` for ergonomic access.
-- `/console` calls same-origin endpoints such as `/dataset/query`, `/dataset/tell`, `/dataset/update`, `/dataset/data`, `/api/v1/ai/status`, and `/api/v1/ai/query-suggestions`.
-- `/ops` remains the operator-facing surface for diagnostics and operational workflows.
+## 3. Runtime topology
 
-## 4. Filesystem Layout
-Recommended host layout:
+- One `nrese-server` instance manages one data directory, with the default repository in it and each repository created over the API in its `repositories/<id>/` ([HTTP interface](http-api.md#rdf4j-protocol)).
+- To scale out, read replicas follow a primary's log ([replication](replication.md)), and nothing partitions the data across machines.
+- Put a reverse proxy in front of NRESE for TLS termination and controls at the edge.
+
+### 3.1 Operator UI endpoint
+
+- `GET /ops` serves a small operator console from the same server process.
+- `GET /ui` stays as an alias, for compatibility.
+- `GET /console` serves the user's console from the same server process.
+- `GET /` redirects to `/console`.
+- `/console` calls endpoints of the same origin, such as `/dataset/query`, `/dataset/tell`, `/dataset/update`, `/dataset/data`, `/api/v1/ai/status` and `/api/v1/ai/query-suggestions`.
+- `/ops` stays the operator's page for diagnostics and operational work.
+
+## 4. Filesystem layout
+
+This is the layout we recommend on the host.
 - `/opt/nrese/bin/nrese-server`
 - `/etc/nrese/nrese.env`
 - `/etc/nrese/config.toml`
@@ -41,72 +43,73 @@ Recommended host layout:
 - `/var/lib/nrese/backups`
 - `/var/log/nrese/`
 
-The service user MUST own data and log directories with least privilege.
+The service user must own the data and log directories, with the least privilege.
 
-## 5. Configuration Surface
-The canonical runtime knob reference is [config-reference.md](./config-reference.md).
+## 5. Configuration surface
 
-Which value wins when a setting is given in several places (command line, environment, file,
-default): [precedence](./config-reference.md#precedence).
+Every setting is in [config-reference.md](./config-reference.md), and
+[precedence](./config-reference.md#precedence) says which value wins when a setting is given in
+several places (command line, environment, file, default).
 
-Current behavior:
+This is how configuration behaves.
 
-- `config.toml` is supported as a first-class runtime input.
+- `config.toml` is a full runtime input.
 - Environment variables override file values.
 - `--set KEY=VALUE` overrides one file key, over the file and the environment.
 - Typed runtime defaults and validation stay in the owning crates.
-- External parsing, file loading, and precedence stay in `crates/nrese-server/src/config/`.
-- `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` is now the explicit deployment-mode selector for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`.
-- Startup validation now rejects invalid `internal-authenticated` / `replacement-grade` combinations instead of silently serving them.
+- External parsing, file loading and precedence stay in `crates/nrese-server/src/config/`.
+- `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` selects the deployment mode explicitly, one of `open-workbench`, `read-only-demo`, `internal-authenticated` and `replacement-grade`.
+- Start-up validation refuses invalid `internal-authenticated` / `replacement-grade` combinations instead of serving them silently.
 
-Durable storage note:
+This is how durable storage behaves.
 
 - `NRESE_STORE_MODE=on-disk` stores a write-ahead log and checkpoints under `NRESE_DATA_DIR`.
-  - It needs no build feature and no native toolchain.
-  - Every commit is synced before it is acknowledged.
-- The data directory is locked: one process at a time. A second server or offline command on the same directory fails at startup ([what to do](#err-data-directory-locked)).
+  It needs no build feature and no native toolchain, and every commit is synced before it is
+  acknowledged.
+- The data directory is locked, so only one process at a time can use it. A second server or offline command on the same directory fails at start-up ([what to do](#err-data-directory-locked)).
 - Checkpoints run in the background and delete the WAL segments they cover.
-- Backups:
-  - Image backups (physical): `POST /api/v1/repositories/{id}/image` (admins; the earlier `POST /ops/api/admin/dataset/image`, with `?repository=ID` for another repository than the default, still answers, into `backups/<ID>-<seconds>/`) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline: `nrese-server backup DIR`. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target: it checks the image against its manifest and places it in the data directory, which must hold no store; the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
-  - N-Quads export: `GET /api/v1/repositories/{id}/backup` and `POST …/restore` (earlier: `/ops/api/admin/dataset/backup`, `/restore`): asserted statements only, portable to other stores, inferences derived again after a restore.
-  - Point-in-time restore: with `store.wal_archive` on, checkpoints move the WAL segments they cover into `wal-archive/` instead of deleting them. `nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N` restores the image and replays the log up to revision `N` (every commit is one revision: `/api/v1/repositories/{id}/info` gives it to whole-dataset readers or administrators, and the logs record it), or with `--until-time 2026-10-02T14:05:00Z` (RFC 3339 with a zone, read by the `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's midnight, digits past the microsecond cut off) the commits made up to that time (logged since WAL version 6), cutting it there; without `--until-revision` as far as the log goes. A restore by time refuses an image whose last commit was made after the time (take an older image), or one with no commit time; restore by revision instead. Images without a commit time: those written before 7 Nov 2026 (checkpoint format 11), and every image, a bulk replacement's included, of a store that was upgraded from such a checkpoint, of a store created before 2 Oct 2026 (it keeps integer literals in its dictionary, and its log keeps no times), or of a replica of one of these. To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export into a new, empty data directory; that store's images have commit times. After a refusal the target directory holds the placed image, so clear it before trying again. The target data directory must hold no store. `nrese-server prune-archive R` removes the archived segments whose records all come before revision `R` (after an image backup at `R - 1` or later they are not needed; safe while the server runs).
+- There are three ways to back up and restore, and you can also copy the directory.
+  - For an image backup (physical), `POST /api/v1/repositories/{id}/image` (for administrators, and the earlier `POST /ops/api/admin/dataset/image`, with `?repository=ID` for another repository than the default, still answers, into `backups/<ID>-<seconds>/`) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline, `nrese-server backup DIR` does the same. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target. It checks the image against its manifest and places it in the data directory, which must hold no store, and the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
+  - The N-Quads export, `GET /api/v1/repositories/{id}/backup`, and its `POST …/restore` (earlier `/ops/api/admin/dataset/backup` and `/restore`) carry the asserted statements only. The export is portable to other stores, and the inferences are derived again after a restore.
+  - For a point-in-time restore, with `store.wal_archive` on, checkpoints move the WAL segments they cover into `wal-archive/` instead of deleting them. `nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N` restores the image and replays the log up to revision `N` (every commit is one revision: `/api/v1/repositories/{id}/info` gives it to whole-dataset readers or administrators, and the logs record it), or with `--until-time 2026-10-02T14:05:00Z` (RFC 3339 with a zone, read by the `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's midnight, digits past the microsecond cut off) the commits made up to that time (logged since WAL version 6), cutting it there, and without `--until-revision` as far as the log goes. A restore by time refuses an image whose last commit was made after the time (take an older image), or one with no commit time, so restore that one by revision instead. These images have no commit time: those written before 7 Nov 2026 (checkpoint format 11), and every image, a bulk replacement's included, of a store that was upgraded from such a checkpoint, of a store created before 2 Oct 2026 (it keeps integer literals in its dictionary, and its log keeps no times), or of a replica of one of these. To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export into a new, empty data directory, and that store's images have commit times. After a refusal the target directory holds the placed image, so clear it before trying again. The target data directory must hold no store. `nrese-server prune-archive R` removes the archived segments whose records all come before revision `R` (after an image backup at `R - 1` or later they are not needed), and it is safe while the server runs.
   - Or copy the directory while the server is stopped.
 
-External exposure note:
+To make the server reachable from other machines:
 
-- Keep default bind (`127.0.0.1`) for local/dev.
-- For externally reachable deployment, bind `NRESE_BIND_ADDR=0.0.0.0:8080` and front with TLS reverse proxy plus access controls.
-- In `mtls` mode, NRESE trusts authenticated client-certificate identity only through the documented trusted reverse-proxy header contract. It does not terminate client TLS certificates directly in-process in the current implementation.
+- Keep the default bind address (`127.0.0.1`) for local work and development.
+- For a deployment reachable from outside, bind `NRESE_BIND_ADDR=0.0.0.0:8080` and put a TLS reverse proxy with access controls in front.
+- In `mtls` mode, NRESE trusts a client certificate's identity only through the documented header contract of a trusted reverse proxy. It doesn't terminate client TLS certificates itself.
 
-### 5.2 Reliability and Storage Variables
+### 5.2 Reliability and storage variables
 
-No setting schedules backups: they are taken through the admin API or offline with `nrese-server backup` (above, and [backup-restore-drills.md](backup-restore-drills.md)). Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. The checkpoint and log settings (`store.checkpoint_after_wal`, `store.wal_archive`, `store.wal_damage`, `store.verify_on_open`, `store.map_checkpoints`) are in [config-reference.md](config-reference.md), the only place settings are listed.
+No setting schedules backups, which are taken through the admin API or offline with `nrese-server backup` (above, and [backup-restore-drills.md](backup-restore-drills.md)). Earlier versions of this page listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`, but none of them was ever implemented. The checkpoint and log settings (`store.checkpoint_after_wal`, `store.wal_archive`, `store.wal_damage`, `store.verify_on_open`, `store.map_checkpoints`) are in [config-reference.md](config-reference.md), the only place settings are listed.
 
-### 5.3 Ontology Preload
+### 5.3 Ontology preload
 
 - Set `NRESE_ONTOLOGY_PATH` (or `store.ontology_path`) to preload an ontology at startup.
 - If it is set and the file is missing, startup fails with a clear error.
 - If it is unset, nothing is preloaded. There are no implicit discovery or fallback paths, so the server behaves the same regardless of the working directory.
 
-### 5.4 Bulk Loading
+### 5.4 Bulk loading
 
-Initial loads and full restores of large files use the offline bulk loader instead of HTTP:
+Initial loads and full restores of large files use the offline bulk loader instead of HTTP.
 
 ```powershell
 $env:NRESE_STORE_MODE = "on-disk"; $env:NRESE_DATA_DIR = ".\data"
 nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] [--strict | --quarantine] data.nt more.nq ...
 ```
 
-- Behaviour:
-  - The format comes from each file's extension.
-  - `--replace` swaps the dataset instead of adding to it.
-  - `--graph` sets the target graph for triple formats; quad formats keep their own graphs.
-  - Blank nodes are fresh per load.
-  - A statement with a syntax error goes into the repository's quarantine and the load goes on (`store.invalid_statements = "quarantine"`, the default; `--quarantine`, or the older `--skip-errors`): a line of N-Triples or N-Quads, a Turtle or TriG statement up to its `.`, an RDF/XML node element, a JSON-LD top-level object. It is kept with its file, line and reason, and its text verbatim except for RDF/XML and JSON-LD, invisible to queries, reasoning, exports and statistics until it is re-admitted (fixed, or repaired on request, through the commit gates) or discarded ([quarantine.md](../design/quarantine.md)). The load prints the count and the first examples. With `--strict` (or `store.invalid_statements = "strict"`) the first stops the load and nothing of it is committed. Malformed XML or JSON and read errors always stop.
-- Bulk loading is offline only. The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
-- N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
+This is how a load behaves.
 
-### 5.4.1 One-off Queries and Conversions
+- The format comes from each file's extension.
+- `--replace` swaps the dataset instead of adding to it.
+- `--graph` sets the target graph for triple formats, and quad formats keep their own graphs.
+- Blank nodes are fresh per load.
+- A statement with a syntax error goes into the repository's quarantine and the load goes on (`store.invalid_statements = "quarantine"`, the default, `--quarantine` or the older `--skip-errors`). Such a statement is a line of N-Triples or N-Quads, a Turtle or TriG statement up to its `.`, an RDF/XML node element or a JSON-LD top-level object. It is kept with its file, line and reason, and its text verbatim except for RDF/XML and JSON-LD, invisible to queries, reasoning, exports and statistics until it is re-admitted (fixed, or repaired on request, through the commit gates) or discarded ([quarantine.md](../design/quarantine.md)). The load prints the count and the first examples. With `--strict` (or `store.invalid_statements = "strict"`) the first stops the load and nothing of it is committed. Malformed XML or JSON and read errors always stop.
+- Bulk loading is offline only. The server must not be running on the same data directory, and the directory lock enforces this. Validation gates don't run during a bulk load.
+- N-Triples and N-Quads are parsed on all cores and are the fastest input, about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
+
+### 5.4.1 One-off queries and conversions
 
 ```powershell
 nrese-server query [--config .\config.toml] [--format json|xml|csv|tsv|nt|ttl|nq|trig|rdf|jsonld] "SELECT ..."
@@ -115,30 +118,33 @@ nrese-server convert data.ttl data.nt
 nrese-server print-query [--config .\config.toml] [--form paths|values] [--schema ontology.ttl]... "SELECT ..."
 ```
 
-- `query` answers one query from the configured store and writes the results to standard output. First it brings the inferred stack up to date, as the server's start does (it rematerialises if the rules changed since the last load or start): SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
-- `print-query` prints the query as standard SPARQL 1.1 for a store without reasoning that holds the same statements: it answers as NRESE does under `owl2-rl` with the QL rewriting on (`docs/design/ql-rewriting.md` §8). `--form paths` (the default) reaches the hierarchy with property paths over the schema, `values` enumerates it. Against the configured store, or with `--schema` against those files alone. The first line, `# NRESE completeness: …`, is NRESE's status for the answers; a query that can't be written exactly (equality, recursive rules, …) gets its reasons on standard error and exit status 2.
-- `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept; a named graph is an error for a format without graphs. The output appears only when complete.
+- `query` answers one query from the configured store and writes the results to standard output, SELECT and ASK in the results format (default JSON) and CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). First it brings the inferred stack up to date, as the server's start does, and it rematerialises if the rules changed since the last load or start. It runs offline, like `load`.
+- `print-query` prints the query as standard SPARQL 1.1 for a store without reasoning that holds the same statements, and that query answers as NRESE does under `owl2-rl` with the QL rewriting on (`docs/design/ql-rewriting.md` §8). `--form paths` (the default) reaches the hierarchy with property paths over the schema, and `values` enumerates it. It works against the configured store, or with `--schema` against those files alone. The first line, `# NRESE completeness: …`, is NRESE's status for the answers. A query that can't be written exactly (equality, recursive rules, …) gets its reasons on standard error and exit status 2.
+- `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept, and a named graph is an error for a format without graphs. The output appears only when complete.
 
-### 5.4.2 Moving Data In from Another Store
+### 5.4.2 Moving data in from another store
 
-From Fuseki, GraphDB, RDF4J or any SPARQL store: export the dataset as N-Quads (named
-graphs kept), load it with `nrese-server load`, then check before switching clients over:
-- the statement count per graph (`SELECT ?g (COUNT(*) AS ?n) { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`, and the default graph) on both sides;
-- the application's own queries and updates on both sides, compared by result;
-- with reasoning on, that the source store's ruleset matches the configured mode
-  ([reasoning semantics](../spec/reasoning-semantics.md)): a different ruleset changes
+To move from Fuseki, GraphDB, RDF4J or any other SPARQL store, export the dataset as N-Quads
+(named graphs kept), load it with `nrese-server load` and check these before you switch the
+clients over.
+
+- Compare the statement count per graph on both sides
+  (`SELECT ?g (COUNT(*) AS ?n) { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`, and the default graph).
+- Run the application's own queries and updates on both sides and compare the results.
+- With reasoning on, check that the source store's ruleset matches the configured mode
+  ([reasoning semantics](../spec/reasoning-semantics.md)), because a different ruleset changes
   the answers, not only their speed.
 
-Keep the old store until the comparison passes; switching back is changing the client's
+Keep the old store until the comparison passes, and switching back is changing the client's
 endpoint.
 
 ### Commands
 
-`nrese-server [COMMAND] [OPTIONS]`. Every command takes `--config FILE` (also `-c FILE`, `--config=FILE`) and `--set KEY=VALUE` (repeatable; [precedence](config-reference.md#precedence)); `convert`, `config-schema` and `print-query --schema` read no configuration. An unknown option is an error. Commands log to standard error; the server logs to standard output.
+The form is `nrese-server [COMMAND] [OPTIONS]`. Every command takes `--config FILE` (also `-c FILE`, `--config=FILE`) and `--set KEY=VALUE` (repeatable, see [precedence](config-reference.md#precedence)), and `convert`, `config-schema` and `print-query --schema` read no configuration. An unknown option is an error. Commands log to standard error, and the server logs to standard output.
 
-Exit status: `0` on success; `1` on any error, with `Error: <message>` and its causes on standard error; `2` from `print-query` when the query can't be written exactly. A binary built for a CPU feature this machine lacks exits `1` before anything runs, naming the feature.
+The exit status is `0` on success, `1` on any error, with `Error: <message>` and its causes on standard error, and `2` from `print-query` when the query can't be written exactly. A binary built for a CPU feature this machine lacks exits `1` before anything runs, naming the feature.
 
-Commands marked *store* open the configured store and lock its data directory: they fail while another process has it open ([locked](#err-data-directory-locked)).
+Commands marked *store* open the configured store and lock its data directory, so they fail while another process has it open ([locked](#err-data-directory-locked)).
 
 | Command | Arguments and options (defaults) | What it does and changes | Fails when |
 |---|---|---|---|
@@ -155,7 +161,7 @@ Commands marked *store* open the configured store and lock its data directory: t
 
 ### Startup errors
 
-A server that fails to start writes `Error: <message>` and its causes to standard error (the journal, `docker logs`) and exits `1`. Configuration errors name the setting; run `nrese-server check-config` with the same configuration to see them without starting.
+A server that fails to start writes `Error: <message>` and its causes to standard error (the journal, `docker logs`) and exits `1`. Configuration errors name the setting, and to see them without starting, run `nrese-server check-config` with the same configuration.
 
 <a id="err-data-directory-locked"></a>
 #### Data directory locked
@@ -167,9 +173,9 @@ Caused by:
     data directory ./data is locked by another process
 ```
 
-- The cause is that another process has the store in `store.data_dir` (the path shown) open: a running server, or an offline command (`load`, `query`, `print-query`, `backup`) on the same directory. The lock is that process's hold on the directory's `LOCK` file, released when it closes the store.
-- To fix it, stop the other process (`systemctl stop nrese`, `docker stop nrese`), or wait for the offline command to end; or give this one another data directory. On Linux, `fuser DATA_DIR/LOCK` names the process. Don't delete `LOCK`: the file isn't the lock, the other process's hold on it is.
-- To check the fix, start the server again; once it reports ready, `curl -fsS http://127.0.0.1:8080/readyz` answers `{"status":"ready"}`.
+- The cause is that another process has the store in `store.data_dir` (the path shown) open, a running server or an offline command (`load`, `query`, `print-query`, `backup`) on the same directory. The lock is that process's hold on the directory's `LOCK` file, released when it closes the store.
+- To fix it, stop the other process (`systemctl stop nrese`, `docker stop nrese`), wait for the offline command to end or give this one another data directory. On Linux, `fuser DATA_DIR/LOCK` names the process. Don't delete `LOCK`, because the file isn't the lock, the other process's hold on it is.
+- To check the fix, start the server again. Once it reports ready, `curl -fsS http://127.0.0.1:8080/readyz` answers `{"status":"ready"}`.
 
 <a id="err-failed-to-bind"></a>
 #### Address can't be bound
@@ -181,11 +187,11 @@ Caused by:
     Address already in use (os error 98)
 ```
 
-- The cause line says which cause it is. `Address already in use`: another process listens on that port. `Cannot assign requested address`: the address isn't one of this machine's. `Permission denied`: a port below 1024 without the right to bind it.
-- To fix it, stop the other listener (on Linux, `ss -ltnp 'sport = :8080'` names it), or set another address or port: `server.bind_address` (`NRESE_BIND_ADDR`), for example `127.0.0.1:8081`. In Docker the server binds inside the container; a busy port on the machine shows as `docker run`'s own error, `port is already allocated`: publish another one (`-p 127.0.0.1:8081:8080`).
-- To check the fix, start the server again; `curl -fsS http://127.0.0.1:8080/readyz` (with the port you chose) answers `{"status":"ready"}`.
+- The cause line says which cause it is. `Address already in use` means another process listens on that port, `Cannot assign requested address` means the address isn't one of this machine's, and `Permission denied` means a port below 1024 without the right to bind it.
+- To fix it, stop the other listener (on Linux, `ss -ltnp 'sport = :8080'` names it), or set another address or port in `server.bind_address` (`NRESE_BIND_ADDR`), for example `127.0.0.1:8081`. In Docker the server binds inside the container, and a busy port on the machine shows as `docker run`'s own error, `port is already allocated`. Then publish another one (`-p 127.0.0.1:8081:8080`).
+- To check the fix, start the server again, and `curl -fsS http://127.0.0.1:8080/readyz` (with the port you chose) answers `{"status":"ready"}`.
 
-## 5.5 Local Test-Server Startup Example (PowerShell)
+## 5.5 Local test-server startup example (PowerShell)
 
 ```powershell
 $env:NRESE_BIND_ADDR = "127.0.0.1:8080"
@@ -196,13 +202,13 @@ $env:NRESE_ONTOLOGY_PATH = ".\ontology.ttl"
 cargo run -p nrese-server
 ```
 
-Explicit config file startup:
+To start with an explicit config file:
 
 ```powershell
 cargo run -p nrese-server -- --config .\config.toml
 ```
 
-Build the frontend before serving `/console`:
+Build the frontend before serving `/console`.
 
 ```powershell
 Set-Location .\apps\nrese-console
@@ -211,14 +217,13 @@ npm run build
 Set-Location ..\..
 ```
 
-## 6. Native Binary Deployment (`systemd`)
+## 6. Native binary deployment (`systemd`)
 
-### 6.1 Create Service User
-- Create dedicated non-login user `nrese`.
-- Grant ownership of `/var/lib/nrese` and `/var/log/nrese`.
+### 6.1 Create a service user
+Create a dedicated non-login user `nrese`, and give it ownership of `/var/lib/nrese` and `/var/log/nrese`.
 
-### 6.2 Example Unit File
-Create `/etc/systemd/system/nrese.service`:
+### 6.2 Example unit file
+Create `/etc/systemd/system/nrese.service`.
 
 ```ini
 [Unit]
@@ -248,7 +253,9 @@ CapabilityBoundingSet=
 WantedBy=multi-user.target
 ```
 
-### 6.3 Start and Verify
+### 6.3 Start and verify
+These commands start the service and check it.
+
 - `systemctl daemon-reload`
 - `systemctl enable --now nrese.service`
 - `systemctl status nrese.service`
@@ -258,22 +265,20 @@ WantedBy=multi-user.target
 - `curl -fsSI http://127.0.0.1:8080/console`
 
 ### 6.4 Stopping
-A stop signal ends the server cleanly: SIGTERM (`systemctl stop`, `docker stop`, Kubernetes) or SIGINT (ctrl-c; on Windows, ctrl-c in the server's console). In this order:
-1. It accepts no new connections, closes idle ones, and lets the requests in flight finish, for up to 5 s. A request still running then is cut: its client sees the connection drop, and doesn't know whether a commit it sent was made, as on any kill.
-2. A replica's follower stops, and the store closes; it waits for the maintenance in progress first, the longest of which is a background checkpoint (it rewrites the whole store).
+A stop signal, SIGTERM (`systemctl stop`, `docker stop`, Kubernetes) or SIGINT (ctrl-c, and on Windows ctrl-c in the server's console), ends the server cleanly, in this order.
+
+1. It accepts no new connections, closes idle ones and lets the requests in flight finish, for up to 5 s. A request still running then is cut, and its client sees the connection drop and doesn't know whether a commit it sent was made, as on any kill.
+2. A replica's follower stops, and the store closes. It waits for the maintenance in progress first, the longest of which is a background checkpoint (it rewrites the whole store).
 3. It logs `nrese-server stopped` (the signal, how long the stop took, whether requests were cut) and exits with code 0.
 
-One deadline bounds the stop: 8 s from the signal. A stop not done by then logs `nrese-server stop deadline reached`, naming what it still waited for, and 200 ms later ends the process with code 0, as a kill would. The tests check that a stopped server has ended within 9 s of the signal: give the supervisor a stop allowance above that before it kills (`docker stop` waits 10 s unless `-t` says otherwise). Nothing acknowledged is lost either way: every commit is synced to the log before it is acknowledged, and the next start recovers from the checkpoint and the log, as after a kill ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+One deadline bounds the stop, 8 s from the signal. A stop not done by then logs `nrese-server stop deadline reached`, naming what it still waited for, and 200 ms later ends the process with code 0, as a kill would. The tests check that a stopped server has ended within 9 s of the signal, so give the supervisor a stop allowance above that before it kills (`docker stop` waits 10 s unless `-t` says otherwise). Nothing acknowledged is lost either way, because every commit is synced to the log before it is acknowledged, and the next start recovers from the checkpoint and the log, as after a kill ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
 
-Not handled: a signal during start-up (while the store opens and start-up reasoning runs) acts as a kill (in the image, Docker kills at the end of its grace period); on Windows, a service stop or `taskkill /F` ends the process without the drain.
+Two cases aren't handled. A signal during start-up (while the store opens and start-up reasoning runs) acts as a kill (in the image, Docker kills at the end of its grace period), and on Windows a service stop or `taskkill /F` ends the process without the drain.
 
-## 7. Container Deployment
+## 7. Container deployment
 
-### 7.1 Image Requirements
-- Minimal base image.
-- Non-root runtime user.
-- Read-only root filesystem where possible.
-- Writable volume mounted only for `/var/lib/nrese`.
+### 7.1 Image requirements
+An image should have a minimal base image, a non-root runtime user, a read-only root filesystem where possible and a writable volume mounted only for `/var/lib/nrese`.
 
 ### 7.2 Example `docker run`
 ```bash
@@ -289,27 +294,17 @@ docker run -d --name nrese \
   nrese
 ```
 
-`nrese` is the image built from this repository (`docker build -t nrese .`, as in the [README](../../README.md#quick-start)). The image sets `NRESE_BIND_ADDR=0.0.0.0:8080`, `NRESE_STORE_MODE=on-disk` and `NRESE_DATA_DIR=/var/lib/nrese/data`, and keeps the server's defaults for everything else ([configuration](config-reference.md)); the example names two of them only to show them. The image's entrypoint is `nrese-server`, so a [command](#commands) runs as `docker run --rm nrese config-schema`; from source, `cargo run --release -p nrese-server -- COMMAND`.
+`nrese` is the image built from this repository (`docker build -t nrese .`, as in the [README](../../README.md#quick-start)). The image sets `NRESE_BIND_ADDR=0.0.0.0:8080`, `NRESE_STORE_MODE=on-disk` and `NRESE_DATA_DIR=/var/lib/nrese/data`, and keeps the server's defaults for everything else ([configuration](config-reference.md)), and the example names two of them only to show them. The image's entrypoint is `nrese-server`, so a [command](#commands) runs as `docker run --rm nrese config-schema`, and from source as `cargo run --release -p nrese-server -- COMMAND`.
 
-### 7.3 Kubernetes Notes
-- Use readiness probe `/readyz` and liveness probe `/healthz`.
-- Use `PodDisruptionBudget` for availability.
-- Mount persistent volume for data.
-- Store secrets in cluster secret manager.
-- Use `NetworkPolicy` to restrict access to trusted namespaces and ingress controllers.
+### 7.3 Kubernetes notes
+On Kubernetes, use `/readyz` as the readiness probe and `/healthz` as the liveness probe, a `PodDisruptionBudget` for availability and a persistent volume for the data. Keep secrets in the cluster's secret manager, and restrict access to trusted namespaces and ingress controllers with a `NetworkPolicy`.
 
-## 8. Reverse Proxy and TLS
+## 8. Reverse proxy and TLS
 
-### 8.1 Recommended Edge Pattern
-- TLS terminates at reverse proxy.
-- NRESE binds to localhost/private network only.
-- Proxy forwards:
-- `X-Forwarded-For`
-- `X-Forwarded-Proto`
-- `X-Request-Id`
-- Expose `/console`, `/ops`, and API routes through the same trusted host, and apply identical auth/rate-limit policy unless you intentionally split user and operator access.
+### 8.1 Recommended edge pattern
+TLS terminates at the reverse proxy, and NRESE binds to localhost or a private network only. The proxy forwards `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Request-Id`. Expose `/console`, `/ops` and the API routes through the same trusted host, and apply the same auth and rate-limit policy to them unless you split user and operator access on purpose.
 
-### 8.2 Nginx Example
+### 8.2 Nginx example
 ```nginx
 server {
     listen 443 ssl http2;
@@ -335,21 +330,19 @@ server {
 }
 ```
 
-## 9. Auth and Secret Management
-- Never hardcode credentials or key material in images.
-- Use file mounts or secret stores for JWT signing secrets, keys, and OIDC secrets.
-- Rotate keys and certificates on defined schedule.
-- Enforce token issuer, audience, and expiration checks.
+## 9. Auth and secret management
+Never put credentials or key material into images. Give JWT signing secrets, keys and OIDC secrets to the server through file mounts or a secret store, rotate keys and certificates on a schedule and enforce the checks of each token's issuer, audience and expiry.
 
-## 10. Backup and Recovery Setup
-- Schedule periodic snapshot backups to local or remote object storage.
-- Validate backups with periodic restore drills.
-- Recovery procedure, from an image backup (`backups/<seconds>/` of the data directory, or a copy of it elsewhere):
+## 10. Backup and recovery setup
+Schedule backups yourself, since no setting does ([5.2](#52-reliability-and-storage-variables)), and keep copies on local or remote storage. Check the backups with restore drills from time to time.
+
+To recover from an image backup (`backups/<seconds>/` of the data directory, or a copy of it elsewhere), follow these steps.
+
 1. Stop writer traffic.
-2. Restore the newest image into an empty staging directory: `NRESE_DATA_DIR=/srv/nrese-staging nrese-server restore /srv/nrese-data/backups/<seconds>` (with `--wal` to replay the log after it: [point-in-time restore](#5-configuration-surface)). Exit `0` means the image passed its manifest check and is in place.
-3. Start a server on it with writes disabled, on another port: `NRESE_DATA_DIR=/srv/nrese-staging NRESE_DEPLOYMENT_POSTURE=read-only-demo NRESE_BIND_ADDR=127.0.0.1:8081 nrese-server`.
-4. Check it: `/readyz` answers `200`; `GET /api/v1/repositories/{id}/info` (as a whole-dataset reader or administrator) gives the `revision` and `quad_count` you expect; a few known queries answer as before. For a full comparison of two servers, run the [drill](backup-restore-drills.md#a-complete-drill)'s count step against both.
-5. Promote it: stop the staging server, start the production server with `NRESE_DATA_DIR` pointing at the restored directory, check `/readyz` again, then switch traffic.
+2. Restore the newest image into an empty staging directory, with `NRESE_DATA_DIR=/srv/nrese-staging nrese-server restore /srv/nrese-data/backups/<seconds>` (and `--wal` to replay the log after it, see [point-in-time restore](#5-configuration-surface)). Exit `0` means the image passed its manifest check and is in place.
+3. Start a server on it with writes disabled, on another port, with `NRESE_DATA_DIR=/srv/nrese-staging NRESE_DEPLOYMENT_POSTURE=read-only-demo NRESE_BIND_ADDR=127.0.0.1:8081 nrese-server`.
+4. Check that `/readyz` answers `200`, that `GET /api/v1/repositories/{id}/info` (as a whole-dataset reader or administrator) gives the `revision` and `quad_count` you expect and that a few known queries answer as before. For a full comparison of two servers, run the [drill](backup-restore-drills.md#a-complete-drill)'s count step against both.
+5. To promote it, stop the staging server, start the production server with `NRESE_DATA_DIR` pointing at the restored directory, check `/readyz` again and then switch traffic.
 
 ## 11. Production Readiness Checklist
 - W3C protocol endpoints reachable and authenticated as expected.
@@ -410,28 +403,29 @@ was 917 MiB with them and 636 MiB without, the queries' times within their sprea
 one's slope; on Linux it also splits resident memory by mapping (the allocator, stacks,
 the store's mapped files, the binary).
 
-## 13. Upgrade Strategy
+## 13. Upgrade strategy
 
-### 13.1 Upgrading a Store (from `main` to v2)
+### 13.1 Upgrading a store (from `main` to v2)
 
-A data directory written by an earlier NRESE opens as it is: no migration step. Checkpoints of formats 4 to 11 are read, the write-ahead log is replayed (also after a crash or a kill), and the repositories, their settings and rules, the namespaces, the access state (users, local logins, roles, workspaces, saved queries) and the image backups carry over. Sessions and the result cache live in memory and start empty, as at every start.
+A data directory written by an earlier NRESE opens as it is, with no migration step. Checkpoints of formats 4 to 11 are read, the write-ahead log is replayed (also after a crash or a kill), and the repositories, their settings and rules, the namespaces, the access state (users, local logins, roles, workspaces, saved queries) and the image backups carry over. Sessions and the result cache live in memory and start empty, as at every start.
 
 1. Stop the server, and keep a copy of the data directory (or an image backup) and the old binary.
-2. Install the new binary and start it with the same configuration. The first start brings each inferred stack in line with the new rules: a stack whose rules didn't change (the reasoning marker's fingerprint, `reasoning.state`) is kept; one whose rules did is rebuilt before the server reports ready, which takes about as long as reasoning after a bulk load. From `main` (d9a4b24) to v2, `owl2-ql` and `owl-horst` stacks are rebuilt; `rdfs`, `owl2-rl` and repositories with their own rules are kept.
+2. Install the new binary and start it with the same configuration. The first start brings each inferred stack in line with the new rules. A stack whose rules didn't change (the reasoning marker's fingerprint, `reasoning.state`) is kept, and one whose rules did is rebuilt before the server reports ready, which takes about as long as reasoning after a bulk load. From `main` (d9a4b24) to v2, `owl2-ql` and `owl-horst` stacks are rebuilt, and `rdfs`, `owl2-rl` and repositories with their own rules are kept.
 3. Check `/readyz` for readiness, then read `revision` and `quad_count` from `/api/v1/repositories/{id}/info` as a whole-dataset reader or administrator, and compare a few known queries against the old server's answers.
 
-What changes on purpose:
-- Queries under `owl2-ql` get answers through existentials: the QL rewriting is on by default there (`reasoner.ql_rewriting = "auto"`), so queries can find individuals that only an existential axiom makes match (`Employee ⊑ ∃worksFor`: an employee without a stated employer now works for something). `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the earlier answers. Under `owl2-rl` nothing changes.
-- The N-Quads export's checksum moves from a leading header to the end: the export streams (constant memory, at any store size), so its SHA-256 is known only after the body. It closes the body as the comment `# nrese-sha256 <hex>` (over every byte before it; N-Quads readers skip it) and follows it as the trailer `x-nrese-checksum-sha256`, announced in `Trailer` (HTTP/1.1 clients ask for trailers with `TE: trailers`). A restore checks the comment where present and refuses a mismatch (400). Graph Store `GET` and the export stream too, and their timeout (`budgets.graph_read_timeout`) bounds the first chunk and each stall, not the whole transfer.
-- New repositories can't have an id starting or ending with `.` or a Windows device name (`CON`, `NUL`, `COM1`, ...). Existing ones keep working and are logged at start; copy one into a repository with another id to move the data directory between systems.
+These change on purpose.
 
-A data directory is open in one process at a time: a second process opening a data directory one already has open is refused (`Locked`), whichever version each runs: earlier and this version lock the directory's `LOCK` file the same way. The lock is the open file's (`flock` on Unix, `LockFileEx` on Windows): reading or copying `LOCK` doesn't release it, and it is released when the store is closed, even while a child process the server started is still starting. Don't put a data directory on NFS: Linux emulates that lock there in a way any other close of the file releases.
+- Queries under `owl2-ql` get answers through existentials. The QL rewriting is on by default there (`reasoner.ql_rewriting = "auto"`), so queries can find individuals that only an existential axiom makes match (with `Employee ⊑ ∃worksFor`, an employee without a stated employer now works for something). `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the earlier answers. Under `owl2-rl` nothing changes.
+- The N-Quads export's checksum moves from a leading header to the end, because the export streams (constant memory, at any store size), so its SHA-256 is known only after the body. It closes the body as the comment `# nrese-sha256 <hex>` (over every byte before it, and N-Quads readers skip it) and follows it as the trailer `x-nrese-checksum-sha256`, announced in `Trailer` (HTTP/1.1 clients ask for trailers with `TE: trailers`). A restore checks the comment where present and refuses a mismatch (400). Graph Store `GET` and the export stream too, and their timeout (`budgets.graph_read_timeout`) bounds the first chunk and each stall, not the whole transfer.
+- New repositories can't have an id starting or ending with `.` or a Windows device name (`CON`, `NUL`, `COM1`, ...). Existing ones keep working and are logged at start, and to move the data directory between systems, copy one into a repository with another id.
 
-Opening a store or restoring an image creates the data directory and any missing directory above it, and makes each one's name durable by syncing the directory that holds it. A directory directly under a drive's root (`D:\nrese-data`) works. If the holding directory can't be synced (for example one this process can't read), the open or restore is refused: create the data directory beforehand.
+A data directory is open in one process at a time, and a second process opening a data directory one already has open is refused (`Locked`), whichever version each runs, because earlier versions and this one lock the directory's `LOCK` file the same way. The lock is the open file's (`flock` on Unix, `LockFileEx` on Windows), so reading or copying `LOCK` doesn't release it, and it is released when the store is closed, even while a child process the server started is still starting. Don't put a data directory on NFS, because Linux emulates that lock there in a way any other close of the file releases.
 
-On a rollback, the earlier binary opens the directory again only until this version writes its first checkpoint (a bulk load, a background or explicit checkpoint): from then on checkpoints are format 12, which earlier binaries refuse (`UnsupportedFormat`). To roll back after that, restore the image backup taken before the upgrade, with the earlier binary. Before that point it opens the directory (checkpoint format 11, unchanged log), rebuilding the stacks whose rules differ. A repository switched to a mode only the new version has (`owl2-dl`) isn't opened by the earlier one: switch it back first. Settings only the new version knows (`ql_rewriting`, `query_timeout_ms`, access `inferred = "supported"`) are ignored, `supported` reading as `hidden`.
+Opening a store or restoring an image creates the data directory and any missing directory above it, and makes each one's name durable by syncing the directory that holds it. A directory directly under a drive's root (`D:\nrese-data`) works. If the holding directory can't be synced (for example one this process can't read), the open or restore is refused, so create the data directory beforehand.
 
-The upgrade is tested (`crates/nrese-server/tests/it/upgrade_tests.rs`): a data directory written by `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that writes it) opened by this build's binary: the same data and answers in every repository (the QL rewriting's one answer apart), every setting, local logins, current stacks, writes surviving a restart, and `main`'s image backup restoring.
+On a rollback, the earlier binary opens the directory again only until this version writes its first checkpoint (a bulk load, a background or explicit checkpoint), and from then on checkpoints are format 12, which earlier binaries refuse (`UnsupportedFormat`). To roll back after that, restore the image backup taken before the upgrade, with the earlier binary. Before that point it opens the directory (checkpoint format 11, unchanged log), rebuilding the stacks whose rules differ. A repository switched to a mode only the new version has (`owl2-dl`) isn't opened by the earlier one, so switch it back first. Settings only the new version knows (`ql_rewriting`, `query_timeout_ms`, access `inferred = "supported"`) are ignored, `supported` reading as `hidden`.
+
+The upgrade is tested (`crates/nrese-server/tests/it/upgrade_tests.rs`). A data directory written by `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that writes it) is opened by this build's binary, with the same data and answers in every repository (the QL rewriting's one answer apart), every setting, local logins, current stacks, writes surviving a restart, and `main`'s image backup restoring.
 
 ### 13.2 Rollout
 - Prefer blue/green or canary rollout.
