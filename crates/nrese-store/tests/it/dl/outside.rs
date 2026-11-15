@@ -493,6 +493,8 @@ impl Reference {
 
     fn ask(&mut self, reasoner: &str, turtle: &str, questions: &BTreeSet<String>) -> Reply {
         let q: Vec<&str> = questions.iter().map(String::as_str).collect();
+        // One request a line: a state read back from the store comes one triple a line.
+        let turtle = turtle.replace('\n', " ");
         let line = format!("{reasoner}\t{PREFIXES} {turtle}\t{}\n", q.join("\t"));
         let (_, stdin, rx) = self.child.get_or_insert_with(|| {
             let mut child = Command::new("sh")
@@ -918,13 +920,14 @@ fn references() -> Reference {
 }
 
 /// A deletion the store leaves undone (planted: a `DELETE DATA` that removes nothing) shows
-/// as an inferred statement the references don't entail; the deletion done passes.
+/// as an inferred statement the references don't entail; the deletion done passes, its
+/// state read back from the store over several lines.
 #[test]
 #[ignore = "needs the DL kit's reference reasoners: benches/reasoning/dl/outside.sh"]
 fn planted_deletion_left_undone() {
     let (mut case, none) = (generate(0), BTreeSet::new());
     case.groups.truncate(2);
-    case.groups[0].turtle = "f:C0 rdfs:subClassOf f:C1 .".into();
+    case.groups[0].turtle = "f:C0 rdfs:subClassOf f:C1 . f:C1 rdfs:subClassOf f:C2 .".into();
     case.groups[1].turtle = "f:a0 a f:C0 .".into();
     (case.queries, case.commits, case.deleted) = (Vec::new(), vec![0, 0], Some(1));
     let (mut reference, texts) = (references(), vec![case.text(0)]);
