@@ -37,72 +37,68 @@ move it.
   reasoner check consistency, classify the ontology and prove query answers beyond the rules
   ([design](docs/design/owl2-dl.md)).
 
-Around that it has what a database needs: its own storage engine, in memory or on disk with a
-write-ahead log, named graphs with read and write rights per graph, sign-in by token, OIDC or
-a client certificate checked by your TLS proxy, full-text, vector and geospatial search inside SPARQL, backups with
-point-in-time restore, read replicas, and several repositories per server. All of it, with its
-limits, is in [features and standards](docs/what-it-covers.md).
+Around that, what a database needs:
 
-## Standards
+- its own storage engine, in memory or on disk with a write-ahead log
+- named graphs, with read and write rights per graph
+- sign-in by token, OIDC, or a client certificate checked by your TLS proxy
+- full-text, vector and geospatial search inside SPARQL
+- backups with point-in-time restore, and read replicas
+- several repositories per server
 
-Each suite below runs in our checks, which fail when its data is missing. The counts are what the
-[release gate](benches/fast/w3c-expected.toml) requires to pass, with no failure allowed, and a
-test we are known to fail is listed with its reason beside its runner.
-
-| Standard | What NRESE does | Tests |
-|---|---|---|
-| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/), [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | All of it, with the [deviations listed](docs/limits.md#sparql) | 505 W3C tests, no known failure ([runner](crates/nrese-sparql/tests/w3c_sparql11)) |
-| [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), [Service Description](https://www.w3.org/TR/sparql11-service-description/) | Served at `/dataset/…` ([HTTP interface](docs/ops/http-api.md)) | Our own ([protocol](crates/nrese-server/tests/it/query_protocol_tests.rs), [Graph Store](crates/nrese-server/tests/it/graph_store_api_tests.rs)) |
-| Results as [JSON](https://www.w3.org/TR/sparql11-results-json/), [XML](https://www.w3.org/TR/rdf-sparql-XMLres/), [CSV and TSV](https://www.w3.org/TR/sparql11-results-csv-tsv/) | Written, and read but for CSV | The SPARQL suites read JSON, XML and TSV and check the CSV writer, and [round trips](crates/rdf/nrese-sparql-results/tests/round_trip_tests.rs) check the others |
-| [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | Read and written, RDF 1.1 and the RDF 1.2 drafts | RDF 1.1 and 1.2 syntax suites, [runner](crates/rdf/nrese-rdf-io/tests/w3c_rdf) |
-| [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Read and written, remote contexts not fetched | `toRdf`, `expand`, `fromRdf`, [runner](crates/rdf/nrese-rdf-io/tests/w3c_jsonld) |
-| [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) | RDFC-1.0 | [runner](crates/rdf/nrese-rdf-io/tests/w3c_rdfc) |
-| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts | Triple terms and directional strings | 269 W3C tests, no known failure |
-| [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/) | Its entailment rules, with the [few left out](docs/spec/reasoning-semantics.md#modes) listed | No W3C suite run |
-| [OWL 2 RL](https://www.w3.org/TR/owl2-profiles/#OWL_2_RL) | The OWL 2 RL/RDF rules, materialised and maintained with each write | 86 W3C test cases, 7 of them passed only under `owl2-dl`, and 3 skipped whose premise is in no RDF syntax or imports another ontology ([runner](crates/nrese-store/tests/w3c_owl2_rl)) |
-| [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) | Rules plus query rewriting | W3C test cases, [9 known failures](crates/nrese-store/tests/w3c_owl2_ql/expected-failures.txt) |
-| [OWL 2 DL](https://www.w3.org/TR/owl2-direct-semantics/) | Consistency, classification, realisation, proven answers | 410 W3C test cases answered as expected, and [1 whose expected answer is wrong](crates/nrese-dl/tests/tableau_w3c/disputed.txt), shown by a model ([runner](crates/nrese-dl/tests/tableau_w3c)) |
-| [SHACL](https://www.w3.org/TR/shacl/) Core and SHACL-SPARQL | On request, or as a gate on writes | 98 Core and 22 SHACL-SPARQL W3C tests, no known failure ([runner](crates/nrese-shacl/tests/w3c_shacl)) |
-| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html) | In part: functions and relations over WKT, GeoJSON and simple GML | 194 of the 212 compliance tests, 18 disputed with the reference ([runner](crates/nrese-sparql/tests/geosparql_compliance)) |
-| [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/) | Served at `/repositories/…`, so RDF4J clients and tools connect | Our own ([protocol](crates/nrese-server/tests/it/rdf4j_protocol_tests.rs), [clients](crates/nrese-server/tests/it/client_compat_tests.rs)) |
-
-What is left out, and the deviations with what to do instead: [limits](docs/limits.md).
+It follows the W3C standards for RDF, SPARQL, SHACL and OWL 2, and runs their test suites in its
+checks. Everything it does, with the [standards and their tests](docs/what-it-covers.md#standards),
+is in [features and standards](docs/what-it-covers.md), and where it stops is in
+[limits](docs/limits.md).
 
 ## How it fits together
 
 ```mermaid
 flowchart TB
-  client(["Your application, the browser console or an RDF4J client"])
-  subgraph proc["One server process"]
-    server["HTTP and sign-in<br/><i>nrese-server</i>"]
-    store["Writes and answers<br/><i>nrese-store</i>"]
-    reasoner["Rules, RDFS to OWL 2 RL<br/><i>nrese-reasoner</i>"]
-    dl["OWL 2 DL engines<br/><i>nrese-dl</i>"]
-    shacl["SHACL<br/><i>nrese-shacl</i>"]
-    sparql["SPARQL evaluation<br/><i>nrese-sparql</i>"]
-    engine["Indexes, snapshots, log<br/><i>nrese-engine</i>"]
-  end
-  disk[("Disk")]
+  client["<b>Client</b><br/>[software]<br/>your application, the browser<br/>console or an RDF4J tool"]
 
-  client -- "HTTP" --> server
-  server -- "1 a write" --> store
-  store -- "2 derive inferences,<br/>check consistency" --> reasoner
-  store -- "3 under owl2-dl,<br/>check again" --> dl
-  store -- "4 validate<br/>(gate on)" --> shacl
-  store -- "5 commit asserted<br/>and inferred together" --> engine
-  engine -- "log each commit<br/>(on disk)" --> disk
-  server -. "a query" .-> store
-  store -. "evaluate on<br/>a snapshot" .-> sparql
-  store -. "under owl2-dl,<br/>prove answers" .-> dl
-  sparql -. "read" .-> engine
+  subgraph server["NRESE server, one process"]
+    tell["<b>Tell</b><br/>[HTTP: SPARQL Update, Graph Store,<br/>transactions, /dataset/tell]<br/>takes a write"]
+    ask["<b>Ask</b><br/>[HTTP: SPARQL Query]<br/>answers a query"]
+    commit["<b>Commit pipeline</b><br/>[nrese-store]<br/>runs a write through its checks,<br/>commits it as one revision"]
+    query["<b>Query service</b><br/>[nrese-store, nrese-sparql]<br/>evaluates on a snapshot,<br/>gives the answer its status"]
+    reasoner["<b>Reasoner</b><br/>[nrese-reasoner]<br/>rules from RDFS to OWL 2 RL"]
+    dl["<b>OWL 2 DL engines</b><br/>[nrese-dl]<br/>consistency, classification,<br/>proven answers"]
+    shacl["<b>SHACL validator</b><br/>[nrese-shacl]"]
+    storage["<b>Storage engine</b><br/>[nrese-engine]<br/>asserted and inferred statements,<br/>snapshots, write-ahead log"]
+  end
+
+  disk[("<b>Data directory</b><br/>[files]<br/>checkpoints and log")]
+
+  client -- "tells" --> tell
+  client -- "asks" --> ask
+  tell --> commit
+  ask --> query
+  commit -- "derives inferences,<br/>checks consistency" --> reasoner
+  commit -- "under owl2-dl,<br/>checks consistency" --> dl
+  commit -- "validates<br/>(gate on)" --> shacl
+  commit -- "writes asserted and<br/>inferred together" --> storage
+  query -- "under owl2-dl,<br/>proves answers" --> dl
+  query -- "reads a snapshot" --> storage
+  storage -- "logs, checkpoints<br/>(on disk)" --> disk
+
+  classDef person fill:#08427b,stroke:#052e56,color:#ffffff
+  classDef iface fill:#1168bd,stroke:#0b4884,color:#ffffff
+  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000000
+  classDef store fill:#438dd5,stroke:#2e6295,color:#ffffff
+  class client person
+  class tell,ask iface
+  class commit,query,reasoner,dl,shacl,storage component
+  class disk store
 ```
 
-Solid arrows are a write, numbered in the order its steps run, and dashed arrows are a query.
-If a step refuses the write, nothing of it is committed. A query reads a snapshot, so it doesn't
-wait for a write to finish, and the store gives its answer a status. Each box names its crate,
-and below them all are the crates they build on: the RDF model and syntaxes, the OWL 2 model,
-joins and memory budgets, and vector indexes. [Architecture](docs/ARCHITECTURE.md) has the
-layers, what each crate owns and which crates you can use on their own.
+The picture follows the [C4 model](https://c4model.com/)'s component view: each box gives its
+name, in brackets its interface or crate, and what it does, and each arrow points from the part
+that calls to the part it calls. A client tells NRESE something by writing, and asks it something
+by querying. A write is refused whole if a check fails, and a query reads a snapshot, so it doesn't
+wait for a write to finish. The steps of a commit, in order, are on
+[what a commit does](docs/what-it-covers.md#what-a-commit-does), and
+[architecture](docs/ARCHITECTURE.md) has the layers, every crate and which you can use on their own.
 
 ## Quick start
 

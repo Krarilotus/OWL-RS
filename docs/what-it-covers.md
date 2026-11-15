@@ -1,11 +1,33 @@
 # Features and standards
 
 <a id="scope"></a>
-What NRESE does in the commit these pages come with, by area, with each part's limits beside it
-and a link to its detail. The standards it follows and the tests behind each are in the README's
-[standards table](../README.md#standards), and this page adds only what the table can't hold.
-What it leaves out, and where it departs from a standard with what to do instead, is in
-[limits](limits.md), which starts with [when to choose another system](limits.md#choose-another-system-when).
+What NRESE does in the commit these pages come with: first the standards it follows and their
+tests, then each area with its limits beside it. What it leaves out, and where it departs from a
+standard with what to do instead, is in [limits](limits.md), which starts with
+[when to choose another system](limits.md#choose-another-system-when).
+
+## Standards
+
+Each W3C suite below runs in our checks, and the [release gate](../benches/fast/w3c-expected.toml)
+requires the counts shown to pass, with no failure. A test we know we fail is listed, with its
+reason, beside its runner.
+
+| Standard | What NRESE does | Tests |
+|---|---|---|
+| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/), [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | All of it, with the [deviations listed](limits.md#sparql) | 505 W3C tests, no known failure ([runner](../crates/nrese-sparql/tests/w3c_sparql11)) |
+| [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), [Service Description](https://www.w3.org/TR/sparql11-service-description/) | Served at `/dataset/…` ([HTTP interface](ops/http-api.md)) | Our own ([protocol](../crates/nrese-server/tests/it/query_protocol_tests.rs), [Graph Store](../crates/nrese-server/tests/it/graph_store_api_tests.rs)) |
+| Results as [JSON](https://www.w3.org/TR/sparql11-results-json/), [XML](https://www.w3.org/TR/rdf-sparql-XMLres/), [CSV and TSV](https://www.w3.org/TR/sparql11-results-csv-tsv/) | Written, and read but for CSV | The SPARQL suites read JSON, XML and TSV and check the CSV writer, and [round trips](../crates/rdf/nrese-sparql-results/tests/round_trip_tests.rs) check the others |
+| [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | Read and written, RDF 1.1 and the RDF 1.2 drafts | RDF 1.1 and 1.2 syntax suites, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf) |
+| [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Read and written, remote contexts not fetched | `toRdf`, `expand`, `fromRdf`, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_jsonld) |
+| [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) | RDFC-1.0 | [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc) |
+| [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts | Triple terms and directional strings | 269 W3C tests, no known failure |
+| [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/) | Its entailment rules, with the [few left out](spec/reasoning-semantics.md#modes) listed | No W3C suite run |
+| [OWL 2 RL](https://www.w3.org/TR/owl2-profiles/#OWL_2_RL) | The OWL 2 RL/RDF rules, materialised and maintained with each write | 86 W3C test cases, 7 of them passed only under `owl2-dl`, and 3 skipped whose premise is in no RDF syntax or imports another ontology ([runner](../crates/nrese-store/tests/w3c_owl2_rl)) |
+| [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) | Rules plus query rewriting | W3C test cases, [9 known failures](../crates/nrese-store/tests/w3c_owl2_ql/expected-failures.txt) |
+| [OWL 2 DL](https://www.w3.org/TR/owl2-direct-semantics/) | Consistency, classification, realisation, proven answers | 410 W3C test cases answered as expected, and [1 whose expected answer is wrong](../crates/nrese-dl/tests/tableau_w3c/disputed.txt), shown by a model ([runner](../crates/nrese-dl/tests/tableau_w3c)) |
+| [SHACL](https://www.w3.org/TR/shacl/) Core and SHACL-SPARQL | On request, or as a gate on writes | 98 Core and 22 SHACL-SPARQL W3C tests, no known failure ([runner](../crates/nrese-shacl/tests/w3c_shacl)) |
+| [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html) | In part: functions and relations over WKT, GeoJSON and simple GML | 194 of the 212 compliance tests, 18 disputed with the reference ([runner](../crates/nrese-sparql/tests/geosparql_compliance)) |
+| [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/) | Served at `/repositories/…`, so RDF4J clients and tools connect | Our own ([protocol](../crates/nrese-server/tests/it/rdf4j_protocol_tests.rs), [clients](../crates/nrese-server/tests/it/client_compat_tests.rs)) |
 
 ## SPARQL
 
@@ -40,7 +62,7 @@ by default, or only the asserted ones with `infer=false`.
 
 Reasoning is chosen per repository with [`reasoner.mode`](ops/config-reference.md#reasoner.mode). What each mode computes, what it leaves
 out and what its answers promise is in [the reasoning contract](spec/reasoning-semantics.md#modes), and
-the W3C tests of each profile are in the [standards table](../README.md#standards).
+the W3C tests of each profile are under [standards](#standards).
 
 | Mode | Follows |
 |---|---|
