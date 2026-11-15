@@ -69,6 +69,15 @@ fn a_later_equality_of_property_names_reads_again() {
     assert!(commit(&store, &pipeline, ":p owl:sameAs :q ."));
 }
 
+/// Two properties declared and never used, then an equality of them: it makes them
+/// individuals too.
+#[test]
+fn a_later_equality_of_declared_properties_reads_again() {
+    let (store, pipeline) =
+        on_the_route(":p a owl:ObjectProperty . :q a owl:DatatypeProperty . :x a :C .");
+    assert!(commit(&store, &pipeline, ":p owl:sameAs :q ."));
+}
+
 /// Two equal individuals, then a class use of one of them: it makes it a class too.
 #[test]
 fn a_later_class_use_of_an_equated_individual_reads_again() {

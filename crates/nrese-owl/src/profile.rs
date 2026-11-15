@@ -777,18 +777,22 @@ pub fn concludes_equality(
 #[derive(Debug, Clone, Default)]
 pub struct Signature {
     /// Every class and property name.
-    pub names: HashSet<Term>,
-    pub classes: HashSet<Term>,
+    pub names: TermSet,
+    pub classes: TermSet,
     /// The properties declared, or asserted, as object, as data, as annotation properties.
-    pub objects: HashSet<Term>,
-    pub data: HashSet<Term>,
-    pub annotations: HashSet<Term>,
+    pub objects: TermSet,
+    pub data: TermSet,
+    pub annotations: TermSet,
     /// The data properties declared so: the others are data properties only while they
     /// have a literal (`mapping.rs`, `is_data_property`).
-    pub declared_data: HashSet<Term>,
+    pub declared_data: TermSet,
 }
 
-/// [`Signature`] of `o`. O(axioms + class expressions).
+/// A set of term ids, hashed fast (ids aren't chosen by an adversary).
+pub type TermSet = HashSet<Term, foldhash::fast::RandomState>;
+
+/// [`Signature`] of `o`. O(axioms + class expressions); an assertion of a property or a
+/// named class costs a lookup or two, no walk.
 pub fn signature(o: &Ontology) -> Signature {
     use crate::model::EntityKind::{AnnotationProperty, Class, DataProperty, ObjectProperty};
     let mut s = Signature::default();
@@ -809,11 +813,16 @@ pub fn signature(o: &Ontology) -> Signature {
             }
             Axiom::DataPropertyAssertion(t, ..) => s.data.insert(*t),
             Axiom::Declaration(AnnotationProperty, t) => s.annotations.insert(*t),
-            _ => false,
+            Axiom::ClassAssertion(c, _) if matches!(o.class(*c), ClassExpr::Class(_)) => false,
+            _ => {
+                s.names.extend(properties(o, axiom));
+                false
+            }
         };
-        s.names.extend(properties(o, axiom));
     }
-    s.names.extend(s.classes.iter().chain(&s.annotations));
+    // A property declared and never used is a name too.
+    let declared = [&s.classes, &s.annotations, &s.objects, &s.data];
+    s.names.extend(declared.into_iter().flatten());
     s
 }
 
