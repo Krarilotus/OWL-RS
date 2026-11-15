@@ -19,6 +19,7 @@ use std::time::Instant;
 use nrese_dl::classify::{self, Realisation, Taxonomy};
 use nrese_dl::verdict::Verdict;
 use nrese_engine::{ReadModel, Snapshot, TermId, TermKind};
+use nrese_exec::cell::{BuildCell, Busy, Claim, Kind};
 use nrese_owl::{Axiom, Characteristic, Ontology, Term, Unsupported};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::classify::Classification;
@@ -34,11 +35,35 @@ pub(crate) struct Cache {
     realisation: Slot<Realisation>,
     /// The EL classifier's answer ([`el_answer`]), complete: a request on the same revision
     /// runs neither the DL engines nor the EL classifier again. Simultaneous first requests
-    /// each run both (nothing coalesces them).
+    /// run the DL engines once ([`cached`]) and the EL classifier each.
     el: Slot<El>,
 }
 
-type Slot<T> = Mutex<Option<(u64, Arc<T>)>>;
+/// A revision's latest complete result, and the computations under way by revision: one
+/// at a time per revision, its complete result handed to the requests waiting for it.
+struct Slot<T> {
+    kept: Mutex<Option<(u64, Arc<T>)>>,
+    building: BuildCell<u64, T>,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            kept: Mutex::new(None),
+            building: BuildCell::default(),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for Slot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+        let revision = kept.as_ref().map(|(at, _)| *at);
+        f.debug_struct("Slot")
+            .field("kept", &revision)
+            .finish_non_exhaustive()
+    }
+}
 
 /// How the engines run under the store's settings. A classification is the store's work,
 /// shared per revision, not a request's: its memory is an envelope of its own within the
@@ -108,9 +133,12 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
     )
 }
 
-/// The cached result at `revision`, else `compute`'s, kept if `complete`. Publishing never
-/// lets an older in-flight request evict a newer revision; same-revision races keep the
-/// first complete result. No solver runs locked.
+/// The cached result at `revision`, else the computation under way for it, else
+/// `compute`'s, kept if `complete`. A request that finds a computation under way waits for
+/// it (`dl/bounds.rs`'s way) and gets its result if complete; where it ends incomplete or
+/// panics, or the request is on a Rayon worker (which must not wait for it), the request
+/// computes its own. Publishing never lets an older in-flight request evict a newer
+/// revision; same-revision races keep the first complete result. No solver runs locked.
 fn cached<T>(
     slot: &Slot<T>,
     revision: u64,
@@ -120,23 +148,39 @@ fn cached<T>(
     if let Some(result) = latest(slot, revision) {
         return result;
     }
-    let result = Arc::new(compute());
-    if complete(&result) {
-        keep(slot, revision, &result);
+    let own = || {
+        let result = Arc::new(compute());
+        if complete(&result) {
+            keep(slot, revision, &result);
+        }
+        result
+    };
+    let kept = || latest(slot, revision).map(Some);
+    match slot.building.claim(revision, Kind::Opaque, kept) {
+        Claim::Build(builder) => {
+            let result = own();
+            if complete(&result) {
+                builder.finish(Some(Arc::clone(&result)));
+            }
+            result
+        }
+        Claim::Wait(build) => match build.wait() {
+            Ok(Some(result)) => result,
+            Ok(None) | Err(Busy) => own(),
+        },
     }
-    result
 }
 
 /// Keeps `result` as `revision`'s unless the slot holds a newer revision's or one already.
 fn keep<T>(slot: &Slot<T>, revision: u64, result: &Arc<T>) {
-    let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = slot.kept.lock().unwrap_or_else(|p| p.into_inner());
     if slot.as_ref().is_none_or(|(at, _)| *at < revision) {
         *slot = Some((revision, Arc::clone(result)));
     }
 }
 
 fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
-    match &*slot.lock().unwrap_or_else(|p| p.into_inner()) {
+    match &*slot.kept.lock().unwrap_or_else(|p| p.into_inner()) {
         Some((at, result)) if *at == revision => Some(Arc::clone(result)),
         _ => None,
     }
@@ -769,6 +813,77 @@ mod tests {
             let first = first.join().unwrap();
             assert_eq!(calls.load(SeqCst), 1, "computations for one revision");
             assert!(Arc::ptr_eq(&first, &second));
+        });
+    }
+
+    /// Holds a computation until a request waits for it (at most 10 s, then fails).
+    fn until_waiting<T>(slot: &Slot<T>, revision: u64) {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Claim::Wait(build) = slot.building.claim(revision, Kind::Opaque, || None)
+                && build.waiting() > 0
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "no request waited for the computation"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A computation that panics while a request waits for it leaves that request its own
+    /// computation: no hang, no poisoned slot, and the waiter's complete result kept.
+    #[test]
+    fn a_panicking_computation_leaves_the_waiter_its_own() {
+        let slot = Slot::<usize>::default();
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                cached(
+                    &slot,
+                    7,
+                    |_| true,
+                    || -> usize {
+                        started.wait();
+                        until_waiting(&slot, 7);
+                        panic!("the computation fails")
+                    },
+                )
+            });
+            started.wait();
+            let second = cached(&slot, 7, |_| true, || 2);
+            assert!(first.join().is_err());
+            assert_eq!(*second, 2);
+            assert!(Arc::ptr_eq(&second, &latest(&slot, 7).unwrap()));
+        });
+    }
+
+    /// A computation its own request's `dl.timeout` stopped (incomplete, so never kept)
+    /// isn't handed on: the request waiting for it computes its own and gets that.
+    #[test]
+    fn a_waiter_on_a_computation_its_timeout_stopped_gets_its_own_computation() {
+        let slot = Slot::<(bool, usize)>::default();
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                cached(
+                    &slot,
+                    7,
+                    |r| r.0,
+                    || {
+                        started.wait();
+                        until_waiting(&slot, 7);
+                        (false, 1)
+                    },
+                )
+            });
+            started.wait();
+            let second = cached(&slot, 7, |r| r.0, || (true, 2));
+            assert_eq!(*first.join().unwrap(), (false, 1));
+            assert_eq!(*second, (true, 2), "the waiter's own computation");
+            assert!(Arc::ptr_eq(&second, &latest(&slot, 7).unwrap()));
         });
     }
 }
