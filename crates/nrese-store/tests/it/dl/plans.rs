@@ -4,13 +4,14 @@
 //! where the run says `sound-only` promises answers the run doesn't certify. Two reasons
 //! the run adds whatever path decides are checked: user rules beside OWL 2 DL, and a
 //! consistency that isn't known (`dl.consistency = "off"`). Each on the RL route and off
-//! it.
+//! it. And a consistency no check has decided yet, which the run decides.
 
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
 use nrese_store::{
-    CancellationToken, DlConfig, DlConsistency, MutationPipeline, SparqlQueryRequest, StoreService,
+    CancellationToken, DlConfig, DlConsistency, MutationPipeline, SparqlQueryRequest, StoreConfig,
+    StoreService,
 };
 
 use super::{PREFIXES, insert, pipeline_with};
@@ -81,4 +82,36 @@ fn a_plan_never_claims_more_than_its_run() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `owl2-dl` over a store kept in `dir`.
+fn on_disk(dir: &std::path::Path) -> MutationPipeline {
+    let store = StoreService::new(StoreConfig::on_disk(dir)).expect("store");
+    let config = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
+    MutationPipeline::new(Arc::new(store), Arc::new(ReasonerService::new(config)))
+}
+
+#[test]
+fn a_plan_where_no_check_decided_the_consistency_says_the_run_decides_it() {
+    // A revision no commit's check recorded (the store reopened: the record is kept in
+    // memory), and U1 can't prove the data consistent (it doesn't check a data at-most
+    // restriction, here the functional property's): before the run checks it, the data's
+    // consistency is unknown, so the plan can't say `complete`.
+    let dir = tempfile::tempdir().expect("dir");
+    let functional = ":age a owl:DatatypeProperty , owl:FunctionalProperty .";
+    insert(&on_disk(dir.path()), &format!("{OFF_RL} {functional}")).expect("data");
+    let dl = on_disk(dir.path());
+    let store = dl.store();
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}{QUERY}"));
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let planned = store
+        .plan_query(&prepared, &CancellationToken::new())
+        .expect("planned");
+    let status = planned.completeness.expect("a status");
+    assert_eq!(status.as_str(), "sound-only", "{status:?}");
+    let undecided = |text: &str| text.contains("consistency") && text.contains("when it runs");
+    assert!(
+        status.reasons.iter().any(|r| undecided(&r.text)),
+        "{status:?}"
+    );
 }
