@@ -260,3 +260,90 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     Ok(())
 }
+
+/// An EL ontology with an irregular role hierarchy (`r1 ∘ r2 ⊑ r3`, `r3 ⊑ r1`): outside
+/// OWL 2 DL, so the DL engines leave the chain out; the EL classifier answers by default.
+const IRREGULAR: &str = r#"
+@prefix ex: <http://example.com/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:r1 a owl:ObjectProperty . ex:r2 a owl:ObjectProperty . ex:r3 a owl:ObjectProperty .
+ex:r3 owl:propertyChainAxiom ( ex:r1 ex:r2 ) ; rdfs:subPropertyOf ex:r1 .
+ex:A a owl:Class . ex:B a owl:Class . ex:C a owl:Class . ex:D a owl:Class .
+ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:r1 ; owl:someValuesFrom ex:B ] .
+ex:B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:r2 ; owl:someValuesFrom ex:C ] .
+[ a owl:Restriction ; owl:onProperty ex:r3 ; owl:someValuesFrom ex:C ] rdfs:subClassOf ex:D .
+"#;
+
+/// The EL classifier's answer on an input outside OWL 2 DL says so in every form: the
+/// header names what is outside and the procedure, the JSON carries the record with its
+/// two texts, and the N-Triples form starts with a comment line saying both. Without a
+/// range, the answer is complete. Every form is checked; the failures are reported together.
+#[tokio::test]
+async fn an_answer_outside_owl2_dl_is_marked_in_every_form()
+-> Result<(), Box<dyn std::error::Error>> {
+    const HEADER: &str = "complete; regime=owl2-dl; outside=\"an irregular role hierarchy\"; by=el";
+    const GUARANTEED: &str = "Every subsumption listed holds under the OWL 2 Direct Semantics.";
+    const NOT_GUARANTEED: &str = "That other OWL 2 DL reasoners give this answer:";
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("irregular.ttl");
+    std::fs::write(&path, IRREGULAR)?;
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(path),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )?;
+    let header = |response: &axum::response::Response| {
+        response
+            .headers()
+            .get("nrese-completeness")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let mut wrong = Vec::new();
+    for route in [ROUTES[0], ROUTES[2]] {
+        let response = app
+            .clone()
+            .oneshot(get_at(route, "application/json")?)
+            .await?;
+        if header(&response).as_deref() != Some(HEADER) {
+            wrong.push(format!("{route} json: header {:?}", header(&response)));
+        }
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+        let outside = &json["outside_profile"];
+        let texts = outside["guaranteed"]
+            .as_str()
+            .is_some_and(|t| t.starts_with(GUARANTEED))
+            && outside["not_guaranteed"]
+                .as_str()
+                .is_some_and(|t| t.starts_with(NOT_GUARANTEED));
+        if (&json["engine"], &json["complete"]) != (&"el".into(), &true.into())
+            || outside["what"] != serde_json::json!(["an irregular role hierarchy"])
+            || outside["by"] != "el"
+            || !texts
+        {
+            wrong.push(format!("{route} json: {json}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(get_at(route, "application/n-triples")?)
+            .await?;
+        if header(&response).as_deref() != Some(HEADER) {
+            wrong.push(format!("{route} triples: header {:?}", header(&response)));
+        }
+        let triples = body_text(response).await?;
+        let first = triples.lines().next().unwrap_or_default();
+        let marked = first
+            .starts_with("# Outside OWL 2 DL (an irregular role hierarchy); answered by el.")
+            && first.contains(&format!("Guaranteed: {GUARANTEED}"))
+            && first.contains(&format!("Not guaranteed: {NOT_GUARANTEED}"));
+        let answered = triples.contains(
+            "<http://example.com/A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> .",
+        );
+        if !(marked && answered) {
+            wrong.push(format!("{route} triples: {triples:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    Ok(())
+}

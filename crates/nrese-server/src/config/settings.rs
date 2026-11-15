@@ -406,6 +406,16 @@ pub const SETTINGS: &[Setting] = &[
          makes the data inconsistent (inline) or not checked (off).",
     ),
     setting(
+        "dl.outside_profile",
+        names::DL_OUTSIDE_PROFILE,
+        Choice(&["proven", "dl-part"]),
+        Unset::Text("proven"),
+        "Under owl2-dl, what a classification answers on an input outside OWL 2 DL: where a \
+         procedure proven sound for the input applies, its answer, marked as outside the \
+         profile (proven, the default); or the DL engines' answer on the part they read, \
+         marked incomplete (dl-part). A repository's outside_profile overrides it.",
+    ),
+    setting(
         "dl.timeout",
         names::DL_TIMEOUT_MS,
         Limit(Some(Duration)),
