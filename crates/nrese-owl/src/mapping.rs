@@ -89,7 +89,8 @@ pub struct Ontology {
     pub anonymous: BTreeSet<Term>,
     /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
     pub rules: Vec<crate::rules::Rule>,
-    /// The first restriction whose cardinality isn't written as the RDF mapping writes it,
+    /// The first restriction whose max cardinality (qualified or not; the only ones the RL
+    /// rules read) isn't written as the RDF mapping writes it,
     /// `"n"^^xsd:nonNegativeInteger` with `n` canonical (`1`, not `01`; Turtle's `1` is an
     /// xsd:integer): read here by its value, but OWL 2 RL's rules (cls-maxc1/2,
     /// cls-maxqc1-4) name the mapping's literal, so they don't read it.
@@ -798,7 +799,10 @@ impl<'a> Reader<'a> {
             let mapped = parsed.is_some_and(|n| text == Some(n.to_string()))
                 && datatype
                     .is_none_or(|d| d == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger");
-            if !mapped {
+            // The rules read only a max cardinality: an exact or min one's spelling matters
+            // to none.
+            let max = [reader.v.owl_max_cardinality, reader.v.owl_max_qualified];
+            if max.contains(&predicate) && !mapped {
                 reader.noncanonical_cardinality.get_or_insert(node);
             }
             Some(parsed)
