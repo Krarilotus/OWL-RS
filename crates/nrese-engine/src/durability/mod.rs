@@ -58,7 +58,7 @@ pub enum SyncPolicy {
 }
 
 /// What opening does with damage in the newest WAL segment that a crash during an append
-/// doesn't leave ([`tail`]): a complete record failing its check, or invalid bytes with an
+/// doesn't leave (`tail`): a complete record failing its check, or invalid bytes with an
 /// intact record after them. A torn tail is cut either way, its bytes kept. Neither choice
 /// costs a healthy commit anything; they trade downtime after a damaged crash against the
 /// silent loss of acknowledged commits.
@@ -115,7 +115,7 @@ pub struct DurabilityConfig {
     /// store, or one replacing its data, whose quads outgrow it sorts them in chunks of a
     /// third of it (one filling, one being sorted, and its sorted copy) spilled to the
     /// store's directory, and merges them into each permutation
-    /// ([`crate::engine::bulk`]): slower by a pass over the disk, but its quads then take
+    /// (`crate::engine::bulk`): slower by a pass over the disk, but its quads then take
     /// this much plus one packed permutation, however large the data. The dictionary is
     /// apart: it grows with the distinct terms. Needs `map_checkpoints`.
     pub bulk_load_memory: Option<u64>,

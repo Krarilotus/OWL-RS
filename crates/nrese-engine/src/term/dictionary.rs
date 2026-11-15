@@ -89,7 +89,7 @@ pub struct DictionaryStats {
     pub mapped_bytes: u64,
     /// The vector index: the vectors and their graphs ([`super::vectors`]).
     pub vector_bytes: u64,
-    /// Derived indexes read from their files since start ([`super::derived`]).
+    /// Derived indexes read from their files since start (`super::derived`).
     pub derived_loaded: u64,
     /// Terms the full-text indexes cover, of literals and of IRIs' local names (none
     /// until a query searches text: [`super::text`]).
@@ -693,7 +693,7 @@ impl Dictionary {
     /// length; a triple term's, its components' looked up one after another and then its key
     /// of ids. `charge` is called with no lock of the dictionary held, so at the larger of a
     /// plain and a compressed base's bounds: a checkpoint may publish a compressed base
-    /// before the lookup's guard is taken (as [`super::overlay::OverlayView::lookup_charged`]).
+    /// before the lookup's guard is taken (as `super::overlay::OverlayView::lookup_charged`).
     pub fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
@@ -1139,7 +1139,7 @@ impl Dictionary {
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
-    /// substring search over the arenas ([`super::strings`]).
+    /// substring search over the arenas (`super::strings`).
     pub fn matching_strings(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
         self.matching_strings_scan(test, limit).0
     }
@@ -2110,7 +2110,7 @@ fn split_sep(rest: &[u8]) -> (&str, &str) {
     (head, tail)
 }
 
-/// Keys are only produced by [`encode_key`] or checked by [`validate_key`], so the
+/// Keys are only produced by `encode_key` or checked by `validate_key`, so the
 /// unchecked constructors are sound here.
 /// A dictionary term's text, borrowed from the arena (see [`Dictionary::with_view`]).
 /// Executors read strings, language tags and datatypes through it without building terms.

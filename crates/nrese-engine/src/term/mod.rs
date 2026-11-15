@@ -2,7 +2,7 @@
 //!
 //! Layout: the top 4 bits are the [`TermKind`] tag, the low 60 bits the payload.
 //! Dictionary-backed kinds (IRI, blank node, literal) carry an index into the
-//! [`Dictionary`](dictionary::Dictionary); inline kinds carry the value itself.
+//! [`Dictionary`]; inline kinds carry the value itself.
 //!
 //! Inline encoding is only used when the lexical form is the canonical form of the value,
 //! so RDF term identity is preserved (`"01"^^xsd:integer` and `"1"^^xsd:integer` are

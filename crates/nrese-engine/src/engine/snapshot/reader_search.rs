@@ -512,7 +512,7 @@ impl Snapshot {
     /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
     /// changes the answer or the report. Building the corpus, the scan and the hits are
     /// charged to `budget` before they are allocated, as [`Snapshot::vector_search`]'s are.
-    /// A private snapshot searches its own vectors too ([`Self::private_vector_search`]).
+    /// A private snapshot searches its own vectors too (`Self::private_vector_search`).
     pub fn vector_search_in<'b>(
         &self,
         model: ReadModel,
@@ -659,7 +659,7 @@ impl Snapshot {
     }
 
     /// The corpora this snapshot's engine keeps, and how many were built by a walk or
-    /// derived from an ancestor's ([`super::super::corpora`]); all zero, `started` false,
+    /// derived from an ancestor's (`super::super::corpora`); all zero, `started` false,
     /// where no reader-scoped search ran on the engine.
     pub fn text_corpus_stats(&self) -> TextCorpusStats {
         self.statistics

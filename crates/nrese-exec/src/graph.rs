@@ -278,7 +278,7 @@ pub fn closure_within<'p, B: Deref<Target = Budget>>(
 /// The transitive closure of `edges`: every `(a, b)` with `b` reachable from `a` in one or
 /// more steps, each once, in no particular order.
 ///
-/// Computed per strongly connected component ([`Condensation`]). Apart from the output,
+/// Computed per strongly connected component (`Condensation`). Apart from the output,
 /// the cost is O(n + m) plus the total size of the components' reach sets. On a clique of
 /// k nodes that's O(k²), the size of the output, where a search per node ([`closure`]) is
 /// O(k³).
@@ -458,7 +458,7 @@ struct ComponentsIn<'p, B: Deref<Target = Budget>> {
 /// graph has nodes): Tarjan's algorithm (1972), iterative, in O(n + m). `None` if `stop`
 /// fired. The SCC kernel the transitive closures here (the reasoner's transitive module,
 /// SPARQL's property paths) and the reasoner's recursion analysis share (G7 of the
-/// investigation of 6 October 2026). Uncharged ([`components_csr_in`] on a pool of its
+/// investigation of 6 October 2026). Uncharged (`components_csr_in` on a pool of its
 /// own).
 pub fn components_csr(
     offsets: &[u32],
