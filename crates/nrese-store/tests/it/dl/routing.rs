@@ -4,9 +4,11 @@
 //! engine), Horn and EL ontologies to the context core, the rest to the hypertableau.
 //! Each test names the route that must be taken (the performance choice's guard).
 
-use nrese_store::MutationError;
+use nrese_sparql::Completeness;
+use nrese_store::{MutationError, MutationPipeline, StatementOp};
 
 use super::queries::query;
+use super::versions::{in_transaction, ntriples};
 use super::{insert, pipeline};
 
 #[test]
@@ -800,4 +802,58 @@ fn a_property_under_a_built_in_one_entails_no_subclass() {
         wrong.is_empty(),
         "wrong rows not labelled unsound: {wrong:#?}"
     );
+}
+
+/// Over an ontology with annotation-property axioms, and over one with an equality
+/// reaching a punned name, the status line of each whose `read` isn't `unsound` with the
+/// reason.
+fn unmarked(read: impl Fn(&MutationPipeline) -> Completeness) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (data, reason) in [
+        (ANNOTATION_AXIOMS, "annotation-property axioms"),
+        (
+            PUNNED_EQUALITY,
+            "a class or property name and an individual equal",
+        ),
+    ] {
+        let dl = pipeline();
+        insert(&dl, data).expect("committed");
+        let status = read(&dl);
+        let reasons: Vec<&str> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let line = format!("{reason}: status {} ({reasons:?})", status.as_str());
+        eprintln!("{line}");
+        let named = reasons.iter().any(|r| r.contains(reason));
+        if status.as_str() != "unsound" || !named {
+            wrong.push(line);
+        }
+    }
+    wrong
+}
+
+/// A read of the inferred statements alone (`FROM onto:implicit`) reads L, the RL closure:
+/// it is `unsound` with the reason, as every other answer there is (one status
+/// everywhere).
+#[test]
+fn a_read_of_the_inferred_statements_alone_carries_the_marks() {
+    let read = "SELECT ?x FROM <http://www.ontotext.com/implicit> { ?x ?p ?o }";
+    let wrong = unmarked(|dl| query(dl, read).1.shared);
+    assert!(wrong.is_empty(), "not marked: {wrong:#?}");
+}
+
+/// A read inside a transaction with an addition pending reads the committed closure, L:
+/// it is `unsound` with the reason, as every other answer there is.
+#[test]
+fn a_read_inside_a_transaction_carries_the_marks() {
+    let wrong = unmarked(|dl| {
+        let add = StatementOp::Add {
+            data: ntriples(
+                "<http://example.com/z> <http://example.com/r> <http://example.com/w> .",
+            ),
+            contexts: Vec::new(),
+        };
+        in_transaction(dl, vec![add], "SELECT ?x { ?x ?p ?o }")
+            .1
+            .expect("a status")
+    });
+    assert!(wrong.is_empty(), "not marked: {wrong:#?}");
 }
