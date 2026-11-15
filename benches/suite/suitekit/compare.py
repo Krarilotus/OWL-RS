@@ -50,7 +50,7 @@ from pathlib import Path
 
 from . import hosts
 from .answers import TimingVerdicts, timed as answer_timed
-from .cases import WHOLE_RUN
+from .cases import WHOLE_RUN, as_declared
 from .schema import read
 from .summary import Item, Pair, estimate, summarise
 
@@ -261,10 +261,11 @@ def pooled(report: dict) -> dict[str, dict]:
         entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
                                            "counters": {}, "phase_peaks": {}, "qps": [], "client_peaks": [],
                                            "cache_peaks": [], "client_case": False,
-                                           "expected": [], "invalid": False, "expected_reps": report.get("reps", 0),
+                                           "expected": [], "declared": [], "invalid": False, "expected_reps": report.get("reps", 0),
                                            "checks": {}, "frontiers": [], "answers": {}, "memory_kind": set(),
                                            "whole": []})
         entry["expected"].append(r.get("expected_outcome", "ok"))
+        entry["declared"].append(as_declared(r))
         # ok None: a check the tool couldn't report (fast.py run --no-routes), unchecked, not failed.
         entry["invalid"] |= any(c.get("ok") is False for c in r.get("checks", []) + r.get("routes", []))
         # Older full reports retain single-level clients only in their raw result.
@@ -362,7 +363,10 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
             elif before != after:
                 out.add("Answers and completeness", f"{case:<26} {name}: rows {'/'.join(map(str, before))} -> "
                         f"{'/'.join(map(str, after))}  ANSWERS DIFFER", True)
-        if set(n["status"]) != set(b["status"]):
+        # A known issue: every run of both sides ended as the case declares (cases.as_declared), killed
+        # at its memory cap or held there until its time limit alike; the statuses stay as they are.
+        known = all(e["declared"] and all(e["declared"]) and "ok" not in e["expected"] for e in (b, n))
+        if set(n["status"]) != set(b["status"]) and not known:
             out.add("Answers and completeness",
                     f"{case:<26} status {','.join(sorted(set(b['status'])))} -> {','.join(sorted(set(n['status'])))}  CHANGED",
                     True)
@@ -371,9 +375,8 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
             out.add("Missing", f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions", True)
             continue
         if any(e["invalid"] or set(e["status"]) != {"ok"} for e in (b, n)):
-            # A known product issue (the status the case declares, on both sides) tracks its
+            # A known product issue (`known` above, on both sides) tracks its
             # values and its frontier; anything else is no valid comparison.
-            known = all(e["status"] == e["expected"] and "ok" not in e["expected"] for e in (b, n))
             out.add("Answers and completeness",
                     f"{case:<26} {'known issue' if known else 'NOT COMPARABLE: failed checks/status'}; no timing verdict",
                     not known)
