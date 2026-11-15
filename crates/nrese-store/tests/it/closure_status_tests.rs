@@ -59,10 +59,11 @@ const DATA: &str = ":Dog a owl:Class . :Dog rdfs:subClassOf :Animal . \
 /// Statements OWL 2 entails for every term that neither a closure nor the QL rewriting
 /// holds over [`DATA`]: the member, its read (`false` over the closure), and a query
 /// whose NOT EXISTS or MINUS over it keeps the row named last, which the certain answers
-/// lack. eq-ref; a named individual's `owl:Thing`; the top properties; and a class's or
+/// lack. eq-ref; a named individual's `owl:Thing`; the top properties; a class's or
 /// property's statements of itself, `owl:Thing`, the top and the bottom: scm-cls gives a
-/// class's only to declared ones, and none gives a property's to the top or the bottom.
-const UNIVERSAL: [(&str, &str, &str, &str); 10] = [
+/// class's only to declared ones, and none gives a property's to the top or the bottom;
+/// and its disjointness with the bottom, which no rule gives.
+const UNIVERSAL: [(&str, &str, &str, &str); 12] = [
     (
         "eq-ref",
         "ASK { :rex owl:sameAs :rex }",
@@ -123,6 +124,19 @@ const UNIVERSAL: [(&str, &str, &str, &str); 10] = [
         "ASK { owl:bottomObjectProperty rdfs:subPropertyOf :owns }",
         "SELECT ?p { ?p a owl:ObjectProperty \
          MINUS { owl:bottomObjectProperty rdfs:subPropertyOf ?p } }",
+        "owns",
+    ),
+    (
+        "C disjointWith owl:Nothing",
+        "ASK { :Animal owl:disjointWith owl:Nothing }",
+        "SELECT ?c { :Dog rdfs:subClassOf ?c MINUS { ?c owl:disjointWith owl:Nothing } }",
+        "Animal",
+    ),
+    (
+        "owl:bottomObjectProperty propertyDisjointWith P",
+        "ASK { owl:bottomObjectProperty owl:propertyDisjointWith :owns }",
+        "SELECT ?p { ?p a owl:ObjectProperty \
+         MINUS { owl:bottomObjectProperty owl:propertyDisjointWith ?p } }",
         "owns",
     ),
 ];
@@ -238,9 +252,9 @@ fn universal_wrongs(store: &StoreService) -> Vec<String> {
 }
 
 /// Where the QL rewriting runs (`owl2-ql` by default, `owl2-rl` with it on), it holds
-/// none of [`UNIVERSAL`] either. Guards (hold on the base too): a read between two
-/// distinct constants, and a negation over what the closure is complete for, stay
-/// `complete`.
+/// none of [`UNIVERSAL`] either. Guards (hold on the base too): reads that no member
+/// matches, between two distinct constants (`owl:Thing ⊑ :Dog` isn't entailed), and a
+/// negation over what the closure is complete for, stay `complete`.
 #[test]
 fn the_rewriting_path_doesnt_call_a_universal_statement_complete() {
     let mut all = Vec::new();
@@ -254,6 +268,7 @@ fn the_rewriting_path_doesnt_call_a_universal_statement_complete() {
         }
         for guard in [
             "ASK { :Dog rdfs:subClassOf :Animal }",
+            "ASK { owl:Thing rdfs:subClassOf :Dog }",
             "SELECT ?x { ?x a :Animal FILTER NOT EXISTS { ?x a :Dog } }",
         ] {
             let status = answer(&store, guard).1;
@@ -282,12 +297,59 @@ fn the_ruleset_path_doesnt_call_a_universal_statement_complete() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
-/// Under `owl2-dl` on the RL route, `x a owl:Thing` is in neither bound.
+/// Under `owl2-dl` on the RL route ([`DATA`] is in OWL 2 RL), `x a owl:Thing` is in
+/// neither bound.
 #[test]
 fn owl2_dl_doesnt_call_a_universal_statement_complete() {
     let dl = pipeline();
     insert(&dl, DATA).expect("data");
     let wrong = universal_wrongs(dl.store());
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Off the RL route (an existential superclass is outside OWL 2 RL), the upper bound
+/// holds `:ann a owl:Thing` and the bounds prove it: the answer is `complete`, and
+/// `dl-answers=exact` gives it.
+#[test]
+fn owl2_dl_off_the_rl_route_proves_an_owl_thing_read_complete() {
+    let dl = pipeline();
+    let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :owns ; \
+                       owl:someValuesFrom :Dog ] .";
+    insert(&dl, &format!("{DATA} {existential}")).expect("data");
+    let mut request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :ann a owl:Thing }}"));
+    request.dl_answers = Some(nrese_store::DlAnswers::Exact);
+    let result = dl.store().execute_query(&request).expect("proved");
+    assert!(String::from_utf8(result.payload).unwrap().contains("true"));
+    assert_eq!(result.completeness.map(|c| c.as_str()), Some("complete"));
+}
+
+/// DESCRIBE reads every predicate of what it names, `:ann owl:sameAs :ann` and its
+/// top-property pairs among them, which no store holds: never `complete`, run or planned.
+#[test]
+fn a_describe_is_never_complete() {
+    let dl = pipeline();
+    insert(&dl, DATA).expect("data");
+    let mut wrong = Vec::new();
+    for (name, store) in [
+        (
+            "owl2-ql",
+            &closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        ),
+        (
+            "owl2-rl with the rewriting",
+            &closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On),
+        ),
+        (
+            "owl2-rl",
+            &closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto),
+        ),
+        ("owl2-dl", dl.store().as_ref()),
+    ] {
+        let (graph, status) = answer(store, "DESCRIBE :ann");
+        if !graph.contains("example.com/owns") || status.contains(&"complete") {
+            wrong.push(format!("{name}: {status:?}"));
+        }
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 

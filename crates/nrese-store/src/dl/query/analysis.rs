@@ -307,13 +307,19 @@ pub(super) fn negation(query: &Query) -> Option<&'static str> {
     found
 }
 
+/// What `x rdf:type owl:Thing` reads are named as by [`universal`].
+pub(super) const THING: &str = "rdf:type owl:Thing";
+
 /// The first predicate `query` reads where OWL 2 entails statements for every term that
 /// neither a ruleset's closure nor the QL rewriting holds: `x owl:sameAs x` (eq-ref is
-/// left out), `x rdf:type owl:Thing` and a class's or property's subsumption or
-/// equivalence with itself, the top or the bottom (only declared ones get theirs), and
-/// the top properties' pairs. A pattern between two distinct other constants reads none.
-/// One walk that allocates nothing.
+/// left out), `x rdf:type owl:Thing`, the top properties' pairs, a class's or property's
+/// equivalence with itself, its subsumption by itself and the top and of the bottom (only
+/// declared classes get theirs), and its disjointness with the bottom. `DESCRIBE` reads
+/// every predicate of what it names. One walk that allocates nothing.
 pub(super) fn universal(query: &Query) -> Option<&'static str> {
+    if matches!(query, Query::Describe { .. }) {
+        return Some("every predicate of what DESCRIBE names");
+    }
     let mut found = None;
     pattern_of(query).find(&mut |node| {
         found = match node {
@@ -345,43 +351,46 @@ fn universal_path(path: &PropertyPathExpression) -> Option<&'static str> {
 /// query doesn't fix) can match a statement [`universal`] names: its name, if so.
 fn universal_read(predicate: &str, t: Option<&TriplePattern>) -> Option<&'static str> {
     const OWL: &str = "http://www.w3.org/2002/07/owl#";
-    const TOPS: [&str; 6] = [
-        "Thing",
-        "Nothing",
-        "topObjectProperty",
-        "topDataProperty",
-        "bottomObjectProperty",
-        "bottomDataProperty",
-    ];
-    // An end that can be the term at the other end, a top or a bottom.
-    let open = |term: &TermPattern| match term {
-        TermPattern::NamedNode(n) => n
-            .as_str()
-            .strip_prefix(OWL)
-            .is_some_and(|n| TOPS.contains(&n)),
-        TermPattern::Literal(_) => false,
-        _ => true,
+    const TOP: [&str; 2] = ["topObjectProperty", "topDataProperty"];
+    const BOTTOM: [&str; 2] = ["bottomObjectProperty", "bottomDataProperty"];
+    // Whether the subject, and the object, can be one of the OWL terms `names`: a
+    // variable or blank node can, as can a path step's ends.
+    let ends = |names: &[&str]| {
+        let can_be = |term: &TermPattern| match term {
+            TermPattern::NamedNode(n) => n
+                .as_str()
+                .strip_prefix(OWL)
+                .is_some_and(|n| names.contains(&n)),
+            TermPattern::Literal(_) => false,
+            _ => true,
+        };
+        t.map_or([true; 2], |t| [can_be(&t.subject), can_be(&t.object)])
     };
-    let ends = t.is_none_or(|t| open(&t.subject) || open(&t.object) || t.subject == t.object);
-    let thing = t.is_none_or(|t| match &t.object {
-        TermPattern::NamedNode(c) => c.as_str() == OWL_THING,
-        _ => true,
-    });
-    match predicate {
-        RDF_TYPE => thing.then_some("rdf:type owl:Thing"),
-        "http://www.w3.org/2002/07/owl#topObjectProperty" => Some("owl:topObjectProperty"),
-        "http://www.w3.org/2002/07/owl#topDataProperty" => Some("owl:topDataProperty"),
-        OWL_SAME_AS => ends.then_some("owl:sameAs"),
-        "http://www.w3.org/2000/01/rdf-schema#subClassOf" => ends.then_some("rdfs:subClassOf"),
-        "http://www.w3.org/2002/07/owl#equivalentClass" => ends.then_some("owl:equivalentClass"),
+    let reflexive = t.is_none_or(can_be_reflexive);
+    // x ⊑ x, x ⊑ the top, the bottom ⊑ x.
+    let subsumed = |top: &[&str], bottom: &[&str]| reflexive || ends(top)[1] || ends(bottom)[0];
+    let (reads, name) = match predicate {
+        RDF_TYPE => (ends(&["Thing"])[1], THING),
+        "http://www.w3.org/2002/07/owl#topObjectProperty" => (true, "owl:topObjectProperty"),
+        "http://www.w3.org/2002/07/owl#topDataProperty" => (true, "owl:topDataProperty"),
+        OWL_SAME_AS => (reflexive, "owl:sameAs"),
+        "http://www.w3.org/2002/07/owl#equivalentClass" => (reflexive, "owl:equivalentClass"),
+        "http://www.w3.org/2002/07/owl#equivalentProperty" => (reflexive, "owl:equivalentProperty"),
+        "http://www.w3.org/2000/01/rdf-schema#subClassOf" => {
+            (subsumed(&["Thing"], &["Nothing"]), "rdfs:subClassOf")
+        }
         "http://www.w3.org/2000/01/rdf-schema#subPropertyOf" => {
-            ends.then_some("rdfs:subPropertyOf")
+            (subsumed(&TOP, &BOTTOM), "rdfs:subPropertyOf")
         }
-        "http://www.w3.org/2002/07/owl#equivalentProperty" => {
-            ends.then_some("owl:equivalentProperty")
+        "http://www.w3.org/2002/07/owl#disjointWith" => {
+            (ends(&["Nothing"]).contains(&true), "owl:disjointWith")
         }
-        _ => None,
-    }
+        "http://www.w3.org/2002/07/owl#propertyDisjointWith" => {
+            (ends(&BOTTOM).contains(&true), "owl:propertyDisjointWith")
+        }
+        _ => return None,
+    };
+    reads.then_some(name)
 }
 
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the

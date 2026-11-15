@@ -270,9 +270,12 @@ const UNIVERSAL: &str = "OWL 2 entails such statements for every term (of the te
 /// onto it by both entry points ([`plan_status`], [`answer`]): each only lowers what the
 /// status asserts, so no earlier return can claim more than they allow.
 fn certify(completeness: &mut Completeness, analysis: &Analysis) {
-    // Of what [`universal`] names, `x rdf:type owl:Thing` is in neither bound on the RL
-    // route; the rest is unbounded, or [`reflexive_same_as`]'s, which says it itself.
-    if let Some(what) = analysis.universal.filter(|what| *what != "owl:sameAs") {
+    // Of what [`universal`] names, `owl:sameAs` is [`reflexive_same_as`]'s, which says it
+    // itself, and `owl:Thing` [`thing_on_the_rl_route`]'s.
+    if let Some(what) = analysis
+        .universal
+        .filter(|what| !["owl:sameAs", THING].contains(what))
+    {
         completeness.incomplete("dl", format!("the query reads {what}: {UNIVERSAL}"));
     }
     if let Some(op) = analysis.not_monotone
@@ -322,6 +325,15 @@ pub(crate) fn certify_closure(
     }
 }
 
+/// `x rdf:type owl:Thing` on the RL route, where L is the RL closure and nothing bounds
+/// it: the closure has it only for members of declared classes. Off that route U1 holds
+/// it and the bounds decide it.
+fn thing_on_the_rl_route(status: &mut Status, analysis: &Analysis, view: &View) {
+    if view.rules && analysis.universal == Some(THING) {
+        status.add(format!("the query reads {THING}: {UNIVERSAL}"));
+    }
+}
+
 fn plan_status_built(
     store: &StoreService,
     prepared: &PreparedQuery,
@@ -345,6 +357,7 @@ fn plan_status_built(
     if closed(analysis, &view, &snapshot) {
         let mut status = Status::complete();
         status.path("closed-predicates");
+        thing_on_the_rl_route(&mut status, analysis, &view);
         return status;
     }
     Status::sound_only(
@@ -443,6 +456,7 @@ fn decide_answers(
     }
     let (snapshot, view) = super::bounds::view(store);
     let mut status = Status::complete();
+    thing_on_the_rl_route(&mut status, analysis, &view);
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
     cancellation.check()?;
     match consistency {
