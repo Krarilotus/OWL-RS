@@ -124,6 +124,8 @@ struct Case {
     queries: Vec<Query>,
     /// Per group, its commit: 0 or 1; the declarations are in the first.
     commits: Vec<usize>,
+    /// A group without blank nodes or lists, deleted in a third commit.
+    deleted: Option<usize>,
 }
 
 fn n(kind: &str, i: u64) -> String {
@@ -189,12 +191,17 @@ fn generate(seed: u64) -> Case {
     let commits = (0..groups.len())
         .map(|g| (g > 0 && r.one_in(2)) as usize)
         .collect();
+    let plain = |g: &Group| !["_:", "[", "("].iter().any(|b| g.turtle.contains(b));
+    let deletable: Vec<usize> = (1..groups.len()).filter(|&g| plain(&groups[g])).collect();
+    let deleted = (!deletable.is_empty() && r.one_in(2))
+        .then(|| deletable[r.below(deletable.len() as u64) as usize]);
     Case {
         seed,
         shape,
         groups,
         queries,
         commits,
+        deleted,
     }
 }
 
@@ -361,7 +368,8 @@ struct Answer {
 /// types it (never read from its sentence), why, and the state it would have made.
 type Answers = Result<(Vec<Result<Answer, String>>, String), (String, String, String)>;
 
-/// The store's answers to `texts` after `commits` (each an update and the state after it).
+/// The store's answers to `texts` after `commits` (each an update and the state after it; a
+/// deletion's, the group it takes away).
 fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
     let dl = pipeline_with(DlConfig {
         timeout: Some(Duration::from_secs(5)),
@@ -369,17 +377,40 @@ fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
         max_branch_points: Some(100_000),
         ..DlConfig::default()
     });
-    for (write, state) in commits {
+    let mut state = String::new();
+    for (write, after) in commits {
+        // A deletion leaves what the store held less the group's triples, as the store
+        // spells them: the reference reads that, so a deletion left undone shows.
+        state = if write.starts_with("DELETE") {
+            let p = PREFIXES.replace("@prefix", "PREFIX").replace("> .", ">");
+            let gone = held(&dl, &format!("{p} CONSTRUCT {{ {after} }} WHERE {{}}"))?;
+            let mut all = held(&dl, "CONSTRUCT WHERE { ?s ?p ?o }")?;
+            all.retain(|t| !gone.contains(t));
+            all.join("\n")
+        } else {
+            after.clone()
+        };
         if let Err(e) = update(&dl, &format!("PREFIX f: <{F}> PREFIX rdf: <{RDF}> {write}")) {
             let kind = match &e {
                 MutationError::Rejected(r) => format!("{:?}", r.kind),
                 other => format!("{other:?}"),
             };
-            return Err((kind, e.to_string(), state.clone()));
+            return Err((kind, e.to_string(), state));
         }
     }
-    let state = commits.last().map(|(_, s)| s.clone()).unwrap_or_default();
     Ok((texts.iter().map(|q| answer(&dl, q)).collect(), state))
+}
+
+/// The triples of `construct` over the store's asserted statements, one a line.
+fn held(dl: &MutationPipeline, construct: &str) -> Result<Vec<String>, (String, String, String)> {
+    let mut request = SparqlQueryRequest::all(construct.to_owned());
+    request.read_model = Some(nrese_store::ReadModel::Asserted);
+    let (s, mut out) = (dl.store(), Vec::new());
+    let prepared = s.prepare_query(&request);
+    let read = prepared.and_then(|p| run_dl(s, &p, &mut out));
+    read.map_err(|e| ("read".to_owned(), e.to_string(), String::new()))?;
+    let held = String::from_utf8_lossy(&out);
+    Ok(held.lines().map(str::to_owned).collect())
 }
 
 /// The store's answer to `q`; `none` is the label where no reasoning path can leave
@@ -435,6 +466,15 @@ enum Reply {
 }
 
 impl Reference {
+    fn new(command: String, wait: Duration) -> Self {
+        let child = None;
+        Self {
+            command,
+            wait,
+            child,
+        }
+    }
+
     fn ask(&mut self, reasoner: &str, turtle: &str, questions: &BTreeSet<String>) -> Reply {
         let q: Vec<&str> = questions.iter().map(String::as_str).collect();
         let line = format!("{reasoner}\t{PREFIXES} {turtle}\t{}\n", q.join("\t"));
@@ -491,7 +531,8 @@ impl Case {
     }
 
     /// The commits under `skip`, each an update and the state after it as Turtle: the groups
-    /// of the first commit, then those of the second.
+    /// of the first commit, those of the second, then the deletion of `deleted`, with the
+    /// group it takes away in place of the state.
     fn commits(&self, skip: &BTreeSet<usize>) -> Vec<(String, String)> {
         let turtle = |keep: &dyn Fn(usize) -> bool| {
             let kept = (0..self.groups.len()).filter(|&g| !skip.contains(&g) && keep(g));
@@ -506,6 +547,10 @@ impl Case {
                 let state = turtle(&|g| self.commits[g] <= c);
                 out.push((format!("INSERT DATA {{ {write} }}"), state));
             }
+        }
+        if let Some(d) = self.deleted.filter(|d| !skip.contains(d)) {
+            let turtle = &self.groups[d].turtle;
+            out.push((format!("DELETE DATA {{ {turtle} }}"), turtle.clone()));
         }
         out
     }
@@ -734,7 +779,8 @@ impl Case {
         for g in (0..self.groups.len()).filter(|g| !skip.contains(g)) {
             let (tag, turtle) = (self.groups[g].tag, short(&self.groups[g].turtle));
             let turtle = turtle.replace(" . ", " .\n");
-            ttl += &format!("# {tag}, commit {}\n{turtle}\n", self.commits[g] + 1);
+            let gone = [", deleted in the last commit", ""][(self.deleted != Some(g)) as usize];
+            ttl += &format!("# {tag}, commit {}{gone}\n{turtle}\n", self.commits[g] + 1);
         }
         std::fs::write(out.join(format!("fail-{seed}-{i}.ttl")), ttl).expect("the case");
     }
@@ -760,11 +806,7 @@ fn dl_answers_agree_with_outside_reasoners() {
     std::thread::scope(|s| {
         for w in 0..workers {
             let (out, summary, shrunk, failures) = (&out, &summary, &shrunk, &failures);
-            let mut reference = Reference {
-                command: command.clone(),
-                wait,
-                child: None,
-            };
+            let mut reference = Reference::new(command.clone(), wait);
             s.spawn(move || {
                 for seed in (first + w..first + cases).step_by(workers as usize) {
                     let case = generate(seed);
@@ -833,12 +875,7 @@ fn dl_answers_agree_with_outside_reasoners() {
 fn planted_answers_are_judged_by_kind_and_label() {
     let command = r#"awk -F'\t' '{ printf "c"; for (i = 3; i <= NF; i++) if ($i != "") printf "0"
         print ""; fflush() }'"#;
-    let wait = Duration::from_secs(10);
-    let mut nothing = Reference {
-        command: command.to_owned(),
-        wait,
-        child: None,
-    };
+    let mut nothing = Reference::new(command.to_owned(), Duration::from_secs(10));
     let (case, none) = (generate(0), BTreeSet::new());
     let mut verdict = |picked: &[usize], got: &Answers| {
         let v = case.verdicts(&none, picked, got, &mut nothing, "hermit");
@@ -856,4 +893,32 @@ fn planted_answers_are_judged_by_kind_and_label() {
     let inferred = [case.queries.len()];
     assert_eq!(verdict(&inferred, &read("unsound")), "unsound");
     assert_eq!(verdict(&inferred, &read("sound-only")), "wrong");
+}
+
+/// The real references, for the planted faults below (run by outside.sh before a campaign).
+fn references() -> Reference {
+    let command = std::env::var("NRESE_DL_REFERENCE").expect("NRESE_DL_REFERENCE");
+    Reference::new(command, Duration::from_secs(60))
+}
+
+/// A deletion the store leaves undone (planted: a `DELETE DATA` that removes nothing) shows
+/// as an inferred statement the references don't entail; the deletion done passes.
+#[test]
+#[ignore = "needs the DL kit's reference reasoners: benches/reasoning/dl/outside.sh"]
+fn planted_deletion_left_undone() {
+    let (mut case, none) = (generate(0), BTreeSet::new());
+    case.groups.truncate(2);
+    case.groups[0].turtle = "f:C0 rdfs:subClassOf f:C1 .".into();
+    case.groups[1].turtle = "f:a0 a f:C0 .".into();
+    (case.queries, case.commits, case.deleted) = (Vec::new(), vec![0, 0], Some(1));
+    let (mut reference, texts) = (references(), vec![case.text(0)]);
+    let mut verdict = |commits: Vec<(String, String)>| {
+        let got = store(&commits, &texts);
+        case.verdicts(&none, &[0], &got, &mut reference, "hermit")
+    };
+    let mut undone = case.commits(&none);
+    undone[1].0 = "DELETE DATA { }".into();
+    assert_eq!(verdict(case.commits(&none))[0].1, "agree");
+    let v = verdict(undone);
+    assert_eq!(v[0].1, "wrong", "{v:?}");
 }
