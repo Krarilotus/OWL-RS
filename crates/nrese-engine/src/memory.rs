@@ -62,3 +62,23 @@ pub fn release_all() {
         release(true);
     }
 }
+
+/// Offers back, unforced, what the calling thread and every pool thread hold unused: at
+/// the end of an operation that leaves the shared workers idle. Without it they keep the
+/// operation's freed memory, so the next one's peak starts above it.
+///
+/// The caller pays for its own release and for queuing the pool threads' releases, nothing
+/// more: each pool thread releases when it is next free, before or after this returns, and
+/// none is waited for, so a worker busy with other work (another request's operation, a
+/// materialisation) doesn't hold the caller up.
+///
+/// Unforced, the allocator gives back what it can without waiting. A forced release
+/// ([`release_all`]) took about 8 ms on an EL classification of 20,000 classes through the
+/// endpoint, and the memory it gave back was soon faulted in again, a few percent more time
+/// on the request.
+pub fn release_idle() {
+    if let Some(&release) = RELEASE.get() {
+        rayon::spawn_broadcast(move |_| release(false));
+        release(false);
+    }
+}

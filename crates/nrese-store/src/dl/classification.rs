@@ -63,16 +63,23 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
         Taxonomy::complete,
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
-            None => run(
-                store,
-                snapshot,
-                classify::classify,
-                Taxonomy::refused,
-                |t, why| {
-                    t.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
-                    t.incomplete.push(why)
-                },
-            ),
+            None => {
+                let taxonomy = run(
+                    store,
+                    snapshot,
+                    classify::classify,
+                    Taxonomy::refused,
+                    |t, why| {
+                        t.classification.consistency =
+                            nrese_dl::verdict::Verdict::Unknown(why.clone());
+                        t.incomplete.push(why)
+                    },
+                );
+                // What the shared workers freed is offered back before the answer is built
+                // from the taxonomy ([`nrese_engine::memory::release_idle`]).
+                nrese_engine::memory::release_idle();
+                taxonomy
+            }
         },
     )
 }
@@ -141,6 +148,9 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
 /// take it, the engine's result over no axioms with its consistency unknown, `incomplete`
 /// saying why (never kept: a result kept is complete). Over no axioms the engine would say
 /// consistent, which nothing read decided.
+/// It offers back nothing the shared workers freed: only a classification does, once this
+/// returns ([`taxonomy`]): its peak is the one the release fixes; whether the other
+/// operations need one is measured separately.
 fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
