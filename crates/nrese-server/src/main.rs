@@ -300,9 +300,8 @@ async fn run() -> Result<()> {
     if let CliCommand::Load(load) = cli.command {
         bulk_load(&store, load)?;
         if let Some(program) = &program {
-            let report = store
-                .rematerialise(program)
-                .context("reasoning after the bulk load failed")?;
+            let report =
+                rematerialise(&store, program).context("reasoning after the bulk load failed")?;
             if report.violations > 0 {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
@@ -462,9 +461,7 @@ fn bring_inferences_up_to_date(
             tracing::info!(ruleset = %program.name(), "inferred stack is current");
         }
         Some(program) => {
-            store
-                .rematerialise(program)
-                .context("startup reasoning failed")?;
+            rematerialise(store, program).context("startup reasoning failed")?;
         }
         None => {
             let cleared = store
@@ -476,6 +473,28 @@ fn bring_inferences_up_to_date(
         }
     }
     Ok(())
+}
+
+/// The inferences rebuilt; a panic in the rebuild (a defect) ends in a message that names
+/// the store and how to start without reasoning, not an anonymous exit. A debug build
+/// panics there for a test with `NRESE_TEST_PANIC_IN_REBUILD`.
+fn rematerialise(
+    store: &StoreService,
+    program: &nrese_reasoner::RuleProgram,
+) -> Result<nrese_store::MaterialisationReport> {
+    let rebuild = || {
+        #[cfg(debug_assertions)]
+        assert!(std::env::var_os("NRESE_TEST_PANIC_IN_REBUILD").is_none());
+        store.rematerialise(program)
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(rebuild)) {
+        Ok(report) => Ok(report?),
+        Err(_) => anyhow::bail!(
+            "rebuilding the inferences of the store in {} failed on a defect; to start without \
+             reasoning, set reasoner.mode = \"disabled\" (or NRESE_REASONING_MODE=disabled)",
+            store.config().data_dir.display()
+        ),
+    }
 }
 
 /// `nrese-server query`: one query on the configured store, its inferences first brought up
