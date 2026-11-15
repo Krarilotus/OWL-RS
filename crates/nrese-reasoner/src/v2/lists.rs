@@ -184,8 +184,8 @@ pub enum ListProblem {
     Cycle { node: u64 },
     /// Equality gives the list more than [`MAX_VARIANTS`] member sequences.
     TooManyVariants,
-    /// A property chain or key with more than `most` properties ([`MAX_RULE_MEMBERS`],
-    /// [`MAX_KEY_MEMBERS`]).
+    /// A list with more than `most` members ([`MAX_RULE_MEMBERS`], [`MAX_KEY_MEMBERS`], or
+    /// a rule past [`super::eval::MAX_RULE_ATOMS`]).
     TooLong { members: usize, most: usize },
 }
 
@@ -235,7 +235,7 @@ impl ListDiagnostic {
                 format!("owl:sameAs gives it more than {MAX_VARIANTS} member sequences")
             }
             ListProblem::TooLong { members, most } => {
-                format!("it has {members} properties, more than a rule holds ({most})")
+                format!("it has {members} members, more than a rule holds ({most})")
             }
         };
         format!(
@@ -316,6 +316,15 @@ pub fn instantiate_with_premises(
                             if rule_sized {
                                 let before = rules.len();
                                 make(subject, &members, rules);
+                                // Whatever its shape, a rule the format can't hold.
+                                if !rules[before..].iter().all(Rule::fits) {
+                                    rules.truncate(before);
+                                    diagnose(ListProblem::TooLong {
+                                        members: members.len(),
+                                        most: super::eval::MAX_RULE_ATOMS,
+                                    });
+                                    continue;
+                                }
                                 let mut facts_used = used;
                                 facts_used.push([subject, predicate, head]);
                                 if predicate == voc.members || predicate == voc.distinct_members {

@@ -50,7 +50,7 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 
 **List limits:**
 - Lists of any length are instantiated. `owl:AllDifferent`, `owl:AllDisjointClasses` and `owl:AllDisjointProperties` over more than 100 members become one rule each whose pairs are checked through an index of the members (a rule per pair would be quadratic); shorter ones a rule per pair.
-- A property chain with more than 250 properties, or a key with more than 127, can't be one rule (the rule format numbers a rule's variables and atoms by a byte, and a key's rule has two atoms per property) and isn't instantiated (`list-too-long`).
+- A property chain with more than 250 properties, a key with more than 127, or an intersection of more than 256 classes can't be one rule (the rule format numbers a rule's variables and atoms by a byte, and a key's rule has two atoms per property) and isn't instantiated (`list-too-long`).
 - A list axiom is instantiated for at most 64 member sequences (when `sameAs` makes several nodes one list).
 - Those, malformed (a node without `rdf:first`/`rdf:rest`) and cyclic lists are not instantiated, never truncated. Each one is reported as a typed diagnostic (`malformed-list`, `cyclic-list`, `list-too-long`, `too-many-list-variants`) with the axiom and node decoded:
   - full materialisations (load, startup) report all of them: in the log, and under `last_materialisation` in `/ops/api/diagnostics/reasoning`;
@@ -113,6 +113,8 @@ Startup skips rematerialisation only if the ruleset and the fingerprint match. A
 | `?x log:notEqualTo ?y` | a guard |
 | `?x log:equalTo ?y` | the two are one (a variable takes the other's place) |
 | plain triples | facts that hold whatever the data, never retracted |
+
+A rule with more than 256 atoms in its premises, or in its conclusion, is a parse error: the rule format numbers them by a byte.
 
 The rules' name in the materialisation state and on `/version` is `custom:<file>` (`owl2-rl+custom:<file>` when added to a ruleset). Its fingerprint covers the file's text, so a changed file rebuilds the closure.
 
