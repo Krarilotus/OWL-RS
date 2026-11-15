@@ -254,8 +254,7 @@ def p50(values: list[float]) -> float:
 
 def evidence(passes: list[dict], case: str) -> dict:
     """One side's evidence of a case, pass by pass, each pass's block and layout beside it."""
-    import fast
-    out = {"status": [], "expected": [], "declared": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
+    out ={"status": [], "expected": [], "declared": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
            "refused": [],
            "samples": [], "blocks": [], "layouts": [],
            "process": [], "estimator": set(), "lifetime": [], "anon_kernel": [], "live": [], "kinds": set(),
@@ -279,7 +278,7 @@ def evidence(passes: list[dict], case: str) -> dict:
         observations = record.get("observations") or []
         out["status"].append(record.get("status"))
         out["expected"].append(record.get("expected_outcome", "ok"))
-        out["declared"].append(fast.as_declared(record))
+        out["declared"].append(cases_registry.as_declared(record))
         # A query refused at its memory limit (fast.py QUERY_REFUSAL, an invocation's `refused`) has
         # no answer: its checks and routes are unanswered, not failed; the refusal is named instead,
         # and fails the case whatever it declares (state()). The record's own checks are its last
@@ -360,7 +359,7 @@ def unanswered(check: dict, refused: dict) -> bool:
 
 
 def state(e: dict, off_route_ok: bool = False) -> str:
-    """ok (every pass ok), known (every pass ended as its case declares, not ok: fast.as_declared),
+    """ok (every pass ok), known (every pass ended as its case declares, not ok: cases.as_declared),
     or failed. A
     baseline off the route the harness asserts (an operator it hasn't) with every answer
     right is a valid time: ok with `off_route_ok`. A refused query fails it, whatever the
