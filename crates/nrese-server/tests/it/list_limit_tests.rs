@@ -151,3 +151,53 @@ async fn a_store_holding_such_a_key_starts_with_reasoning_on()
     drop(server);
     Ok(())
 }
+
+/// A panic in the rebuild of the inferences (forced: `NRESE_TEST_PANIC_IN_REBUILD`, a
+/// debug build's), after `load` and at the start: the process ends with an error that
+/// names the store and how to start without reasoning.
+#[test]
+fn a_panic_in_the_rebuild_ends_in_a_message_naming_the_store()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("data");
+    let config = configure(dir.path(), &data)?;
+    let file = dir.path().join("one.ttl");
+    std::fs::write(&file, format!("<{EX}a> <{EX}b> <{EX}c> .\n"))?;
+    let base = |command: &mut Command| {
+        command
+            .arg("--config")
+            .arg(&config)
+            .env("NRESE_TEST_PANIC_IN_REBUILD", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("RUST_LOG");
+    };
+    let mut load = Command::new(env!("CARGO_BIN_EXE_nrese-server"));
+    base(load.arg("load"));
+    let loaded = load.arg(&file).output()?;
+    let mut start = Command::new(env!("CARGO_BIN_EXE_nrese-server"));
+    base(&mut start);
+    let mut child = start
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill()?;
+            panic!("the server still runs after a panic in its start's rebuild");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let started = child.wait_with_output()?;
+    for (place, output) in [("load", loaded), ("start", started)] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && stderr.contains(&data.display().to_string())
+                && stderr.contains("reasoner.mode = \"disabled\""),
+            "{place}: {}:\n{stderr}",
+            output.status
+        );
+    }
+    Ok(())
+}
