@@ -36,6 +36,8 @@ mod literal_kind_tests;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::WhyUndecided;
+
 pub use bounds::BoundsReport;
 pub use config::{DlAnswers, DlConfig, DlConsistency, OutsideProfile};
 pub use consistency::{Checked, Verdict};
@@ -117,5 +119,16 @@ impl Dl {
 
     pub(crate) fn record(&self, status: DlStatus) {
         *self.status.lock().unwrap_or_else(|p| p.into_inner()) = Some(status);
+    }
+
+    /// Why `owl2-dl` wouldn't decide the OWL 2 RL rules' violations in `snapshot`, where it
+    /// wouldn't: one read of its asserted ontology, charged to the bounds' budget. A read
+    /// refused there leaves it undecided too, and says so.
+    pub(crate) fn undecided(&self, snapshot: &nrese_engine::Snapshot) -> Option<WhyUndecided> {
+        match source::read_snapshot(snapshot, std::sync::Arc::clone(self.bounds.kept())) {
+            Ok(o) => nrese_owl::profile::rules_read_differently(&o)
+                .then_some(WhyUndecided::ReadsDifferently),
+            Err(_) => Some(WhyUndecided::Unchecked),
+        }
     }
 }

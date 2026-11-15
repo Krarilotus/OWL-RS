@@ -431,6 +431,7 @@ impl MutationPipeline {
             if matches!(
                 self.store.consistency(),
                 crate::ConsistencyStatus::Inconsistent { .. }
+                    | crate::ConsistencyStatus::Undecided { .. }
             ) && let Err(error) = self.store.rematerialise(&rules)
             {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");

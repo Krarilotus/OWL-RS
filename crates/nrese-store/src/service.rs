@@ -877,6 +877,14 @@ impl StoreService {
         // Under the writer slot, as every change of the certificate's QL schema.
         let tx = self.engine.transaction();
         self.dl.set_active(active, user_rules);
+        // A state with violations (read at open, or recorded before): whether `owl2-dl`
+        // decides them, derived under the mode now set (`ReasoningState::undecided`).
+        if let Some(mut state) = self.reasoning_state().filter(|s| s.violations > 0) {
+            state.undecided = active
+                .then(|| self.dl.undecided(&self.engine.snapshot()))
+                .flatten();
+            *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
+        }
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
@@ -901,6 +909,13 @@ impl StoreService {
     /// The `owl2-dl` mode's state.
     pub fn dl(&self) -> &crate::dl::Dl {
         &self.dl
+    }
+
+    /// Why `owl2-dl` wouldn't decide the OWL 2 RL rules' violations in the current data
+    /// (one read of its asserted ontology), for a caller that runs the mode without its
+    /// pipeline (`nrese-server load`).
+    pub fn undecided_under_dl(&self) -> Option<crate::WhyUndecided> {
+        self.dl.undecided(&self.engine.snapshot())
     }
 
     /// The `owl2-dl` mode's bounds at the latest revision (`crate::dl::bounds`): the
@@ -2177,6 +2192,10 @@ impl StoreService {
             reported.diagnostics_total,
             "materialisation skipped an ontology axiom",
         );
+        // Under `owl2-dl`, whether it decides the violations (`ReasoningState::undecided`).
+        let undecided = (violations > 0 && self.dl.active())
+            .then(|| self.dl.undecided(base))
+            .flatten();
         // The last word under the writer slot: a caller whose claim ended meanwhile (a
         // retired pipeline, a cancelled request) changes nothing.
         if stop() {
@@ -2200,16 +2219,22 @@ impl StoreService {
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(
             finished.writer(),
-            crate::ReasoningState::of_with(
-                rules,
-                self.config.hide_unnamed_classes,
-                self.config.equality_compact,
-                violations,
-            ),
+            crate::ReasoningState {
+                undecided,
+                ..crate::ReasoningState::of_with(
+                    rules,
+                    self.config.hide_unnamed_classes,
+                    self.config.equality_compact,
+                    violations,
+                )
+            },
         )
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
         drop(finished);
-        if violations > 0 {
+        if let Some(why) = undecided {
+            let text = why.text(violations);
+            tracing::error!(ruleset = %rules.name(), violations_at_least, "{text}; the store is in quarantine until it is repaired");
+        } else if violations > 0 {
             tracing::error!(
                 ruleset = %rules.name(),
                 violations,
