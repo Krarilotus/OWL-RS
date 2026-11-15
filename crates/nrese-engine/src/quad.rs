@@ -218,6 +218,17 @@ impl Permutation {
         [c[o[0]], c[o[1]], c[o[2]], c[o[3]]]
     }
 
+    /// The key position that holds the graph: first in a graph-first permutation, last in
+    /// the others. A scan that only asks a key's graph reads it there, not through
+    /// [`Self::key_to_quad`].
+    #[inline]
+    pub(crate) const fn graph_slot(self) -> usize {
+        match self {
+            Self::Gspo | Self::Gpos | Self::Gosp | Self::Gpso => 0,
+            Self::Spog | Self::Posg | Self::Ospg | Self::Psog => 3,
+        }
+    }
+
     #[inline]
     pub(crate) const fn key_to_quad(self, key: &Key) -> EncodedQuad {
         let o = self.order();
@@ -358,6 +369,19 @@ mod tests {
         let quad = EncodedQuad::new(id(1), id(2), id(3), id(4));
         for permutation in Permutation::ALL {
             assert_eq!(permutation.key_to_quad(&permutation.to_key(&quad)), quad);
+        }
+    }
+
+    /// A key's graph is at `graph_slot` in every permutation.
+    #[test]
+    fn graph_slot_holds_the_graph() {
+        let quad = EncodedQuad::new(id(1), id(2), id(3), id(4));
+        for permutation in Permutation::ALL {
+            assert_eq!(
+                permutation.to_key(&quad)[permutation.graph_slot()],
+                quad.graph.raw(),
+                "{permutation:?}"
+            );
         }
     }
 
