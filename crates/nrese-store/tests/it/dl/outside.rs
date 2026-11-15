@@ -550,7 +550,7 @@ impl Case {
 
     /// The commits under `skip`, each an update and the state after it as Turtle: the groups
     /// of the first commit, those of the second, then the deletion of `deleted`, with the
-    /// group it takes away in place of the state.
+    /// group it takes away in place of the state; only the first NRESE_DL_STEPS if it is set.
     fn commits(&self, skip: &BTreeSet<usize>) -> Vec<(String, String)> {
         let turtle = |keep: &dyn Fn(usize) -> bool| {
             let kept = (0..self.groups.len()).filter(|&g| !skip.contains(&g) && keep(g));
@@ -570,6 +570,7 @@ impl Case {
             let turtle = &self.groups[d].turtle;
             out.push((format!("DELETE DATA {{ {turtle} }}"), turtle.clone()));
         }
+        out.truncate(env("NRESE_DL_STEPS").map_or(usize::MAX, |n| n as usize));
         out
     }
 
@@ -773,7 +774,8 @@ impl Case {
             true => "the commits of these triples".into(),
             false => self.text(i),
         };
-        let mut ttl = format!("# seed {seed}, shape {shape}, {name} (query {i}): {query}\n");
+        let steps = env("NRESE_DL_STEPS").map_or(String::new(), |n| format!(", {n} steps"));
+        let mut ttl = format!("# seed {seed}, shape {shape}{steps}, {name} (query {i}): {query}\n");
         for reasoner in ["hermit", "openllet"] {
             for (j, class, detail) in self.verdicts(skip, &picked, &got, reference, reasoner) {
                 let detail = detail.replace('\n', " ");
@@ -818,12 +820,13 @@ fn dl_answers_agree_with_outside_reasoners() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(50);
     let workers = env("NRESE_DL_WORKERS").unwrap_or(1);
     let wait = Duration::from_secs(env("NRESE_DL_WAIT").unwrap_or(60));
-    let summary = Mutex::new(std::fs::File::create(out.join("summary.tsv")).expect("summary.tsv"));
+    let file = |name: &str| Mutex::new(std::fs::File::create(out.join(name)).expect(name));
+    let (summary, unwritten) = (&file("summary.tsv"), &file("unwritten.tsv"));
     let shrunk = Mutex::new(BTreeMap::<String, usize>::new());
     let failures = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|s| {
         for w in 0..workers {
-            let (out, summary, shrunk, failures) = (&out, &summary, &shrunk, &failures);
+            let (out, shrunk, failures) = (&out, &shrunk, &failures);
             let mut reference = Reference::new(command.clone(), wait);
             s.spawn(move || {
                 for seed in (first + w..first + cases).step_by(workers as usize) {
@@ -858,11 +861,13 @@ fn dl_answers_agree_with_outside_reasoners() {
                         }
                         if outcome == "FAIL" {
                             failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            // Shrunk: 20 per verdict and query; written: 3 per template set left.
+                            // Shrunk: 20 per verdict and query; written: 3 per template set left;
+                            // every other failure listed in unwritten.tsv, with why.
                             let count = |key: String| {
                                 let mut seen = shrunk.lock().expect("shrunk");
                                 *seen.entry(key).and_modify(|n| *n += 1).or_insert(1)
                             };
+                            let mut why = "20 of its verdict and query were shrunk".to_owned();
                             if count(format!("{class} {name}")) <= 20 {
                                 let skip = case.shrink(*i, class, &mut reference);
                                 let left = case.kept(&skip).map(|g| g.tag);
@@ -870,8 +875,12 @@ fn dl_answers_agree_with_outside_reasoners() {
                                 let left: Vec<&str> = left.collect();
                                 if count(format!("{class} {name} {}", left.join(","))) <= 3 {
                                     case.report(out, *i, &skip, &mut reference);
+                                    continue;
                                 }
+                                why = format!("3 shrunk to {} were written", left.join(","));
                             }
+                            let mut file = unwritten.lock().expect("unwritten");
+                            writeln!(file, "{seed}\t{name}\t{class}\t{why}").expect("unwritten");
                         }
                     }
                 }

@@ -31,6 +31,7 @@ S=$OUT/summary.tsv
   awk -F'\t' '!c[$1]++ {all++} $4 != "write" && $5 !~ /^(reference-undecided|not-judged)$/ && !q[$1]++ {n++}
     END {print "cases", all; print "cases with a query judged", n + 0}' "$S"
   echo "not judged: an inconsistent state after the first commit that the store accepted"
+  echo "failures not written (unwritten.tsv, with why): $(wc -l < "$OUT/unwritten.tsv")"
   awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"
   awk -F'\t' '$5 ~ /^declined/' "$S" > "$OUT/declined.tsv"; } > "$OUT/counts.txt"
 exit "${rc:-0}"
