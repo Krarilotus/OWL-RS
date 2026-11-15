@@ -236,8 +236,10 @@ then counts, per baseline, the cases compared and those absent by product and by
 head failing a case blocks; so does the head stopping at its declared limit where a baseline
 completed. A pass that reaches its time limit with its scope held at its memory cap stopped at a
 declared `memory-limit` as much as one killed there: the kernel can postpone that kill for many
-minutes (`fast.py held_at_cap`). Its record still says `timeout`, and a timeout away from the
-cap, or with no reading of the scope at its end, still fails.
+minutes. Held means, read from the scope when the time limit came: its memory within 1 % of the
+cap, and its tasks stalled on memory at least 10 % of the last 10 s (`suitekit/cases.py
+held_at_cap`). Its record still says `timeout`; a timeout the cap wasn't holding, or with no such
+reading, still fails.
 
 **The inference** (`suitekit/gatestats.py`; research round 8, 19 Oct 2026). One question per
 hypothesis, all of them declared before any result, the *family*: does the head lose on this

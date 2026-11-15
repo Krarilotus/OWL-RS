@@ -268,8 +268,9 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
 # ql-memberships-reuse, 0.05 s, none in four of six passes). The reading itself
 # (anon_kernel_bytes) is suitekit/runtime.py's, which the suite's Docker runtime reads too.
 SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
-# A native case's scope when its time limit came: its anon + kernel memory, then its cap, in bytes.
-SCOPE_AT_TIMEOUT = re.compile(r"^fast-scope-at-timeout (\d+) (\d+)$", re.M)
+# A native case's scope when its time limit came (scope_at_timeout()): its anon + kernel memory and
+# its cap, in bytes, and the share of the last 10 s all its tasks stalled on memory, in %.
+SCOPE_AT_TIMEOUT = re.compile(r"^fast-scope-at-timeout (\d+) (\d+) (\d+(?:\.\d+)?)$", re.M)
 # The process's transparent huge pages, reported only (no hypothesis; 14 Nov 2026: a slower
 # clients-lookups in F2 that no later run reproduced, and the host's state then unrecorded). From
 # the same memory.stat reads, without walking a process's mappings under its mmap lock as
@@ -316,8 +317,7 @@ def thp_modes(group: Path, known: set) -> list[dict]:
 
 
 class AnonKernelSampler(threading.Thread):
-    """Samples a scope's anon + kernel memory until stopped; `peak`: the largest seen, `last`: the
-    newest. The scope's
+    """Samples a scope's anon + kernel memory until stopped; `peak`: the largest seen. The scope's
     cgroup directory is what the command's wrapper writes to `where` once it runs in it. Until it
     is found and for `dense_s` after, it looks every `dense_period_s`; then every `period_s`. It
     keeps off `avoid`, the case's pinned CPUs (taskset notation), where it can run elsewhere."""
@@ -325,7 +325,7 @@ class AnonKernelSampler(threading.Thread):
     def __init__(self, where: Path, period_s: float = 0.05, dense_period_s: float = 0.001, dense_s: float = 0.25,
                  avoid: str | None = None):
         super().__init__(daemon=True)
-        self.where, self.period_s, self.peak, self.last, self.thp = where, period_s, None, None, {}
+        self.where, self.period_s, self.peak, self.thp = where, period_s, None, {}
         self.dense_period_s, self.dense_s, self.avoid = dense_period_s, dense_s, avoid
         self.modes_period_s = 1.0
         self.halt = threading.Event()
@@ -350,7 +350,7 @@ class AnonKernelSampler(threading.Thread):
             except OSError:
                 value = None
             if value is not None:
-                self.peak, self.last = max(self.peak or 0, value), value
+                self.peak = max(self.peak or 0, value)
                 if "anon_thp" in fields:
                     self.thp["anon_thp_peak_bytes"] = max(self.thp.get("anon_thp_peak_bytes", 0), int(fields["anon_thp"]))
                 self.thp.update({k: int(fields[k]) for k in ("thp_fault_alloc", "thp_collapse_alloc") if k in fields})
@@ -388,23 +388,23 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     # At the cap the kernel kills the command alone (OOMPolicy=continue): the wrapper then still prints the peak.
     # Pinned (pinned_cpus) the command and all it starts stay on one L3 and NUMA node.
     cpus = pinned_cpus()
-    cap_mib = int(cap_gb * 1024)
-    argv = [*scope_argv(unit, f"{cap_mib}m"),*(["taskset", "-c", cpus] if cpus else []),
+    argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), *(["taskset", "-c", cpus] if cpus else []),
             "sh", "-c", wrapper, "sh", *(native(c, dirs) for c in command)]
     started = time.monotonic()
     cleanup_error = ""
     where = FAST_DATA / f".scope-{unit}"
     sampler = AnonKernelSampler(where, avoid=cpus)
     sampler.start()
-    timed_out = False
+    at_timeout = ""
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
                               errors="replace", env={**ENV, **pad, "FAST_SCOPE_DIR": str(where),
                                                      **{k: str(v) for k, v in (env or {}).items()}},
                               pass_fds=tuple(map(int, os.environ.get("SUITE_LEASE_FDS", "").split())))
     except subprocess.TimeoutExpired:
-        timed_out = True
-        done = subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")
+        # Read now, while what the scope holds is still in it (the cleanup below ends it).
+        at_timeout = scope_at_timeout(where)
+        done =subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")
     finally:
         anon_kernel = sampler.stop()
         where.unlink(missing_ok=True)
@@ -422,8 +422,7 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
            + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "")
            + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "")
-           # Where the scope stood when the time limit came (held_at_cap()): its newest reading, its cap.
-           + (f"fast-scope-at-timeout {sampler.last} {cap_mib << 20}\n" if timed_out and sampler.last else "")
+           + at_timeout
            + (f"fast-scope-thp {json.dumps(sampler.thp, separators=(',', ':'))}\n" if sampler.thp else "") + err)
     # A command that succeeded has its scope's anon + kernel peak, or its case fails here, at once,
     # not as an incomplete memory series in the report.
@@ -432,6 +431,24 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
         if note:
             err += "\n" + note
     return done.returncode or (1 if cleanup_error or unread else 0), done.stdout, err, time.monotonic() - started
+
+
+def scope_at_timeout(where: Path) -> str:
+    """The scope's state when the case's time limit came, read from the scope itself at that moment
+    (the cgroup directory the wrapper wrote to `where`): `fast-scope-at-timeout` with its anon + kernel
+    memory, its memory.max and its memory `full avg10` (cases.held_at_cap()). Empty when any of them
+    can't be read: no reading is never a scope held at its cap."""
+    try:
+        group = where.read_text().strip()
+        if not group:
+            return ""
+        group = Path(group)
+        used = anon_kernel_bytes((group / "memory.stat").read_text())
+        cap = int((group / "memory.max").read_text().strip())
+        stall = re.search(r"^full avg10=(\d+(?:\.\d+)?) ", (group / "memory.pressure").read_text(), re.M)
+    except (OSError, ValueError):
+        return ""
+    return f"fast-scope-at-timeout {used} {cap} {stall.group(1)}\n" if used and stall else ""
 
 
 def scope_peak_mib(stderr: str) -> int | None:
@@ -881,28 +898,6 @@ def run_case(case: dict, label: str, rep: int) -> dict:
 # not with a wrong answer.
 LIMITS = ("memory-limit", "timeout", "gave-up", "query-memory-limit", "not-answered")
 
-# A scope within this share of its cap holds nothing beside its anon + kernel memory but a few file
-# pages, its binary's own among them, which the kernel keeps reclaiming and faulting back instead of
-# killing at once (D16-563, sparqloscope-dblp at 28 GiB: held 1 to 3 MiB under the cap for 20 min,
-# then killed; a pass still loading was 25 % under it).
-AT_THE_CAP = 0.01
-
-
-def held_at_cap(record: dict) -> bool:
-    """The case's scope was at its memory cap when its time limit came (fast-scope-at-timeout). No
-    reading (a Docker or Windows run, an older record) is not held."""
-    end = record.get("at_timeout") or {}
-    used, cap = end.get("anon_kernel_bytes"), end.get("max_bytes")
-    return bool(used and cap) and cap - used <= AT_THE_CAP * cap
-
-
-def as_declared(record: dict) -> bool:
-    """The run ended as its case declares: that status; or, for a declared memory limit, its time
-    limit with its scope held at the cap, where the kernel postpones the kill (held_at_cap()). The
-    record keeps its own status."""
-    status, wanted = record.get("status"), record.get("expected_outcome", "ok")
-    return status == wanted or (wanted == "memory-limit" and status == "timeout" and held_at_cap(record))
-
 
 def frontier(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """A case stopped at its limit, run once more past it (`frontier`: a larger `cap_gb`, a
@@ -938,7 +933,7 @@ def verdict(case: dict, record: dict) -> dict:
         # A failure without a known cause (an exit status) is nobody's yet: its notes say more.
         whose = "unknown" if kind == "failed" else "product"
     out = {"verdict": kind, "whose": whose}
-    if kind != "ok" and as_declared(record) and case.get("known"):
+    if kind != "ok" and cases_registry.as_declared(record) and case.get("known"):
         out["issue"] = case["known"]
     return out
 
@@ -1294,7 +1289,8 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
             "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr),
             **({"anon_kernel_peak_bytes": int(found[-1])} if (found := SCOPE_ANON_KERNEL.findall(stderr or "")) else {}),
-            **({"at_timeout": {"anon_kernel_bytes": int(found[-1][0]), "max_bytes": int(found[-1][1])}}
+            **({"at_timeout": {"anon_kernel_bytes": int(found[-1][0]), "max_bytes": int(found[-1][1]),
+                               "memory_full_avg10": float(found[-1][2])}}
                if (found := SCOPE_AT_TIMEOUT.findall(stderr or "")) else {}),
             **({"thp": json.loads(found[-1])} if (found := SCOPE_THP.findall(stderr or "")) else {}),
             **({"peak_live_requested_bytes": result["peak_live_requested_bytes"]}
@@ -2045,14 +2041,14 @@ def changed_inputs(files: dict) -> list[str]:
 
 
 def not_as_expected(records: list[dict], off_route_ok: bool = False) -> list[dict]:
-    """The runs that make `run` fail: each that didn't end as its case declares (as_declared()),
+    """The runs that make `run` fail: each that didn't end as its case declares (cases.as_declared()),
     except, for an A/B's base (`off_route_ok`), a case off its expected route: measured
     without the operator the branch brings. Failed, wrong and missing runs always count, and so
     does a run in which a query was refused at its memory limit (`refused`), whatever its status:
     no case declares a refusal."""
     tolerated = {"off-route"} if off_route_ok else set()
     return [r for r in records
-            if (not as_declared(r) and r["status"] not in tolerated) or r.get("refused")]
+            if (not cases_registry.as_declared(r) and r["status"] not in tolerated) or r.get("refused")]
 
 
 def suite_rows(report: dict, cases: list[dict]) -> list:
@@ -2172,7 +2168,7 @@ def run(args) -> int:
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             report["records"].append(record)
-            mark = "" if as_declared(record) else "  <<<"
+            mark = "" if cases_registry.as_declared(record) else "  <<<"
             metric = record.get("metric")
             print(f"rep {rep} {case['name']:<24} {record['status']:<13} "
                   f"{(f'{metric:,.{1 if metric >= 10 else 4}f} ms' if isinstance(metric, (int, float)) else '-'):>14} "
