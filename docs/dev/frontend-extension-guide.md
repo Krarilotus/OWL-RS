@@ -78,8 +78,8 @@ This document explains how to extend the NRESE user frontend without mixing styl
 
 The frontend package ships a small CLI on the same client boundary:
 
-```powershell
-Set-Location .\apps\nrese-console
+```bash
+cd apps/nrese-console
 npm install
 npm run cli -- runtime
 npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
@@ -87,7 +87,7 @@ npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
 
 For named graph operations:
 
-```powershell
+```bash
 npm run cli -- graph-read --graph named --graph-iri https://example.org/g
 ```
 
@@ -106,10 +106,10 @@ The CLI contract and browser/runtime connection boundary are documented in [fron
 
 ## Build And Test
 
-```powershell
-Set-Location .\apps\nrese-console
+```bash
+cd apps/nrese-console
 npm install
 npm run build
 npm run test -- --run
-Set-Location ..\..
+cd ../..
 ```
