@@ -22,9 +22,11 @@ pub(crate) struct Analysis {
     /// An `owl:sameAs` read whose two ends can be one term: a triple pattern with a
     /// variable or blank node at an end or one constant at both, or any path step. A
     /// variable predicate and a negated property set count as possible `owl:sameAs` reads.
-    reflexive_same_as: bool,
-    /// Its first read that may miss entailed rows wherever it is answered ([`denied`]).
-    pub(super) denied: Option<String>,
+    /// eq-ref (OWL 2 Profiles table 4: every term is `owl:sameAs` itself) is in neither
+    /// bound: the RL rules leave it out by design, and so does U1. So the bounds can't
+    /// decide such a read on any route: it is answered over L, and its status, like every
+    /// `owl:sameAs` read's, is [`denied`]'s.
+    pub(super) reflexive_same_as: bool,
 }
 
 /// Whether the `owl:sameAs` pattern `t` can match a reflexive pair: only two distinct
@@ -207,7 +209,6 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     let mut analysis = Analysis {
         shape: shape_of(query),
         answers: answer_variables(query),
-        denied: denied(query),
         ..Analysis::default()
     };
     if matches!(query, Query::Describe { .. }) {
@@ -322,8 +323,9 @@ fn reserved(iri: &str) -> bool {
 /// The first read of `query` that may miss entailed rows wherever it is answered (default
 /// deny): any but a predicate outside the [`reserved`] namespaces or `rdf:type` with a
 /// class constant outside them. A variable predicate, a negated property set and DESCRIBE
-/// read every predicate. One walk that allocates only for what it finds.
-pub(super) fn denied(query: &Query) -> Option<String> {
+/// read every predicate. On the bounds' path (`bounds`), one more read may be complete:
+/// see [`denied_read`]. One walk that allocates only for what it finds.
+pub(super) fn denied(query: &Query, bounds: bool) -> Option<String> {
     if matches!(query, Query::Describe { .. }) {
         return Some("every predicate of what DESCRIBE names".to_owned());
     }
@@ -332,7 +334,9 @@ pub(super) fn denied(query: &Query) -> Option<String> {
         found = match node {
             Node::Pattern(GraphPattern::Bgp { patterns }) => {
                 patterns.iter().find_map(|t| match &t.predicate {
-                    NamedNodePattern::NamedNode(p) => denied_read(p.as_str(), Some(&t.object)),
+                    NamedNodePattern::NamedNode(p) => {
+                        denied_read(p.as_str(), Some((&t.subject, &t.object)), bounds)
+                    }
                     NamedNodePattern::Variable(_) => Some("a variable predicate".to_owned()),
                 })
             }
@@ -347,24 +351,76 @@ pub(super) fn denied(query: &Query) -> Option<String> {
 fn denied_path(path: &PropertyPathExpression) -> Option<String> {
     use PropertyPathExpression as P;
     match path {
-        P::NamedNode(n) => denied_read(n.as_str(), None),
+        P::NamedNode(n) => denied_read(n.as_str(), None, false),
         P::Reverse(p) | P::ZeroOrMore(p) | P::OneOrMore(p) | P::ZeroOrOne(p) => denied_path(p),
         P::Sequence(paths) | P::Alternative(paths) => paths.iter().find_map(denied_path),
         P::NegatedPropertySet(_) => Some("a negated property set".to_owned()),
     }
 }
 
-/// [`denied`] for a read of `predicate` with `object` (`None`: a path step's, which the
-/// query doesn't name).
-fn denied_read(predicate: &str, object: Option<&TermPattern>) -> Option<String> {
-    if predicate != RDF_TYPE {
-        return reserved(predicate).then(|| format!("<{predicate}>"));
+/// [`denied`] for a read of `predicate` between `ends` (`None`: a path step's, which the
+/// query doesn't name). What may be complete, each by its argument:
+/// - a predicate outside the [`reserved`] namespaces, and `rdf:type` with a class constant
+///   outside them: their entailed statements are facts about individuals, which the bounds
+///   bound and a closure holds for its profile;
+/// - on the bounds' path only, `owl:sameAs` between two different constant IRIs: U1
+///   bounds equality between the data's individuals as it bounds their other facts, so
+///   the bounds decide it; the pair neither bound holds, eq-ref's reflexive one, needs one
+///   term at both ends. A constant outside the data is no individual of U1's
+///   ([`absent_same_as`]).
+fn denied_read(
+    predicate: &str,
+    ends: Option<(&TermPattern, &TermPattern)>,
+    bounds: bool,
+) -> Option<String> {
+    match (predicate, ends) {
+        (p, _) if !reserved(p) => None,
+        (RDF_TYPE, Some((_, TermPattern::NamedNode(c)))) if !reserved(c.as_str()) => None,
+        (RDF_TYPE, Some((_, TermPattern::NamedNode(c)))) => {
+            Some(format!("rdf:type <{}>", c.as_str()))
+        }
+        (RDF_TYPE, _) => Some("rdf:type of a class it doesn't name".to_owned()),
+        (OWL_SAME_AS, Some((TermPattern::NamedNode(a), TermPattern::NamedNode(b))))
+            if bounds && a != b =>
+        {
+            None
+        }
+        (p, _) => Some(format!("<{p}>")),
     }
-    match object {
-        Some(TermPattern::NamedNode(c)) if !reserved(c.as_str()) => None,
-        Some(TermPattern::NamedNode(c)) => Some(format!("rdf:type <{}>", c.as_str())),
-        _ => Some("rdf:type of a class it doesn't name".to_owned()),
-    }
+}
+
+/// The first `owl:sameAs` read [`denied_read`] allows on the bounds' path with a constant
+/// that isn't a term of `snapshot`, the bounds' own: U1's individuals are the data's, and a
+/// term outside it may be entailed equal to another where the ontology allows only one
+/// individual (`owl:Thing ⊑ {:a}`) though neither bound says so. A dictionary lookup.
+pub(super) fn absent_same_as(query: &Query, snapshot: &Snapshot) -> Option<String> {
+    let absent = |n: &str| {
+        snapshot
+            .lookup(NamedNodeRef::new_unchecked(n).into())
+            .is_none()
+    };
+    let mut found = None;
+    pattern_of(query).find(&mut |node| {
+        if let Node::Pattern(GraphPattern::Bgp { patterns }) = node {
+            found = patterns
+                .iter()
+                .find_map(|t| match (&t.subject, &t.predicate, &t.object) {
+                    (
+                        TermPattern::NamedNode(a),
+                        NamedNodePattern::NamedNode(p),
+                        TermPattern::NamedNode(b),
+                    ) if p.as_str() == OWL_SAME_AS => [a.as_str(), b.as_str()]
+                        .into_iter()
+                        .find(|n| absent(n))
+                        .map(|n| {
+                            format!("<{OWL_SAME_AS}> of <{n}>, which isn't a term of the data")
+                        }),
+                    _ => None,
+                });
+        }
+        found.is_some()
+    });
+    found
 }
 
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
@@ -397,31 +453,10 @@ pub(super) fn unbounded(analysis: &Analysis) -> Option<String> {
         })
 }
 
-/// Why the bounds can't decide `analysis`'s `owl:sameAs` reads: eq-ref (OWL 2 Profiles
-/// table 4: every term is `owl:sameAs` itself) is in neither bound: the RL rules leave it
-/// out by design, and so does U1. Holds on every route, so it is asked before [`closed`].
-/// The answers over L then miss certain ones; under an operator that isn't monotone
-/// (`not_monotone`: NOT EXISTS, MINUS, OPTIONAL, …) a missing pair can also keep a row the
-/// certain answers lack, so they aren't sound either: `(why, sound)`.
-pub(super) fn reflexive_same_as(analysis: &Analysis) -> Option<(String, bool)> {
-    if !analysis.reflexive_same_as {
-        return None;
-    }
-    const WHY: &str = "the query reads owl:sameAs where both ends can be one term: reflexive \
-                       owl:sameAs isn't materialised in either bound";
-    Some(match analysis.not_monotone {
-        None => (WHY.to_owned(), true),
-        Some(op) => (
-            format!("{WHY}, and under {op}, which isn't monotone, a row it would remove is kept"),
-            false,
-        ),
-    })
-}
-
 /// Whether every predicate and class `analysis` reads has no fact in U1 beyond L.
 pub(super) fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
     // The RL route: the RL closure is complete for an OWL 2 RL ontology, but for the
-    // reflexive owl:sameAs it leaves out ([`reflexive_same_as`], asked first).
+    // reflexive owl:sameAs it leaves out (`Analysis::reflexive_same_as`, asked first).
     if view.rules {
         return true;
     }

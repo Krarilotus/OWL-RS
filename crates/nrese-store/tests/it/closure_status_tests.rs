@@ -7,11 +7,11 @@
 
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphTarget, QlRewritingMode, SparqlQueryRequest,
+    BulkLoadRequest, CancellationToken, DlConfig, GraphTarget, QlRewritingMode, SparqlQueryRequest,
     StatementOp, StatementsRequest, StoreConfig, StoreService,
 };
 
-use crate::dl::{PREFIXES, insert, pipeline};
+use crate::dl::{PREFIXES, insert, pipeline, pipeline_with};
 
 /// eq-ref (OWL 2 Profiles §4.3, table 4), which the RL rules leave out: `:rex owl:sameAs
 /// :rex` is entailed, so NOT EXISTS removes `:rex` and the certain answers are none.
@@ -52,7 +52,9 @@ const MEMBER: (&str, &str) = (
 
 /// The data of [`MEMBERS`]: `:Dog`, `:owns` and `:age` declared; `:Animal` and `:Pet`
 /// used as classes undeclared; `:ann` typed by no class.
-const DATA: &str = ":Dog a owl:Class . :Dog rdfs:subClassOf :Animal .     :owns a owl:ObjectProperty . :age a owl:DatatypeProperty .     :rex a :Dog , :Pet . :ann :owns :rex ; :age 3 .";
+const DATA: &str = ":Dog a owl:Class . :Dog rdfs:subClassOf :Animal . \
+     :owns a owl:ObjectProperty . :age a owl:DatatypeProperty . \
+     :rex a :Dog , :Pet . :ann :owns :rex ; :age 3 .";
 
 /// Statements of the reserved vocabulary that OWL 2 entails over [`DATA`] and no path
 /// holds, found one by one before the rule: the member, its read (`false`), and a query
@@ -104,7 +106,8 @@ const MEMBERS: [(&str, &str, &str, &str); 8] = [
     (
         "owl:topObjectProperty is transitive",
         "ASK { owl:topObjectProperty a owl:TransitiveProperty }",
-        "SELECT ?p { ?p a owl:ObjectProperty          FILTER NOT EXISTS { owl:topObjectProperty a owl:TransitiveProperty } }",
+        "SELECT ?p { ?p a owl:ObjectProperty \
+         FILTER NOT EXISTS { owl:topObjectProperty a owl:TransitiveProperty } }",
         "owns",
     ),
 ];
@@ -223,7 +226,8 @@ fn member_wrongs(store: &StoreService) -> Vec<String> {
 /// existential superclass is outside OWL 2 RL).
 fn dl(off_the_rl_route: bool) -> nrese_store::MutationPipeline {
     let dl = pipeline();
-    let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :owns ;                        owl:someValuesFrom :Dog ] .";
+    let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :owns ; \
+                       owl:someValuesFrom :Dog ] .";
     let data = format!("{DATA} {}", if off_the_rl_route { existential } else { "" });
     insert(&dl, &data).expect("data");
     dl
@@ -397,4 +401,205 @@ fn a_read_that_can_only_miss_rows_stays_sound_only() {
     ] {
         assert_eq!(answer(&store, query).1, ["sound-only"; 2], "{query}");
     }
+}
+
+/// The rewriting's own report (`ql.completeness`) says no more than the answer's status:
+/// a denied read is `complete` in neither, run, planned or explained.
+#[test]
+fn the_rewritings_report_calls_no_denied_read_complete() {
+    let store = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :fresh a owl:Thing }}"));
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let cancel = CancellationToken::new();
+    let run = store.execute_query(&request).expect("answered");
+    let planned = store.plan_query(&prepared, &cancel).expect("planned");
+    let explained = store.explain_query(&prepared, &cancel).expect("explained");
+    for (how, status, report) in [
+        ("run", run.completeness, run.ql.map(|q| q.completeness)),
+        (
+            "planned",
+            planned.completeness,
+            planned.ql.map(|q| q.completeness),
+        ),
+        (
+            "explained",
+            explained.completeness,
+            explained.ql.map(|q| q.completeness),
+        ),
+    ] {
+        let report = report.unwrap_or_else(|| panic!("{how}: no report of the rewriting"));
+        assert_eq!(report.as_str(), "sound-only", "{how}: ql.completeness");
+        assert_eq!(status.map(|s| s.as_str()), Some("sound-only"), "{how}");
+    }
+}
+
+/// An `owl2-dl` store whose bounds leave candidates of `?x a :D` unresolved (no branch
+/// point allowed): x and w are `:D`s only through the union, which the RL closure lacks.
+fn unresolved() -> nrese_store::MutationPipeline {
+    let dl = pipeline_with(DlConfig {
+        max_branch_points: Some(0),
+        ..DlConfig::default()
+    });
+    insert(
+        &dl,
+        ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . \
+         :C rdfs:subClassOf :D . :x a :A . :y a :B . :w a [ owl:unionOf ( :B :C ) ] .",
+    )
+    .expect("data");
+    dl
+}
+
+/// Which operators turn an answer that may miss rows into one that may be wrong, on the
+/// DL path as on the others: LIMIT or OFFSET without ORDER BY, GRAPH, SERVICE and DESCRIBE
+/// are monotone in the data. Adding the statements an incomplete answer lacks can only add
+/// rows or triples; it can't make a returned row wrong. So an answer incomplete for its
+/// own reasons (here candidates the bounds leave unresolved) is `sound-only` under them.
+/// An ordered slice differs: a missing row can push a returned one out, so it is
+/// `unsound`. Changing this list means arguing with these cases.
+#[test]
+fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
+    let store = unresolved();
+    // x or w, as a JSON value or an N-Triples term.
+    let rows = |text: &str| {
+        ["x", "w"].map(|r| {
+            ["\"", ">"]
+                .iter()
+                .any(|e| text.contains(&format!("example.com/{r}{e}")))
+        })
+    };
+    let mut wrong = Vec::new();
+    for (query, expected) in [
+        ("SELECT ?x { ?x a :D } LIMIT 2 OFFSET 1", "sound-only"),
+        ("SELECT ?x { GRAPH ?g { ?x a :D } }", "sound-only"),
+        ("DESCRIBE ?x { ?x a :D }", "sound-only"),
+        ("SELECT ?x { ?x a :D } ORDER BY ?x LIMIT 1", "unsound"),
+    ] {
+        let (text, status) = answer(store.store(), query);
+        if status != [expected; 2] {
+            wrong.push(format!("{query}: {status:?}, expected {expected}"));
+        }
+        // Sound under the monotone ones: only y, which the RL closure has, is returned.
+        if expected == "sound-only" && rows(&text) != [false; 2] {
+            wrong.push(format!("{query}: a candidate returned: {text}"));
+        }
+    }
+    // SERVICE calls no endpoint here (no federation is set up): its plan says it.
+    let service = "SELECT ?x { ?x a :D SERVICE <http://elsewhere.example/sparql> { ?x :p ?o } }";
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}{service}"));
+    let prepared = store.store().prepare_query(&request).expect("prepared");
+    let planned = store
+        .store()
+        .plan_query(&prepared, &CancellationToken::new())
+        .expect("planned");
+    let status = planned.completeness.map(|s| s.as_str());
+    if status != Some("sound-only") {
+        wrong.push(format!("{service}: planned {status:?}"));
+    }
+    // A denied read is incomplete for its own reason too: the same two outcomes.
+    let thing = dl(false);
+    for (query, expected) in [
+        ("SELECT ?x { ?x a owl:Thing } LIMIT 1", "sound-only"),
+        (
+            "SELECT ?x { ?x a owl:Thing } ORDER BY ?x LIMIT 1",
+            "unsound",
+        ),
+    ] {
+        let status = answer(thing.store(), query).1;
+        if status != [expected; 2] {
+            wrong.push(format!("{query}: {status:?}, expected {expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `owl:sameAs` between two different constant IRIs is the one reserved read that may be
+/// `complete`, on the DL path only: the bounds decide equality between the data's
+/// individuals as they decide their other facts. :x has one :p, so :a = :b is entailed;
+/// nothing makes :a = :x. Off the RL route (an existential outside OWL 2 RL) and on it.
+/// The same read over the rules' closure stays denied.
+#[test]
+fn owl2_dl_decides_same_as_between_two_different_constants() {
+    let data = ":p a owl:ObjectProperty , owl:FunctionalProperty . :x :p :a , :b . \
+                :a a :Dog . :x a :Dog .";
+    let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :q ; \
+                       owl:someValuesFrom :Dog ] .";
+    let mut wrong = Vec::new();
+    for off_the_rl_route in [false, true] {
+        let dl = pipeline();
+        let extra = if off_the_rl_route { existential } else { "" };
+        insert(&dl, &format!("{data} {extra}")).expect("data");
+        for (read, holds) in [
+            ("ASK { :a owl:sameAs :b }", "true"),
+            ("ASK { :a owl:sameAs :x }", "false"),
+        ] {
+            let (text, status) = answer(dl.store(), read);
+            if !text.contains(holds) || status != ["complete"; 2] {
+                wrong.push(format!("off {off_the_rl_route}: {read}: {text} {status:?}"));
+            }
+        }
+    }
+    let closure = closure(data, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let (text, status) = answer(&closure, "ASK { :a owl:sameAs :b }");
+    if !text.contains("true") || status.contains(&"complete") {
+        wrong.push(format!("owl2-rl with the rewriting: {text} {status:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// What the `owl:sameAs` entry leaves denied on the DL path: one term at both ends (eq-ref,
+/// in neither bound: `:x owl:sameAs :x` and `:fresh owl:sameAs :fresh` are entailed, and
+/// the store answers `false`), and a variable end (`:a`'s own pair is missing).
+#[test]
+fn owl2_dl_denies_same_as_of_one_term_or_a_variable() {
+    let dl = pipeline();
+    insert(&dl, ":p a owl:FunctionalProperty . :x :p :a , :b .").expect("data");
+    for read in [
+        "ASK { :x owl:sameAs :x }",
+        "ASK { :fresh owl:sameAs :fresh }",
+    ] {
+        let (text, status) = answer(dl.store(), read);
+        assert!(text.contains("false"), "{read}: {text}");
+        assert!(!status.contains(&"complete"), "{read}: {status:?}");
+    }
+    let (text, status) = answer(dl.store(), "SELECT ?y { :a owl:sameAs ?y }");
+    assert!(text.contains("example.com/b"), "{text}");
+    assert!(!status.contains(&"complete"), "{status:?}");
+}
+
+/// A constant outside the data isn't one of the individuals U1 bounds, and where the
+/// ontology allows one individual only (`owl:Thing ⊑ {:a}`) it is entailed equal to every
+/// other, which neither bound says. So the entry holds only for terms of the data: there
+/// every term is entailed equal to :a, and the store answers `false` for those outside the
+/// data. In data with no such axiom the same reads are `false` and right, but not
+/// `complete` either.
+#[test]
+fn owl2_dl_same_as_of_a_term_outside_the_data_is_never_complete() {
+    let mut wrong = Vec::new();
+    for (data, entailed) in [
+        (":x a :Dog .", false),
+        (
+            "owl:Thing rdfs:subClassOf [ owl:oneOf ( :a ) ] . :a a :Dog . :b a :Dog .",
+            true,
+        ),
+    ] {
+        let dl = pipeline();
+        insert(&dl, data).expect("data");
+        for read in [
+            "ASK { :fresh owl:sameAs :new }",
+            "ASK { :x owl:sameAs :fresh }",
+        ] {
+            let (text, status) = answer(dl.store(), read);
+            if !text.contains("false") || status.contains(&"complete") {
+                wrong.push(format!("{data}: {read}: {text} {status:?}"));
+            }
+        }
+        // Between two terms of the data the bounds decide, the one domain element included.
+        if entailed {
+            let (text, status) = answer(dl.store(), "ASK { :a owl:sameAs :b }");
+            if !(text.contains("true") || !status.contains(&"complete")) {
+                wrong.push(format!("{data}: :a = :b: {text} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
