@@ -23,6 +23,7 @@ use nrese_exec::cell::{BuildCell, Busy, Claim, Kind};
 use nrese_owl::{Axiom, Characteristic, Ontology, Term, Unsupported};
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::classify::Classification;
+use nrese_reasoner::eval::Stop;
 
 use super::source;
 use crate::StoreService;
@@ -78,13 +79,18 @@ pub(super) fn options(store: &StoreService) -> classify::Options {
 }
 
 /// The taxonomy of `snapshot`'s asserted ontology (from the cache if it is current,
-/// or from a current realisation).
-pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonomy> {
+/// or from a current realisation); `None` if `stop` fired while it waited ([`cached`]).
+pub(crate) fn taxonomy(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    stop: Stop<'_>,
+) -> Option<Arc<Taxonomy>> {
     let cache = &store.dl().classification;
     let revision = snapshot.revision();
     cached(
         &cache.taxonomy,
         revision,
+        stop,
         Taxonomy::complete,
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
@@ -109,12 +115,18 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
     )
 }
 
-/// The realisation of `snapshot`'s asserted ontology (from the cache if it is current).
-pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Realisation> {
+/// The realisation of `snapshot`'s asserted ontology (from the cache if it is current);
+/// `None` if `stop` fired while it waited ([`cached`]).
+pub(crate) fn realisation(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    stop: Stop<'_>,
+) -> Option<Arc<Realisation>> {
     let complete = |r: &Realisation| r.incomplete.is_empty() && r.taxonomy.complete();
     cached(
         &store.dl().classification.realisation,
         snapshot.revision(),
+        stop,
         complete,
         || {
             run(
@@ -139,14 +151,16 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
 /// panics, or the request is on a Rayon worker (which must not wait for it), the request
 /// computes its own. Publishing never lets an older in-flight request evict a newer
 /// revision; same-revision races keep the first complete result. No solver runs locked.
+/// `None`: `_stop` fired while the request waited (not yet: it waits to the end).
 fn cached<T>(
     slot: &Slot<T>,
     revision: u64,
+    _stop: Stop<'_>,
     complete: impl Fn(&T) -> bool,
     compute: impl FnOnce() -> T,
-) -> Arc<T> {
+) -> Option<Arc<T>> {
     if let Some(result) = latest(slot, revision) {
-        return result;
+        return Some(result);
     }
     let own = || {
         let result = Arc::new(compute());
@@ -162,11 +176,11 @@ fn cached<T>(
             if complete(&result) {
                 builder.finish(Some(Arc::clone(&result)));
             }
-            result
+            Some(result)
         }
         Claim::Wait(build) => match build.wait() {
-            Ok(Some(result)) => result,
-            Ok(None) | Err(Busy) => own(),
+            Ok(Some(result)) => Some(result),
+            Ok(None) | Err(Busy) => Some(own()),
         },
     }
 }
@@ -522,7 +536,19 @@ pub(crate) fn el_answer(
 mod tests {
     use super::*;
     use crate::{DlConfig, StoreConfig};
+    use nrese_reasoner::eval::NEVER;
     use std::time::Duration;
+
+    // The tests' requests never give up, except the one test about giving up.
+    fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonomy> {
+        super::taxonomy(store, snapshot, NEVER).unwrap()
+    }
+    fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Realisation> {
+        super::realisation(store, snapshot, NEVER).unwrap()
+    }
+    fn cached<T>(s: &Slot<T>, r: u64, c: impl Fn(&T) -> bool, f: impl FnOnce() -> T) -> Arc<T> {
+        super::cached(s, r, NEVER, c, f).unwrap()
+    }
 
     fn store(timeout: Duration) -> StoreService {
         let store = StoreService::new(StoreConfig {
@@ -884,6 +910,72 @@ mod tests {
             assert_eq!(*first.join().unwrap(), (false, 1));
             assert_eq!(*second, (true, 2), "the waiter's own computation");
             assert!(Arc::ptr_eq(&second, &latest(&slot, 7).unwrap()));
+        });
+    }
+
+    /// A request waiting for another's computation that gives up (its policy timeout passed,
+    /// the client has its 408) returns while that computation still runs, with no result and
+    /// no computation of its own; the computation runs on and its result is kept. (Found
+    /// with D16-655: each waiter held a blocking thread until the computation ended, so a
+    /// client retrying after each 408 could fill the pool.) Counted, not timed: the
+    /// computation holds until the waiter has returned, or for 10 s, a guard only.
+    #[test]
+    fn a_waiter_whose_request_gave_up_returns_while_the_computation_runs() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let slot = Slot::<usize>::default();
+        let (calls, over, returned, gave_up) = (
+            AtomicUsize::new(0),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                cached(
+                    &slot,
+                    7,
+                    |_| true,
+                    || {
+                        calls.fetch_add(1, SeqCst);
+                        started.wait();
+                        let until = Instant::now() + Duration::from_secs(10);
+                        while !returned.load(SeqCst) && Instant::now() < until {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        over.store(true, SeqCst);
+                        1
+                    },
+                )
+            });
+            started.wait();
+            let second = s.spawn(|| {
+                let stop = || gave_up.load(SeqCst);
+                let result = super::cached(
+                    &slot,
+                    7,
+                    &stop,
+                    |_| true,
+                    || {
+                        calls.fetch_add(1, SeqCst);
+                        2
+                    },
+                );
+                let over_then = over.load(SeqCst);
+                returned.store(true, SeqCst);
+                (result, over_then)
+            });
+            until_waiting(&slot, 7);
+            gave_up.store(true, SeqCst);
+            let (result, over_then) = second.join().unwrap();
+            assert!(
+                !over_then,
+                "the waiter returned only after the computation ended"
+            );
+            assert!(result.is_none(), "the waiter that gave up got a result");
+            let first = first.join().unwrap();
+            assert_eq!(calls.load(SeqCst), 1, "computations for one revision");
+            assert!(Arc::ptr_eq(&first, &latest(&slot, 7).unwrap()));
         });
     }
 }
