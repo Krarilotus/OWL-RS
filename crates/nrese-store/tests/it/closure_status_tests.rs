@@ -36,19 +36,96 @@ const ORDERED: (&str, &str) = (
     "SELECT ?x { ?x a :Pet } ORDER BY ?x LIMIT 1",
 );
 
-/// rdfs4a (RDF 1.1 Semantics §9.2.1), which `rdfs` and the rulesets on it leave out:
-/// `:rex a rdfs:Resource` is entailed.
+/// rdfs4a (RDF 1.1 Semantics §9.2.1), which `rdfs` and the rulesets on it leave out by
+/// design (docs/spec/reasoning-semantics.md): `:rex a rdfs:Resource` isn't in their regime.
 const RESOURCE: (&str, &str) = (
     ":rex a :Dog .",
     "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x a rdfs:Resource } }",
 );
 
 /// The axiomatic `rdf:_1 a rdf:Property` (RDF 1.1 Semantics §8.1.1), which `rdfs-full`
-/// leaves out.
+/// leaves out by design (the same page): not in its regime either.
 const MEMBER: (&str, &str) = (
     ":rex a :Dog .",
     "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { rdf:_1 a rdf:Property } }",
 );
+
+/// The data of [`UNIVERSAL`]: `:Dog`, `:owns` and `:age` declared; `:Animal` and `:Pet`
+/// used as classes undeclared; `:ann` typed by no class.
+const DATA: &str = ":Dog a owl:Class . :Dog rdfs:subClassOf :Animal . \
+    :owns a owl:ObjectProperty . :age a owl:DatatypeProperty . \
+    :rex a :Dog , :Pet . :ann :owns :rex ; :age 3 .";
+
+/// Statements OWL 2 entails for every term that neither a closure nor the QL rewriting
+/// holds over [`DATA`]: the member, its read (`false` over the closure), and a query
+/// whose NOT EXISTS or MINUS over it keeps the row named last, which the certain answers
+/// lack. eq-ref; a named individual's `owl:Thing`; the top properties; and a class's or
+/// property's statements of itself, `owl:Thing`, the top and the bottom: scm-cls gives a
+/// class's only to declared ones, and none gives a property's to the top or the bottom.
+const UNIVERSAL: [(&str, &str, &str, &str); 10] = [
+    (
+        "eq-ref",
+        "ASK { :rex owl:sameAs :rex }",
+        "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x owl:sameAs ?x } }",
+        "rex",
+    ),
+    (
+        "owl:Thing",
+        "ASK { :ann a owl:Thing }",
+        "SELECT ?x { ?x :owns ?y FILTER NOT EXISTS { ?x a owl:Thing } }",
+        "ann",
+    ),
+    (
+        "owl:topObjectProperty",
+        "ASK { :rex owl:topObjectProperty :ann }",
+        "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x owl:topObjectProperty :ann } }",
+        "rex",
+    ),
+    (
+        "owl:topDataProperty",
+        "ASK { :rex owl:topDataProperty 3 }",
+        "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x owl:topDataProperty 3 } }",
+        "rex",
+    ),
+    (
+        "C subClassOf C",
+        "ASK { :Animal rdfs:subClassOf :Animal }",
+        "SELECT ?c { :Dog rdfs:subClassOf ?c FILTER NOT EXISTS { ?c rdfs:subClassOf ?c } }",
+        "Animal",
+    ),
+    (
+        "C equivalentClass C",
+        "ASK { :Animal owl:equivalentClass :Animal }",
+        "SELECT ?c { :Dog rdfs:subClassOf ?c FILTER NOT EXISTS { ?c owl:equivalentClass ?c } }",
+        "Animal",
+    ),
+    (
+        "C subClassOf owl:Thing",
+        "ASK { :Animal rdfs:subClassOf owl:Thing }",
+        "SELECT ?c { :Dog rdfs:subClassOf ?c MINUS { ?c rdfs:subClassOf owl:Thing } }",
+        "Animal",
+    ),
+    (
+        "owl:Nothing subClassOf C",
+        "ASK { owl:Nothing rdfs:subClassOf :Pet }",
+        "SELECT ?c { :rex a ?c MINUS { owl:Nothing rdfs:subClassOf ?c } }",
+        "Pet",
+    ),
+    (
+        "P subPropertyOf owl:topObjectProperty",
+        "ASK { :owns rdfs:subPropertyOf owl:topObjectProperty }",
+        "SELECT ?p { ?p a owl:ObjectProperty \
+         MINUS { ?p rdfs:subPropertyOf owl:topObjectProperty } }",
+        "owns",
+    ),
+    (
+        "owl:bottomObjectProperty subPropertyOf P",
+        "ASK { owl:bottomObjectProperty rdfs:subPropertyOf :owns }",
+        "SELECT ?p { ?p a owl:ObjectProperty \
+         MINUS { owl:bottomObjectProperty rdfs:subPropertyOf ?p } }",
+        "owns",
+    ),
+];
 
 const RDF: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
@@ -123,21 +200,95 @@ fn owl2_rl_and_owl2_ql_without_the_rewriting_label_it_unsound() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+/// Under `rdfs` and `custom` (rdfs-full, rdfs-plus, owl-horst) the regime is the closure's
+/// own (`nrese_sparql::Regime`): what the rules leave out by design isn't entailed, so a
+/// NOT EXISTS over it removes nothing it should, and the answers stay `sound-only`.
 #[test]
-fn the_rdfs_rulesets_label_it_unsound() {
-    let mut all = Vec::new();
-    for (ruleset, case) in [
+fn the_rdfs_rulesets_stay_sound_only_under_negation() {
+    let mut wrong = Vec::new();
+    for (ruleset, (data, query)) in [
         (Ruleset::Rdfs, RESOURCE),
         (Ruleset::RdfsPlus, RESOURCE),
         (Ruleset::OwlHorst, RESOURCE),
         (Ruleset::RdfsFull, MEMBER),
     ] {
-        let store = |data: &str| closure(data, ruleset, QlRewritingMode::Off);
-        for w in wrong(store, &[case]) {
-            all.push(format!("{}: {w}", ruleset.name()));
+        let (rows, status) = answer(&closure(data, ruleset, QlRewritingMode::Off), query);
+        if !rows.contains("example.com/rex") || status != ["sound-only"; 2] {
+            wrong.push(format!("{}: {query}: {status:?}", ruleset.name()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Each [`UNIVERSAL`] member in a store: its read is `false` and not `complete`, and
+/// the query over it keeps its wrong row and is `unsound`.
+fn universal_wrongs(store: &StoreService) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (member, read, negated, row) in UNIVERSAL {
+        let (answer_, status) = answer(store, read);
+        if !answer_.contains("false") || status.contains(&"complete") {
+            wrong.push(format!("{member}: {read}: {status:?}"));
+        }
+        let (rows, status) = answer(store, negated);
+        if !rows.contains(&format!("example.com/{row}")) || status != ["unsound"; 2] {
+            wrong.push(format!("{member}: {negated}: {status:?}"));
+        }
+    }
+    wrong
+}
+
+/// Where the QL rewriting runs (`owl2-ql` by default, `owl2-rl` with it on), it holds
+/// none of [`UNIVERSAL`] either. Guards (hold on the base too): a read between two
+/// distinct constants, and a negation over what the closure is complete for, stay
+/// `complete`.
+#[test]
+fn the_rewriting_path_doesnt_call_a_universal_statement_complete() {
+    let mut all = Vec::new();
+    for (ruleset, ql) in [
+        (Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        (Ruleset::Owl2Rl, QlRewritingMode::On),
+    ] {
+        let store = closure(DATA, ruleset, ql);
+        for w in universal_wrongs(&store) {
+            all.push(format!("{} {ql:?}: {w}", ruleset.name()));
+        }
+        for guard in [
+            "ASK { :Dog rdfs:subClassOf :Animal }",
+            "SELECT ?x { ?x a :Animal FILTER NOT EXISTS { ?x a :Dog } }",
+        ] {
+            let status = answer(&store, guard).1;
+            if status != ["complete"; 2] {
+                all.push(format!(
+                    "{} {ql:?}: guard {guard}: {status:?}",
+                    ruleset.name()
+                ));
+            }
         }
     }
     assert!(all.is_empty(), "{all:#?}");
+}
+
+#[test]
+fn the_ruleset_path_doesnt_call_a_universal_statement_complete() {
+    let mut all = Vec::new();
+    for (ruleset, ql) in [
+        (Ruleset::Owl2Rl, QlRewritingMode::Auto),
+        (Ruleset::Owl2Ql, QlRewritingMode::Off),
+    ] {
+        for w in universal_wrongs(&closure(DATA, ruleset, ql)) {
+            all.push(format!("{} {ql:?}: {w}", ruleset.name()));
+        }
+    }
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+/// Under `owl2-dl` on the RL route, `x a owl:Thing` is in neither bound.
+#[test]
+fn owl2_dl_doesnt_call_a_universal_statement_complete() {
+    let dl = pipeline();
+    insert(&dl, DATA).expect("data");
+    let wrong = universal_wrongs(dl.store());
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Under `owl2-dl`, a read of the inferred statements alone reads the rules' closure

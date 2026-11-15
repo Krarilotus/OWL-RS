@@ -262,10 +262,19 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
     completeness
 }
 
+/// Why a read of a statement [`universal`] names may miss rows.
+const UNIVERSAL: &str = "OWL 2 entails such statements for every term (of the term itself, \
+                         owl:Thing, the top and the bottom); the closure holds them in part";
+
 /// The hazards that hold of `analysis` whatever path decided its status, composed last
 /// onto it by both entry points ([`plan_status`], [`answer`]): each only lowers what the
 /// status asserts, so no earlier return can claim more than they allow.
 fn certify(completeness: &mut Completeness, analysis: &Analysis) {
+    // Of what [`universal`] names, `x rdf:type owl:Thing` is in neither bound on the RL
+    // route; the rest is unbounded, or [`reflexive_same_as`]'s, which says it itself.
+    if let Some(what) = analysis.universal.filter(|what| *what != "owl:sameAs") {
+        completeness.incomplete("dl", format!("the query reads {what}: {UNIVERSAL}"));
+    }
     if let Some(op) = analysis.not_monotone
         && !completeness.complete
     {
@@ -285,15 +294,24 @@ fn certify(completeness: &mut Completeness, analysis: &Analysis) {
     }
 }
 
-/// [`certify`] for answers over a ruleset's closure without the bounds, which may miss
-/// rows (`completeness` says so): under an operator that can turn a missing row into a
-/// wrong one they are unsound too, from `source`. Its reflexive `owl:sameAs` part says
-/// nothing more of answers that are incomplete already.
+/// [`certify`] for answers over a ruleset's closure without the bounds, with or without
+/// the QL rewriting, under an OWL 2 regime (under `rdfs` and `custom` the regime is the
+/// closure's own: what it lacks isn't entailed). A read of a statement OWL 2 entails for
+/// everything that neither holds ([`universal`]) misses rows; and where rows may be
+/// missing, an operator that can turn a missing row into a wrong one makes the answers
+/// unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
     query: &Query,
     source: &'static str,
 ) {
+    use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
+    if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
+        return;
+    }
+    if let Some(what) = universal(query) {
+        completeness.incomplete(source, format!("the query reads {what}: {UNIVERSAL}"));
+    }
     if let Some(op) = negation(query)
         && !completeness.complete
     {
