@@ -422,6 +422,8 @@ All authentication settings are scope start. Secrets are never printed and are r
 
 ### JWT bearer
 
+Tokens are [JSON Web Tokens](https://www.rfc-editor.org/rfc/rfc7519) signed with a shared HMAC secret.
+
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
 | <a id="auth.bearer_jwt.shared_secret"></a>`auth.bearer_jwt.shared_secret` | `NRESE_AUTH_JWT_SECRET` | text, secret | required | The HMAC secret tokens are signed with |
@@ -445,6 +447,8 @@ A subject list is written in one of two forms.
 - list: `admin_subjects = ["CN=admin-1,O=Example", "CN=admin-2,O=Example"]`
 
 ### OIDC introspection
+
+The server asks the provider about each token through [OAuth 2.0 token introspection](https://www.rfc-editor.org/rfc/rfc7662).
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
