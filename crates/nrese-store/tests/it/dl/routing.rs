@@ -608,7 +608,7 @@ fn owl2_rl_answers_the_punning_and_annotation_reads_from_the_closure() {
         insert(&rl, data).expect("committed under owl2-rl");
         let store = rl.store();
         for read in reads {
-            let request = SparqlQueryRequest::all(format!("{super::PREFIXES}{read}"));
+            let request = SparqlQueryRequest::all(format!("{}{read}", super::PREFIXES));
             let result = store.execute_query(&request).expect("answered");
             let planned = store
                 .plan_query(
