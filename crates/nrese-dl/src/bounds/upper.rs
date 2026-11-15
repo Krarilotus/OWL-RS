@@ -138,6 +138,7 @@ pub fn compile_with(
         top_object,
         top_data,
     };
+    c.program.left_out = ontology.diagnostics.iter().any(|d| d.is_fatal());
     // Datatype definitions only refine data ranges, which `ranges` evaluates; keys are
     // rules here (`axiom`), which the clauses leave to the engines that apply them.
     c.program.incomplete = normalised
