@@ -8,23 +8,23 @@ planned.
 
 ## Choose another system when
 
-- **You need several writers at once.** One commit runs at a time; reads never wait for
+- You need several writers at once. One commit runs at a time; reads never wait for
   it ([storage](spec/02-storage-and-transactions.md#writes)).
-- **You need automatic failover, or data spread over several machines.** Read replicas
+- You need automatic failover, or data spread over several machines. Read replicas
   follow a primary's log; nothing promotes a replica or partitions the data
   ([replication](ops/replication.md)).
-- **You need named graphs as separate reasoning contexts.** Rules read every graph, and
+- You need named graphs as separate reasoning contexts. Rules read every graph, and
   inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)).
-- **You need every OWL 2 DL answer proven complete.** Some answers are `sound-only` and say
+- You need every OWL 2 DL answer proven complete. Some answers are `sound-only` and say
   so; asking for exact answers turns those into an error rather than a guess
   ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
-- **You need SHACL rules (SHACL Advanced Features) or `sh:entailment`.** Neither is
+- You need SHACL rules (SHACL Advanced Features) or `sh:entailment`. Neither is
   supported ([SHACL limits](ops/http-api.md#shacl-validation)).
-- **You need property-graph query languages** (openCypher, Gremlin, GQL). Only SPARQL is
+- You need property-graph query languages (openCypher, Gremlin, GQL). Only SPARQL is
   offered.
-- **You need the store to compute embeddings.** Vector search works on vectors you bring
+- You need the store to compute embeddings. Vector search works on vectors you bring
   ([vector search](ops/http-api.md#sparql)).
-- **You want a released Rust library.** The crates aren't published on crates.io.
+- You want a released Rust library. The crates aren't published on crates.io.
 
 ## SPARQL
 
@@ -67,12 +67,12 @@ planned.
 
 ## Reasoning
 
-- **Materialised, in the default graph.** A statement both asserted and derivable counts as
+- Inferences are materialised, in the default graph. A statement both asserted and derivable counts as
   asserted ([storage](spec/02-storage-and-transactions.md#data-model)).
-- **`rdfs`** is a six-rule subset without axiomatic triples; `rdfs-full` has the RDFS rules
+- `rdfs` is a six-rule subset without axiomatic triples; `rdfs-full` has the RDFS rules
   but `rdfD1`, and the axioms but those about `rdf:_1`, `rdf:_2`, …
   ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset), [modes](spec/reasoning-semantics.md#modes)).
-- **`owl2-rl`** doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
+- `owl2-rl` doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
   return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain or key of more than 250 properties, more than
   64 member sequences) aren't used at all, never truncated, and each is reported in the log
@@ -81,21 +81,21 @@ planned.
   keeping lists within those limits. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
   values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
-- **What an answer promises.** Without the OWL 2 QL rewriting, every answer over a
+- Without the OWL 2 QL rewriting, every answer over a
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
   Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
   budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
   monotone over answers that may be missing gives `unsound`
   ([what an answer promises](what-it-covers.md#what-an-answer-promises)).
-- **User rules** (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
+- User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
-- **Undecided consistency.** Under `owl2-dl`, a commit whose consistency check isn't decided
+- Under `owl2-dl`, a commit whose consistency check isn't decided
   (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
-- **Bulk loads skip the commit gates** ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
+- Bulk loads skip the commit gates ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
   neither SHACL nor the OWL 2 DL consistency check runs. With reasoning on,
   `nrese-server load` recomputes the inferences and fails when the rules' consistency
   checks find a violation (under `owl2-dl`, those of OWL 2 RL); the data stays loaded, and

@@ -63,7 +63,7 @@ pub enum Guard {
     SameList(Term, Term, SharedListIndex),
     /// A rule's guards where it runs over representatives of `owl:sameAs` classes: they
     /// hold where members of the classes of their variables' values, and their constants
-    /// themselves, satisfy all of them together ([`super::representatives::over_classes`]).
+    /// themselves, satisfy all of them together (`super::representatives::over_classes`).
     /// `bound` holds the values grounding gave variables of schema atoms.
     OverClasses {
         guards: Vec<Guard>,

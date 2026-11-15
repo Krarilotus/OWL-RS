@@ -38,7 +38,7 @@ SEMANTICS = {"none", "rdfs", "rdfs-full", "rdfs-plus", "owl-horst", "owl2-ql", "
 # rewritten queries, or its own reasoner or service under that name.
 COMPARATOR_SEMANTICS = {"plain", "closure", "rewritten", "rdfs", "rdfs-plus", "owl-horst", "owl2-rl", "owl2-ql",
                         "custom", "el", "dl", "shacl", "text", "geosparql", "federation", "vector"}
-TOOLS = {"perf_lab", "tableau", "classify-el", "classify-horn"}
+TOOLS = {"perf_lab", "tableau", "classify-el", "classify-horn", "endpoint-classify"}
 OUTCOMES = {"ok", "memory-limit", "gave-up", "timeout", "unsupported", "wrong"}
 LEVELS = {"focused", "full"}
 NEEDS = {"docker", "java", "apptainer"}
@@ -65,7 +65,9 @@ KEYS = {
 # declares fewer (`phases`) where the tool can't resolve one on the baseline (README.md), and then
 # `wall`, the harness's time of the whole process (fast.py PROCESS_WALL), in which it still counts.
 TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
-               "classify-horn": ("read", "owl", "write")}
+               "classify-horn": ("read", "owl", "write"),
+               # The server's answer to GET /dataset/classification (fast.py endpoint_script).
+               "endpoint-classify": ("request",)}
 WHOLE_RUN = "wall"
 REQUIRED = ("name", "area", "what", "semantics", "data", "metric", "cap_gb", "systems")
 

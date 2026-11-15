@@ -17,7 +17,7 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 The examples run against a server started with the defaults (`open-workbench`, no authentication, an empty in-memory store, reasoning off), in this order.
 
 **`/dataset/query`**: queries only.
-- Methods: `GET` with `?query=…`; `POST` with a form (`Content-Type: application/x-www-form-urlencoded`, a `query` field); `POST` with the query as the body (`application/sparql-query`; a body with any other `Content-Type`, or none, is read as the query too, never refused as `415`) and the other parameters in the URL. The query is in the body or the URL, not both, and only once.
+- Methods: `GET` with `?query=…`; `POST` with a form (`Content-Type: application/x-www-form-urlencoded`, a `query` field); `POST` with the query as the body (`application/sparql-query`; a body with any other `Content-Type`, or none, is read as the query too, never refused as `415`; `/dataset/sparql` takes `application/sparql-query` and `application/sparql-update` bodies and refuses a missing or unknown media type with `415`) and the other parameters in the URL. The query is in the body or the URL, not both, and only once.
 - Parameters: `query` (required), the dataset and `infer`, `explain`, `dl-answers` parameters ([below](#query-parameters)); others are ignored.
 - Response: `200` with the results in the format the `Accept` header asks for ([formats](#result-formats); JSON by default) and the `NRESE-Completeness` header.
 - Failures: `400` (syntax error: [example](#example-a-sparql-syntax-error); empty or repeated `query`; a parameter value it doesn't take), `401`/`403`, `406` (no acceptable format), `408` (`budgets.query_timeout`, or an operator cancelled it), `413` (`budgets.query_text`, or the query's memory past `budgets.query_memory`), `422` (`dl-answers=exact` not provable), `429`, `503` (`budgets.total_query_memory` taken; try again).
@@ -43,7 +43,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8080/dataset/update \
 204
 ```
 
-**`/dataset/sparql` and `/dataset`**: queries and updates on one URL.
+`/dataset/sparql` and `/dataset`: queries and updates on one URL.
 - `GET` with `query`: as `/dataset/query`. `GET` without `query`: the service description (Turtle, `200`).
 - `POST`: a form is a query or an update by its field (`query` or `update`; both, or neither, is `400`); a body by its media type (`application/sparql-query` or `application/sparql-update`; any other is `415`).
 - Response and failures: those of the endpoint the request is routed to.
@@ -58,7 +58,9 @@ curl -sS http://localhost:8080/dataset/sparql -H 'Content-Type: application/spar
 
 ### Requests in detail
 
-**Queries** (SPARQL 1.1 Protocol; how to send them: [contracts](#endpoint-contracts)).
+#### Queries
+
+Queries follow the SPARQL 1.1 Protocol; how to send them: [contracts](#endpoint-contracts).
 
 Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
 header `NRESE-Completeness`: `complete; regime=owl2-ql`, or `sound-only; regime=owl2-ql; reasons="ql: …"` when answers
@@ -90,9 +92,9 @@ token they don't know; the console's CLI exits 3 under `--require-complete`.
 | `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, `ql`, `completeness`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`), drawing on the query's memory envelope as its run does |
 | `dl-answers` | Under `reasoner.mode = "owl2-dl"`: which answers this query asks for, over `dl.answers`: `certain-where-complete`, `sound` or `exact` (fails with 422 when the answers can't be proven complete, below). Anything else is a 400 |
 
-**Under `owl2-dl`, every answer carries its status** in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are sound, except inside a transaction whose pending operations may delete statements (below), and where a query with `OPTIONAL`, `MINUS`, `NOT EXISTS` or another operator that isn't monotone has answers that aren't complete: rows may then be wrong as well as missing, and the status is `unsound`. `complete; regime=owl2-dl`, or `sound-only; regime=owl2-dl; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction with nothing pending, answers are as outside it; with operations pending (not reasoned over before the commit) they are `sound-only`, or `unsound` where an operation may delete statements whose inferences remain. A read of the inferred statements alone (`FROM onto:implicit`, or it as `default-graph-uri`) reads the rules' closure without the bounds: `sound-only; regime=owl2-dl`, never `complete`.
+Under `owl2-dl`, every answer carries its status in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are sound, except inside a transaction whose pending operations may delete statements (below), and where a query with `OPTIONAL`, `MINUS`, `NOT EXISTS` or another operator that isn't monotone has answers that aren't complete: rows may then be wrong as well as missing, and the status is `unsound`. `complete; regime=owl2-dl`, or `sound-only; regime=owl2-dl; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction with nothing pending, answers are as outside it; with operations pending (not reasoned over before the commit) they are `sound-only`, or `unsound` where an operation may delete statements whose inferences remain. A read of the inferred statements alone (`FROM onto:implicit`, or it as `default-graph-uri`) reads the rules' closure without the bounds: `sound-only; regime=owl2-dl`, never `complete`.
 
-Exact answers asked for (`dl-answers=exact`, or `dl.answers = "exact"`) that can't be proven complete answer **422** with a problem document: `type` `https://nrese.dev/problems/incomplete-answer`, `title`, `status`, `detail`, `regime`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `unresolved` (the first 20 candidates neither proved nor refuted, as `?x=<…> ?y=<…>`, `ASK` for a boolean query).
+Exact answers asked for (`dl-answers=exact`, or `dl.answers = "exact"`) that can't be proven complete answer 422 with a problem document: `type` `https://nrese.dev/problems/incomplete-answer`, `title`, `status`, `detail`, `regime`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `unresolved` (the first 20 candidates neither proved nor refuted, as `?x=<…> ?y=<…>`, `ASK` for a boolean query).
 
 Under a ruleset's closure where the QL rewriting doesn't apply, answers carry `NRESE-Completeness: sound-only; regime=owl2-rl; reasons="rules: …"` (the ruleset's regime): the closure's, not every certain answer under OWL 2 DL. With reasoning disabled, and for `infer=false`, answers carry `NRESE-Completeness: complete` with no regime: the asserted statements' answers, which no reasoning path can leave out. Every query answer carries the header, so a client can read its absence as "not told" (the console and CLI read it as `not-certified`).
 
@@ -110,7 +112,9 @@ Without dataset parameters and `FROM` clauses, a query reads the default graph, 
 
 A default graph merged from several graphs (`FROM`, `default-graph-uri`, the union default graph, or a restricted user's readable graphs) keeps each blank node's identity across graphs, as Jena, GraphDB and Oxigraph do: a statement that two graphs hold, blank nodes included, counts once, and a blank node that two graphs share is one node of the merge, the same node as in `GRAPH`. This is a deliberate deviation from the RDF merge that SPARQL 1.1 §13.2 asks for, which keeps the blank nodes of different graphs apart.
 
-**Full-text search,** with Blazegraph's vocabulary (what ResearchSpace sends), in any basic graph pattern:
+#### Full-text search
+
+Full-text search uses Blazegraph's vocabulary (what ResearchSpace sends), in any basic graph pattern:
 
 ```sparql
 PREFIX bds: <http://www.bigdata.com/rdf/search#>
@@ -132,7 +136,7 @@ SELECT ?s ?o ?score WHERE {
 
 The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Under `GRAPH ?g` the search runs per named graph of the query's dataset (SPARQL 1.1 §18.6): a row per literal and graph that has it, `?g` bound, at the same relevance; `bds:rank`, `bds:minRank` and `bds:maxRank` count within each graph, so there `bds:maxRank` doesn't shorten the search (every match is read), while `bds:minRelevance` does. Words are runs of letters and digits. The index is built in memory at the first search and extended with new literals at later searches; a durable store writes it to `derived/` of its data directory after each checkpoint and reads it back at the first search after a restart, so it isn't built again. Searches start the pattern's joins.
 
-The same index answers **Jena's `text:query`** (what Fuseki clients send) and **GraphDB's legacy `luc:` predicates**:
+The same index answers Jena's `text:query` (what Fuseki clients send) and GraphDB's legacy `luc:` predicates:
 
 ```sparql
 PREFIX text: <http://jena.apache.org/text#>
@@ -146,7 +150,9 @@ SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 
 `text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals (counted among the objects of the property, if one is given) and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped ([what to do](../limits.md#sparql)). Scores are the relevance above, not Lucene's.
 
-**Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
+#### Vector similarity search
+
+Vector similarity search goes through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
 
 ```sparql
 PREFIX nrv: <urn:nrese:vector:>
@@ -170,9 +176,13 @@ SELECT ?doc ?score WHERE {
 
 The subject is the matched vector literal; only literals the query's dataset uses as objects are found, so a user finds no vector of a graph it may not read. The search returns the `k` nearest vectors that satisfy the patterns joined to it (`?doc ex:embedding ?v` with other conditions on `?doc`). Where those patterns are estimated to bind few rows, they go first and the search is among their values: an exact scan when they are few (under 2% of the vectors of that dimension), the graph with that filter otherwise. Where they bind many, the search goes first, its beam widened by the share of the vectors they are estimated to bind (as for a filter the graph applies itself), and each hit, nearest first, is checked against them through the indexes until `k` pass (100,000 vectors of 384 dimensions: 0.24 ms a query through the graph, recall@10 0.94; 1.3 ms exact). Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; up to 20,000 of a dimension are compared exactly, beyond that through an HNSW graph per metric. The graph is built at the first search that needs it, at once up to 50,000 vectors and on a thread of its own beyond (searches scan exactly until it is there); vectors added later are scanned exactly until they pass a tenth of the graph, which is then extended on a thread. A durable store keeps the vectors and graphs in `derived/` (written after each checkpoint), so a restart doesn't rebuild them. Wrong options are client errors that name the option.
 
-**GeoSPARQL functions** over geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`, and `geo:gmlLiteral` for the simple features: points, lines, polygons, envelopes and their multi-forms), in any expression: the Simple Features, Egenhofer and RCC8 relations (`geof:sfWithin`, `geof:ehCovers`, `geof:rcc8ntpp`, …), `geof:relate` (DE-9IM), `geof:distance`, `geof:area`, `geof:length` (with an OGC unit such as `uom:metre`), `geof:buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference`, `getSRID`, `isEmpty`, `dimension`, `boundary`, `asWKT`, `asGeoJSON`. Constructions answer in their first argument's serialisation (GeoJSON only in CRS84), coordinates rounded to 9 decimal places; `buffer` in metres works on CRS84 too (in a plane about the geometry); an empty literal is the empty geometry. Coordinates are CRS84 (longitude, latitude) unless the literal names another system (GeoJSON is always CRS84; GML names it in `srsName`); EPSG:4326 is read latitude first. In CRS84, metres are geodesic (WGS84), degrees planar. `distance`, `area`, `length` and `buffer` also measure, planar and in metres only, in these projected systems whose axes are in metres (from the EPSG registry): WGS 84 / UTM zones (EPSG:32601–32660, 32701–32760), WGS 84 / Pseudo-Mercator (3857), ETRS89 / UTM zones 28N–38N (25828–25838), ETRS89 / LAEA Europe (3035), RGF93 / Lambert-93 (2154), OSGB36 / British National Grid (27700) and DHDN / Gauss-Krüger zones 2–5 (31466–31469), under any EPSG identifier form (`http://www.opengis.net/def/crs/EPSG/<version>/<code>`, `urn:ogc:def:crs:EPSG:<version>:<code>`, `http://www.opengis.net/gml/srs/epsg.xml#<code>`, GML's `EPSG:<code>`). Another unit there, or a measure in any other system, gives no value (an expression error, as for a unit a measure doesn't know): its coordinates' unit isn't known, so no requested unit can be shown to be its own. A CRS database, with units and conversions for every system, comes in v2.0; until then, convert the coordinates to CRS84 or one of the systems above before loading, and measure those. The other functions work in any system, both geometries in the same one. The relations also work as triple patterns between features and geometries (`?building geo:sfWithin ex:Berlin`, GeoSPARQL's query-rewrite extension): a feature relates through its `geo:hasDefaultGeometry` (else its `geo:hasGeometry`), a geometry through its `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML`; relation statements in the data count as well; an R-tree over the shapes' bounding boxes finds the candidates (built at the first such pattern, kept for the snapshot, and charged to the memory of the query that builds it: a filter whose query has no room for it runs without it, a relation pattern fails with the memory error). Geometries, features and relation statements come from the graph the pattern reads (the dataset's default graph or the `GRAPH`), as the user's access restricts it, so a user gets no relation, candidate or count from a graph it may not read; `GRAPH ?g` relates within each graph. A filter `geof:sfWithin(?wkt, constant)` (any relation but the disjointness ones) over a `geo:asWKT`-style pattern starts the joins from the literals the R-tree finds near the constant, in the same graphs. Not read: GML curves with arcs and 3D solids. Such a literal is no geometry, so every function over it gives no value (an expression error). What to do: store an arc as straight segments (a `LineString`, or a `Polygon`'s ring); for a 3D solid, none known. The GeoSPARQL compliance benchmark runs in CI: 175 of its 212 queries pass, the others are reference answers that contradict the standard (`crates/nrese-sparql/tests/geosparql_compliance/disputed.txt`).
+#### GeoSPARQL functions
 
-**Updates** (how to send them: [contracts](#endpoint-contracts)):
+GeoSPARQL functions work over geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`, and `geo:gmlLiteral` for the simple features: points, lines, polygons, envelopes and their multi-forms), in any expression: the Simple Features, Egenhofer and RCC8 relations (`geof:sfWithin`, `geof:ehCovers`, `geof:rcc8ntpp`, …), `geof:relate` (DE-9IM), `geof:distance`, `geof:area`, `geof:length` (with an OGC unit such as `uom:metre`), `geof:buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference`, `getSRID`, `isEmpty`, `dimension`, `boundary`, `asWKT`, `asGeoJSON`. Constructions answer in their first argument's serialisation (GeoJSON only in CRS84), coordinates rounded to 9 decimal places; `buffer` in metres works on CRS84 too (in a plane about the geometry); an empty literal is the empty geometry. Coordinates are CRS84 (longitude, latitude) unless the literal names another system (GeoJSON is always CRS84; GML names it in `srsName`); EPSG:4326 is read latitude first. In CRS84, metres are geodesic (WGS84), degrees planar. `distance`, `area`, `length` and `buffer` also measure, planar and in metres only, in these projected systems whose axes are in metres (from the EPSG registry): WGS 84 / UTM zones (EPSG:32601–32660, 32701–32760), WGS 84 / Pseudo-Mercator (3857), ETRS89 / UTM zones 28N–38N (25828–25838), ETRS89 / LAEA Europe (3035), RGF93 / Lambert-93 (2154), OSGB36 / British National Grid (27700) and DHDN / Gauss-Krüger zones 2–5 (31466–31469), under any EPSG identifier form (`http://www.opengis.net/def/crs/EPSG/<version>/<code>`, `urn:ogc:def:crs:EPSG:<version>:<code>`, `http://www.opengis.net/gml/srs/epsg.xml#<code>`, GML's `EPSG:<code>`). Another unit there, or a measure in any other system, gives no value (an expression error, as for a unit a measure doesn't know): its coordinates' unit isn't known, so no requested unit can be shown to be its own. A CRS database, with units and conversions for every system, comes in v2.0; until then, convert the coordinates to CRS84 or one of the systems above before loading, and measure those. The other functions work in any system, both geometries in the same one. The relations also work as triple patterns between features and geometries (`?building geo:sfWithin ex:Berlin`, GeoSPARQL's query-rewrite extension): a feature relates through its `geo:hasDefaultGeometry` (else its `geo:hasGeometry`), a geometry through its `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML`; relation statements in the data count as well; an R-tree over the shapes' bounding boxes finds the candidates (built at the first such pattern, kept for the snapshot, and charged to the memory of the query that builds it: a filter whose query has no room for it runs without it, a relation pattern fails with the memory error). Geometries, features and relation statements come from the graph the pattern reads (the dataset's default graph or the `GRAPH`), as the user's access restricts it, so a user gets no relation, candidate or count from a graph it may not read; `GRAPH ?g` relates within each graph. A filter `geof:sfWithin(?wkt, constant)` (any relation but the disjointness ones) over a `geo:asWKT`-style pattern starts the joins from the literals the R-tree finds near the constant, in the same graphs. Not read: GML curves with arcs and 3D solids. Such a literal is no geometry, so every function over it gives no value (an expression error). What to do: store an arc as straight segments (a `LineString`, or a `Polygon`'s ring); for a 3D solid, none known. The GeoSPARQL compliance benchmark runs in CI: 175 of its 212 queries pass, the others are reference answers that contradict the standard (`crates/nrese-sparql/tests/geosparql_compliance/disputed.txt`).
+
+#### Updates
+
+How to send them: [contracts](#endpoint-contracts).
 
 <a id="update-parameters"></a>
 
@@ -182,7 +192,9 @@ The subject is the matched vector literal; only literals the query's dataset use
 
 `CLEAR GRAPH` and `DROP GRAPH` of a graph that holds nothing succeed: the store doesn't record empty graphs, so there is nothing to miss.
 
-<a id="result-formats"></a>**Result formats,** chosen from the `Accept` header by weight (`q`), with wildcards; the first of each list is the default:
+#### Formats
+
+<a id="result-formats"></a>Result formats are chosen from the `Accept` header by weight (`q`), with wildcards; the first of each list is the default:
 
 | Query form | Media types |
 |---|---|
@@ -398,9 +410,9 @@ x-request-id: <id>
 
 (The body is shown formatted; the server sends it on one line, its fields possibly in another order.)
 
-- **What it means:** the server couldn't parse the query. Nothing ran and nothing changed. `detail` gives the place (line 1, column 24 is the `}`) and what the parser expected there: the pattern `?x a` has no object.
-- **What to change:** complete the triple pattern, for example `SELECT ?x WHERE { ?x a ?type }`. Other 400s name their cause in `detail` the same way; `request_id` finds the request in the server's log.
-- **Check the fix:** send the corrected query; it answers `200` (on an empty store `{"head":{"vars":["x"]},"results":{"bindings":[]}}`):
+- It means the server couldn't parse the query. Nothing ran and nothing changed. `detail` gives the place (line 1, column 24 is the `}`) and what the parser expected there: the pattern `?x a` has no object.
+- To fix it, complete the triple pattern, for example `SELECT ?x WHERE { ?x a ?type }`. Other 400s name their cause in `detail` the same way; `request_id` finds the request in the server's log.
+- To check the fix, send the corrected query; it answers `200` (on an empty store `{"head":{"vars":["x"]},"results":{"bindings":[]}}`):
 
   ```bash
   curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8080/dataset/query \
@@ -431,7 +443,7 @@ Under `policy.sparql_parse_error_profile = "plain-text"` the same error is `400`
 
 Monitoring that needs figures or DL diagnostics should authenticate to `/api/v1/repositories/{id}/info` as a whole-dataset reader or administrator. With access enforcement off, the existing unrestricted access view preserves detailed `/info` responses, including for an unconfigured single-user server without credentials. `/readyz` remains status-only.
 
-**Routes of the earlier release** answer as before until the next release, with `Deprecation: @1790985600` (RFC 9745: since 3 October 2026) and `Link: <successor>; rel="successor-version"`:
+Routes of the earlier release answer as before until the next release, with `Deprecation: @1790985600` (RFC 9745: since 3 October 2026) and `Link: <successor>; rel="successor-version"`:
 
 | Earlier | Now |
 |---|---|

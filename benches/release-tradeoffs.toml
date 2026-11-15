@@ -14,8 +14,9 @@
 # without them makes the file an error, and the verdict NOT PASSED.
 #
 # A trade-off covers a loss when its case and dimension match (and its baseline, if `against` names
-# one), the worse end of the loss's interval is at most `max_ratio`, and the paying win shows as
-# `better` against the same baseline in the same report. Dimensions are as the report names them:
+# one), and in every round that showed the loss the worse end of its interval is at most `max_ratio`
+# and the paying win shows as `better` against the same baseline in the same report. A round that
+# showed no loss neither needs nor gives cover. Dimensions are as the report names them:
 # time/<series>, memory/lifetime, memory/phase/<phase>, qps/<clients>, ...
 #
 # [[tradeoff]]
@@ -72,6 +73,35 @@
 # reason = "<the check that costs it, and why it ships>"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
+
+# The DBpedia core store load's memory peak (reopen-dbpedia's setup: 67 M quads loaded into a store on
+# disk), measured apart in the gate's form: a 10 GB scope, anon + kernel every 50 ms, on the gate's host,
+# 14 Nov 2026.
+# - engine-v2 with the arena fix (#335) and the checkpoint release (#330): 5.95 GiB, the median of five
+#   runs; seven later runs of the same code gave 5.80-5.95 (median 5.91). Main: 5.20, and 5.14-5.18 in
+#   the later runs. That is x1.14-1.15.
+# - Load time: 15.4 s against main's 28.0 s, the win the owner traded for. No gated row times this load:
+#   the gate doesn't time a case's setup, and no other case times DBpedia's load. The row that stands in
+#   is the bulk load the gate does time against main, load-entities: 1.98 s against main's 4.01 s (the
+#   medians of every pass of the last release run).
+# - max_ratio 1.20: the row's interval as the gate computes it (t over the block contrasts), over every
+#   round drawn from the runs above. The landed code's runs spread by 1.0 % (sd); main's by 0.3 %, plus
+#   one load in six at 5.76. The gate judges the bound in the rounds that showed the loss. At 1.20, about
+#   1 % of 3-block rounds (2 % of those that show it) and no 6-block round would show it past the bound.
+#   At 1.19, 2 % of 3-block rounds would, and 6-block rounds end within 0.002 of it. The
+#   states before the fixes stay above 1.20 in every round: engine-v2 before both (6.37 GiB, x1.23) and
+#   with the release alone (6.23, x1.21).
+[[tradeoff]]
+case = "reopen-dbpedia"
+dimension = "memory/anon_kernel"
+against = "main"
+max_ratio = 1.20
+approved = "2026-11-14"
+by = "Johannes"
+reason = "the DBpedia core store load peaks about 0.75 GiB above main (5.95 against 5.20 GiB, x1.14) and is 1.8 times as fast; the remainder is resident in the allocator's arenas, not memory freed lazily. The ceiling of 1.20 is the lowest the landed code's measured runs pass reliably as the gate reads them (comment above)"
+quote = "Ok"
+source = "his answer of 14 Nov 2026, 20:26 Berlin, accepting the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
+pays_with = { case = "load-entities", dimension = "time/_" }
 
 # The release baselines' measurement builds can't run these cases yet, though their products
 # can (a static audit of each build against each case's command, 11 Nov 2026). Each pair stays

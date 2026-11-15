@@ -279,7 +279,7 @@ fn uses_any<'a>(
 
 /// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
 /// one of the names OWL 2 DL gives it (`owl:Thing`, `owl:Nothing`, the top and bottom
-/// properties): an entity the reader leaves out ([`leave_out_reserved`]). Callers that
+/// properties): an entity the reader leaves out (`leave_out_reserved`). Callers that
 /// choose input for the reader ask it here, not by a copy of the list.
 pub fn reserved_name(iri: &str) -> bool {
     use crate::vocab::{OWL, RDF, RDFS, XSD};

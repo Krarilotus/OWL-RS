@@ -28,7 +28,7 @@
 //! Memory: a round's derivations, which grow with the rule instances (a complete
 //! transitive relation of n² facts has n³), are charged to the evaluation's working budget
 //! ([`Limits::scratch`]) before they are allocated, and reduced per fact as they come,
-//! exactly ([`found`]); a refusal stops the evaluation ([`Stopped::Refused`]). The rest of
+//! exactly (`found`); a refusal stops the evaluation ([`Stopped::Refused`]). The rest of
 //! its working set (the closure's store, the sets, a round's delta) is not charged before
 //! it is allocated: it reports its size to a [`Watch`] at round boundaries and stops when
 //! the watch refuses (the reading query's envelope), or when the process passes its memory
@@ -117,7 +117,7 @@ pub enum Stopped {
 // (`Run::fired`), so each such read takes the run's own cause, `Run::stopped` (REAS-2 fix
 // check r1, B11: a refusal read as a cancel would lose the store's `Unavailable::Memory`).
 
-/// A budget refusal keeps its cause through a lookup's `?` ([`Lookup::sets_of`]).
+/// A budget refusal keeps its cause through a lookup's `?` (`Lookup::sets_of`).
 impl From<BudgetExceeded> for Stopped {
     fn from(exceeded: BudgetExceeded) -> Self {
         Self::Refused(exceeded)

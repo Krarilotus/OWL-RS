@@ -7,15 +7,15 @@ the last run got.
 
 ## The last run
 
-- **When:** 13 November 2026, 22:57 (CET).
-- **Code:** commit `78b4a49b7becb0df1decc3f858d8ddf7c8166286`, package version 0.1.0.
-- **Server:** built and started as the README's [quick start](../../README.md#quick-start) says (`docker build -t nrese .`, then
+- The run was on 13 November 2026, 22:57 (CET).
+- The code was commit `78b4a49b7becb0df1decc3f858d8ddf7c8166286`, package version 0.1.0.
+- The server was built and started as the README's [quick start](../../README.md#quick-start) says (`docker build -t nrese .`, then
   `docker run` with `NRESE_REASONING_MODE=owl2-rl` and `NRESE_SHACL_GATE=enforce`, a fresh volume)
   on a Linux x86-64 machine.
-- **Runner:** `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml`.
+- The runner was `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml`.
   That run used the file under its earlier name, `readme-first-example.toml`; since then only its
   description has changed, to name where the example now is.
-- **Result:** 9 of 9 steps passed.
+- 9 of 9 steps passed.
 
 ## The steps
 

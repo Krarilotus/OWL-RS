@@ -12,6 +12,8 @@ use crate::runtime_posture::{DeploymentPosture, validate_configuration};
 mod ai_env;
 mod auth_env;
 mod cli;
+#[cfg(test)]
+mod defaults_tests;
 mod env_names;
 mod env_values;
 mod file_config;
@@ -37,7 +39,7 @@ use reasoner_env::parse_reasoner_config;
 use source::{ConfigSource, KeyValueSource, LayeredSource, ProcessEnv};
 use store_env::parse_store_config;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
     pub deployment_posture: DeploymentPosture,
