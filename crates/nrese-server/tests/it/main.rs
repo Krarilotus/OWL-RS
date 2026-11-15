@@ -20,6 +20,7 @@ mod graph_store_api_tests;
 mod http_api_tests;
 mod http_fuzz_tests;
 mod lifecycle_tests;
+mod list_limit_tests;
 mod openapi_tests;
 mod packaging_tests;
 mod policy_api_tests;
