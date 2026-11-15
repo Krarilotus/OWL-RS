@@ -403,36 +403,6 @@ fn a_read_that_can_only_miss_rows_stays_sound_only() {
     }
 }
 
-/// The rewriting's own report (`ql.completeness`) says no more than the answer's status:
-/// a denied read is `complete` in neither, run, planned or explained.
-#[test]
-fn the_rewritings_report_calls_no_denied_read_complete() {
-    let store = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
-    let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :fresh a owl:Thing }}"));
-    let prepared = store.prepare_query(&request).expect("prepared");
-    let cancel = CancellationToken::new();
-    let run = store.execute_query(&request).expect("answered");
-    let planned = store.plan_query(&prepared, &cancel).expect("planned");
-    let explained = store.explain_query(&prepared, &cancel).expect("explained");
-    for (how, status, report) in [
-        ("run", run.completeness, run.ql.map(|q| q.completeness)),
-        (
-            "planned",
-            planned.completeness,
-            planned.ql.map(|q| q.completeness),
-        ),
-        (
-            "explained",
-            explained.completeness,
-            explained.ql.map(|q| q.completeness),
-        ),
-    ] {
-        let report = report.unwrap_or_else(|| panic!("{how}: no report of the rewriting"));
-        assert_eq!(report.as_str(), "sound-only", "{how}: ql.completeness");
-        assert_eq!(status.map(|s| s.as_str()), Some("sound-only"), "{how}");
-    }
-}
-
 /// An `owl2-dl` store whose bounds leave candidates of `?x a :D` unresolved (no branch
 /// point allowed): x and w are `:D`s only through the union, which the RL closure lacks.
 fn unresolved() -> nrese_store::MutationPipeline {
@@ -450,12 +420,14 @@ fn unresolved() -> nrese_store::MutationPipeline {
 }
 
 /// Which operators turn an answer that may miss rows into one that may be wrong, on the
-/// DL path as on the others: LIMIT or OFFSET without ORDER BY, GRAPH, SERVICE and DESCRIBE
-/// are monotone in the data. Adding the statements an incomplete answer lacks can only add
-/// rows or triples; it can't make a returned row wrong. So an answer incomplete for its
-/// own reasons (here candidates the bounds leave unresolved) is `sound-only` under them.
-/// An ordered slice differs: a missing row can push a returned one out, so it is
-/// `unsound`. Changing this list means arguing with these cases.
+/// DL path as on the others. GRAPH, SERVICE and DESCRIBE are monotone in the data: adding
+/// the statements an incomplete answer lacks can only add rows or triples. LIMIT or OFFSET
+/// without ORDER BY isn't: a missing row can change which rows it selects. But every row
+/// it returns is one of the answer's rows, so no returned row is wrong. So an answer
+/// incomplete for its own reasons (here candidates the bounds leave unresolved) is
+/// `sound-only` under all four. An ordered slice differs: a missing row can take a
+/// returned one's place, which is then no row of the certain slice, so it is `unsound`.
+/// Changing this list means arguing with these cases.
 #[test]
 fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
     let store = unresolved();
@@ -478,7 +450,7 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
         if status != [expected; 2] {
             wrong.push(format!("{query}: {status:?}, expected {expected}"));
         }
-        // Sound under the monotone ones: only y, which the RL closure has, is returned.
+        // Sound under the four: only y, which the RL closure has, is returned.
         if expected == "sound-only" && rows(&text) != [false; 2] {
             wrong.push(format!("{query}: a candidate returned: {text}"));
         }
@@ -512,39 +484,143 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// `print-query` prints a query with the status this store gives it under `owl2-rl` with
-/// the rewriting on, its answer's: a denied read (an annotation, the one part of the
-/// reserved vocabulary print prints) isn't `complete` there either, and under NOT EXISTS
-/// it is `unsound` in both. Guard: a read of a user class stays `complete`. What print
-/// can't print carries no status of its own: `owl:Thing` is of the schema vocabulary.
+/// Every place that reports a query's completeness gives the answer's status, never a
+/// value of its own: the answer (the `NRESE-Completeness` header), EXPLAIN that runs it,
+/// the QL rewriting's report in both (`ql.completeness`), a refusal of exact answers (the
+/// 422 problem document), and `print-query`, for the store it prints for (`owl2-rl` with
+/// the rewriting on). The server writes these as the store gives them. A plan (`explain=
+/// plan`, its `ql` too) never claims more than the run, and claims less only where the run
+/// decides, saying so (docs/spec/reasoning-semantics.md, "A plan's status"). One read per
+/// status and reason kind: a plain read, a denied one (an annotation, the one part of the
+/// reserved vocabulary print prints), that under NOT EXISTS, an ordered slice, and the
+/// `owl:sameAs` entry, on and off the RL route.
 #[test]
-fn a_printed_query_carries_the_stores_status() {
+fn every_place_gives_a_query_the_answers_status() {
+    use nrese_sparql::Completeness;
     use nrese_sparql::ql::{PrintForm, Printed};
-    let store = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
-    let print = |query: &str| store.print_query(&format!("{PREFIXES}{query}"), PrintForm::Paths);
-    for (query, expected) in [
-        ("SELECT ?l { :rex rdfs:label ?l }", "sound-only"),
+    // Each read with the answer every store must give, where the rule fixes it: a denied
+    // read is `sound-only` everywhere, and `unsound` under NOT EXISTS. Those must print.
+    let reads = [
+        ("ASK { :rex a :Animal }", None),
+        ("SELECT ?l { :rex rdfs:label ?l }", Some("sound-only")),
         (
             "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x rdfs:label ?l } }",
-            "unsound",
+            Some("unsound"),
         ),
-        ("ASK { :rex a :Animal }", "complete"),
-    ] {
-        let printed = match print(query) {
-            Ok(Printed::Query { completeness, .. }) => completeness.as_str(),
-            other => panic!("{query}: not printed: {other:?}"),
-        };
-        assert_eq!(
-            [printed, answer(&store, query).1[0]],
-            [expected; 2],
-            "{query}"
-        );
+        ("SELECT ?x { ?x a :Animal } ORDER BY ?x LIMIT 1", None),
+        ("ASK { :rex owl:sameAs :ann }", None),
+    ];
+    let printed_for = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let ql = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let rl = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto);
+    let (on, off) = (dl(false), dl(true));
+    let stores = [
+        ("owl2-rl with the rewriting", &printed_for, true),
+        ("owl2-ql", &ql, false),
+        ("owl2-rl", &rl, false),
+        ("owl2-dl on the RL route", on.store(), false),
+        ("owl2-dl off it", off.store(), false),
+    ];
+    fn report(r: &Option<nrese_sparql::ql::QlReport>) -> Option<&nrese_sparql::Completeness> {
+        r.as_ref().map(|r| &r.completeness)
     }
-    let refused = print("ASK { :fresh a owl:Thing }");
-    assert!(
-        matches!(refused, Ok(Printed::NotExpressible(_))),
-        "{refused:?}"
+    let name = |c: Option<&Completeness>| c.map_or("none", |c| c.as_str());
+    // `not-certified` claims nothing, so it is never above.
+    let order = ["not-certified", "unsound", "sound-only", "complete"];
+    let rank = |c: Option<&Completeness>| order.iter().position(|r| *r == name(c));
+    let cancel = CancellationToken::new();
+    let mut wrong = Vec::new();
+    for (store_name, store, prints) in stores {
+        for (query, expected) in reads {
+            let at = format!("{store_name}: {query}");
+            let text = format!("{PREFIXES}{RDF}{query}");
+            let request = SparqlQueryRequest::all(text.clone());
+            let run = store.execute_query(&request).expect("answered");
+            let answer = run.completeness.as_ref();
+            let prepared = store.prepare_query(&request).expect("prepared");
+            let explained = store.explain_query(&prepared, &cancel).expect("explained");
+            let planned = store.plan_query(&prepared, &cancel).expect("planned");
+            // A `ql` report is null where the rewriting doesn't apply.
+            let mut equal = vec![("EXPLAIN", explained.completeness.as_ref())];
+            for (place, r) in [("ql", &run.ql), ("EXPLAIN's ql", &explained.ql)] {
+                equal.extend(report(r).map(|c| (place, Some(c))));
+            }
+            let exact = refusal(store, &request);
+            equal.extend(exact.as_ref().map(|status| ("422", Some(status))));
+            let printed = prints.then(|| store.print_query(&text, PrintForm::Paths));
+            match &printed {
+                Some(Ok(Printed::Query { completeness, .. })) => {
+                    equal.push(("print-query", Some(completeness)));
+                }
+                Some(other) if expected.is_some() => wrong.push(format!("{at}: {other:?}")),
+                _ => {}
+            }
+            for (place, status) in equal {
+                if name(status) != name(answer) {
+                    wrong.push(format!(
+                        "{at}: {place} {}, the answer {}",
+                        name(status),
+                        name(answer)
+                    ));
+                }
+            }
+            let mut plans = vec![("plan", planned.completeness.as_ref())];
+            plans.extend(report(&planned.ql).map(|c| ("plan's ql", Some(c))));
+            for (place, plan) in plans {
+                let decides = plan.is_some_and(|p| {
+                    p.reasons
+                        .iter()
+                        .any(|r| r.text.contains("decided when it runs"))
+                });
+                let (p, a) = (rank(plan), rank(answer));
+                if p > a || (p < a && !decides) {
+                    wrong.push(format!(
+                        "{at}: {place} {}, the answer {}",
+                        name(plan),
+                        name(answer)
+                    ));
+                }
+            }
+            if expected.is_some_and(|e| e != name(answer)) {
+                wrong.push(format!("{at}: the answer {}", name(answer)));
+            }
+        }
+    }
+    // None of those reads is refused yet under exact answers (D16-653): one the bounds
+    // leave undecided is.
+    let undecided = unresolved();
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}SELECT ?x {{ ?x a :D }}"));
+    let answer = undecided.store().execute_query(&request).expect("answered");
+    let refused = refusal(undecided.store(), &request);
+    if refused.as_ref().map(|c| c.as_str()) != answer.completeness.as_ref().map(|c| c.as_str()) {
+        wrong.push(format!(
+            "422 {refused:?}, the answer {:?}",
+            answer.completeness
+        ));
+    }
+    let printed = printed_for.print_query(
+        &format!("{PREFIXES}ASK {{ :fresh a owl:Thing }}"),
+        PrintForm::Paths,
     );
+    // What print can't print carries no status: `owl:Thing` is of the schema vocabulary.
+    if !matches!(printed, Ok(Printed::NotExpressible(_))) {
+        wrong.push(format!("print-query of owl:Thing: {printed:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The status of `request`'s refusal under exact answers (the 422 problem document's),
+/// if it is refused.
+fn refusal(
+    store: &StoreService,
+    request: &SparqlQueryRequest,
+) -> Option<nrese_sparql::Completeness> {
+    let mut exact = request.clone();
+    exact.dl_answers = Some(nrese_store::DlAnswers::Exact);
+    match store.execute_query(&exact) {
+        Err(nrese_store::StoreError::Incomplete(refused)) => Some(refused.status),
+        _ => None,
+    }
 }
 
 /// An existential outside OWL 2 RL: a store with it is off the RL route.
