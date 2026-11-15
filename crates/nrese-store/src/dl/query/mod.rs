@@ -281,14 +281,12 @@ pub(crate) fn certify_closure(
     certify(completeness, query, source, false);
 }
 
-/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan):
-/// [`denied`] composed onto it, so it never says `complete` for a denied read. The denial
-/// only: the operators are the answer status's ([`certify_closure`]).
+/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan), with
+/// the whole composition ([`certify_closure`]) on it: the answer's status is this report
+/// (`StoreService::status_outside_dl`), so the two are one value.
 pub(crate) fn certify_report(completeness: Option<&mut Completeness>, query: &Query) {
-    if let Some(completeness) = completeness
-        && let Some(what) = denied(query, false)
-    {
-        completeness.incomplete("ql", format!("the query reads {what}: {DENIED}"));
+    if let Some(completeness) = completeness {
+        certify_closure(completeness, query, "ql");
     }
 }
 

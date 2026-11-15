@@ -258,11 +258,14 @@ fn schema_vocabulary_and_variable_predicates_are_not_bounded() {
     let (_, status) = query(&dl, "ASK { :x owl:sameAs :y }");
     assert!(status.is_complete(), "{:?}", status.reasons());
     // Reflexive owl:sameAs (OWL 2 Profiles table 4, eq-ref) is in neither bound: ?x = ?y
-    // for every individual is missing, so not complete (RSH-04).
+    // for every individual is missing, so not complete (RSH-04). A variable end is denied.
     let (_, status) = query(&dl, "SELECT ?x { ?x owl:sameAs ?y }");
     assert!(!status.is_complete(), "{:?}", status.reasons());
     assert!(
-        status.reasons()[0].contains("reflexive"),
+        status
+            .reasons()
+            .iter()
+            .any(|r| r.contains("reads <http://www.w3.org/2002/07/owl#sameAs>")),
         "{:?}",
         status.reasons()
     );

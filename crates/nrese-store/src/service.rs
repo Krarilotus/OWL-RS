@@ -1174,19 +1174,17 @@ impl StoreService {
     }
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
-    /// with what neither it nor the closure answers composed onto it
-    /// ([`crate::dl::query::certify_closure`]); else [`Self::status_without_dl`].
+    /// as it left the rewriting with what neither it nor the closure answers composed onto
+    /// it ([`crate::dl::query::certify_report`]); else [`Self::status_without_dl`].
     fn status_outside_dl(
         &self,
         prepared: &PreparedQuery,
         ql: Option<&nrese_sparql::ql::QlReport>,
     ) -> Option<nrese_sparql::Completeness> {
-        let Some(ql) = ql else {
-            return self.status_without_dl(prepared);
-        };
-        let mut status = ql.completeness.clone();
-        crate::dl::query::certify_closure(&mut status, prepared.query(), "ql");
-        Some(status)
+        match ql {
+            Some(ql) => Some(ql.completeness.clone()),
+            None => self.status_without_dl(prepared),
+        }
     }
 
     /// The status of answers that don't go through the DL bounds; known before the query
