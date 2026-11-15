@@ -264,8 +264,10 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
 }
 
 /// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
-/// ([`reads_differently`]): composed last by both DL entry points.
-fn mark(store: &StoreService, completeness: &mut Completeness) {
+/// ([`reads_differently`]): composed last by both DL entry points, by a read of the
+/// inferred statements alone (`StoreService::status_without_dl`) and by a read inside a
+/// transaction with operations pending (`StoreService::run_query_pending_reporting`).
+pub(crate) fn mark(store: &StoreService, completeness: &mut Completeness) {
     let (snapshot, view) = super::bounds::view(store);
     if let Some(reason) = reads_differently(store, &snapshot, &view) {
         completeness.unsound("dl", reason);
