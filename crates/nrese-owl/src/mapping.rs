@@ -89,6 +89,10 @@ pub struct Ontology {
     pub anonymous: BTreeSet<Term>,
     /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
     pub rules: Vec<crate::rules::Rule>,
+    /// The first data property with a maximum written with a data range (`owl:onDataRange`,
+    /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
+    /// an unqualified maximum.
+    pub qualified_data_max: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -367,6 +371,7 @@ struct Reader<'a> {
     /// Properties used with literal objects.
     used_with_literals: HashSet<Term>,
     used_with_nodes: HashSet<Term>,
+    qualified_data_max: Option<Term>,
     class_memo: HashMap<Term, Option<ExprId>>,
     range_memo: HashMap<Term, Option<RangeId>>,
     /// Blank nodes read as operands, and how often.
@@ -441,6 +446,7 @@ impl<'a> Reader<'a> {
             declared: BTreeMap::new(),
             used_with_literals,
             used_with_nodes,
+            qualified_data_max: None,
             class_memo: HashMap::new(),
             range_memo: HashMap::new(),
             uses: HashMap::new(),
@@ -813,6 +819,9 @@ impl<'a> Reader<'a> {
                 if let Some(n) = number(self, qualified) {
                     let filler = self.one(node, v.owl_on_data_range)?;
                     let range = self.range(filler)?;
+                    if qualified == v.owl_max_qualified {
+                        self.qualified_data_max.get_or_insert(property);
+                    }
                     return Some(self.intern_class(make(n?, property, range)));
                 }
             }
@@ -1430,6 +1439,7 @@ impl<'a> Reader<'a> {
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
             rules: Vec::new(),
+            qualified_data_max: self.qualified_data_max,
         };
         complete(&mut ontology, self.terms);
         ontology

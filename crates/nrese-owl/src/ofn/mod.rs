@@ -69,6 +69,7 @@ pub(super) struct Model {
     pub annotations: usize,
     pub uses: HashMap<Term, Uses>,
     pub rules: Vec<crate::rules::Rule>,
+    pub qualified_data_max: Option<Term>,
 }
 
 /// Reads functional-syntax documents into one ontology (a document and its imports).
@@ -125,6 +126,7 @@ impl<'a> FunctionalReader<'a> {
             data: Default::default(),
             anonymous: BTreeSet::new(),
             rules: model.rules,
+            qualified_data_max: model.qualified_data_max,
         };
         crate::mapping::complete(&mut ontology, terms);
         ontology
