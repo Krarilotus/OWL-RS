@@ -177,7 +177,7 @@ TriG, RDF/XML (positive and negative syntax, evaluation compared by isomorphism 
 `nrese-rdf`'s canonicalisation), and JSON-LD 1.1 `toRdf` and `fromRdf`. N3 (a W3C
 Community Group format oxttl reads) is not used here and stays out unless asked for. (14 Nov
 2026: added since; the library reads and writes it, `nrese_rdf_io::n3`:
-[what it covers](../what-it-covers.md#rdf-syntaxes).)
+[features and standards](../what-it-covers.md#rdf-syntaxes).)
 
 **The newest standards: RDF 1.2 and SPARQL 1.2** (the owner's request, 2026-10-01: the
 engine must be usable with, and optimised for, the newest versions). W3C status in October

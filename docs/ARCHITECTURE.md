@@ -2,18 +2,18 @@
 
 This page says which layer owns which concern, which way dependencies may point and, most important for day-to-day work, at which layer a kind of problem is fixed. The specs under `docs/spec/` refine single concerns, and where one contradicts this page, this page wins and the spec is corrected.
 
-Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the version it comes with, not a plan or another version. What NRESE covers today is in [what it covers](what-it-covers.md), and what is planned is in [ROADMAP.md](ROADMAP.md).
+Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the version it comes with, not a plan or another version. What NRESE covers today is in [features and standards](what-it-covers.md), and what is planned is in [ROADMAP.md](ROADMAP.md).
 
 ## 1. Product target
 
-NRESE is an RDF database with reasoning built in. It runs as one server that uses every core of its machine, with every setting it derives from the machine configurable, and read replicas can follow it. The [scope](what-it-covers.md#scope) says what is in, what is left out and what is planned, and these are the parts this page describes.
+NRESE is an RDF database with reasoning built in, run as one server that uses every core of its
+machine. What it does is in [features and standards](what-it-covers.md), and the
+[README's picture](../README.md#how-it-fits-together) shows the crates a write and a query pass
+through. This page is for changing it: who owns what, which way dependencies point, and where a
+problem is fixed.
 
-- Query execution has dictionary-encoded, sorted permutation indexes and merge, hash and worst-case-optimal joins, with parallel bulk loading and full-text, vector and geospatial search.
-- Semantics and data governance cover materialised, incrementally maintained reasoning from RDFS to OWL 2 RL, with the inferred statements kept apart from the asserted ones. They also cover SHACL validation on request and, with its gate on, on commit, as well as transactional writes and access control by graph.
-- Reasoning beyond the materialisable profiles is OWL 2 DL, with consistency, classification, realisation, explanations and query answers that state their completeness. Reasoning is the centre of the project, built on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
-- One engine API with a thin connector surface means that every capability is an operation of the core, and the protocols (SPARQL, Graph Store, RDF4J and the compatibility vocabularies) and the one frontend only translate to it. That frontend is still to come ([ADR-0007](adr/0007-one-engine-api.md)), and the browser console today calls the protocol routes (`/dataset/…`).
-
-Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the benchmark kits in [`benches/`](../benches/README.md) ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
+Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the
+benchmark kits in [`benches/`](../benches/README.md).
 
 ## 2. Layer model
 
@@ -87,7 +87,7 @@ reasoning on the reasoner then recomputes the inferences and runs the rules' con
 | Storage, snapshots, durability | [storage contract](spec/02-storage-and-transactions.md), §4 | `crates/nrese-engine/src/lib.rs`, `crates/nrese-engine/src/durability/mod.rs` |
 | A commit and its gates | [what a commit does](what-it-covers.md#what-a-commit-does), §2.2 | `crates/nrese-store/src/mutation/mod.rs` |
 | SPARQL query and update | [HTTP interface](ops/http-api.md#sparql), §5 | `crates/nrese-sparql/src/lib.rs` |
-| What an answer promises | [what it covers](what-it-covers.md#what-an-answer-promises) | `crates/nrese-sparql/src/completeness.rs` |
+| What an answer promises | [features and standards](what-it-covers.md#what-an-answer-promises) | `crates/nrese-sparql/src/completeness.rs` |
 | Reasoning modes and rules | [reasoning semantics](spec/reasoning-semantics.md) | `crates/nrese-reasoner/src/lib.rs`; when it runs: `crates/nrese-store/src/reasoning.rs` |
 | OWL 2 DL | [design](design/owl2-dl.md) | `crates/nrese-dl/src/lib.rs`, `crates/nrese-owl/src/lib.rs`, `crates/nrese-store/src/dl/mod.rs` |
 | SHACL | [design](design/shacl.md), [HTTP interface](ops/http-api.md#shacl-validation) | `crates/nrese-shacl/src/lib.rs`, `crates/nrese-store/src/shacl.rs` |
@@ -98,7 +98,7 @@ reasoning on the reasoner then recomputes the inferences and runs the rules' con
 | Read replicas | [replication](ops/replication.md) | `crates/nrese-server/src/replication.rs` |
 | Configuration | [configuration reference](ops/config-reference.md) | `crates/nrese-server/src/config.rs` |
 | HTTP endpoints and errors | [HTTP interface](ops/http-api.md) | `crates/nrese-server/src/http/mod.rs` |
-| RDF syntaxes | [what it covers](what-it-covers.md#rdf-syntaxes) | `crates/rdf/nrese-rdf-io/src/lib.rs` |
+| RDF syntaxes | [features and standards](what-it-covers.md#rdf-syntaxes) | `crates/rdf/nrese-rdf-io/src/lib.rs` |
 
 ### 2.4 Dependencies, and using a crate on its own
 

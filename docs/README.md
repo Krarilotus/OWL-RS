@@ -1,23 +1,22 @@
 # NRESE documentation
 
-Find your question below, and the page beside it answers it.
-
 ## Using NRESE
 
-| Question | Document |
+| To | Read |
 |---|---|
-| How do I run it and send a first query? | the [quick start](../README.md#quick-start), then the [tutorial](tutorial.md). To build from source, [getting started](dev/getting-started.md), and the example's test and its last run are in the [record](dev/first-example-record.md) |
-| What can it do, and with which limits? | [what it covers](what-it-covers.md) |
-| What doesn't it do, and when should I choose another system? | [Limits and deviations](limits.md) |
-| What changed since `main`, and what is slower? | [release notes, 1.5 (prerelease)](releases/v1.5.md) |
-| How do I load my own data? | [your own data](tutorial.md#your-own-data), and for large files [bulk loading](ops/server-setup.md#54-bulk-loading) |
-| How do I change a setting, or switch reasoning? | [change a setting](tutorial.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
-| How do I run it as a service? | [server setup](ops/server-setup.md) and its [commands](ops/server-setup.md#commands) |
-| Which endpoints are there? | [the HTTP interface](ops/http-api.md) |
-| What does an error mean, and what do I do? | [status codes](ops/http-api.md#status-codes), [startup errors](ops/server-setup.md#startup-errors) |
-| How do I back up and restore? | [a complete drill](ops/backup-restore-drills.md) |
-| What does reasoning compute, and what does an answer promise? | [reasoning-semantics.md](spec/reasoning-semantics.md) |
-| Which crates can I use on their own? | [ARCHITECTURE.md §2.4](ARCHITECTURE.md#24-dependencies-and-using-a-crate-on-its-own) |
+| Run it and get a first answer | the [quick start](../README.md#quick-start), then the [tutorial](tutorial.md). The example is also a test, with its [last run](dev/first-example-record.md) |
+| See what it does, and which standards it follows | [features and standards](what-it-covers.md) |
+| Know where it stops, and what to do instead | [limits and deviations](limits.md) |
+| Know what reasoning computes and what an answer promises | [reasoning](spec/reasoning-semantics.md) |
+| Load your own data | [your own data](tutorial.md#your-own-data), and for large files [bulk loading](ops/server-setup.md#54-bulk-loading) |
+| Change a setting, or switch reasoning | [change a setting](tutorial.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
+| Call it over HTTP | [the HTTP interface](ops/http-api.md) |
+| Run it as a service | [server setup](ops/server-setup.md) and its [commands](ops/server-setup.md#commands) |
+| Back up and restore | [a complete drill](ops/backup-restore-drills.md) |
+| Understand an error | [status codes](ops/http-api.md#status-codes), [startup errors](ops/server-setup.md#startup-errors) |
+| Build it from source | [getting started](dev/getting-started.md) |
+| Use a crate on its own | [the crates](ARCHITECTURE.md#24-dependencies-and-using-a-crate-on-its-own) |
+| See what changed | [release notes, 1.5 (prerelease)](releases/v1.5.md) |
 
 ## Working on NRESE
 
@@ -35,7 +34,7 @@ list wins, and the lower one is corrected in the same change.
 | How is NRESE fast, which ideas worked and which didn't? | [design/performance.md](design/performance.md), with the wins to keep and their guards (§0), the ideas by layer and the lab log |
 | How does a component work? | [design/](#design) |
 | What does reasoning compute? | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
-| What can it do, and with which limits? | [what it covers](what-it-covers.md) |
+| What can it do, and with which limits? | [features and standards](what-it-covers.md) |
 | How is it run and configured? | [ops/](#operations) |
 | How is it measured? | [benches/README.md](../benches/README.md) (the four levels, hosts), and the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
 | What should research find out next? | [plan/2026-10-05-research-tasks.md](plan/2026-10-05-research-tasks.md) |
@@ -88,3 +87,9 @@ The integrations are [ResearchSpace](integration/researchspace.md) and
 To contribute, there are [CONTRIBUTING.md](../CONTRIBUTING.md), [AGENTS.md](../AGENTS.md) for
 agents and the [code rules](dev/code-structure-guidelines.md), and for the console the
 [frontend contract](dev/frontend-backend-contract.md) and [extending it](dev/frontend-extension-guide.md).
+
+## Thanks
+
+Many of NRESE's ideas come from the research literature and from systems such as QLever,
+Konclude, HermiT and RDFox. Its first prototype was built on Oxigraph. Thanks to their
+authors.
