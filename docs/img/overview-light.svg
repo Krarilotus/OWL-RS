@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 728" width="720" height="728" role="img" aria-labelledby="title desc">
+<!-- The light and dark variants of this drawing differ only in <style>. -->
+<title id="title">How NRESE fits together</title>
+<desc id="desc">Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write goes through one commit: the reasoner infers and checks consistency, SHACL validates when its gate is on, and under owl2-dl the OWL 2 DL engines check it too. If a check fails, the write is refused with the reason. Otherwise storage keeps asserted and inferred statements apart in one new revision, logged to the data directory. A query runs on a snapshot, under owl2-dl the DL engines prove answers, and the answer comes back with a status that says whether rows may be missing.</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1B2330; }
+  .panel { fill: #F4F6F9; }
+  .t { font-size: 18px; font-weight: 600; }
+  .n { font-size: 16px; font-weight: 600; }
+  .d { font-size: 14px; fill: #566173; }
+  .lbl { font-size: 14px; fill: #566173; }
+  .lvl { font-size: 22px; font-weight: 600; fill: #566173; }
+  .band { fill: #E3E7ED; }
+  .boundary { fill: none; stroke: #9AA4B2; stroke-width: 1.2; stroke-dasharray: 6 5; }
+  .box { fill: #FFFFFF; stroke: #9AA4B2; stroke-width: 1.2; }
+  .chip { fill: #FFFFFF; stroke: #9AA4B2; stroke-width: 1; }
+  .client { fill: #1B2330; }
+  .client-t { fill: #FFFFFF; font-size: 16px; font-weight: 600; }
+  .commit { fill: #EEE8F8; stroke: #6440A8; stroke-width: 2; }
+  .commit-chip { fill: #FFFFFF; stroke: #6440A8; stroke-width: 1; }
+  .query { fill: #E3F2F0; stroke: #0B766F; stroke-width: 2; }
+  .query-chip { fill: #FFFFFF; stroke: #0B766F; stroke-width: 1; }
+  .asserted { fill: #E3E7ED; stroke: #9AA4B2; stroke-width: 1; }
+  .inferred { fill: #EEE8F8; stroke: #6440A8; stroke-width: 1; }
+  .w-tell { fill: #6440A8; font-weight: 600; font-size: 15px; }
+  .w-ask { fill: #0B766F; font-weight: 600; font-size: 15px; }
+  .w-refuse { fill: #B42330; font-weight: 600; font-size: 15px; }
+  .a { fill: none; stroke-width: 1.6; }
+  .a-ink { stroke: #566173; }
+  .a-tell { stroke: #6440A8; }
+  .a-ask { stroke: #0B766F; }
+  .a-refuse { stroke: #B42330; stroke-dasharray: 5 4; }
+  .m-ink { fill: #566173; }
+  .m-tell { fill: #6440A8; }
+  .m-ask { fill: #0B766F; }
+  .m-refuse { fill: #B42330; }
+</style>
+<defs><marker id="h-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ink" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-tell" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-tell" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-ask" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ask" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-refuse" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-refuse" d="M0 0 L10 5 L0 10 z"/></marker></defs>
+<rect class="panel" x="0" y="0" width="720" height="728" rx="14"/>
+<rect class="client" x="72" y="24" width="576" height="48" rx="24"/>
+<text x="360" y="54" class="client-t" text-anchor="middle">Your application</text>
+<rect class="boundary" x="24" y="148" width="672" height="464" rx="14"/>
+<text x="676" y="600" class="lbl" text-anchor="end">NRESE server</text>
+<path class="a a-tell" d="M264 72 V186" marker-end="url(#h-tell)"/>
+<text x="276" y="102" class="w-tell">tell</text>
+<text x="276" y="120" class="lbl">SPARQL Update, Graph Store</text>
+<path class="a a-refuse" d="M96 188 V74" marker-end="url(#h-refuse)"/>
+<text x="108" y="102" class="w-refuse">refused</text>
+<text x="108" y="120" class="lbl">with the reason</text>
+<path class="a a-ask" d="M496 72 V186" marker-end="url(#h-ask)"/>
+<path class="a a-ask" d="M520 188 V74" marker-end="url(#h-ask)"/>
+<text x="534" y="102" class="w-ask">ask</text>
+<text x="534" y="120" class="lbl">answer, with its status</text>
+<rect class="commit" x="48" y="188" width="288" height="196" rx="10"/>
+<text x="68" y="216" class="t">Commit</text>
+<text x="68" y="236" class="d">one write, all or nothing</text>
+<rect class="commit-chip" x="68" y="252" width="248" height="54" rx="6"/>
+<text x="84" y="275" class="n">Reasoner</text>
+<text x="84" y="294" class="d">infers, checks consistency</text>
+<rect class="commit-chip" x="68" y="316" width="248" height="54" rx="6"/>
+<text x="84" y="339" class="n">SHACL</text>
+<text x="84" y="358" class="d">validates, when the gate is on</text>
+<rect class="query" x="384" y="188" width="288" height="196" rx="10"/>
+<text x="404" y="216" class="t">Query</text>
+<text x="404" y="236" class="d">on a snapshot, never waits for a write</text>
+<rect class="query-chip" x="404" y="252" width="248" height="54" rx="6"/>
+<text x="420" y="275" class="n">SPARQL</text>
+<text x="420" y="294" class="d">evaluates the query</text>
+<rect class="query-chip" x="404" y="316" width="248" height="54" rx="6"/>
+<text x="420" y="339" class="n">Status</text>
+<text x="420" y="358" class="d">says whether rows may be missing</text>
+<path class="a a-tell" d="M264 384 V422" marker-end="url(#h-tell)"/>
+<path class="a a-ask" d="M456 384 V422" marker-end="url(#h-ask)"/>
+<rect class="box" x="192" y="424" width="336" height="56" rx="8"/>
+<text x="360" y="448" class="n" text-anchor="middle">OWL 2 DL engines</text>
+<text x="360" y="467" class="d" text-anchor="middle">under owl2-dl: check writes, prove answers</text>
+<path class="a a-tell" d="M120 384 V506" marker-end="url(#h-tell)"/>
+<path class="a a-ask" d="M600 508 V386" marker-end="url(#h-ask)"/>
+<rect class="box" x="48" y="508" width="624" height="76" rx="8"/>
+<text x="68" y="538" class="t">Storage</text>
+<text x="68" y="559" class="d">one revision per commit,</text>
+<text x="68" y="575" class="d">a snapshot for each reader</text>
+<rect class="asserted" x="320" y="522" width="160" height="48" rx="6"/>
+<text x="400" y="551" class="n" text-anchor="middle">asserted</text>
+<rect class="inferred" x="492" y="522" width="160" height="48" rx="6"/>
+<text x="572" y="551" class="n" text-anchor="middle">inferred</text>
+<path class="a a-ink" d="M360 584 V642" marker-end="url(#h-ink)"/>
+<text x="372" y="634" class="lbl">on disk</text>
+<path class="box" d="M230 652 a130 10 0 0 1 260 0 v52 a130 10 0 0 1 -260 0 z"/>
+<path class="box" d="M230 652 a130 10 0 0 0 260 0" fill="none"/>
+<text x="360" y="682" class="n" text-anchor="middle">Data directory</text>
+<text x="360" y="700" class="d" text-anchor="middle">write-ahead log, checkpoints</text>
+</svg>

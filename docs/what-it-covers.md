@@ -138,28 +138,12 @@ A write (a SPARQL update, a Graph Store write or the commit of a client transact
 commit, and its operations apply in order, each one seeing the ones before it. Before anything
 becomes visible:
 
-```mermaid
-sequenceDiagram
-  participant C as Client
-  participant S as Store
-  participant R as Reasoner and DL engines
-  participant V as SHACL
-  participant E as Storage engine
-  C->>S: a write
-  S->>S: take the single writer slot and a snapshot, plan the change
-  S->>R: derive the inferred change, check consistency
-  alt the check finds an inconsistency
-    S-->>C: refused, saying why, nothing committed
-  end
-  S->>V: validate what the change can affect (gate on)
-  alt a violation, with the gate set to enforce
-    S-->>C: refused, saying why, nothing committed
-  end
-  S->>E: log asserted and inferred changes, publish one revision
-  S-->>C: done
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/commit-dark.svg">
+  <img src="img/commit-light.svg" width="580" alt="A write is planned under the single writer slot on a snapshot. The reasoner infers and checks consistency, with the DL engines under owl2-dl, and SHACL validates when its gate is on. A failed check or a timeout refuses the write and nothing is committed; otherwise the asserted and inferred changes are logged and published as one revision, seen whole by every query.">
+</picture>
 
-In order:
+The two checks:
 
 1. With reasoning on, the reasoner updates the inferred statements from the change, in the same
    transaction, and checks consistency. Under `owl2-dl` the DL engines check it too, and a check
