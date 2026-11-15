@@ -11,7 +11,7 @@ use super::hazards::Hazard;
 use super::witness::Work;
 use super::{Atom, Cq};
 use crate::mapping::Ontology;
-use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Term};
+use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, ExprId, ObjProp, Term};
 
 /// A role: a property, or an object property's inverse.
 pub type Role = ObjProp;
@@ -171,10 +171,23 @@ impl Tbox {
             });
         }
         // Over RL's closure, an axiom that compares data values: its conclusions may be
-        // missing for any term, named individuals included.
+        // missing for any term, named individuals included. The Tbox reads no assertions, so
+        // it can't see a property's use: a key or a disjointness on a property not declared
+        // an object property counts as one on data values.
         if closure.lists && tbox.hazards.global.is_none() {
-            tbox.hazards.global =
-                super::hazards::reads_data_values(ontology).map(Hazard::DataValues);
+            let undeclared = |p: &&ObjProp| {
+                let declared = Axiom::Declaration(EntityKind::ObjectProperty, p.named());
+                matches!(p, ObjProp::Named(_)) && ontology.axioms.binary_search(&declared).is_err()
+            };
+            let by_use = ontology.axioms.iter().find_map(|axiom| match axiom {
+                Axiom::HasKey(_, ps, _) | Axiom::DisjointObjectProperties(ps) => {
+                    ps.iter().find(undeclared).map(|p| p.named())
+                }
+                _ => None,
+            });
+            tbox.hazards.global = super::hazards::reads_data_values(ontology)
+                .or(by_use)
+                .map(Hazard::DataValues);
         }
         tbox.rewritable = tbox.rewritable_terms();
         tbox

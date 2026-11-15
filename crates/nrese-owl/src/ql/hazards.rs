@@ -61,7 +61,8 @@ pub enum Hazard {
     /// it reports: the axiom it was part of isn't read at all (I24c-2).
     Dropped(Term),
     /// A data property whose values OWL 2 RL's rules would compare or type
-    /// ([`reads_data_values`]): global.
+    /// ([`reads_data_values`]), or a property not declared an object property in a key or
+    /// a disjointness, which may be one: global.
     DataValues(Term),
 }
 
@@ -163,7 +164,7 @@ impl Hazard {
             Self::Equating => "an axiom outside the profile equates individuals".to_owned(),
             Self::Dropped(_) => format!("a schema structure at {t} that can't be read"),
             Self::DataValues(_) => format!(
-                "an axiom compares or types values of {t}, and the rule set leaves out dt-eq \
+                "an axiom may compare or type values of {t}, and the rule set leaves out dt-eq \
                  and dt-type2: one value in two lexical forms isn't matched, nor a value's \
                  datatype read"
             ),
