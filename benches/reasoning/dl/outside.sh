@@ -18,6 +18,8 @@ echo "test $(sha256sum "$BIN")" >> "$OUT/identity.txt"
 export NRESE_DL_OUT="$OUT" NRESE_DL_REFERENCE="exec docker run --rm -i --init \
   --memory ${DL_OUTSIDE_MEMORY:-2g} --label ${DL_OUTSIDE_LABEL:-dl-outside=1} --entrypoint java \
   $TAG -Xmx1500m -cp /opt/dl-runner.jar nrese.dl.Entail 30"
+# First the check against its planted faults: one it misses stops the run.
+"$BIN" --ignored dl::outside::planted_ > "$OUT/planted.log" 2>&1 || { echo "planted fault missed" >&2; exit 5; }
 # 101: the test ran and found failures (summary.tsv, fail-*.ttl); anything else is the harness's.
 "$BIN" --ignored --exact --nocapture dl::outside::dl_answers_agree_with_outside_reasoners \
   > "$OUT/test.log" 2>&1 || rc=$?
@@ -28,6 +30,7 @@ S=$OUT/summary.tsv
 [ ! -f "$S" ] || { awk -F'\t' '{n[$6]++} END {for (k in n) print k, n[k]}' "$S" | sort
   awk -F'\t' '!c[$1]++ {all++} $4 != "write" && $5 !~ /^(reference-undecided|not-judged)$/ && !q[$1]++ {n++}
     END {print "cases", all; print "cases with a query judged", n + 0}' "$S"
+  echo "not judged: an inconsistent state after the first commit that the store accepted"
   awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"
   awk -F'\t' '$5 ~ /^declined/' "$S" > "$OUT/declined.tsv"; } > "$OUT/counts.txt"
 exit "${rc:-0}"
