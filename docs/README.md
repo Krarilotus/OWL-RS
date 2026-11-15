@@ -1,22 +1,7 @@
-# NRESE documentation
+# NRESE: the contributors' map
 
-## Using NRESE
-
-| To | Read |
-|---|---|
-| Run it and get a first answer | the [quick start](../README.md#quick-start), then the [tutorial](tutorial.md). The example is also a test, with its [last run](dev/first-example-record.md) |
-| See what it does, and which standards it follows | [features and standards](what-it-covers.md) |
-| Know where it stops, and what to do instead | [limits and deviations](limits.md) |
-| Know what reasoning computes and what an answer promises | [reasoning](spec/reasoning-semantics.md) |
-| Load your own data | [your own data](tutorial.md#your-own-data), and for large files [bulk loading](ops/server-setup.md#loading-data) |
-| Change a setting, or switch reasoning | [change a setting](tutorial.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
-| Call it over HTTP | [the HTTP interface](ops/http-api.md) |
-| Run it as a service | [running a server](ops/server-setup.md) and its [commands](ops/server-setup.md#commands) |
-| Back up and restore | [backups](ops/backups.md), with a drill to prove they restore |
-| Understand an error | [status codes](ops/http-api.md#status-codes), [startup errors](ops/server-setup.md#startup-errors) |
-| Build it from source | [getting started](dev/getting-started.md) |
-| Use a crate on its own | [the crates](ARCHITECTURE.md#24-dependencies-and-using-a-crate-on-its-own) |
-| See what changed | [release notes, 1.5 (prerelease)](releases/v1.5.md) |
+To use NRESE, start at the README's [documentation table](../README.md#documentation). This page
+maps the rest, for people who work on NRESE.
 
 ## Working on NRESE
 

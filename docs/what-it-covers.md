@@ -1,37 +1,10 @@
 # Features and standards
 
+<a id="scope"></a>
 What NRESE does in the commit these pages come with, by area. Each row links the standard it
 follows, the page with the detail and the tests that back it, and gives its limits beside it.
-What it does on purpose differently from a standard, and what to do instead, is in
-[limits](limits.md).
-
-## Scope
-
-In, by section below:
-
-- [SPARQL](#sparql): SPARQL 1.1 query, update and federation, the SPARQL 1.2 drafts, and
-  full-text, vector and, in part, GeoSPARQL search
-- [RDF syntaxes](#rdf-syntaxes): the W3C RDF syntaxes, JSON-LD 1.1, Notation3 data in the
-  library, canonicalisation and parallel bulk loads
-- [Reasoning](#reasoning): from RDFS to OWL 2 DL, materialised and kept up to date by every
-  commit, and the status every answer carries
-- [SHACL](#shacl): SHACL Core and SHACL-SPARQL, on request and as a commit gate
-- [Storage](#storage-transactions-and-durability): its own storage engine, with atomic commits,
-  durability, client transactions, backups, read replicas and several repositories
-- [Access control and operations](#access-control-and-operations): authentication, graph-level
-  access control, deployment postures, budgets and metrics
-- [Interfaces](#interfaces): the SPARQL, Graph Store, RDF4J and engine HTTP interfaces, the
-  browser console, the server's commands and the console CLI
-
-Not in this version:
-
-- several writers at once, automatic failover, and data split across machines
-- named graphs as separate reasoning contexts, and every OWL 2 DL answer proven complete
-- SHACL Advanced Features (rules) and `sh:entailment`
-- embeddings computed by the store, a released Rust library, and property-graph query languages
-
-Each of these, and every deviation from a standard, is in [limits](limits.md) with what to do
-instead. What is planned, and in which order, is in the [roadmap](ROADMAP.md).
+What it leaves out, and where it departs from a standard with what to do instead, is in
+[limits](limits.md), which starts with [when to choose another system](limits.md#choose-another-system-when).
 
 ## SPARQL
 
@@ -105,8 +78,7 @@ query form and the protocol. `EXPLAIN` shows the same status, and classification
 carry it too ([details](ops/http-api.md#sparql)). Graph and statement downloads (Graph Store,
 RDF4J `/statements`) carry none.
 
-The status is `complete`, `sound-only` (rows may be missing), `unsound` (rows may be missing or
-wrong) or `not-certified` (no assessment). What each promises under each mode is in
+What each status promises under each mode is in
 [the reasoning contract](spec/reasoning-semantics.md#what-complete-refers-to), and the header's
 form, with its regime and reasons, in the [HTTP interface](ops/http-api.md#sparql). Inside a
 transaction whose pending changes delete statements, answers are `unsound`, because those

@@ -1,7 +1,7 @@
 # Limits and deviations
 
 Where NRESE stops, and where it departs from a standard on purpose, in the commit these pages
-come with. Each item says what to do instead, or "none known". What is in is on
+come with. Where there is something to do instead, the item says so. What is in is on
 [features and standards](what-it-covers.md).
 
 ## Choose another system when
@@ -39,25 +39,25 @@ come with. Each item says what to do instead, or "none known". What is in is on
   the answer.
 - GeoSPARQL measures in metres only in CRS84 and a listed set of projected systems, and reads
   no GML arcs or 3D solids: such a measure or literal gives no value. Convert coordinates and
-  approximate arcs before loading. For solids, none known ([GeoSPARQL](ops/http-api.md#sparql)).
+  approximate arcs before loading ([GeoSPARQL](ops/http-api.md#sparql)).
 - Full-text query strings drop Lucene's `OR`, `+`, field names and boosts
   ([full-text search](ops/http-api.md#sparql)). Words without `AND` match as any of them, as
   `OR` would. To require words, join them with `AND` (every word is then needed), and to search
-  one property, name it in `text:query`'s list. For boosts, none known.
+  one property, name it in `text:query`'s list.
 - A named graph without statements doesn't exist. `CREATE GRAPH` stores nothing, and an
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
-  Read that 404 as an empty graph. To keep an empty graph listed, none known.
-- A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
+  Read that 404 as an empty graph.
+- A reader of only some graphs gets no plan steps in `EXPLAIN`.
 - Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
-  None known, so a client that may meet them should read results as RDF 1.2.
+  A client that may meet them should read results as RDF 1.2.
 - The first query that plans with a pattern counts the pattern's distinct values, and waits for the count. Counts
   are reused until the pattern's matches change by a quarter, and a pattern with more than about 4 million matches
-  isn't counted afresh. None known.
+  isn't counted afresh.
 - After a load, the planner's statistics of which predicates occur together (characteristic sets) are built once,
   about 1.5 s at one thread for 10 M statements, kept beside the checkpoint, and rebuilt in the background once
   the data has changed by a quarter. Data with more than 131,072 distinct predicate sets (DBpedia among them) gets
-  none. A build at first use runs inside the planning query and can't be cancelled. None known.
+  none. A build at first use runs inside the planning query and can't be cancelled.
 
 ## RDF syntaxes
 
@@ -125,7 +125,6 @@ leave something out.
 
 - SHACL Core and SHACL-SPARQL. Not supported: SHACL Advanced Features, and `sh:entailment`,
   which is reported as a failure ([HTTP interface](ops/http-api.md#shacl-validation)).
-  None known.
 - The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
@@ -143,23 +142,22 @@ leave something out.
     and other processes draw on the same memory, so leave room beside them.
   - Outside the limits: the full-text index, built by the first text search and kept; operators' working state
     (the keys of `OPTIONAL`, `ORDER BY`, `GROUP BY`, `MINUS` and `NOT EXISTS`, and the like) and a join's output
-    while it is built; the working state of a cyclic count (triangles, four-cycles), which `main`'s limit refused
-    at small limits ([measured](releases/v1.5.md#the-cyclic-counts-against-main)); and what reasoning allocates,
+    while it is built; the working state of a cyclic count (triangles, four-cycles); and what reasoning allocates,
     which is watched rather than charged, so an overshoot is seen within 10 ms. The full list is in the
     [memory contract](architecture/contracts.md#memory).
   - A join may take half the room left when it starts. That is a reading, not a reservation: it is checked every
     1,024 rows, and joins running at once can read the same room.
-  - None known. A design that bounds the rest follows this release.
+  - A design that bounds the rest follows this release.
 - A query can be refused while part of what it reserved is still unused, since reservations are taken ahead. That
-  part has no stated bound in this release. None known.
+  part has no stated bound in this release.
 - Near the memory limit, a cached decoding can cause a refusal while memory the cache could give back is still
-  held. The output is never wrong. None known.
+  held. The output is never wrong.
 - A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
   nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
-  A stop never gives a partial or wrong answer. None known.
+  A stop never gives a partial or wrong answer.
 - Some phases run to their end after a stop: the executor's selection and sorting (seconds at 10 M rows on a term
   key), one call of a regular expression (seconds for adversarial megabyte literals), and the graph kernel's
-  sorts and set-up arrays. None known.
+  sorts and set-up arrays.
 
 ## Storage and transactions
 
@@ -177,13 +175,13 @@ leave something out.
 - A write that fails or is refused can leave its new terms in the dictionary, and the next commit publishes them,
   at most what its own request added ([dictionary continuity](adr/0002-engine-storage-lsm-permutations.md#implementation-notes-2026-09-25-e2e4)). Under
   the global search scope they show in text and IRI search, and under the reader's scope they don't
-  ([`store.search_scope`](ops/config-reference.md#store.search_scope)). None known, and v1.6 removes them.
+  ([`store.search_scope`](ops/config-reference.md#store.search_scope)). v1.6 removes them.
 - A commit keeps every term it added, even one no statement uses (an `INSERT` and a `DELETE` of it in one
-  transaction), and such terms behave like those of deleted statements. None known, and reclaiming them is
+  transaction), and such terms behave like those of deleted statements. Reclaiming them is
   planned for v1.6.
 - Terms of the system's own vocabulary are published when the stored state lacks them: the DL vocabulary, DL's
   fresh individuals, generated rule names and configured rule constants. They come only from fixed names, the
-  configuration and the published ontology, never from a request. None known.
+  configuration and the published ontology, never from a request.
 
 ## Access control
 
@@ -191,6 +189,6 @@ leave something out.
   reachable from other machines ([configuration](ops/config-reference.md#auth-modes)).
 - Endpoints over the whole dataset (classification, SHACL validation, autocomplete) are
   only for readers of every graph
-  ([access control](ops/http-api.md#graph-level-access-control)). None known.
-- A refusal for memory or work can hint at how much data a reader of only some graphs may not see. None known,
-  and v2.0 admits requests by what the reader sees.
+  ([access control](ops/http-api.md#graph-level-access-control)).
+- A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
+  requests by what the reader sees.
