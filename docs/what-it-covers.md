@@ -85,6 +85,9 @@ Beside the modes:
 - With reasoning on, you can ask why a statement holds and get its derivation, or the minimal
   sets of asserted statements it follows from, and under `owl2-dl` the minimal sets of axioms (`/explain`,
   [HTTP interface](ops/http-api.md#engine-api-apiv1)).
+- `nrese-server print-query` writes a query out as plain SPARQL 1.1 that, on a store without
+  reasoning holding the same statements, answers as NRESE does under `owl2-rl` with the QL
+  rewriting, and says when a query can't be written so ([commands](ops/server-setup.md#commands)).
 - The DL engines classify and realise the ontology in any mode
   ([HTTP interface](ops/http-api.md#classification)).
 - The inferences are maintained incrementally, and this is tested against full recomputation on
