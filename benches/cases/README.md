@@ -61,7 +61,7 @@ est_min = 20
 | `data` | `KIND key=value ...` for `perf_lab generate` (seeded, with its own answers in `.expect.json`), `volume:FILE` (the datasets: a full-level case's file is frozen in [../datasets.toml](../datasets.toml)), `ore:ID` (an ORE 2015 ontology), `concat:A+B`, or `none`. Required |
 | `extra`, `data_alt` | more data specs loaded with it; a second file the DL tools check |
 | `queries` | a directory of `.rq` files: `NAME` (benches/fast/queries/NAME), `@FAMILY` (benches/competitors/queries/FAMILY), `lubm` or `owl2bench` (benches/reasoning/queries), or a generated set (`@vectors`, `@parse`, `@cache-log`) |
-| `tool`, `args`, `env`, `setup`, `repeat`, `sweep`, `tool_loads` | how NRESE measures it: `perf_lab` (default), `tableau`, `classify-el`, `classify-horn`; their arguments (`{data}`, `{scratch}` substituted), environment, a one-time setup, fresh-process repetitions, argument sweeps |
+| `tool`, `args`, `env`, `setup`, `repeat`, `sweep`, `tool_loads` | how NRESE measures it: `perf_lab` (default), `tableau`, `classify-el`, `classify-horn`, `endpoint-classify` (a fresh server per process: the data loaded by `PUT /dataset/data?default`, one `GET /dataset/classification` timed, its answer checked against `reference`; marked incomplete or not 200 fails as not answered); their arguments (`{data}`, `{scratch}` substituted), environment, a one-time setup, fresh-process repetitions, argument sweeps |
 | `page_cache` | `["warm"]` (default) or `["warm", "cold"]`: fresh processes alternate, the page cache emptied before each cold one by the host's `cold_cache` command; a host without one runs warm and says so |
 | `timeout_s`, `cap_gb` | the time limit of a DL tool; the memory cap without swap (required) |
 | `metric`, `counters` | the number the case is timed by (a path in the result: `sum_p50_ms`, `reason.p50_ms`, `load_s`, `cold_ms`, `whole_ms`, `clients.p99_ms`, ...); further work counters to compare exactly. `metric` is required |
@@ -69,7 +69,7 @@ est_min = 20
 | `route` | the plan or engine path the case must take: `path = "OP VALUE"` (`==`, `<=`, `>=`, `has`, `lacks`) |
 | `expect` | `{ answers = [SYSTEM, ...] }`: the reference systems the comparators' captured answers are checked against, in order (the first with a complete, stable answer, confirmed by the next; never NRESE: [../suite/suitekit/answers.py](../suite/suitekit/answers.py)); default jena, oxigraph, virtuoso, qlever. Single answers the case checks (`q.NAME.value`, `q.NAME.rows`) are known answers to every system |
 | `reference` | a reference taxonomy file for the classification cases |
-| `phases` | a classifier tool's case (`classify-el`, `classify-horn`): the phases it is compared by; default all the tool prints and `wall`, the process's whole run as the harness times it (below, "What the tool can resolve"). A case that leaves one out declares `wall` too. The others stay in each record and report |
+| `phases` | a classifier tool's case (`classify-el`, `classify-horn`, `endpoint-classify`): the phases it is compared by; default all the tool prints and `wall`, the process's whole run as the harness times it (below, "What the tool can resolve"). A case that leaves one out declares `wall` too. The others stay in each record and report |
 | `absent` | `{ main = "CAPABILITY" }`: a release-gate baseline (`base`, `main`) whose product lacks what the case needs; the gate declares no hypothesis against it and the verdict names it "main has no CAPABILITY" ([../PROTOCOL.md](../PROTOCOL.md) §5). A baseline that has it but whose measurement build can't run it is absent only by Johannes's entry in [../release-tradeoffs.toml](../release-tradeoffs.toml) |
 | `outcome`, `known`, `frontier` | a known product issue: the outcome a run ends as (`memory-limit`, `gave-up`, `timeout`, `unsupported`, `wrong`), what the issue is (required with an outcome), and the settings to run it once more past its limit (`cap_gb`, `timeout_s`) |
 | `systems` | the comparators, `SYSTEM:SEMANTICS`: `plain` (the same SPARQL on the same data), `closure` (NRESE's closure, for stores without reasoning), `rewritten` (NRESE's rewritten queries), or the system's own `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql`, `custom`, `el`, `dl`, `shacl`, `text`, `geosparql`, `federation`, `vector`. A system is a key of [../suite/systems.toml](../suite/systems.toml). `[]`: NRESE only. Required |
@@ -88,6 +88,14 @@ Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
 `q.QUERY.operators`, `sum_p50_ms`, `peak_mib`, `cgroup_peak_mib`; the DL tools': `answer`,
 `whole_ms`, their telemetry's counters (`branch_points`, `clauses`, `nodes_created`, ...),
 `hash`.
+
+A perf-lab case timed by its load (`load_s`) has a second series, `ready` (per sweep entry,
+`ready ENTRY`): the load plus the planner statistics build the load command runs before it
+returns, where the side has one (the perf lab's `statistics_ms`, timed apart); a side without
+such a step is ready when loaded, its `ready` its load. The release gate compares `ready`
+against main only. Against the release base it is not comparable: base's perf lab leaves out
+the build its server runs at load, so the gate declares no hypothesis there and `load_s`
+compares the load proper.
 
 ## Rules every case keeps
 

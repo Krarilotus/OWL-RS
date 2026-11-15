@@ -37,12 +37,12 @@ A suggested graph naming, which the smoke test uses: one graph per module versio
 
 ## What to know
 
-- **Validation on request or on commit.** By default a `PUT` of data that breaks the shapes succeeds, and the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). With `shacl.gate = "enforce"` ([configuration](../ops/config-reference.md)) an export that introduces a violation is refused whole (400, with the validation results), so no export adds a violation (data stored before the gate was on isn't checked by it: [SHACL](../what-it-covers.md#shacl)); `report` logs instead.
-- **SHACL Core and SHACL-SPARQL** (`sh:sparql` constraints and components) are evaluated.
-- **Updates without `GRAPH`** write to, and delete from, the default graph only, also with `store.default_graph = "union"`. The exporter should name the graph in updates.
-- **The shapes graph is an ordinary graph:** a query over all graphs sees the shapes too. Validation leaves it out of the data by itself.
-- **Inferred statements** live in the default graph. `GET /dataset/data?graph=…` returns what was exported, not what was inferred from it; queries see both unless they say `infer=false`.
-- **A consistency rejection** (with `owl2-rl`) is a 400 with an explanation: the violated rule, the statements that clash, and the likely trigger in the export.
+- Validation runs on request or on commit. By default a `PUT` of data that breaks the shapes succeeds, and the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). With `shacl.gate = "enforce"` ([configuration](../ops/config-reference.md)) an export that introduces a violation is refused whole (400, with the validation results), so no export adds a violation (data stored before the gate was on isn't checked by it: [SHACL](../what-it-covers.md#shacl)); `report` logs instead.
+- SHACL Core and SHACL-SPARQL (`sh:sparql` constraints and components) are evaluated.
+- Updates without `GRAPH` write to, and delete from, the default graph only, also with `store.default_graph = "union"`. The exporter should name the graph in updates.
+- The shapes graph is an ordinary graph: a query over all graphs sees the shapes too. Validation leaves it out of the data by itself.
+- Inferred statements live in the default graph. `GET /dataset/data?graph=…` returns what was exported, not what was inferred from it; queries see both unless they say `infer=false`.
+- A consistency rejection (with `owl2-rl`) is a 400 with an explanation: the violated rule, the statements that clash, and the likely trigger in the export.
 
 ## Trying it
 
@@ -59,13 +59,13 @@ Before anything is exported, DMW checks drafts: a model proposal's data, its sch
 
 The protocol, as NRESE implements it:
 
-1. **Capabilities.** `GET /api/v1/draft-check/capabilities` answers `protocol`, `operations`, `profiles`, `semantics`, `build_id` and `max_seconds`. DMW pins them in a run's evidence.
-2. **Check.** `POST /api/v1/draft-check` with:
+1. `GET /api/v1/draft-check/capabilities` answers `protocol`, `operations`, `profiles`, `semantics`, `build_id` and `max_seconds`. DMW pins them in a run's evidence.
+2. A check is a `POST /api/v1/draft-check` with:
    - `protocol` (`dmw-store-check/1`) and `operation` (`shacl`, `query` or `reasoning`)
    - the check's identity, echoed unchanged: `request_sha256`, `scope`, `build_id`, `semantics_id`, `profile`, `input_hashes`
    - `limits`: `max_seconds`, `max_results`, `max_triples`
    - `inputs`: `data`, `schema`, `shapes` (N-Triples) and `query` (SPARQL), as the operation needs them
-3. **Reply.** The identity as asked, `effective_limits` (the limits asked, never silently lowered), and the outcome:
+3. The reply holds the identity as asked, `effective_limits` (the limits asked, never silently lowered), and the outcome:
    - `terminal_status` (`completed`, `failed`, `timeout`, `unsupported`), `complete`, `unsupported` and `detail`
    - SHACL: `shacl_conforms`, `shacl_applicable` (some targeted shape had a focus node and a constraint), `shacl_meta_validated`
    - query: `observed_ask`, or `observed_rows` with terms as `kind` (`uri`, `literal`, `bnode`), `value`, `datatype`, `language`
@@ -73,8 +73,8 @@ The protocol, as NRESE implements it:
 
 What a check means (`nrese:draft-check/2`). SHACL and queries follow DMW's offline checks; reasoning is NRESE's own regime, the OWL 2 RL rules and the OWL 2 DL engines, and may decide more than DMW's offline rules:
 
-- **SHACL:** data and schema together, asserted statements only, SHACL Core. The shapes are checked for well-formedness when they are compiled.
-- **Query:** the data alone, asserted statements only, `ASK` and `SELECT`. More rows than `max_results` is a failure, never a truncated answer.
-- **Reasoning:** inconsistent (`false`) where the OWL 2 RL rules or the OWL 2 DL engines find no model, consistent (`true`) where neither does and both decided, undecided (`null`) otherwise. The OWL 2 DL classification lists unsatisfiable classes, none for an inconsistent input. Whatever either skipped, and an undecided verdict, is listed as unsupported, and the answer is then not complete. (Under `/1`, `logical_consistent` was the RL rules' alone.)
+- SHACL checks data and schema together, asserted statements only, SHACL Core. The shapes are checked for well-formedness when they are compiled.
+- A query reads the data alone, asserted statements only, `ASK` and `SELECT`. More rows than `max_results` is a failure, never a truncated answer.
+- Reasoning answers inconsistent (`false`) where the OWL 2 RL rules or the OWL 2 DL engines find no model, consistent (`true`) where neither does and both decided, undecided (`null`) otherwise. The OWL 2 DL classification lists unsatisfiable classes, none for an inconsistent input. Whatever either skipped, and an undecided verdict, is listed as unsupported, and the answer is then not complete. (Under `/1`, `logical_consistent` was the RL rules' alone.)
 
 The server refuses, in the reply, a request for another build, semantics or profile, a time limit above its own, and inputs that don't match their pinned SHA-256 (`@active_data`, `@active_schema`, `@active_shapes`, `@query`).

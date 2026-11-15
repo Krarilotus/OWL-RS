@@ -257,7 +257,7 @@ impl Program {
     }
 }
 
-/// An id decoded for reports ([`term_text`]); `#id` if the dictionary lacks it.
+/// An id decoded for reports (`term_text`); `#id` if the dictionary lacks it.
 pub fn decoded(term: Option<nrese_rdf::Term>, id: u64) -> String {
     term.map_or_else(|| format!("#{id}"), |term| term_text(&term))
 }

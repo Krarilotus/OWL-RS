@@ -216,7 +216,7 @@ In the order of Motik, Shearer and Horrocks (JAIR 2009)†, with every step reco
 
 **Modules.** ⊥-locality modules (Cuenca Grau et al., JAIR 2008)† are computed per task,
 for example the signature of a class to classify, or of a query's gap. Over them, an atomic
-decomposition (Chainsaw, ReAD) serves as a reusable index of which axioms always travel
+decomposition (Chainsaw, ReAD) is a reusable index of which axioms always travel
 together. MORe's numbers show why: on NCI, 94.9% of the signature was EL and the hard
 module 15.4% of the axioms (author figures, B). The part needing complete DL reasoning can
 be much smaller than the ontology's expressive part.
@@ -397,7 +397,7 @@ struct HotNode {                     // expansion and blocking data only: one ca
 - **Search:**
   - **Semantic branching:** after `C` fails, `¬C` is added.
   - **Dependency-directed backjumping:** on a clash, jump to the latest branch point the clash depends on.
-  - Both have the largest robust historical effects:
+  - Both have the largest historical effects:
     - Tableaux'98 solved problems: 967 with everything, 849 without semantic branching, 880 without backjumping†;
     - modified GALEN: 70 s with everything, over 10,000 s without backjumping†.
 
@@ -888,8 +888,8 @@ program per candidate batch holds a fresh selector per test that implies its ass
 only the selected probe asserts its selector, and the unselected definitions are
 conservative extensions of the premise. Each probe owns fresh search state; temporary
 selector axioms are removed from the operation's scratch ontology afterwards. Test forms
-the batch can't express (where no assumption exists) use the scalar reduction, which also
-serves as the batch's differential oracle. There is no cross-query compiled cache: the
+the batch can't express (where no assumption exists) use the scalar reduction, which is
+also the batch's differential oracle. There is no cross-query compiled cache: the
 batch owns its program.
 
 Candidates run as a batch of the operation's `Workers` width, each with a one-worker

@@ -1189,7 +1189,7 @@ enum At {
 /// The longest run of positions (or copies, or probes) a read counts ahead at once: REAS-2's
 /// bound on the work after a stop is `POLL_UNITS` plus one run, so a run never exceeds
 /// `POLL_UNITS` ([`in_runs`], [`Run::scan_unmarked`], `Equality::run`'s and `list`'s
-/// products).
+/// products). That bound is one read's; under nested reads it is [`Poller`]'s.
 const RUN: usize = nrese_exec::POLL_UNITS as usize;
 
 /// Hands `pairs` to `f` a run of at most [`RUN`] positions at a time, each run counted

@@ -6,7 +6,7 @@ the detail.
 
 ## Scope
 
-**In:** the sections below. Each item there links the specification, document or test that backs
+What is in: the sections below. Each item there links the specification, document or test that backs
 it, with its limits beside it; nothing in them is a plan.
 
 - SPARQL 1.1 query, update and federation; SPARQL 1.2 drafts; full-text, vector and, in part,
@@ -23,7 +23,7 @@ it, with its limits beside it; nothing in them is a plan.
 - The SPARQL, Graph Store, RDF4J and engine HTTP interfaces, the browser console, the server's
   commands, the console CLI: [interfaces](#interfaces)
 
-**Left out**, today; each with what to do instead in [limits](limits.md):
+What is left out today, each with what to do instead in [limits](limits.md):
 
 - Several writers at once; automatic failover; data split across machines:
   [choose another system](limits.md#choose-another-system-when)
@@ -36,7 +36,7 @@ it, with its limits beside it; nothing in them is a plan.
   [SPARQL](limits.md#sparql), [RDF syntaxes](limits.md#rdf-syntaxes),
   [reasoning](limits.md#reasoning), [storage](limits.md#storage-and-transactions)
 
-**Planned**, in order: [roadmap](ROADMAP.md); of it, only the stages it marks done are present.
+What is planned, in order: [roadmap](ROADMAP.md); of it, only the stages it marks done are present.
 
 - The open items before v2 goes to `main`, then benchmarks, the merge into `main`, concise docs
   and a refactoring, v3: [the order](ROADMAP.md#the-order-owner-5-october-2026)
@@ -94,20 +94,20 @@ default, or only the asserted ones with `infer=false`. The contract for every mo
 
 Also:
 
-- **Explanations,** with reasoning on: why a statement holds, as a derivation or as
+- Explanations, with reasoning on: why a statement holds, as a derivation or as
   minimal sets of asserted statements it follows from; under `owl2-dl`, minimal sets of
   axioms (`/explain`, [HTTP interface](ops/http-api.md#engine-api-apiv1)).
-- **Classification and realisation** of the ontology by the DL engines, in any mode
+- Classification and realisation of the ontology by the DL engines, in any mode
   ([HTTP interface](ops/http-api.md#classification)).
-- **Incremental maintenance,** tested against full recomputation on random changes
+- Incremental maintenance, tested against full recomputation on random changes
   ([maintenance](spec/reasoning-semantics.md#maintenance)).
-- **Conformance:** the W3C OWL 2 test cases for RL ([runner](../crates/nrese-store/tests/w3c_owl2_rl)),
+- Conformance, checked by the W3C OWL 2 test cases for RL ([runner](../crates/nrese-store/tests/w3c_owl2_rl)),
   QL ([runner](../crates/nrese-store/tests/w3c_owl2_ql), 9 failures listed with reasons) and DL
   ([runner](../crates/nrese-dl/tests/tableau_w3c), the undecided and disputed cases listed).
-- **Upgrades:** stored inferences carry a fingerprint of the rules that made them; a build
+- On an upgrade, stored inferences carry a fingerprint of the rules that made them; a build
   that changes what a ruleset derives recomputes them once at start
   ([freshness](spec/reasoning-semantics.md#freshness)).
-- **Limit:** rules read every graph, and inferences go to the default graph. A named graph
+- One limit is that rules read every graph, and inferences go to the default graph. A named graph
   isn't a reasoning boundary yet ([graph scope](spec/reasoning-semantics.md#graph-scope)).
 
 ### What an answer promises

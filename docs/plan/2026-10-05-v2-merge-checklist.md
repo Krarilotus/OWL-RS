@@ -2,7 +2,7 @@
 
 The owner's order: finish the current goals, benchmark them, merge to `main`, then make the
 docs and README concise and refactor before v3; the new goals (STATUS G8–G13) wait. This is
-the list to check before the merge. Items marked **check** are measurements that decide
+the list to check before the merge. Items marked "check" are measurements that decide
 whether something is built now or in v3; a number from a paper is a hypothesis until it is
 measured here (benches/PROTOCOL.md, interleaved, confidence intervals).
 
@@ -56,7 +56,7 @@ ranking of 5 October).
 
 Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rules.
 
-**Targets** (to test, not promises):
+The targets, to test, not promises:
 
 | Target | Bar |
 |---|---|
@@ -74,11 +74,11 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 - [ ] DL: the reference comparison re-run on equal resources (the 3 October references ran
       in 2-CPU containers), all outliers against Konclude and HermiT in one run once the
       classification fixes are merged.
-- [ ] **Concurrent load** (measured for no system yet): clients 1 to 64 with `query-mix` on Sparqloscope (DBLP) and BSBM explore, writes under read load; throughput against p99, peak memory per concurrent client, throughput per GB. QLever with `--num-simultaneous-queries` 1 (defaults) and = cores (best configuration).
-- [ ] **QLever's published bars** for the basics: Sparqloscope on DBLP (502 M) and Wikidata truthy (7.9 B; QLever 2.43 s geometric mean, 2.0 % failed), SPARQL with text, export of large results, loading and serving dblp then Wikidata truthy. Later goals take theirs: autocompletion and maps (G11/G12), GeoSPARQL spatial joins on OSM, natural language to SPARQL (GRASP/GRISP), vector search (QUIVER).
-- [ ] A **defaults track** beside the best-configuration track: every system, NRESE included,
+- [ ] Concurrent load (measured for no system yet): clients 1 to 64 with `query-mix` on Sparqloscope (DBLP) and BSBM explore, writes under read load; throughput against p99, peak memory per concurrent client, throughput per GB. QLever with `--num-simultaneous-queries` 1 (defaults) and = cores (best configuration).
+- [ ] QLever's published bars for the basics: Sparqloscope on DBLP (502 M) and Wikidata truthy (7.9 B; QLever 2.43 s geometric mean, 2.0 % failed), SPARQL with text, export of large results, loading and serving dblp then Wikidata truthy. Later goals take theirs: autocompletion and maps (G11/G12), GeoSPARQL spatial joins on OSM, natural language to SPARQL (GRASP/GRISP), vector search (QUIVER).
+- [ ] A defaults track beside the best-configuration track: every system, NRESE included,
       on its out-of-the-box settings. "No tuning needed" is a claim only with this track.
-- [ ] **Home turf:** each competitor measured on what it is best at, not only on our
+- [ ] Home turf: each competitor measured on what it is best at, not only on our
       workloads. For example: QLever on full Wikidata or UniProt queries and text search;
       Virtuoso on many parallel clients (BSBM explore, multi-client); Oxigraph embedded and
       small stores; Jena on TDB2 loads and its rule engine; GLog/VLog and RDFox on
@@ -93,12 +93,12 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 - [ ] The benchmark: no regression against the last recorded run beyond the confidence
       interval on any workload.
 - [ ] Docs agree with the code (STATUS, the coverage plan, the configuration reference).
-- [x] **Upgrade path:** a store written by `main` opens on v2, or a documented and tested migration exists (checkpoint format; a `SEMANTICS_VERSION` change rebuilds the inferred stack). Done 6 October: no migration needed. A data directory written by `main`'s server (d9a4b24; `crates/nrese-server/tests/fixtures/main-store`, with its `make.sh`) opens on v2's binary with the same data, answers, settings and logins; the stacks whose rules changed (`owl2-ql`, `owl-horst`) rebuild at start, the others are kept; main's image backup restores (`upgrade_tests.rs`). Two incompatibilities found and fixed: repositories with ids main accepted but v2 refuses were skipped at start, and a repository named `.trash-*` was deleted at start (data loss). The one answer that changes is the QL rewriting's under `owl2-ql`, on purpose. Rolling back to `main` works too. How to upgrade: docs/ops/server-setup.md §13.1.
-- [ ] **Soak and fuzz clean,** each run recorded (`benches/probes/soak.py`, `scripts/fuzz-campaign.sh`).
-- [ ] **Safety of the new reasoning paths:** (the QL rewriting's part done, 7 October, `ql/safety`: every rewriting path ends in a status at a budget, one work budget per query, the data check's and the printer's bounds; restricted readers get neither the data check nor another graph's schema under a negation; each shown by a test that fails without it, docs/design/ql-rewriting.md §1 and §5) every DL and rewriting path has a budget; access control applies to inferred and rewritten answers (no derivation from graphs the user can't read); read replicas give the same DL answers and completeness status as the primary.
-- [ ] **DL scope:** every W3C OWL 2 DL case decided, or documented as over budget with its cause. No deadlines (owner, 6 October): progress as fast as possible without compromising quality.
+- [x] Upgrade path: a store written by `main` opens on v2, or a documented and tested migration exists (checkpoint format; a `SEMANTICS_VERSION` change rebuilds the inferred stack). Done 6 October: no migration needed. A data directory written by `main`'s server (d9a4b24; `crates/nrese-server/tests/fixtures/main-store`, with its `make.sh`) opens on v2's binary with the same data, answers, settings and logins; the stacks whose rules changed (`owl2-ql`, `owl-horst`) rebuild at start, the others are kept; main's image backup restores (`upgrade_tests.rs`). Two incompatibilities found and fixed: repositories with ids main accepted but v2 refuses were skipped at start, and a repository named `.trash-*` was deleted at start (data loss). The one answer that changes is the QL rewriting's under `owl2-ql`, on purpose. Rolling back to `main` works too. How to upgrade: docs/ops/server-setup.md §13.1.
+- [ ] Soak and fuzz clean, each run recorded (`benches/probes/soak.py`, `scripts/fuzz-campaign.sh`).
+- [ ] Safety of the new reasoning paths: (the QL rewriting's part done, 7 October, `ql/safety`: every rewriting path ends in a status at a budget, one work budget per query, the data check's and the printer's bounds; restricted readers get neither the data check nor another graph's schema under a negation; each shown by a test that fails without it, docs/design/ql-rewriting.md §1 and §5) every DL and rewriting path has a budget; access control applies to inferred and rewritten answers (no derivation from graphs the user can't read); read replicas give the same DL answers and completeness status as the primary.
+- [ ] DL scope: every W3C OWL 2 DL case decided, or documented as over budget with its cause. No deadlines (owner, 6 October): progress as fast as possible without compromising quality.
 
-**Timing:** the paper needs v2's Draco runs; that informs priorities, not the quality bar.
+As for timing, the paper needs v2's Draco runs; that informs priorities, not the quality bar.
 
 After the merge: the concise README and docs, the major refactoring (Miri over the unsafe
 code, measured test coverage, duplicate dependency versions, the last typed error, the R1

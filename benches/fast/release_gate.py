@@ -43,7 +43,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry  # noqa: E402
-from suitekit import driver, gatestats  # noqa: E402
+from suitekit import driver, gatestats, manifest  # noqa: E402
 from suitekit.compare import counter_changes  # noqa: E402
 from suitekit import hosts as hosts_registry  # noqa: E402
 from suitekit.hosts import run_identity  # noqa: E402
@@ -416,6 +416,7 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     the case's A-A' noise floor on this host, per dimension (read_floor()). `not_compared`: each
     dimension deliberately not tested, with its reason (one this baseline doesn't support, or one
     whose loss of evidence blocks); gate() holds every other untested hypothesis an error."""
+    import fast
     floor = floor or {}
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}, "not_compared": {}}
     base_state = state(base, off_route_ok=True)
@@ -461,6 +462,10 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     series = sorted({s for rep in cand[key] + base[key] for s in rep})
     for s in series:
         if s in excluded:
+            continue
+        if why := fast.ready_not_compared(f"time/{s}", side):
+            row["notes"].append(f"time/{s}: {why}")
+            row["not_compared"][f"time/{s}"] = why
             continue
         on_cand = all(s in rep for rep in cand[key])
         on_base = all(s in rep for rep in base[key])
@@ -687,7 +692,8 @@ def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] 
         # --count-allocations alone counts calls and bytes, as the baselines' perf labs do.
         if "--count-live" in case.get("args", []):
             dims.append("memory/live")
-        out += [hypothesis(side, name, d) for side in baselines if side not in case.get("absent", {}) for d in dims]
+        out += [hypothesis(side, name, d) for side in baselines if side not in case.get("absent", {}) for d in dims
+                if not fast.ready_not_compared(d, side)]
     return out
 
 
@@ -1040,6 +1046,18 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     if not planned:
         summary["errors"].append(f"nothing timed: {len(passes)} passes, none planned a case")
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    # Sides that ran one build compare nothing (D16-593): a round of a build against itself reads "no
+    # loss". Sides of one revision are declared identical (an A-A' control; a confirmation's main that
+    # is its base); any other two must differ, layout by layout. Per build, not per case: a case one
+    # side doesn't run changes no side's binaries.
+    for layout in sorted({(p["report"].get("binaries") or {}).get("layout", 1) for p in passes}):
+        hashes: dict[str, dict | None] = {}
+        for p in passes:
+            built = p["report"].get("binaries") or {}
+            if built.get("layout", 1) == layout:
+                hashes.setdefault(p["side"], built.get("sha256"))
+        identical = {frozenset((s, t)) for s in hashes for t in hashes if s != t and sides.get(s) == sides.get(t)}
+        summary["errors"] += [f"layout {layout}: {e}" if layout > 1 else e for e in manifest.one_binary(hashes, identical)]
     summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
@@ -1630,7 +1648,7 @@ MAX_RUNS, MAX_REPEAT = 2000, 30
 PROCESS_S = 15.0       # a case's fresh processes a pass, at most this long together ...
 MAX_PROCESSES = 5      # ... and at most this many (a process that started differently, outvoted)
 PROCESS_BLOCKS = 15    # only where this many blocks alone don't reach the target
-PROCESS_TOOLS = ("perf_lab", "tableau", "classify-el", "classify-horn")
+PROCESS_TOOLS = ("perf_lab", "tableau", "classify-el", "classify-horn", "endpoint-classify")
 KEPT = ("runs", "warmup", "batch", "batch_queries", "repeat", "processes")
 BATCH_SAMPLE_MS = 0.05  # a batched sample lasts at least this (50 µs: the timer's steps far below)
 BATCH_BELOW_MS = 0.25   # queries batched: those whose 2 % loss is below the 5 µs resolution
@@ -2992,12 +3010,15 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
     for h in d["losses"]:
         side, case, dim = h.split("|")
         ps = d["rounds"].get(h, [])
-        # The approval must cover the loss in every round that shows it (its worse end within the bound,
-        # its win shown there): one round within the bound never waives another beyond it.
+        # The approval must cover the loss in every round that showed it, confirmations beyond the
+        # third included (the round's own status: its worse end within the bound, its win shown
+        # there): one round within the bound never waives another beyond it. A round that showed no
+        # loss neither needs nor gives cover: its interval, too broad to show the loss, says nothing
+        # of its size (a 3-block round's is t(2) = 4.30 errors wide). A confirmed loss always has two
+        # rounds that showed it (combine_rounds: two p at most ALPHA * PAIR_WEIGHTS[0]); none, none covers it.
         covers = [accepted(policy.tradeoffs, side, case, dim, r, report.get("comparisons", {}))
                   for rounds in parts for report in rounds
-                  if (r := report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dim))
-                  is not None]
+                  if (r := dimension_in(report, side, case, dim)) is not None and r.get("status") == "loss shown"]
         accepted_ = covers[0] if covers and all(covers) else None
         text = f"{case} against {side}: {dim}: p per round {ps}, combined {d['combined'][h]:.3g}"
         if accepted_:
