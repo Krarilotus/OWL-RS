@@ -301,9 +301,9 @@ pub(crate) fn el_outside() -> nrese_sparql::Outside {
              rules, Baader, Brandt and Lutz 2005, Lemma 3). These rules need no regular role \
              hierarchy.",
         not_guaranteed: "That other OWL 2 DL reasoners give this answer: the input breaks \
-             OWL 2 DL's global restrictions, and they refuse it. Completeness where the input \
-             states an object-property range. The OWL 2 RDF-Based Semantics. Realisation, \
-             which still answers only the DL engines' lower bound.",
+             OWL 2 DL's global restrictions; reasoners that check them refuse it. Completeness \
+             where the input states an object-property range. The OWL 2 RDF-Based Semantics. \
+             Realisation, which still answers only the DL engines' lower bound.",
     }
 }
 
