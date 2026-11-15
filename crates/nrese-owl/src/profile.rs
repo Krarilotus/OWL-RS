@@ -783,6 +783,9 @@ pub struct Signature {
     pub objects: HashSet<Term>,
     pub data: HashSet<Term>,
     pub annotations: HashSet<Term>,
+    /// The data properties declared so: the others are data properties only while they
+    /// have a literal (`mapping.rs`, `is_data_property`).
+    pub declared_data: HashSet<Term>,
 }
 
 /// [`Signature`] of `o`. O(axioms + class expressions).
@@ -800,9 +803,11 @@ pub fn signature(o: &Ontology) -> Signature {
             Axiom::Declaration(ObjectProperty, t) | Axiom::ObjectPropertyAssertion(t, ..) => {
                 s.objects.insert(*t)
             }
-            Axiom::Declaration(DataProperty, t) | Axiom::DataPropertyAssertion(t, ..) => {
+            Axiom::Declaration(DataProperty, t) => {
+                s.declared_data.insert(*t);
                 s.data.insert(*t)
             }
+            Axiom::DataPropertyAssertion(t, ..) => s.data.insert(*t),
             Axiom::Declaration(AnnotationProperty, t) => s.annotations.insert(*t),
             _ => false,
         };

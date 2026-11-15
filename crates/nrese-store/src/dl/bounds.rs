@@ -212,8 +212,10 @@ impl Kinds {
     /// annotation property's statement gives none; any other leaves the schema as it is,
     /// names no class or property as subject or IRI object, and its predicate is
     /// `rdf:type` with a known class, `owl:sameAs`, or a property known only as the kind
-    /// its object needs (a literal a data property, an IRI an object property).
-    fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple) -> bool {
+    /// its object needs (a literal a data property, an IRI an object property). A deleted
+    /// literal needs a declared data property: one that is data only by its literals may
+    /// lose the last one, and its other axioms then read it as an object property.
+    fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
         if k.annotations.contains(&p) {
             return true;
@@ -225,7 +227,9 @@ impl Kinds {
         if Some(p) == self.rdf_type {
             k.classes.contains(&o)
         } else if !iri {
-            k.data.contains(&p) && !k.objects.contains(&p)
+            k.data.contains(&p)
+                && !k.objects.contains(&p)
+                && (!deleted || k.declared_data.contains(&p))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
             !k.names.contains(&o) && (Some(p) == self.same_as || property)
@@ -389,7 +393,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     // On the RL route, a commit that gives no term a new kind leaves what the reader reads,
     // and so the route, as they were; any other is read again below.
     if let Some((Some(kinds), _)) = &current
-        && asserted().all(|t| kinds.keep(tx, t))
+        && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
+        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
     {
         return Preparation {
             base,
