@@ -129,6 +129,9 @@ fn realise(dl: &MutationPipeline) {
     assert!(report.complete(), "{:?}", report.incomplete);
 }
 
+/// A DL operation by name.
+type Operation = (&'static str, fn(&MutationPipeline));
+
 /// A pool worker held on other work, a job that waits on a channel, until it is freed: by
 /// the test, by its watchdog, or when the last handle goes (the sender dropped ends the
 /// wait), so a failing test never leaves it held.
@@ -176,8 +179,7 @@ fn a_dl_operation_offers_the_unused_memory_of_its_caller_and_every_pool_thread_b
     let _serial = serial();
     let dl = ontology();
     let pool = pool();
-    let operations: [(&str, fn(&MutationPipeline)); 2] =
-        [("classification", classify), ("realisation", realise)];
+    let operations: [Operation; 2] = [("classification", classify), ("realisation", realise)];
     for (name, operation) in operations {
         releases();
         operation(&dl);
