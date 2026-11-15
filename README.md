@@ -1,31 +1,35 @@
 # NRESE
 
 NRESE is an [RDF](https://www.w3.org/TR/rdf11-primer/) database with
-[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust, that runs as one
-server with SPARQL endpoints. It is built for applications that need to know what an answer
-rests on: what was asserted, what was inferred from it, and whether anything may be missing.
+[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust. It runs as one server
+with SPARQL endpoints, and it is a hobby project.
 
-What it puts first:
+The point of it is that you can see what an answer rests on, which statements were asserted and
+which were inferred from them, and whether something may be missing. With reasoning on, the
+inferences are computed as part of committing your write, so the new statements and what the
+rules derive from them become visible together, and when you delete a statement, the inferences
+that no longer follow go with it. Asserted and inferred statements are kept apart, and a query
+can read both or only one kind.
 
-- **Inferences are committed with the write.** With reasoning on, a write and the statements
-  the rules derive from it become visible together, and a deleted statement takes along the
-  inferences that no longer follow.
-- **Checks before the commit.** Under OWL 2 QL, RL and DL, a write found to
-  introduce an inconsistency is refused whole, and so is one that introduces a SHACL
-  violation when the SHACL gate is set to `enforce`.
-- **Every SPARQL answer over HTTP carries a status:** `complete`, `sound-only` (rows may be
-  missing), `unsound` (rows may be wrong or missing) or `not-certified` (no assessment).
-- **Inferences explain themselves.** Ask why a statement the rules derived holds, and you get
-  its derivation from asserted statements, rule by rule.
-- **OWL 2 DL engines of its own.** In the `owl2-dl` mode they classify the ontology and prove
-  query answers beyond what the rules derive. They are a hypertableau and a consequence-based
-  engine.
+Every SPARQL answer over HTTP carries a status. It says `complete` when nothing is missing or
+wrong, `sound-only` when rows may be missing, `unsound` when rows may be wrong or missing, and
+`not-certified` when there is no assessment.
 
-Here, a write is a SPARQL update, a Graph Store write or a transaction's commit. A bulk load
-and the ontology file loaded at start-up skip these checks. With reasoning on, the load command
-and the import endpoint then recompute inferences, with the rules' consistency checks.
+Under OWL 2 QL, RL and DL, a write that is found to introduce an inconsistency is refused as a
+whole, and with the SHACL gate set to `enforce`, so is a write that introduces a SHACL violation.
+(By a write we mean a SPARQL update, a Graph Store write or a transaction's commit. A bulk load
+and the ontology file loaded at start-up skip these checks, and with reasoning on, the load
+command and the import endpoint recompute the inferences afterwards, with the rules' consistency
+checks.)
 
-Access rights and budgets can limit any answer. A hobby project: [quick start](#quick-start), [Limits](docs/limits.md).
+In the `owl2-dl` mode, NRESE classifies the ontology and proves query answers beyond what the
+rules derive, with OWL 2 DL engines of its own, a hypertableau and a consequence-based one. For
+anything the rules derived, you can ask why it holds and get its derivation from the asserted
+statements, rule by rule.
+
+Access rights and budgets can limit any answer. What NRESE doesn't do is listed in
+[Limits and deviations](docs/limits.md), and the [quick start](#quick-start) below gets a server
+running.
 
 ## Architecture overview
 
@@ -56,37 +60,39 @@ flowchart TB
   T -- "log each commit (on-disk mode)" --> L
 ```
 
-Everything in the frame is one process. What happens to a write, step by step:
-[what a commit does](docs/what-it-covers.md#what-a-commit-does).
+Everything in the frame runs as one process.
+[What a commit does](docs/what-it-covers.md#what-a-commit-does) follows a write through it.
 
-## What NRESE offers
+## What it can do
 
-| Feature | What you get |
+| Area | Details |
 |---|---|
-| [Reasoning](docs/what-it-covers.md#reasoning) | Modes from none to OWL 2 DL: RDFS, RDFS-Plus, OWL-Horst, OWL 2 QL, RL and DL; or your own rules, alone or added to any mode but none |
-| [Inferred statements](docs/ops/http-api.md#queries) | Stored apart from asserted ones; a query reads both, asserted only, or inferred only |
-| [Consistency checks](docs/what-it-covers.md#what-a-commit-does) | Under OWL 2 QL, RL and DL, on each write; the OWL 2 DL engines' check can be switched off |
-| [Answer status](docs/what-it-covers.md#what-an-answer-promises) | One of four on every SPARQL answer over HTTP; under OWL 2 DL, you can ask for an answer proven complete, or else an error |
-| [Explanations](docs/ops/http-api.md#engine-api-apiv1) | Why an inferred statement holds: its derivation, rule by rule |
+| [Reasoning](docs/what-it-covers.md#reasoning) | None, or RDFS, RDFS-Plus, OWL-Horst, OWL 2 QL, RL or DL, and your own rules, alone or on top of one of those |
+| [Inferred statements](docs/ops/http-api.md#queries) | Kept apart from the asserted ones, so a query reads both, only the asserted or only the inferred |
+| [Consistency checks](docs/what-it-covers.md#what-a-commit-does) | On each write under OWL 2 QL, RL and DL (the OWL 2 DL engines' check can be switched off) |
+| [Answer status](docs/what-it-covers.md#what-an-answer-promises) | On every SPARQL answer over HTTP, and under OWL 2 DL you can ask for an answer proven complete, or an error instead |
+| [Explanations](docs/ops/http-api.md#engine-api-apiv1) | Why an inferred statement holds, as its derivation rule by rule |
 | [Classification](docs/ops/http-api.md#classification) | The ontology's class hierarchy, and named individuals' named classes |
-| [SHACL](docs/what-it-covers.md#shacl) | SHACL Core and SHACL-SPARQL, inferred statements included by default; on request, or on each write as a report or a refusal |
-| [SPARQL and search](docs/what-it-covers.md#sparql) | SPARQL 1.1 query and update, with the deviations in Limits; full-text, vector and, in part, GeoSPARQL search |
-| [Named graphs](docs/ops/config-reference.md#store.default_graph) | Statements in named graphs; a query's default graph is the default graph, or the union of all graphs |
-| [Storage](docs/what-it-covers.md#storage-transactions-and-durability) | Its own storage engine, in memory or on disk; backups and restores; read replicas |
-| [Access control](docs/what-it-covers.md#access-control-and-operations) | Sign-in by tokens, OIDC, or a client certificate's subject passed on by a trusted proxy; read and write rights per named graph |
-| [Interfaces](docs/what-it-covers.md#interfaces) | SPARQL 1.1 and Graph Store protocols, the RDF4J REST protocol (not its `SNAPSHOT` or `SERIALIZABLE` isolation), an engine API with an OpenAPI description, a browser console in the Docker image; several repositories per server |
+| [SHACL](docs/what-it-covers.md#shacl) | SHACL Core and SHACL-SPARQL, with inferred statements included by default, on request or on each write as a report or a refusal |
+| [SPARQL and search](docs/what-it-covers.md#sparql) | SPARQL 1.1 query and update (with the deviations listed in Limits), full-text and vector search, and part of GeoSPARQL |
+| [Named graphs](docs/ops/config-reference.md#store.default_graph) | Statements in named graphs, and a query's default graph is either the default graph or the union of all graphs |
+| [Storage](docs/what-it-covers.md#storage-transactions-and-durability) | Its own storage engine, in memory or on disk, with backups, restores and read replicas |
+| [Access control](docs/what-it-covers.md#access-control-and-operations) | Sign-in by tokens, OIDC, or a client certificate's subject passed on by a trusted proxy, and read and write rights per named graph |
+| [Interfaces](docs/what-it-covers.md#interfaces) | SPARQL 1.1 and Graph Store protocols, the RDF4J REST protocol (without its `SNAPSHOT` and `SERIALIZABLE` isolation), an engine API with an OpenAPI description, a browser console in the Docker image, and several repositories per server |
 
 ## Quick start
 
-You need:
+To run it, you need:
 
 - git
-- Docker with BuildKit (the image builds the server and its console, so no Rust or Node.js)
+- Docker with BuildKit
 - curl
-- port 8080 free
-- a POSIX shell: Linux, macOS, or Git Bash or WSL on Windows
+- a free port 8080
+- a POSIX shell (Linux, macOS, or Git Bash or WSL on Windows)
 
-The image's server runs on an x86-64-v3 (amd64) or Neoverse N1 level (arm64) CPU; for an older one, build with `--build-arg NRESE_TARGET_CPU=portable`.
+The image builds the server and its console, so you don't need Rust or Node.js. Its server runs
+on an x86-64-v3 (amd64) or Neoverse N1 level (arm64) CPU, and for an older one you build with
+`--build-arg NRESE_TARGET_CPU=portable`.
 
 ```bash
 git clone https://github.com/Krarilotus/OWL-RS.git
@@ -97,15 +103,16 @@ docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/d
 until curl -sf http://localhost:8080/readyz; do sleep 1; done
 ```
 
-The server's compile in `docker build` took under 6 minutes with 8 build jobs on an AMD Ryzen 9
-5950X; a first build also downloads the base images and builds the console.
+On an AMD Ryzen 9 5950X, compiling the server in `docker build` took us under 6 minutes with 8
+build jobs. A first build also downloads the base images and builds the console, so it takes
+longer.
 
-The last line waits until the server answers `{"status":"ready"}`. If it never does,
-`docker logs nrese` shows the server's output ([startup errors](docs/ops/server-setup.md#startup-errors)).
+The last line waits until the server answers `{"status":"ready"}`. If that never happens,
+`docker logs nrese` shows what the server printed ([startup errors](docs/ops/server-setup.md#startup-errors)).
 
-The server keeps its data on the volume `nrese-data`, listens on this machine only, and has
-no authentication on. It reasons under OWL 2 RL, with the SHACL gate set to `enforce` for the
-[tutorial](docs/tutorial.md). The browser console is at `http://localhost:8080/console`.
+The data stays on the volume `nrese-data`. The server listens on this machine only, has no
+authentication on, reasons under OWL 2 RL and has the SHACL gate set to `enforce`, which the
+[tutorial](docs/tutorial.md) uses. The browser console is at `http://localhost:8080/console`.
 
 ### A first answer: inference
 
