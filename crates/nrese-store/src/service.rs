@@ -1163,9 +1163,7 @@ impl StoreService {
             &memory,
             out,
             |ql| {
-                let status = ql
-                    .map(|ql| ql.completeness.clone())
-                    .or_else(|| self.status_without_dl(prepared));
+                let status = self.status_outside_dl(prepared, ql);
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = format!("{status:?}");
                 report(status_for_its_reader(prepared, status, ql.is_some()));
@@ -1173,6 +1171,22 @@ impl StoreService {
             },
         )?;
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
+    }
+
+    /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
+    /// with what neither it nor the closure answers composed onto it
+    /// ([`crate::dl::query::certify_closure`]); else [`Self::status_without_dl`].
+    fn status_outside_dl(
+        &self,
+        prepared: &PreparedQuery,
+        ql: Option<&nrese_sparql::ql::QlReport>,
+    ) -> Option<nrese_sparql::Completeness> {
+        let Some(ql) = ql else {
+            return self.status_without_dl(prepared);
+        };
+        let mut status = ql.completeness.clone();
+        crate::dl::query::certify_closure(&mut status, prepared.query(), "ql");
+        Some(status)
     }
 
     /// The status of answers that don't go through the DL bounds; known before the query
@@ -1303,11 +1317,7 @@ impl StoreService {
                 refuted: detail.refuted,
             });
         } else {
-            explanation.completeness = explanation
-                .ql
-                .as_ref()
-                .map(|ql| ql.completeness.clone())
-                .or_else(|| self.status_without_dl(prepared));
+            explanation.completeness = self.status_outside_dl(prepared, explanation.ql.as_ref());
         }
         Ok(explanation)
     }
@@ -1349,11 +1359,7 @@ impl StoreService {
         )?;
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
-            None => planned
-                .ql
-                .as_ref()
-                .map(|ql| ql.completeness.clone())
-                .or_else(|| self.status_without_dl(prepared)),
+            None => self.status_outside_dl(prepared, planned.ql.as_ref()),
         };
         Ok(planned)
     }
@@ -1565,9 +1571,7 @@ impl StoreService {
                             crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
                             Some(status)
                         }
-                        false => ql
-                            .map(|ql| ql.completeness.clone())
-                            .or_else(|| self.status_without_dl(prepared)),
+                        false => self.status_outside_dl(prepared, ql),
                     };
                     if deletes && let Some(status) = &mut status {
                         status.unsound(

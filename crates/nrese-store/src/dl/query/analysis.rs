@@ -23,6 +23,8 @@ pub(crate) struct Analysis {
     /// variable or blank node at an end or one constant at both, or any path step. A
     /// variable predicate and a negated property set count as possible `owl:sameAs` reads.
     reflexive_same_as: bool,
+    /// What the query reads of the statements OWL 2 entails for every term ([`universal`]).
+    pub(super) universal: Option<&'static str>,
 }
 
 /// Whether the `owl:sameAs` pattern `t` can match a reflexive pair: only two distinct
@@ -205,6 +207,7 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     let mut analysis = Analysis {
         shape: shape_of(query),
         answers: answer_variables(query),
+        universal: universal(query),
         ..Analysis::default()
     };
     if matches!(query, Query::Describe { .. }) {
@@ -302,6 +305,83 @@ pub(super) fn negation(query: &Query) -> Option<&'static str> {
         found.is_some()
     });
     found
+}
+
+/// The first predicate `query` reads where OWL 2 entails statements for every term that
+/// neither a ruleset's closure nor the QL rewriting holds: `x owl:sameAs x` (eq-ref is
+/// left out), `x rdf:type owl:Thing` and a class's or property's subsumption or
+/// equivalence with itself, the top or the bottom (only declared ones get theirs), and
+/// the top properties' pairs. A pattern between two distinct other constants reads none.
+/// One walk that allocates nothing.
+pub(super) fn universal(query: &Query) -> Option<&'static str> {
+    let mut found = None;
+    pattern_of(query).find(&mut |node| {
+        found = match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => {
+                patterns.iter().find_map(|t| match &t.predicate {
+                    NamedNodePattern::NamedNode(p) => universal_read(p.as_str(), Some(t)),
+                    NamedNodePattern::Variable(_) => Some("a variable predicate"),
+                })
+            }
+            Node::Pattern(GraphPattern::Path { path, .. }) => universal_path(path),
+            _ => None,
+        };
+        found.is_some()
+    });
+    found
+}
+
+fn universal_path(path: &PropertyPathExpression) -> Option<&'static str> {
+    use PropertyPathExpression as P;
+    match path {
+        P::NamedNode(n) => universal_read(n.as_str(), None),
+        P::Reverse(p) | P::ZeroOrMore(p) | P::OneOrMore(p) | P::ZeroOrOne(p) => universal_path(p),
+        P::Sequence(paths) | P::Alternative(paths) => paths.iter().find_map(universal_path),
+        P::NegatedPropertySet(_) => Some("a negated property set"),
+    }
+}
+
+/// Whether a read of `predicate` (`t` its pattern; `None` for a path step, whose ends the
+/// query doesn't fix) can match a statement [`universal`] names: its name, if so.
+fn universal_read(predicate: &str, t: Option<&TriplePattern>) -> Option<&'static str> {
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    const TOPS: [&str; 6] = [
+        "Thing",
+        "Nothing",
+        "topObjectProperty",
+        "topDataProperty",
+        "bottomObjectProperty",
+        "bottomDataProperty",
+    ];
+    // An end that can be the term at the other end, a top or a bottom.
+    let open = |term: &TermPattern| match term {
+        TermPattern::NamedNode(n) => n
+            .as_str()
+            .strip_prefix(OWL)
+            .is_some_and(|n| TOPS.contains(&n)),
+        TermPattern::Literal(_) => false,
+        _ => true,
+    };
+    let ends = t.is_none_or(|t| open(&t.subject) || open(&t.object) || t.subject == t.object);
+    let thing = t.is_none_or(|t| match &t.object {
+        TermPattern::NamedNode(c) => c.as_str() == OWL_THING,
+        _ => true,
+    });
+    match predicate {
+        RDF_TYPE => thing.then_some("rdf:type owl:Thing"),
+        "http://www.w3.org/2002/07/owl#topObjectProperty" => Some("owl:topObjectProperty"),
+        "http://www.w3.org/2002/07/owl#topDataProperty" => Some("owl:topDataProperty"),
+        OWL_SAME_AS => ends.then_some("owl:sameAs"),
+        "http://www.w3.org/2000/01/rdf-schema#subClassOf" => ends.then_some("rdfs:subClassOf"),
+        "http://www.w3.org/2002/07/owl#equivalentClass" => ends.then_some("owl:equivalentClass"),
+        "http://www.w3.org/2000/01/rdf-schema#subPropertyOf" => {
+            ends.then_some("rdfs:subPropertyOf")
+        }
+        "http://www.w3.org/2002/07/owl#equivalentProperty" => {
+            ends.then_some("owl:equivalentProperty")
+        }
+        _ => None,
+    }
 }
 
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
