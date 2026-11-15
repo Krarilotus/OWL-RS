@@ -3,8 +3,8 @@
 What is in, left out and planned: the [scope](what-it-covers.md#scope); each capability's state
 of work with its evidence: the [capability matrix](spec/06-target-capability-matrix.md).
 
-Below, the one place for the state of the work. Each item is **done** (implemented, tested,
-in the branch), **deferred** (not done, with the reason and where it went), or **open**.
+Below, the one place for the state of the work. Each item is done (implemented, tested,
+in the branch), deferred (not done, with the reason and where it went), or open.
 "Done" means done: what isn't, says so here.
 
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
@@ -34,7 +34,7 @@ each with its run record.
 | Area | Implemented | Open |
 |---|---|---|
 | QL preparation and cache identity | One preparation per execution snapshot, its report kept with the result; compiler input identified by the exact schema; failed probes never cached as negative answers | Schema reading and rewriting don't poll cancellation |
-| Cancellation and deadlines | A request's flag reaches nested DL work; one absolute deadline covers pending and prior consistency checks and rejection evidence | Normalisation and compilation don't poll |
+| Cancellation and deadlines | A request's flag reaches nested DL work; one absolute deadline covers pending and prior consistency checks and rejection evidence | Normalisation and compilation don't poll; under nested reasoner reads, up to 4096 units per suspended read can run past a stop before the answer `Stopped` (`nrese_reasoner::Poller`) |
 | Execution | Queries run on their caller; parallel kernels on Rayon's global pool; one catalog-wide native query budget; `Workers` sets the DL batch width and result encoding's, not other kernels'; one RAII reservation type; a Rayon worker never waits on a cache flight, it computes the part itself (the bounded rule, [decided](design/research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule) 12 October) | The continuation design, only if embedding needs it |
 | Context task memory | Optional owner-based capacity estimates sampled at work checkpoints, incremental index totals, message payloads that carry their charge; `dl.memory = 0` is unlimited; within a request, reserved from its envelope | Can overshoot; excluded allocations |
 | Atomic reasoning updates | Split and revival closure run in the pending transaction and its gates; the post-commit repair is gone | The whole-dataset fallback holds the writer slot (unmeasured; `eq-giant-split` times it); incremental split maintenance |
@@ -46,10 +46,10 @@ each with its run record.
 
 ### Open work
 
-- **Performance acceptance against `0f46563`:** Horn context saturation is about 6 %
+- Performance acceptance against `0f46563` is open: Horn context saturation is about 6 %
   slower, serial and at 16 threads, with the retained accounting; there is no 95-case
   matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
-- **Resource ownership in `nrese-dl`:** the envelope needed and has: an engine's budget is
+- Resource ownership in `nrese-dl`: the envelope needed and has: an engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
   envelope's refusal included). `context::Engine::with_budget` no longer exists. Open:
@@ -58,27 +58,27 @@ each with its run record.
   engine's reservation (request-scoped saturations are dropped at the request's end;
   cached classification draws from an envelope of its own, see Process memory above); changed policy and historical peaks
   need an API contract first.
-- **Performance acceptance of v1.5's robustness:** the A-B-B-A `fast.py compare` of the
+- Performance acceptance of v1.5's robustness is open: the A-B-B-A `fast.py compare` of the
   envelope and the bounded rule on the affected cases (queued on host A; lab log, 12
   October).
-- **Vector search:** the filtered search that goes first widens its beam by the joined
+- In vector search, the filtered search that goes first widens its beam by the joined
   pattern's share (12 October): `vector-knn-filtered`'s recall 0.56 → 0.98, its gate passes
   ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its uniform 64-d
   vectors the graph search now costs what the exact scan does (10.5 against 10.4 ms): open,
   the scan chosen by cost, and the graph's own recall at the default beam (0.44).
-- **Answer checks:** rerun with the committed recorder to decide the unordered `LIMIT`
+- Rerun the answer checks with the committed recorder to decide the unordered `LIMIT`
   case.
-- **Measurement:** container lifetime peaks (cgroup) on host A need system-manager
+- For measurement, container lifetime peaks (cgroup) on host A need system-manager
   permissions; a large-answer recorder that streams instead of retaining; the result
   cache's overhead (keys, ranking, ID copies, encoding) is unattributed.
-- **Later structure:** the physical plan executed directly ([query-plan.md](design/query-plan.md)),
+- Later structure: the physical plan executed directly ([query-plan.md](design/query-plan.md)),
   calibrated routing, NUMA, GPU and distribution ([hardware-and-scaling.md](design/hardware-and-scaling.md)).
-- **Write workloads:** 1M/10M writes, sustained timing and incremental reasoning are not
+- For write workloads, 1M/10M writes, sustained timing and incremental reasoning are not
   measured yet.
 
 ## OWL 2 DL (v1.5, branch `v15/dl-complete`, 12 October)
 
-**Coverage.** Every construct OWL 2 DL has is decided by the engines; an answer is
+Every construct OWL 2 DL has is decided by the engines; an answer is
 `unknown` only for what the specification rules out, a resource limit, or a reader
 diagnostic ([design](design/owl2-dl.md) §3, §6):
 - *ruled out by OWL 2 DL, answered `unsupported`:* `owl:topObjectProperty` where a simple
@@ -109,8 +109,8 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   pair, and in keys; the datatype theory's search for distinct values (exact to the
   deadline) and its pattern limit (per combination).
 
-**The coverage proof** ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc)):
-every OWL 2 DL ontology of the small scope `4,4,4` (2,761,335 after symmetry reduction:
+The coverage proof ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc))
+consists of every OWL 2 DL ontology of the small scope `4,4,4` (2,761,335 after symmetry reduction:
 every constructor and axiom type, one axiom up to size 4, two and three up to total size
 4) and a covering array of every pair and triple of the 67 features beyond it (3,354
 ontologies of 3 to 6 axioms, all 47,905 triples), each answered by NRESE's consistency,
@@ -122,7 +122,7 @@ equal; keys over transitive properties; keys over U alone in the context core an
 scope `3,3` (35,505 cases) against the recorded references in the push tier; its 8,578
 one-axiom cases also when only a crate nrese-dl depends on changes.
 
-**Certificates** ([design](design/owl2-dl.md) §10): "consistent", satisfiable classes and
+As certificates ([design](design/owl2-dl.md) §10), "consistent", satisfiable classes and
 non-entailments of the hypertableau come with a model the independent checker
 (`nrese_dl::certificate`) verifies: 99.84 % of such claims on the small scope without data
 values (8,990,815 of 9,005,280); the number module's validated models likewise. Data values
@@ -130,7 +130,7 @@ since 13 October (the models carry the values the datatype theory assigns: 196 o
 suite's 199 consistent answers with a model certified, the 3 others listed with why). Not
 yet: "inconsistent" and entailments (the references decide them in the campaigns).
 
-**Incrementality** ([design](design/owl2-dl.md) §9): U1 and the RL closure maintained per
+For incrementality ([design](design/owl2-dl.md) §9), U1 and the RL closure are maintained per
 commit; the consistency gate after a commit of assertions only, from a consistent
 revision, checks nothing for removals and only the ABox islands the additions touch;
 schema changes, the taxonomy, classification and realisation recompute. Each maintained
@@ -138,7 +138,7 @@ path is tested against a cold rebuild (store: 3,200 random commits, every one ac
 exactly when a fresh store accepts its data). Not built: the context core's incremental
 saturation, bounded-cone TBox deletion, footprint caches.
 
-**Open:** a hard tiny case where NRESE's search is slow (`cover:3` case 2413, five axioms,
+What is open: a hard tiny case where NRESE's search is slow (`cover:3` case 2413, five axioms,
 a pigeonhole through a nominal: 20.6 s; [DL
 performance lab log](design/owl2-dl-performance.md#8-lab-log-measured-changes-kept-and-rejected));
 certificates for "inconsistent", and for the 3 data-value answers listed under Certificates.
@@ -165,7 +165,7 @@ The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gat
 
 ## Beyond OWL 2 DL (branch `v15/dl-beyond`, 13 October)
 
-**Decided where it is sound, said why where it isn't** ([design](design/owl2-dl.md) §16;
+Inputs outside OWL 2 DL are decided where that is sound, and where it isn't the answer says why ([design](design/owl2-dl.md) §16;
 [campaigns and ORE](../benches/reasoning/dl/README.md#inputs-outside-owl-2-dl-13-october-2026-office-pc-queue-jobs)):
 `nrese_dl::beyond` answers consistency and classification of inputs the reader finds
 outside OWL 2 DL. Every "consistent" rests on a model the independent checker verifies

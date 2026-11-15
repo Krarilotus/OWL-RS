@@ -55,7 +55,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 4. **Nested shapes:**
    - `sh:property` reports the nested shape's own results;
    - `sh:node`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and `sh:qualifiedValueShape` only ask whether the value conforms.
-5. **Recursion:** the specification leaves recursive shapes undefined. A node being checked against a shape it is already being checked against is taken to conform (the common reading). This is a stated choice, not a guarantee.
+5. **Recursion:** the specification leaves recursive shapes undefined. A node being checked against a shape it is already being checked against is taken to conform. This is a stated choice, not a guarantee.
 
 **Where the time goes, and what the design does about it:**
 

@@ -7,15 +7,17 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
     python nrese.py consistency CASES [--binary …/tableau_consistency] [--beyond …/dl_beyond]
 
 - `el`: the OWL 2 EL classifier (crates/nrese-reasoner/src/classify.rs), on the EL
-  track's tasks. It reads N-Triples: the runner's `ntriples` task converts each ontology
+  track's tasks: the oracle beside the product's classifier, which `dl` runs on the
+  same tasks. It reads N-Triples: the runner's `ntriples` task converts each ontology
   first (`CASES/tax/ID.nt`, made here through the image unless `CASES/tax/ntriples.tsv`
   records that file's completed conversion: its hash). The closure it
   writes becomes the canonical taxonomy with the signature of a reference run
   (`canonical.py`), so equal hashes mean equal taxonomies. The detail column holds the
   hash, then the classifier's profile: its phases in ms and its counters (`profile` line
   of the `classify` example).
-- `dl`: the DL driver (`nrese_dl::classify`, the `dl_classify` example) on the DL tracks'
-  classification and realisation tasks, reading each task's functional-syntax file
+- `dl`: the DL driver (`nrese_dl::classify`, the `dl_classify` example, what the product's
+  `/dataset/classification` runs) on every track's classification and realisation tasks,
+  the EL track's included, reading each task's functional-syntax file
   (`CASES/files/ID.owl`) and writing the canonical taxonomy or realisation itself. The
   detail column holds the hash, then the driver's profile (phases and counters: tests,
   candidates, branch points, clashes, the Horn bound's share). The status is the driver's
@@ -227,7 +229,10 @@ def launch(command, timeout, inputs=(), grace=60):
 
 
 def dl_tasks(rows, kinds, only):
-    tasks = sorted({(r[0], r[2]) for r in rows if r[2] in kinds and ("-dl-" in r[0] or "-pure_dl-" in r[0])})
+    # Every track's tasks of these kinds, the EL track's included: the product classifies them all
+    # with this driver, and `el`'s rows stay beside them as the oracle.
+    tasks = sorted({(r[0], r[2]) for r in rows if r[2] in kinds
+                    and any(f"-{track}-" in r[0] for track in ("dl", "pure_dl", "el"))})
     if only:
         keep = {f"ore_ont_{i}" if i.isdigit() else i for i in only.split(",")}
         tasks = [(t, k) for t, k in tasks if t.split("-")[0] in keep or t in keep]

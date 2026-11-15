@@ -216,6 +216,21 @@ def binaries(target: Path, revision: str = "") -> dict:
     return out
 
 
+def one_binary(hashes: dict[str, dict | None], identical: set[frozenset[str]] | frozenset = frozenset()) -> list[str]:
+    """Why sides can't be compared by what they ran (D16-593): a side without its binaries' hashes
+    (HASHES: each side's binaries() `sha256`), and two sides whose builds are one, every binary the
+    same, unless IDENTICAL declares that pair so (an A/A run). A build compared with itself says
+    "no difference" whatever the code: no finding, a failure. One binary alike on two sides isn't
+    this: a tool whose code two trees share builds the same."""
+    errors = [f"{side}: no hash of its binaries: not compared" for side, found in hashes.items() if not found]
+    built = [(side, found) for side, found in hashes.items() if found]
+    for k, (a, mine) in enumerate(built):
+        for b, theirs in built[k + 1:]:
+            if mine == theirs and frozenset((a, b)) not in identical:
+                errors.append(f"{a} and {b} ran one build ({len(mine)} binaries, every hash the same): not compared")
+    return errors
+
+
 def image_ids(images: list[str]) -> dict[str, str | None]:
     ids = {}
     for image in images:

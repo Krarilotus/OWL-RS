@@ -159,6 +159,7 @@ impl super::Context<'_> {
             cache: None,
             pin: RefCell::default(),
             search_scope: self.search_scope,
+            bgp_line: std::cell::Cell::new(None),
         };
         child.cache = self.child_cache(&child);
         child

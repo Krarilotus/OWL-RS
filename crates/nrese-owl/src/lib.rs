@@ -1,7 +1,7 @@
 //! OWL 2 for NRESE (docs/design/owl2-dl.md): the structural model of an ontology read
 //! from RDF triples ([`read`]) or from the functional-style syntax ([`read_functional`]),
 //! with a diagnostic for whatever isn't well-formed OWL 2 DL, and the ways back: to
-//! triples ([`write`]) and to the functional-style syntax ([`Ontology::functional`]).
+//! triples ([`write()`]) and to the functional-style syntax ([`Ontology::functional`]).
 //!
 //! It works over the term ids of whatever holds the triples (the store's `TermId`s) and
 //! reads strings only of the literals it needs ([`Terms`]); nothing here depends on the
@@ -34,7 +34,9 @@ pub use clauses::{
 };
 pub use diagnostics::Diagnostic;
 pub use functional::{iri_text, literal_text};
-pub use mapping::{BuiltinProperties, Ontology, Source, Statement, TermKind, Terms, read};
+pub use mapping::{
+    BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement, TermKind, Terms, read,
+};
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
     ObjProp, RangeId, Term,

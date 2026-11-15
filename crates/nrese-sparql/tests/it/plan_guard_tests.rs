@@ -331,10 +331,47 @@ fn explain_estimates_every_operator() {
     }
 }
 
+/// EXPLAIN prints one estimate per BGP: the BGP's line shows what its own planning
+/// estimated, the estimate of its last step (the master's decision of 14 November, 12:01;
+/// its planning counts shared values that estimate-time planning doesn't).
+///
+/// - Input: a counted pair (the 3 nodes knowing n2 and the 3 knowing n8, sharing 1), a
+///   chain, a star with a constant object, a cycle, and a chain under a LIMIT.
+/// - Expected: every BGP line's estimate equals that of the last step under it.
+#[test]
+fn explain_prints_one_estimate_per_bgp() {
+    let engine = engine();
+    for query in [
+        "SELECT * WHERE { ?s e:knows e:n2 . ?s e:knows e:n8 }",
+        "SELECT * WHERE { e:n1 e:knows ?o . ?o e:knows ?p . ?p e:kind ?k }",
+        "SELECT * WHERE { ?s e:kind e:k1 . ?s e:knows ?o . ?o e:label ?l }",
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+        "SELECT * WHERE { ?s e:knows ?o . ?o e:label ?l } LIMIT 5",
+    ] {
+        let plan = steps(&engine, query);
+        let mut bgps = 0;
+        for (at, bgp) in plan.iter().enumerate().filter(|(_, s)| s.operator == "bgp") {
+            bgps += 1;
+            let last = plan[at + 1..]
+                .iter()
+                .take_while(|s| s.depth > bgp.depth)
+                .filter(|s| s.depth == bgp.depth + 1 && s.estimated_rows.is_some())
+                .last()
+                .unwrap_or_else(|| panic!("{query}: no step under its BGP\n{plan:#?}"));
+            assert_eq!(
+                bgp.estimated_rows, last.estimated_rows,
+                "{query}\n{plan:#?}"
+            );
+        }
+        assert_eq!(bgps, 1, "{query}\n{plan:#?}");
+    }
+}
+
 /// Estimates within their bounds (LUBM-10 materialised, `perf_lab --qerror`: q-error
 /// median 15 → 1.00, p90 2,540 → 1.89): a pattern whose variables are all bound keeps at
 /// most the rows it checks, a step over non-empty inputs is never estimated at 0, and two
-/// small single-variable patterns on one variable are estimated by the values they share.
+/// single-variable patterns on one variable, read within the BGP's allowance (its plain
+/// plan's cost), are estimated by the values they share.
 #[test]
 fn estimates_never_exceed_their_bounds() {
     let engine = engine();
@@ -349,13 +386,15 @@ fn estimates_never_exceed_their_bounds() {
         .find(|s| s.detail.contains("kind") && s.operator != "scan")
         .unwrap_or_else(|| panic!("{plan:#?}"));
     assert!(check.estimated_rows.is_some_and(|e| e <= 3), "{plan:#?}");
-    // Kind k1 (300 nodes) and the 3 nodes knowing n2 share 2 (n1, n2971): counted.
+    // The 3 nodes knowing n2 (n1, n2971, n2995) and the 3 knowing n8 (n1, n7, n2977)
+    // share 1: counted, within the allowance (the plain plan's cost), by the BGP's
+    // own planning (its join step; estimate-time planning reads no lists).
     let plan = steps(
         &engine,
-        "SELECT * WHERE { ?s e:kind e:k1 . ?s e:knows e:n2 }",
+        "SELECT * WHERE { ?s e:knows e:n2 . ?s e:knows e:n8 }",
     );
-    let bgp = plan.iter().find(|s| s.operator == "bgp").unwrap();
-    assert_eq!((bgp.estimated_rows, bgp.rows), (Some(2), 2), "{plan:#?}");
+    let join = plan.iter().find(|s| s.operator == "join").unwrap();
+    assert_eq!((join.estimated_rows, join.rows), (Some(1), 1), "{plan:#?}");
     for query in [
         "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:kind e:k3 . ?a e:kind e:k1 }",
         "SELECT * WHERE { ?s e:kind e:k1 . ?s e:knows ?o . ?o e:kind e:k8 . ?o e:label ?l }",

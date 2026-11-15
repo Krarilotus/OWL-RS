@@ -288,7 +288,7 @@ impl<T: Visits + ?Sized> Source for T {
 /// How a source hands a scan's positions to its reader: each counted on the reading task's
 /// poller before the reader sees it, so no source can deliver work the poller didn't count.
 /// Only [`Source`]'s reads make one; a source that reads another hands it on
-/// ([`Visit::within`]).
+/// (`Visit::within`).
 pub struct Visit<'v, 'p> {
     poll: &'v Poller<'p>,
     f: &'v mut dyn FnMut(Triple),
@@ -742,9 +742,9 @@ pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>], poll: &Poller<'_>
 
 /// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Its
 /// scans count on `poll` ([`Source`]: each scan and each fact it visits, bound or not);
-/// once its stop has fired, they deliver nothing more and nothing deeper is scanned, so
-/// one driver's fan-out can't outlive the stop by more than [`nrese_exec::POLL_UNITS`]
-/// units (RSH-18).
+/// once its stop has fired, a scan that begins reads nothing (RSH-18), but a scan already
+/// running can still deliver positions it counted ahead. How far a driver's fan-out can
+/// outlive the stop is [`Poller`]'s bound under nested reads.
 #[allow(clippy::too_many_arguments)]
 pub fn walk<S: Source + ?Sized>(
     source: &S,
@@ -1336,9 +1336,10 @@ impl<'r> Job<'r> {
 }
 
 /// Asked between units of work: `true` means stop (the caller gave up). It is asked at each
-/// morsel's start and, through a [`Poller`], every [`nrese_exec::POLL_UNITS`] facts a
-/// morsel scans: inside a source's scan, so it must take no lock (the store's stops read
-/// atomics, a clock and the process's memory).
+/// morsel's start and, through a [`Poller`], at its checkpoints, when its countdown of
+/// [`nrese_exec::POLL_UNITS`] units runs out: inside a source's scan, so it must take no
+/// lock (the store's stops read atomics, a clock and the process's memory). How much work
+/// can run between two asks, and after a refusal, is [`Poller`]'s bound.
 pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
 
 /// A read its poller stopped: an error its caller has to handle, never an answer (REAS-2
@@ -1355,6 +1356,18 @@ pub use nrese_engine::Stopped;
 /// flag are cells: a plain load and store per tick, no borrow flag, no atomic), so a
 /// source's scan can tick it while the callback it calls reads through it too ([`Source`]);
 /// `Send`, not `Sync`. The shared stop is read only when the countdown runs out.
+///
+/// **The stopping bound under nested reads**, stated here once. Within one read with no
+/// nesting, a task does at most `POLL_UNITS` counted units plus one run between two asks of
+/// its stop, and nothing after a refusal. A level is a counted read suspended while another
+/// read runs inside its callback (a rule join's nested read, the engine's scan delivering
+/// into the reasoner); a suspended read spends what it counted ahead without asking again.
+/// With d such levels, up to `POLL_UNITS` plus one run plus `d·POLL_UNITS` units run
+/// between two asks, and up to `d·POLL_UNITS` after a refusal, before the read answers
+/// [`Stopped`], never a part of its answer. d is at most the longest rule body plus the engine's scan and
+/// equality-product levels. The guard searches of grounding and of
+/// [`GroundProgram::one_step_images`] take [`Poller::never`]: they ask no stop inside their
+/// search. A redesign follows.
 pub struct Poller<'a> {
     ticker: nrese_exec::Ticker<Stop<'a>>,
     stopped: std::cell::Cell<bool>,
@@ -1649,7 +1662,7 @@ impl<'a> OperationStop<'a> {
 }
 
 /// The filter of a morsel's derived facts, reading with the morsel's poller: [`Stopped`]
-/// once that has stopped, which ends the morsel's keep ([`keep_until_stopped`]).
+/// once that has stopped, which ends the morsel's keep (`keep_until_stopped`).
 pub type Keep<'k> = &'k (dyn Fn(Triple, &Poller<'_>) -> Result<bool, Stopped> + Sync);
 
 /// Keeps the facts `keep` accepts, in order, until it answers [`Stopped`]: then `facts` is
@@ -2764,7 +2777,7 @@ impl GroundProgram {
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`): a
     /// bodiless instance, a rule whose head matches it, or (optionally: the caller may
     /// recompute its closure) transitivity; searching under `stop`
-    /// ([`Self::derivable_through`]).
+    /// (`Self::derivable_through`).
     pub fn derivable_with<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -2873,7 +2886,7 @@ impl GroundProgram {
     }
 
     /// Whether one of the rules `only` marks, or with `bodiless_too` a bodiless instance,
-    /// derives `fact` from `source` in one step ([`Self::derivable_through`], without
+    /// derives `fact` from `source` in one step (`Self::derivable_through`, without
     /// transitivity), searching under `stop`.
     pub fn derivable_by<S: Source + ?Sized>(
         &self,
