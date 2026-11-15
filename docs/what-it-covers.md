@@ -93,7 +93,7 @@ can't be proven complete is then a 422 error naming the undecided candidates.
 |---|---|
 | [SHACL](https://www.w3.org/TR/shacl/) (W3C Recommendation, 2017): Core and SHACL-SPARQL | W3C suite for both, with no known failure listed ([runner](../crates/nrese-shacl/tests/w3c_shacl)). Data is validated with its inferred statements unless `infer=false`. Not supported: SHACL Advanced Features (rules), and `sh:entailment`, which is reported as a failure |
 | Validation on request (`/dataset/shacl`), against stored shapes or shapes sent with the request | Sent shapes live in a transaction that is never committed, and count against the request's memory ([HTTP interface](ops/http-api.md#shacl-validation)) |
-| Validation on commit (`shacl.gate`: `report` or `enforce`), only for the focus nodes the commit can affect | Off by default ([configuration](ops/config-reference.md)) |
+| Validation on commit (`shacl.gate`: `report` or `enforce`), only for the focus nodes the commit can affect | Off by default. `enforce` refuses results of [`shacl.gate_severity`](ops/config-reference.md#shacl.gate_severity) or above, `violation` by default |
 
 ## Storage, transactions and durability
 
