@@ -1,9 +1,9 @@
-//! When a DL operation over the store's ontology ends (a classification, a realisation),
-//! what the shared workers hold unused is offered back to the system, unforced: idle
-//! workers otherwise keep the operation's freed memory, and the next operation's peak
-//! starts above it. A forced release would cost the request time. The calling thread
-//! releases before the operation returns; each pool thread when it is next free, so a
-//! worker busy with other work doesn't hold the operation up.
+//! When a classification of the store's ontology ends, what the shared workers hold unused
+//! is offered back to the system, unforced: idle workers otherwise keep the classification's
+//! freed memory, and the next one's peak starts above it. A forced release would cost the
+//! request time. The calling thread releases before the classification returns; each pool
+//! thread when it is next free, so a worker busy with other work doesn't hold it up. Only a
+//! classification releases: a realisation offers nothing back.
 //!
 //! The allocator's release is registered once per process (`set_memory_release`), and the
 //! global pool is given a fixed width of two before anything uses it, so this file is a test
@@ -129,9 +129,6 @@ fn realise(dl: &MutationPipeline) {
     assert!(report.complete(), "{:?}", report.incomplete);
 }
 
-/// A DL operation by name.
-type Operation = (&'static str, fn(&MutationPipeline));
-
 /// A pool worker held on other work, a job that waits on a channel, until it is freed: by
 /// the test, by its watchdog, or when the last handle goes (the sender dropped ends the
 /// wait), so a failing test never leaves it held.
@@ -175,35 +172,48 @@ impl Held {
 }
 
 #[test]
-fn a_dl_operation_offers_the_unused_memory_of_its_caller_and_every_pool_thread_back_unforced() {
+fn a_classification_offers_the_unused_memory_of_its_caller_and_every_pool_thread_back_unforced() {
     let _serial = serial();
     let dl = ontology();
     let pool = pool();
-    let operations: [Operation; 2] = [("classification", classify), ("realisation", realise)];
-    for (name, operation) in operations {
-        releases();
-        operation(&dl);
-        let caller = thread::current().id();
-        let at_return = RELEASES.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert!(
-            at_return.contains(&(false, caller)),
-            "{name}: the calling thread was not asked to give back what it holds unused before \
-             the operation returned ({at_return:?})"
-        );
-        let after = releases_once_offered_on(&pool);
-        let forced = after.iter().filter(|(force, _)| *force).count();
-        assert_eq!(
-            forced, 0,
-            "{name}: {forced} forced releases, a cost on the request"
-        );
-        let offered: HashSet<ThreadId> = after.iter().map(|&(_, at)| at).collect();
-        let missed = pool.difference(&offered).count();
-        assert_eq!(
-            missed, 0,
-            "{name}: {missed} of the {WORKERS} pool threads were not asked to give back what \
-             they hold unused before the watchdog ({WATCHDOG:?}) ended the wait ({after:?})"
-        );
-    }
+    releases();
+    classify(&dl);
+    let caller = thread::current().id();
+    let at_return = RELEASES.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        at_return.contains(&(false, caller)),
+        "the calling thread was not asked to give back what it holds unused before the \
+         classification returned ({at_return:?})"
+    );
+    let after = releases_once_offered_on(&pool);
+    let forced = after.iter().filter(|(force, _)| *force).count();
+    assert_eq!(forced, 0, "{forced} forced releases, a cost on the request");
+    let offered: HashSet<ThreadId> = after.iter().map(|&(_, at)| at).collect();
+    let missed = pool.difference(&offered).count();
+    assert_eq!(
+        missed, 0,
+        "{missed} of the {WORKERS} pool threads were not asked to give back what they hold \
+         unused before the watchdog ({WATCHDOG:?}) ended the wait ({after:?})"
+    );
+}
+
+#[test]
+fn a_realisation_offers_nothing_back() {
+    let _serial = serial();
+    let dl = ontology();
+    // What earlier work queued on the workers has run before the count starts: a broadcast
+    // runs on each worker after everything broadcast to it before.
+    rayon::broadcast(|_| ());
+    releases();
+    realise(&dl);
+    // Likewise, a release spawned on the workers by the realisation has run after this.
+    rayon::broadcast(|_| ());
+    let after = releases();
+    assert!(
+        after.is_empty(),
+        "a realisation asked the allocator to give back memory ({after:?}): only a \
+         classification does"
+    );
 }
 
 #[test]
