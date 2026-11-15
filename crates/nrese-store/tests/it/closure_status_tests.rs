@@ -786,11 +786,16 @@ fn never_complete(declaration: &str) {
 
 /// cls-maxc2 names its cardinality as the term `"1"^^xsd:nonNegativeInteger`, and the rule
 /// set leaves out dt-eq: under owl2-rl only that spelling is read, and plain Turtle
-/// `owl:maxCardinality 1` (an xsd:integer) doesn't equate `:x` and `:y`.
+/// `owl:maxCardinality 1` (an xsd:integer) or `"01"^^xsd:nonNegativeInteger` doesn't
+/// equate `:x` and `:y`.
 #[test]
 fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
     let mut wrong = Vec::new();
-    for (card, read) in [("\"1\"^^xsd:nonNegativeInteger", true), ("1", false)] {
+    for (card, read) in [
+        ("\"1\"^^xsd:nonNegativeInteger", true),
+        ("1", false),
+        ("\"01\"^^xsd:nonNegativeInteger", false),
+    ] {
         let data = format!(
             ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
                owl:maxCardinality {card} ] . \

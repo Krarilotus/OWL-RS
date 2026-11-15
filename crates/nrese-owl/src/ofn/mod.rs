@@ -125,6 +125,8 @@ impl<'a> FunctionalReader<'a> {
             data: Default::default(),
             anonymous: BTreeSet::new(),
             rules: model.rules,
+            // Functional syntax writes a cardinality as a number: no spelling to mark.
+            noncanonical_cardinality: None,
         };
         crate::mapping::complete(&mut ontology, terms);
         ontology
