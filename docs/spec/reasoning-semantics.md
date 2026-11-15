@@ -41,7 +41,7 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 - 58 fixed rules from W3C OWL 2 Profiles §4.3 tables 4 (equality), 5 (properties), 6 (classes), 7 (class axioms) and 9 (schema vocabulary), with the W3C rule names.
 - One extra `eq-diff1`, by which `x owl:differentFrom x` is inconsistent (see `eq-ref` below).
 - List axioms, instantiated per axiom: `prp-spo2` (property chains), `prp-key`, `cls-int1/2`, `cls-uni`, `cls-oo`, `scm-int`, `scm-uni`, `cax-adc`, `eq-diff2/3`, `prp-adp`.
-- The cardinality rules (`cls-maxc1/2`, `cls-maxqc1-4`) read a cardinality only as the RDF mapping writes it, `"0"^^xsd:nonNegativeInteger` or `"1"^^xsd:nonNegativeInteger`; any other spelling, such as Turtle's plain `1` (an `xsd:integer`) or `"01"^^xsd:nonNegativeInteger`, isn't read.
+- The cardinality rules (`cls-maxc1/2`, `cls-maxqc1-4`) read a cardinality only as the RDF mapping writes it, `"0"^^xsd:nonNegativeInteger` or `"1"^^xsd:nonNegativeInteger`; any other spelling, such as Turtle's plain `1` (an `xsd:integer`) or `"01"^^xsd:nonNegativeInteger`, isn't read, so the QL rewriting's status over such a schema is never `complete`.
 
 #### Omitted, and what that means
 
