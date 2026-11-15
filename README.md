@@ -21,9 +21,9 @@ What it puts first:
   query answers beyond what the rules derive. They are a hypertableau and a consequence-based
   engine.
 
-Every change to your data is a write as above, except a bulk load or the ontology file loaded
-at start-up: they skip a write's checks. With reasoning on, the load command and the import
-endpoint then recompute inferences, with the rules' consistency checks.
+Here, a write is a SPARQL update, a Graph Store write or a transaction's commit. A bulk load
+and the ontology file loaded at start-up skip these checks. With reasoning on, the load command
+and the import endpoint then recompute inferences, with the rules' consistency checks.
 
 Access rights and budgets can limit any answer. A hobby project: [quick start](#quick-start), [Limits](docs/limits.md).
 
@@ -68,7 +68,7 @@ Everything in the frame is one process. What happens to a write, step by step:
 | [Consistency checks](docs/what-it-covers.md#what-a-commit-does) | Under OWL 2 QL, RL and DL, on each write; the OWL 2 DL engines' check can be switched off |
 | [Answer status](docs/what-it-covers.md#what-an-answer-promises) | One of four on every SPARQL answer over HTTP; under OWL 2 DL, you can ask for an answer proven complete, or else an error |
 | [Explanations](docs/ops/http-api.md#engine-api-apiv1) | Why an inferred statement holds: its derivation, rule by rule |
-| [Classification](docs/ops/http-api.md#classification) | The ontology's class hierarchy, and the named classes of each named individual |
+| [Classification](docs/ops/http-api.md#classification) | The ontology's class hierarchy, and named individuals' named classes |
 | [SHACL](docs/what-it-covers.md#shacl) | SHACL Core and SHACL-SPARQL, inferred statements included by default; on request, or on each write as a report or a refusal |
 | [SPARQL and search](docs/what-it-covers.md#sparql) | SPARQL 1.1 query and update, with the deviations in Limits; full-text, vector and, in part, GeoSPARQL search |
 | [Named graphs](docs/ops/config-reference.md#store.default_graph) | Statements in named graphs; a query's default graph is the default graph, or the union of all graphs |
