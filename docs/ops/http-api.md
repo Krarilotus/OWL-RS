@@ -365,7 +365,7 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 
 ## Status codes
 
-Nothing of a request refused with a `4xx` status is applied. Each row says what to do; the check is the same request answering `2xx`.
+Nothing of a request refused with a `4xx` status is applied, except that a refused write's new terms can stay in the dictionary and show in search ([limits](../limits.md#storage-and-transactions)). Each row says what to do; the check is the same request answering `2xx`.
 
 | Code | When | What to do |
 |---|---|---|
