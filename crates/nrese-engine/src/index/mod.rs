@@ -1369,13 +1369,16 @@ impl<'a> QuadScan<'a> {
         &mut self,
         account: &mut impl Account,
     ) -> Result<Option<TermId>, Stopped> {
-        let permutation = self.permutation;
+        let slot = self.permutation.graph_slot();
         Ok(self
             .step_key_with(account)?
-            .map(|key| permutation.key_to_quad(&key).graph))
+            .map(|key| TermId::from_raw(key[slot])))
     }
 
-    /// [`Self::step_with`]'s visible key, in the scan's permutation.
+    /// [`Self::step_with`]'s visible key, in the scan's permutation. The default graph's
+    /// keys are told by the graph's slot alone: a quad is decoded once, by the caller that
+    /// hands it on, so the plain scan's step stays as small as before the point reads shared
+    /// it (#328; graphs4 in the third cut, 15 Nov 2026).
     #[inline]
     fn step_key_with(&mut self, account: &mut impl Account) -> Result<Option<Key>, Stopped> {
         loop {
@@ -1388,7 +1391,7 @@ impl<'a> QuadScan<'a> {
                 continue;
             }
             if self.exclude_default_graph
-                && self.permutation.key_to_quad(&key).graph.is_default_graph()
+                && TermId::from_raw(key[self.permutation.graph_slot()]).is_default_graph()
             {
                 continue;
             }
