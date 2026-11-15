@@ -760,23 +760,44 @@ fn owl2_rl_calls_no_answer_a_qualified_data_maximum_misses_complete() {
     );
 }
 
+/// An existential on `:age`, which is undeclared and carries a literal, filled by `filler`.
+fn data_existential(filler: &str) -> String {
+    format!(
+        ":Aged a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom {filler} ] \
+           rdfs:subClassOf :Aged . \
+         :a :age 5 ."
+    )
+}
+
 /// cls-svf1 on `:age`, which is undeclared and carries a literal: `:a` is `:Aged` (OWL 2
 /// Direct Semantics, DataSomeValuesFrom), whose premise `5 rdf:type xsd:integer` is
 /// dt-type2's, which the rule set leaves out. The rewriting's schema reads no assertions,
-/// so only the filler, a datatype, says `:age` is a data property. As over `rdfs:Literal`.
+/// so only the filler, a datatype, says `:age` is a data property.
 #[test]
 fn owl2_rl_calls_no_answer_an_undeclared_data_existential_misses_complete() {
-    for filler in ["xsd:integer", "rdfs:Literal"] {
-        no_place_complete(
-            &format!(
-                ":Aged a owl:Class . \
-                 [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom {filler} ] \
-                   rdfs:subClassOf :Aged . \
-                 :a :age 5 ."
-            ),
-            "ASK { :a a :Aged }",
-        );
+    no_place_complete(&data_existential("xsd:integer"), "ASK { :a a :Aged }");
+}
+
+/// `:a :age 5` and ∃age.rdfs:Literal ⊑ :Aged entail `:a a :Aged` (every literal is in
+/// `rdfs:Literal`; no datatype rule is needed). With the rewriting on, the filler says the
+/// undeclared `:age` is a data property, and the answer is the entailed `true`; on `Auto`,
+/// the closure's `false` is called complete in no place.
+#[test]
+fn owl2_rl_answers_an_undeclared_data_existential_over_any_literal() {
+    let data = data_existential("rdfs:Literal");
+    let mut wrong = Vec::new();
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let (text, line, complete, _) = places(&data, "ASK { :a a :Aged }", ql);
+        let right = match ql {
+            QlRewritingMode::On => text.contains("true"),
+            _ => text.contains("false") && !complete,
+        };
+        if !right {
+            wrong.push(line);
+        }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// The key's case, `:ssn` declared by `declaration`: see [`no_place_complete`].
@@ -792,33 +813,41 @@ fn never_complete(declaration: &str) {
 /// `data` under owl2-rl, and `read`, entailed but `false` over the closure: no place calls
 /// it complete, with the rewriting on or not.
 fn no_place_complete(data: &str, read: &str) {
-    let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
-    let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-        let store = closure(data, Ruleset::Owl2Rl, ql);
-        let run = store.execute_query(&request).expect("answered");
-        let prepared = store.prepare_query(&request).expect("prepared");
-        let planned = store
-            .plan_query(&prepared, &CancellationToken::new())
-            .expect("planned");
-        let text = String::from_utf8_lossy(&run.payload).into_owned();
-        let places = [
-            ("run", run.completeness.as_ref()),
-            ("ql", run.ql.as_ref().map(|r| &r.completeness)),
-            ("plan", planned.completeness.as_ref()),
-            ("plan's ql", planned.ql.as_ref().map(|r| &r.completeness)),
-        ];
-        let line = format!(
-            "rewriting {ql:?}: {text} {:?}",
-            places.map(|(p, c)| (p, name(c)))
-        );
-        eprintln!("{line}");
-        let complete = places.iter().any(|(_, c)| name(*c) == "complete");
+        let (text, line, complete, reported) = places(data, read, ql);
         // With the rewriting on, its report is one of the places.
-        if !text.contains("false") || complete || (ql == QlRewritingMode::On && run.ql.is_none()) {
+        if !text.contains("false") || complete || (ql == QlRewritingMode::On && !reported) {
             wrong.push(line);
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
+/// with what each place (the run, its rewriting, the plan, the plan's rewriting) calls it,
+/// whether any place calls it complete, and whether the run has the rewriting's report.
+fn places(data: &str, read: &str, ql: QlRewritingMode) -> (String, String, bool, bool) {
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
+    let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+    let store = closure(data, Ruleset::Owl2Rl, ql);
+    let run = store.execute_query(&request).expect("answered");
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let planned = store
+        .plan_query(&prepared, &CancellationToken::new())
+        .expect("planned");
+    let text = String::from_utf8_lossy(&run.payload).into_owned();
+    let places = [
+        ("run", run.completeness.as_ref()),
+        ("ql", run.ql.as_ref().map(|r| &r.completeness)),
+        ("plan", planned.completeness.as_ref()),
+        ("plan's ql", planned.ql.as_ref().map(|r| &r.completeness)),
+    ];
+    let line = format!(
+        "rewriting {ql:?}: {text} {:?}",
+        places.map(|(p, c)| (p, name(c)))
+    );
+    eprintln!("{line}");
+    let complete = places.iter().any(|(_, c)| name(*c) == "complete");
+    (text, line, complete, run.ql.is_some())
 }
