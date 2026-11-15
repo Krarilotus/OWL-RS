@@ -19,7 +19,7 @@ export NRESE_DL_OUT="$OUT" NRESE_DL_REFERENCE="exec docker run --rm -i --init \
   --memory ${DL_OUTSIDE_MEMORY:-2g} --label ${DL_OUTSIDE_LABEL:-dl-outside=1} --entrypoint java \
   $TAG -Xmx1500m -cp /opt/dl-runner.jar nrese.dl.Entail 30"
 # First the check against its planted faults: one it misses stops the run.
-"$BIN" --ignored dl::outside::planted_ > "$OUT/planted.log" 2>&1 || { echo "planted fault missed" >&2; exit 5; }
+env -u NRESE_DL_STEPS "$BIN" --ignored dl::outside::planted_ > "$OUT/planted.log" 2>&1 || { echo "planted fault missed" >&2; exit 5; }
 # 101: the test ran and found failures (summary.tsv, fail-*.ttl); anything else is the harness's.
 "$BIN" --ignored --exact --nocapture dl::outside::dl_answers_agree_with_outside_reasoners \
   > "$OUT/test.log" 2>&1 || rc=$?
