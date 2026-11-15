@@ -29,6 +29,9 @@ move it.
   ([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
 - **Ask why.** For anything the rules derived, you get its derivation from your statements, rule
   by rule, within a [size limit](docs/limits.md#reasoning) ([explanations](docs/ops/http-api.md#engine-api-apiv1)).
+- **Inferences respect read rights.** A reader who may see only some named graphs can be shown
+  just the inferences that follow from those graphs
+  ([access control](docs/ops/http-api.md#graph-level-access-control)).
 - **OWL 2 DL engines of its own.** Under `owl2-dl`, a hypertableau and a consequence-based
   reasoner check consistency, classify the ontology and prove query answers beyond the rules
   ([design](docs/design/owl2-dl.md)).
