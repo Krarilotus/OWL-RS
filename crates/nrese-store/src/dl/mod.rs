@@ -2,16 +2,16 @@
 //! normal interfaces, every answer saying how complete it is.
 //!
 //! - [`config`]: the mode's settings.
-//! - [`source`]: the ontology of the asserted statements, read for the engines.
-//! - [`consistency`]: consistency by the engine the ontology allows; [`gate`]: the check
+//! - `source`: the ontology of the asserted statements, read for the engines.
+//! - [`consistency`]: consistency by the engine the ontology allows; `gate`: the check
 //!   on commit.
-//! - [`classification`]: classification and realisation, kept per revision.
+//! - `classification`: classification and realisation, kept per revision.
 //! - [`entailment`]: axiom entailment, reduced to consistency; [`explain`]: why
 //!   something holds, as a minimal set of the ontology's axioms.
-//! - [`lower`]: L's memberships beyond the RL closure, from the TBox's taxonomy.
-//! - [`upper`]: the upper bound U1 in a stack of its own; [`bounds`]: U1 per revision,
+//! - `lower`: L's memberships beyond the RL closure, from the TBox's taxonomy.
+//! - [`upper`]: the upper bound U1 in a stack of its own; `bounds`: U1 per revision,
 //!   maintained per commit, and the read view queries take.
-//! - [`query`]: the query path: closed predicates, the bounds, the exact services, the
+//! - `query`: the query path: closed predicates, the bounds, the exact services, the
 //!   status of every answer.
 //!
 //! The mode is the reasoner's (`ReasoningMode::Owl2Dl`): its OWL 2 RL closure is the
@@ -101,7 +101,7 @@ impl Dl {
         self.replica.load(Ordering::Acquire)
     }
 
-    /// Whether user rules run with the mode ([`Dl::set_active`]).
+    /// Whether user rules run with the mode (`Dl::set_active`).
     pub fn user_rules(&self) -> bool {
         self.user_rules.load(Ordering::Acquire)
     }

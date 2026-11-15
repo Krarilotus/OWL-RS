@@ -2,7 +2,7 @@
 //! index stacks, inferred statements included) and a manifest, written while writers go
 //! on; restored by placing the image in an empty data directory, where opening the store
 //! recovers it as any checkpoint. Faster and smaller than the N-Quads export
-//! ([`crate::backup`]), and nothing is derived again after a restore; the image needs an
+//! (`crate::backup`), and nothing is derived again after a restore; the image needs an
 //! engine that reads its checkpoint format.
 
 use std::fs;

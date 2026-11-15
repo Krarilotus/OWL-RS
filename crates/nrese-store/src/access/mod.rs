@@ -18,7 +18,7 @@
 //!   logs in under their name, and hold the password of a local login.
 //!
 //! The state changes only through [`AccessControl::apply`], each change with its author,
-//! time and a required reason, kept as RDF with its history ([`control`]). Enforcement is
+//! time and a required reason, kept as RDF with its history (`control`). Enforcement is
 //! on once the state says so ([`Settings::enforced`]); until then everyone may read and
 //! write what their credentials allow, as without a policy.
 //!

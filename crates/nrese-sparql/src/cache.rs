@@ -3,7 +3,7 @@
 //!
 //! **What is kept.** Each operator the executor evaluates is a part: a scan, a basic graph
 //! pattern, a join, a group, the whole query. Its result is an id table with the part's
-//! variables by number ([`crate::native`]'s cache key numbers them, so parts that differ
+//! variables by number (`crate::native`'s cache key numbers them, so parts that differ
 //! only in their variables' names share an entry), plus the few terms computed during the
 //! query that it holds (`BIND` and aggregate values the dictionary doesn't know). Nothing
 //! is decoded: a cached part costs 8 bytes per value.
@@ -32,7 +32,7 @@
 //! on a Rayon worker never waits: it computes the part itself (research-designs.md §8).
 //!
 //! **Serialised answers.** A query's whole answer is also kept as the bytes of each
-//! output format it was asked in ([`ResultCache::output`], [`CachedOutput`]), beside its
+//! output format it was asked in (`ResultCache::output`, [`CachedOutput`]), beside its
 //! id columns, so a repeated query with a large answer is copied instead of serialised
 //! again. They share the budget and the ranking; their cost is the time the request took
 //! (what the cache didn't answer of the evaluation, and the serialisation), so they are
@@ -50,7 +50,7 @@
 //! one, never reaches it. Looking a key up needs no admission.
 //!
 //! **An unpublished version's own cache.** What an unpublished snapshot computes is kept in
-//! a cache its version owns ([`ResultCache::for_admission`]; the engine's `OwnState`): a
+//! a cache its version owns (`ResultCache::for_admission`; the engine's `OwnState`): a
 //! session reading its kept pending view again is answered from it, and nothing else reaches
 //! it. It has the store's cache's capacity and policy, holds no pin, and everything it keeps
 //! is charged to a part of the envelope of the request that made it, refused when that is

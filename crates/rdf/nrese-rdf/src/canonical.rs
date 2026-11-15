@@ -28,7 +28,7 @@
 //!    during refinement, so a choice in one part can't reach another through it.
 //!
 //! 6. **Triple terms** (RDF 1.2) that hold blank nodes become nodes of their own before
-//!    all this (see [`encode`]), so the same search covers them, nested ones included.
+//!    all this (see `encode`), so the same search covers them, nested ones included.
 //!
 //! The names depend on the hash function, so they are stable only within one build.
 

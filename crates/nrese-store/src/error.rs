@@ -100,7 +100,7 @@ pub enum StoreError {
     #[error(transparent)]
     Forbidden(#[from] Refusal),
     /// A query's memory refusal as a reader of some graphs is told it
-    /// ([`Self::without_amounts`]): the limit, not the bytes held and asked for.
+    /// (`Self::without_amounts`): the limit, not the bytes held and asked for.
     #[error(
         "{}: limit {} MiB (what the query held and asked for is not reported to a reader of some graphs)",
         memory_refusal(.shared),

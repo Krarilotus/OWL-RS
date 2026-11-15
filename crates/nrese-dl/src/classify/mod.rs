@@ -11,13 +11,13 @@
 //!   Shearer and Stoilos, *A Novel Approach to Ontology Classification*, JWS 2012). Only
 //!   `P(C) \ K(C)` is tested, most general first: a non-subsumption rules out every known
 //!   subclass of the candidate, and its model's label rules out what it leaves out
-//!   ([`driver`]).
+//!   (`driver`).
 //! - **Parallel:** satisfiability tests run in waves over every core, a class seen in a
 //!   model needs none; candidate tests run per class over every core; only the merging of
 //!   results is serialised.
 //! - **Realisation** is the same over individuals, with the consistency run's labels as
 //!   known and possible types and every refutation's model pruning the others
-//!   ([`realise`]).
+//!   ([`realise`](mod@realise)).
 //!
 //! The output is the context core's [`Classification`] (whose `canonical` is the DL lab's
 //! taxonomy format) and a [`Realisation`] in the reference runner's format; both report

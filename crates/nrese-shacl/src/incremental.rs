@@ -163,7 +163,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
 /// A result is the same finding in either compilation when its focus node, path, value,
 /// shape (by node), component, source constraint, the shape's severity and the messages in
 /// effect (the result's own, else the shape's) are: compared in place, nothing copied
-/// ([`Key`]). The comparison's own storage is charged to `resources` before it is filled,
+/// (`Key`). The comparison's own storage is charged to `resources` before it is filled,
 /// and it checks `resources` as it goes; only the results introduced are decoded.
 pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     before: &A,
