@@ -4,6 +4,8 @@
 //! engine), Horn and EL ontologies to the context core, the rest to the hypertableau.
 //! Each test names the route that must be taken (the performance choice's guard).
 
+use nrese_store::MutationError;
+
 use super::queries::query;
 use super::{insert, pipeline};
 
@@ -546,32 +548,79 @@ fn annotation_property_axioms_entail_nothing_about_annotated_terms() {
     );
 }
 
-/// An annotation property's domain says nothing about the subjects it annotates under the
-/// OWL 2 Direct Semantics, so a subject of a class disjoint with that domain is consistent:
-/// the commit must go through. The route is printed.
-fn annotation_domain_disjoint_with_the_subject_commits(extra: &str) {
+/// `data` (with `extra`) committed: the RL rules clash where OWL 2 DL is consistent, and
+/// this release refuses the commit as undecided (`WhyUndecided`), not as an inconsistency.
+/// When OWL 2 DL decides these clashes, the tests that call this expect the commit.
+fn refused_as_undecided(data: &str, extra: &str) {
     let dl = pipeline();
-    let result = insert(
-        &dl,
-        &format!(
-            ":note a owl:AnnotationProperty ; rdfs:domain :C . \
-             :C a owl:Class ; owl:disjointWith :D . :D a owl:Class . \
-             :x a owl:NamedIndividual , :D ; :note \"a note\" . {extra}"
-        ),
+    let result = insert(&dl, &format!("{data} {extra}"));
+    let Err(MutationError::Rejected(reject)) = &result else {
+        panic!("expected the refusal, got {result:?}");
+    };
+    assert!(
+        reject
+            .detail
+            .contains("annotation-property axioms or a punned name")
+            && reject.detail.contains("doesn't decide")
+            && !reject.detail.contains("consistency check"),
+        "{}",
+        reject.detail
     );
-    let route = dl.store().dl_bounds().last;
-    eprintln!("route {route}: {result:?}");
-    assert!(result.is_ok(), "rejected, route {route}: {result:?}");
+}
+
+/// An annotation property's domain says nothing under the OWL 2 Direct Semantics about the
+/// subjects it annotates; the rules' prp-dom puns `:x` into `:C`, disjoint with `:D`.
+const ANNOTATION_DOMAIN: &str = ":note a owl:AnnotationProperty ; rdfs:domain :C . \
+     :C a owl:Class ; owl:disjointWith :D . :D a owl:Class . \
+     :x a owl:NamedIndividual , :D ; :note \"a note\" .";
+
+/// The individuals `:A` and `:B` are equal, the classes of the same names are not
+/// (punning); the rules' eq-rep-o makes `:x` a `:B` too.
+const PUNNED_DISJOINT: &str = ":A a owl:Class ; owl:disjointWith :B ; owl:sameAs :B . \
+     :B a owl:Class . :x a owl:NamedIndividual , :A .";
+
+#[test]
+fn an_annotation_domain_disjoint_with_the_subject_is_refused_as_undecided_in_rl() {
+    refused_as_undecided(ANNOTATION_DOMAIN, "");
 }
 
 #[test]
-fn an_annotation_domain_disjoint_with_the_subject_commits_in_rl() {
-    annotation_domain_disjoint_with_the_subject_commits("");
+fn an_annotation_domain_disjoint_with_the_subject_is_refused_as_undecided_outside_rl() {
+    refused_as_undecided(ANNOTATION_DOMAIN, OUTSIDE_RL);
 }
 
 #[test]
-fn an_annotation_domain_disjoint_with_the_subject_commits_outside_rl() {
-    annotation_domain_disjoint_with_the_subject_commits(OUTSIDE_RL);
+fn an_equality_of_punned_disjoint_class_names_is_refused_as_undecided_in_rl() {
+    refused_as_undecided(PUNNED_DISJOINT, "");
+}
+
+#[test]
+fn an_equality_of_punned_disjoint_class_names_is_refused_as_undecided_outside_rl() {
+    refused_as_undecided(PUNNED_DISJOINT, OUTSIDE_RL);
+}
+
+/// The control: a clash with no annotation axiom and no punned name is an inconsistency
+/// under both readings, and is rejected as one on both routes.
+#[test]
+fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
+    for extra in ["", OUTSIDE_RL] {
+        let dl = pipeline();
+        let result = insert(
+            &dl,
+            &format!(
+                ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class . \
+                 :x a owl:NamedIndividual , :A , :B . {extra}"
+            ),
+        );
+        let Err(MutationError::Rejected(reject)) = &result else {
+            panic!("expected a rejection, got {result:?}");
+        };
+        assert!(
+            !reject.detail.contains("doesn't decide"),
+            "{}",
+            reject.detail
+        );
+    }
 }
 
 /// A class name that is also an individual (punning, OWL 2 Structural Specification §5.9)
