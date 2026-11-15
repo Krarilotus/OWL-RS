@@ -1,6 +1,6 @@
 # HTTP interface
 
-What the server answers on which URL, for the code of the commit this page is in. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)); a disabled surface answers 404.
+This page says what the server answers on which URL, in the version it comes with, not in a plan or another version. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)), and a disabled surface answers 404.
 
 ## SPARQL
 
@@ -16,7 +16,7 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 
 The examples run against a server started with the defaults (`open-workbench`, no authentication, an empty in-memory store, reasoning off), in this order.
 
-**`/dataset/query`**: queries only.
+**`/dataset/query`** takes queries only.
 - Methods: `GET` with `?query=…`; `POST` with a form (`Content-Type: application/x-www-form-urlencoded`, a `query` field); `POST` with the query as the body (`application/sparql-query`; a body with any other `Content-Type`, or none, is read as the query too, never refused as `415`; `/dataset/sparql` takes `application/sparql-query` and `application/sparql-update` bodies and refuses a missing or unknown media type with `415`) and the other parameters in the URL. The query is in the body or the URL, not both, and only once.
 - Parameters: `query` (required), the dataset and `infer`, `explain`, `dl-answers` parameters ([below](#query-parameters)); others are ignored.
 - Response: `200` with the results in the format the `Accept` header asks for ([formats](#result-formats); JSON by default) and the `NRESE-Completeness` header.
@@ -29,7 +29,7 @@ curl -sS http://localhost:8080/dataset/query --data-urlencode 'query=ASK {}'
 {"head":{},"boolean":true}
 ```
 
-**`/dataset/update`**: updates only.
+**`/dataset/update`** takes updates only.
 - Method: `POST` with a form (an `update` field), or with the update as the body (`application/sparql-update`; `text/plain` or no `Content-Type` are read the same) and the other parameters in the URL. The update is in the body or the URL, not both, and only once.
 - Parameters: `update` (required), `using-graph-uri`, `using-named-graph-uri` (repeatable; [below](#update-parameters)).
 - Response: `204 No Content`, no body; the change is committed and synced.
@@ -43,7 +43,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8080/dataset/update \
 204
 ```
 
-`/dataset/sparql` and `/dataset`: queries and updates on one URL.
+**`/dataset/sparql`** and **`/dataset`** take queries and updates on one URL.
 - `GET` with `query`: as `/dataset/query`. `GET` without `query`: the service description (Turtle, `200`).
 - `POST`: a form is a query or an update by its field (`query` or `update`; both, or neither, is `400`); a body by its media type (`application/sparql-query` or `application/sparql-update`; any other is `415`).
 - Response and failures: those of the endpoint the request is routed to.
@@ -60,7 +60,7 @@ curl -sS http://localhost:8080/dataset/sparql -H 'Content-Type: application/spar
 
 #### Queries
 
-Queries follow the SPARQL 1.1 Protocol; how to send them: [contracts](#endpoint-contracts).
+Queries follow the SPARQL 1.1 Protocol, and the [contracts](#endpoint-contracts) say how to send them.
 
 Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
 header `NRESE-Completeness`: `complete; regime=owl2-ql`, or `sound-only; regime=owl2-ql; reasons="ql: …"` when answers
@@ -114,7 +114,7 @@ A default graph merged from several graphs (`FROM`, `default-graph-uri`, the uni
 
 #### Full-text search
 
-Full-text search uses Blazegraph's vocabulary (what ResearchSpace sends), in any basic graph pattern:
+Full-text search uses Blazegraph's vocabulary (what ResearchSpace sends), in any basic graph pattern.
 
 ```sparql
 PREFIX bds: <http://www.bigdata.com/rdf/search#>
@@ -136,7 +136,7 @@ SELECT ?s ?o ?score WHERE {
 
 The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Under `GRAPH ?g` the search runs per named graph of the query's dataset (SPARQL 1.1 §18.6): a row per literal and graph that has it, `?g` bound, at the same relevance; `bds:rank`, `bds:minRank` and `bds:maxRank` count within each graph, so there `bds:maxRank` doesn't shorten the search (every match is read), while `bds:minRelevance` does. Words are runs of letters and digits. The index is built in memory at the first search and extended with new literals at later searches; a durable store writes it to `derived/` of its data directory after each checkpoint and reads it back at the first search after a restart, so it isn't built again. Searches start the pattern's joins.
 
-The same index answers Jena's `text:query` (what Fuseki clients send) and GraphDB's legacy `luc:` predicates:
+The same index answers Jena's `text:query` (what Fuseki clients send) and GraphDB's legacy `luc:` predicates.
 
 ```sparql
 PREFIX text: <http://jena.apache.org/text#>
@@ -152,7 +152,7 @@ SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 
 #### Vector similarity search
 
-Vector similarity search goes through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
+Vector similarity search goes through a virtual `SERVICE`. The vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array, which is what embedding services return), and the search finds the nearest ones.
 
 ```sparql
 PREFIX nrv: <urn:nrese:vector:>
@@ -182,7 +182,7 @@ GeoSPARQL functions work over geometry literals (`geo:wktLiteral`, `geo:geoJSONL
 
 #### Updates
 
-How to send them: [contracts](#endpoint-contracts).
+The [contracts](#endpoint-contracts) say how to send them.
 
 <a id="update-parameters"></a>
 
@@ -194,7 +194,7 @@ How to send them: [contracts](#endpoint-contracts).
 
 #### Formats
 
-<a id="result-formats"></a>Result formats are chosen from the `Accept` header by weight (`q`), with wildcards; the first of each list is the default:
+<a id="result-formats"></a>Result formats are chosen from the `Accept` header by weight (`q`), with wildcards, and the first of each list is the default.
 
 | Query form | Media types |
 |---|---|
@@ -206,20 +206,20 @@ How to send them: [contracts](#endpoint-contracts).
 
 ## Classification
 
-`GET /dataset/classification`: the OWL 2 DL class hierarchy of the asserted statements (all graphs), computed on request by the DL engines ([design](../design/owl2-dl.md) §7): the context core where its Horn stage takes the ontology (EL and Horn ontologies), else the hypertableau driver (known and possible subsumers, tests in parallel on `dl.threads` workers, within `dl.timeout`). The result is kept per revision, so a second request on an unchanged store is free.
+`GET /dataset/classification` gives the OWL 2 DL class hierarchy of the asserted statements (all graphs), computed on request by the DL engines ([design](../design/owl2-dl.md) §7), by the context core where its Horn stage takes the ontology (EL and Horn ontologies) and else by the hypertableau driver (known and possible subsumers, tests in parallel on `dl.threads` workers, within `dl.timeout`). The result is kept per revision, so a second request on an unchanged store is free.
 
 - `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `equivalent_to_thing`, `consistent` (`true`; `false`: the ontology has no model, and nothing is listed; `null`: not decided) with `consistency` (`consistent`, `inconsistent` or `unknown`), `engine` (`context-core`, `tableau`, or `el`: the EL classifier, where an irregular role hierarchy is all the DL engines leave out and the ontology has no assertion, no range on a property of a chain and nothing the EL classifier skips, under `dl.outside_profile = proven`, the default), `complete` (nothing left out and the consistency decided) and `incomplete` (why subsumptions may be missing: a budget ran out, a construct the engines lack, or, for `el`, an object-property range; what is listed is entailed either way), `micros`; where a procedure outside OWL 2 DL answered (`el`), `outside_profile`: `what` (what in the input is outside OWL 2 DL), `by` (the procedure), `guaranteed` and `not_guaranteed` (what its answer guarantees, and what not)
 - `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes; an inconsistent ontology as the one statement `owl:Thing rdfs:subClassOf owl:Nothing`; where a procedure outside OWL 2 DL answered, a comment line first: `# Outside OWL 2 DL (an irregular role hierarchy); answered by el. Guaranteed: … Not guaranteed: …`
 
 Both forms carry `NRESE-Completeness` (regime `owl2-dl`, as query answers do): `complete`, or `sound-only` with the reasons (`dl: …`), an undecided consistency among them. An answer from outside OWL 2 DL names what is outside and the procedure after the regime: `complete; regime=owl2-dl; outside="an irregular role hierarchy"; by=el`.
 
-`GET /dataset/realisation`: each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of; none for an inconsistent ontology), `consistent` and `consistency` (as above), `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements, or an inconsistency's one statement as above; the same `NRESE-Completeness` header.
+`GET /dataset/realisation` gives each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of; none for an inconsistent ontology), `consistent` and `consistency` (as above), `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements, or an inconsistency's one statement as above; the same `NRESE-Completeness` header.
 
-The hierarchy isn't stored; the reasoning modes materialise instance-level inferences (see [config-reference.md](config-reference.md)).
+The hierarchy isn't stored, and the reasoning modes materialise instance-level inferences (see [config-reference.md](config-reference.md)).
 
 ## Graph Store Protocol
 
-`/dataset/data?default` or `/dataset/data?graph=<IRI>`
+The Graph Store Protocol works on `/dataset/data?default` or `/dataset/data?graph=<IRI>`.
 
 | Method | Does | Answers |
 |---|---|---|
@@ -237,7 +237,7 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 
 ## RDF4J protocol
 
-The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it. The configured store is repository `nrese` (what `/dataset/…` serves); `PUT /repositories/{id}` creates another (admins; on disk under `repositories/<id>/` of the data directory, opened again at start, with the default's store settings). The repository configuration in the body (RDF4J's, Turtle unless `Content-Type` says otherwise) sets its title (`rdfs:label`) and reasoning: GraphDB's `ruleset` (`empty`, `rdfs`, `rdfsplus`, `owl-horst`, `owl2-ql`, `owl2-rl`, also `-optimized`, or an NRESE reasoning mode), else an RDFS inferencer sail (`…RDFSInferencer`) for RDFS and a sail stack without one for none; a configuration naming neither keeps the server's reasoning, and one naming another repository id is refused (400). User rules: a `ruleset` that is the path of a GraphDB ruleset file (`….pie`, read on the server; the whole program), or rules in the configuration (`nrc:rules`, Notation3 unless `nrc:rulesFormat "pie"`, `nrc:` = `https://nrese.dev/ns/config#`; added to the ruleset named beside them, else the whole program). What its classifications answer outside OWL 2 DL: `nrc:outsideProfile` (`proven` or `dl-part`; the server's `dl.outside_profile` when absent). Rules are checked when the repository is created (400 with the faulty rule) and kept with its settings and `DELETE /repositories/{id}` removes one with its data. A repository besides the default has no preloaded ontology; its `SERVICE` calls go to the endpoints `federation.allow` names, as the default's do.
+The server speaks the RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it. The configured store is repository `nrese` (what `/dataset/…` serves), and `PUT /repositories/{id}` creates another (for administrators, on disk under `repositories/<id>/` of the data directory, opened again at start, with the default's store settings). The repository configuration in the body (RDF4J's, Turtle unless `Content-Type` says otherwise) sets its title (`rdfs:label`) and reasoning: GraphDB's `ruleset` (`empty`, `rdfs`, `rdfsplus`, `owl-horst`, `owl2-ql`, `owl2-rl`, also `-optimized`, or an NRESE reasoning mode), else an RDFS inferencer sail (`…RDFSInferencer`) for RDFS and a sail stack without one for none; a configuration naming neither keeps the server's reasoning, and one naming another repository id is refused (400). User rules: a `ruleset` that is the path of a GraphDB ruleset file (`….pie`, read on the server; the whole program), or rules in the configuration (`nrc:rules`, Notation3 unless `nrc:rulesFormat "pie"`, `nrc:` = `https://nrese.dev/ns/config#`; added to the ruleset named beside them, else the whole program). What its classifications answer outside OWL 2 DL: `nrc:outsideProfile` (`proven` or `dl-part`; the server's `dl.outside_profile` when absent). Rules are checked when the repository is created (400 with the faulty rule) and kept with its settings and `DELETE /repositories/{id}` removes one with its data. A repository besides the default has no preloaded ontology; its `SERVICE` calls go to the endpoints `federation.allow` names, as the default's do.
 
 | Path | What |
 |---|---|
@@ -260,14 +260,14 @@ Terms in `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>
 
 ## SHACL validation
 
-`/dataset/shacl`
+SHACL validation is at `/dataset/shacl`.
 
 | Method | Validates against | Body |
 |---|---|---|
 | GET | The repository's shapes graph (`shacl.shapes_graph`, by default `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph`) | none |
 | POST | The shapes in the request body; they aren't stored | The shapes, in any graph format |
 
-Shapes are stored like any graph: `PUT /dataset/data?graph=<the shapes graph>`.
+Shapes are stored like any graph, with `PUT /dataset/data?graph=<the shapes graph>`.
 
 | Parameter | Meaning |
 |---|---|
@@ -276,36 +276,38 @@ Shapes are stored like any graph: `PUT /dataset/data?graph=<the shapes graph>`.
 | `shapes-graph=<IRI>` | `GET` only: shapes stored in another graph |
 | `infer=false` | Validate asserted statements only (the default includes inferred ones) |
 
-The answer is the validation report, with status 200 whether the data conforms or not. A validation changes nothing, and a report that doesn't conform rejects no write:
+The answer is the validation report, with status 200 whether the data conforms or not. A validation changes nothing, and a report that doesn't conform rejects no write. The report comes in two forms.
 - `text/turtle` by default, or any other graph format: the `sh:ValidationReport` graph;
 - `application/json`: `conforms`, `revision`, `shapes` (how many were used; 0 means no shapes were found) and `results`, each with `focusNode`, `resultPath`, `value`, `sourceShape`, `sourceConstraintComponent`, `resultSeverity` and `resultMessage`.
 
 Ill-formed shapes are 400, naming the shape and the parameter.
 
-Limits today:
+These are its limits.
+
 - SHACL Core and SHACL-SPARQL; SHACL Advanced Features are not supported, nor is `sh:entailment` (a shapes graph that asks for an entailment regime is reported as a failure). Commits are validated where the SHACL gate is on (`shacl.gate`, off by default: [config-reference.md](config-reference.md)), and rejected only under `enforce`; bulk loads (`nrese-server load`, the import endpoints) skip the gate ([storage](../spec/02-storage-and-transactions.md#bulk-loads)).
 - A `POST`'s shapes live in a transaction of its own that is never committed and takes no writer slot, so other writes go on; they count against the request's memory.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
 ## Draft checks (`/api/v1/draft-check`)
 
-Isolated checks of pinned inputs, for the Datamodel Workflow and any other client of its store-check protocol (`dmw-store-check/1`, see [the DMW guide](../integration/datamodel-workflow.md#draft-checks)). Each check runs in a throwaway in-memory store: no repository is read or written. The permission asked is the one to query.
+These are isolated checks of pinned inputs, for the Datamodel Workflow and any other client of its store-check protocol (`dmw-store-check/1`, see [the DMW guide](../integration/datamodel-workflow.md#draft-checks)). Each check runs in a throwaway in-memory store, and no repository is read or written. The permission asked is the one to query.
 
 | Method and URL | What |
 |---|---|
 | `GET /api/v1/draft-check/capabilities` | The protocol, operations (`shacl`, `query`, `reasoning`), profiles, semantics, this build's id, and the longest time limit a request may ask for |
 | `POST /api/v1/draft-check` | One check: a JSON request with the check's identity, limits and inputs (N-Triples; the query as SPARQL text); the answer is JSON |
 
-Every answer is 200 with a terminal status (`completed`, `failed`, `timeout`, `unsupported`) and echoes the request's identity. A request that isn't a draft-check request is 400; a larger one than the upload limit, 413.
+Every answer is 200 with a terminal status (`completed`, `failed`, `timeout`, `unsupported`) and echoes the request's identity. A request that isn't a draft-check request is 400, and one larger than the upload limit is 413.
 
-Limits today:
+These are its limits.
+
 - One profile, `owl2-rl`, under the semantics `nrese:draft-check/2`: `logical_consistent` is `false` where the OWL 2 RL rules or the OWL 2 DL engines find no model, `true` where neither does and both decided, and `null` where it isn't decided; unsatisfiable classes by the OWL 2 DL classification, none listed for an inconsistent input. Axioms either skipped, and an undecided verdict, are reported as unsupported, and the answer is then not complete. (`/1`'s `logical_consistent` was the RL rules' alone; it is no longer served.)
 - SHACL Core only; SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported as unsupported.
 - A time limit above the server's query timeout is refused, not shortened.
 
 ## Engine API (`/api/v1`)
 
-One repository-scoped API for what the server does ([ADR-0007](../adr/0007-one-engine-api.md); library-only parts, such as Notation3 data and resolving quarantined statements, have none yet), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; tests check that every route is in it, and that each SPARQL Protocol request form it names is served and each refusal is described as `application/problem+json`), for generating clients. The same description is committed beside this page as [openapi.json](openapi.json); a test fails when it differs from what the code generates.
+The engine API is one repository-scoped API for what the server does, the same for every repository ([ADR-0007](../adr/0007-one-engine-api.md), and library-only parts, such as Notation3 data and resolving quarantined statements, have none yet). The `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it for generating clients (OpenAPI 3.1, generated from the server's handlers and types, and tests check that every route is in it, that each SPARQL Protocol request form it names is served and that each refusal is described as `application/problem+json`). The same description is committed beside this page as [openapi.json](openapi.json); a test fails when it differs from what the code generates.
 
 | URL | What |
 |---|---|
@@ -333,7 +335,7 @@ One repository-scoped API for what the server does ([ADR-0007](../adr/0007-one-e
 
 ### Users, workspaces and policies (`/api/v1/access`)
 
-[ADR-0008](../adr/0008-users-workspaces-policies.md). Server-wide; every change takes a `reason` (in the JSON body, or `?reason=` for `DELETE` and the import), answers with its history record (`number`, `author`, `time`, `reason`, `summary`, `added`, `removed`), and applies to the next request.
+Users, workspaces and policies are server-wide ([ADR-0008](../adr/0008-users-workspaces-policies.md)). Every change takes a `reason` (in the JSON body, or `?reason=` for `DELETE` and the import), answers with its history record (`number`, `author`, `time`, `reason`, `summary`, `added`, `removed`) and applies to the next request.
 
 | URL | What | Who |
 |---|---|---|
@@ -355,7 +357,7 @@ Graph prefixes: a personal space is `{base}space/{user}/`, a workspace `{base}wo
 
 ## Graph-level access control
 
-With access enforced (the access state's `enforced` setting, on once a policy file is imported or an administrator turns it on) each user has its own dataset: the graphs its roles, its workspaces and its personal space let it read. The policy file (`auth.access_policy`, [configuration](config-reference.md#graph-level-access-control)) is imported at the first start; afterwards the state changes through `/api/v1/access` (a changed file is reported at start and applies only when imported).
+With access enforced (the access state's `enforced` setting, on once a policy file is imported or an administrator turns it on) each user has its own dataset, the graphs its roles, its workspaces and its personal space let it read. The policy file (`auth.access_policy`, [configuration](config-reference.md#graph-level-access-control)) is imported at the first start, and afterwards the state changes through `/api/v1/access` (a changed file is reported at start and applies only when imported).
 
 - **Queries** evaluate over that dataset, restricted before anything is evaluated: the other graphs are absent, not forbidden. `GRAPH ?g` never binds them, `FROM` and `GRAPH` with their names match nothing, counts don't see them, and a union default graph merges the readable graphs only. The same holds for the `WHERE` clauses of updates, RDF4J's `/statements`, `/size` and `/contexts`, and reads inside RDF4J transactions.
 - **Inferred statements** come from statements in any graph; users who may not read every graph see the asserted statements only, unless the policy sets `inferred = "visible"` (all inferred statements, to users who may read the default graph) or `inferred = "supported"` (those one of whose derivations uses graphs the user may read alone; [configuration](config-reference.md)). A statement asserted only in graphs the user can't read is shown to them as inferred where it would be without that assertion: under `"supported"` when the graphs they may read derive it, under `"visible"` when it follows from the other statements without that assertion. So adding or removing an assertion in a graph a user can't read changes none of their answers about what they can derive (not yet under `reasoner.equality = "compact"` with `"visible"`). Queries, counts, statement reads and explanations agree on which.
@@ -365,7 +367,7 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 
 ## Status codes
 
-Nothing of a request refused with a `4xx` status is applied, except that a refused write's new terms can stay in the dictionary and show in search ([limits](../limits.md#storage-and-transactions)). Each row says what to do; the check is the same request answering `2xx`.
+Nothing of a request refused with a `4xx` status is applied, except that a refused write's new terms can stay in the dictionary and show in search ([limits](../limits.md#storage-and-transactions)). Each row says what to do, and the check is the same request answering `2xx`.
 
 | Code | When | What to do |
 |---|---|---|
@@ -384,7 +386,7 @@ Nothing of a request refused with a `4xx` status is applied, except that a refus
 
 Every error is an `application/problem+json` document (RFC 9457), whoever answered: a handler, or the framework itself (no such route 404, a method the route doesn't take 405 with `Allow`, a body that doesn't decode). It has `type`, `title`, `status` and `detail`, and `request_id`, the id that `x-request-id` carries on every response and the server's log carries with the request. A rejected commit answers 400, its type saying what kind of reason the committer is shown, not which check rejected: `reasoner-reject` (the data shown is inconsistent), `shacl-reject` (the data shown has SHACL results the gate rejects for) or `commit-reject` (the committer's graphs show no reason by themselves, whichever check rejected). The data shown is the whole data for a committer that may read every graph, else the graphs it may read. Its `reasoner_reject` has the rule or constraint and the statements shown, where there are any; the field keeps its name for every kind, so that clients that read it go on working. The exceptions are for clients that show the message as text: SPARQL parse errors under the `plain-text` profile, and an RDF4J transaction's refused isolation level; and a not-ready `503` from `/readyz` or the extended health, which is the status document probes read. The console and its CLI print an error as `title: detail (request <id>)`, and the CLI exits non-zero.
 
-A server that doesn't start answers nothing: its errors are in the log and its exit status ([startup errors](server-setup.md#startup-errors), such as a [locked data directory](server-setup.md#err-data-directory-locked) or an [address that can't be bound](server-setup.md#err-failed-to-bind)).
+A server that doesn't start answers nothing, and its errors are in the log and its exit status ([startup errors](server-setup.md#startup-errors), such as a [locked data directory](server-setup.md#err-data-directory-locked) or an [address that can't be bound](server-setup.md#err-failed-to-bind)).
 
 ### Example: a SPARQL syntax error
 
@@ -443,7 +445,7 @@ Under `policy.sparql_parse_error_profile = "plain-text"` the same error is `400`
 
 Monitoring that needs figures or DL diagnostics should authenticate to `/api/v1/repositories/{id}/info` as a whole-dataset reader or administrator. With access enforcement off, the existing unrestricted access view preserves detailed `/info` responses, including for an unconfigured single-user server without credentials. `/readyz` remains status-only.
 
-Routes of the earlier release answer as before until the next release, with `Deprecation: @1790985600` (RFC 9745: since 3 October 2026) and `Link: <successor>; rel="successor-version"`:
+Routes of the earlier release answer as before until the next release, with `Deprecation: @1790985600` (RFC 9745, since 3 October 2026) and `Link: <successor>; rel="successor-version"`.
 
 | Earlier | Now |
 |---|---|
@@ -455,7 +457,7 @@ Routes of the earlier release answer as before until the next release, with `Dep
 | `/api/ai/status`, `/api/ai/query-suggestions` | `/api/v1/ai/status`, `/api/v1/ai/query-suggestions` |
 | `/api/v1/queries…` (saved queries) | `/api/v1/saved-queries…` (the running queries are `/api/v1/repositories/{id}/queries`) |
 
-`/metrics`, in Prometheus' text format:
+`/metrics` gives these metrics, in Prometheus' text format.
 
 | Metric | What |
 |---|---|
