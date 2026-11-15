@@ -8,11 +8,11 @@
 | See what it does, and which standards it follows | [features and standards](what-it-covers.md) |
 | Know where it stops, and what to do instead | [limits and deviations](limits.md) |
 | Know what reasoning computes and what an answer promises | [reasoning](spec/reasoning-semantics.md) |
-| Load your own data | [your own data](tutorial.md#your-own-data), and for large files [bulk loading](ops/server-setup.md#54-bulk-loading) |
+| Load your own data | [your own data](tutorial.md#your-own-data), and for large files [bulk loading](ops/server-setup.md#loading-data) |
 | Change a setting, or switch reasoning | [change a setting](tutorial.md#change-a-setting-start-over), [every setting](ops/config-reference.md) |
 | Call it over HTTP | [the HTTP interface](ops/http-api.md) |
-| Run it as a service | [server setup](ops/server-setup.md) and its [commands](ops/server-setup.md#commands) |
-| Back up and restore | [a complete drill](ops/backup-restore-drills.md) |
+| Run it as a service | [running a server](ops/server-setup.md) and its [commands](ops/server-setup.md#commands) |
+| Back up and restore | [backups](ops/backups.md), with a drill to prove they restore |
 | Understand an error | [status codes](ops/http-api.md#status-codes), [startup errors](ops/server-setup.md#startup-errors) |
 | Build it from source | [getting started](dev/getting-started.md) |
 | Use a crate on its own | [the crates](ARCHITECTURE.md#24-dependencies-and-using-a-crate-on-its-own) |
@@ -81,7 +81,7 @@ its manual.
 [server-setup.md](ops/server-setup.md) covers deploying, loading and moving data in,
 [config-reference.md](ops/config-reference.md) every setting and
 [http-api.md](ops/http-api.md) every endpoint, and there are
-[replication.md](ops/replication.md) and [backup-restore-drills.md](ops/backup-restore-drills.md).
+[replication.md](ops/replication.md) and [backups.md](ops/backups.md).
 The integrations are [ResearchSpace](integration/researchspace.md) and
 [the Datamodel Workflow](integration/datamodel-workflow.md).
 To contribute, there are [CONTRIBUTING.md](../CONTRIBUTING.md), [AGENTS.md](../AGENTS.md) for

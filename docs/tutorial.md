@@ -85,11 +85,11 @@ curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   supports is an `rdfs:Datatype` ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
 - After the restart the count is the same. On Docker's stop signal the server lets the
   requests in flight finish, closes the store and exits
-  ([stopping](ops/server-setup.md#64-stopping)). Every commit is synced to the log
+  ([stopping](ops/server-setup.md#stopping)). Every commit is synced to the log
   before it is acknowledged, so not even a kill loses one
   ([durability](spec/02-storage-and-transactions.md#durability-on-disk-mode)).
 - Other syntaxes take their media type as `Content-Type`. Large files load offline with
-  `nrese-server load` ([server setup](ops/server-setup.md)).
+  `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
 - Queries are standard SPARQL ([SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns)).
   This one, sent as `query=` like the count, gives the names of the animals older than 5, in order:
   `PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?a a ex:Animal ; ex:age ?age ; ex:name ?name . FILTER(?age > 5) } ORDER BY ?name`.
@@ -135,4 +135,4 @@ To start over with no data, run `docker rm -f nrese && docker volume rm nrese-da
   and queries included, and the console's own command-line client is described under
   [console CLI](dev/getting-started.md#frontend-cli).
 - [Features and standards](what-it-covers.md) says what NRESE does, with the limits of each part.
-- [Server setup](ops/server-setup.md) is about running it as a service.
+- [Running a server](ops/server-setup.md) is about running it for others, and [backups](ops/backups.md) about keeping its data.

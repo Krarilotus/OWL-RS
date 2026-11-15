@@ -1,7 +1,7 @@
 # Read replicas
 
 One server takes the writes and ships its write-ahead log. Other servers apply it and answer
-queries (hardware plan H6, step 1). This gives more query throughput and availability. The
+queries. This gives more query throughput and availability. The
 data must still fit one machine; partitioning across machines is a later step.
 
 ## How it works

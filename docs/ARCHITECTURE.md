@@ -93,8 +93,8 @@ reasoning on the reasoner then recomputes the inferences and runs the rules' con
 | SHACL | [design](design/shacl.md), [HTTP interface](ops/http-api.md#shacl-validation) | `crates/nrese-shacl/src/lib.rs`, `crates/nrese-store/src/shacl.rs` |
 | Access control | [HTTP interface](ops/http-api.md#graph-level-access-control), [ADR-0008](adr/0008-users-workspaces-policies.md) | `crates/nrese-store/src/access/mod.rs` |
 | Memory limits | [budgets](ops/config-reference.md#budgets) | `crates/nrese-store/src/runtime.rs`, `crates/nrese-exec/src/budget.rs` |
-| Bulk load, quarantine | [server setup](ops/server-setup.md), [quarantine](design/quarantine.md) | `crates/nrese-store/src/bulk_load.rs`, `crates/nrese-store/src/quarantine.rs` |
-| Backups | [backup and recovery](ops/server-setup.md#10-backup-and-recovery-setup) | `crates/nrese-store/src/backup.rs` |
+| Bulk load, quarantine | [loading data](ops/server-setup.md#loading-data), [quarantine](design/quarantine.md) | `crates/nrese-store/src/bulk_load.rs`, `crates/nrese-store/src/quarantine.rs` |
+| Backups | [backups](ops/backups.md) | `crates/nrese-store/src/backup.rs` |
 | Read replicas | [replication](ops/replication.md) | `crates/nrese-server/src/replication.rs` |
 | Configuration | [configuration reference](ops/config-reference.md) | `crates/nrese-server/src/config.rs` |
 | HTTP endpoints and errors | [HTTP interface](ops/http-api.md) | `crates/nrese-server/src/http/mod.rs` |
