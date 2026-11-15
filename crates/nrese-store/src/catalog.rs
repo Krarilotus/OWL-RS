@@ -104,6 +104,10 @@ pub struct RepositorySettings {
     /// `store.reader_corpus_bytes` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reader_corpus_bytes: Option<u64>,
+    /// What a classification answers on an input outside OWL 2 DL (`proven`, `dl-part`;
+    /// [`crate::OutsideProfile`]); the server's `dl.outside_profile` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_profile: Option<String>,
 }
 
 /// The longest per-repository query timeout: one hour.
@@ -127,6 +131,13 @@ impl RepositorySettings {
         self.search_scope
             .as_deref()
             .and_then(crate::SearchScope::from_name)
+    }
+
+    /// What a classification answers outside OWL 2 DL, if the settings choose it.
+    pub fn outside_profile_mode(&self) -> Option<crate::OutsideProfile> {
+        self.outside_profile
+            .as_deref()
+            .and_then(crate::OutsideProfile::from_name)
     }
 
     /// The bytes a `reader` search scope's corpora may take, if the settings give them.
@@ -174,6 +185,7 @@ pub struct Effective {
     pub ql_rewriting: crate::QlRewritingMode,
     pub search_scope: crate::SearchScope,
     pub reader_corpus_bytes: usize,
+    pub outside_profile: crate::OutsideProfile,
 }
 
 impl Effective {
@@ -190,6 +202,9 @@ impl Effective {
             reader_corpus_bytes: settings
                 .reader_corpus_bytes()
                 .unwrap_or(template.reader_corpus_bytes),
+            outside_profile: settings
+                .outside_profile_mode()
+                .unwrap_or(template.dl.outside_profile),
         })
     }
 
@@ -218,6 +233,7 @@ impl Effective {
         store.set_ql_rewriting(self.ql_rewriting);
         store.set_search_scope(self.search_scope);
         store.set_reader_corpus_bytes(self.reader_corpus_bytes);
+        store.set_outside_profile(self.outside_profile);
     }
 }
 
@@ -526,6 +542,10 @@ impl Catalog {
             ql_rewriting: effective.ql_rewriting,
             search_scope: effective.search_scope,
             reader_corpus_bytes: effective.reader_corpus_bytes,
+            dl: crate::DlConfig {
+                outside_profile: effective.outside_profile,
+                ..self.template.dl.clone()
+            },
             ..self.template.clone()
         };
         let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
@@ -839,6 +859,13 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     {
         return Err(CatalogError::Invalid(format!(
             "search_scope must be 'global' or 'reader', not '{name}'"
+        )));
+    }
+    if let Some(name) = &settings.outside_profile
+        && settings.outside_profile_mode().is_none()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "outside_profile must be 'proven' or 'dl-part', not '{name}'"
         )));
     }
     if let Some(ms) = settings.query_timeout_ms

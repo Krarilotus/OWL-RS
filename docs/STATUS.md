@@ -88,12 +88,13 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   the map and undefined, facets outside a datatype's facet space, cyclic datatype
   definitions (§11.2, §7.5); an irregular property hierarchy (§11.2), except a classification
   the EL classifier answers in a store set to answer outside OWL 2 DL by a proven procedure
-  (`OutsideProfile::Proven`, not yet a server setting; off by default): where the irregular
-  hierarchy is all the engines leave out and
+  (`dl.outside_profile`, default `proven`; a repository's `outside_profile` overrides it,
+  and `dl-part` turns it off): where the irregular hierarchy is all the engines leave out and
   the ontology has no assertion, no range on a property of a chain and nothing the EL
   classifier skips, its completion rules (which need no regular hierarchy) answer
-  `/dataset/classification` completely, `engine` `el`, and it is then no independent oracle
-  for that answer; literals beyond what
+  `/dataset/classification`, `engine` `el`, marked as outside OWL 2 DL in every form, and
+  complete where the ontology states no object-property range (else marked incomplete);
+  it is then no independent oracle for that answer; literals beyond what
   §4 asks an implementation to support (numbers past 128 bits, more than 18 fractional
   digits of a second);
 - *a budget the configuration set, answered `gave-up` naming its setting:* none is built
@@ -149,7 +150,7 @@ The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gat
 | Package | State | Correctness gate | Performance gate |
 |---|---|---|---|
 | 3.0 DL lab | done in part | the reference runner (HermiT, ELK, Openllet, Konclude), the W3C runner, the ORE development subset (80 tasks, adjudicated), the stratified-set tool (`ore.py strata`), the fast suite's DL cases, the small scope; the ≥ 300-task set's and OWL2Bench DL / UOBM reference results aren't committed | bars recorded for the 80-task subset only |
-| 3.1 Context core, Horn stage | done | Horn and EL taxonomies equal to the references'; parallel; proofs into the proof IR. The store classifies through `nrese-dl`'s context core (`nrese-store/src/classification.rs`); `nrese-reasoner`'s EL classifier remains an oracle, and answers `/dataset/classification` only where an irregular role hierarchy is all the DL engines leave out and it is complete for the ontology, in a store set to answer so (off by default; Coverage above); there it is no independent oracle | EL: measured on the development subset; the full EL track not run |
+| 3.1 Context core, Horn stage | done | Horn and EL taxonomies equal to the references'; parallel; proofs into the proof IR. The store classifies through `nrese-dl`'s context core (`nrese-store/src/classification.rs`); `nrese-reasoner`'s EL classifier remains an oracle, and answers `/dataset/classification` only where an irregular role hierarchy is all the DL engines leave out and it is complete for the ontology, in a store set to answer so (`dl.outside_profile`, on by default; Coverage above); there it is no independent oracle | EL: measured on the development subset; the full EL track not run |
 | 3.2 Bounds | done | U1 maintained per commit, equal to U1 afresh; consistency through U1 and the Horn core | LUBM(800) / UOBM(500): not measured |
 | 3.3 Hypertableau | done | the W3C DL suite: every case decided (410 right, one disputed in the suite's own answer); the small scope | not measured on the 300-task set |
 | 3.4 Classification and realisation | done | taxonomies equal to the references' on the development subset; the small scope's classification and realisation | not measured |

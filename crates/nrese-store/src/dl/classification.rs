@@ -283,6 +283,28 @@ impl nrese_reasoner::ir::Vocabulary for Lookup<'_> {
 pub(crate) struct El {
     pub classification: Classification,
     pub consistency: Verdict,
+    /// Why subsumptions may be missing: an object-property range, whose completeness the
+    /// cited proof doesn't cover ([`el_outside`]).
+    pub unproven: Option<String>,
+}
+
+/// What the EL classifier's answers say about themselves, outside OWL 2 DL: the input's
+/// irregular role hierarchy, and the texts of what they guarantee and what not. The proof
+/// cited is the EL++ calculus's (Baader, Brandt and Lutz, "Pushing the EL Envelope", IJCAI
+/// 2005, Lemma 3 and Theorem 4): arbitrary role inclusions, no ranges.
+pub(crate) fn el_outside() -> nrese_sparql::Outside {
+    nrese_sparql::Outside {
+        what: vec![Unsupported::IrregularRoleHierarchy.as_str()],
+        by: "el",
+        guaranteed: "Every subsumption listed holds under the OWL 2 Direct Semantics. Where \
+             the input states no object-property range, none is missing (the EL++ completion \
+             rules, Baader, Brandt and Lutz 2005, Lemma 3). These rules need no regular role \
+             hierarchy.",
+        not_guaranteed: "That other OWL 2 DL reasoners give this answer: the input breaks \
+             OWL 2 DL's global restrictions; reasoners that check them refuse it. Completeness \
+             where the input states an object-property range. The OWL 2 RDF-Based Semantics. \
+             Realisation, which still answers only the DL engines' lower bound.",
+    }
 }
 
 /// What the EL route gave where it was taken ([`el_answer`]).
@@ -295,8 +317,13 @@ pub(crate) enum ElRoute {
     Stopped(Option<crate::StoreError>),
 }
 
-/// The EL classifier's answer kept for `snapshot`'s revision, if there is one.
+/// The EL classifier's answer kept for `snapshot`'s revision, if there is one and the store
+/// answers outside OWL 2 DL by a proven procedure now: a change of that setting never
+/// serves the other value's answer.
 pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<El>> {
+    if store.outside_profile() != crate::dl::OutsideProfile::Proven {
+        return None;
+    }
     latest(&store.dl().classification.el, snapshot.revision())
 }
 
@@ -305,7 +332,7 @@ pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<E
 /// classifier is complete for the ontology: no assertion, no range with a chain
 /// ([`el_complete_for`]), nothing it skipped. Its completion rules (CR6) need no regular
 /// hierarchy. Taken only where the store answers outside OWL 2 DL by a proven procedure
-/// ([`crate::dl::OutsideProfile::Proven`], not the default); `None` everywhere else, where
+/// ([`crate::dl::OutsideProfile::Proven`], the default); `None` everywhere else, where
 /// the DL engines' answer stands as it is. It runs under the request's stop:
 /// `started` plus `dl.timeout`, and the store's memory watch with the process's limit
 /// ([`StoreService::memory_stop`]), polled as `nrese_reasoner::classify::classify_parallel_within`
@@ -325,7 +352,7 @@ pub(crate) fn el_answer(
     started: Instant,
 ) -> Option<ElRoute> {
     // Outside OWL 2 DL: only where the store answers by a proven procedure.
-    if store.config().dl.outside_profile != crate::dl::OutsideProfile::Proven {
+    if store.outside_profile() != crate::dl::OutsideProfile::Proven {
         return None;
     }
     // The driver's lower bound, where an irregular role hierarchy is all it left out.
@@ -334,9 +361,23 @@ pub(crate) fn el_answer(
     }
     let options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
-    if !el_complete_for(&source::read_snapshot(snapshot, memory.clone()).ok()?) {
+    let ontology = source::read_snapshot(snapshot, memory.clone()).ok()?;
+    if !el_complete_for(&ontology) {
         return None;
     }
+    // An object-property range: the answer is marked incomplete, naming the first.
+    let unproven = ontology.axioms.iter().find_map(|axiom| match axiom {
+        Axiom::ObjectPropertyRange(p, _) => {
+            let property = snapshot.decode(TermId::from_raw(p.named()));
+            let name = property.map_or_else(|| "a property".to_owned(), |t| t.to_string());
+            Some(format!(
+                "the input states an object-property range (on {name}): the EL classifier's \
+                 completeness with ranges is not proven"
+            ))
+        }
+        _ => None,
+    });
+    drop(ontology);
     let deadline = options.timeout.map(|limit| started + limit);
     let memory_stop = store.memory_stop();
     let stop = || deadline.is_some_and(|at| Instant::now() >= at) || memory_stop.exceeded();
@@ -417,6 +458,7 @@ pub(crate) fn el_answer(
     let el = Arc::new(El {
         classification,
         consistency,
+        unproven,
     });
     keep(&store.dl().classification.el, snapshot.revision(), &el);
     Some(ElRoute::Answered(el))

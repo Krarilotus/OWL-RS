@@ -1141,6 +1141,13 @@
         "additionalProperties": false,
         "description": "What a repository is created with besides the server's settings. Unknown fields are\nrefused: a misspelt setting would otherwise be silently ignored.",
         "properties": {
+          "outside_profile": {
+            "description": "What a classification answers on an input outside OWL 2 DL (`proven`, `dl-part`;\n[`crate::OutsideProfile`]); the server's `dl.outside_profile` when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ql_rewriting": {
             "description": "When queries get OWL 2 QL answers through existentials (`auto`, `on`, `off`;\ndocs/design/ql-rewriting.md §4); the server's `reasoner.ql_rewriting` when absent.",
             "type": [
