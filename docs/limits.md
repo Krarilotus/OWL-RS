@@ -118,8 +118,6 @@ leave something out.
   [storage](spec/02-storage-and-transactions.md#bulk-loads)), so neither SHACL nor the OWL 2 DL
   consistency check runs. To have the checks, load over HTTP (Graph Store), or validate after
   the load with `GET /dataset/shacl`.
-- Data that is already inconsistent can keep more facts derived before the clash, depending on the order in which
-  they were derived. Answers don't change. None known.
 - Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow. At a budget the answer
   is `sound-only` and partial (about 18 s for a class of 20,000 members, with 1,002 of 20,002 rows certain). Proofs
   per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
@@ -182,9 +180,6 @@ leave something out.
 - A commit keeps every term it added, even one no statement uses (an `INSERT` and a `DELETE` of it in one
   transaction), and such terms behave like those of deleted statements. Reclaiming them is
   planned for v1.6.
-- Terms of the system's own vocabulary are published when the stored state lacks them: the DL vocabulary, DL's
-  fresh individuals, generated rule names and configured rule constants. They come only from fixed names, the
-  configuration and the published ontology, never from a request.
 
 ## Access control
 
