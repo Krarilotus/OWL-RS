@@ -364,10 +364,10 @@ fn denied_path(path: &PropertyPathExpression) -> Option<String> {
 ///   outside them: their entailed statements are facts about individuals, which the bounds
 ///   bound and a closure holds for its profile;
 /// - on the bounds' path only, `owl:sameAs` between two different constant IRIs: U1
-///   bounds equality between the data's individuals as it bounds their other facts, so
-///   the bounds decide it; the pair neither bound holds, eq-ref's reflexive one, needs one
-///   term at both ends. A constant outside the data is no individual of U1's
-///   ([`absent_same_as`]).
+///   bounds equality between the individuals it reasons about as it bounds their other
+///   facts, so the bounds decide it; the pair neither bound holds, eq-ref's reflexive one,
+///   needs one term at both ends. Only where U1 types both as individuals
+///   ([`untyped_same_as`]).
 fn denied_read(
     predicate: &str,
     ends: Option<(&TermPattern, &TermPattern)>,
@@ -390,14 +390,27 @@ fn denied_read(
 }
 
 /// The first `owl:sameAs` read [`denied_read`] allows on the bounds' path with a constant
-/// that isn't a term of `snapshot`, the bounds' own: U1's individuals are the data's, and a
-/// term outside it may be entailed equal to another where the ontology allows only one
-/// individual (`owl:Thing ⊑ {:a}`) though neither bound says so. A dictionary lookup.
-pub(super) fn absent_same_as(query: &Query, snapshot: &Snapshot) -> Option<String> {
-    let absent = |n: &str| {
-        snapshot
-            .lookup(NamedNodeRef::new_unchecked(n).into())
-            .is_none()
+/// that `view`'s upper bound doesn't type as `owl:Thing`: U1 types the individuals it
+/// reasons about so, and a term it doesn't (outside the data, or only a class or property
+/// name) may be entailed equal to another where the ontology allows one individual only
+/// (`owl:Thing ⊑ {:a}`), though neither bound says so. On the RL route no upper bound is
+/// built: denied there (that an OWL 2 RL ontology can't force one individual isn't argued).
+pub(super) fn untyped_same_as(query: &Query, view: &View) -> Option<String> {
+    let upper = view.upper.as_ref().filter(|_| !view.rules);
+    let untyped = |n: &str| {
+        !upper.is_some_and(|u| {
+            let id = |iri: &str| u.lookup(NamedNodeRef::new_unchecked(iri).into());
+            let (Some(s), Some(p), Some(o)) = (id(n), id(RDF_TYPE), id(OWL_THING)) else {
+                return false;
+            };
+            let typed = nrese_engine::QuadPattern {
+                subject: Some(s),
+                predicate: Some(p),
+                object: Some(o),
+                graph: nrese_engine::GraphSelector::Any,
+            };
+            u.exists_in(ReadModel::Materialised, &typed)
+        })
     };
     let mut found = None;
     pattern_of(query).find(&mut |node| {
@@ -411,10 +424,8 @@ pub(super) fn absent_same_as(query: &Query, snapshot: &Snapshot) -> Option<Strin
                         TermPattern::NamedNode(b),
                     ) if p.as_str() == OWL_SAME_AS => [a.as_str(), b.as_str()]
                         .into_iter()
-                        .find(|n| absent(n))
-                        .map(|n| {
-                            format!("<{OWL_SAME_AS}> of <{n}>, which isn't a term of the data")
-                        }),
+                        .find(|n| untyped(n))
+                        .map(|n| format!("<{OWL_SAME_AS}> of <{n}>, which no upper bound types")),
                     _ => None,
                 });
         }

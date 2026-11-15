@@ -281,16 +281,14 @@ pub(crate) fn certify_closure(
     certify(completeness, query, source, false);
 }
 
-/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan):
-/// [`denied`] composed onto it, so it never says `complete` for a denied read. Its
-/// documented values stay `complete` and `sound-only`: the operators are the answer
-/// status's ([`certify_closure`]).
-pub(crate) fn certify_report(ql: Option<&mut nrese_sparql::ql::QlReport>, query: &Query) {
-    if let Some(ql) = ql
+/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan):
+/// [`denied`] composed onto it, so it never says `complete` for a denied read. The denial
+/// only: the operators are the answer status's ([`certify_closure`]).
+pub(crate) fn certify_report(completeness: Option<&mut Completeness>, query: &Query) {
+    if let Some(completeness) = completeness
         && let Some(what) = denied(query, false)
     {
-        ql.completeness
-            .incomplete("ql", format!("the query reads {what}: {DENIED}"));
+        completeness.incomplete("ql", format!("the query reads {what}: {DENIED}"));
     }
 }
 
@@ -329,7 +327,7 @@ fn plan_status_built(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
-    if let Some(what) = absent_same_as(prepared.query(), &snapshot) {
+    if let Some(what) = untyped_same_as(prepared.query(), &view) {
         return Status::sound_only(format!("the query reads {what}: {DENIED}"));
     }
     // Answered over L alone; [`certify_closure`] says what that misses.
@@ -464,7 +462,7 @@ fn decide_answers(
         ));
         return Ok(status.stream(lower_view(&view)));
     }
-    if let Some(what) = absent_same_as(prepared.query(), &snapshot) {
+    if let Some(what) = untyped_same_as(prepared.query(), &view) {
         status.add(format!("the query reads {what}: {DENIED}"));
         return Ok(status.stream(lower_view(&view)));
     }

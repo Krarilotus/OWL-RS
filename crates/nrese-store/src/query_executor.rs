@@ -425,7 +425,7 @@ pub(crate) fn run_query(
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
-    crate::dl::query::certify_report(ql.as_mut(), &prepared.query);
+    crate::dl::query::certify_report(ql.as_mut().map(|r| &mut r.completeness), &prepared.query);
     let context = report(ql.as_ref());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
@@ -632,7 +632,8 @@ pub(crate) fn explain_prepared(
 ) -> StoreResult<Explanation> {
     let options = query_options(prepared, store, cancellation, memory);
     let mut explanation = explain_query(view, &prepared.query, &options)?;
-    crate::dl::query::certify_report(explanation.ql.as_mut(), &prepared.query);
+    let report = explanation.ql.as_mut().map(|r| &mut r.completeness);
+    crate::dl::query::certify_report(report, &prepared.query);
     Ok(explanation)
 }
 
@@ -647,7 +648,8 @@ pub(crate) fn plan_prepared(
 ) -> StoreResult<PlannedQuery> {
     let options = query_options(prepared, store, cancellation, memory);
     let mut planned = plan_query(view, &prepared.query, &options)?;
-    crate::dl::query::certify_report(planned.ql.as_mut(), &prepared.query);
+    let report = planned.ql.as_mut().map(|r| &mut r.completeness);
+    crate::dl::query::certify_report(report, &prepared.query);
     Ok(planned)
 }
 

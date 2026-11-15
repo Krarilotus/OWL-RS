@@ -1385,7 +1385,14 @@ impl StoreService {
     ) -> StoreResult<nrese_sparql::ql::Printed> {
         let query = nrese_sparql::compat::parse_query(query, None)?;
         let snapshot = self.engine.snapshot();
-        Ok(nrese_sparql::ql::print(&snapshot, &query, form)?)
+        let mut printed = nrese_sparql::ql::print(&snapshot, &query, form)?;
+        // The status this store gives the same answers ([`Self::status_outside_dl`]): its
+        // regime, as the rewriting's run sets it for the RL closure, and its composition.
+        if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
+            completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
+            crate::dl::query::certify_closure(completeness, &query, "ql");
+        }
+        Ok(printed)
     }
 
     /// A query over every graph (the server's own work, tests).
