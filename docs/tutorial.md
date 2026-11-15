@@ -59,7 +59,7 @@ curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localho
 curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 docker restart nrese
-curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
+until curl -sf http://localhost:8080/readyz; do sleep 1; done
 curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 ```
@@ -91,7 +91,7 @@ docker rm -f nrese
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
   -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce \
   -e NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES=2GiB nrese
-curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
+until curl -sf http://localhost:8080/readyz; do sleep 1; done
 curl http://localhost:8080/version
 ```
 

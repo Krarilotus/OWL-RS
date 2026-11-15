@@ -45,7 +45,7 @@ limits, is in [features and standards](docs/what-it-covers.md).
 
 ## Standards
 
-The test suites below run in our checks with their data required. The counts are what the
+Each suite below runs in our checks, which fail when its data is missing. The counts are what the
 [release gate](benches/fast/w3c-expected.toml) requires to pass, with no failure allowed, and a
 test we are known to fail is listed with its reason beside its runner.
 
@@ -61,7 +61,7 @@ test we are known to fail is listed with its reason beside its runner.
 | [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/) | Its entailment rules, with the [few left out](docs/spec/reasoning-semantics.md#modes) listed | No W3C suite run |
 | [OWL 2 RL](https://www.w3.org/TR/owl2-profiles/#OWL_2_RL) | The OWL 2 RL/RDF rules, materialised and maintained with each write | 86 W3C test cases, 7 of them passed only under `owl2-dl`, and 3 skipped whose premise is in no RDF syntax or imports another ontology ([runner](crates/nrese-store/tests/w3c_owl2_rl)) |
 | [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) | Rules plus query rewriting | W3C test cases, [9 known failures](crates/nrese-store/tests/w3c_owl2_ql/expected-failures.txt) |
-| [OWL 2 DL](https://www.w3.org/TR/owl2-direct-semantics/) | Consistency, classification, realisation, proven answers | 410 W3C test cases decided as expected, [1 disputed](crates/nrese-dl/tests/tableau_w3c/disputed.txt) with a witness model ([runner](crates/nrese-dl/tests/tableau_w3c)) |
+| [OWL 2 DL](https://www.w3.org/TR/owl2-direct-semantics/) | Consistency, classification, realisation, proven answers | 410 W3C test cases answered as expected, and [1 whose expected answer is wrong](crates/nrese-dl/tests/tableau_w3c/disputed.txt), shown by a model ([runner](crates/nrese-dl/tests/tableau_w3c)) |
 | [SHACL](https://www.w3.org/TR/shacl/) Core and SHACL-SPARQL | On request, or as a gate on writes | 98 Core and 22 SHACL-SPARQL W3C tests, no known failure ([runner](crates/nrese-shacl/tests/w3c_shacl)) |
 | [GeoSPARQL 1.1](https://docs.ogc.org/is/22-047r1/22-047r1.html) | In part: functions and relations over WKT, GeoJSON and simple GML | 194 of the 212 compliance tests, 18 disputed with the reference ([runner](crates/nrese-sparql/tests/geosparql_compliance)) |
 | [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/) | Served at `/repositories/…`, so RDF4J clients and tools connect | Our own ([protocol](crates/nrese-server/tests/it/rdf4j_protocol_tests.rs), [clients](crates/nrese-server/tests/it/client_compat_tests.rs)) |
@@ -74,36 +74,35 @@ What is left out, and the deviations with what to do instead: [limits](docs/limi
 flowchart TB
   client(["Your application, the browser console or an RDF4J client"])
   subgraph proc["One server process"]
-    server["nrese-server<br/>HTTP endpoints, sign-in, rights per graph"]
-    store["nrese-store<br/>runs each write through its checks,<br/>commits it as one revision,<br/>gives each answer its status"]
-    reasoner["nrese-reasoner<br/>rules from RDFS to OWL 2 RL,<br/>maintained with each write"]
-    dl["nrese-dl<br/>OWL 2 DL: consistency,<br/>classification, proven answers"]
-    shacl["nrese-shacl<br/>SHACL Core and SHACL-SPARQL"]
-    sparql["nrese-sparql<br/>query and update evaluation"]
-    engine["nrese-engine<br/>quad indexes, snapshots,<br/>write-ahead log"]
-    base["rdf/, nrese-owl, nrese-exec, nrese-vector<br/>RDF model and syntaxes, OWL 2 model,<br/>joins and memory budgets, vector indexes"]
+    server["HTTP and sign-in<br/><i>nrese-server</i>"]
+    store["Writes and answers<br/><i>nrese-store</i>"]
+    reasoner["Rules, RDFS to OWL 2 RL<br/><i>nrese-reasoner</i>"]
+    dl["OWL 2 DL engines<br/><i>nrese-dl</i>"]
+    shacl["SHACL<br/><i>nrese-shacl</i>"]
+    sparql["SPARQL evaluation<br/><i>nrese-sparql</i>"]
+    engine["Indexes, snapshots, log<br/><i>nrese-engine</i>"]
   end
   disk[("Disk")]
 
   client -- "HTTP" --> server
   server -- "1 a write" --> store
   store -- "2 derive inferences,<br/>check consistency" --> reasoner
-  store -- "3 under owl2-dl, check<br/>consistency again" --> dl
-  store -- "4 validate the change<br/>(SHACL gate on)" --> shacl
-  store -- "5 commit asserted and<br/>inferred together" --> engine
-  engine -- "log each commit<br/>(on-disk mode)" --> disk
+  store -- "3 under owl2-dl,<br/>check again" --> dl
+  store -- "4 validate<br/>(gate on)" --> shacl
+  store -- "5 commit asserted<br/>and inferred together" --> engine
+  engine -- "log each commit<br/>(on disk)" --> disk
   server -. "a query" .-> store
-  store -. "evaluate on a snapshot" .-> sparql
+  store -. "evaluate on<br/>a snapshot" .-> sparql
   store -. "under owl2-dl,<br/>prove answers" .-> dl
   sparql -. "read" .-> engine
-  engine ~~~ base
 ```
 
 Solid arrows are a write, numbered in the order its steps run, and dashed arrows are a query.
-Each box is a crate of this workspace, and the bottom box holds the crates the others build on.
 If a step refuses the write, nothing of it is committed. A query reads a snapshot, so it doesn't
-wait for a write to finish. [Architecture](docs/ARCHITECTURE.md) has the layers, what each crate owns and
-which crates you can use on their own.
+wait for a write to finish, and the store gives its answer a status. Each box names its crate,
+and below them all are the crates they build on: the RDF model and syntaxes, the OWL 2 model,
+joins and memory budgets, and vector indexes. [Architecture](docs/ARCHITECTURE.md) has the
+layers, what each crate owns and which crates you can use on their own.
 
 ## Quick start
 
@@ -156,8 +155,8 @@ nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the
 ```
 
 Tom is an animal because the update's commit also stored the inferred statement
-`ex:tom a ex:Animal`. The status is `sound-only` because the answer comes from the OWL 2 RL rules,
-which may miss answers that full OWL 2 DL would give. Ask again with `--data infer=false` and you
+`ex:tom a ex:Animal`. The status is `sound-only`: every row is right, but the answer
+comes from the OWL 2 RL rules, which may miss answers that full OWL 2 DL would give. Ask again with `--data infer=false` and you
 read only what you stored: no rows, and the status is `complete`.
 
 The [tutorial](docs/tutorial.md) goes on from here with a delete, a refused write, your own data
