@@ -1,28 +1,32 @@
 # Status
 
-What is in, left out and planned: the [scope](what-it-covers.md#scope); each capability's state
-of work with its evidence: the [capability matrix](spec/06-target-capability-matrix.md).
+The [scope](what-it-covers.md#scope) says what is in, what is left out and what is planned, and
+the [capability matrix](spec/06-target-capability-matrix.md) gives each capability's state of
+work with its evidence.
 
-Below, the one place for the state of the work. Each item is done (implemented, tested,
-in the branch), deferred (not done, with the reason and where it went), or open.
-"Done" means done: what isn't, says so here.
+This page is the one place for the state of the work. Each item is done (implemented, tested,
+in the branch), deferred (not done, with the reason and where it went) or open. "Done" means
+done, and what isn't done says so here.
 
-- Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
+The [roadmap](ROADMAP.md) says why and in which order, and the designs are in
+[design/](design/).
 
 What is left before v2 goes to `main`, with owners and state, is the status table of the
-[merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the sections from "Audit
+[merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1, and the sections from "Audit
 work" on are the record by goal.
 
 ## Dated changes
 
-Changes that affect stored data, answers or clients, with their dates and what to do:
-- Upgrading a store written by an earlier version: what changes on purpose, and rolling back
-  ([upgrade](ops/server-setup.md#131-upgrading-a-store-from-main-to-v2)).
-- Reasoning semantics versions 4 (7 November 2026) and 3 (28 October 2026): which stored
-  verdicts and closures are rebuilt once ([reasoning semantics](spec/reasoning-semantics.md)).
-- Crash recovery of the write-ahead log (2 November 2026) and durable renames on Windows
-  (7 November 2026): what each changed ([ADR-0002](adr/0002-engine-storage-lsm-permutations.md)).
-- Routes of the earlier release, deprecated since 3 October 2026 and answering until the next
+These are the changes that affect stored data, answers or clients, with their dates and what to
+do.
+- For a store written by an earlier version, [upgrade](ops/server-setup.md#131-upgrading-a-store-from-main-to-v2)
+  says what changes on purpose and how to roll back.
+- Reasoning semantics versions 4 (7 November 2026) and 3 (28 October 2026) rebuild some stored
+  verdicts and closures once, and [reasoning semantics](spec/reasoning-semantics.md) says which.
+- [ADR-0002](adr/0002-engine-storage-lsm-permutations.md) says what the crash recovery of the
+  write-ahead log (2 November 2026) and the durable renames on Windows (7 November 2026) each
+  changed.
+- The routes of the earlier release are deprecated since 3 October 2026 and answer until the next
   release ([HTTP interface](ops/http-api.md#service-and-operations)).
 
 ## Execution and performance (PR #23)
@@ -46,41 +50,43 @@ each with its run record.
 
 ### Open work
 
-- Performance acceptance against `0f46563` is open: Horn context saturation is about 6 %
-  slower, serial and at 16 threads, with the retained accounting; there is no 95-case
+- Performance acceptance against `0f46563` is open. Horn context saturation is about 6 %
+  slower, serial and at 16 threads, with the retained accounting, and there is no 95-case
   matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
-- Resource ownership in `nrese-dl`: the envelope needed and has: an engine's budget is
+- Resource ownership in `nrese-dl` now gives the envelope what it needed. An engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
-  envelope's refusal included). `context::Engine::with_budget` no longer exists. Open:
-  detached `Individuals` keep their original owner; public mutation of
-  `Individuals.contexts` isn't tracked; a result retained beyond its request keeps its
-  engine's reservation (request-scoped saturations are dropped at the request's end;
-  cached classification draws from an envelope of its own, see Process memory above); changed policy and historical peaks
-  need an API contract first.
-- Performance acceptance of v1.5's robustness is open: the A-B-B-A `fast.py compare` of the
-  envelope and the bounded rule on the affected cases (queued on host A; lab log, 12
+  envelope's refusal included). `context::Engine::with_budget` no longer exists. Still open are
+  that detached `Individuals` keep their original owner, that public mutation of
+  `Individuals.contexts` isn't tracked and that a result retained beyond its request keeps its
+  engine's reservation (request-scoped saturations are dropped at the request's end, and
+  cached classification draws from an envelope of its own, see Process memory above). Changed
+  policy and historical peaks need an API contract first.
+- Performance acceptance of v1.5's robustness is open. It is the A-B-B-A `fast.py compare` of the
+  envelope and the bounded rule on the affected cases (queued on host A, lab log of 12
   October).
 - In vector search, the filtered search that goes first widens its beam by the joined
-  pattern's share (12 October): `vector-knn-filtered`'s recall 0.56 → 0.98, its gate passes
-  ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its uniform 64-d
-  vectors the graph search now costs what the exact scan does (10.5 against 10.4 ms): open,
-  the scan chosen by cost, and the graph's own recall at the default beam (0.44).
+  pattern's share (12 October). `vector-knn-filtered`'s recall went from 0.56 to 0.98, and its
+  gate passes ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its
+  uniform 64-d vectors the graph search now costs what the exact scan does (10.5 against
+  10.4 ms). Still open are choosing the scan by cost and the graph's own recall at the default
+  beam (0.44).
 - Rerun the answer checks with the committed recorder to decide the unordered `LIMIT`
   case.
 - For measurement, container lifetime peaks (cgroup) on host A need system-manager
-  permissions; a large-answer recorder that streams instead of retaining; the result
-  cache's overhead (keys, ranking, ID copies, encoding) is unattributed.
-- Later structure: the physical plan executed directly ([query-plan.md](design/query-plan.md)),
-  calibrated routing, NUMA, GPU and distribution ([hardware-and-scaling.md](design/hardware-and-scaling.md)).
+  permissions, a large-answer recorder that streams instead of retaining is still to come, and
+  the result cache's overhead (keys, ranking, ID copies, encoding) is unattributed.
+- The later structure work is the physical plan executed directly
+  ([query-plan.md](design/query-plan.md)), calibrated routing, NUMA, GPU and distribution
+  ([hardware-and-scaling.md](design/hardware-and-scaling.md)).
 - For write workloads, 1M/10M writes, sustained timing and incremental reasoning are not
   measured yet.
 
 ## OWL 2 DL (v1.5, branch `v15/dl-complete`, 12 October)
 
-Every construct OWL 2 DL has is decided by the engines; an answer is
-`unknown` only for what the specification rules out, a resource limit, or a reader
-diagnostic ([design](design/owl2-dl.md) §3, §6):
+Every construct OWL 2 DL has is decided by the engines. An answer is `unknown` only for what the
+specification rules out, for a resource limit or for a reader diagnostic
+([design](design/owl2-dl.md) §3, §6), as follows.
 - *ruled out by OWL 2 DL, answered `unsupported`:* `owl:topObjectProperty` where a simple
   property is required (it is composite, *Structural Specification* §11.1, §11.2: in a
   cardinality; functional, inverse-functional, irreflexive, asymmetric, disjoint);
@@ -116,36 +122,39 @@ every constructor and axiom type, one axiom up to size 4, two and three up to to
 4) and a covering array of every pair and triple of the 67 features beyond it (3,354
 ontologies of 3 to 6 axioms, all 47,905 triples), each answered by NRESE's consistency,
 classification and realisation, compared differentially and every difference settled by
-the semantics: NRESE decides every case of the scope, and of the covering array all but
+the semantics. NRESE decides every case of the scope, and of the covering array all but
 one within the campaign's 20 s (that one in 20.6 s), and no answer of NRESE's was found
-wrong. The campaign found and fixed four defects (disjoint operands U's rewriting made
-equal; keys over transitive properties; keys over U alone in the context core and in realisation). In the gate: the
-scope `3,3` (35,505 cases) against the recorded references in the push tier; its 8,578
-one-axiom cases also when only a crate nrese-dl depends on changes.
+wrong. The campaign found and fixed four defects (disjoint operands that U's rewriting made
+equal, keys over transitive properties, and keys over U alone in the context core and in
+realisation). In the gate, the scope `3,3` (35,505 cases) runs against the recorded references
+in the push tier, and its 8,578 one-axiom cases also run when only a crate nrese-dl depends on
+changes.
 
 As certificates ([design](design/owl2-dl.md) §10), "consistent", satisfiable classes and
-non-entailments of the hypertableau come with a model the independent checker
-(`nrese_dl::certificate`) verifies: 99.84 % of such claims on the small scope without data
-values (8,990,815 of 9,005,280); the number module's validated models likewise. Data values
-since 13 October (the models carry the values the datatype theory assigns: 196 of the W3C
-suite's 199 consistent answers with a model certified, the 3 others listed with why). Not
-yet: "inconsistent" and entailments (the references decide them in the campaigns).
+non-entailments of the hypertableau come with a model that the independent checker
+(`nrese_dl::certificate`) verifies. That is 99.84 % of such claims on the small scope without
+data values (8,990,815 of 9,005,280), and the number module's validated models are checked
+likewise. Data values have been covered since 13 October, as the models carry the values the
+datatype theory assigns (196 of the W3C suite's 199 consistent answers with a model certified,
+the 3 others listed with why). "Inconsistent" and entailments are not certified yet, and the
+references decide them in the campaigns.
 
 For incrementality ([design](design/owl2-dl.md) §9), U1 and the RL closure are maintained per
-commit; the consistency gate after a commit of assertions only, from a consistent
-revision, checks nothing for removals and only the ABox islands the additions touch;
-schema changes, the taxonomy, classification and realisation recompute. Each maintained
-path is tested against a cold rebuild (store: 3,200 random commits, every one accepted
-exactly when a fresh store accepts its data). Not built: the context core's incremental
-saturation, bounded-cone TBox deletion, footprint caches.
+commit. After a commit of assertions only, from a consistent revision, the consistency gate
+checks nothing for removals and only the ABox islands the additions touch, and schema changes,
+the taxonomy, classification and realisation recompute. Each maintained path is tested against
+a cold rebuild (store: 3,200 random commits, every one accepted exactly when a fresh store
+accepts its data). The context core's incremental saturation, bounded-cone TBox deletion and
+footprint caches are not built.
 
-What is open: a hard tiny case where NRESE's search is slow (`cover:3` case 2413, five axioms,
-a pigeonhole through a nominal: 20.6 s; [DL
-performance lab log](design/owl2-dl-performance.md#8-lab-log-measured-changes-kept-and-rejected));
-certificates for "inconsistent", and for the 3 data-value answers listed under Certificates.
+Two things are open. One is a hard tiny case where NRESE's search is slow (`cover:3` case 2413,
+five axioms, a pigeonhole through a nominal, 20.6 s, [DL
+performance lab log](design/owl2-dl-performance.md#8-lab-log-measured-changes-kept-and-rejected)),
+and the other is certificates for "inconsistent" and for the 3 data-value answers listed under
+Certificates.
 
-The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gates are
-[owl2-dl-performance.md](design/owl2-dl-performance.md) §6's):
+These are the packages of [design/owl2-dl.md](design/owl2-dl.md) §14, with the performance gates
+of [owl2-dl-performance.md](design/owl2-dl-performance.md) §6.
 
 | Package | State | Correctness gate | Performance gate |
 |---|---|---|---|
@@ -166,8 +175,8 @@ The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gat
 
 ## Beyond OWL 2 DL (branch `v15/dl-beyond`, 13 October)
 
-Inputs outside OWL 2 DL are decided where that is sound, and where it isn't the answer says why ([design](design/owl2-dl.md) §16;
-[campaigns and ORE](../benches/reasoning/dl/README.md#inputs-outside-owl-2-dl-13-october-2026-queue-jobs)):
+Inputs outside OWL 2 DL are decided where that is sound, and where it isn't the answer says why ([design](design/owl2-dl.md) §16,
+[campaigns and ORE](../benches/reasoning/dl/README.md#inputs-outside-owl-2-dl-13-october-2026-queue-jobs)).
 `nrese_dl::beyond` answers consistency and classification of inputs the reader finds
 outside OWL 2 DL. Every "consistent" rests on a model the independent checker verifies
 against every axiom and rule (data values included since 13 October), every
@@ -238,7 +247,7 @@ follow from their rules); nothing is assumed.
 | Step 2: rewrites on the plan | started | Named rewrites, in order, for queries and update `WHERE`s alike: `join-groups` (groups joined to each other become one basic graph pattern; inputs with an `ORDER BY` keep their place), `eager-aggregation`, `filter-pushdown`; EXPLAIN lists those that changed the query (`rewrites`). Open: pushdown on the plan itself, and the executor's match-guard strategies (paths from their bound end, limit placement, bind joins to `SERVICE`) as rewrites |
 | Step 3: estimates on the plan, EXPLAIN before running | started | `plan_query` and `explain=plan`: the rewritten plan, each node with estimated rows from the store's statistics (triple patterns exact, basic graph patterns by the join orderer, the rest by documented rules in `native/estimate.rs`), without running; every random query of the differential tests is planned. Characteristic sets of the default graph (per read model; built at once up to 1 M statements, beyond on a thread of their own, kept until the size drifts by a quarter, none past 131,072 distinct sets) estimate stars in the join orderer and in EXPLAIN. Characteristic pairs (3 October; a second scan when the sets are built, within 8 M subjects and 1 M pairs) estimate chains: a star pattern joined after an edge `?x p ?y` counts only the links whose object has its predicate (exact on the chain test, where independence was 7 times off). `perf_lab --qerror` reports the planner's q-error per operator over a query set: on LUBM(10) with OWL 2 RL (`benches/baselines/perf-lab/lubm10-owl2rl-qerror-2026-10-03.json`; all 14 queries 14.6 ms at p50) scans are exact and index joins within 2× but for one, while 5 joins are 12.6× off, all from Q8's star with two constant objects (`?Y a Department ; subOrganizationOf <University0>`): characteristic sets know no value correlations. EXPLAIN after running (`explain=true`, `explain_query`) shows the same estimates beside the actual rows for every operator, those inside an operator included (5 October): the joins of a pattern evaluated from rows (`sideways`), `limit pushdown`, `closure` (by strongly connected components), `semi join`/`anti join` (EXISTS as sets) and the rest report themselves, each with a plan guard; only full-text and vector searches have no estimate (no statistics). Open: correlated constants in stars, the physical operator choices |
 | Step 4: executor on the plan | open | |
-| The result cache, step 1 (merge checklist §2 item 7) | done | `nrese_sparql::cache` replaces the store's whole-query cache of serialised answers. Every operator's result and every prefix of a basic graph pattern's joins (not a single pattern, which is a scan, or `VALUES`) is a part kept as id columns, shared by every query of the store: keyed by the part (variables numbered, so renamed parts share) and by everything its result depends on, from the snapshot's identity (revision and content: a transaction's pending state never meets a committed part) to the user's access. Admitted by recompute cost against bytes within a byte budget (an allocator-checked guard), computed once when requested concurrently, pinnable by name (`/api/v1/…/cache/pins/{name}`, `budgets.result_cache_pins`); EXPLAIN marks parts from the cache. Cache on and off agree on random queries over random commits. A whole answer's bytes are kept per output format beside its id columns (owner's decision, 6 October), so repeats are copies. Replayed logs (performance.md lab log, 6 October), against the whole-query cache: first rounds 1.8× faster (olympics 0.253 → 0.134 s, yago-tiny 0.722 → 0.394 s), repeats as fast (0.007 → 0.007 s, 0.015 → 0.014 s). Open (v3): invalidation by footprint, delta maintenance, common subexpressions, operator internals, a compressed cache |
+| The result cache, step 1 (merge checklist §2 item 7) | done | `nrese_sparql::cache` replaces the store's whole-query cache of serialised answers. Every operator's result and every prefix of a basic graph pattern's joins (not a single pattern, which is a scan, or `VALUES`) is a part kept as id columns, shared by every query of the store: keyed by the part (variables numbered, so renamed parts share) and by everything its result depends on, from the snapshot's identity (revision and content: a transaction's pending state never meets a committed part) to the user's access. Admitted by recompute cost against bytes within a byte budget (an allocator-checked guard), computed once when requested concurrently, pinnable by name (`/api/v1/…/cache/pins/{name}`, `budgets.result_cache_pins`); EXPLAIN marks parts from the cache. Cache on and off agree on random queries over random commits. A whole answer's bytes are kept per output format beside its id columns (decided on 6 October), so repeats are copies. Replayed logs (performance.md lab log, 6 October), against the whole-query cache: first rounds 1.8× faster (olympics 0.253 → 0.134 s, yago-tiny 0.722 → 0.394 s), repeats as fast (0.007 → 0.007 s, 0.015 → 0.014 s). Open (v3): invalidation by footprint, delta maintenance, common subexpressions, operator internals, a compressed cache |
 | `nrese-sparql` split | open | Numeric promotion is done: one implementation for expressions and aggregates (`nrese-sparql/src/native/numeric.rs`) |
 
 ### D. Reasoning (with G3)
@@ -255,7 +264,7 @@ follow from their rules); nothing is assumed.
 
 ### E. Benchmarks
 
-Open, in bulk at the end of a batch.
+This is open, and it runs in bulk at the end of a batch.
 
 ### F. Assurance
 
@@ -277,17 +286,17 @@ Open, in bulk at the end of a batch.
 | G6 Hardware and scale-out | started | **Read replicas (3 October):** a primary ships its write-ahead log (`/api/v1/replication/log`, and an image to start from), replicas apply it commit by commit with the primary's revisions and term ids, in their own log too, take no writes and don't reason ([ops/replication.md](ops/replication.md)); tested end to end over HTTP (image bootstrap, inferences, named graphs, restart, status) and in the engine (gaps refused, truncated logs detected). Not yet: automatic re-bootstrap and failover, partitioning across machines |
 | Persisted derived indexes | done | The full-text indexes (literals, IRIs' local names) and the vector index (vectors and HNSW graphs) are written to `derived/` of the data directory after each checkpoint (atomically, with a checksum and a fingerprint of the dictionary entries they cover) and read at their first use after a start, then extended with the terms interned since: no rebuild at start. A file of another store, an older dictionary or a damaged one is ignored and the index built anew. `nrese_derived_indexes_loaded_total` counts the reads |
 | G7 Smaller items | started | RDF 1.2 `version` announced in results: done. Error recovery (5 October: a recovering parse skips the rest of the outermost RDF/XML node element an error is in, and a JSON-LD top-level element that fails to expand; bulk loads use it): done. Bulk loads quarantine what they can't read (13 October, docs/design/quarantine.md): every valid statement loads, each invalid one is kept per repository (text, file, line, reason, load; the text within [the limits](design/quarantine.md#2-what-is-kept), none for RDF/XML and JSON-LD), invisible to queries, reasoning, exports and statistics, reported with the first examples, and re-admitted through the commit pipeline (fixed, or repaired on request) or discarded; `store.invalid_statements = "strict"` or `--strict` stops at the first as before. The HTTP and CLI resolution endpoints are proposed, not built: open. HTTP fuzzing (5 October: seeded random requests over every route of the router's source, with and without bearer tokens, in `scripts/fuzz-campaign.sh`) and a soak probe (`benches/probes/soak.py`: errors, memory slope, lost writes) found two bugs, fixed: two image backups within a second collided (500), and an answer sent before a small request body was read closed the connection under clients that send the body after the headers. A 30-minute soak on the main PC (8 workers, about 1.35 M requests): no errors, the soak graph exactly as committed, resident memory flat (91 MiB after the warm-up, 88 MiB at the end), handles and threads steady. The slow growth of the soak on host A (6 October, 5 h: 287 → 308 MiB resident) is the allocator's, not a leak (7 October, performance.md lab log): the program holds about 2 MiB and never more than 15 MiB; mimalloc's transparent huge pages hold the rest, bounded by its reserve; `budgets.huge_pages = "off"` serves the same load in about 100 MiB at 26 % slower materialisation; a guard keeps the program's heap level under the soak's mix. Multi-architecture images (5 October): the Dockerfile cross-compiles for linux/amd64 and linux/arm64 (x86-64-v3 and Neoverse N1 by default; the arm64 image checked under emulation), `.github/workflows/images.yml` builds both and pushes only when asked, and the CPU check reads arm64's real capabilities from the kernel. Missing benchmark kits, a second oracle, a soak of hours on the benchmark machine: open |
-| G8 Property graphs | open | Owner's goal (5 October): property graph queries (openCypher, Gremlin, ISO GQL, SQL/PGQ) over the same store, mapped onto RDF 1.2 (edge properties on reifiers); ISO GQL and an openCypher subset compiled to the same algebra, so reasoning applies; paths, lists and maps as values; graph algorithms; Neptune and Neo4j CSV and GraphML import; LDBC SNB as the workload. Design from research first (coverage plan §4) |
+| G8 Property graphs | open | A goal since 5 October: property graph queries (openCypher, Gremlin, ISO GQL, SQL/PGQ) over the same store, mapped onto RDF 1.2 (edge properties on reifiers); ISO GQL and an openCypher subset compiled to the same algebra, so reasoning applies; paths, lists and maps as values; graph algorithms; Neptune and Neo4j CSV and GraphML import; LDBC SNB as the workload. Design from research first (coverage plan §4) |
 | G9 Enterprise operations | open | Automatic failover and a write cluster beyond read replicas; backups to object storage; Kubernetes and Helm packaging; LDAP, SAML and SCIM besides OIDC; tenants with quotas and isolation (a managed offering) |
 | G10 Data integration | open | R2RML and RML mappings from relational, CSV and JSON sources; virtual graphs over live SQL sources; a SQL (JDBC/ODBC) endpoint for BI tools; a GraphQL API generated from the schema; change streams (Kafka, webhooks) |
-| G11 AI integration | open | An MCP server for agents; questions in natural language to SPARQL (and GQL); GraphRAG over the graph, its vector and text indexes; embeddings and LLMs run locally (CPU and GPU, quantized) besides hosted ones. Owner's direction (5 October): integrate the methods that measure best today, not the original GraphRAG, with minimal resource overhead; research first (four prompts: GraphRAG methods, vector and hybrid retrieval, local model integration, KG construction checked by reasoning) |
+| G11 AI integration | open | An MCP server for agents; questions in natural language to SPARQL (and GQL); GraphRAG over the graph, its vector and text indexes; embeddings and LLMs run locally (CPU and GPU, quantized) besides hosted ones. The direction since 5 October: integrate the methods that measure best today, not the original GraphRAG, with minimal resource overhead; research first (four prompts: GraphRAG methods, vector and hybrid retrieval, local model integration, KG construction checked by reasoning) |
 | G12 Exploration and history | open | Visual exploration for non-experts in the console; versioned graphs with queries at a revision, diffs and branches; entity resolution (suggesting `owl:sameAs` matches) |
 | G13 Ontology work and publishing | open | SKOS taxonomy editing with change requests, approval and governance; an ontology editor in the browser (with G2's frontend); Linked Data publishing (resolvable IRIs, content negotiation); SHACL rules, SWRL import as user rules (DL-safe SWRL rules are read and decided under OWL 2 DL already: [beyond OWL 2 DL](#beyond-owl-2-dl-branch-v15dl-beyond-13-october)) and Datalog with negation and aggregation where user rules don't reach; a Python SDK and notebook integration |
-| Named graphs as a reasoning boundary (v2.0) | open | Owner's decision (20 October): ships in v2.0. Reasoning scopes declared per repository: one graph, a set of graphs, or all of them (today's behaviour, the default). Each scope places its inferences in a declared target graph. Support graph sets are persisted with the inferred statements, so per-graph access to inferences is exact without recomputation and survives restarts and replication. No cost when unused: a single default scope runs today's path. Now: access by named graph is done ([§4](#research-designs)); the support graph sets that `inferred = "supported"` reads are computed in memory per revision ([D](#d-reasoning-with-g3)). Takes over R9 of [reasoner-v2.md](design/reasoner-v2.md) |
+| Named graphs as a reasoning boundary (v2.0) | open | Decided on 20 October: it ships in v2.0. Reasoning scopes declared per repository: one graph, a set of graphs, or all of them (today's behaviour, the default). Each scope places its inferences in a declared target graph. Support graph sets are persisted with the inferred statements, so per-graph access to inferences is exact without recomputation and survives restarts and replication. No cost when unused: a single default scope runs today's path. Now: access by named graph is done ([§4](#research-designs)); the support graph sets that `inferred = "supported"` reads are computed in memory per revision ([D](#d-reasoning-with-g3)). Takes over R9 of [reasoner-v2.md](design/reasoner-v2.md) |
 
 ## Next batch
 
-From the milestone review (R5–R9), low priority:
+These come from the milestone review (R5 to R9), with low priority.
 
 | Item | State |
 |---|---|
