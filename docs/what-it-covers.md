@@ -73,10 +73,11 @@ the W3C tests of each profile are under [standards](#standards).
 | `owl2-ql` | The [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) rules, and answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)). A query with a dataset of its own doesn't get the rewriting, so its answers say `sound-only` |
 | `owl2-rl` | The [OWL 2 RL/RDF rules](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules) |
 | `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency, classification, realisation and the certain answers they can prove ([design](design/owl2-dl.md)) |
-| `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every mode above as well |
+| `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every other mode that reasons |
 
 A commit that, with its inferences, breaks a consistency rule of the mode is refused, and the
-response names the rule and its premises ([consistency](spec/reasoning-semantics.md#consistency)).
+response names the rule and its premises, as far as the writer may read them
+([consistency](spec/reasoning-semantics.md#consistency)).
 
 Beside the modes:
 

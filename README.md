@@ -70,26 +70,31 @@ git clone --branch refactor/engine-v2 https://github.com/Krarilotus/OWL-RS.git
 cd OWL-RS
 docker build -t nrese .
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
-  -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce nrese
+  -e NRESE_REASONING_MODE=owl2-dl -e NRESE_SHACL_GATE=enforce nrese
 until curl -sf http://localhost:8080/readyz; do sleep 1; done
 ```
 
-The server now listens on this machine only, without sign-in, reasons under OWL 2 RL, refuses
+The server now listens on this machine only, without sign-in, reasons under OWL 2 DL, refuses
 writes that violate a SHACL shape, and keeps its data on the volume `nrese-data`. The console is at
-<http://localhost:8080/console>. If `docker run` itself fails, its name or port is taken; if the
-last line never returns, `docker logs nrese` shows why
+<http://localhost:8080/console>. If `docker run` itself fails, Docker says why (often the
+name or the port is taken); if the last line never returns, `docker logs nrese` shows why
 ([startup errors](docs/ops/server-setup.md#startup-errors)). The image targets x86-64-v3 and
 Neoverse N1 CPUs, and on an older CPU you build with `--build-arg NRESE_TARGET_CPU=portable`.
 
 ### A first answer
 
-Store that every cat is an animal, and that Tom is a cat:
+Store that cats and dogs are animals, that every pet is a cat or a dog, that Tom is a cat and
+Rex a pet:
 
 ```bash
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
   PREFIX ex: <http://example.org/>
   PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-  INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat }'
+  PREFIX owl: <http://www.w3.org/2002/07/owl#>
+  INSERT DATA {
+    ex:Cat rdfs:subClassOf ex:Animal . ex:Dog rdfs:subClassOf ex:Animal .
+    ex:Pet rdfs:subClassOf [ owl:unionOf (ex:Cat ex:Dog) ] .
+    ex:tom a ex:Cat . ex:rex a ex:Pet }'
 ```
 
 Ask for every animal:
@@ -103,15 +108,20 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
 ```text
 HTTP/1.1 200 OK
 content-type: application/sparql-results+json
-nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the owl2-rl closure: …"
+nrese-completeness: complete; regime=owl2-dl
+access-control-expose-headers: nrese-completeness
+x-request-id: a20dd9b2-6f62-4d57-b234-5693005725f4
+transfer-encoding: chunked
+date: Sun, 15 Nov 2026 22:20:42 GMT
 
-{"head":{"vars":["x"]},"results":{"bindings":[{"x":{"type":"uri","value":"http://example.org/tom"}}]}}
+{"head":{"vars":["x"]},"results":{"bindings":[{"x":{"type":"uri","value":"http://example.org/tom"}},{"x":{"type":"uri","value":"http://example.org/rex"}}]}}
 ```
 
-Tom is an animal because the update's commit also stored the inferred statement
-`ex:tom a ex:Animal`. The status is `sound-only`: every row is right, but the answer
-comes from the OWL 2 RL rules, which may miss answers that full OWL 2 DL would give. Ask again with `--data infer=false` and you
-read only what you stored: no rows, and the status is `complete`.
+Tom is an animal by a rule: the update's commit also stored `ex:tom a ex:Animal`. Rex is one
+only by cases, as a pet is a cat or a dog and either is an animal. No rule draws that, but the
+OWL 2 DL engines prove from the ontology that every pet is an animal, so Rex is in the answer,
+and the header says the answer is `complete`: no row is missing. The rows may come in either
+order. Ask again with `--data infer=false` and you read only what you stored: no rows.
 
 The [tutorial](docs/tutorial.md) goes on from here with a delete, a refused write, your own data
 and a changed setting. To build from source instead, see

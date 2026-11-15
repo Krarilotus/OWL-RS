@@ -1,18 +1,18 @@
 # Tutorial: from the first answer to your own data
 
 This page picks up where the README's [quick start](../README.md#quick-start) ends. The server
-`nrese` runs as started there, with OWL 2 RL reasoning and the SHACL gate on, and the [first
-query](../README.md#a-first-answer) answered `ex:tom`. Every step here runs against that
-server, and `ex:` stands for `http://example.org/`.
+`nrese` runs as started there, with OWL 2 DL reasoning and the SHACL gate on, and the [first
+query](../README.md#a-first-answer) answered `ex:tom` and `ex:rex`. Every step here runs against
+that server, and `ex:` stands for `http://example.org/`.
 
-## Retract, and the inference goes
+## Retract, and the inferences go
 
-Delete the premise, and the inference goes with it, in the same commit:
+Delete the premises, and what followed from them goes too, in the same commit:
 
 ```bash
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
   PREFIX ex: <http://example.org/>
-  DELETE DATA { ex:tom a ex:Cat }'
+  DELETE DATA { ex:tom a ex:Cat . ex:rex a ex:Pet }'
 ```
 
 The same query now answers no rows: `{"head":{"vars":["x"]},"results":{"bindings":[]}}`.
@@ -39,8 +39,11 @@ curl -i http://localhost:8080/dataset/update --data-urlencode 'update=
 ```text
 HTTP/1.1 400 Bad Request
 content-type: application/problem+json
+x-request-id: 63f55350-5736-4b00-a1d4-1f63e22b0fe4
+content-length: 333
+date: Sun, 15 Nov 2026 22:20:44 GMT
 
-{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>","reasoner_reject":null,"request_id":"…","status":400,"title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
+{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>","reasoner_reject":null,"request_id":"63f55350-5736-4b00-a1d4-1f63e22b0fe4","status":400,"title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
 ```
 
 Nothing of the rejected commit remains, so the query still answers no rows. With a name
@@ -66,8 +69,8 @@ curl http://localhost:8080/dataset/query --data-urlencode infer=false \
 
 - The `PUT` answers `204 No Content` and replaces the [default graph](glossary.md#graph) with your file.
 - `infer=false` reads the asserted statements only, so the count is the number of statements in
-  your file (for a file of three, `"value":"3"`). Without it the inferred ones count too, 32 of
-  them even in an empty store ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+  your file (for a file of three, `"value":"3"`). Without it the inferred ones count too, some
+  of them even in an empty store ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
 - After the restart the count is the same. On Docker's stop signal the server lets the
   requests in flight finish, closes the store and exits
   ([stopping](ops/server-setup.md#stopping)). Every commit is synced to the log
@@ -89,7 +92,7 @@ and updates may take together at 2 GiB:
 ```bash
 docker rm -f nrese
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
-  -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce \
+  -e NRESE_REASONING_MODE=owl2-dl -e NRESE_SHACL_GATE=enforce \
   -e NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES=2GiB nrese
 until curl -sf http://localhost:8080/readyz; do sleep 1; done
 curl http://localhost:8080/version

@@ -77,7 +77,7 @@ is written to disk) and with reasoning off. Set `NRESE_STORE_MODE=on-disk` and
 `NRESE_REASONING_MODE` to change that ([configuration](../ops/config-reference.md)), and
 `--release` builds it optimised. With reasoning off, the quick start's first query answers no
 rows, as `complete`, because nothing is inferred. Start the server with
-`NRESE_REASONING_MODE=owl2-rl` and `NRESE_SHACL_GATE=enforce` for the quick start's example and
+`NRESE_REASONING_MODE=owl2-dl` and `NRESE_SHACL_GATE=enforce` for the quick start's example and
 the [tutorial](../tutorial.md). The operator page `/ops` is built in, and the browser console is
 embedded only when it was built first ([above](#build-the-user-frontend)). Without it,
 `/console` says how.
