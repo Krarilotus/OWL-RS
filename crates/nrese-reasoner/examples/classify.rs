@@ -7,7 +7,10 @@
 //!
 //! `--threads N` saturates on N workers (`classify_parallel`); the default, 1, runs the
 //! sequential saturation. `--repeat N` classifies N times in the process (for profilers
-//! and warm timings); the output and profile are the last run's.
+//! and warm timings); the output and profile are the last run's. `--within` runs the
+//! bounded entry (`classify_parallel_within`) under a stop that never fires and the
+//! process's memory limit, as the store runs it, and prints how often it polled the stop
+//! (`polls N`, the last run's) before the profile.
 //!
 //! Writes one `sub<TAB>super` line per subsumption between named classes (IRIs without
 //! brackets, sorted), `sub<TAB>owl:Nothing` for unsatisfiable classes,
@@ -21,9 +24,13 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-use nrese_reasoner::classify::classify_profiled;
+use nrese_reasoner::classify::{
+    Classification, Profile, classify_profiled, classify_profiled_within,
+};
+use nrese_reasoner::eval::OperationStop;
 use nrese_reasoner::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
@@ -41,6 +48,7 @@ fn split(line: &str) -> Option<[&str; 3]> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (mut out, mut inputs, mut threads, mut repeat) = (None, Vec::new(), 1, 1usize);
+    let mut within = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => out = args.next(),
@@ -56,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|n| n.parse().ok())
                     .ok_or("--repeat N")?
             }
+            "--within" => within = true,
             _ => inputs.push(arg),
         }
     }
@@ -73,22 +82,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let load = started.elapsed();
     let names = vocabulary.clone();
+    let named = |id: u64| names.text(id).starts_with('<');
+    // The stop's caller is asked once per poll that finds it unlatched: its count is the polls.
+    let polls = AtomicU64::new(0);
+    let caller = || {
+        polls.fetch_add(1, Relaxed);
+        false
+    };
+    let run = |vocabulary: &mut LocalVocabulary| -> Result<(Classification, Profile), String> {
+        polls.store(0, Relaxed);
+        if within {
+            let stop = OperationStop::new(&caller);
+            classify_profiled_within(&triples, vocabulary, &named, threads, &stop)
+                .map_err(|stopped| stopped.to_string())
+        } else {
+            Ok(classify_profiled(&triples, vocabulary, &named, threads))
+        }
+    };
     for _ in 1..repeat {
-        let mut scratch = vocabulary.clone();
-        classify_profiled(
-            &triples,
-            &mut scratch,
-            &|id| names.text(id).starts_with('<'),
-            threads,
-        );
+        run(&mut vocabulary.clone())?;
     }
     let started = Instant::now();
-    let (result, profile) = classify_profiled(
-        &triples,
-        &mut vocabulary,
-        &|id| names.text(id).starts_with('<'),
-        threads,
-    );
+    let (result, profile) = run(&mut vocabulary)?;
     let elapsed = started.elapsed();
     let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, kind) in &result.skipped {
@@ -120,6 +135,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.unsatisfiable.len(),
         skipped
     );
+    if within {
+        eprintln!("polls {}", polls.load(Relaxed));
+    }
     let ms = |d: std::time::Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
     eprintln!(
         "profile read={} normalise={} prepare={} saturate={} assemble={} write={} concepts={} contexts={} subsumers={} links={} conclusions={} duplicates={} threads={}",

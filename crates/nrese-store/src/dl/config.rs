@@ -59,6 +59,20 @@ impl DlConsistency {
     }
 }
 
+/// What a classification answers on an input outside OWL 2 DL (the setting
+/// `dl.outside_profile`, not yet read: every store has the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutsideProfile {
+    /// The DL engines' answer on the part they read: sound, marked incomplete, the axioms
+    /// left out named. No procedure outside the profile runs.
+    #[default]
+    DlPart,
+    /// Where a procedure proven sound for the input applies, its answer: today the EL
+    /// classifier, where an irregular role hierarchy is all the DL engines leave out
+    /// (`crate::dl::classification::el_answer`). Elsewhere as [`Self::DlPart`].
+    Proven,
+}
+
 /// The `owl2-dl` mode's settings. They apply when the reasoner's mode is `owl2-dl`.
 ///
 /// Every budget is a setting and `None` is unlimited (`nrese_dl::limits`: nothing is
@@ -101,6 +115,8 @@ pub struct DlConfig {
     pub lower_bound_timeout: Option<Duration>,
     pub max_join: Option<usize>,
     pub max_join_steps: Option<usize>,
+    /// What a classification answers on an input outside OWL 2 DL ([`OutsideProfile`]).
+    pub outside_profile: OutsideProfile,
 }
 
 impl Default for DlConfig {
@@ -120,6 +136,7 @@ impl Default for DlConfig {
             lower_bound_timeout: routes.lower_bound_timeout,
             max_join: routes.max_join,
             max_join_steps: routes.max_join_steps,
+            outside_profile: OutsideProfile::default(),
         }
     }
 }

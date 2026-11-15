@@ -41,7 +41,7 @@ each with its run record.
 | Kernels and allocation | Moving projection, shared forward search, direct raw spill, ordered dedup without a sort; one SPARQL numeric implementation | Work and copy savings carry no end-to-end timing claim |
 | DL bounds and exact work | ID-level results with dictionary checks; a true lower ASK skips the upper evaluation; one compiled program per candidate batch; the bounds, the gap, compilation scratch and the engines in the request's one envelope | Base search and compilation repeated between batches; the upper table is materialised |
 | DL classification and realisation | The initial search kept as Base; one fallback allowance; realisation reuses the deterministic start; only complete results cached | Stages compile separately; cooperative checkpoints; partial aggregate counters |
-| Process memory | The server installs the process limit; store-local watches reach bounds and diagnostics; one envelope per request within the catalog's budget (queries, updates and their DL gate, DL entailment and explanations) | Cooperative only; a request's envelope and process memory are separate contracts; classification and realisation (shared per revision) draw from an envelope of their own within the catalog's budget, under `dl.memory` and the process limit, not from the requesting operation's envelope |
+| Process memory | The server installs the process limit; store-local watches reach bounds and diagnostics; one envelope per request within the catalog's budget (queries, updates and their DL gate, DL entailment and explanations) | Cooperative only; a request's envelope and process memory are separate contracts; classification and realisation (shared per revision) draw from an envelope of their own within the catalog's budget, under `dl.memory` and the process limit, not from the requesting operation's envelope. Where the EL classifier answers a classification (an irregular role hierarchy, off by default: Coverage below), its reading of the ontology and of the triples is charged to that envelope, within the catalog's budget; its own structures are charged to nothing, bounded by `dl.timeout` and the process limit as a soft bound (polled, not refused in advance): stopped, it answers nothing, and the DL engines' answer stands, marked with why |
 | Benchmarks | Fast suite with exact counters and QPS per width; one case registry (`benches/cases/`: every case the tools time); a change timed by one command on the fleet (`benches/suite/abba.py run`) and the release gate as one fleet set, both asking by capability; one run-record schema; the answer recorder (strict and value matches, legal `LIMIT` subsets); STATUS and STANDINGS marking pre-reset results | One result row and one `compare` ([benches/README.md](../benches/README.md#where-this-stands)); checkpointed level-3 chunks; the release gate's first complete run on engine-v2; a calibration of the 34 uncalibrated cases |
 
 ### Open work
@@ -86,7 +86,14 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   cardinality; functional, inverse-functional, irreflexive, asymmetric, disjoint);
   `owl:topDataProperty` other than above another data property (§11.2); datatypes outside
   the map and undefined, facets outside a datatype's facet space, cyclic datatype
-  definitions (§11.2, §7.5); an irregular property hierarchy (§11.2); literals beyond what
+  definitions (§11.2, §7.5); an irregular property hierarchy (§11.2), except a classification
+  the EL classifier answers in a store set to answer outside OWL 2 DL by a proven procedure
+  (`OutsideProfile::Proven`, not yet a server setting; off by default): where the irregular
+  hierarchy is all the engines leave out and
+  the ontology has no assertion, no range on a property of a chain and nothing the EL
+  classifier skips, its completion rules (which need no regular hierarchy) answer
+  `/dataset/classification` completely, `engine` `el`, and it is then no independent oracle
+  for that answer; literals beyond what
   §4 asks an implementation to support (numbers past 128 bits, more than 18 fractional
   digits of a second);
 - *a budget the configuration set, answered `gave-up` naming its setting:* none is built
@@ -142,7 +149,7 @@ The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gat
 | Package | State | Correctness gate | Performance gate |
 |---|---|---|---|
 | 3.0 DL lab | done in part | the reference runner (HermiT, ELK, Openllet, Konclude), the W3C runner, the ORE development subset (80 tasks, adjudicated), the stratified-set tool (`ore.py strata`), the fast suite's DL cases, the small scope; the ≥ 300-task set's and OWL2Bench DL / UOBM reference results aren't committed | bars recorded for the 80-task subset only |
-| 3.1 Context core, Horn stage | done | Horn and EL taxonomies equal to the references'; parallel; proofs into the proof IR. The store classifies through `nrese-dl`'s context core (`nrese-store/src/classification.rs`); `nrese-reasoner`'s EL classifier remains as an oracle only | EL: measured on the development subset; the full EL track not run |
+| 3.1 Context core, Horn stage | done | Horn and EL taxonomies equal to the references'; parallel; proofs into the proof IR. The store classifies through `nrese-dl`'s context core (`nrese-store/src/classification.rs`); `nrese-reasoner`'s EL classifier remains an oracle, and answers `/dataset/classification` only where an irregular role hierarchy is all the DL engines leave out and it is complete for the ontology, in a store set to answer so (off by default; Coverage above); there it is no independent oracle | EL: measured on the development subset; the full EL track not run |
 | 3.2 Bounds | done | U1 maintained per commit, equal to U1 afresh; consistency through U1 and the Horn core | LUBM(800) / UOBM(500): not measured |
 | 3.3 Hypertableau | done | the W3C DL suite: every case decided (410 right, one disputed in the suite's own answer); the small scope | not measured on the 300-task set |
 | 3.4 Classification and realisation | done | taxonomies equal to the references' on the development subset; the small scope's classification and realisation | not measured |

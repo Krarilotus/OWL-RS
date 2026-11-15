@@ -143,11 +143,8 @@ pub fn compile_with(
     c.program.incomplete = normalised
         .unsupported
         .iter()
-        .filter(|(_, why)| {
-            *why != nrese_owl::UNSUPPORTED_DATATYPE_DEFINITIONS
-                && *why != nrese_owl::UNSUPPORTED_KEYS
-        })
-        .copied()
+        .filter(|&&(_, why)| crate::tableau::leaves_out(why))
+        .map(|&(axiom, why)| (axiom, why.as_str()))
         .collect();
     for (index, clause) in normalised.clauses.iter().enumerate() {
         c.clause(index, clause);

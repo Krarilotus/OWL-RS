@@ -8,21 +8,34 @@
 //! The query lower bound owns its separate schema-lifetime cache (`bounds.rs`).
 //! The context core receives the store's explicit process-memory policy, including zero
 //! to disable its watch; opening another store cannot change that policy.
+//!
+//! Where an irregular role hierarchy is all the DL engines leave out, the EL classifier
+//! may answer instead ([`el_answer`]); its complete answers are kept per revision too.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nrese_dl::classify::{self, Realisation, Taxonomy};
-use nrese_engine::Snapshot;
+use nrese_dl::verdict::Verdict;
+use nrese_engine::{ReadModel, Snapshot, TermId, TermKind};
+use nrese_owl::{Axiom, Characteristic, Ontology, Term, Unsupported};
+use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
+use nrese_reasoner::classify::Classification;
 
 use super::source;
 use crate::StoreService;
 
-/// The latest complete results, by revision.
+/// The latest complete results, by revision. Kept, not charged to any envelope: each is
+/// one revision's answer, replaced by the next.
 #[derive(Debug, Default)]
 pub(crate) struct Cache {
     taxonomy: Slot<Taxonomy>,
     realisation: Slot<Realisation>,
+    /// The EL classifier's answer ([`el_answer`]), complete: a request on the same revision
+    /// runs neither the DL engines nor the EL classifier again. Simultaneous first requests
+    /// each run both (nothing coalesces them).
+    el: Slot<El>,
 }
 
 type Slot<T> = Mutex<Option<(u64, Arc<T>)>>;
@@ -102,12 +115,17 @@ fn cached<T>(
     }
     let result = Arc::new(compute());
     if complete(&result) {
-        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_none_or(|(at, _)| *at < revision) {
-            *slot = Some((revision, Arc::clone(&result)));
-        }
+        keep(slot, revision, &result);
     }
     result
+}
+
+/// Keeps `result` as `revision`'s unless the slot holds a newer revision's or one already.
+fn keep<T>(slot: &Slot<T>, revision: u64, result: &Arc<T>) {
+    let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.as_ref().is_none_or(|(at, _)| *at < revision) {
+        *slot = Some((revision, Arc::clone(result)));
+    }
 }
 
 fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
@@ -154,6 +172,256 @@ fn run<T>(
     }
 }
 
+/// Whether the EL classifier's completion rules are complete for `o`, given that it reads
+/// all of it: no assertion (the ontology then has a model iff `owl:Thing` is satisfiable),
+/// and no object-property range on a property of a chain or a transitivity, or above or
+/// below one through the property hierarchy. The classifier applies a range on the edges
+/// class axioms create, not on those a chain composes; the EL++ update's condition on the
+/// ranges above a chain's superproperty is taken conservatively, refusing every such range.
+/// O(axioms + property inclusions).
+fn el_complete_for(o: &Ontology) -> bool {
+    if o.axioms.iter().any(Axiom::is_assertion) {
+        return false;
+    }
+    let mut chained: Vec<Term> = Vec::new();
+    let mut ranged: Vec<Term> = Vec::new();
+    // Property inclusions by named property (inverses merged: wider, so safer), both ways.
+    let mut up: HashMap<Term, Vec<Term>> = HashMap::new();
+    let mut down: HashMap<Term, Vec<Term>> = HashMap::new();
+    let mut include = |r: Term, s: Term| {
+        up.entry(r).or_default().push(s);
+        down.entry(s).or_default().push(r);
+    };
+    for axiom in &o.axioms {
+        match axiom {
+            Axiom::SubObjectPropertyOf(chain, sup) if chain.len() > 1 => {
+                chained.extend(chain.iter().chain([sup]).map(|p| p.named()));
+            }
+            Axiom::SubObjectPropertyOf(chain, sup) => {
+                for r in chain {
+                    include(r.named(), sup.named());
+                }
+            }
+            Axiom::EquivalentObjectProperties(ps) => {
+                for pair in ps.windows(2) {
+                    include(pair[0].named(), pair[1].named());
+                    include(pair[1].named(), pair[0].named());
+                }
+            }
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, p) => chained.push(p.named()),
+            Axiom::ObjectPropertyRange(p, _) => ranged.push(p.named()),
+            _ => {}
+        }
+    }
+    if chained.is_empty() || ranged.is_empty() {
+        return true;
+    }
+    // Each direction walks on its own: a property the upward walk reached (an equivalent)
+    // still leads the downward walk on to what is below it.
+    let mut related: HashSet<Term> = HashSet::new();
+    for edges in [&up, &down] {
+        let mut seen: HashSet<Term> = chained.iter().copied().collect();
+        let mut todo = chained.clone();
+        while let Some(p) = todo.pop() {
+            for &q in edges.get(&p).into_iter().flatten() {
+                if seen.insert(q) {
+                    todo.push(q);
+                }
+            }
+        }
+        related.extend(seen);
+    }
+    !ranged.iter().any(|p| related.contains(p))
+}
+
+/// The EL classifier's vocabulary in a snapshot's dictionary. A term the store doesn't hold
+/// gets an id of its own, once per term, counted down from `u64::MAX`: the top four bits
+/// all set are no `TermKind`'s tag, so no stored term has such an id.
+struct Lookup<'a> {
+    snapshot: &'a Snapshot,
+    missing: HashMap<String, u64>,
+    next: u64,
+}
+
+impl Lookup<'_> {
+    fn id(&mut self, term: TermRef<'_>) -> u64 {
+        if let Some(id) = self.snapshot.lookup(term) {
+            return id.raw();
+        }
+        let next = &mut self.next;
+        *self.missing.entry(term.to_string()).or_insert_with(|| {
+            *next -= 1;
+            *next
+        })
+    }
+
+    /// An id no term has.
+    fn fresh(&mut self) -> u64 {
+        self.next -= 1;
+        self.next
+    }
+}
+
+impl nrese_reasoner::ir::Vocabulary for Lookup<'_> {
+    fn iri(&mut self, iri: &str) -> u64 {
+        self.id(NamedNodeRef::new_unchecked(iri).into())
+    }
+
+    fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
+        self.id(
+            LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype)).into(),
+        )
+    }
+
+    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
+        self.id(LiteralRef::new_language_tagged_literal_unchecked(lexical, language).into())
+    }
+}
+
+/// The EL classifier's answer over a snapshot's term ids, with the consistency it decides.
+#[derive(Debug)]
+pub(crate) struct El {
+    pub classification: Classification,
+    pub consistency: Verdict,
+}
+
+/// What the EL route gave where it was taken ([`el_answer`]).
+pub(crate) enum ElRoute {
+    /// Its complete answer (kept for the snapshot's revision).
+    Answered(Arc<El>),
+    /// Stopped before its end (nothing of the run is used): the DL engines'
+    /// answer stands, marked with why. The store's memory error where memory stopped it;
+    /// `None`: `dl.timeout` passed.
+    Stopped(Option<crate::StoreError>),
+}
+
+/// The EL classifier's answer kept for `snapshot`'s revision, if there is one.
+pub(crate) fn kept_el(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<El>> {
+    latest(&store.dl().classification.el, snapshot.revision())
+}
+
+/// The EL classifier's classification of `snapshot`'s asserted statements, where `taxonomy`
+/// (the DL engines') left out an irregular role hierarchy and nothing else, and the EL
+/// classifier is complete for the ontology: no assertion, no range with a chain
+/// ([`el_complete_for`]), nothing it skipped. Its completion rules (CR6) need no regular
+/// hierarchy. Taken only where the store answers outside OWL 2 DL by a proven procedure
+/// ([`crate::dl::OutsideProfile::Proven`], not the default); `None` everywhere else, where
+/// the DL engines' answer stands as it is. It runs under the request's stop:
+/// `started` plus `dl.timeout`, and the store's memory watch with the process's limit
+/// ([`StoreService::memory_stop`]), polled as `nrese_reasoner::classify::classify_parallel_within`
+/// says; stopped, or with that time already passed before it would start,
+/// [`ElRoute::Stopped`].
+///
+/// Its consistency: with no assertion, `owl:Thing`'s satisfiability, read from a fresh class
+/// that no axiom names (unsatisfiable iff `owl:Thing` is), left out of the answer.
+///
+/// The triples it reads are charged to the classification's envelope; the classifier's
+/// own structures are bounded by the stop's memory watch, a soft bound (seen at the next
+/// poll, not refused in advance).
+pub(crate) fn el_answer(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    taxonomy: &Taxonomy,
+    started: Instant,
+) -> Option<ElRoute> {
+    // Outside OWL 2 DL: only where the store answers by a proven procedure.
+    if store.config().dl.outside_profile != crate::dl::OutsideProfile::Proven {
+        return None;
+    }
+    // The driver's lower bound, where an irregular role hierarchy is all it left out.
+    if !taxonomy.left_out.only(Unsupported::IrregularRoleHierarchy) {
+        return None;
+    }
+    let options = options(store);
+    let memory = options.tableau.memory.clone().unwrap_or_default();
+    if !el_complete_for(&source::read_snapshot(snapshot, memory.clone()).ok()?) {
+        return None;
+    }
+    let deadline = options.timeout.map(|limit| started + limit);
+    let memory_stop = store.memory_stop();
+    let stop = || deadline.is_some_and(|at| Instant::now() >= at) || memory_stop.exceeded();
+    let room = || memory_stop.room();
+    if stop() {
+        let interrupted = nrese_reasoner::delta::Interrupted::default();
+        return Some(ElRoute::Stopped(memory_stop.error(interrupted)));
+    }
+    let mut triples = nrese_exec::ChargedVec::new(memory);
+    for q in snapshot.quads_for_pattern_in(ReadModel::Asserted, &source::ANY) {
+        triples
+            .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
+            .ok()?;
+    }
+    let mut vocabulary = Lookup {
+        snapshot,
+        missing: HashMap::new(),
+        next: u64::MAX,
+    };
+    use nrese_reasoner::ir::Vocabulary as _;
+    let probe = vocabulary.fresh();
+    let rdf_type = vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let class = vocabulary.iri("http://www.w3.org/2002/07/owl#Class");
+    triples.push([probe, rdf_type, class]).ok()?;
+    // The DL engines' classes, declared: the EL classifier classifies the classes of what it
+    // reads, and one named only where it reads nothing (a data property's domain) would
+    // be missing from its answer, with its subsumers among `owl:Thing`'s equivalents.
+    for &c in &taxonomy.classification.classes {
+        triples.push([c, rdf_type, class]).ok()?;
+    }
+    triples.sort_unstable();
+    let mut kept = 0;
+    for i in 0..triples.len() {
+        if kept == 0 || triples[i] != triples[kept - 1] {
+            triples[kept] = triples[i];
+            kept += 1;
+        }
+    }
+    triples.truncate(kept);
+    let named = |id: u64| id == probe || TermId::from_raw(id).kind() == TermKind::Iri;
+    let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+    let run = nrese_reasoner::classify::classify_parallel_within(
+        &triples,
+        &mut vocabulary,
+        &named,
+        options.workers.width(),
+        &operation,
+    );
+    drop(triples);
+    let mut classification = match run {
+        Ok(classification) => classification,
+        Err(interrupted) => return Some(ElRoute::Stopped(memory_stop.error(interrupted))),
+    };
+    if !classification.skipped.is_empty() {
+        return None;
+    }
+    let consistency = match classification.unsatisfiable.contains(&probe) {
+        true => Verdict::Inconsistent,
+        false => Verdict::Consistent,
+    };
+    classification.unsatisfiable.retain(|&c| c != probe);
+    classification.top.retain(|&c| c != probe);
+    classification
+        .subsumptions
+        .retain(|&(a, b)| a != probe && b != probe);
+    // A class the DL engines' signature lacks (one in the class axiom on an axiom's
+    // reification, `owl:Axiom`): the two readers read the ontology differently, so neither
+    // reading is trusted, and the DL engines' lower bound stands.
+    let signature: HashSet<u64> = taxonomy.classification.classes.iter().copied().collect();
+    let known = |c: &u64| signature.contains(c);
+    let c = &classification;
+    if !(c.unsatisfiable.iter().all(known)
+        && c.top.iter().all(known)
+        && c.subsumptions.iter().all(|(a, b)| known(a) && known(b)))
+    {
+        return None;
+    }
+    let el = Arc::new(El {
+        classification,
+        consistency,
+    });
+    keep(&store.dl().classification.el, snapshot.revision(), &el);
+    Some(ElRoute::Answered(el))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +448,94 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    /// The irregular chain of the store's tests (`tests/it/dl/classification.rs`), with
+    /// nothing else: the EL route's input.
+    const IRREGULAR: &str = "PREFIX : <urn:el:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { :r3 owl:propertyChainAxiom ( :r1 :r2 ) . :r3 rdfs:subPropertyOf :r1 .
+            :r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :r3 a owl:ObjectProperty .
+            :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+            :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] .
+            :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C ] .
+            [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :C ] rdfs:subClassOf :D . }";
+
+    fn el_config(timeout: Duration) -> StoreConfig {
+        StoreConfig {
+            process_memory_bytes: crate::ProcessMemory::Bytes(0),
+            dl: DlConfig {
+                timeout: Some(timeout),
+                threads: 1,
+                outside_profile: crate::dl::OutsideProfile::Proven,
+                ..DlConfig::default()
+            },
+            ..StoreConfig::in_memory()
+        }
+    }
+
+    /// An EL run answers in time and is kept: a later request on the revision gets that
+    /// answer. One stopped (by a `dl.timeout` of 1 ns, past before the run starts; by the
+    /// memory unread) answers no classification and keeps nothing, and a memory stop is told
+    /// apart from the deadline by the store's memory error. (The stopped stores get the first
+    /// one's taxonomy: their own DL engines would stop too.)
+    #[test]
+    fn a_stopped_el_run_answers_nothing_and_keeps_nothing() {
+        let store = StoreService::new(el_config(Duration::from_secs(3600))).unwrap();
+        store.update_str_ungated(IRREGULAR).unwrap();
+        let snapshot = store.engine().snapshot();
+        let taxonomy = taxonomy(&store, &snapshot);
+        assert!(
+            taxonomy
+                .left_out
+                .only(nrese_owl::Unsupported::IrregularRoleHierarchy),
+            "{:?}",
+            taxonomy.incomplete
+        );
+        assert!(kept_el(&store, &snapshot).is_none());
+        let Some(ElRoute::Answered(el)) = el_answer(&store, &snapshot, &taxonomy, Instant::now())
+        else {
+            panic!("the EL route didn't answer in time");
+        };
+        let kept = kept_el(&store, &snapshot).expect("an answer kept for the revision");
+        assert!(Arc::ptr_eq(&el, &kept));
+
+        let late = StoreService::new(el_config(Duration::from_nanos(1))).unwrap();
+        late.update_str_ungated(IRREGULAR).unwrap();
+        let snapshot = late.engine().snapshot();
+        assert!(matches!(
+            el_answer(&late, &snapshot, &taxonomy, Instant::now()),
+            Some(ElRoute::Stopped(None))
+        ));
+        assert!(kept_el(&late, &snapshot).is_none());
+
+        fn unread() -> nrese_exec::memory::Reading {
+            Err(nrese_exec::memory::Unread::Failed)
+        }
+        // The process limit by default (not off, as `el_config` sets it): found by the
+        // capacity reader, which can't read.
+        let unreadable = StoreService::with_runtime(
+            StoreConfig {
+                process_memory_bytes: crate::ProcessMemory::Default,
+                ..el_config(Duration::from_secs(3600))
+            },
+            Arc::new(crate::Runtime::new(0, 0)),
+        )
+        .unwrap()
+        .with_capacity(unread);
+        unreadable.update_str_ungated(IRREGULAR).unwrap();
+        let snapshot = unreadable.engine().snapshot();
+        let stopped = el_answer(&unreadable, &snapshot, &taxonomy, Instant::now());
+        assert!(
+            matches!(
+                stopped,
+                Some(ElRoute::Stopped(Some(
+                    crate::StoreError::MemoryUnreadable { .. }
+                )))
+            ),
+            "the memory stop isn't told apart"
+        );
+        assert!(kept_el(&unreadable, &snapshot).is_none());
     }
 
     /// D2, A-902: where the process's limit can't be found (its memory unread), no engine

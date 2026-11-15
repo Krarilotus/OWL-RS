@@ -152,7 +152,7 @@ impl Terms for StoreTerms<'_> {
     }
 }
 
-const ANY: QuadPattern = QuadPattern {
+pub(super) const ANY: QuadPattern = QuadPattern {
     subject: None,
     predicate: None,
     object: None,

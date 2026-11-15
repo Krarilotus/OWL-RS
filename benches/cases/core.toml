@@ -1327,7 +1327,7 @@ reference = "/fast/ref/el-classes20000-roles12.elk.tax"
 [[case]]
 name = "el-classify-irregular"
 area = "dl"
-what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL, inside OWL 2 EL"
+what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL and OWL 2 EL, which keeps the regularity of Structural Specification §11.2 (Profiles §2.2.6)"
 semantics = "el"
 data = "el classes=20000 roles=12 irregular=1"
 tool = "classify-el"
@@ -1339,7 +1339,8 @@ check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
 # HermiT and Openllet refuse an irregular hierarchy; ELK and Konclude don't check it. On
-# 6 Oct 2026 ELK's taxonomy equalled NRESE's (outside OWL 2 DL, no answer is defined).
+# 6 Oct 2026 ELK's taxonomy equalled NRESE's (outside OWL 2 DL the direct semantics still defines the
+# answer; what OWL 2 DL's restrictions secure, a decision procedure, is what is missing).
 systems = ["elk:el", "konclude:dl"]
 home_turf = "elk"
 reference = "/fast/ref/el-classes20000-roles12-irregular1.elk.tax"
