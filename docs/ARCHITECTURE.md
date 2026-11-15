@@ -17,11 +17,11 @@ benchmark kits in [`benches/`](../benches/README.md).
 
 ## 2. Layer model
 
-Dependencies point downwards only. A crate may use the public API of a crate below it in this picture (a lower layer, or a lower row of its own layer), but never another crate's internals and never one above. The picture is the order of the manifests' `[dependencies]`, and test-only dev-dependencies aren't shown.
+Dependencies point downwards only. A crate may use the public API of a crate below it in this picture (a lower layer, or a lower row of its own layer), but never another crate's internals, never one above and never one beside it in its row. The picture is the order of the manifests' `[dependencies]`, and test-only dev-dependencies aren't shown.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/layers-dark.svg">
-  <img src="img/layers-light.svg" width="792" alt="Crates by layer, dependencies pointing down. L5: apps/nrese-console. L4: nrese-server. L3: nrese-store. L2: nrese-shacl above nrese-sparql and nrese-reasoner. L1: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.">
+  <img src="img/layers-light.svg" width="792" alt="NRESE's parts by layer; each uses only parts below it, and parts side by side don't use each other. L5: apps/nrese-console, the browser UI and CLI, an npm package that uses the server over HTTP. The crates: L4: nrese-server. L3: nrese-store. L2: nrese-shacl above nrese-sparql and nrese-reasoner. L1: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.">
 </picture>
 
 Outside the layer model are `nrese-sparql-reference` (the SPARQL evaluator written from the specification, the oracle of the differential tests, used by tests only), `nrese-fuzz` (fuzz targets for every parser of untrusted input) and `benches/` (the benchmark kits).

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 792 860" width="792" height="860" role="img" aria-labelledby="title desc">
 <!-- The light and dark variants of this drawing differ only in <style>. -->
 <title id="title">NRESE's layers</title>
-<desc id="desc">Crates by layer, dependencies pointing down. L5: apps/nrese-console. L4: nrese-server. L3: nrese-store. L2: nrese-shacl above nrese-sparql and nrese-reasoner. L1: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.</desc>
+<desc id="desc">NRESE's parts by layer; each uses only parts below it, and parts side by side don't use each other. L5: apps/nrese-console, the browser UI and CLI, an npm package that uses the server over HTTP. The crates: L4: nrese-server. L3: nrese-store. L2: nrese-shacl above nrese-sparql and nrese-reasoner. L1: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.</desc>
 <style>
   text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1B2330; }
   .panel { fill: #F4F6F9; }
@@ -9,6 +9,7 @@
   .n { font-size: 16px; font-weight: 600; }
   .d { font-size: 14px; fill: #566173; }
   .lbl { font-size: 14px; fill: #566173; }
+  .r { font-size: 14px; }
   .lvl { font-size: 22px; font-weight: 600; fill: #566173; }
   .band { fill: #E3E7ED; }
   .boundary { fill: none; stroke: #9AA4B2; stroke-width: 1.2; stroke-dasharray: 6 5; }
@@ -42,7 +43,7 @@
 <text x="40" y="74" class="d">clients</text>
 <rect class="chip" x="160" y="36" width="616" height="48" rx="6"/>
 <text x="174.0" y="57" class="n">apps/nrese-console</text>
-<text x="174.0" y="75" class="d">browser UI and CLI, HTTP</text>
+<text x="174.0" y="75" class="d">browser UI and CLI over HTTP; an npm package, not a crate</text>
 <rect class="band" x="20" y="110" width="772" height="80" rx="10"/>
 <text x="40" y="144" class="lvl">L4</text>
 <text x="40" y="164" class="d">transport</text>
@@ -54,7 +55,7 @@
 <text x="40" y="254" class="d">application</text>
 <rect class="chip" x="160" y="216" width="616" height="48" rx="6"/>
 <text x="174.0" y="237" class="n">nrese-store</text>
-<text x="174.0" y="255" class="d">commit pipeline, gates</text>
+<text x="174.0" y="255" class="d">commits and their checks, the answers' status</text>
 <rect class="band" x="20" y="290" width="772" height="138" rx="10"/>
 <text x="40" y="324" class="lvl">L2</text>
 <text x="40" y="344" class="d">evaluation</text>

@@ -55,7 +55,7 @@ is in [features and standards](docs/what-it-covers.md), and where it stops is in
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/overview-dark.svg">
-  <img src="docs/img/overview-light.svg" width="720" alt="Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write goes through one commit, where the reasoner infers and checks consistency, SHACL validates when its gate is on, and under owl2-dl the OWL 2 DL engines check it too; if a check fails, the write is refused with the reason. Storage keeps asserted and inferred statements apart, one revision per commit, logged to the data directory. A query runs on a snapshot, the DL engines prove answers under owl2-dl, and the answer comes back with its status.">
+  <img src="docs/img/overview-light.svg" width="720" alt="Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write is one commit, all of it or none: when reasoning is on, the reasoner infers and checks consistency, and SHACL validates when its gate is on. The commit writes asserted and inferred statements, kept apart, as one revision. A query never waits for a write: it reads a snapshot, and its status says whether rows may be missing. Under owl2-dl, where cheaper checks can't decide, the commit asks the OWL 2 DL engines whether the data is consistent, and the query asks whether a row follows. Storage is in memory, or on disk, where the data directory holds the log and checkpoints. Each arrow points from the part that calls to the part it calls.">
 </picture>
 
 ## Quick start
