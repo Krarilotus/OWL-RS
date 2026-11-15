@@ -63,16 +63,23 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
         Taxonomy::complete,
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
-            None => run(
-                store,
-                snapshot,
-                classify::classify,
-                Taxonomy::refused,
-                |t, why| {
-                    t.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
-                    t.incomplete.push(why)
-                },
-            ),
+            None => {
+                let taxonomy = run(
+                    store,
+                    snapshot,
+                    classify::classify,
+                    Taxonomy::refused,
+                    |t, why| {
+                        t.classification.consistency =
+                            nrese_dl::verdict::Verdict::Unknown(why.clone());
+                        t.incomplete.push(why)
+                    },
+                );
+                // What the shared workers freed is offered back before the answer is built
+                // from the taxonomy ([`nrese_engine::memory::release_idle`]).
+                nrese_engine::memory::release_idle();
+                taxonomy
+            }
         },
     )
 }
@@ -141,8 +148,9 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
 /// take it, the engine's result over no axioms with its consistency unknown, `incomplete`
 /// saying why (never kept: a result kept is complete). Over no axioms the engine would say
 /// consistent, which nothing read decided.
-/// When the engine returns, what the shared workers freed is offered back
-/// ([`nrese_engine::memory::release_idle`]), before the answer is built from the result.
+/// It offers back nothing the shared workers freed: only a classification does, once this
+/// returns ([`taxonomy`]): its peak is the one the release fixes; whether the other
+/// operations need one is measured separately.
 fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
@@ -164,16 +172,14 @@ fn run<T>(
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
-    let result = match read {
+    match read {
         Ok(ontology) => engine(&ontology, &options),
         Err(_) => {
             let mut none = engine(&nrese_owl::Ontology::default(), &options);
             incomplete(&mut none, source::refused("the revision"));
             none
         }
-    };
-    nrese_engine::memory::release_idle();
-    result
+    }
 }
 
 /// Whether the EL classifier's completion rules are complete for `o`, given that it reads
