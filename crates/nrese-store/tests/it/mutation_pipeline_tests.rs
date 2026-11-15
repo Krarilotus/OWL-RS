@@ -1580,3 +1580,55 @@ fn unbuilt_key_status(pipeline: &MutationPipeline) {
         "{payload} with {status:?}"
     );
 }
+
+/// `:C owl:intersectionOf ( :A1 … :An )` and an `:x` in every `:Ai`: cls-int1 (OWL 2
+/// Profiles §4.3, table 6) makes `:x` a `:C`. Its rule has one atom per member, and a
+/// rule's atoms are numbered by `u8`.
+fn long_intersection(n: usize) -> String {
+    let members: Vec<String> = (1..=n).map(|i| format!("<{EX}A{i}>")).collect();
+    let mut data = format!(
+        "<{EX}C> <http://www.w3.org/2002/07/owl#intersectionOf> ( {} ) .",
+        members.join(" ")
+    );
+    for member in &members {
+        data.push_str(&format!(" <{EX}x> a {member} ."));
+    }
+    data
+}
+
+/// An intersection of 256 members is one rule; one of 257 is either one too or reported
+/// and not built, never a panic and never a failed commit, under `owl2-rl` and `owl2-dl`.
+#[test]
+fn a_long_intersection_is_built_or_reported() {
+    let mut wrong = Vec::new();
+    for mode in ["owl2-rl", "owl2-dl"] {
+        for n in [256, 257] {
+            let run = std::panic::catch_unwind(|| {
+                let owl = match mode {
+                    "owl2-rl" => pipeline(ReasoningMode::Owl2Rl),
+                    _ => crate::dl::pipeline(),
+                };
+                owl.apply(
+                    insert(&long_intersection(n)),
+                    &nrese_store::Requester::all(),
+                    &MutationTicket::new(),
+                )
+                .map_err(|error| error.to_string())?;
+                let entailed = contains(&owl, &format!("<{EX}x> a <{EX}C>"));
+                let reported = owl.last_reasoning_run().is_some_and(|run| {
+                    run.diagnostics
+                        .iter()
+                        .any(|d| d.rules.starts_with("cls-int"))
+                });
+                Ok::<_, String>((entailed, reported))
+            });
+            match run {
+                Ok(Ok((true, _))) => {}
+                Ok(Ok((false, reported))) if n == 257 && reported => {}
+                Ok(outcome) => wrong.push(format!("{mode}, {n} members: {outcome:?}")),
+                Err(_) => wrong.push(format!("{mode}, {n} members: panicked")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
