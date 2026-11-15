@@ -5,7 +5,7 @@ An [RDF](https://www.w3.org/TR/rdf11-primer/) store with built-in
 It runs as one server binary with a browser console, or as a set of Rust crates. A hobby project, developed in
 the open; not yet for parallel writers, failover or data split across machines
 ([limits, and when to choose another system](docs/limits.md)). These pages describe the code of the commit they
-are in, package version 0.1.0, which is not a release.
+are in, package version 1.5.0; the release is the commit tagged `v1.5.0`.
 
 To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
 planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
