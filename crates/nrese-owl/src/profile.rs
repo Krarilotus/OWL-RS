@@ -11,6 +11,8 @@
 //! grammar (EL's on property chains and ranges, QL's and RL's on anonymous individuals in
 //! assertions); an axiom outside every profile is still OWL 2 DL.
 
+use std::collections::HashSet;
+
 use crate::model::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, RangeId};
 use crate::{Ontology, Term};
 
@@ -767,6 +769,47 @@ pub fn concludes_equality(
         // Any other conclusion on an equating property (a chain into a functional one).
         _ => properties(o, axiom).iter().any(|t| equating.contains(t)),
     }
+}
+
+/// The TBox signature as the reader typed it, the individuals left out: the reader types
+/// terms by use, assertions included, so an assertion whose terms already have these kinds
+/// changes nothing it reads.
+#[derive(Debug, Clone, Default)]
+pub struct Signature {
+    /// Every class and property name.
+    pub names: HashSet<Term>,
+    pub classes: HashSet<Term>,
+    /// The properties declared, or asserted, as object, as data, as annotation properties.
+    pub objects: HashSet<Term>,
+    pub data: HashSet<Term>,
+    pub annotations: HashSet<Term>,
+}
+
+/// [`Signature`] of `o`. O(axioms + class expressions).
+pub fn signature(o: &Ontology) -> Signature {
+    use crate::model::EntityKind::{AnnotationProperty, Class, DataProperty, ObjectProperty};
+    let mut s = Signature::default();
+    for e in 0..o.classes.len() as u32 {
+        if let ClassExpr::Class(c) = o.classes.get(e) {
+            s.classes.insert(*c);
+        }
+    }
+    for axiom in &o.axioms {
+        let _ = match axiom {
+            Axiom::Declaration(Class, t) => s.classes.insert(*t),
+            Axiom::Declaration(ObjectProperty, t) | Axiom::ObjectPropertyAssertion(t, ..) => {
+                s.objects.insert(*t)
+            }
+            Axiom::Declaration(DataProperty, t) | Axiom::DataPropertyAssertion(t, ..) => {
+                s.data.insert(*t)
+            }
+            Axiom::Declaration(AnnotationProperty, t) => s.annotations.insert(*t),
+            _ => false,
+        };
+        s.names.extend(properties(o, axiom));
+    }
+    s.names.extend(s.classes.iter().chain(&s.annotations));
+    s
 }
 
 /// The profiles every axiom of `o` is in.
