@@ -262,21 +262,24 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
     completeness
 }
 
-/// Why a read of a statement [`universal`] names may miss rows.
-const UNIVERSAL: &str = "OWL 2 entails such statements for every term (of the term itself, \
-                         owl:Thing, the top and the bottom); the closure holds them in part";
+/// Why a read [`denied`] names may miss rows.
+const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocabulary that                       no closure, rewriting or bound holds in full";
 
 /// The hazards that hold of `analysis` whatever path decided its status, composed last
 /// onto it by both entry points ([`plan_status`], [`answer`]): each only lowers what the
-/// status asserts, so no earlier return can claim more than they allow.
+/// status asserts, so no earlier return can claim more than they allow. The bounds decide
+/// what the query reads ([`unbounded`]); its status is the one rule of every path
+/// ([`denied`]).
 fn certify(completeness: &mut Completeness, analysis: &Analysis) {
-    // Of what [`universal`] names, `owl:sameAs` is [`reflexive_same_as`]'s, which says it
-    // itself, and `owl:Thing` [`thing_on_the_rl_route`]'s.
-    if let Some(what) = analysis
-        .universal
-        .filter(|what| !["owl:sameAs", THING].contains(what))
-    {
-        completeness.incomplete("dl", format!("the query reads {what}: {UNIVERSAL}"));
+    if let Some((why, sound)) = reflexive_same_as(analysis) {
+        if sound {
+            completeness.incomplete("dl", why);
+        } else {
+            completeness.unsound("dl", why);
+        }
+    }
+    if let Some(what) = &analysis.denied {
+        completeness.incomplete("dl", format!("the query reads {what}: {DENIED}"));
     }
     if let Some(op) = analysis.not_monotone
         && !completeness.complete
@@ -288,21 +291,13 @@ fn certify(completeness: &mut Completeness, analysis: &Analysis) {
             ),
         );
     }
-    if let Some((why, sound)) = reflexive_same_as(analysis) {
-        if sound {
-            completeness.incomplete("dl", why);
-        } else {
-            completeness.unsound("dl", why);
-        }
-    }
 }
 
 /// [`certify`] for answers over a ruleset's closure without the bounds, with or without
 /// the QL rewriting, under an OWL 2 regime (under `rdfs` and `custom` the regime is the
-/// closure's own: what it lacks isn't entailed). A read of a statement OWL 2 entails for
-/// everything that neither holds ([`universal`]) misses rows; and where rows may be
-/// missing, an operator that can turn a missing row into a wrong one makes the answers
-/// unsound. Each from `source`.
+/// closure's own: what it lacks isn't entailed). A read [`denied`] names misses rows; and
+/// where rows may be missing, an operator that can turn a missing row into a wrong one
+/// makes the answers unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
     query: &Query,
@@ -312,8 +307,8 @@ pub(crate) fn certify_closure(
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         return;
     }
-    if let Some(what) = universal(query) {
-        completeness.incomplete(source, format!("the query reads {what}: {UNIVERSAL}"));
+    if let Some(what) = denied(query) {
+        completeness.incomplete(source, format!("the query reads {what}: {DENIED}"));
     }
     if let Some(op) = negation(query)
         && !completeness.complete
@@ -322,22 +317,6 @@ pub(crate) fn certify_closure(
             source,
             format!("the query uses {op} over answers that may be missing: a row may be wrong"),
         );
-    }
-}
-
-/// `x rdf:type owl:Thing` where no bound holds it: on the RL route, where L is the RL
-/// closure, which has it only for members of declared classes; off it, for an `x` U1
-/// doesn't type ([`thing_covered`], read in `snapshot`, the bounds' own). Elsewhere the
-/// bounds decide it.
-fn thing_unbounded(
-    status: &mut Status,
-    analysis: &Analysis,
-    query: &Query,
-    view: &View,
-    snapshot: &Snapshot,
-) {
-    if analysis.universal == Some(THING) && (view.rules || !thing_covered(query, snapshot)) {
-        status.add(format!("the query reads {THING}: {UNIVERSAL}"));
     }
 }
 
@@ -364,7 +343,6 @@ fn plan_status_built(
     if closed(analysis, &view, &snapshot) {
         let mut status = Status::complete();
         status.path("closed-predicates");
-        thing_unbounded(&mut status, analysis, prepared.query(), &view, &snapshot);
         return status;
     }
     Status::sound_only(
@@ -463,7 +441,6 @@ fn decide_answers(
     }
     let (snapshot, view) = super::bounds::view(store);
     let mut status = Status::complete();
-    thing_unbounded(&mut status, analysis, prepared.query(), &view, &snapshot);
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
     cancellation.check()?;
     match consistency {

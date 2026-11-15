@@ -23,8 +23,8 @@ pub(crate) struct Analysis {
     /// variable or blank node at an end or one constant at both, or any path step. A
     /// variable predicate and a negated property set count as possible `owl:sameAs` reads.
     reflexive_same_as: bool,
-    /// What the query reads of the statements OWL 2 entails for every term ([`universal`]).
-    pub(super) universal: Option<&'static str>,
+    /// Its first read that may miss entailed rows wherever it is answered ([`denied`]).
+    pub(super) denied: Option<String>,
 }
 
 /// Whether the `owl:sameAs` pattern `t` can match a reflexive pair: only two distinct
@@ -207,7 +207,7 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     let mut analysis = Analysis {
         shape: shape_of(query),
         answers: answer_variables(query),
-        universal: universal(query),
+        denied: denied(query),
         ..Analysis::default()
     };
     if matches!(query, Query::Describe { .. }) {
@@ -307,29 +307,36 @@ pub(super) fn negation(query: &Query) -> Option<&'static str> {
     found
 }
 
-/// What `x rdf:type owl:Thing` reads are named as by [`universal`].
-pub(super) const THING: &str = "rdf:type owl:Thing";
+/// Whether `iri` is in a reserved namespace, rdf:, rdfs: or owl:, whose entailed statements
+/// no closure, rewriting or bound holds in full.
+fn reserved(iri: &str) -> bool {
+    [
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "http://www.w3.org/2000/01/rdf-schema#",
+        "http://www.w3.org/2002/07/owl#",
+    ]
+    .iter()
+    .any(|ns| iri.starts_with(ns))
+}
 
-/// The first predicate `query` reads where OWL 2 entails statements for every term that
-/// neither a ruleset's closure nor the QL rewriting holds: `x owl:sameAs x` (eq-ref is
-/// left out), `x rdf:type owl:Thing`, the top properties' pairs, a class's or property's
-/// equivalence with itself, its subsumption by itself and the top and of the bottom (only
-/// declared classes get theirs), and its disjointness with the bottom. `DESCRIBE` reads
-/// every predicate of what it names. One walk that allocates nothing.
-pub(super) fn universal(query: &Query) -> Option<&'static str> {
+/// The first read of `query` that may miss entailed rows wherever it is answered (default
+/// deny): any but a predicate outside the [`reserved`] namespaces or `rdf:type` with a
+/// class constant outside them. A variable predicate, a negated property set and DESCRIBE
+/// read every predicate. One walk that allocates only for what it finds.
+pub(super) fn denied(query: &Query) -> Option<String> {
     if matches!(query, Query::Describe { .. }) {
-        return Some("every predicate of what DESCRIBE names");
+        return Some("every predicate of what DESCRIBE names".to_owned());
     }
     let mut found = None;
     pattern_of(query).find(&mut |node| {
         found = match node {
             Node::Pattern(GraphPattern::Bgp { patterns }) => {
                 patterns.iter().find_map(|t| match &t.predicate {
-                    NamedNodePattern::NamedNode(p) => universal_read(p.as_str(), Some(t)),
-                    NamedNodePattern::Variable(_) => Some("a variable predicate"),
+                    NamedNodePattern::NamedNode(p) => denied_read(p.as_str(), Some(&t.object)),
+                    NamedNodePattern::Variable(_) => Some("a variable predicate".to_owned()),
                 })
             }
-            Node::Pattern(GraphPattern::Path { path, .. }) => universal_path(path),
+            Node::Pattern(GraphPattern::Path { path, .. }) => denied_path(path),
             _ => None,
         };
         found.is_some()
@@ -337,92 +344,27 @@ pub(super) fn universal(query: &Query) -> Option<&'static str> {
     found
 }
 
-fn universal_path(path: &PropertyPathExpression) -> Option<&'static str> {
+fn denied_path(path: &PropertyPathExpression) -> Option<String> {
     use PropertyPathExpression as P;
     match path {
-        P::NamedNode(n) => universal_read(n.as_str(), None),
-        P::Reverse(p) | P::ZeroOrMore(p) | P::OneOrMore(p) | P::ZeroOrOne(p) => universal_path(p),
-        P::Sequence(paths) | P::Alternative(paths) => paths.iter().find_map(universal_path),
-        P::NegatedPropertySet(_) => Some("a negated property set"),
+        P::NamedNode(n) => denied_read(n.as_str(), None),
+        P::Reverse(p) | P::ZeroOrMore(p) | P::OneOrMore(p) | P::ZeroOrOne(p) => denied_path(p),
+        P::Sequence(paths) | P::Alternative(paths) => paths.iter().find_map(denied_path),
+        P::NegatedPropertySet(_) => Some("a negated property set".to_owned()),
     }
 }
 
-/// Whether a read of `predicate` (`t` its pattern; `None` for a path step, whose ends the
-/// query doesn't fix) can match a statement [`universal`] names: its name, if so.
-fn universal_read(predicate: &str, t: Option<&TriplePattern>) -> Option<&'static str> {
-    const OWL: &str = "http://www.w3.org/2002/07/owl#";
-    const TOP: [&str; 2] = ["topObjectProperty", "topDataProperty"];
-    const BOTTOM: [&str; 2] = ["bottomObjectProperty", "bottomDataProperty"];
-    // Whether the subject, and the object, can be one of the OWL terms `names`: a
-    // variable or blank node can, as can a path step's ends.
-    let ends = |names: &[&str]| {
-        let can_be = |term: &TermPattern| match term {
-            TermPattern::NamedNode(n) => n
-                .as_str()
-                .strip_prefix(OWL)
-                .is_some_and(|n| names.contains(&n)),
-            TermPattern::Literal(_) => false,
-            _ => true,
-        };
-        t.map_or([true; 2], |t| [can_be(&t.subject), can_be(&t.object)])
-    };
-    let reflexive = t.is_none_or(can_be_reflexive);
-    // x ⊑ x, x ⊑ the top, the bottom ⊑ x.
-    let subsumed = |top: &[&str], bottom: &[&str]| reflexive || ends(top)[1] || ends(bottom)[0];
-    let (reads, name) = match predicate {
-        RDF_TYPE => (ends(&["Thing"])[1], THING),
-        "http://www.w3.org/2002/07/owl#topObjectProperty" => (true, "owl:topObjectProperty"),
-        "http://www.w3.org/2002/07/owl#topDataProperty" => (true, "owl:topDataProperty"),
-        OWL_SAME_AS => (reflexive, "owl:sameAs"),
-        "http://www.w3.org/2002/07/owl#equivalentClass" => (reflexive, "owl:equivalentClass"),
-        "http://www.w3.org/2002/07/owl#equivalentProperty" => (reflexive, "owl:equivalentProperty"),
-        "http://www.w3.org/2000/01/rdf-schema#subClassOf" => {
-            (subsumed(&["Thing"], &["Nothing"]), "rdfs:subClassOf")
-        }
-        "http://www.w3.org/2000/01/rdf-schema#subPropertyOf" => {
-            (subsumed(&TOP, &BOTTOM), "rdfs:subPropertyOf")
-        }
-        "http://www.w3.org/2002/07/owl#disjointWith" => {
-            (ends(&["Nothing"]).contains(&true), "owl:disjointWith")
-        }
-        "http://www.w3.org/2002/07/owl#propertyDisjointWith" => {
-            (ends(&BOTTOM).contains(&true), "owl:propertyDisjointWith")
-        }
-        _ => return None,
-    };
-    reads.then_some(name)
-}
-
-/// Whether U1 can hold `x rdf:type owl:Thing` for every `x` that `query` reads it of: U1
-/// types the data's individuals, so a variable is covered, a named node only if it is a
-/// term of `snapshot`, and a blank node or literal never. A dictionary lookup: a term of
-/// the data U1 doesn't type (a class or property name alone) passes it.
-pub(super) fn thing_covered(query: &Query, snapshot: &Snapshot) -> bool {
-    let covered = |term: &TermPattern| match term {
-        TermPattern::Variable(_) => true,
-        TermPattern::NamedNode(n) => snapshot
-            .lookup(NamedNodeRef::new_unchecked(n.as_str()).into())
-            .is_some(),
-        _ => false,
-    };
-    let mut uncovered = false;
-    pattern_of(query).find(&mut |node| {
-        uncovered = match node {
-            Node::Pattern(GraphPattern::Bgp { patterns }) => patterns.iter().any(|t| {
-                matches!(&t.predicate, NamedNodePattern::NamedNode(p)
-                    if universal_read(p.as_str(), Some(t)) == Some(THING))
-                    && !covered(&t.subject)
-            }),
-            Node::Pattern(GraphPattern::Path {
-                subject,
-                path,
-                object,
-            }) => universal_path(path) == Some(THING) && !(covered(subject) && covered(object)),
-            _ => false,
-        };
-        uncovered
-    });
-    !uncovered
+/// [`denied`] for a read of `predicate` with `object` (`None`: a path step's, which the
+/// query doesn't name).
+fn denied_read(predicate: &str, object: Option<&TermPattern>) -> Option<String> {
+    if predicate != RDF_TYPE {
+        return reserved(predicate).then(|| format!("<{predicate}>"));
+    }
+    match object {
+        Some(TermPattern::NamedNode(c)) if !reserved(c.as_str()) => None,
+        Some(TermPattern::NamedNode(c)) => Some(format!("rdf:type <{}>", c.as_str())),
+        _ => Some("rdf:type of a class it doesn't name".to_owned()),
+    }
 }
 
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
@@ -444,18 +386,13 @@ fn ordered(mut pattern: &GraphPattern) -> bool {
 /// equivalence, subproperty, disjointness axioms as triples) are classification's. A
 /// variable predicate reads them too.
 pub(super) fn unbounded(analysis: &Analysis) -> Option<String> {
-    const RESERVED: [&str; 3] = [
-        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-        "http://www.w3.org/2000/01/rdf-schema#",
-        "http://www.w3.org/2002/07/owl#",
-    ];
     analysis
         .reads
         .iter()
         .find_map(|(predicate, _)| match predicate {
             None => Some("a variable predicate".to_owned()),
             Some(p) if p == RDF_TYPE || p == OWL_SAME_AS => None,
-            Some(p) if RESERVED.iter().any(|ns| p.starts_with(ns)) => Some(format!("<{p}>")),
+            Some(p) if reserved(p) => Some(format!("<{p}>")),
             Some(_) => None,
         })
 }

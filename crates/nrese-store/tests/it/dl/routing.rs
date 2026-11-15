@@ -53,10 +53,11 @@ fn reflexive_same_as_reads_are_not_complete_on_the_rules_route() {
     )
     .expect("an RL ontology");
     assert_eq!(dl.store().dl_bounds().last, "rules");
-    // Guard (holds on the base too): two distinct constants are decided.
+    // Two distinct constants are decided; the one rule (default deny) withholds
+    // `complete` from the reserved read: an over-mark.
     let (rows, status) = query(&dl, "ASK { :rex owl:sameAs :ann }");
     assert_eq!(rows, ["false"]);
-    assert!(status.is_complete(), "{:?}", status.reasons());
+    assert!(!status.is_complete(), "{:?}", status.reasons());
     // Every read is checked and the wrong ones reported together.
     let mut wrong = Vec::new();
     for read in [
