@@ -1,23 +1,22 @@
 # Limits and deviations
 
-What NRESE doesn't do, and where it departs from a standard on purpose, for the code of
-the commit this page is in. Most items are stated in the document they link to, and this page gathers them; an
-item without a link is stated here. Each has what to do instead, or "none known" where there is nothing. It is the
-detail of the
-"left out" list of the [scope](what-it-covers.md#scope), which also says what is in and what is
-planned.
+This page lists what NRESE doesn't do, and where it departs from a standard on purpose, in the
+code of the commit it is in. Most items are stated in the page they link to and gathered here,
+and an item without a link is stated only here. Each one says what to do instead, or "none known"
+where we know of nothing. It is the detail of the "left out" list in the
+[scope](what-it-covers.md#scope), which also says what is in and what is planned.
 
 ## Choose another system when
 
-- You need several writers at once. One commit runs at a time; reads never wait for
+- You need several writers at once. One commit runs at a time, and reads never wait for
   it ([storage](spec/02-storage-and-transactions.md#writes)).
 - You need automatic failover, or data spread over several machines. Read replicas
-  follow a primary's log; nothing promotes a replica or partitions the data
+  follow a primary's log, but nothing promotes a replica or partitions the data
   ([replication](ops/replication.md)).
 - You need named graphs as separate reasoning contexts. Rules read every graph, and
   inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)).
 - You need every OWL 2 DL answer proven complete. Some answers are `sound-only` and say
-  so; asking for exact answers turns those into an error rather than a guess
+  so, and if you ask for exact answers, those become an error instead of a guess
   ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
 - You need SHACL rules (SHACL Advanced Features) or `sh:entailment`. Neither is
   supported ([SHACL limits](ops/http-api.md#shacl-validation)).
@@ -38,84 +37,92 @@ planned.
   `HAVING (COUNT(?x) > 1)`.
 - A default graph merged from several graphs keeps a blank node they share as one node,
   where SPARQL's RDF merge keeps them apart ([why](ops/http-api.md#sparql)). No setting
-  gives the standard merge; where it matters, read with `GRAPH ?g { … }` and keep `?g` in
+  gives the standard merge. Where it matters, read with `GRAPH ?g { … }` and keep `?g` in
   the answer.
 - GeoSPARQL measures in metres only in CRS84 and a listed set of projected systems, and reads
   no GML arcs or 3D solids: such a measure or literal gives no value. Convert coordinates and
-  approximate arcs before loading; for solids, none known ([GeoSPARQL](ops/http-api.md#sparql)).
+  approximate arcs before loading. For solids, none known ([GeoSPARQL](ops/http-api.md#sparql)).
 - Full-text query strings drop Lucene's `OR`, `+`, field names and boosts
   ([full-text search](ops/http-api.md#sparql)). Words without `AND` match as any of them, as
-  `OR` would; to require words, join them with `AND` (every word is then needed); to search one
-  property, name it in `text:query`'s list; for boosts, none known.
-- A named graph without statements doesn't exist: `CREATE GRAPH` stores nothing, and an
+  `OR` would. To require words, join them with `AND` (every word is then needed), and to search
+  one property, name it in `text:query`'s list. For boosts, none known.
+- A named graph without statements doesn't exist. `CREATE GRAPH` stores nothing, and an
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
-  Read that 404 as an empty graph; to keep an empty graph listed, none known.
+  Read that 404 as an empty graph. To keep an empty graph listed, none known.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
-- Directional strings in the data alone don't make a result announce RDF 1.2; a query that
+- Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
-  None known: a client that may meet them should read results as RDF 1.2.
+  None known, so a client that may meet them should read results as RDF 1.2.
 - The planner counts a pattern's distinct values in the first query that plans with it, so that query waits for the
-  count; the count stops when the query does. Counts are kept in a table of 16,384 entries, charged to the engine's
-  budget, not the query's, and reused until the pattern's matches drift by a quarter. A pattern with more than about
-  4 million (2²²) matches isn't counted afresh. None known.
+  count, and the count stops when the query does. Counts are kept in a table of 16,384 entries, charged to the
+  engine's budget, not the query's, and reused until the pattern's matches drift by a quarter. A pattern with more
+  than about 4 million (2²²) matches isn't counted afresh. None known.
 - After a load, the planner's characteristic sets are built once (about 1.5 s at one thread for 10 M statements),
   saved beside the checkpoint, read at a restart, and rebuilt on their own thread once the data has drifted by a
   quarter. Data with more than 131,072 distinct predicate sets (DBpedia among them) gets none. What the build holds
-  while it runs isn't charged; a view of the data builds sets of its own, which no budget limits; a build at first
-  use runs inside the planning query and can't be cancelled; and closing the store doesn't stop a rebuild. None
-  known.
+  while it runs isn't charged, and a view of the data builds sets of its own, which no budget limits. A build at
+  first use runs inside the planning query and can't be cancelled, and closing the store doesn't stop a rebuild.
+  None known.
 
 ## RDF syntaxes
 
-- JSON-LD remote contexts aren't fetched. Over HTTP, send the context inline; a library
-  caller supplies a document loader.
+- JSON-LD remote contexts aren't fetched. Over HTTP, send the context inline, and in the library
+  supply a document loader.
 - Notation3 is read in the library only (not over HTTP), and only what RDF can hold. N3
   rules go to the reasoner through `reasoner.rules`
   ([configuration](ops/config-reference.md#reasoner)).
-- Blank nodes are scoped to one write: every request gets fresh ones
+- Blank nodes are scoped to one write, so every request gets fresh ones
   ([storage](spec/02-storage-and-transactions.md#data-model)). Give a node an IRI where a
   later write must name it.
 
 ## Reasoning
 
+What each mode computes and what its answers promise is in
+[the reasoning contract](spec/reasoning-semantics.md#modes). These are the parts of it that
+leave something out.
+
 - Inferences are materialised, in the default graph. A statement both asserted and derivable counts as
   asserted ([storage](spec/02-storage-and-transactions.md#data-model)).
-- `rdfs` is a six-rule subset without axiomatic triples; `rdfs-full` has the RDFS rules
-  but `rdfD1`, and the axioms but those about `rdf:_1`, `rdf:_2`, …
-  ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset), [modes](spec/reasoning-semantics.md#modes)).
-- `owl2-rl` doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
-  return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+- `rdfs` has no axiomatic triples, and `rdfs-full` leaves out `rdfD1` and the axioms about
+  `rdf:_1`, `rdf:_2`, … ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset),
+  [modes](spec/reasoning-semantics.md#modes)).
+- `owl2-rl` doesn't infer `x owl:sameAs x` for every term, so `?x owl:sameAs ?x` doesn't
+  return one for each, though an asserted one is returned. It checks the datatype rules in part,
+  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements, in every store
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain or key of more than 250 properties, more than
   64 member sequences) aren't used at all, never truncated, and each is reported in the log
   and the reasoning diagnostics
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
-  keeping lists within those limits. Literals aren't
-  equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
-  values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
-- Without the OWL 2 QL rewriting, every answer over a
-  ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
-  under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
-  Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
-  budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
-  monotone over answers that may be missing gives `unsound`
-  ([what an answer promises](what-it-covers.md#what-an-answer-promises)).
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)). None known beyond
+  keeping lists within those limits. Literals aren't equated by value (`"1"^^xsd:integer` and
+  `"01"^^xsd:integer` stay two terms), so compare values in a `FILTER` (`?v = 1`), which SPARQL
+  does by value. Otherwise none known.
+- Without the OWL 2 QL rewriting, every answer over a ruleset's closure is `sound-only`
+  ([completeness](spec/reasoning-semantics.md#completeness)). Under `owl2-rl`, turn the
+  rewriting on with `reasoner.ql_rewriting = "on"`. Under `owl2-dl`, raise the `dl.*` budgets
+  where they leave answers `sound-only`, or ask `dl-answers=exact` to get an error instead.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
-  `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
+  `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
 - Under `owl2-dl`, a commit whose consistency check isn't decided
-  (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
+  (a budget or the timeout) goes through, and the status says `unknown`. No answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
-- Bulk loads skip the commit gates ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
-  neither SHACL nor the OWL 2 DL consistency check runs. With reasoning on,
-  `nrese-server load` recomputes the inferences and fails when the rules' consistency
-  checks find a violation (under `owl2-dl`, those of OWL 2 RL); the data stays loaded, and
-  the store is quarantined until it is repaired. With reasoning off, nothing is checked
-  ([consistency](spec/reasoning-semantics.md#consistency)). For the gates, load over HTTP
-  (Graph Store), or validate after the load with `GET /dataset/shacl`.
+- An explanation of what the rules derived (`/explain`) examines at most 4,096 statements.
+  Outside `owl2-dl`, a derivation it doesn't find within them is answered 404, the same as for a
+  statement that doesn't hold, so you can't tell the two apart. Justifications
+  (`justifications=…`) say `complete: false` when a budget cut them short, and under `owl2-dl`
+  a set of axioms past `dl.explanation_tests` or `dl.timeout` comes back unminimised, with
+  `minimal: false`. Where OWL 2 DL doesn't decide it, the answer is a 422 that says why, not a
+  404 ([HTTP interface](ops/http-api.md#engine-api-apiv1)). For the derivation, none known.
+- Bulk loads and the ontology file loaded at start-up skip the commit checks
+  ([what a commit does](what-it-covers.md#what-a-commit-does),
+  [storage](spec/02-storage-and-transactions.md#bulk-loads)), so neither SHACL nor the OWL 2 DL
+  consistency check runs. To have the checks, load over HTTP (Graph Store), or validate after
+  the load with `GET /dataset/shacl`.
 - Data that is already inconsistent can keep more facts derived before the clash, depending on the order in which
   they were derived. Answers don't change. None known.
-- Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow; at a budget the answer
+- Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow. At a budget the answer
   is `sound-only` and partial (about 18 s for a class of 20,000 members, with 1,002 of 20,002 rows certain). Proofs
   per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
 
@@ -124,7 +131,7 @@ planned.
 - SHACL Core and SHACL-SPARQL. Not supported: SHACL Advanced Features, and `sh:entailment`,
   which is reported as a failure ([HTTP interface](ops/http-api.md#shacl-validation)).
   None known.
-- The commit gate is off by default; when on, it checks only what a commit introduces
+- The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
 
@@ -161,13 +168,13 @@ planned.
     can exceed it, and joins running at once can read the same room. So no headroom follows from these numbers.
   - None known. A design that bounds the rest follows this release.
 - A query can be refused while part of what it reserved is unused: reservations are taken ahead, in grants and
-  credit. That unused part has no stated bound in this release; the bound is designed and comes after it. None
-  known.
+  credit. That unused part has no stated bound in this release, and the bound is designed and comes after it.
+  None known.
 - Near the memory limit, a cached decoding can cause a refusal while memory that the cache may give back is still
   held. The output is never wrong, and memory isn't unbounded. None known.
 - A cancel, a deadline or a refusal takes effect at the work's next poll. Under nested reads in reasoning (a read
   suspended while another runs inside its callback), up to 4,096 units plus one run plus d × 4,096 units can run
-  between two polls, where a run is at most 4,096 units and d is the number of suspended reads; after a refusal,
+  between two polls, where a run is at most 4,096 units and d is the number of suspended reads. After a refusal,
   up to d × 4,096 units still run before the query reports that it stopped
   ([cancellation](architecture/contracts.md#cancellation)). The units bound work, not time. A stop never gives a
   partial or wrong answer. None known.
@@ -177,33 +184,34 @@ planned.
 
 ## Storage and transactions
 
-- One writer at a time; a commit holds at most 4 GiB of log payload, about 130 M quads;
-  larger loads go through the bulk loader
+- One writer at a time, and a commit holds at most 4 GiB of log payload, about 130 M quads.
+  Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).
-- Client transactions read the latest commit; `SNAPSHOT` and `SERIALIZABLE` isolation are
+- Client transactions read the latest commit, and `SNAPSHOT` and `SERIALIZABLE` isolation are
   refused ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)). A read, then a write
   that depends on it, fits in one SPARQL update (`DELETE … INSERT … WHERE`), which is one
   commit.
 - A stop signal during start-up acts as a kill, and on Windows a service stop or
-  `taskkill /F` ends the server without letting its requests finish; acknowledged commits
+  `taskkill /F` ends the server without letting its requests finish. Acknowledged commits
   are kept either way ([stopping](ops/server-setup.md#64-stopping)). On Windows, stop it
   with ctrl-c in its console.
-- A write that fails or is refused can leave its new terms in the dictionary, and the next commit publishes them:
+- A write that fails or is refused can leave its new terms in the dictionary, and the next commit publishes them,
   at most what its own request added ([dictionary continuity](adr/0002-engine-storage-lsm-permutations.md#implementation-notes-2026-09-25-e2e4)). Under
-  the global search scope they show in text and IRI search; under the reader's scope they don't
-  ([`store.search_scope`](ops/config-reference.md#store.search_scope)). None known; v1.6 removes them.
+  the global search scope they show in text and IRI search, and under the reader's scope they don't
+  ([`store.search_scope`](ops/config-reference.md#store.search_scope)). None known, and v1.6 removes them.
 - A commit keeps every term it added, even one no statement uses (an `INSERT` and a `DELETE` of it in one
-  transaction); such terms behave like those of deleted statements. None known; reclaiming them is planned for v1.6.
+  transaction), and such terms behave like those of deleted statements. None known, and reclaiming them is
+  planned for v1.6.
 - Terms of the system's own vocabulary are published when the stored state lacks them: the DL vocabulary, DL's
   fresh individuals, generated rule names and configured rule constants. They come only from fixed names, the
   configuration and the published ontology, never from a request. None known.
 
 ## Access control
 
-- No authentication by default (`auth.mode = none`): set one before the server is reachable
-  from other machines ([configuration](ops/config-reference.md#auth-modes)).
+- There is no authentication by default (`auth.mode = none`), so set one before the server is
+  reachable from other machines ([configuration](ops/config-reference.md#auth-modes)).
 - Endpoints over the whole dataset (classification, SHACL validation, autocomplete) are
   only for readers of every graph
   ([access control](ops/http-api.md#graph-level-access-control)). None known.
-- A refusal for memory or work can hint at how much data a reader of only some graphs may not see. None known;
-  v2.0 admits requests by what the reader sees.
+- A refusal for memory or work can hint at how much data a reader of only some graphs may not see. None known,
+  and v2.0 admits requests by what the reader sees.
