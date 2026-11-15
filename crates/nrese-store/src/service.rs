@@ -1117,7 +1117,6 @@ impl StoreService {
         let memory = self.settings.query_envelope(prepared);
         if let Some(mode) = self.dl_mode(prepared) {
             use crate::dl::query::{Outcome, Read};
-            let dl = format!("owl2-dl {mode:?}");
             let detail =
                 match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
                     Outcome::Answers(answers, status, detail) => {
@@ -1136,7 +1135,7 @@ impl StoreService {
                                 self.read_snapshot_within(prepared.access(), &memory, cancellation)?
                             }
                         };
-                        let context = format!("{dl} {status:?}");
+                        let context = dl_context(mode, &status);
                         run_query(
                             &snapshot,
                             prepared,
@@ -1165,7 +1164,7 @@ impl StoreService {
             |ql| {
                 let status = self.status_outside_dl(prepared, ql);
                 // The cache's context is the whole assessment, not what the reader is told.
-                let context = format!("{status:?}");
+                let context = context_outside_dl(status.as_ref());
                 report(status_for_its_reader(prepared, status, ql.is_some()));
                 context
             },
@@ -1589,7 +1588,7 @@ impl StoreService {
                     }
                     // A transaction's pending state: never answered from the cache.
                     report(status_for_its_reader(prepared, status, ql.is_some()));
-                    String::new()
+                    Vec::new()
                 },
             )
             .map(|_| ())
@@ -2325,6 +2324,31 @@ fn withholds_certification(prepared: &PreparedQuery) -> bool {
         .is_some_and(|access| access.inferred && !access.inferred_by_support)
 }
 
+/// The result cache's context of an answer under `owl2-dl` in `mode`: a tag no other
+/// context starts with, the mode, then the status, every field of it.
+fn dl_context(mode: crate::DlAnswers, status: &nrese_sparql::Completeness) -> Vec<u8> {
+    use crate::DlAnswers::{CertainWhereComplete, Exact, Sound};
+    let mode = match mode {
+        CertainWhereComplete => 0,
+        Sound => 1,
+        Exact => 2,
+    };
+    let mut context = vec![b'D', mode];
+    status.write_cache_context(&mut context);
+    context
+}
+
+/// The result cache's context of an answer outside the DL bounds: its whole status, or
+/// none, each with a tag of its own.
+fn context_outside_dl(status: Option<&nrese_sparql::Completeness>) -> Vec<u8> {
+    let Some(status) = status else {
+        return vec![b'N'];
+    };
+    let mut context = vec![b'S'];
+    status.write_cache_context(&mut context);
+    context
+}
+
 /// A run or an EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A
 /// reader of every graph is told everything. Another is told only what comes from its query
 /// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
@@ -2973,5 +2997,31 @@ mod memory_stop_tests {
         let none = MemoryStop::of(Ok(0));
         assert!(!none.exceeded());
         assert_eq!(none.room(), Ok(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::{context_outside_dl, dl_context};
+    use crate::DlAnswers;
+    use nrese_sparql::{Completeness, Regime};
+
+    /// One status keys apart under `owl2-dl` and outside it, apart in each DL answers mode,
+    /// and apart from no status at all: a cached answer of one is never another's.
+    #[test]
+    fn the_cache_contexts_of_one_status_never_meet() {
+        let status = Completeness::under(Regime::Owl2Dl);
+        let contexts = [
+            context_outside_dl(None),
+            context_outside_dl(Some(&status)),
+            dl_context(DlAnswers::CertainWhereComplete, &status),
+            dl_context(DlAnswers::Sound, &status),
+            dl_context(DlAnswers::Exact, &status),
+        ];
+        for (i, a) in contexts.iter().enumerate() {
+            for b in &contexts[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

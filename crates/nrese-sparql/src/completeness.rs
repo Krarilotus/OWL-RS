@@ -40,8 +40,7 @@ pub struct Outside {
     pub not_guaranteed: &'static str,
 }
 
-// The store's output cache keys on this form: an assessment prints as it did before
-// `certification_withheld` and `outside`.
+// For logs; the store's output cache keys on [`Completeness::write_cache_context`].
 impl fmt::Debug for Completeness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("Completeness");
@@ -169,6 +168,65 @@ impl Completeness {
         }
     }
 
+    /// Writes every field to `out` as the result cache's keys are written
+    /// (`native::cache_key::Encoder`): a byte per bool and tag, a count before a list, a
+    /// presence byte before an option, each text as its length (u64, little-endian) and its
+    /// bytes. Injective, so two statuses share bytes exactly when they are equal.
+    pub fn write_cache_context(&self, out: &mut Vec<u8>) {
+        let Self {
+            sound,
+            complete,
+            certification_withheld,
+            reasons,
+            bounds,
+            regime,
+            outside,
+        } = self;
+        let number = |out: &mut Vec<u8>, n: u64| out.extend_from_slice(&n.to_le_bytes());
+        let text = |out: &mut Vec<u8>, t: &str| {
+            number(out, t.len() as u64);
+            out.extend_from_slice(t.as_bytes());
+        };
+        out.extend([*sound, *complete, *certification_withheld].map(u8::from));
+        number(out, reasons.len() as u64);
+        for Reason { source, text: said } in reasons {
+            text(out, source);
+            text(out, said);
+        }
+        out.push(u8::from(bounds.is_some()));
+        if let Some(Bounds {
+            lower,
+            upper,
+            unresolved,
+        }) = bounds
+        {
+            for n in [*lower, *upper, *unresolved] {
+                number(out, n);
+            }
+        }
+        out.push(match regime {
+            None => 0,
+            Some(Regime::Owl2Ql) => 1,
+            Some(Regime::Owl2Rl) => 2,
+            Some(Regime::Owl2Dl) => 3,
+            Some(Regime::Rdfs) => 4,
+            Some(Regime::Custom) => 5,
+        });
+        out.push(u8::from(outside.is_some()));
+        if let Some(Outside {
+            what,
+            by,
+            guaranteed,
+            not_guaranteed,
+        }) = outside
+        {
+            number(out, what.len() as u64);
+            for t in what.iter().chain([by, guaranteed, not_guaranteed]) {
+                text(out, *t);
+            }
+        }
+    }
+
     /// `complete`, `sound-only`, `unsound` or `not-certified`.
     pub fn as_str(&self) -> &'static str {
         if self.certification_withheld {
@@ -287,6 +345,69 @@ fn quoted(out: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The result cache tells statuses apart by [`Completeness::write_cache_context`]: a
+    /// change to any one field, or to one reason's text alone, gives other bytes. The
+    /// status is built field by field, so a field added later fails to compile here until
+    /// it has its own change below.
+    #[test]
+    fn every_field_of_a_status_changes_its_cache_context() {
+        let reason = |text: &str| Reason {
+            source: "ql",
+            text: text.to_owned(),
+        };
+        let base = Completeness {
+            sound: true,
+            complete: false,
+            certification_withheld: false,
+            reasons: vec![reason("a"), reason("b")],
+            bounds: Some(Bounds {
+                lower: 1,
+                upper: 2,
+                unresolved: 1,
+            }),
+            regime: Some(Regime::Owl2Ql),
+            outside: Some(Outside {
+                what: vec!["x"],
+                by: "el",
+                guaranteed: "g",
+                not_guaranteed: "n",
+            }),
+        };
+        let changed: [fn(&mut Completeness); 14] = [
+            |c| c.sound = false,
+            |c| c.complete = true,
+            |c| c.certification_withheld = true,
+            |c| c.reasons[1].text = "c".to_owned(),
+            |c| c.reasons[0].source = "dl",
+            |c| c.reasons.swap(0, 1),
+            |c| {
+                c.reasons.pop();
+            },
+            |c| c.bounds = None,
+            |c| c.bounds.as_mut().unwrap().unresolved = 0,
+            |c| c.regime = Some(Regime::Owl2Rl),
+            |c| c.regime = None,
+            |c| c.outside = None,
+            |c| c.outside.as_mut().unwrap().what.push("y"),
+            |c| c.outside.as_mut().unwrap().not_guaranteed = "m",
+        ];
+        let bytes = |c: &Completeness| {
+            let mut out = Vec::new();
+            c.write_cache_context(&mut out);
+            out
+        };
+        let mut seen = vec![bytes(&base)];
+        for (i, change) in changed.iter().enumerate() {
+            let mut c = base.clone();
+            change(&mut c);
+            let b = bytes(&c);
+            assert!(!seen.contains(&b), "change {i} gives bytes already seen");
+            seen.push(b);
+        }
+        // Equal statuses, equal bytes.
+        assert_eq!(bytes(&base), bytes(&base.clone()));
+    }
 
     #[test]
     fn headers_say_the_status_and_its_reasons_in_ascii() {
