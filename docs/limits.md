@@ -1,8 +1,9 @@
 # Limits and deviations
 
 What NRESE doesn't do, and where it departs from a standard on purpose, for the code of
-the commit this page is in. Each item is stated in the document it links to; this page only gathers them, each
-with what to do instead, or "none known" where there is nothing. It is the detail of the
+the commit this page is in. Most items are stated in the document they link to, and this page gathers them; an
+item without a link is stated here. Each has what to do instead, or "none known" where there is nothing. It is the
+detail of the
 "left out" list of the [scope](what-it-covers.md#scope), which also says what is in and what is
 planned.
 
@@ -53,6 +54,16 @@ planned.
 - Directional strings in the data alone don't make a result announce RDF 1.2; a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
   None known: a client that may meet them should read results as RDF 1.2.
+- The planner counts a pattern's distinct values in the first query that plans with it, so that query waits for the
+  count; the count stops when the query does. Counts are kept in a table of 16,384 entries, charged to the engine's
+  budget, not the query's, and reused until the pattern's matches drift by a quarter. A pattern with more than about
+  4 million (2²²) matches isn't counted afresh. None known.
+- After a load, the planner's characteristic sets are built once (about 1.5 s at one thread for 10 M statements),
+  saved beside the checkpoint, read at a restart, and rebuilt on their own thread once the data has drifted by a
+  quarter. Data with more than 131,072 distinct predicate sets (DBpedia among them) gets none. What the build holds
+  while it runs isn't charged; a view of the data builds sets of its own, which no budget limits; a build at first
+  use runs inside the planning query and can't be cancelled; and closing the store doesn't stop a rebuild. None
+  known.
 
 ## RDF syntaxes
 
@@ -102,6 +113,11 @@ planned.
   the store is quarantined until it is repaired. With reasoning off, nothing is checked
   ([consistency](spec/reasoning-semantics.md#consistency)). For the gates, load over HTTP
   (Graph Store), or validate after the load with `GET /dataset/shacl`.
+- Data that is already inconsistent can keep more facts derived before the clash, depending on the order in which
+  they were derived. Answers don't change. None known.
+- Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow; at a budget the answer
+  is `sound-only` and partial (about 18 s for a class of 20,000 members, with 1,002 of 20,002 rows certain). Proofs
+  per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
 
 ## SHACL
 
@@ -111,6 +127,53 @@ planned.
 - The commit gate is off by default; when on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
+
+## Memory and stopping
+
+- Memory limits constrain charged query reservations. Some operator working state and lazily built engine
+  structures remain outside those reservations; total allocation and resident memory can exceed the configured
+  limits. No fixed multiplier bounds that excess.
+  - A limit counts what requests charge and reserve, not resident memory. Some of what it covers is charged only
+    after it is built: a join's output, and the rows a query produces.
+  - Outside it: the full-text index and the text order, built by the first query that needs them and kept; a
+    join's output while it is built; operators' working state (`OPTIONAL`'s keys, `ORDER BY`'s decoded terms,
+    `GROUP BY`'s ids, the aggregates' members, the table of `MINUS` and `NOT EXISTS`, `CONTAINS`'s view of the
+    dictionary, `BIND`'s copy, `FILTER`'s mask); and the working state of a cyclic count (triangles,
+    four-cycles). So a limit doesn't bound a cyclic count's working state, where `main`'s limit refuses such
+    counts at small limits ([measured](releases/v1.5.md#the-cyclic-counts-against-main)).
+  - Also outside, by design in this release: the sample of `EXPLAIN`'s cyclic estimate; the list of the range
+    hints' counts; the per-query cache of compiled regular expressions, and `REPLACE`'s output; a vector charged
+    only after it was allocated (`adopt_vec`); the keys and values a charged map holds apart from its table; the
+    request's and its parts' bookkeeping; the planner's small temporaries (a few words per pattern of a basic
+    graph pattern, at most 4,096 states of the join order's exact search, and the characteristic-set search's
+    copies, bounded at 2¹⁶ steps); cache entries still held
+    after the cache released their charge; reasoning's `owl:sameAs` copies; and everything else reasoning
+    allocates, which isn't charged but polled: an overshoot is seen within 10 ms. The planner's distinct-value
+    table is charged to the engine's budget, not the request's.
+  - The settings: one query's envelope, [`budgets.query_memory`](ops/config-reference.md#budgets.query_memory)
+    (4 GiB by default); every running request's together,
+    [`budgets.total_query_memory`](ops/config-reference.md#budgets.total_query_memory) (50 % of the memory);
+    both inside the process's, [`budgets.process_memory`](ops/config-reference.md#budgets.process_memory) (75 %).
+    An embedded store's defaults have no separate query pool: queries charge the process's budget. None of these
+    is set aside: the store's data, the text structures, reasoning, the allocator's retained memory and other
+    processes draw on the same memory. A join's cap, half the room left at its start, is a reading of that room,
+    not a reservation: it is checked every 1,024 rows, the capacity of its vectors and the joining of its parts
+    can exceed it, and joins running at once can read the same room. So no headroom follows from these numbers.
+  - None known. A design that bounds the rest follows this release.
+- A query can be refused while part of what it reserved is unused: reservations are taken ahead, in grants and
+  credit. That unused part has no stated bound in this release; the bound is designed and comes after it. None
+  known.
+- Near the memory limit, a cached decoding can cause a refusal while memory that the cache may give back is still
+  held. The output is never wrong, and memory isn't unbounded. None known.
+- A cancel, a deadline or a refusal takes effect at the work's next poll. Under nested reads in reasoning (a read
+  suspended while another runs inside its callback), up to 4,096 units plus one run plus d × 4,096 units can run
+  between two polls, where a run is at most 4,096 units and d is the number of suspended reads; after a refusal,
+  up to d × 4,096 units still run before the query reports that it stopped
+  ([cancellation](architecture/contracts.md#cancellation)). The units bound work, not time. A stop never gives a
+  partial or wrong answer. None known.
+- Some phases run to their end after a stop: the executor's selection and sorting (seconds at 10 M rows on a term
+  key), one call of a regular expression (seconds for adversarial megabyte literals), and the graph kernel's
+  sorts and set-up arrays. None known.
 
 ## Storage and transactions
 
@@ -125,6 +188,15 @@ planned.
   `taskkill /F` ends the server without letting its requests finish; acknowledged commits
   are kept either way ([stopping](ops/server-setup.md#64-stopping)). On Windows, stop it
   with ctrl-c in its console.
+- A write that fails or is refused can leave its new terms in the dictionary, and the next commit publishes them:
+  at most what its own request added ([dictionary continuity](adr/0002-engine-storage-lsm-permutations.md#implementation-notes-2026-09-25-e2e4)). Under
+  the global search scope they show in text and IRI search; under the reader's scope they don't
+  ([`store.search_scope`](ops/config-reference.md#store.search_scope)). None known; v1.6 removes them.
+- A commit keeps every term it added, even one no statement uses (an `INSERT` and a `DELETE` of it in one
+  transaction); such terms behave like those of deleted statements. None known; reclaiming them is planned for v1.6.
+- Terms of the system's own vocabulary are published when the stored state lacks them: the DL vocabulary, DL's
+  fresh individuals, generated rule names and configured rule constants. They come only from fixed names, the
+  configuration and the published ontology, never from a request. None known.
 
 ## Access control
 
@@ -133,3 +205,5 @@ planned.
 - Endpoints over the whole dataset (classification, SHACL validation, autocomplete) are
   only for readers of every graph
   ([access control](ops/http-api.md#graph-level-access-control)). None known.
+- A refusal for memory or work can hint at how much data a reader of only some graphs may not see. None known;
+  v2.0 admits requests by what the reader sees.
