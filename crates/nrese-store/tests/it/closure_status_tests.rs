@@ -783,3 +783,27 @@ fn never_complete(declaration: &str) {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// cls-maxc2 names its cardinality as the term `"1"^^xsd:nonNegativeInteger`, and the rule
+/// set leaves out dt-eq: under owl2-rl only that spelling is read, and plain Turtle
+/// `owl:maxCardinality 1` (an xsd:integer) doesn't equate `:x` and `:y`.
+#[test]
+fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
+    let mut wrong = Vec::new();
+    for (card, read) in [("\"1\"^^xsd:nonNegativeInteger", true), ("1", false)] {
+        let data = format!(
+            ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+               owl:maxCardinality {card} ] . \
+             :p a owl:ObjectProperty . :c a :C ; :p :x , :y ."
+        );
+        let store = closure(&data, Ruleset::Owl2Rl, QlRewritingMode::Auto);
+        let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :x owl:sameAs :y }}"));
+        let run = store.execute_query(&request).expect("answered");
+        let text = String::from_utf8_lossy(&run.payload).into_owned();
+        eprintln!("owl2-rl maxCardinality {card}: ASK {{ :x owl:sameAs :y }} answers {text}");
+        if text.contains("true") != read {
+            wrong.push(format!("{card}: {text}"));
+        }
+    }
+    assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
+}
