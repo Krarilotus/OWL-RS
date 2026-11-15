@@ -281,7 +281,7 @@ impl Status {
 pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
     let analysis = analyse(prepared.query());
     let mut completeness = plan_status_built(store, prepared, &analysis).completeness;
-    certify(&mut completeness, prepared.query(), "dl", true);
+    certify(&mut completeness, prepared.reads(), "dl", true);
     completeness
 }
 
@@ -298,37 +298,59 @@ const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocab
 /// the answers unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
-    query: &Query,
+    (query, reads): (&Query, &Reads),
     source: &'static str,
 ) {
-    certify(completeness, query, source, false);
+    certify(completeness, (query, reads), source, false);
 }
 
 /// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan), with
 /// the whole composition ([`certify_closure`]) on it: the answer's status is this report
 /// (`StoreService::status_outside_dl`), so the two are one value.
-pub(crate) fn certify_report(completeness: Option<&mut Completeness>, query: &Query) {
+pub(crate) fn certify_report(completeness: Option<&mut Completeness>, query: (&Query, &Reads)) {
     if let Some(completeness) = completeness {
         certify_closure(completeness, query, "ql");
     }
 }
 
+/// What [`certify`] reads of a query, which depends on the query alone, as the reasons it
+/// gives: each found on its first use and kept with the prepared query
+/// (`PreparedQuery::reads`), so a query run again walks and formats nothing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Reads {
+    /// [`denied`]'s reason, off the bounds' path and on it.
+    denied: [std::sync::OnceLock<Option<String>>; 2],
+    /// [`negation`]'s.
+    negation: std::sync::OnceLock<Option<String>>,
+}
+
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
-fn certify(completeness: &mut Completeness, query: &Query, source: &'static str, bounds: bool) {
+fn certify(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+    bounds: bool,
+) {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         return;
     }
-    if let Some(what) = denied(query, bounds) {
-        completeness.incomplete(source, format!("the query reads {what}: {DENIED}"));
+    let read = reads.denied[usize::from(bounds)].get_or_init(|| {
+        denied(query, bounds).map(|what| format!("the query reads {what}: {DENIED}"))
+    });
+    if let Some(reason) = read {
+        completeness.incomplete(source, reason.clone());
     }
-    if let Some(op) = negation(query)
-        && !completeness.complete
-    {
-        completeness.unsound(
-            source,
-            format!("the query uses {op} over answers that may be missing: a row may be wrong"),
-        );
+    if completeness.complete {
+        return;
+    }
+    let operator = reads.negation.get_or_init(|| {
+        negation(query).map(|op| {
+            format!("the query uses {op} over answers that may be missing: a row may be wrong")
+        })
+    });
+    if let Some(reason) = operator {
+        completeness.unsound(source, reason.clone());
     }
 }
 
@@ -400,7 +422,7 @@ pub(crate) fn answer(
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
-            certify(status, prepared.query(), "dl", true)
+            certify(status, prepared.reads(), "dl", true)
         }
     }
     let status = match &outcome {

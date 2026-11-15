@@ -124,6 +124,8 @@ pub struct PreparedQuery {
     dl_answers: Option<crate::DlAnswers>,
     /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
     on_evaluation: Option<OnEvaluation>,
+    /// What the status's composition reads of the query, found once ([`Self::reads`]).
+    reads: crate::dl::query::Reads,
 }
 
 /// What [`PreparedQuery::on_evaluation`] calls.
@@ -200,6 +202,7 @@ impl PreparedQuery {
             rdf12: false,
             dl_answers: request.dl_answers,
             on_evaluation: None,
+            reads: Default::default(),
         })
     }
 
@@ -279,6 +282,12 @@ impl PreparedQuery {
     /// The parsed query.
     pub(crate) fn query(&self) -> &Query {
         &self.query
+    }
+
+    /// The query with what the status's composition reads of it, which depends on the
+    /// query alone: found on its first run and kept for every later one.
+    pub(crate) fn reads(&self) -> (&Query, &crate::dl::query::Reads) {
+        (&self.query, &self.reads)
     }
 
     /// Whether the query names its dataset (`FROM`, or the protocol's graphs).
@@ -425,7 +434,7 @@ pub(crate) fn run_query(
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
-    crate::dl::query::certify_report(ql.as_mut().map(|r| &mut r.completeness), &prepared.query);
+    crate::dl::query::certify_report(ql.as_mut().map(|r| &mut r.completeness), prepared.reads());
     let context = report(ql.as_ref());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
@@ -633,7 +642,7 @@ pub(crate) fn explain_prepared(
     let options = query_options(prepared, store, cancellation, memory);
     let mut explanation = explain_query(view, &prepared.query, &options)?;
     let report = explanation.ql.as_mut().map(|r| &mut r.completeness);
-    crate::dl::query::certify_report(report, &prepared.query);
+    crate::dl::query::certify_report(report, prepared.reads());
     Ok(explanation)
 }
 
@@ -649,7 +658,7 @@ pub(crate) fn plan_prepared(
     let options = query_options(prepared, store, cancellation, memory);
     let mut planned = plan_query(view, &prepared.query, &options)?;
     let report = planned.ql.as_mut().map(|r| &mut r.completeness);
-    crate::dl::query::certify_report(report, &prepared.query);
+    crate::dl::query::certify_report(report, prepared.reads());
     Ok(planned)
 }
 
