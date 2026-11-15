@@ -343,7 +343,10 @@ impl MutationPipeline {
                     }
                     detail.push_str(&evidence::trigger(attribution.as_ref()));
                     evidence::Draft {
-                        kind: RejectKind::Inconsistent,
+                        kind: match undecided {
+                            Some(_) => RejectKind::Undecided,
+                            None => RejectKind::Inconsistent,
+                        },
                         detail,
                         explanation,
                         attribution,

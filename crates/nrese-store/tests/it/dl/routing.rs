@@ -5,7 +5,7 @@
 //! Each test names the route that must be taken (the performance choice's guard).
 
 use nrese_sparql::Completeness;
-use nrese_store::{MutationError, MutationPipeline, StatementOp};
+use nrese_store::{MutationError, MutationPipeline, RejectKind, StatementOp};
 
 use super::queries::query;
 use super::versions::{in_transaction, ntriples};
@@ -571,6 +571,7 @@ fn refused_as_undecided(data: &str, extra: &str) {
     let Err(MutationError::Rejected(reject)) = &result else {
         panic!("expected the refusal, got {result:?}");
     };
+    assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
     assert!(
         reject
             .detail
@@ -629,6 +630,7 @@ fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
         let Err(MutationError::Rejected(reject)) = &result else {
             panic!("expected a rejection, got {result:?}");
         };
+        assert_eq!(reject.kind, RejectKind::Inconsistent, "{}", reject.detail);
         assert!(
             !reject.detail.contains("doesn't decide"),
             "{}",
