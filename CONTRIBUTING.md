@@ -25,7 +25,7 @@ owns its tests, and benchmarks never run in a gate.
 | Tier | When | What |
 |---|---|---|
 | `commit` | the pre-commit hook, also called by pre-merge-commit for clean merges | seconds, on this machine, with no build: rustfmt; for the changed files, the lock check and the Docker-name check (`scripts/check-names.sh`). A branch may hold unchecked commits: a tree lands only when its push tier passed for that exact tree, and its Windows inputs (`scripts/lib/gate-key.sh` `windows_inputs`) passed the Windows check |
-| `push` | the pre-push hook | changes since the upstream branch: rustfmt and clippy on changed crates (every crate when the root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml` or `clippy.toml` changed); all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check |
+| `push` | the pre-push hook | changes since the upstream branch: rustfmt and clippy on changed crates (every crate when the root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/config.toml` or `clippy.toml` changed); all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check; the benchmark-suite contract tests when `benches/suite/`, `scripts/` or `.githooks/` changed |
 | `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), benchmark-suite contract tests, the console's typecheck and tests |
 
 - A crate declares its slow test binaries (conformance suites, fuzz campaigns: over ~15 s)
