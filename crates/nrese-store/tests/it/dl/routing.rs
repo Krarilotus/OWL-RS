@@ -402,10 +402,26 @@ fn max_cardinality() -> Vec<String> {
     .to_vec()
 }
 
+/// Such an ontology leaves the RL route, and the DL path reads the cardinality by its
+/// value: `:y :q :z` is answered true, complete.
 #[test]
 fn a_max_cardinality_in_another_lexical_form_equates_in_rl() {
-    let wrong = missed(&max_cardinality(), false, &["ASK { :y :q :z }"]);
-    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+    let mut wrong = Vec::new();
+    for data in max_cardinality() {
+        let dl = pipeline();
+        insert(&dl, &data).expect("consistent");
+        let route = dl.store().dl_bounds().last;
+        let (rows, status) = query(&dl, "ASK { :y :q :z }");
+        let line = format!(
+            "{data} / route {route}: answers {rows:?}, complete {}",
+            status.is_complete()
+        );
+        eprintln!("{line}");
+        if rows != ["true"] || !status.is_complete() || route == "rules" {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]
