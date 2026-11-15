@@ -821,10 +821,13 @@ fn dl_answers_agree_with_outside_reasoners() {
                         let row = format!("{seed}\t{shape}\t{tags}\t{name}");
                         let row = format!("{row}\t{class}\t{outcome}\t{detail}");
                         writeln!(summary.lock().expect("summary"), "{row}").expect("summary.tsv");
+                        // Written whole, to be read by hand: it shrinks against HermiT alone.
+                        if outcome == "set-aside" {
+                            case.report(out, *i, &BTreeSet::new(), &mut reference);
+                        }
                         if outcome == "FAIL" {
                             failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            // Up to 20 shrinks per verdict and query, and the first 3 cases
-                            // per template set left are written: each cause keeps its own.
+                            // Shrunk: 20 per verdict and query; written: 3 per template set left.
                             let count = |key: String| {
                                 let mut seen = shrunk.lock().expect("shrunk");
                                 *seen.entry(key).and_modify(|n| *n += 1).or_insert(1)
