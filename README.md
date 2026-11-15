@@ -94,6 +94,9 @@ docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/d
 until curl -sf http://localhost:8080/readyz; do sleep 1; done
 ```
 
+The server's compile in `docker build` took 6 minutes on 8 cores of an AMD Ryzen 9 5950X; a
+first build also downloads the base images and builds the console.
+
 The last line waits until the server answers `{"status":"ready"}`. If it never does,
 `docker logs nrese` shows the server's output ([startup errors](docs/ops/server-setup.md#startup-errors)).
 
