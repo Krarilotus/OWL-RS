@@ -7,15 +7,14 @@ the last run got.
 
 ## The last run
 
-- The run was on 13 November 2026, 22:57 (CET).
-- The code was commit `78b4a49b7becb0df1decc3f858d8ddf7c8166286`, package version 0.1.0.
-- The server was built and started as the README's [quick start](../../README.md#quick-start) says (`docker build -t nrese .`, then
-  `docker run` with `NRESE_REASONING_MODE=owl2-rl` and `NRESE_SHACL_GATE=enforce`, a fresh volume)
-  on a Linux x86-64 machine.
-- The runner was `python3 scripts/verify/verify.py run --url http://127.0.0.1:8080 scripts/verify/scenarios/first-example.toml`.
-  That run used the file under its earlier name, `readme-first-example.toml`; since then only its
-  description has changed, to name where the example now is.
-- 9 of 9 steps passed.
+- The run was on 15 November 2026, 18:33 (CET).
+- The code was commit `0628a3f71bd87a30c5bceb4c54bb3327cfde602d`, package version 0.1.0.
+- The server was built and started as the README's [quick start](../../README.md#quick-start) says
+  (`docker build`, with `--build-arg CARGO_BUILD_JOBS=8`, then `docker run` with
+  `NRESE_REASONING_MODE=owl2-rl` and `NRESE_SHACL_GATE=enforce`, a fresh volume and another host
+  port) on a Linux x86-64 machine, and was ready at the first try of the README's wait line.
+- The runner was `python3 scripts/verify/verify.py run --url http://localhost:PORT scripts/verify/scenarios/first-example.toml`.
+- 10 of 10 steps passed.
 
 ## The steps
 
@@ -26,13 +25,14 @@ Every step is a `POST` with a form body; `ex:` is `http://example.org/`. "All an
 |---|---|---|---|
 | 1 | update: `INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat }` | 200 or 204 | 204 |
 | 2 | query: all animals | 200, `NRESE-Completeness` containing `sound-only; regime=owl2-rl`, one row, `ex:tom` | 200, `sound-only; regime=owl2-rl; …`, one row: `ex:tom` |
-| 3 | update: `DELETE DATA { ex:tom a ex:Cat }` | 200 or 204 | 204 |
-| 4 | query: all animals | 200, no rows | 200, no rows |
-| 5 | update: insert the shape `ex:AnimalShape` (every `ex:Animal` needs an `ex:name`) into the shapes graph `<http://rdf4j.org/schema/rdf4j#SHACLShapeGraph>` | 200 or 204 | 204 |
-| 6 | update: `INSERT DATA { ex:felix a ex:Cat }` | 400, `application/problem+json`, title `SHACL Reject`, type `https://nrese.dev/problems/shacl-reject`, detail naming `focus node <http://example.org/felix>` | 400: `the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>` |
-| 7 | query: all animals | 200, no rows | 200, no rows |
-| 8 | update: `INSERT DATA { ex:felix a ex:Cat ; ex:name "Felix" }` | 200 or 204 | 204 |
-| 9 | query: all animals | 200, one row, `ex:felix` | 200, one row: `ex:felix` |
+| 3 | query: all animals, `infer=false` | 200, `NRESE-Completeness` equal to `complete`, no rows | 200, `complete`, no rows |
+| 4 | update: `DELETE DATA { ex:tom a ex:Cat }` | 200 or 204 | 204 |
+| 5 | query: all animals | 200, no rows | 200, no rows |
+| 6 | update: insert the shape `ex:AnimalShape` (every `ex:Animal` needs an `ex:name`) into the shapes graph `<http://rdf4j.org/schema/rdf4j#SHACLShapeGraph>` | 200 or 204 | 204 |
+| 7 | update: `INSERT DATA { ex:felix a ex:Cat }` | 400, `application/problem+json`, title `SHACL Reject`, type `https://nrese.dev/problems/shacl-reject`, detail naming `focus node <http://example.org/felix>` | 400: `the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>` |
+| 8 | query: all animals | 200, no rows | 200, no rows |
+| 9 | update: `INSERT DATA { ex:felix a ex:Cat ; ex:name "Felix" }` | 200 or 204 | 204 |
+| 10 | query: all animals | 200, one row, `ex:felix` | 200, one row: `ex:felix` |
 
 ## Run it yourself
 
