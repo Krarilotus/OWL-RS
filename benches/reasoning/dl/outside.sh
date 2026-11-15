@@ -22,10 +22,12 @@ export NRESE_DL_OUT="$OUT" NRESE_DL_REFERENCE="exec docker run --rm -i --init \
 "$BIN" --ignored --exact --nocapture dl::outside::dl_answers_agree_with_outside_reasoners \
   > "$OUT/test.log" 2>&1 || rc=$?
 # Per outcome; the cases, and those with a query judged (an inconsistent case tests the write
-# alone); the rows set aside, where the two references differ, to be read by hand.
+# alone); the rows set aside, where the two references differ, to be read by hand; the writes
+# the store declined as undecided (class: HermiT's word on the data; outcome: Openllet's).
 S=$OUT/summary.tsv
 [ ! -f "$S" ] || { awk -F'\t' '{n[$6]++} END {for (k in n) print k, n[k]}' "$S" | sort
   awk -F'\t' '!c[$1]++ {all++} $4 != "write" && $5 !~ /^(reference-undecided|not-judged)$/ && !q[$1]++ {n++}
     END {print "cases", all; print "cases with a query judged", n + 0}' "$S"
-  awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"; } > "$OUT/counts.txt"
+  awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"
+  awk -F'\t' '$5 ~ /^declined/' "$S" > "$OUT/declined.tsv"; } > "$OUT/counts.txt"
 exit "${rc:-0}"
