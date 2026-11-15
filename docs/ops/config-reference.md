@@ -1,19 +1,19 @@
-# NRESE Runtime Configuration Reference
+# NRESE runtime configuration reference
 
 ## Purpose
 
-This document is the operator-facing source of truth for `nrese-server` runtime configuration: every setting's file key, environment variable, type, default and scope, and the precedence between them. Each setting's row has an anchor named as its file key, so a link can name one setting: [`config-reference.md#store.mode`](#store.mode). Implementation ownership remains in `crates/nrese-server/src/config/`.
+This page is the one list of `nrese-server`'s settings, in the version it comes with, not in a plan or another version. For each setting it gives the file key, environment variable, type, default and scope, and it says which value wins when a setting is given in several places. Each setting's row has an anchor named as its file key, so a link can name one setting, as [`config-reference.md#store.mode`](#store.mode) does. The parsing and the precedence are implemented in `crates/nrese-server/src/config/`.
 
 ## Precedence
 
-Every setting has a key in the configuration file and an environment variable (the tables below; the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of:
+Every setting has a key in the configuration file and an environment variable (the tables below, and the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of these.
 
 1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command; secrets (tokens, keys, passwords) are refused there, since a command line shows in the process list
 2. the environment variable
 3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
 4. the built-in default
 
-Notes:
+These also hold.
 
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
@@ -44,7 +44,7 @@ The tables use these words.
 
 Besides a repository's settings, only the result cache's pins and the access state have APIs that change them while the server runs (named where they are listed).
 
-The Default column starts with the default as the file writes it, in code (`4GiB`, `50%`, `false`): the value the setting has unset, and the schema's `default`. `none` means no value until it is set, `required` that the mode it belongs to needs one. One default depends on the host and no value states it: `budgets.result_cache`'s (its row says what it is).
+The Default column starts with the default as the file writes it, in code (`4GiB`, `50%`, `false`), which is the value the setting has unset and the schema's `default`. `none` means no value until it is set, and `required` that the mode it belongs to needs one. One default, `budgets.result_cache`'s, depends on the host, and no value states it (its row says what it is).
 
 ## Validation
 
@@ -54,7 +54,7 @@ The Default column starts with the default as the file writes it, in code (`4GiB
 - A value of the wrong kind (text for a flag, a negative number) is a startup error that names the key.
 - `nrese-server check-config [--config FILE]` loads and validates the configuration (file, then environment overrides), prints the main effective settings and exits ([commands](server-setup.md#commands)). It doesn't print every setting: `budgets.process_memory`, `budgets.huge_pages`, `budgets.reasoning_release`, the `dl.*` settings and the `store.reader_*` settings are among those it leaves out. Credentials are never printed: authentication and AI show their mode and provider only. `reasoner.semantics` shows the ruleset and its semantic fingerprint (the stored inferences are rebuilt when it changes).
 
-## Minimal Example
+## Minimal example
 
 ```toml
 [server]
@@ -119,7 +119,7 @@ api_key = "replace-me"
 | <a id="server.bind_address"></a>`server.bind_address` (older `server.bind_addr`) | `NRESE_BIND_ADDR` | text: `IP:PORT` | `127.0.0.1:8080` | start | The address and port the server listens on. Port `0`: the system picks one, and the start log names it. `0.0.0.0:8080` listens on every interface (put a TLS proxy in front: [server-setup.md](server-setup.md)) |
 | <a id="server.deployment_posture"></a>`server.deployment_posture` | `NRESE_DEPLOYMENT_POSTURE` | choice: `open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade` | `open-workbench` | start | What the deployment is for (below) |
 
-Posture effects:
+The deployment posture has these effects.
 - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces (they answer 404)
 - `internal-authenticated` requires `auth.mode` other than `none`
 - `replacement-grade` also requires on-disk storage and `problem-json` SPARQL parse errors
@@ -150,7 +150,7 @@ Posture effects:
 
 The result cache (`budgets.result_cache`, older key `store.query_cache_bytes`) and its pins (`budgets.result_cache_pins`) are in [Budgets](#budgets), with their details [below](#the-result-cache).
 
-Details:
+These settings need more than their row.
 
 - **`store.default_graph`**: what a query, or an update's `WHERE`, reads when it names no dataset:
   - `default`: only the default graph, as the SPARQL specification describes a plain dataset;
@@ -224,7 +224,7 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 | <a id="reasoner.ql_rewriting"></a>`reasoner.ql_rewriting` | `NRESE_REASONING_QL_REWRITING` | choice: `auto`, `on`, `off` | `auto` | repo (as `ql_rewriting`) | OWL 2 QL answers through existentials |
 | <a id="reasoner.support_sets"></a>`reasoner.support_sets` | `NRESE_REASONING_SUPPORT_SETS` | integer, at least 1 | `16` | start | Support graph sets kept per inferred statement |
 
-`reasoner.mode` values:
+`reasoner.mode` takes these values.
 - `disabled`: no reasoning; reads see asserted statements only
 - `rdfs`: the RDFS closure is materialised into the inferred stack (the six rules queries over data use)
 - `rdfs-full`: the RDFS entailment rules but `rdfD1`, and the axiomatic triples but the
@@ -237,7 +237,7 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 - `custom`: the user's rules only (`reasoner.rules`)
 - unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
 
-Details:
+These settings need more than their row.
 
 - **`reasoner.rules`**: a Notation3 file (`.n3`) or a GraphDB ruleset (`.pie`) of user rules. With `custom` they are the whole program; with any other reasoning mode they are added to its ruleset. They are compiled at startup, and a rule the reasoner can't run stops the startup with the rule and the reason. What compiles:
   - `{ premises } => { conclusions } .` (and `<=`), with quick variables `?x`; blank nodes in the premises are variables
@@ -286,7 +286,7 @@ Details:
 
 ## Replication
 
-Read replicas ([replication.md](replication.md)); both sides need an on-disk store (else a startup error).
+These settings set up read replicas ([replication.md](replication.md)), and both sides need an on-disk store (else a startup error).
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
@@ -308,13 +308,13 @@ Fixed limits on every exchange with the primary: a log answer must begin within 
 | <a id="federation.timeout"></a>`federation.timeout` | `NRESE_FEDERATION_TIMEOUT_MS` | duration | `30s` | start | Per request to an endpoint |
 | <a id="federation.max_rows"></a>`federation.max_rows` | `NRESE_FEDERATION_MAX_ROWS` | integer | `1000000` | start | Rows one request may return |
 
-A `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache. With access enforced, calling `SERVICE` is a role's privilege ([below](#graph-level-access-control)).
+A `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values, and beyond that the block goes once, unbound). Redirects are not followed, and queries with `SERVICE` are never answered from the result cache. With access enforced, calling `SERVICE` is a role's privilege ([below](#graph-level-access-control)).
 
 ## Budgets
 
-Every limit on memory, time and request size is in one table, `[budgets]`. Memory shares range from `0%` to `100%` and use the process's capacity (including container limits), read once when configuration loads. `budgets.query_memory = "50%"` gives each query half of that capacity; `0%` has the same meaning as `0`.
+Every limit on memory, time and request size is in one table, `[budgets]`. Memory shares range from `0%` to `100%` and use the process's capacity (including container limits), read once when configuration loads. `budgets.query_memory = "50%"` gives each query half of that capacity, and `0%` has the same meaning as `0`.
 
-Three settings limit memory. The two query settings bound what requests charge and reserve, not all they allocate ([what stays outside](../limits.md#memory-and-stopping)); none of the three bounds the store's own data and indexes.
+Three settings limit memory. The two query settings bound what requests charge and reserve, not all they allocate ([what stays outside](../limits.md#memory-and-stopping)), and none of the three bounds the store's own data and indexes.
 - `budgets.query_memory`: what one query's evaluation may charge. Past it the query gets `413`.
 - `budgets.total_query_memory`: what all running queries and updates charge together. A request that finds no room gets `503` and may succeed later.
 - `budgets.process_memory`: what the whole process may hold before a long operation (a load's or a commit's reasoning) stops with an error instead of taking the machine. Queries count toward it too: one that finds no room left in it gets the same `503`.
@@ -341,7 +341,7 @@ To give the server's request work 2 GiB, set `budgets.total_query_memory = "2GiB
 
 `/version` reports, under `budgets`, `query_memory`, `total_query_memory`, `query_text`, `update_size`, `upload_size` and `result_cache` in bytes, and `query_timeout_ms`, `update_timeout_ms`, `graph_read_timeout_ms` and `graph_write_timeout_ms`. It doesn't report `process_memory`, `bulk_load_memory`, `huge_pages`, `reasoning_release` or the pins.
 
-How query memory accounting works:
+This is how query memory accounting works.
 
 - Each request has one envelope within the catalog's budget, and what it charges draws from it: operator tables and scratch (joins, groups, sorts), retained native results and DL bound tables until they drop, and under `owl2-dl` the DL engines' capacity and their compilation scratch (`docs/design/execution-core.md`, "Execution and resource lifetime"). A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment. Decoded graph payloads and encoder buffers are not counted; classification and realisation, shared per revision, have an envelope of their own within the catalog's budget, and the process limit. Some operator working state and structures built at their first use stay outside the envelope, so a request can hold more than it charges, and no fixed multiplier bounds the difference ([what stays outside](../limits.md#memory-and-stopping)).
 - The machine's memory is the container's limit where there is one (cgroups, or a Windows job object), else the machine's, read on Linux and Windows. Where it can't be read (the reading fails, or another platform), a limit given as a share such as `50%` (the defaults of `total_query_memory`, `process_memory` and `bulk_load_memory` included) stops the server at startup, naming the setting: set a size, or `0` for no limit. `result_cache` falls back to 64 MiB, since it is a cache, not a limit.
@@ -358,15 +358,15 @@ or preemption of schema reading, normalisation and compilation.
 
 ### Process-wide settings
 
-In this build four settings are the process's, not a repository's: `store.index_encoding`, `store.vocabulary`, `budgets.huge_pages` and `budgets.reasoning_release`. They are set once for the whole process (`nrese-store/src/process_settings.rs`): the server sets them from its configuration at start-up, before it opens a store, and refuses to start if a store opened earlier set other values. Every store opened after that leaves them as they are, so the operator's values hold for every repository, for `restore`'s recovery, and through the stores the server opens for itself (the system store, a draft check's scratch store). `print-query --schema` reads no configuration and runs with the defaults. Under `bulk`, the bulk loads and materialisations of every store count together: huge pages stay on while any one runs. Switching them off doesn't take back huge pages the process already holds. An embedding application sets them with `nrese_store::apply_process_settings` before it opens a store, or gets the first opened store's everywhere; `nrese_store::process_settings()` reads the values in effect.
+Four settings, `store.index_encoding`, `store.vocabulary`, `budgets.huge_pages` and `budgets.reasoning_release`, are the process's, not a repository's. They are set once for the whole process (`nrese-store/src/process_settings.rs`), and the server sets them from its configuration at start-up, before it opens a store, and refuses to start if a store opened earlier set other values. Every store opened after that leaves them as they are, so the operator's values hold for every repository, for `restore`'s recovery, and through the stores the server opens for itself (the system store, a draft check's scratch store). `print-query --schema` reads no configuration and runs with the defaults. Under `bulk`, the bulk loads and materialisations of every store count together: huge pages stay on while any one runs. Switching them off doesn't take back huge pages the process already holds. An embedding application sets them with `nrese_store::apply_process_settings` before it opens a store, or gets the first opened store's everywhere; `nrese_store::process_settings()` reads the values in effect.
 
 One diagnostic is read from the environment outside this configuration: `NRESE_CLASSIFY_TRACE` (set to anything) makes the DL classification write its phases with their start times to stderr (`nrese-dl/src/classify/mod.rs`). It changes no result; it is for the lab, not an operator setting.
 
 The same settings have older names, which still work: `policy.limits.max_query_bytes`, `max_query_memory_bytes`, `max_update_bytes`, `max_rdf_upload_bytes`; `policy.timeouts.query_ms`, `update_ms`, `graph_read_ms`, `graph_write_ms`; `store.query_cache_bytes`. A setting under both names is a startup error.
 
-## Policy Rate Limits
+## Policy rate limits
 
-Requests per client and window; a client over its limit gets `429`.
+These settings limit the requests per client and window, and a client over its limit gets `429`.
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
@@ -377,7 +377,7 @@ Requests per client and window; a client over its limit gets `429`.
 
 ## Timeouts and writes
 
-A write that times out before its commit starts is never committed, and the request gets 408. The deadline reaches every phase of the write:
+A write that times out before its commit starts is never committed, and the request gets 408. The deadline reaches every phase of the write.
 - the `WHERE` evaluation of an update;
 - commit-path reasoning, polled between rounds and per work unit.
 
@@ -390,22 +390,22 @@ runs when no current reasoning state is recorded.
 
 A fixed limit comes before every authenticated request: a body of known length up to 64 KiB is read whole before the answer (clients that send the headers and the body apart need that), and that read waits at most 10 s. A body still missing then gets 401 if authentication refused the request's credentials, else 408.
 
-## SPARQL Parse Error Profile
+## SPARQL parse error profile
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
 | <a id="policy.sparql_parse_error_profile"></a>`policy.sparql_parse_error_profile` | `NRESE_SPARQL_PARSE_ERROR_PROFILE` | choice: `problem-json`, `plain-text`, `fuseki-plain-text` (lower case) | `problem-json` | start | How invalid SPARQL syntax is answered |
 
-`plain-text` reports invalid SPARQL syntax as a plain-text error instead of a problem document ([example](http-api.md#example-a-sparql-syntax-error)); the rest of the API keeps problem+json. `fuseki-plain-text` is another name for `plain-text`.
+`plain-text` reports invalid SPARQL syntax as a plain-text error instead of a problem document ([example](http-api.md#example-a-sparql-syntax-error)), and the rest of the API keeps problem+json. `fuseki-plain-text` is another name for `plain-text`.
 
-## Endpoint Exposure
+## Endpoint exposure
 
 | Key | Env | Type | Default | Scope | Meaning |
 |---|---|---|---|---|---|
 | <a id="policy.exposure.operator_ui"></a>`policy.exposure.operator_ui` | `NRESE_ENABLE_OPERATOR_UI` | bool | `true` | start | Whether the operator console (`/ops`) is served |
 | <a id="policy.exposure.metrics"></a>`policy.exposure.metrics` | `NRESE_ENABLE_METRICS` | bool | `true` | start | Whether `/metrics` is served |
 
-## Auth Modes
+## Auth modes
 
 All authentication settings are scope start. Secrets are never printed and are refused by `--set`.
 
@@ -413,14 +413,14 @@ All authentication settings are scope start. Secrets are never printed and are r
 |---|---|---|---|---|
 | <a id="auth.mode"></a>`auth.mode` | `NRESE_AUTH_MODE` | choice: `none`, `bearer-static`, `bearer-jwt`, `mtls`, `oidc-introspection` | `none` | How requests are authenticated; each mode's required settings are below, and a missing one is a startup error |
 
-### Static Bearer
+### Static bearer
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
 | <a id="auth.bearer_static.read_token"></a>`auth.bearer_static.read_token` | `NRESE_AUTH_READ_TOKEN` | text, secret | none | The token that may read |
 | <a id="auth.bearer_static.admin_token"></a>`auth.bearer_static.admin_token` | `NRESE_AUTH_ADMIN_TOKEN` | text, secret | required | The token that may administer |
 
-### JWT Bearer
+### JWT bearer
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
@@ -431,7 +431,7 @@ All authentication settings are scope start. Secrets are never printed and are r
 | <a id="auth.bearer_jwt.admin_role"></a>`auth.bearer_jwt.admin_role` | `NRESE_AUTH_JWT_ADMIN_ROLE` | text | `nrese.admin` | The role that may administer |
 | <a id="auth.bearer_jwt.leeway_seconds"></a>`auth.bearer_jwt.leeway_seconds` | `NRESE_AUTH_JWT_LEEWAY_SECS` | integer (seconds) | `30` | Clock leeway for expiry checks |
 
-### Proxy-Terminated mTLS
+### Proxy-terminated mTLS
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
@@ -440,11 +440,11 @@ All authentication settings are scope start. Secrets are never printed and are r
 | <a id="auth.mtls.admin_subjects"></a>`auth.mtls.admin_subjects` | `NRESE_AUTH_MTLS_ADMIN_SUBJECTS` | list (`;`) | required | The subjects that may administer |
 | <a id="auth.mtls.trusted_proxies"></a>`auth.mtls.trusted_proxies` | `NRESE_AUTH_MTLS_TRUSTED_PROXIES` | list (`,`): addresses or ranges such as `10.0.0.0/8` | `127.0.0.0/8,::1` (loopback) | The peers that terminate TLS and may pass the subject header on. From any other peer the header is dropped before authentication, so a client that reaches the server's port directly can't claim a subject. With the proxy in another container or host, list its address or network here |
 
-File format of the subject lists:
+A subject list is written in one of two forms.
 - string: `admin_subjects = "CN=admin,O=Example"`
 - list: `admin_subjects = ["CN=admin-1,O=Example", "CN=admin-2,O=Example"]`
 
-### OIDC Introspection
+### OIDC introspection
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
@@ -455,7 +455,7 @@ File format of the subject lists:
 | <a id="auth.oidc_introspection.admin_role"></a>`auth.oidc_introspection.admin_role` | `NRESE_AUTH_OIDC_ADMIN_ROLE` | text | `nrese.admin` | The role that may administer |
 | <a id="auth.oidc_introspection.timeout_ms"></a>`auth.oidc_introspection.timeout_ms` | `NRESE_AUTH_OIDC_TIMEOUT_MS` | integer (milliseconds, no unit) | `5000` | Per introspection request |
 
-### Graph-Level Access Control
+### Graph-level access control
 
 The rules are the server's access state (users, workspaces, personal spaces, role rules; [ADR-0008](../adr/0008-users-workspaces-policies.md)), kept in `system/` of the data directory and changed through `/api/v1/access` while the server runs ([HTTP API](http-api.md#users-workspaces-and-policies-apiv1access)). Until access is enforced, every user reads and writes what its authentication grants allow.
 
@@ -466,7 +466,7 @@ The rules are the server's access state (users, workspaces, personal spaces, rol
 | <a id="auth.trusted_proxies"></a>`auth.trusted_proxies` | `NRESE_AUTH_TRUSTED_PROXIES` | list (`,`): addresses or ranges | `127.0.0.0/8,::1` (loopback) | The reverse proxies whose `X-Forwarded-For` names the client. Failed local logins are counted per user name and client address (past 10, each further attempt waits, from one second doubling up to five minutes) and per client address over all names (past 100); behind a proxy that isn't listed here, every client has the proxy's address, so list it |
 | <a id="auth.workspace_base"></a>`auth.workspace_base` | `NRESE_WORKSPACE_BASE` | text | `urn:nrese:` | What workspace graph prefixes start with: a personal space is `{base}space/{user}/` (a local user's `{base}space/{user}~{id}/`), a workspace `{base}workspace/{name}~{id}/` ([HTTP interface](http-api.md#users-workspaces-and-policies-apiv1access)) |
 
-The policy file (TOML), per role:
+The policy file (TOML) gives the rules per role, as in this example.
 
 ```toml
 default = "deny"        # roles no rule names: nothing ("deny") or everything ("allow")
@@ -490,7 +490,7 @@ service = true          # may call other endpoints with SERVICE (default false)
 - the policy grants as well as restricts: a role with a rule may query and read graphs even without the read role, and a role that may write a graph may update. So a role can edit some graphs without being an administrator.
 - what it means for requests: [HTTP API, access control](http-api.md#graph-level-access-control).
 
-## AI Query Suggestions
+## AI query suggestions
 
 All AI settings are scope start. Secrets are never printed and are refused by `--set`.
 
@@ -519,7 +519,9 @@ All AI settings are scope start. Secrets are never printed and are refused by `-
 | <a id="ai.openrouter.site_url"></a>`ai.openrouter.site_url` | `NRESE_AI_OPENROUTER_SITE_URL` | text | none | The site URL sent to OpenRouter |
 | <a id="ai.openrouter.app_name"></a>`ai.openrouter.app_name` | `NRESE_AI_OPENROUTER_APP_NAME` | text | none | The application name sent to OpenRouter |
 
-## Ownership Rules
+## Ownership rules
+
+These rules say where the configuration is defined and documented.
 
 - typed runtime defaults and validation live in owning crates
 - external config parsing and precedence live in `crates/nrese-server/src/config/`
