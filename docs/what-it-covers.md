@@ -1,12 +1,13 @@
 # What it covers
 
-This page says what NRESE does in the code of the commit it is in. It starts with the scope, what
+This page says what NRESE does in the version it comes with, not in a plan or another version. It
+starts with the scope, what
 is in, what is left out and what is planned, one line each with a link to the page that has the
 detail.
 
 ## Scope
 
-What is in is in the sections below. Each item there links the specification, document or test
+The sections below say what is in. Each item there links the specification, document or test
 that backs it and gives its limits beside it, and none of it is a plan.
 
 - [SPARQL](#sparql): SPARQL 1.1 query, update and federation, the SPARQL 1.2 drafts, and
