@@ -28,8 +28,9 @@ rules derive, with OWL 2 DL engines of its own, a hypertableau and a consequence
 anything the rules derived, you can ask why it holds and get its derivation from the asserted
 statements, rule by rule.
 
-What you are allowed to read and the server's limits on time and memory can limit any answer, so
-an answer may hold less than the data does. [Limits and deviations](docs/limits.md) describes
+What you are allowed to read decides what an answer can hold, and the server's limits on time
+and memory can stop a query before it answers (a stopped query gives no partial answer).
+[Limits and deviations](docs/limits.md) describes
 those limits and what NRESE doesn't do. To try it, start with the [quick start](#quick-start)
 below.
 
