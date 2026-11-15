@@ -1467,6 +1467,15 @@ impl ValueWalk<'_> {
             Self::One(value) => Ok(value.take()),
         }
     }
+
+    /// The values [`Self::next`] would still yield, counted without yielding them
+    /// ([`keys::Groups::count_rest`]): the same blocks loaded and counted on `account`.
+    fn count_rest(&mut self, account: &mut impl Account) -> Result<u64, Stopped> {
+        match self {
+            Self::Groups(groups) => groups.count_rest(account),
+            Self::One(value) => Ok(u64::from(value.take().is_some())),
+        }
+    }
 }
 
 /// The number of distinct values among `walks`: merged in ascending order, each value
@@ -1484,14 +1493,11 @@ pub(crate) fn count_distinct(
             heads.push((value, walk));
         }
     }
-    let mut count = 0u64;
+    // One walk holds each value once: its groups are counted, not merged.
     if let [(_, walk)] = &mut heads[..] {
-        count += 1;
-        while walk.next(&mut account)?.is_some() {
-            count += 1;
-        }
-        return Ok(count);
+        return Ok(1 + walk.count_rest(&mut account)?);
     }
+    let mut count = 0u64;
     while !heads.is_empty() {
         // A step compares every head twice, for the least and to advance, however many runs
         // merge: each comparison counted before it is made, and each portion's comparisons
