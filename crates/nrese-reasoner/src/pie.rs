@@ -600,12 +600,16 @@ fn compile_rule(
     if body.is_empty() {
         return Err("a rule without premises".into());
     }
-    Ok(Rule {
+    let rule = Rule {
         name: name.to_owned(),
         body,
         guards,
         head,
-    })
+    };
+    if !rule.fits() {
+        return Err(super::n3::too_many_atoms());
+    }
+    Ok(rule)
 }
 
 #[cfg(test)]
