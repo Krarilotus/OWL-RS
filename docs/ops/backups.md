@@ -7,24 +7,29 @@ commands run in a container the way an offline load does
 
 | | Holds | Taken | Restored |
 |---|---|---|---|
-| [An image](#image-backups) | The store as it is on disk, inferred statements included, with a manifest | While the server runs (`POST …/image`), or offline (`nrese-server backup`) | Offline, with `nrese-server restore`, by an NRESE that reads its checkpoint format |
+| [An image](#image-backups) | One repository's statements as stored, inferred ones included, with a manifest. Not its settings, namespaces or quarantine, nor the users and other repositories | While the server runs (`POST …/image`), or offline (`nrese-server backup`) | Offline, with `nrese-server restore`, by an NRESE that reads its checkpoint format |
 | [An N-Quads export](#n-quads-exports) | The asserted statements, closed by their checksum | While the server runs (`GET …/backup`) | Over HTTP (`POST …/restore`), or offline with `nrese-server load --replace`. Any RDF store reads it |
 | A copy of the data directory | Everything | While the server is stopped | Copy it back, with the server stopped |
 
-An image restores without deriving anything again, and with the archived log it restores
-to [any later revision](#point-in-time-restore). An export outlives versions and stores.
+An image restores without parsing, and with the archived log it restores to
+[any later revision](#point-in-time-restore); with reasoning on, the first start after it
+derives the inferences again. An export outlives versions and stores. For a whole server, with
+its users and every repository, copy the data directory.
 
 ## Image backups
 
 `POST /api/v1/repositories/{id}/image` (administrators) writes an image of the repository's
-current snapshot while writes go on. It goes into `backups/` of the data directory, named by the
-seconds since 1970 (`backups/1794787200/`), and for another repository than the default by its
-id and the seconds (`backups/films-1794787200/`). Beside the store's checkpoint file is
+current snapshot while writes go on. It goes into `backups/` of the repository's directory, named
+by the seconds since 1970: `backups/1794787200/` of the data directory for the default
+repository, `repositories/films/backups/films-1794787200/` for the repository `films`, which
+`DELETE /repositories/films` removes with it. Beside the store's checkpoint file is
 `manifest.json`, with the revision, the statement counts, the size and the SHA-256. The older
-`POST /ops/api/admin/dataset/image`, with `?repository=ID`, still answers. An image in `backups/`
-is on the same disk as the data it protects, so copy it elsewhere.
+`POST /ops/api/admin/dataset/image` still answers; with `?repository=ID` its image goes into
+`backups/<id>-<seconds>/` of the data directory. An image in `backups/` is on the same disk as
+the data it protects, so copy it elsewhere.
 
-Offline, `nrese-server backup DIR` writes the same into `DIR`.
+Offline, with `store.mode = "on-disk"`, `nrese-server backup DIR` writes the default
+repository's image into `DIR`.
 
 To restore, stop the server and run `nrese-server restore DIR` with the target's configuration.
 It checks the image against its manifest and places it in the data directory, which must hold no
@@ -39,7 +44,8 @@ revision and the statement count ([HTTP interface](http-api.md#engine-api-apiv1)
 
 `POST /api/v1/repositories/{id}/restore` replaces the repository's statements with the export's,
 as one commit, and derives the inferences again. It checks the checksum first and answers `400`,
-changing nothing, when it doesn't match. Over HTTP an export of at most about 384 MiB restores
+changing nothing, when it doesn't match. Like any write, it passes the target's checks, so a
+target that reasons or validates may refuse it with `400`, changing nothing. Over HTTP an export of at most about 384 MiB restores
 (3 × `budgets.upload_size` + 64 KiB, held whole while it is parsed). A larger one restores offline
 with `nrese-server load --replace export.nq`, which doesn't check the checksum, so check it
 first, as in the drill's first step.
@@ -92,12 +98,14 @@ From an image (`backups/<seconds>/` of the data directory, or a copy elsewhere):
    with `--wal` to replay the log after it. Exit `0` means the image passed its manifest check
    and is in place.
 3. Start a server on it with writes off, on another port:
-   `NRESE_DATA_DIR=/srv/nrese-staging NRESE_DEPLOYMENT_POSTURE=read-only-demo NRESE_BIND_ADDR=127.0.0.1:8081 nrese-server`.
+   `NRESE_STORE_MODE=on-disk NRESE_DATA_DIR=/srv/nrese-staging NRESE_DEPLOYMENT_POSTURE=read-only-demo NRESE_BIND_ADDR=127.0.0.1:8081 nrese-server`.
 4. Check that `/readyz` answers `200`, that `GET /api/v1/repositories/{id}/info` gives the
    `revision` and `quad_count` you expect, and that a few known queries answer as before. To
    compare two servers in full, run the drill's third step against both.
 5. To promote it, stop the staging server, start the production server with `NRESE_DATA_DIR` on
-   the restored directory, check `/readyz` again and switch the traffic.
+   the restored directory, check `/readyz` again and switch the traffic. The image brings the
+   default repository's statements only: users, other repositories, stored settings and
+   namespaces come back from a copy of the data directory, or are set up again.
 
 ## A complete drill
 

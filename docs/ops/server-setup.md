@@ -12,7 +12,8 @@ with your data loaded, and how to stop and upgrade it. Every setting is in the
   created over the API in its `repositories/<id>/` ([repositories](http-api.md#rdf4j-protocol)).
 - The store is in memory unless `store.mode` is `on-disk` (`NRESE_STORE_MODE`, which the image
   sets). On disk, every commit is synced to the write-ahead log before it is acknowledged, and
-  checkpoints run in the background and remove the log segments they cover.
+  checkpoints run in the background and remove the log segments they cover (or move them to
+  `wal-archive/`, with [`store.wal_archive`](config-reference.md#store.wal_archive) on).
 - One process at a time opens a data directory. A second server or offline command on it fails
   at start ([data directory locked](#err-data-directory-locked)). Don't put a data directory on
   NFS, where Linux emulates the lock in a way any other close of the file releases.
@@ -75,7 +76,7 @@ Wants=network-online.target
 User=nrese
 Group=nrese
 EnvironmentFile=/etc/nrese/nrese.env
-ExecStart=/opt/nrese/bin/nrese-server --config /etc/nrese/config.toml
+ExecStart=/opt/nrese/bin/nrese-server
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
@@ -123,7 +124,10 @@ default, in that order ([precedence](config-reference.md#precedence)).
 TLS ends at the proxy, and NRESE listens on localhost or a private network only. The proxy passes
 on `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Request-Id`, and the server believes
 `X-Forwarded-For` only from the proxies in
-[`auth.trusted_proxies`](config-reference.md#auth.trusted_proxies). The console, the operator page
+[`auth.trusted_proxies`](config-reference.md#auth.trusted_proxies), loopback by default. With
+the server in a container, as above, a proxy on the host reaches it through Docker's bridge, so
+the server sees the bridge's gateway address (`docker network inspect bridge`): list that
+address. The console, the operator page
 and the API go through the same host and the same access rules, unless you split user and
 operator access on purpose.
 
@@ -153,7 +157,8 @@ server {
 
 With `auth.mode = "mtls"` the proxy also checks the client certificates and passes the subject
 on in a header. NRESE doesn't check certificates itself, and takes that header only from
-[`auth.mtls.trusted_proxies`](config-reference.md#auth.mtls.trusted_proxies).
+[`auth.mtls.trusted_proxies`](config-reference.md#auth.mtls.trusted_proxies), which needs the
+same address. Without it, no request authenticates.
 
 ## Before others use it
 
@@ -197,9 +202,10 @@ docker start nrese
 - A load isn't refused the way a write is: the SHACL gate doesn't run, and a load that leaves
   the data inconsistent under the ruleset exits `1` with the count of violations, the data stays
   loaded, and the server starts in quarantine.
-- N-Triples, N-Quads, Turtle and TriG are read on all cores; N-Triples loads about 2.7 million
+- N-Triples, N-Quads, Turtle and TriG are split and read in parallel: a file up to
+  512 MiB in 8 parts, a larger one in a part per 64 MiB, on at most one thread per core. N-Triples loads about 2.7 million
   statements a second on our reference machine (100 million in 37 s,
-  [baselines](../../benches/baselines/README.md)). The other formats are read on one core, and
+  [baselines](../../benches/baselines/README.md)). The other formats are read on one thread, and
   `nrese-server convert data.rdf data.nt` turns them into N-Triples first.
 
 ### From another store
@@ -226,25 +232,27 @@ The exit status is `0` on success and `1` on any error, with `Error: <message>` 
 standard error, and `2` from `print-query` for a query it can't write exactly. A binary built for
 a CPU feature this machine lacks exits `1` before anything runs, naming the feature.
 
-Commands marked *store* open the configured store and lock its data directory, so they fail
-while another process has it open.
+Commands marked *store* open the configured store. With `store.mode = "on-disk"` (the image's
+setting) they lock its data directory, so they fail while another process has it open. In the
+default in-memory mode they open an empty store and read nothing of the directory, so set the
+mode for them as for the server.
 
 | Command | Arguments and options (defaults) | What it does | Fails when |
 |---|---|---|---|
 | (none) | | *store*. Opens the store, brings the inferred statements up to date, then serves HTTP on `server.bind_address` until SIGTERM or SIGINT ([stopping](#stopping)) | the configuration is invalid; the directory is locked; the address can't be bound ([`failed to bind`](#err-failed-to-bind)); reasoning at start fails |
-| `load` | `FILE...` (format by extension); `--replace` (default: add); `--graph IRI` (triple formats; default: the default graph); `--strict` or `--quarantine` (older `--skip-errors`; default: `store.invalid_statements`) | *store*. Commits the files' statements, then derives the inferences again and prepares the planner's statistics ([loading data](#loading-data)) | no file; a file can't be read or parsed (with `--strict`: any bad statement); the data is inconsistent under the ruleset (exit `1`, the data stays loaded, and the server starts in quarantine) |
+| `load` | `FILE...` (format by extension); `--replace` (default: add); `--graph IRI` (triple formats; default: the default graph); `--strict` or `--quarantine` (older `--skip-errors`; default: `store.invalid_statements`) | *store*. Commits the files' statements, then, with reasoning on, derives the inferences again, and prepares the planner's statistics ([loading data](#loading-data)) | no file; a file can't be read or parsed (with `--strict`: any bad statement); the data is inconsistent under the ruleset (exit `1`, the data stays loaded, and the server starts in quarantine) |
 | `query` | `QUERY` or `--file FILE`; `--format` `json`, `xml`, `csv`, `tsv`, or for CONSTRUCT and DESCRIBE `nt`, `ttl`, `nq`, `trig`, `rdf`, `jsonld` (default JSON, N-Triples) | *store*. Answers one query over every graph, to standard output | both or neither of `QUERY` and `--file`; an unknown format; the query doesn't parse or fails |
-| `print-query` | `QUERY` or `--file FILE`; `--form paths\|values` (default `paths`); `--schema FILE` (repeatable; default: the configured store) | *store* without `--schema`. Prints the query as plain SPARQL 1.1. Changes nothing | exit `2`: it can't be written exactly, with the reasons on standard error |
+| `print-query` | `QUERY` or `--file FILE`; `--form paths\|values` (default `paths`); `--schema FILE` (repeatable; default: the configured store) | *store* without `--schema`. Prints the query as plain SPARQL 1.1. Changes nothing | exit `2`: it can't be written exactly, with the reasons on standard error. Exit `1`: both or neither of `QUERY` and `--file`; another `--form`; the query doesn't parse; without `--schema`, the directory is locked |
 | `convert` | `INPUT OUTPUT` (formats by extension) | Writes `OUTPUT` from `INPUT`, without a store | not two files; an unknown extension; a named graph in a format without graphs |
 | `check-config` | | Validates the configuration and prints the main settings in effect, a `cpu:` line and `configuration is valid` ([what it prints](config-reference.md#validation)) | the configuration is invalid: it names the setting and the reason |
 | `config-schema` | | Prints the JSON Schema of the configuration file | |
-| `backup` | `DIR` | *store*. Writes an [image](backups.md#image-backups) of the store into `DIR` | the directory is locked; writing fails |
-| `restore` | `DIR`; `--wal LOGDIR` (repeatable; default: no replay); `--until-revision N` or `--until-time T` | Places the image in `DIR` in the configured data directory, then replays the log ([point-in-time restore](backups.md#point-in-time-restore)) | the data directory holds a store; the image fails its manifest check; `T` comes before the image's last commit, or the image has no commit times |
+| `backup` | `DIR` | *store*. Writes an [image](backups.md#image-backups) of the default repository's store into `DIR` | the directory is locked; `DIR` already holds a backup; writing fails |
+| `restore` | `DIR`; `--wal LOGDIR` (repeatable; default: no replay); `--until-revision N`, `--until-time T`, or both | Places the image in `DIR` in the configured data directory, then replays the log ([point-in-time restore](backups.md#point-in-time-restore)) | the data directory holds a store; the image fails its manifest check; the image is newer than `N`, or the log ends before `N`; `T` comes before the image's last commit, or the image has no commit times |
 | `prune-archive` | `REVISION` | Removes the segments in `wal-archive/` whose records all come before `REVISION`. Safe while the server runs | no revision, or not a number |
 
-`query` and `print-query` first bring the inferred statements up to date, as a start does, and
-derive them again if the rules changed since. `query` writes them, so it may change the store's
-files, not its data.
+`query` first brings the inferred statements up to date, as a start does, and derives them again
+if the rules changed since. It writes them, so it may change the store's files, not its data.
+`print-query` reads the asserted statements alone and brings nothing up to date.
 
 `print-query` writes a query that a store without reasoning, holding the same statements,
 answers as NRESE does under `owl2-rl` with the QL rewriting on. `--form paths` reaches the class
@@ -317,9 +325,10 @@ console on Windows) ends the server cleanly, in this order:
 The stop has 8 s from the signal. A stop not done by then logs `nrese-server stop deadline
 reached`, with what it still waited for, and 200 ms later ends the process with `0`, as a kill
 would. The tests check that a server has ended within 9 s, so give the supervisor more than that
-before it kills (`docker stop` waits 10 s unless `-t` says otherwise). Nothing acknowledged is
-lost either way: every commit is in the log before it is acknowledged, and the next start
+before it kills (`docker stop` waits 10 s unless `-t` says otherwise). On disk, nothing
+acknowledged is lost either way: every commit is in the log before it is acknowledged, and the next start
 recovers from the checkpoint and the log ([durability](../spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+In memory, every stop loses the data.
 
 A signal during the start, while the store opens and reasons, acts as a kill. On Windows a
 service stop or `taskkill /F` ends the process without letting requests finish.
@@ -335,8 +344,9 @@ design. Each part has a gauge in `/metrics`:
 | The data and its indexes | the statements | the data | `nrese_index_bytes`, `nrese_store_quads` |
 | The dictionary | every distinct term ever written (a deleted term keeps its entry) | the distinct terms, so a store that keeps receiving new terms keeps growing | `nrese_dictionary_terms`, `nrese_dictionary_bytes` |
 | The full-text index | the dictionary's literals, from the first text search on | as the dictionary | `nrese_text_index_terms` |
-| The result cache | repeated queries on an unchanged store (a commit empties it) | `budgets.result_cache` | `nrese_query_cache_bytes` |
+| The result cache | repeated queries on an unchanged store (after a commit, the first result stored drops the older revisions' entries) | `budgets.result_cache` | `nrese_query_cache_bytes` |
 | The write-ahead log (on disk) | writes | `store.checkpoint_after_wal`, then a checkpoint | `nrese_wal_bytes_since_checkpoint` |
+| The log archive (`store.wal_archive` on) | every checkpoint | `nrese-server prune-archive` | |
 | Sessions, running queries | open client transactions, queries | their end (an idle session after ten minutes) | `nrese_sessions_open`, `nrese_queries_running` |
 | The allocator | the most the program held at once, across its threads | what it reserved, within minutes | `nrese_allocator_bytes{kind="committed"}` |
 
@@ -344,10 +354,10 @@ The allocator is most of a serving process's memory. With
 [`budgets.huge_pages`](config-reference.md#budgets.huge_pages) at its default, `on`, transparent
 huge pages back it on Linux, where one touched byte makes 2 MiB resident. In a soak of 16 clients
 (inserts, deletes, queries, transactions, Graph Store calls; 7 October 2026) the program held about
-2 MiB once warm and never more than 15 MiB, while the process held 250 to 330 MiB, within the
+2 MiB once warm and never more than 15 MiB, while the process held about 250 to 310 MiB, within the
 about 600 MiB the allocator reserved in the first minutes. That is not a leak: the program's own
 memory stays level, and `crates/nrese-store/tests/memory_churn.rs` checks it. With `off` the same
-soak held 95 to 120 MiB, and materialising LUBM 100 took 26 % longer. `bulk` uses huge pages only
+soak held about 100 MiB, and materialising LUBM 100 took 26 % longer. `bulk` uses huge pages only
 while a load or a materialisation runs.
 
 `benches/probes/soak.py` reads every gauge above beside the resident memory and prints each
