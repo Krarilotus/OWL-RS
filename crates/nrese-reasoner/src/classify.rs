@@ -21,17 +21,28 @@
 //! `owl:Thing`, `owl:Nothing`, `rdfs:subPropertyOf`, `owl:equivalentProperty`,
 //! `owl:propertyChainAxiom`, `owl:TransitiveProperty`, `rdfs:domain`, and `rdfs:range`
 //! (applied where a class axiom creates the edge), between named object properties. Every
-//! other class or property axiom is skipped and counted, outside EL (unions, universal
-//! restrictions, complements, cardinalities, inverses, nominals, data ranges) or not
-//! (property characteristics other than transitivity, disjoint properties, disjoint unions,
-//! self restrictions, named class expressions, the top and bottom properties, datatypes
-//! where a class is read, restrictions on data properties, nodes that state two
-//! expressions): the hierarchy is then complete for the part read only. A data property's domain and range, which say
-//! nothing about classes without such a restriction, assertions about individuals, and
-//! keys, which constrain only individuals, are not read: an inconsistency among them goes
-//! unseen. Nor are an annotation property's domain, range and sub-properties, which say
-//! nothing about classes. What a declaration declares is read from nrese-owl's table
-//! ([`DECLARATION_KINDS`]), as the mapping reads it.
+//! other class or property axiom is skipped and counted (OWL 2 Profiles §2.2):
+//! - outside OWL 2 EL: unions and disjoint unions, universal restrictions, complements,
+//!   cardinalities, inverse properties, nominals of more than one individual, disjoint
+//!   properties, functional object properties, inverse-functional, irreflexive, symmetric
+//!   and asymmetric properties, and the data ranges EL lacks (complements, facet
+//!   restrictions);
+//! - inside OWL 2 EL but not read here: nominals of one individual (`owl:oneOf` with one
+//!   member, `owl:hasValue`), self restrictions, reflexive properties, functional data
+//!   properties, restrictions on data properties, EL's data ranges (its datatypes, their
+//!   intersections, one-literal enumerations), and the top and bottom properties;
+//! - neither, but how the triples state them: named class expressions, datatypes where a
+//!   class is read, nodes that state two expressions.
+//!
+//! The hierarchy is then complete for the part read only. OWL 2's global
+//! restrictions are not checked: an irregular role hierarchy (*Structural Specification*
+//! §11.2), outside OWL 2 EL as well (Profiles §2.2.6), is read, and CR6 needs no regular one.
+//! A data property's domain and range, which say nothing about classes without such a
+//! restriction, assertions about individuals, and keys, which constrain only individuals,
+//! are not read: an inconsistency among them goes unseen. Nor are an annotation
+//! property's domain, range and sub-properties, which say nothing about classes. What a
+//! declaration declares is read from nrese-owl's table ([`DECLARATION_KINDS`]), as the
+//! mapping reads it.
 
 use std::time::{Duration, Instant};
 
@@ -39,9 +50,37 @@ use hashbrown::{HashMap, HashSet};
 use nrese_owl::{DECLARATION_KINDS, EntityKind};
 use nrese_xsd::owl::Datatype;
 
+use super::delta::Interrupted;
+use super::eval::{OperationStop, Poller};
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
 
 type Triple = [u64; 3];
+
+/// A run's stop and the calling thread's countdown to its next poll
+/// ([`classify_parallel_within`]): every [`nrese_exec::stop::POLL_UNITS`] units it asks
+/// [`OperationStop::fired`]. A unit is counted before it is done.
+struct Checkpoint<'a> {
+    poll: Poller<'a>,
+    stop: &'a OperationStop<'a>,
+}
+
+impl Checkpoint<'_> {
+    /// One unit of work: `Err` once the stop has fired.
+    fn tick(&self) -> Result<(), Interrupted> {
+        match self.poll.tick() {
+            true => Err(self.stop.interrupted()),
+            false => Ok(()),
+        }
+    }
+
+    /// The closing check of a run's phase: `Err` if the stop has fired, asked now.
+    fn finish(&self) -> Result<(), Interrupted> {
+        match self.poll.stopped() || self.stop.fired() {
+            true => Err(self.stop.interrupted()),
+            false => Ok(()),
+        }
+    }
+}
 
 /// A classification's result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -725,12 +764,18 @@ impl Graph<'_> {
     }
 
     /// The class expression `node` is; `Err` names what EL lacks.
+    /// Each node read is a unit of `checkpoint`'s; once it has fired, `Err` (the caller's
+    /// next tick sees it).
     fn expr(
         &self,
         node: u64,
         named: &dyn Fn(u64) -> bool,
         depth: usize,
+        checkpoint: &Checkpoint<'_>,
     ) -> Result<Expr, &'static str> {
+        if checkpoint.tick().is_err() {
+            return Err("stopped");
+        }
         if depth > 64 {
             return Err("too deeply nested");
         }
@@ -753,7 +798,7 @@ impl Graph<'_> {
             }
             return members
                 .into_iter()
-                .map(|m| self.expr(m, named, depth + 1))
+                .map(|m| self.expr(m, named, depth + 1, checkpoint))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Expr::And);
         }
@@ -767,7 +812,7 @@ impl Graph<'_> {
             }
             return Ok(Expr::Some(
                 role,
-                Box::new(self.expr(filler, named, depth + 1)?),
+                Box::new(self.expr(filler, named, depth + 1, checkpoint)?),
             ));
         }
         Err("unknown class expression")
@@ -806,8 +851,46 @@ pub fn classify_profiled(
     named: &dyn Fn(u64) -> bool,
     threads: usize,
 ) -> (Classification, Profile) {
+    let no_memory = || -> Option<nrese_exec::memory::MemoryStopCause> { None };
+    let never = OperationStop::with_poll(super::eval::NEVER, &no_memory);
+    match classify_profiled_within(triples, vocabulary, named, threads, &never) {
+        Ok(result) => result,
+        Err(_) => unreachable!("a stop that never fires doesn't stop"),
+    }
+}
+
+/// [`classify_parallel`] under `stop`: once it fires (a deadline, the memory limit), every
+/// worker stops within [`nrese_exec::stop::POLL_UNITS`] units of work (a message handled or
+/// sent, a class or pair assembled, a step of reading an axiom), the work so far is
+/// discarded, and the run answers its [`Interrupted`], never a partial classification. A
+/// soft bound: an excess is seen by the poll after it, not refused in advance. Unpolled,
+/// each growing with the input or the answer, not with time: indexing the triples, the
+/// role closure (`prepare`) and the answer's final sorts.
+pub fn classify_parallel_within(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+    threads: usize,
+    stop: &OperationStop<'_>,
+) -> Result<Classification, Interrupted> {
+    classify_profiled_within(triples, vocabulary, named, threads, stop).map(|(c, _)| c)
+}
+
+/// [`classify_parallel_within`] with its [`Profile`].
+pub fn classify_profiled_within(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+    threads: usize,
+    stop: &OperationStop<'_>,
+) -> Result<(Classification, Profile), Interrupted> {
+    let fired = || stop.fired();
+    let checkpoint = Checkpoint {
+        poll: Poller::new(&fired).ok_or_else(|| stop.interrupted())?,
+        stop,
+    };
     let started = Instant::now();
-    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named);
+    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named, &checkpoint)?;
     let mut profile = Profile {
         normalise: started.elapsed(),
         concepts: tbox.named.len(),
@@ -815,21 +898,39 @@ pub fn classify_profiled(
         ..Profile::default()
     };
     let result = if threads <= 1 {
-        saturate(&mut tbox, thing, nothing, skipped, &mut profile)
+        saturate(
+            &mut tbox,
+            thing,
+            nothing,
+            skipped,
+            &mut profile,
+            &checkpoint,
+        )
     } else {
-        parallel::saturate(&mut tbox, thing, nothing, skipped, threads, &mut profile)
-    };
-    (result, profile)
+        parallel::saturate(
+            &mut tbox,
+            thing,
+            nothing,
+            skipped,
+            threads,
+            &mut profile,
+            &checkpoint,
+        )
+    }?;
+    Ok((result, profile))
 }
 
 type Built = (Tbox, Concept, Concept, Vec<(u64, &'static str)>);
 
-/// The normalised TBox of `triples`, with `owl:Thing`, `owl:Nothing` and what was skipped.
+/// The normalised TBox of `triples`, with `owl:Thing`, `owl:Nothing` and what was skipped;
+/// counting per triple, per class expression node read, per disjoint pair and per
+/// expansion step.
 fn build(
     triples: &[Triple],
     vocabulary: &mut impl Vocabulary,
     named: &dyn Fn(u64) -> bool,
-) -> Built {
+    checkpoint: &Checkpoint<'_>,
+) -> Result<Built, Interrupted> {
     let names = Names::new(vocabulary);
     let graph = Graph::new(triples, &names, named);
     let mut tbox = Tbox::default();
@@ -837,7 +938,7 @@ fn build(
     let nothing = tbox.concept(Some(names.nothing));
     let mut skipped = Vec::new();
     let expr = |node: u64, predicate: u64, skipped: &mut Vec<(u64, &'static str)>| match graph
-        .expr(node, named, 0)
+        .expr(node, named, 0, checkpoint)
     {
         Ok(e) => Some(e),
         Err(kind) => {
@@ -845,13 +946,17 @@ fn build(
             None
         }
     };
+    // Once the checkpoint has fired (an expression's read reports it as a skip), every
+    // tick answers the stop: the run stops, what was read discarded.
     // Every declared class is classified, also one no axiom names.
     for &[s, p, o] in triples {
+        checkpoint.tick()?;
         if named(s) && names.declared(p, o) == Some(EntityKind::Class) {
             let _ = tbox.concept(Some(s));
         }
     }
     for &[s, p, o] in triples {
+        checkpoint.tick()?;
         let Some(disposition) = names.disposition(p, o) else {
             continue;
         };
@@ -892,6 +997,9 @@ fn build(
                     .collect();
                 for (i, &a) in concepts.iter().enumerate() {
                     for &b in &concepts[i + 1..] {
+                        checkpoint.tick()?;
+                        #[cfg(test)]
+                        tests::unit(checkpoint.stop);
                         tbox.and_sub(a, b, nothing);
                     }
                 }
@@ -936,6 +1044,7 @@ fn build(
                     let mut roles: Vec<Role> = links.iter().map(|&l| tbox.role(Some(l))).collect();
                     // r1 ∘ r2 ∘ … ∘ rn ⊑ s as (((r1 ∘ r2) ∘ r3) …) with fresh roles.
                     while roles.len() > 2 {
+                        checkpoint.tick()?;
                         let fresh = tbox.role(None);
                         tbox.chains.push((roles[0], roles[1], fresh));
                         roles.splice(0..2, [fresh]);
@@ -979,7 +1088,8 @@ fn build(
             Disposition::Expression(..) => {}
         }
     }
-    (tbox, thing, nothing, skipped)
+    checkpoint.finish()?;
+    Ok((tbox, thing, nothing, skipped))
 }
 
 /// The role closure and chain indexes, and the ranges folded into the existentials: what
@@ -1042,14 +1152,22 @@ fn prepare(tbox: &mut Tbox) -> Prepared {
     }
 }
 
-/// The classification from every concept's subsumers.
+/// The classification from every concept's subsumers, counting per class and pair.
 fn assemble(
     tbox: &Tbox,
     subsumers: &[HashSet<Concept>],
     thing: Concept,
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
-) -> Classification {
+    checkpoint: &Checkpoint<'_>,
+) -> Result<Classification, Interrupted> {
+    // A class or a pair looked at.
+    let unit = || -> Result<(), Interrupted> {
+        checkpoint.tick()?;
+        #[cfg(test)]
+        tests::unit(checkpoint.stop);
+        Ok(())
+    };
     let mut result = Classification {
         skipped,
         ..Classification::default()
@@ -1062,6 +1180,7 @@ fn assemble(
         .collect();
     let top = &subsumers[thing as usize];
     for &(d, id) in &named_ids {
+        unit()?;
         if d != thing && d != nothing && top.contains(&d) {
             result.top.push(id);
         }
@@ -1071,12 +1190,14 @@ fn assemble(
             continue;
         }
         let set = &subsumers[c as usize];
+        unit()?;
         if set.contains(&nothing) {
             result.unsatisfiable.push(id);
             continue;
         }
         // Its own subsumers, not every named class: linear in the taxonomy's size.
         for &d in set {
+            unit()?;
             if d != c
                 && d != thing
                 && let Some(super_id) = tbox.named[d as usize]
@@ -1085,23 +1206,35 @@ fn assemble(
             }
         }
     }
+    checkpoint.finish()?;
     result.subsumptions.sort_unstable();
     result.unsatisfiable.sort_unstable();
     result.top.sort_unstable();
-    result
+    Ok(result)
 }
 
 mod parallel {
     //! The parallel saturation of [`super::classify_parallel`].
 
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::sync::{Mutex, MutexGuard};
 
     use hashbrown::HashSet;
+    use nrese_exec::stop::POLL_UNITS;
 
     use std::time::Instant;
 
-    use super::{Classification, Concept, Prepared, Profile, Role, Tbox, assemble, prepare};
+    use super::{
+        Checkpoint, Classification, Concept, Interrupted, OperationStop, Prepared, Profile, Role,
+        Tbox, assemble, prepare,
+    };
+
+    thread_local! {
+        /// This worker's units left before its next poll: counted per thread, since an
+        /// activation is too short to reach [`POLL_UNITS`] alone.
+        static LEFT: Cell<u32> = const { Cell::new(POLL_UNITS) };
+    }
 
     enum Message {
         /// A subsumer of the context's concept.
@@ -1146,6 +1279,9 @@ mod parallel {
         contexts: Vec<Context>,
         thing: Concept,
         nothing: Concept,
+        /// The run's one stop: polled every [`POLL_UNITS`] units per worker; once it has
+        /// fired (its latch), every worker drops what it holds and sends nothing more.
+        stop: &'a OperationStop<'a>,
     }
 
     pub(super) fn saturate(
@@ -1155,7 +1291,8 @@ mod parallel {
         skipped: Vec<(u64, &'static str)>,
         threads: usize,
         profile: &mut Profile,
-    ) -> Classification {
+        checkpoint: &Checkpoint<'_>,
+    ) -> Result<Classification, Interrupted> {
         let started = Instant::now();
         let prepared = prepare(tbox);
         profile.prepare = started.elapsed();
@@ -1167,19 +1304,27 @@ mod parallel {
             contexts: (0..n).map(|_| Context::default()).collect(),
             thing,
             nothing,
+            stop: checkpoint.stop,
         };
         let run = || {
             rayon::scope(|scope| {
-                for c in 0..n as Concept {
+                // A concept looked at and a message delivered are units; stopped, no more.
+                let _ = (0..n as Concept).try_for_each(|c| {
+                    saturation.tick()?;
                     if saturation.tbox.named[c as usize].is_some()
                         && !saturation.contexts[c as usize]
                             .initialised
                             .swap(true, SeqCst)
                     {
-                        saturation.deliver(scope, c, Message::Sub(c));
-                        saturation.deliver(scope, c, Message::Sub(thing));
+                        for message in [Message::Sub(c), Message::Sub(thing)] {
+                            saturation.tick()?;
+                            #[cfg(test)]
+                            super::tests::unit(saturation.stop);
+                            saturation.deliver(scope, c, message);
+                        }
                     }
-                }
+                    Ok::<_, Interrupted>(())
+                });
             });
         };
         match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
@@ -1205,10 +1350,15 @@ mod parallel {
         profile.saturate = started.elapsed();
         profile.contexts = initialised;
         profile.subsumers = subsumers.iter().map(HashSet::len).sum();
+        // Every worker has joined: a stop that fired left the saturation partial, and
+        // nothing of it is assembled.
+        if checkpoint.stop.latched() {
+            return Err(checkpoint.stop.interrupted());
+        }
         let started = Instant::now();
-        let result = assemble(tbox, &subsumers, thing, nothing, skipped);
+        let result = assemble(tbox, &subsumers, thing, nothing, skipped, checkpoint)?;
         profile.assemble = started.elapsed();
-        result
+        Ok(result)
     }
 
     /// The context a worker is saturating, and the messages it sends itself: those are
@@ -1219,6 +1369,23 @@ mod parallel {
     }
 
     impl Saturation<'_> {
+        /// One unit of this worker's work; polls the stop when its allowance runs out (which
+        /// latches it once it fires). `Err` once the stop has latched, on any worker: the
+        /// activation ends, and nothing more is sent.
+        fn tick(&self) -> Result<(), Interrupted> {
+            LEFT.with(|left| match left.get() {
+                1 => {
+                    left.set(POLL_UNITS);
+                    self.stop.fired();
+                }
+                rest => left.set(rest - 1),
+            });
+            match self.stop.latched() {
+                true => Err(self.stop.interrupted()),
+                false => Ok(()),
+            }
+        }
+
         /// A message into `to`'s inbox; `to` gets a worker unless it has one.
         fn deliver<'s>(&'s self, scope: &rayon::Scope<'s>, to: Concept, message: Message) {
             let context = &self.contexts[to as usize];
@@ -1234,12 +1401,16 @@ mod parallel {
             own: &mut Own<'_>,
             to: Concept,
             message: Message,
-        ) {
+        ) -> Result<(), Interrupted> {
+            self.tick()?;
+            #[cfg(test)]
+            super::tests::unit(self.stop);
             if to == own.context {
                 own.local.push(message);
             } else {
                 self.deliver(scope, to, message);
             }
+            Ok(())
         }
 
         /// `from →t to`: a backward link to `to`, a forward link to `from`; `to` starts
@@ -1251,13 +1422,13 @@ mod parallel {
             from: Concept,
             t: Role,
             to: Concept,
-        ) {
+        ) -> Result<(), Interrupted> {
             if !self.contexts[to as usize].initialised.swap(true, SeqCst) {
-                self.send(scope, own, to, Message::Sub(to));
-                self.send(scope, own, to, Message::Sub(self.thing));
+                self.send(scope, own, to, Message::Sub(to))?;
+                self.send(scope, own, to, Message::Sub(self.thing))?;
             }
-            self.send(scope, own, to, Message::Backward(from, t));
-            self.send(scope, own, from, Message::Forward(t, to));
+            self.send(scope, own, to, Message::Backward(from, t))?;
+            self.send(scope, own, from, Message::Forward(t, to))
         }
 
         /// Processes a context's messages until its inbox stays empty.
@@ -1280,7 +1451,16 @@ mod parallel {
                         context: c,
                         local: &mut batch,
                     };
-                    self.handle(scope, &mut own, &mut state, message);
+                    // Stopped, here or on another worker: what this context holds is dropped;
+                    // its inbox empties the same way, and the worker returns.
+                    if self
+                        .tick()
+                        .and_then(|()| self.handle(scope, &mut own, &mut state, message))
+                        .is_err()
+                    {
+                        batch.clear();
+                        break;
+                    }
                 }
             }
         }
@@ -1291,33 +1471,35 @@ mod parallel {
             own: &mut Own<'_>,
             state: &mut State,
             message: Message,
-        ) {
+        ) -> Result<(), Interrupted> {
+            #[cfg(test)]
+            super::tests::unit(self.stop);
             let (tbox, p, c) = (self.tbox, &self.prepared, own.context);
             state.handled += 1;
             match message {
                 Message::Sub(d) => {
                     if !state.subsumers.insert(d) {
                         state.repeated += 1;
-                        return;
+                        return Ok(());
                     }
                     for &e in &tbox.told[d as usize] {
-                        self.send(scope, own, c, Message::Sub(e));
+                        self.send(scope, own, c, Message::Sub(e))?;
                     }
                     for &(b, e) in &tbox.conjunctions[d as usize] {
                         if state.subsumers.contains(&b) {
-                            self.send(scope, own, c, Message::Sub(e));
+                            self.send(scope, own, c, Message::Sub(e))?;
                         }
                     }
                     for &(r, b) in &tbox.existentials[d as usize] {
-                        self.link(scope, own, c, r, b);
+                        self.link(scope, own, c, r, b)?;
                     }
                     for &(from, r) in &state.pred {
                         if d == self.nothing {
-                            self.send(scope, own, from, Message::Sub(self.nothing));
+                            self.send(scope, own, from, Message::Sub(self.nothing))?;
                         }
                         for &(s, f) in &tbox.filler_of[d as usize] {
                             if p.supers[r as usize].contains(&s) {
-                                self.send(scope, own, from, Message::Sub(f));
+                                self.send(scope, own, from, Message::Sub(f))?;
                             }
                         }
                     }
@@ -1325,16 +1507,16 @@ mod parallel {
                 Message::Backward(from, r) => {
                     if !state.pred_seen.insert((from, r)) {
                         state.repeated += 1;
-                        return;
+                        return Ok(());
                     }
                     state.pred.push((from, r));
                     for &e in &state.subsumers {
                         if e == self.nothing {
-                            self.send(scope, own, from, Message::Sub(self.nothing));
+                            self.send(scope, own, from, Message::Sub(self.nothing))?;
                         }
                         for &(s, f) in &tbox.filler_of[e as usize] {
                             if p.supers[r as usize].contains(&s) {
-                                self.send(scope, own, from, Message::Sub(f));
+                                self.send(scope, own, from, Message::Sub(f))?;
                             }
                         }
                     }
@@ -1343,7 +1525,7 @@ mod parallel {
                         for &(r2, t) in &p.chains_first[s1 as usize] {
                             for &(r2_edge, e) in &state.succ {
                                 if p.supers[r2_edge as usize].contains(&r2) {
-                                    self.link(scope, own, from, t, e);
+                                    self.link(scope, own, from, t, e)?;
                                 }
                             }
                         }
@@ -1352,7 +1534,7 @@ mod parallel {
                 Message::Forward(r, to) => {
                     if !state.succ_seen.insert((r, to)) {
                         state.repeated += 1;
-                        return;
+                        return Ok(());
                     }
                     state.succ.push((r, to));
                     // ... and second: b →r1 c →r to.
@@ -1360,13 +1542,14 @@ mod parallel {
                         for &(r1, t) in &p.chains_second[s2 as usize] {
                             for &(b, r1_edge) in &state.pred {
                                 if p.supers[r1_edge as usize].contains(&r1) {
-                                    self.link(scope, own, b, t, to);
+                                    self.link(scope, own, b, t, to)?;
                                 }
                             }
                         }
                     }
                 }
             }
+            Ok(())
         }
     }
 }
@@ -1377,7 +1560,8 @@ fn saturate(
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
     profile: &mut Profile,
-) -> Classification {
+    checkpoint: &Checkpoint<'_>,
+) -> Result<Classification, Interrupted> {
     let started = Instant::now();
     let Prepared {
         supers,
@@ -1398,19 +1582,34 @@ fn saturate(
         Link(Concept, Role, Concept),
     }
     let mut todo: Vec<Item> = Vec::new();
-    let init = |c: Concept, initialised: &mut Vec<bool>, todo: &mut Vec<Item>| {
-        if !initialised[c as usize] {
-            initialised[c as usize] = true;
-            todo.push(Item::Sub(c, c));
-            todo.push(Item::Sub(c, thing));
+    // A message queued is a unit, as one handled is.
+    let queue = |todo: &mut Vec<Item>, item: Item| -> Result<(), Interrupted> {
+        checkpoint.tick()?;
+        #[cfg(test)]
+        tests::unit(checkpoint.stop);
+        todo.push(item);
+        Ok(())
+    };
+    let init = |c: Concept,
+                initialised: &mut Vec<bool>,
+                todo: &mut Vec<Item>|
+     -> Result<(), Interrupted> {
+        if initialised[c as usize] {
+            return Ok(());
         }
+        initialised[c as usize] = true;
+        queue(todo, Item::Sub(c, c))?;
+        queue(todo, Item::Sub(c, thing))
     };
     for c in 0..n as Concept {
         if tbox.named[c as usize].is_some() {
-            init(c, &mut initialised, &mut todo);
+            init(c, &mut initialised, &mut todo)?;
         }
     }
     while let Some(item) = todo.pop() {
+        checkpoint.tick()?;
+        #[cfg(test)]
+        tests::unit(checkpoint.stop);
         conclusions += 1;
         match item {
             Item::Sub(c, d) => {
@@ -1419,23 +1618,23 @@ fn saturate(
                     continue;
                 }
                 for &e in &tbox.told[d as usize] {
-                    todo.push(Item::Sub(c, e));
+                    queue(&mut todo, Item::Sub(c, e))?;
                 }
                 for &(b, e) in &tbox.conjunctions[d as usize] {
                     if subsumers[c as usize].contains(&b) {
-                        todo.push(Item::Sub(c, e));
+                        queue(&mut todo, Item::Sub(c, e))?;
                     }
                 }
                 for &(r, b) in &tbox.existentials[d as usize] {
-                    todo.push(Item::Link(c, r, b));
+                    queue(&mut todo, Item::Link(c, r, b))?;
                 }
                 for &(from, r) in &pred[c as usize] {
                     if d == nothing {
-                        todo.push(Item::Sub(from, nothing));
+                        queue(&mut todo, Item::Sub(from, nothing))?;
                     }
                     for &(s, f) in &tbox.filler_of[d as usize] {
                         if supers[r as usize].contains(&s) {
-                            todo.push(Item::Sub(from, f));
+                            queue(&mut todo, Item::Sub(from, f))?;
                         }
                     }
                 }
@@ -1445,16 +1644,16 @@ fn saturate(
                     duplicates += 1;
                     continue;
                 }
-                init(d, &mut initialised, &mut todo);
+                init(d, &mut initialised, &mut todo)?;
                 succ[c as usize].push((r, d));
                 pred[d as usize].push((c, r));
                 for &e in &subsumers[d as usize] {
                     if e == nothing {
-                        todo.push(Item::Sub(c, nothing));
+                        queue(&mut todo, Item::Sub(c, nothing))?;
                     }
                     for &(s, f) in &tbox.filler_of[e as usize] {
                         if supers[r as usize].contains(&s) {
-                            todo.push(Item::Sub(c, f));
+                            queue(&mut todo, Item::Sub(c, f))?;
                         }
                     }
                 }
@@ -1463,7 +1662,7 @@ fn saturate(
                     for &(r2, t) in &chains_first[s1 as usize] {
                         for &(r2_edge, e) in &succ[d as usize] {
                             if supers[r2_edge as usize].contains(&r2) {
-                                todo.push(Item::Link(c, t, e));
+                                queue(&mut todo, Item::Link(c, t, e))?;
                             }
                         }
                     }
@@ -1473,7 +1672,7 @@ fn saturate(
                     for &(r1, t) in &chains_second[s2 as usize] {
                         for &(b, r1_edge) in &pred[c as usize] {
                             if supers[r1_edge as usize].contains(&r1) {
-                                todo.push(Item::Link(b, t, d));
+                                queue(&mut todo, Item::Link(b, t, d))?;
                             }
                         }
                     }
@@ -1488,9 +1687,9 @@ fn saturate(
     profile.conclusions = conclusions;
     profile.duplicates = duplicates;
     let started = Instant::now();
-    let result = assemble(tbox, &subsumers, thing, nothing, skipped);
+    let result = assemble(tbox, &subsumers, thing, nothing, skipped, checkpoint)?;
     profile.assemble = started.elapsed();
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1541,6 +1740,194 @@ mod tests {
     fn holds(v: &mut LocalVocabulary, result: &Classification, sub: &str, sup: &str) -> bool {
         let (a, b) = (v.iri(&format!("{EX}{sub}")), v.iri(&format!("{EX}{sup}")));
         result.subsumptions.binary_search(&(a, b)).is_ok()
+    }
+
+    /// `n` classes, each below the next: n(n+1)/2 subsumers to derive, many polls' work.
+    fn chain(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("ex:C{i} rdfs:subClassOf ex:C{}\n", i + 1))
+            .collect()
+    }
+
+    /// `text` classified on `threads` workers under a stop whose caller fires from its
+    /// `caller_at`-th poll on and whose memory poll from its `memory_at`-th (`0`: never).
+    fn within(
+        text: &str,
+        threads: usize,
+        caller_at: u64,
+        memory_at: u64,
+    ) -> Result<Classification, Interrupted> {
+        use nrese_exec::memory::MemoryStopCause;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let mut v = LocalVocabulary::default();
+        let triples = load(&mut v, text);
+        let snapshot = v.clone();
+        let named = move |id: u64| snapshot.text(id).starts_with('<');
+        let (callers, memories) = (AtomicU64::new(0), AtomicU64::new(0));
+        let reached = |count: &AtomicU64, at: u64| at != 0 && count.fetch_add(1, Relaxed) + 1 >= at;
+        let caller = || reached(&callers, caller_at);
+        let memory = || reached(&memories, memory_at).then_some(MemoryStopCause::OverLimit);
+        let stop = OperationStop::with_poll(&caller, &memory);
+        classify_parallel_within(&triples, &mut v, &named, threads, &stop)
+    }
+
+    /// The bounded entry under a stop that never fires answers what the unbounded one does,
+    /// on one worker and on several.
+    #[test]
+    fn a_stop_that_never_fires_changes_no_classification() {
+        let text = chain(300);
+        for threads in [1, 4] {
+            let mut v = LocalVocabulary::default();
+            let triples = load(&mut v, &text);
+            let snapshot = v.clone();
+            let named = move |id: u64| snapshot.text(id).starts_with('<');
+            let unbounded = classify_parallel(&triples, &mut v, &named, threads);
+            assert_eq!(unbounded.subsumptions.len(), 300 * 301 / 2);
+            assert_eq!(
+                within(&text, threads, 0, 0),
+                Ok(unbounded),
+                "{threads} workers"
+            );
+        }
+    }
+
+    /// A stop that fires during the run ends it with the stop, never a classification: the
+    /// work so far is discarded (on one worker and on several), and a memory limit that
+    /// fires it is named as its cause.
+    #[test]
+    fn a_stop_that_fires_during_the_run_answers_no_classification() {
+        use nrese_exec::memory::MemoryStopCause;
+        let text = chain(300);
+        for threads in [1, 4] {
+            assert_eq!(
+                within(&text, threads, 3, 0),
+                Err(Interrupted { memory: None }),
+                "{threads} workers"
+            );
+            assert_eq!(
+                within(&text, threads, 0, 3),
+                Err(Interrupted {
+                    memory: Some(MemoryStopCause::OverLimit)
+                }),
+                "{threads} workers"
+            );
+        }
+    }
+
+    /// `n` classes in one `owl:AllDisjointClasses` axiom: a first row of n − 1 pairs.
+    fn disjoint_row(n: usize) -> String {
+        let mut text = String::from("_:d rdf:type owl:AllDisjointClasses\n_:d owl:members _:l0\n");
+        for i in 0..n {
+            let rest = match i + 1 < n {
+                true => format!("_:l{}", i + 1),
+                false => "rdf:nil".to_owned(),
+            };
+            text += &format!("_:l{i} rdf:first ex:C{i}\n_:l{i} rdf:rest {rest}\n");
+        }
+        text
+    }
+
+    /// One class below `n` others: one message's fan-out of n.
+    fn fan_out(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("ex:A rdfs:subClassOf ex:B{i}\n"))
+            .collect()
+    }
+
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+
+    /// The run a bound test probes ([`probe`]): its stop's address (0: none), the units of work
+    /// it has done ([`unit`]), the units after which its stop turns true, the run's number, and
+    /// the most units one thread did after that.
+    static PROBED: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    static AT: AtomicU64 = AtomicU64::new(0);
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    static MOST: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// This thread's units after the probed stop turned true: (run, units).
+        static AFTER: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// A unit of work done under `stop`, counted where it is done (a message handled or
+    /// sent, a disjoint pair made, a class or pair assembled) if `stop` is the probed run's.
+    pub(super) fn unit(stop: &OperationStop<'_>) {
+        if PROBED.load(SeqCst) != std::ptr::from_ref(stop) as usize
+            || DONE.fetch_add(1, SeqCst) < AT.load(SeqCst)
+        {
+            return;
+        }
+        let run = RUN.load(SeqCst);
+        let after = AFTER.with(|after| {
+            let units = match after.get() {
+                (r, units) if r == run => units + 1,
+                _ => 1,
+            };
+            after.set((run, units));
+            units
+        });
+        MOST.fetch_max(after, SeqCst);
+    }
+
+    /// `text` classified on `threads` workers under a stop that turns true once the run has
+    /// done `at` units of work: the answer, the most units one worker did after that, and the
+    /// units the run did. One probed run at a time.
+    fn probe(
+        text: &str,
+        threads: usize,
+        at: u64,
+    ) -> (Result<Classification, Interrupted>, u64, u64) {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut v = LocalVocabulary::default();
+        let triples = load(&mut v, text);
+        let snapshot = v.clone();
+        let named = move |id: u64| snapshot.text(id).starts_with('<');
+        let caller = || DONE.load(SeqCst) >= AT.load(SeqCst);
+        let no_memory = || -> Option<nrese_exec::memory::MemoryStopCause> { None };
+        let stop = OperationStop::with_poll(&caller, &no_memory);
+        DONE.store(0, SeqCst);
+        AT.store(at, SeqCst);
+        MOST.store(0, SeqCst);
+        RUN.fetch_add(1, SeqCst);
+        PROBED.store(std::ptr::from_ref(&stop) as usize, SeqCst);
+        let answer = classify_parallel_within(&triples, &mut v, &named, threads, &stop);
+        PROBED.store(0, SeqCst);
+        (answer, MOST.load(SeqCst), DONE.load(SeqCst))
+    }
+
+    /// Once its stop turns true, a run does at most `POLL_UNITS` more units of work, also
+    /// where one step holds more: a disjointness row of 4999 pairs, its stop turning true
+    /// at the first.
+    #[test]
+    fn a_disjointness_row_longer_than_a_poll_stops_within_one() {
+        let (answer, most, _) = probe(&disjoint_row(5000), 1, 1);
+        assert_eq!(answer, Err(Interrupted { memory: None }));
+        let poll = u64::from(nrese_exec::stop::POLL_UNITS);
+        assert!(most <= poll, "{most} units after the stop");
+    }
+
+    /// Once its stop turns true, each worker does at most `POLL_UNITS` more units of work,
+    /// also where one message fans out to more (10,000 subsumers of one class), wherever in
+    /// the run the stop turns true (every 2048th unit), on one worker and on four.
+    #[test]
+    fn a_fan_out_longer_than_a_poll_stops_within_one_on_every_worker() {
+        let text = fan_out(10_000);
+        let poll = u64::from(nrese_exec::stop::POLL_UNITS);
+        for threads in [1, 4] {
+            let (whole, _, done) = probe(&text, threads, u64::MAX);
+            assert!(whole.is_ok(), "{threads} workers");
+            for at in (1..done).step_by(2048) {
+                let (_, most, _) = probe(&text, threads, at);
+                assert!(
+                    most <= poll,
+                    "{threads} workers, stop at unit {at}: {most} units after it"
+                );
+            }
+        }
     }
 
     /// The textbook example (Baader et al.): pericarditis is a heart disease, through an

@@ -226,16 +226,16 @@ pub struct Normalised {
     pub fresh: Vec<FreshOf>,
     /// Axioms (by index) the clauses don't cover, and why: their tasks are answered
     /// `unsupported`.
-    pub unsupported: Vec<(usize, &'static str)>,
+    pub unsupported: Vec<(usize, crate::Unsupported)>,
     /// The ontology's expressions with those the normalisation made (fresh names refer
     /// to them).
     pub classes: Interner<ClassExpr>,
     pub ranges: Interner<DataRange>,
     /// Keys as DL-safe rules (their axioms are also in `unsupported`, under
-    /// [`crate::UNSUPPORTED_KEYS`], for engines that don't apply them).
+    /// [`crate::Unsupported::Keys`], for engines that don't apply them).
     pub rules: Vec<SafeRule>,
     /// Datatype definitions: the datatype and its range (also in `unsupported`, under
-    /// [`crate::UNSUPPORTED_DATATYPE_DEFINITIONS`]).
+    /// [`crate::Unsupported::DatatypeDefinitions`]).
     pub definitions: Vec<(Term, RangeId)>,
     /// How many class definitions are lazily unfolded (`Options::lazy_definitions`).
     pub unfolded: usize,

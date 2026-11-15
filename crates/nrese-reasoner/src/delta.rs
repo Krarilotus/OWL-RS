@@ -388,6 +388,19 @@ pub struct Interrupted {
     pub memory: Option<nrese_exec::memory::MemoryStopCause>,
 }
 
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use nrese_exec::memory::MemoryStopCause;
+        out.write_str(match self.memory {
+            None => "stopped by its caller (a stop or a deadline)",
+            Some(MemoryStopCause::OverLimit) => "stopped: past the process's memory limit",
+            Some(MemoryStopCause::Unread) => "stopped: the process's memory couldn't be read",
+        })
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 /// [`update`], polling `stop` between rounds and per job morsel. When it fires, the work
 /// so far is discarded: nothing has been applied, so the state stays as it was.
 pub fn update_until<B: Base + ?Sized>(

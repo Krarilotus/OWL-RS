@@ -233,3 +233,235 @@ fn pipeline_without_gate() -> nrese_store::MutationPipeline {
         ..nrese_store::DlConfig::default()
     })
 }
+
+/// [`pipeline_without_gate`], answering outside OWL 2 DL by a proven procedure (the EL route).
+fn pipeline_proven() -> nrese_store::MutationPipeline {
+    super::pipeline_with(nrese_store::DlConfig {
+        consistency: nrese_store::DlConsistency::Off,
+        outside_profile: nrese_store::OutsideProfile::Proven,
+        ..nrese_store::DlConfig::default()
+    })
+}
+
+/// An EL ontology whose role hierarchy is irregular (`r1 ∘ r2 ⊑ r3` with `r3 ⊑ r1`,
+/// *OWL 2 Structural Specification* §11.2): outside OWL 2 DL and OWL 2 EL, so the DL
+/// engines leave its chain out; the EL classifier's completion rules (CR6) need no
+/// regular hierarchy.
+const IRREGULAR: &str = ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . \
+     :r3 a owl:ObjectProperty . :r3 owl:propertyChainAxiom ( :r1 :r2 ) . \
+     :r3 rdfs:subPropertyOf :r1 . \
+     :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class . \
+     :E a owl:Class . :F a owl:Class . :G a owl:Class . \
+     :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] . \
+     :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C ] . \
+     :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :F ] . \
+     [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :C ] rdfs:subClassOf :D . \
+     [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :C ] rdfs:subClassOf :E . \
+     [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :F ] rdfs:subClassOf :G .";
+
+/// The reason the DL engines give for leaving the irregular chain out.
+const LEFT_OUT: &str = "axioms left out: an irregular role hierarchy";
+
+fn irregular(extra: &str) -> nrese_store::ClassificationReport {
+    let dl = pipeline_proven();
+    insert(&dl, &format!("{IRREGULAR} {extra}")).expect("ontology");
+    dl.store()
+        .classify(&ReadScope::All)
+        .expect("classification")
+}
+
+/// Where the irregular hierarchy is the only part the DL engines leave out, and the EL
+/// classifier reads the whole ontology, the EL classifier's answer is the report's: complete,
+/// and saying it gave it.
+#[test]
+fn an_irregular_el_ontology_is_answered_completely_by_the_el_classifier() {
+    let report = irregular("");
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert_eq!(report.consistency, nrese_store::dl::Verdict::Consistent);
+    let expected: Vec<(String, String)> = [
+        // A r1 B, B r2 C: the chain gives A r3 C, and ∃r3.C ⊑ D.
+        ("A", "D"),
+        // A r3 C with r3 ⊑ r1 is an r1 edge, and ∃r1.C ⊑ E.
+        ("A", "E"),
+        // That r1 edge chains again with C r2 F: A r3 F, and ∃r3.F ⊑ G (irregularity's step).
+        ("A", "G"),
+    ]
+    .iter()
+    .map(|(sub, sup)| (format!("{EX}{sub}"), format!("{EX}{sup}")))
+    .collect();
+    // B, C and F have no r1 edge: nothing else holds.
+    assert_eq!(report.subsumptions, expected);
+    assert!(
+        report.unsatisfiable.is_empty(),
+        "{:?}",
+        report.unsatisfiable
+    );
+    assert!(report.equivalent_to_thing.is_empty());
+}
+
+/// Without assertions, the ontology has a model iff `owl:Thing` is satisfiable: where the
+/// chain makes it unsatisfiable, the EL classifier's answer is "inconsistent", complete,
+/// listing nothing (the DL engines' Horn part, without the chain, can't find it).
+#[test]
+fn an_irregular_el_ontology_whose_thing_is_unsatisfiable_is_inconsistent() {
+    let dl = pipeline_proven();
+    insert(
+        &dl,
+        ":r1 a owl:ObjectProperty . :r2 a owl:ObjectProperty . :r3 a owl:ObjectProperty . \
+         :r3 owl:propertyChainAxiom ( :r1 :r2 ) . :r3 rdfs:subPropertyOf :r1 . \
+         :B a owl:Class . :C a owl:Class . \
+         owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r1 ; owl:someValuesFrom :B ] . \
+         :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r2 ; owl:someValuesFrom :C ] . \
+         [ a owl:Restriction ; owl:onProperty :r3 ; owl:someValuesFrom :C ] rdfs:subClassOf owl:Nothing .",
+    )
+    .expect("ontology");
+    let report = dl
+        .store()
+        .classify(&ReadScope::All)
+        .expect("classification");
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert_eq!(report.consistency, nrese_store::dl::Verdict::Inconsistent);
+    assert!(report.subsumptions.is_empty() && report.unsatisfiable.is_empty());
+}
+
+/// The answer the DL engines give when they leave the irregular chain out: their lower
+/// bound, marked incomplete for that reason (the EL classifier didn't answer).
+fn assert_lower_bound(report: &nrese_store::ClassificationReport) {
+    assert_eq!(report.engine, "tableau");
+    assert!(!report.complete());
+    assert!(
+        report.incomplete.contains(&format!(
+            "consistency not decided (unsupported): {LEFT_OUT}"
+        )),
+        "{:?}",
+        report.incomplete
+    );
+}
+
+/// By default no procedure outside OWL 2 DL runs: the irregular ontology the EL classifier
+/// would answer gets the DL engines' marked lower bound, as before the EL route. (No red
+/// run first: this default keeps today's behaviour, so no tree fails it.)
+#[test]
+fn by_default_an_irregular_el_ontology_gets_the_dl_engines_lower_bound() {
+    let dl = pipeline_without_gate();
+    insert(&dl, IRREGULAR).expect("ontology");
+    let report = dl
+        .store()
+        .classify(&ReadScope::All)
+        .expect("classification");
+    assert!(
+        !has(&report.subsumptions, "A", "D"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert_lower_bound(&report);
+}
+
+/// A range on a property above a chain's (`r3 ⊑ r4`) needs applying on the edges the
+/// chain composes, which the EL classifier doesn't (the EL++ update's condition): the
+/// answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_with_a_range_above_a_chain_is_not_answered_by_the_el_classifier() {
+    assert_lower_bound(&irregular(
+        ":r4 a owl:ObjectProperty . :X a owl:Class . :r3 rdfs:subPropertyOf :r4 . \
+         :r4 rdfs:range :X .",
+    ));
+}
+
+/// The EL classifier doesn't read assertions: with one, the answer stays the DL engines'
+/// marked lower bound.
+#[test]
+fn an_irregular_ontology_with_an_assertion_is_not_answered_by_the_el_classifier() {
+    assert_lower_bound(&irregular(":a a :A ."));
+}
+
+/// An axiom the EL classifier skips (a single-individual nominal) leaves its answer
+/// incomplete: the answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_with_an_axiom_the_el_classifier_skips_is_not_answered_by_it() {
+    assert_lower_bound(&irregular(":F owl:equivalentClass [ owl:oneOf ( :o ) ] ."));
+}
+
+/// A class the EL classifier reads nothing about (named only as a data property's domain)
+/// is still classified: below a class equivalent to `owl:Thing`, as every class is.
+#[test]
+fn an_irregular_el_answer_classifies_a_class_named_only_where_the_el_classifier_reads_nothing() {
+    let report = irregular(
+        ":dp a owl:DatatypeProperty ; rdfs:domain :X . :T a owl:Class . \
+         owl:Thing rdfs:subClassOf :T .",
+    );
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert_eq!(report.equivalent_to_thing, [format!("{EX}T")]);
+    assert!(
+        has(&report.subsumptions, "X", "T"),
+        "{:?}",
+        report.subsumptions
+    );
+}
+
+/// A range on a property below one equivalent to a chain's (`r5 ⊑ r4 ≡ r3`) is below the
+/// chain's too: the answer stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_with_a_range_below_a_chains_equivalent_is_not_answered_by_the_el_classifier()
+ {
+    assert_lower_bound(&irregular(
+        ":r4 a owl:ObjectProperty . :r5 a owl:ObjectProperty . :X a owl:Class . \
+         :r3 owl:equivalentProperty :r4 . :r5 rdfs:subPropertyOf :r4 ; rdfs:range :X .",
+    ));
+}
+
+/// An annotation property's domain says nothing about classes, and neither reader reads it:
+/// the EL classifier answers, complete, and the domain is no class in its answer.
+#[test]
+fn an_irregular_el_answer_leaves_an_annotation_propertys_domain_out() {
+    let report = irregular(
+        ":ap a owl:AnnotationProperty ; rdfs:domain :X . :T a owl:Class . \
+         owl:Thing rdfs:subClassOf :T .",
+    );
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+    assert!(
+        !has(&report.subsumptions, "X", "T"),
+        "{:?}",
+        report.subsumptions
+    );
+}
+
+/// An axiom's reification (`owl:Axiom`) states no axiom for the DL engines, but the EL
+/// classifier reads the class axiom its node carries (`X ⊓ Y ⊑ Z`): its answer names
+/// classes the DL engines' signature lacks, so neither reading is trusted, and the answer
+/// stays the DL engines' marked lower bound.
+#[test]
+fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_answered_by_the_el_classifier()
+ {
+    let report = irregular(
+        ":T a owl:Class . owl:Thing rdfs:subClassOf :T . \
+         _:ax a owl:Axiom ; owl:intersectionOf ( :X :Y ) ; rdfs:subClassOf :Z .",
+    );
+    // X is no class to the DL engines: the reification asserts nothing.
+    assert!(
+        !has(&report.subsumptions, "X", "T"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert_lower_bound(&report);
+}
+
+/// The EL classifier skips a datatype declared `owl:DataRange` where it reads a class (a
+/// data range): it skipped part of the ontology, so the answer stays the DL engines' marked
+/// lower bound.
+#[test]
+fn an_irregular_ontology_whose_data_ranges_the_el_classifier_skips_is_not_answered_by_it() {
+    let report =
+        irregular(":Dt a owl:DataRange . :Et a owl:DataRange . :Dt owl:equivalentClass :Et .");
+    // Dt and Et are datatypes, no classes: no pair between them.
+    assert!(
+        !has(&report.subsumptions, "Dt", "Et") && !has(&report.subsumptions, "Et", "Dt"),
+        "{:?}",
+        report.subsumptions
+    );
+    assert_lower_bound(&report);
+}

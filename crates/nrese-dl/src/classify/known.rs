@@ -18,10 +18,7 @@
 //! and `owl:Thing`, the part's taxonomy is the terminology's, and only consistency is
 //! left to decide.
 
-use nrese_owl::{
-    BodyAtom, Clause, HeadAtom, Normalised, Term, UNSUPPORTED_DATATYPE_DEFINITIONS,
-    UNSUPPORTED_KEYS,
-};
+use nrese_owl::{BodyAtom, Clause, HeadAtom, Normalised, Term};
 
 /// What the Horn part proves, by class index.
 #[derive(Debug, Clone, Default)]
@@ -188,7 +185,7 @@ fn exact_for(
     // Axioms the clauses don't cover: no part of them is exact.
     if n.unsupported
         .iter()
-        .any(|(_, r)| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
+        .any(|&(_, r)| crate::tableau::leaves_out(r))
     {
         super::trace("exactness: unsupported axioms");
         return;

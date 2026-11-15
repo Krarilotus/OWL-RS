@@ -1,7 +1,10 @@
 //! Classification and realisation of the store's asserted statements (all graphs), on
 //! request, by the OWL 2 DL engines ([`crate::dl::classification`]): complete for OWL 2
 //! DL within `dl.timeout`, and saying so when a budget or an unsupported construct leaves
-//! a result incomplete (what it contains is entailed either way).
+//! a result incomplete (what it contains is entailed either way). Where an irregular role
+//! hierarchy is all they leave out, the EL classifier answers if it is complete for the
+//! ontology ([`crate::dl::classification::el_answer`]); stopped, it says so, and the DL
+//! engines' answer stands.
 
 use std::time::Instant;
 
@@ -23,8 +26,9 @@ pub struct ClassificationReport {
     pub equivalent_to_thing: Vec<String>,
     /// Whether the ontology has a model; `Unknown`: what is listed holds either way.
     pub consistency: Verdict,
-    /// The engine that classified: `context-core` (the Horn stage took the ontology) or
-    /// `tableau` (the hypertableau driver).
+    /// The engine that classified: `context-core` (the Horn stage took the ontology),
+    /// `tableau` (the hypertableau driver) or `el` (the EL classifier, where an irregular
+    /// role hierarchy is all the DL engines left out: `dl::classification::el_answer`).
     pub engine: &'static str,
     /// Why the hierarchy may lack subsumptions (empty: it is complete).
     pub incomplete: Vec<String>,
@@ -91,11 +95,39 @@ impl StoreService {
         scope.require_all("classification")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
-        let taxonomy = crate::dl::classification::taxonomy(self, &snapshot);
-        let c = &taxonomy.classification;
-        let listed = c.consistency != Verdict::Inconsistent;
-        let mut subsumptions: Vec<(String, String)> = c
-            .subsumptions
+        use crate::dl::classification::{self as dl, ElRoute};
+        // An EL answer kept for this revision: neither engine runs again.
+        let answer = match dl::kept_el(self, &snapshot) {
+            Some(el) => Ok(el),
+            None => {
+                let taxonomy = dl::taxonomy(self, &snapshot);
+                match dl::el_answer(self, &snapshot, &taxonomy, started) {
+                    Some(ElRoute::Answered(el)) => Ok(el),
+                    None => Err((taxonomy, None)),
+                    Some(ElRoute::Stopped(memory)) => {
+                        let why = memory
+                            .map_or_else(|| "`dl.timeout` passed".to_owned(), |e| e.to_string());
+                        Err((taxonomy, Some(format!("the EL classifier stopped: {why}"))))
+                    }
+                }
+            }
+        };
+        let ((pairs, unsatisfiable, top), consistency, engine, incomplete) = match &answer {
+            Ok(el) => {
+                let c = &el.classification;
+                let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
+                (lists, &el.consistency, "el", Vec::new())
+            }
+            Err((taxonomy, stopped)) => {
+                let c = &taxonomy.classification;
+                let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
+                let mut why = taxonomy.incomplete.clone();
+                why.extend(stopped.clone());
+                (lists, &c.consistency, taxonomy.profile.path, why)
+            }
+        };
+        let listed = *consistency != Verdict::Inconsistent;
+        let mut subsumptions: Vec<(String, String)> = pairs
             .iter()
             .filter(|_| listed)
             .filter_map(|&(a, b)| Some((iri(&snapshot, a)?, iri(&snapshot, b)?)))
@@ -107,11 +139,11 @@ impl StoreService {
         };
         Ok(ClassificationReport {
             subsumptions,
-            unsatisfiable: list(&c.unsatisfiable),
-            equivalent_to_thing: list(&c.top),
-            consistency: c.consistency.clone(),
-            engine: taxonomy.profile.path,
-            incomplete: reasons(&c.consistency, taxonomy.incomplete.clone()),
+            unsatisfiable: list(unsatisfiable),
+            equivalent_to_thing: list(top),
+            consistency: consistency.clone(),
+            engine,
+            incomplete: reasons(consistency, incomplete),
             micros: started.elapsed().as_micros() as u64,
         })
     }

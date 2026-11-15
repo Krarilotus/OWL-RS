@@ -36,7 +36,7 @@ use nrese_exec::workers::Workers;
 use nrese_owl::{Normalised, Ontology, Term, normalise_with};
 
 pub use crate::context::Classification;
-use crate::tableau;
+use crate::tableau::{self, Omissions};
 pub use profile::Profile;
 pub use realise::{Realisation, realise};
 
@@ -165,6 +165,9 @@ pub struct Taxonomy {
     /// left out. What it does contain is entailed.
     pub incomplete: Vec<String>,
     pub profile: Profile,
+    /// What the engines left out of the ontology, by cause, where that made this the
+    /// driver's lower bound (empty on every other path).
+    pub left_out: Omissions,
 }
 
 impl Taxonomy {
@@ -182,6 +185,7 @@ impl Taxonomy {
             ),
             incomplete: vec![why],
             profile: Profile::default(),
+            left_out: Omissions::default(),
         }
     }
 }
@@ -293,6 +297,7 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
                 classification,
                 incomplete: Vec::new(),
                 profile,
+                left_out: Omissions::default(),
             };
         }
     }

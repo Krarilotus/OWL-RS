@@ -27,7 +27,7 @@ pub mod ground;
 
 use std::time::{Duration, Instant};
 
-use nrese_owl::{Diagnostic, Ontology, Term};
+use nrese_owl::{Diagnostic, Ontology, Term, Unsupported};
 
 use crate::certificate::{self, Interpretation, Violation};
 use crate::tableau::{self, Answer, Config};
@@ -145,13 +145,21 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
 }
 
 /// The normalisation's reason as the restriction it breaks, where it is outside OWL 2 DL.
-fn engine_restriction(why: &str) -> &'static str {
-    if why.contains("irregular") {
-        "OWL 2 Structural Specification §11.2: a regular property hierarchy"
-    } else if why.contains("datatype") || why.contains("facet") {
-        "OWL 2 Structural Specification §4, §11.2: the datatype map"
-    } else {
-        "left out by NRESE's engines"
+/// (The universal object property's names §11.1 and §11.2 in its own text, and is mapped
+/// to the engines, as before: listed, not changed here.)
+fn engine_restriction(why: Unsupported) -> &'static str {
+    match why {
+        Unsupported::IrregularRoleHierarchy => {
+            "OWL 2 Structural Specification §11.2: a regular property hierarchy"
+        }
+        Unsupported::DatatypeDefinitions => {
+            "OWL 2 Structural Specification §4, §11.2: the datatype map"
+        }
+        Unsupported::Keys
+        | Unsupported::UniversalDataProperty
+        | Unsupported::UniversalObjectProperty
+        | Unsupported::UncountedNegation
+        | Unsupported::TooWide => "left out by NRESE's engines",
     }
 }
 
@@ -189,22 +197,20 @@ impl Decision {
         }
         // What the engines leave out of what the reader read: the certificate checks it.
         let normalised = nrese_owl::normalise(&tableau::prepared(o));
-        let mut reasons: Vec<&str> = normalised
+        let mut reasons: Vec<Unsupported> = normalised
             .unsupported
             .iter()
-            .map(|(_, why)| *why)
-            .filter(|why| {
-                *why != nrese_owl::UNSUPPORTED_DATATYPE_DEFINITIONS
-                    && *why != nrese_owl::UNSUPPORTED_KEYS
-            })
+            .map(|&(_, why)| why)
+            .filter(|&why| tableau::leaves_out(why))
             .collect();
-        reasons.sort_unstable();
+        // By their text, as when they were text.
+        reasons.sort_unstable_by_key(|why| why.as_str());
         reasons.dedup();
         for why in reasons {
             let n = normalised
                 .unsupported
                 .iter()
-                .filter(|(_, w)| *w == why)
+                .filter(|&&(_, w)| w == why)
                 .count();
             left_out.push(LeftOut {
                 what: format!("{n} axioms: {why}"),

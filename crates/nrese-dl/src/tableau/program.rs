@@ -31,8 +31,7 @@ use super::graph::NONE;
 use crate::datatypes::Ranges;
 use nrese_owl::{
     Axiom, BodyAtom, Characteristic, Clause, Concept, DataRange, Filler as OwlFiller, HeadAtom,
-    Normalised, ObjProp, Ontology, RangeId, SafeRule, Term, UNSUPPORTED_DATATYPE_DEFINITIONS,
-    UNSUPPORTED_KEYS, Var,
+    Normalised, ObjProp, Ontology, RangeId, SafeRule, Term, Unsupported, Var,
 };
 
 /// A dense concept id.
@@ -233,28 +232,72 @@ pub struct Program {
     pub disjoint: hashbrown::HashSet<(ConceptId, ConceptId)>,
 }
 
-/// The axioms any program of `normalised` leaves out, and why: those the normalisation
-/// reports unsupported (but datatype definitions, the datatype theory's, and keys, which
-/// are rules), and those the reader couldn't take as OWL 2 DL. Known before any test: with
-/// one, no test can show a class satisfiable or a subsumption absent.
-pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Vec<String> {
-    let reasons: BTreeSet<&str> = normalised
-        .unsupported
-        .iter()
-        .map(|(_, r)| *r)
-        .filter(|r| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
-        .collect();
-    let mut why: Vec<String> = reasons
-        .into_iter()
-        .map(|reason| format!("axioms left out: {reason}"))
-        .collect();
-    let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
-    if fatal > 0 {
-        why.push(format!(
-            "{fatal} reader diagnostics (not OWL 2 DL, left out)"
-        ));
+/// Whether an axiom the normalisation left out for `cause` leaves the engines' answers a
+/// lower bound: every cause but datatype definitions, which the datatype theory reads, and
+/// keys, which are rules. The one place that decides it; a new cause is decided here.
+pub(crate) fn leaves_out(cause: Unsupported) -> bool {
+    match cause {
+        Unsupported::DatatypeDefinitions | Unsupported::Keys => false,
+        Unsupported::UniversalDataProperty
+        | Unsupported::UniversalObjectProperty
+        | Unsupported::UncountedNegation
+        | Unsupported::TooWide
+        | Unsupported::IrregularRoleHierarchy => true,
     }
-    why
+}
+
+/// What every program of an ontology leaves out ([`left_out`]): the normalisation's causes
+/// that leave answers a lower bound (`leaves_out`), and how many reader diagnostics
+/// weren't OWL 2 DL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Omissions {
+    /// Each cause once, in the order first met.
+    causes: Vec<Unsupported>,
+    fatal: usize,
+}
+
+impl Omissions {
+    /// Nothing left out.
+    pub fn is_empty(&self) -> bool {
+        self.causes.is_empty() && self.fatal == 0
+    }
+
+    /// Whether `cause` is all that is left out: no other cause, no reader diagnostic.
+    pub fn only(&self, cause: Unsupported) -> bool {
+        self.fatal == 0 && self.causes == [cause]
+    }
+
+    /// What is left out, in words: a line per cause, ordered by its text, then the reader's
+    /// diagnostics.
+    pub fn messages(&self) -> Vec<String> {
+        let reasons: BTreeSet<&str> = self.causes.iter().map(|c| c.as_str()).collect();
+        let mut why: Vec<String> = reasons
+            .into_iter()
+            .map(|reason| format!("axioms left out: {reason}"))
+            .collect();
+        if self.fatal > 0 {
+            why.push(format!(
+                "{} reader diagnostics (not OWL 2 DL, left out)",
+                self.fatal
+            ));
+        }
+        why
+    }
+}
+
+/// The axioms any program of `normalised` leaves out, and why: those the normalisation
+/// reports unsupported where that leaves answers a lower bound (`leaves_out`), and those
+/// the reader couldn't take as OWL 2 DL. Known before any test: with one, no test can show
+/// a class satisfiable or a subsumption absent.
+pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Omissions {
+    let mut causes = Vec::new();
+    for &(_, cause) in &normalised.unsupported {
+        if leaves_out(cause) && !causes.contains(&cause) {
+            causes.push(cause);
+        }
+    }
+    let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
+    Omissions { causes, fatal }
 }
 
 impl Program {
@@ -331,7 +374,7 @@ impl Program {
             simple: true,
             ..Program::default()
         };
-        p.weakened = left_out(ontology, normalised);
+        p.weakened = left_out(ontology, normalised).messages();
         p.refuted = crate::numbers::refute(ontology).map(|r| r.why);
         let facts = &normalised.facts;
         if normalised.clauses.iter().any(|c| c.flags.datatype)

@@ -171,7 +171,7 @@ pub fn saturate_with_workers(
     let classes = signature(ontology);
     let mut saturated = saturate_normalised(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
-    saturated.left_out = crate::tableau::left_out(ontology, &normalised);
+    saturated.left_out = crate::tableau::left_out(ontology, &normalised).messages();
     Ok(saturated)
 }
 
