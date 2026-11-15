@@ -88,10 +88,10 @@ leave something out.
   Lists past their limits (a property chain or key of more than 250 properties, more than
   64 member sequences) aren't used at all, never truncated, and each is reported in the log
   and the reasoning diagnostics
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)). None known beyond
-  keeping lists within those limits. Literals aren't equated by value (`"1"^^xsd:integer` and
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)), so keep lists within
+  those limits. Literals aren't equated by value (`"1"^^xsd:integer` and
   `"01"^^xsd:integer` stay two terms), so compare values in a `FILTER` (`?v = 1`), which SPARQL
-  does by value. Otherwise none known.
+  does by value.
 - Without the OWL 2 QL rewriting, every answer over a ruleset's closure is `sound-only`
   ([completeness](spec/reasoning-semantics.md#completeness)). Under `owl2-rl`, turn the
   rewriting on with `reasoner.ql_rewriting = "on"`. Under `owl2-dl`, raise the `dl.*` budgets
@@ -102,7 +102,7 @@ leave something out.
   answers as `unsound`.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
-  complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
+  complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
 - Under `owl2-dl`, a commit whose consistency check isn't decided
   (a budget or the timeout) goes through, and the status says `unknown`. No answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
@@ -113,7 +113,7 @@ leave something out.
   (`justifications=…`) say `complete: false` when a budget cut them short, and under `owl2-dl`
   a set of axioms past `dl.explanation_tests` or `dl.timeout` comes back unminimised, with
   `minimal: false`. Where OWL 2 DL doesn't decide it, the answer is a 422 that says why, not a
-  404 ([HTTP interface](ops/http-api.md#engine-api-apiv1)). For the derivation, none known.
+  404 ([HTTP interface](ops/http-api.md#engine-api-apiv1)).
 - Bulk loads and the ontology file loaded at start-up skip the commit checks
   ([what a commit does](what-it-covers.md#what-a-commit-does),
   [storage](spec/02-storage-and-transactions.md#bulk-loads)), so neither SHACL nor the OWL 2 DL
