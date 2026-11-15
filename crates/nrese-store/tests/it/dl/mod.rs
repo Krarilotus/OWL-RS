@@ -10,6 +10,7 @@ mod gap;
 mod gates;
 mod identity;
 mod mode;
+mod outside;
 mod queries;
 mod representatives;
 mod review;
