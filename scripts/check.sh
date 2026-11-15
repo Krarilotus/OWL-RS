@@ -12,7 +12,9 @@
 #                                  when its push tier passed for that exact tree, and its
 #                                  Windows inputs passed the Windows check (below).
 #        scripts/check.sh push     pre-push hook (.githooks/pre-push): the crates a pushed
-#                                  commit changes in the pushed range, on the fleet only
+#                                  commit changes in the pushed range (every crate when the
+#                                  root manifest, lock file or toolchain changed:
+#                                  scripts/lib/changed-crates.sh), on the fleet only
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
 #                                  tests, the dependents' fast tests; random tests on new
 #                                  seeds; the lock check; nrese-exec's unsafe code under Miri
@@ -79,22 +81,8 @@ python() {
   else echo "the gate needs python (or python3)" >&2; return 127; fi
 }
 
-# The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
-crates_of() {
-  local file dir name
-  declare -A seen=()
-  for file in "$@"; do
-    dir=$(dirname "$file")
-    while [ "$dir" != . ] && [ "$dir" != / ]; do
-      if [ -f "$dir/Cargo.toml" ] && [[ "$dir" == crates/* ]]; then
-        name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
-        [ -n "$name" ] && [ -z "${seen[$name]:-}" ] && { seen[$name]=1; echo "$name"; }
-        break
-      fi
-      dir=$(dirname "$dir")
-    done
-  done
-}
+# The crates a change reaches (changed_crates), and the workspace's packages by name.
+. scripts/lib/changed-crates.sh
 
 # The workspace crates depending on any of the given ones (directly or not, dev-
 # dependencies included: their tests must still compile), the given ones excluded.
@@ -111,13 +99,6 @@ dependents_of() {
 }
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
-
-# The workspace's packages, by name.
-workspace_packages() {
-  cargo metadata --no-deps --format-version 1 --offline \
-    | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
-    | tr -d '\r'
-}
 
 # Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
 # read without carriage returns: Windows writes them, and cargo rejects names with them.
@@ -440,7 +421,7 @@ case "$mode" in
       exit 2
     fi
     mapfile -t files < "$NRESE_FILES_FROM"
-    mapfile -t changed < <(crates_of "${files[@]}")
+    mapfile -t changed < <(changed_crates "${files[@]}")
     mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
