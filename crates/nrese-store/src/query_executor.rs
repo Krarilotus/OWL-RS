@@ -424,7 +424,8 @@ pub(crate) fn run_query(
     report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> String,
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(prepared, store, cancellation, memory);
-    let (query, ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
+    let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
+    crate::dl::query::certify_report(ql.as_mut(), &prepared.query);
     let context = report(ql.as_ref());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
@@ -630,7 +631,9 @@ pub(crate) fn explain_prepared(
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<Explanation> {
     let options = query_options(prepared, store, cancellation, memory);
-    Ok(explain_query(view, &prepared.query, &options)?)
+    let mut explanation = explain_query(view, &prepared.query, &options)?;
+    crate::dl::query::certify_report(explanation.ql.as_mut(), &prepared.query);
+    Ok(explanation)
 }
 
 /// The plan `prepared` would run as on `view`, with estimated rows, without running it
@@ -643,7 +646,9 @@ pub(crate) fn plan_prepared(
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<PlannedQuery> {
     let options = query_options(prepared, store, cancellation, memory);
-    Ok(plan_query(view, &prepared.query, &options)?)
+    let mut planned = plan_query(view, &prepared.query, &options)?;
+    crate::dl::query::certify_report(planned.ql.as_mut(), &prepared.query);
+    Ok(planned)
 }
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from

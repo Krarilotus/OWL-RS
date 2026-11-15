@@ -258,56 +258,49 @@ impl Status {
 pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
     let analysis = analyse(prepared.query());
     let mut completeness = plan_status_built(store, prepared, &analysis).completeness;
-    certify(&mut completeness, &analysis);
+    certify(&mut completeness, prepared.query(), "dl", true);
     completeness
 }
 
 /// Why a read [`denied`] names may miss rows.
-const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocabulary that                       no closure, rewriting or bound holds in full";
+const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocabulary that \
+                      no closure, rewriting or bound holds in full";
 
-/// The hazards that hold of `analysis` whatever path decided its status, composed last
-/// onto it by both entry points ([`plan_status`], [`answer`]): each only lowers what the
-/// status asserts, so no earlier return can claim more than they allow. The bounds decide
-/// what the query reads ([`unbounded`]); its status is the one rule of every path
-/// ([`denied`]).
-fn certify(completeness: &mut Completeness, analysis: &Analysis) {
-    if let Some((why, sound)) = reflexive_same_as(analysis) {
-        if sound {
-            completeness.incomplete("dl", why);
-        } else {
-            completeness.unsound("dl", why);
-        }
-    }
-    if let Some(what) = &analysis.denied {
-        completeness.incomplete("dl", format!("the query reads {what}: {DENIED}"));
-    }
-    if let Some(op) = analysis.not_monotone
-        && !completeness.complete
-    {
-        completeness.unsound(
-            "dl",
-            format!(
-                "the query uses {op} over an uncertified lower bound: answers may not be certain"
-            ),
-        );
-    }
-}
-
-/// [`certify`] for answers over a ruleset's closure without the bounds, with or without
-/// the QL rewriting, under an OWL 2 regime (under `rdfs` and `custom` the regime is the
-/// closure's own: what it lacks isn't entailed). A read [`denied`] names misses rows; and
-/// where rows may be missing, an operator that can turn a missing row into a wrong one
-/// makes the answers unsound. Each from `source`.
+/// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
+/// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
+/// closure, with or without the QL rewriting): each step only lowers what the status
+/// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
+/// entailed. A read [`denied`] names misses rows; and where rows may be missing, an
+/// operator under which a missing row can make a returned one wrong ([`negation`]) makes
+/// the answers unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
     query: &Query,
     source: &'static str,
 ) {
+    certify(completeness, query, source, false);
+}
+
+/// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN, plan):
+/// [`denied`] composed onto it, so it never says `complete` for a denied read. Its
+/// documented values stay `complete` and `sound-only`: the operators are the answer
+/// status's ([`certify_closure`]).
+pub(crate) fn certify_report(ql: Option<&mut nrese_sparql::ql::QlReport>, query: &Query) {
+    if let Some(ql) = ql
+        && let Some(what) = denied(query, false)
+    {
+        ql.completeness
+            .incomplete("ql", format!("the query reads {what}: {DENIED}"));
+    }
+}
+
+/// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
+fn certify(completeness: &mut Completeness, query: &Query, source: &'static str, bounds: bool) {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         return;
     }
-    if let Some(what) = denied(query) {
+    if let Some(what) = denied(query, bounds) {
         completeness.incomplete(source, format!("the query reads {what}: {DENIED}"));
     }
     if let Some(op) = negation(query)
@@ -336,8 +329,11 @@ fn plan_status_built(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
-    // Answered over L alone; [`certify`] says what that misses.
-    if reflexive_same_as(analysis).is_some() {
+    if let Some(what) = absent_same_as(prepared.query(), &snapshot) {
+        return Status::sound_only(format!("the query reads {what}: {DENIED}"));
+    }
+    // Answered over L alone; [`certify_closure`] says what that misses.
+    if analysis.reflexive_same_as {
         return Status::complete();
     }
     if closed(analysis, &view, &snapshot) {
@@ -367,7 +363,7 @@ pub(crate) fn answer(
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
-            certify(status, &analysis)
+            certify(status, prepared.query(), "dl", true)
         }
     }
     let status = match &outcome {
@@ -468,8 +464,12 @@ fn decide_answers(
         ));
         return Ok(status.stream(lower_view(&view)));
     }
-    // Answered over L alone; [`certify`] says what that misses.
-    if reflexive_same_as(analysis).is_some() {
+    if let Some(what) = absent_same_as(prepared.query(), &snapshot) {
+        status.add(format!("the query reads {what}: {DENIED}"));
+        return Ok(status.stream(lower_view(&view)));
+    }
+    // Answered over L alone; [`certify_closure`] says what that misses.
+    if analysis.reflexive_same_as {
         return Ok(status.stream(lower_view(&view)));
     }
     if closed(analysis, &view, &snapshot) {
