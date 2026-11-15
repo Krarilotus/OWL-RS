@@ -747,15 +747,17 @@ fn owl2_rl_calls_no_answer_a_key_on_an_undeclared_property_misses_complete() {
 /// A max cardinality in plain Turtle (`1`, an xsd:integer): at most one `:p` equates `:x`
 /// and `:y` (OWL 2 Direct Semantics), but the owl2-rl rules read only the mapping's
 /// spelling (`"1"^^xsd:nonNegativeInteger`). Its `false` must not be labelled complete at
-/// any place, as the key's.
+/// any place, as the key's: neither the equality's nor that of `:y :q :z`, which follows
+/// from it and reads no equality.
 #[test]
 fn owl2_rl_calls_no_answer_a_plain_max_cardinality_misses_complete() {
-    no_place_complete(
-        ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+    let data = ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
            owl:maxCardinality 1 ] . \
-         :p a owl:ObjectProperty . :c a :C ; :p :x , :y .",
-        "ASK { :x owl:sameAs :y }",
-    );
+         :p a owl:ObjectProperty . :q a owl:ObjectProperty . \
+         :c a :C ; :p :x , :y . :x :q :z .";
+    for read in ["ASK { :x owl:sameAs :y }", "ASK { :y :q :z }"] {
+        no_place_complete(data, read);
+    }
 }
 
 /// The key's case, `:ssn` declared by `declaration`: see [`no_place_complete`].
