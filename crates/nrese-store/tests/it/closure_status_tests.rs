@@ -727,20 +727,42 @@ fn owl2_dl_same_as_of_a_term_the_upper_bound_doesnt_type_is_never_complete() {
 }
 
 /// A key on one data value in two lexical forms (`1` and `"01"` as xsd:integer) equates
-/// `:a` and `:b` (OWL 2 Direct Semantics, HasKey), so `:b :p :x` is entailed; the owl2-rl
-/// closure matches literals by term and lacks it. Its `false` must not be labelled
-/// complete, with the rewriting or without; each status is printed.
+/// `:a` and `:b` (OWL 2 Direct Semantics, HasKey), so `:b :p :x` is entailed. The owl2-rl
+/// closure lacks it: the rule set leaves out dt-eq. Its `false` must not be labelled
+/// complete at any place the read reaches (run, plan, and the rewriting's report in both),
+/// with the rewriting on or not; that the other places give the same value is
+/// [`every_place_gives_a_query_the_answers_status`]'s. Each status is printed.
 #[test]
 fn owl2_rl_calls_no_answer_a_key_misses_by_term_complete() {
     let data = ":Person owl:hasKey ( :ssn ) . :ssn a owl:DatatypeProperty . \
                 :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
                 :b a :Person ; :ssn \"01\"^^xsd:integer .";
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :b :p :x }}"));
+    let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-        let (text, status) = answer(&closure(data, Ruleset::Owl2Rl, ql), "ASK { :b :p :x }");
-        eprintln!("owl2-rl, rewriting {ql:?}: {text} {status:?}");
-        if text.contains("false") && status.contains(&"complete") {
-            wrong.push(format!("rewriting {ql:?}: {text} {status:?}"));
+        let store = closure(data, Ruleset::Owl2Rl, ql);
+        let run = store.execute_query(&request).expect("answered");
+        let prepared = store.prepare_query(&request).expect("prepared");
+        let planned = store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("planned");
+        let text = String::from_utf8_lossy(&run.payload).into_owned();
+        let places = [
+            ("run", run.completeness.as_ref()),
+            ("ql", run.ql.as_ref().map(|r| &r.completeness)),
+            ("plan", planned.completeness.as_ref()),
+            ("plan's ql", planned.ql.as_ref().map(|r| &r.completeness)),
+        ];
+        let line = format!(
+            "rewriting {ql:?}: {text} {:?}",
+            places.map(|(p, c)| (p, name(c)))
+        );
+        eprintln!("{line}");
+        let complete = places.iter().any(|(_, c)| name(*c) == "complete");
+        // With the rewriting on, its report is one of the places.
+        if !text.contains("false") || complete || (ql == QlRewritingMode::On && run.ql.is_none()) {
+            wrong.push(line);
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

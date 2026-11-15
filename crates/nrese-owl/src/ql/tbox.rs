@@ -170,6 +170,12 @@ impl Tbox {
                 _ => None,
             });
         }
+        // Over RL's closure, an axiom that compares data values: its conclusions may be
+        // missing for any term, named individuals included.
+        if closure.lists && tbox.hazards.global.is_none() {
+            tbox.hazards.global =
+                super::hazards::reads_data_values(ontology).map(Hazard::DataValues);
+        }
         tbox.rewritable = tbox.rewritable_terms();
         tbox
     }
