@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 728" width="720" height="728" role="img" aria-labelledby="title desc">
 <!-- The light and dark variants of this drawing differ only in <style>. -->
 <title id="title">How NRESE fits together</title>
-<desc id="desc">Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write goes through one commit: the reasoner infers and checks consistency, SHACL validates when its gate is on, and under owl2-dl the OWL 2 DL engines check it too. If a check fails, the write is refused with the reason. Otherwise storage keeps asserted and inferred statements apart in one new revision, logged to the data directory. A query runs on a snapshot, under owl2-dl the DL engines prove answers, and the answer comes back with a status that says whether rows may be missing.</desc>
+<desc id="desc">Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write is one commit, refused whole if a check fails: the reasoner infers and checks consistency, SHACL validates when its gate is on, and under owl2-dl the OWL 2 DL engines check it too. The commit writes asserted and inferred statements, kept apart, as one revision. A query never waits for a write: it reads a snapshot, under owl2-dl the DL engines prove answers, and its status says whether rows may be missing. Storage is in memory, or on disk, where the data directory holds the log and checkpoints. Each arrow points from the part that calls to the part it calls.</desc>
 <style>
   text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #E6EDF3; }
   .panel { fill: #161B22; }
@@ -44,16 +44,12 @@
 <path class="a a-tell" d="M264 72 V186" marker-end="url(#h-tell)"/>
 <text x="276" y="102" class="w-tell">tell</text>
 <text x="276" y="120" class="lbl">SPARQL Update, Graph Store</text>
-<path class="a a-refuse" d="M96 188 V74" marker-end="url(#h-refuse)"/>
-<text x="108" y="102" class="w-refuse">refused</text>
-<text x="108" y="120" class="lbl">with the reason</text>
-<path class="a a-ask" d="M496 72 V186" marker-end="url(#h-ask)"/>
-<path class="a a-ask" d="M520 188 V74" marker-end="url(#h-ask)"/>
-<text x="534" y="102" class="w-ask">ask</text>
-<text x="534" y="120" class="lbl">answer, with its status</text>
+<path class="a a-ask" d="M528 72 V186" marker-end="url(#h-ask)"/>
+<text x="540" y="102" class="w-ask">ask</text>
+<text x="540" y="120" class="lbl">SPARQL query</text>
 <rect class="commit" x="48" y="188" width="288" height="196" rx="10"/>
 <text x="68" y="216" class="t">Commit</text>
-<text x="68" y="236" class="d">one write, all or nothing</text>
+<text x="68" y="236" class="d">one write, refused whole if a check fails</text>
 <rect class="commit-chip" x="68" y="252" width="248" height="54" rx="6"/>
 <text x="84" y="275" class="n">Reasoner</text>
 <text x="84" y="294" class="d">infers, checks consistency</text>
@@ -62,7 +58,7 @@
 <text x="84" y="358" class="d">validates, when the gate is on</text>
 <rect class="query" x="384" y="188" width="288" height="196" rx="10"/>
 <text x="404" y="216" class="t">Query</text>
-<text x="404" y="236" class="d">on a snapshot, never waits for a write</text>
+<text x="404" y="236" class="d">never waits for a write</text>
 <rect class="query-chip" x="404" y="252" width="248" height="54" rx="6"/>
 <text x="420" y="275" class="n">SPARQL</text>
 <text x="420" y="294" class="d">evaluates the query</text>
@@ -70,24 +66,29 @@
 <text x="420" y="339" class="n">Status</text>
 <text x="420" y="358" class="d">says whether rows may be missing</text>
 <path class="a a-tell" d="M264 384 V422" marker-end="url(#h-tell)"/>
+<text x="256" y="408" class="lbl" text-anchor="end">checks the write</text>
 <path class="a a-ask" d="M456 384 V422" marker-end="url(#h-ask)"/>
+<text x="464" y="408" class="lbl">proves answers</text>
 <rect class="box" x="192" y="424" width="336" height="56" rx="8"/>
 <text x="360" y="448" class="n" text-anchor="middle">OWL 2 DL engines</text>
-<text x="360" y="467" class="d" text-anchor="middle">under owl2-dl: check writes, prove answers</text>
+<text x="360" y="467" class="d" text-anchor="middle">used under owl2-dl</text>
 <path class="a a-tell" d="M120 384 V506" marker-end="url(#h-tell)"/>
-<path class="a a-ask" d="M600 508 V386" marker-end="url(#h-ask)"/>
+<text x="112" y="450" class="lbl" text-anchor="end">writes</text>
+<path class="a a-ask" d="M640 384 V506" marker-end="url(#h-ask)"/>
+<text x="632" y="499" class="lbl" text-anchor="end">reads a snapshot</text>
 <rect class="box" x="48" y="508" width="624" height="76" rx="8"/>
 <text x="68" y="538" class="t">Storage</text>
 <text x="68" y="559" class="d">one revision per commit,</text>
-<text x="68" y="575" class="d">a snapshot for each reader</text>
+<text x="68" y="575" class="d">in memory or on disk</text>
 <rect class="asserted" x="320" y="522" width="160" height="48" rx="6"/>
 <text x="400" y="551" class="n" text-anchor="middle">asserted</text>
 <rect class="inferred" x="492" y="522" width="160" height="48" rx="6"/>
 <text x="572" y="551" class="n" text-anchor="middle">inferred</text>
 <path class="a a-ink" d="M360 584 V642" marker-end="url(#h-ink)"/>
-<text x="372" y="634" class="lbl">on disk</text>
 <path class="box" d="M230 652 a130 10 0 0 1 260 0 v52 a130 10 0 0 1 -260 0 z"/>
 <path class="box" d="M230 652 a130 10 0 0 0 260 0" fill="none"/>
 <text x="360" y="682" class="n" text-anchor="middle">Data directory</text>
-<text x="360" y="700" class="d" text-anchor="middle">write-ahead log, checkpoints</text>
+<text x="360" y="700" class="d" text-anchor="middle">on-disk mode: log, checkpoints</text>
+<text x="36" y="690" class="lbl">An arrow points from the part</text>
+<text x="36" y="708" class="lbl">that calls to the part it calls.</text>
 </svg>
