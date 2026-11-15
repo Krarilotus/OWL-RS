@@ -14,7 +14,7 @@ reason, beside its runner.
 
 | Standard | What NRESE does | Tests |
 |---|---|---|
-| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/), [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | All of it, with the [deviations listed](limits.md#sparql) | 505 W3C tests, no known failure ([runner](../crates/nrese-sparql/tests/w3c_sparql11)) |
+| [SPARQL 1.1](https://www.w3.org/TR/sparql11-overview/) [Query](https://www.w3.org/TR/sparql11-query/), [Update](https://www.w3.org/TR/sparql11-update/), [Federated Query](https://www.w3.org/TR/sparql11-federated-query/) | All of it but Update's `LOAD`, with the [deviations listed](limits.md#sparql) | 505 W3C tests, no known failure ([runner](../crates/nrese-sparql/tests/w3c_sparql11)) |
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), [Service Description](https://www.w3.org/TR/sparql11-service-description/) | Served at `/dataset/…` ([HTTP interface](ops/http-api.md)) | Our own ([protocol](../crates/nrese-server/tests/it/query_protocol_tests.rs), [Graph Store](../crates/nrese-server/tests/it/graph_store_api_tests.rs)) |
 | Results as [JSON](https://www.w3.org/TR/sparql11-results-json/), [XML](https://www.w3.org/TR/rdf-sparql-XMLres/), [CSV and TSV](https://www.w3.org/TR/sparql11-results-csv-tsv/) | Written, and read but for CSV | The SPARQL suites read JSON, XML and TSV and check the CSV writer, and [round trips](../crates/rdf/nrese-sparql-results/tests/round_trip_tests.rs) check the others |
 | [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | Read and written, RDF 1.1 and the RDF 1.2 drafts | RDF 1.1 and 1.2 syntax suites, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf) |
@@ -67,7 +67,7 @@ the W3C tests of each profile are under [standards](#standards).
 | Mode | Follows |
 |---|---|
 | `disabled` (the default) | No reasoning |
-| `rdfs` | Six rules of [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/), for domain, range, sub-class and sub-property |
+| `rdfs` | The [RDFS entailment rules](https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative) rdfs2, rdfs3, rdfs5, rdfs7, rdfs9 and rdfs11: domain, range, sub-class and sub-property |
 | `rdfs-full` | The RDFS entailment rules and axioms of [RDF 1.1 Semantics](https://www.w3.org/TR/rdf11-mt/), but the few the contract lists |
 | `rdfs-plus`, `owl-horst` | RDFS plus equality and inverse, symmetric, transitive and functional properties, and for `owl-horst` also `hasValue`, `someValuesFrom` and `allValuesFrom` |
 | `owl2-ql` | The [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) rules, and answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)). A query with a dataset of its own doesn't get the rewriting, so its answers say `sound-only` |
