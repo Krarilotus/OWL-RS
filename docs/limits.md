@@ -74,8 +74,8 @@ planned.
   ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset), [modes](spec/reasoning-semantics.md#modes)).
 - `owl2-rl` doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
   return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  Lists past their limits (a property chain or key of more than 250 properties, more than
-  64 member sequences) aren't used at all, never truncated, and each is reported in the log
+  Lists past their limits (a property chain of more than 250 properties, a key of more
+  than 127, more than 64 member sequences) aren't used at all, never truncated, and each is reported in the log
   and the reasoning diagnostics
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
   keeping lists within those limits. Literals aren't
