@@ -89,6 +89,11 @@ pub struct Ontology {
     pub anonymous: BTreeSet<Term>,
     /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
     pub rules: Vec<crate::rules::Rule>,
+    /// The first restriction whose cardinality isn't written as the RDF mapping writes it,
+    /// `"n"^^xsd:nonNegativeInteger` with `n` canonical (`1`, not `01`; Turtle's `1` is an
+    /// xsd:integer): read here by its value, but OWL 2 RL's rules (cls-maxc1/2,
+    /// cls-maxqc1-4) name the mapping's literal, so they don't read it.
+    pub noncanonical_cardinality: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -382,6 +387,7 @@ struct Reader<'a> {
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<(Term, &'static str)>,
     annotations: usize,
+    noncanonical_cardinality: Option<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -467,6 +473,7 @@ impl<'a> Reader<'a> {
             diagnostics: Vec::new(),
             reported: HashSet::new(),
             annotations: 0,
+            noncanonical_cardinality: None,
         }
     }
 
@@ -778,15 +785,21 @@ impl<'a> Reader<'a> {
         let data = self.kind(property) == TermKind::Iri && self.is_data_property(property);
         let number = |reader: &mut Self, predicate: Option<Term>| -> Option<Option<u32>> {
             let literal = reader.one(node, predicate)?;
-            let parsed = reader
-                .terms
-                .lexical(literal)
-                .and_then(|text| text.trim().parse::<u32>().ok());
+            let text = reader.terms.lexical(literal);
+            let parsed = text.as_deref().and_then(|t| t.trim().parse::<u32>().ok());
             if parsed.is_none() {
                 reader.report(Diagnostic::Malformed {
                     node,
                     what: "a cardinality that isn't a non-negative integer",
                 });
+            }
+            // The source may not give the datatype: then the lexical form alone decides.
+            let datatype = reader.terms.datatype(literal);
+            let mapped = parsed.is_some_and(|n| text == Some(n.to_string()))
+                && datatype
+                    .is_none_or(|d| d == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger");
+            if !mapped {
+                reader.noncanonical_cardinality.get_or_insert(node);
             }
             Some(parsed)
         };
@@ -1433,6 +1446,7 @@ impl<'a> Reader<'a> {
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
             rules: Vec::new(),
+            noncanonical_cardinality: self.noncanonical_cardinality,
         };
         complete(&mut ontology, self.terms);
         ontology
