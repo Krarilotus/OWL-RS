@@ -826,6 +826,25 @@ pub fn signature(o: &Ontology) -> Signature {
     s
 }
 
+/// The names `o` puns (OWL 2 Structural Specification §5.9): each read both as a named
+/// individual and as a class or a property ([`Signature::names`]). Theorem PR1 (OWL 2
+/// Profiles §4.3) needs none, and an equality the RL rules carry to such a name (eq-rep-p,
+/// eq-rep-o) equates the class or property, which the Direct Semantics doesn't. Sorted.
+pub fn punned(o: &Ontology) -> Vec<Term> {
+    let names = signature(o).names;
+    let mut punned = o.named_individuals();
+    punned.retain(|t| names.contains(t));
+    punned
+}
+
+/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
+/// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
+/// theorem PR1 (OWL 2 Profiles §4.3) excludes. The one detection the route, the answers'
+/// status and the consistency verdicts take.
+pub fn rules_read_differently(o: &Ontology) -> bool {
+    !o.annotation_schema.is_empty() || !punned(o).is_empty()
+}
+
 /// The profiles every axiom of `o` is in.
 pub fn of_ontology(o: &Ontology) -> Profiles {
     o.axioms
