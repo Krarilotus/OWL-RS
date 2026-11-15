@@ -147,7 +147,7 @@ becomes visible:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/commit-dark.svg">
-  <img src="img/commit-light.svg" width="580" alt="A write is planned under the single writer slot on a snapshot. The reasoner infers and checks consistency, with the DL engines under owl2-dl, and SHACL validates when its gate is on. A failed check or a timeout refuses the write and nothing is committed; otherwise the asserted and inferred changes are logged and published as one revision, seen whole by every query.">
+  <img src="img/commit-light.svg" width="604" alt="A write is planned under the single writer slot on a snapshot; a write that is invalid, not allowed or too big is refused there. When reasoning is on, the reasoner derives the inferences and checks consistency, with the DL engines under owl2-dl; an inconsistent write is refused. When the SHACL gate is on, the shapes validate what the change can affect; under enforce a violation refuses the write. A timeout before Publish refuses it too. A refused write commits nothing, and the response says why. Otherwise the asserted and inferred changes are published as one revision, logged first in on-disk mode, and every query that starts after sees all of it.">
 </picture>
 
 The two checks:
@@ -159,10 +159,11 @@ The two checks:
    statements included. Only what the commit introduces counts, so data that was invalid before
    doesn't block it.
 
-If a check refuses the write, or the request times out, nothing of the request is committed,
-neither an asserted statement nor an inference, and the response says why. Otherwise the
-asserted and the inferred changes are written to the log (synced, on disk) and published
-together as one revision, so a query sees all of the commit or none of it. When you delete a
+If a check refuses the write, or the request times out before publishing starts, nothing
+of the request is committed, neither an asserted statement nor an inference, and the response
+says why. Otherwise the asserted and the inferred changes are published together as one
+revision, in on-disk mode after they are written to the log and synced, so a query sees all of
+the commit or none of it. When you delete a
 statement, its inferences go in the same commit, unless they still follow from what remains.
 The gate's result isn't stored (`report` logs it), and `GET /dataset/shacl` validates the
 current data on request.
