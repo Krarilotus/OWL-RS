@@ -1,79 +1,84 @@
 # NRESE
 
-An [RDF](https://www.w3.org/TR/rdf11-primer/) store with built-in
-[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust.
-It runs as one server binary with a browser console, or as a set of Rust crates. A hobby project, developed in
-the open; not yet for parallel writers, failover or data split across machines
-([limits, and when to choose another system](docs/limits.md)). These pages describe the code of the commit they
-are in, package version 1.5.0; the release is the commit tagged `v1.5.0`.
+NRESE is an [RDF](https://www.w3.org/TR/rdf11-primer/) database with
+[OWL](https://www.w3.org/TR/owl2-primer/) reasoning, written in Rust, for data you query
+together with its ontology. It runs as one server with SPARQL endpoints and a browser console.
 
-To try it: [Quick start](#quick-start), below. What is in, what is left out and what is
-planned: [scope](docs/what-it-covers.md#scope); how it works: [How it is built](#how-it-is-built).
+What it does that is its own:
 
-NRESE stores RDF datasets (statements: subject,
-predicate, object) and answers [SPARQL 1.1](https://www.w3.org/TR/sparql11-query/) queries
-and updates. Given an [ontology](docs/glossary.md#ontology), it derives the statements that
-follow from the stored (asserted) ones and keeps these inferred statements up to date on
-every commit (a write, applied whole or not at all), so you query them like asserted ones.
-Reasoning goes from [RDFS](https://www.w3.org/TR/rdf11-schema/) to
-OWL 2 DL; in the OWL 2 QL, RL and DL
-[profiles](docs/glossary.md#reasoning-mode-profile) a commit shown to make the data
-inconsistent is rejected, with the reason (under OWL 2 DL a check that can't decide lets it through and says so). Every SPARQL answer carries a status that says what it promises
-(complete, or sound with rows possibly missing, and why) and warns where it can promise
-neither. [SHACL](https://www.w3.org/TR/shacl/) validation, full-text and vector search,
-graph-level access control and the SPARQL, Graph Store and RDF4J protocols are built in.
+- **Reasoning is part of the write.** With reasoning on, the statements your chosen rules
+  derive from a write are computed in the write's own transaction and committed with it, as
+  one revision. A bulk load recomputes them after loading instead.
+- **Writes are checked before they commit.** Under OWL 2 QL, RL and DL, a write that fails
+  a consistency check is refused, and nothing of it is committed. With the SHACL gate set to
+  `enforce`, so is a write that introduces a shape violation.
+- **Each answer says whether it is complete.** Every SPARQL query answer over HTTP has an
+  `NRESE-Completeness` header: `complete`, or a status saying rows may be missing, with the
+  reasons where the store knows them.
+- **OWL 2 DL engines of its own.** In the `owl2-dl` mode, a hypertableau and a
+  consequence-based engine check writes for consistency, classify the ontology, and add the
+  query answers they can prove beyond what the rules derive.
 
-It may suit you if you:
+A hobby project. Try it: [quick start](#quick-start). When to choose another system:
+[limits](docs/limits.md).
 
-- query data together with its ontology and want the inferences to follow every change;
-- need to know when an answer under OWL reasoning may be missing rows;
-- want a store you can read and take apart: small crates in clear layers.
+## How a write becomes queryable
+
+Where inferred statements come from, and when a query sees them (reasoning on):
+
+```mermaid
+flowchart TD
+  W["<b>Write</b><br/>a SPARQL update, a Graph Store write,<br/>or the commit of a client transaction"]
+  P["<b>Plan</b><br/>the statements to insert and delete,<br/>against the latest revision"]
+  R["<b>Reason</b><br/>the rules derive the inferred statements<br/>the change adds or removes, and run<br/>their consistency checks; under owl2-dl,<br/>by default, the DL engines check too"]
+  S["<b>Validate</b><br/>with the SHACL gate on, shapes check<br/>the nodes the change can affect,<br/>inferred statements included"]
+  C["<b>Commit</b><br/>both changes go to the log<br/>(synced, on disk) and are published<br/>as one new revision"]
+  X["<b>Refused</b><br/>nothing of the write is committed"]
+  subgraph REV["New revision"]
+    A[("asserted<br/>statements")]
+    I[("inferred<br/>statements")]
+  end
+  Q["<b>Query</b><br/>reads both together (default),<br/>or one of them alone"]
+  H["<b>Answer</b><br/>the rows, and the NRESE-Completeness<br/>header"]
+  W --> P --> R --> S --> C
+  R -- "a consistency check fails" --> X
+  S -- "a shape is violated (enforce)" --> X
+  C --> A
+  C --> I
+  A --> Q
+  I --> Q
+  Q --> H
+  classDef refused stroke-dasharray: 6 4
+  class X refused
+```
+
+Dashed: where a write ends without a commit; a write that times out before its commit ends
+there too. One write runs at a time; until it commits, queries read the revision before it.
+The steps in detail: [what a commit does](docs/what-it-covers.md#what-a-commit-does).
+
+## What you can choose
+
+| Feature | What it does | How you set or use it (default in **bold**) |
+|---|---|---|
+| [Reasoning](docs/what-it-covers.md#reasoning) | Derives statements from your data and ontology | `NRESE_REASONING_MODE`: **`disabled`**, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl`; or `custom`, your own rules in Notation3 or `.pie`, which can also be added to any other mode but `disabled` |
+| [Inferred statements](docs/ops/http-api.md#queries) | Kept apart from asserted ones, updated in each write's commit; a bulk load recomputes them afterwards | A query reads **both**, asserted only (`infer=false`), or inferred only (`FROM <http://www.ontotext.com/implicit>`) |
+| [Consistency](docs/what-it-covers.md#what-a-commit-does) | Under `owl2-ql`, `owl2-rl` and `owl2-dl`, refuses a write that fails a consistency check | Under `owl2-dl`, `NRESE_DL_CONSISTENCY`: **`inline`** or `off`. A DL check that can't decide lets the write through, and the store's status says so |
+| [Answer status](docs/what-it-covers.md#what-an-answer-promises) | `NRESE-Completeness` on every SPARQL query answer over HTTP: `complete`, `sound-only`, `unsound` or `not-certified` | Under `owl2-dl`, `dl-answers=exact` turns an answer that can't be proven complete into an error (422) |
+| [Explanations](docs/ops/http-api.md#engine-api-apiv1) | Why a statement holds: the rules and premises that derive it | `GET /api/v1/repositories/{id}/explain` |
+| [SHACL](docs/what-it-covers.md#shacl) | SHACL Core and SHACL-SPARQL, inferred statements included | On request: `/dataset/shacl`. On each write, `NRESE_SHACL_GATE`: **`off`**, `report` or `enforce` |
+| [Named graphs](docs/what-it-covers.md#reasoning) | Statements live in named graphs or the default graph; rules read every graph and put inferences in the default graph | The default graph of a query, `NRESE_DEFAULT_GRAPH`: **`default`**, or `union` of all graphs |
+| [Search](docs/what-it-covers.md#sparql) | Full-text (BM25), vector, and in part GeoSPARQL, inside SPARQL queries | Vectors are literals you supply; the store computes no embeddings |
+| [Storage](docs/what-it-covers.md#storage-transactions-and-durability) | Its own engine: snapshots for readers, a write-ahead log, one writer at a time, read replicas | `NRESE_STORE_MODE`: **`in-memory`** or `on-disk` (the Docker image sets `on-disk`) |
+| [Access](docs/what-it-covers.md#access-control-and-operations) | Authentication, and access per named graph | `NRESE_AUTH_MODE`: **`none`**, `bearer-static`, `bearer-jwt`, `oidc-introspection` or `mtls` |
+| [Interfaces](docs/what-it-covers.md#interfaces) | SPARQL 1.1 Protocol, Graph Store Protocol, the RDF4J REST protocol (without `SNAPSHOT` and `SERIALIZABLE` isolation), an engine API described in OpenAPI | Several repositories per server, each with its own reasoning mode and rules |
 
 ## Quick start
 
-You need:
-
-- git ([install](https://git-scm.com/downloads));
-- Docker Engine 23 or later ([install](https://docs.docker.com/engine/install/)) or Docker
-  Desktop ([install](https://docs.docker.com/desktop/)): the build needs BuildKit, their
-  default builder;
-- curl 7.71 or later (`curl --version`; [download](https://curl.se/download.html));
-- for the build: an amd64 CPU of level [x86-64-v3](https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels)
-  (Intel from Haswell, 2013; AMD from Excavator, 2015), or an arm64 CPU
-  from Neoverse N1 on (AWS Graviton2, Ampere Altra); for an older one, add
-  `--build-arg NRESE_TARGET_CPU=portable` to `docker build`; and about 3 GB of free
-  memory and 3 GB of free disk, besides the base images Docker downloads;
-- port 8080 free on this machine.
-
-The commands on this page are for a POSIX shell: Linux, macOS, or Git Bash or WSL on Windows.
-In PowerShell, write a backtick for a `\` that ends a line, and in Windows PowerShell 5.1
-`curl.exe` for `curl` (there `curl` is `Invoke-WebRequest`). To check what you need first:
-
-```bash
-git --version
-docker version --format '{{.Server.Version}}'  # 23 or later; fails if the engine isn't running
-docker buildx version                          # BuildKit, which the build needs
-curl --version                                 # 7.71 or later
-docker info --format '{{.MemTotal}}'           # memory Docker can use, in bytes: at least 3 GB
-/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3  # optional: amd64 Linux, glibc 2.33 or later
-```
-
-The last line, on amd64 Linux with glibc 2.33 or later, says `supported` on an x86-64-v3 CPU. Where that
-loader is absent or older (musl, an older glibc, another system), skip it: it proves nothing about the CPU.
-
-Rust and Node.js aren't needed: the image builds the server and its console. The commands
-below fetch the code, build the [image](docs/glossary.md#image-container-volume) `nrese`
-and start it as the container `nrese`:
-
-- its data on disk (the image sets `NRESE_STORE_MODE=on-disk`; its other settings:
-  [container](docs/ops/server-setup.md#72-example-docker-run)), on the volume `nrese-data`,
-  so it outlives the container;
-- its port bound to this machine only, since no authentication is on (set
-  `NRESE_AUTH_MODE` before you expose it: [access control](docs/what-it-covers.md#access-control-and-operations));
-- reasoning under OWL 2 RL, and the [SHACL commit gate](docs/glossary.md#shape-shapes-graph-shacl-gate)
-  on, which the first answer below and the [tutorial](docs/tutorial.md) use.
-
-Other words these pages use: [glossary](docs/glossary.md).
+You need git, Docker with BuildKit, curl, and port 8080 free. Rust and Node.js aren't
+needed: the image builds the server and its console. The image's server needs an x86-64-v3
+CPU (amd64) or a Neoverse N1 level CPU (arm64); for an older one, add
+`--build-arg NRESE_TARGET_CPU=portable` to `docker build`. The commands are for a POSIX
+shell: Linux, macOS, or Git Bash or WSL on Windows.
 
 ```bash
 git clone https://github.com/Krarilotus/OWL-RS.git
@@ -81,42 +86,34 @@ cd OWL-RS
 docker build -t nrese .
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
   -e NRESE_REASONING_MODE=owl2-rl -e NRESE_SHACL_GATE=enforce nrese
-curl -sSf --max-time 5 --retry 60 --retry-delay 1 --retry-max-time 60 --retry-all-errors http://localhost:8080/readyz
+until curl -sf http://localhost:8080/readyz; do sleep 1; done
 ```
 
-- The build compiles the server: about 5 minutes on 16 cores, 7 on 12, longer on fewer.
-- The `curl` line waits for the server and prints `{"status":"ready"}`. It tries every
-  second, each try at most 5 s, and gives up with an error after 60 s. A `curl:` error
-  line before it is a try made before the server was up. A large store takes longer to
-  start: raise `--retry` and `--retry-max-time` to match.
-- If it never gets ready, `docker logs nrese` shows why ([startup errors](docs/ops/server-setup.md#startup-errors)).
-  If `docker run` says the port is already allocated, something else holds port 8080.
+The last line waits until the server answers `{"status":"ready"}`. If it never does,
+`docker logs nrese` shows the server's output ([startup errors](docs/ops/server-setup.md#startup-errors)).
 
-The browser console is at `http://localhost:8080/console`.
+The server keeps its data on the volume `nrese-data`, listens on this machine only, and has
+no authentication on. It reasons under OWL 2 RL, with the SHACL gate set to `enforce` for the
+[tutorial](docs/tutorial.md). The browser console is at `http://localhost:8080/console`.
 
 ### A first answer: inference
 
-Add a [class hierarchy and an instance](docs/glossary.md#class-instance-subclass), then ask
-for the instances of the superclass:
+Store that every cat is an animal, and that Tom is a cat. The update prints nothing:
 
 ```bash
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
   PREFIX ex: <http://example.org/>
   PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
   INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat }'
+```
 
+Ask for every animal:
+
+```bash
 curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
   PREFIX ex: <http://example.org/>
   SELECT ?x WHERE { ?x a ex:Animal }'
 ```
-
-The answer has `ex:tom`, because `ex:tom a ex:Animal` was inferred. The
-`NRESE-Completeness` header says `sound-only`: every row is entailed, and the rules are
-complete only for ontologies inside the OWL 2 RL profile, which isn't checked per query
-([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
-
-The answer: the [HTTP](docs/glossary.md#http-request-response-status) status and headers,
-then the rows as [JSON](docs/glossary.md#json):
 
 ```text
 HTTP/1.1 200 OK
@@ -126,12 +123,30 @@ nrese-completeness: sound-only; regime=owl2-rl; reasons="rules: answers over the
 {"head":{"vars":["x"]},"results":{"bindings":[{"x":{"type":"uri","value":"http://example.org/tom"}}]}}
 ```
 
-Other headers are left out here, and `…` marks shortened text: compare the status, the
-`regime` and the rows, as [the record of its last run](docs/dev/first-example-record.md) does.
+- `ex:tom` is in the answer because the update's commit also stored the inferred statement
+  `ex:tom a ex:Animal`.
+- `sound-only` says rows may be missing. The reason here: the answers come from the OWL 2 RL
+  rules, not from every answer OWL 2 DL entails
+  ([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
 
-`/dataset/query` takes queries only and never refuses a body for its media type; `/dataset/sparql`
-takes queries and updates on one URL and refuses a missing or unknown media type with `415`
-([endpoints](docs/ops/http-api.md#endpoint-contracts)).
+Ask again, for asserted statements only:
+
+```bash
+curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
+  PREFIX ex: <http://example.org/>
+  SELECT ?x WHERE { ?x a ex:Animal }' --data infer=false
+```
+
+```text
+HTTP/1.1 200 OK
+content-type: application/sparql-results+json
+nrese-completeness: complete
+
+{"head":{"vars":["x"]},"results":{"bindings":[]}}
+```
+
+No animal was asserted, so there are no rows. No reasoning was involved, so the answer is
+`complete`. In both outputs other headers are left out, and `…` marks shortened text.
 
 The [tutorial](docs/tutorial.md) goes on from here: retraction, validation,
 [your own data](docs/tutorial.md#your-own-data), a changed setting, and starting over.
