@@ -190,14 +190,18 @@ fn shape_of(query: &Query) -> Option<Shape> {
     })
 }
 
-/// What `query` reads, whether it is monotone, and its shape for the exact services.
-pub(crate) fn analyse(query: &Query) -> Analysis {
-    let pattern = match query {
+fn pattern_of(query: &Query) -> &GraphPattern {
+    match query {
         Query::Select { pattern, .. }
         | Query::Construct { pattern, .. }
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
-    };
+    }
+}
+
+/// What `query` reads, whether it is monotone, and its shape for the exact services.
+pub(crate) fn analyse(query: &Query) -> Analysis {
+    let pattern = pattern_of(query);
     let mut analysis = Analysis {
         shape: shape_of(query),
         answers: answer_variables(query),
@@ -249,14 +253,7 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                         }
                         None
                     }
-                    GraphPattern::LeftJoin { .. } => Some("OPTIONAL"),
-                    GraphPattern::Minus { .. } => Some("MINUS"),
-                    GraphPattern::Lateral { .. } => Some("LATERAL"),
-                    GraphPattern::Group { .. } => Some("an aggregate"),
-                    GraphPattern::Slice { .. } => Some("LIMIT or OFFSET"),
-                    GraphPattern::Graph { .. } => Some("GRAPH"),
-                    GraphPattern::Service { .. } => Some("SERVICE"),
-                    _ => None,
+                    _ => not_monotone(p),
                 };
                 if analysis.not_monotone.is_none() {
                     analysis.not_monotone = op;
@@ -272,6 +269,53 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
         false
     });
     analysis
+}
+
+/// The operator `p` is, where it isn't monotone (or isn't under entailment).
+fn not_monotone(p: &GraphPattern) -> Option<&'static str> {
+    match p {
+        GraphPattern::LeftJoin { .. } => Some("OPTIONAL"),
+        GraphPattern::Minus { .. } => Some("MINUS"),
+        GraphPattern::Lateral { .. } => Some("LATERAL"),
+        GraphPattern::Group { .. } => Some("an aggregate"),
+        GraphPattern::Slice { .. } => Some("LIMIT or OFFSET"),
+        GraphPattern::Graph { .. } => Some("GRAPH"),
+        GraphPattern::Service { .. } => Some("SERVICE"),
+        _ => None,
+    }
+}
+
+/// The first operator of `query` under which a missing row can make a returned one
+/// wrong: `EXISTS` and those [`not_monotone`] names but `GRAPH`, `SERVICE` and a slice
+/// of an unordered answer, which only drop rows or read no inference (nor does
+/// `DESCRIBE`). One walk that allocates nothing: every answer over a closure asks it.
+pub(super) fn negation(query: &Query) -> Option<&'static str> {
+    let mut found = None;
+    pattern_of(query).find(&mut |node| {
+        found = match node {
+            Node::Pattern(GraphPattern::Slice { inner, .. }) if !ordered(inner) => None,
+            Node::Pattern(GraphPattern::Graph { .. } | GraphPattern::Service { .. }) => None,
+            Node::Pattern(p) => not_monotone(p),
+            Node::Expression(nrese_sparql_syntax::algebra::Expression::Exists(_)) => Some("EXISTS"),
+            Node::Expression(_) => None,
+        };
+        found.is_some()
+    });
+    found
+}
+
+/// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
+/// first rows, which a missing row can change.
+fn ordered(mut pattern: &GraphPattern) -> bool {
+    loop {
+        match pattern {
+            GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner } => pattern = inner,
+            GraphPattern::OrderBy { .. } => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// The vocabulary the bounds don't cover: U1 bounds facts about individuals (class

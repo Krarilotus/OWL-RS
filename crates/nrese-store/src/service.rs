@@ -1181,7 +1181,8 @@ impl StoreService {
     /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
     /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
     /// rules' closure without the bounds (`Self::dl_mode`): sound only, never complete
-    /// (SYN-72 slice 2 r1 F1).
+    /// (SYN-72 slice 2 r1 F1). Either is unsound where a missing row can make a returned
+    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
@@ -1197,6 +1198,7 @@ impl StoreService {
                  bounds; certain answers under OWL 2 DL may be missing"
                     .to_owned(),
             );
+            crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
             return Some(status);
         }
         let ruleset = self
@@ -1216,6 +1218,7 @@ impl StoreService {
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
+        crate::dl::query::certify_closure(&mut status, prepared.query(), "rules");
         Some(status)
     }
 
@@ -1559,6 +1562,7 @@ impl StoreService {
                          over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
+                            crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
                             Some(status)
                         }
                         false => ql

@@ -67,7 +67,7 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 
 #### Completeness
 
-W3C states the conditions under which the RL/RDF rules are complete for OWL 2 RL ontologies. Datasets labelled EL, QL or DL are reasoned with these RL rules, and results are RL entailments, not EL/QL/DL reasoning: an answer over a ruleset's closure where the QL rewriting doesn't run carries the status `sound-only` (the `nrese-completeness` header) with the ruleset's regime, saying it is the closure's: the rules are complete for the ontologies of their profile, which isn't checked per query. Where the rewriting runs (by default under `owl2-ql`; under `owl2-rl` with `ql_rewriting = "on"`), each query is checked, and its answers may be `complete` (below). `owl2-dl` gives certain answers under OWL 2 DL.
+W3C states the conditions under which the RL/RDF rules are complete for OWL 2 RL ontologies. Datasets labelled EL, QL or DL are reasoned with these RL rules, and results are RL entailments, not EL/QL/DL reasoning: an answer over a ruleset's closure where the QL rewriting doesn't run carries the status `sound-only` (the `nrese-completeness` header; `unsound` under an operator that isn't monotone) with the ruleset's regime, saying it is the closure's: the rules are complete for the ontologies of their profile, which isn't checked per query. Where the rewriting runs (by default under `owl2-ql`; under `owl2-rl` with `ql_rewriting = "on"`), each query is checked, and its answers may be `complete` (below). `owl2-dl` gives certain answers under OWL 2 DL.
 
 #### What `complete` refers to
 

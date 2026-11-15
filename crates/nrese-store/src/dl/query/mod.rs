@@ -285,6 +285,25 @@ fn certify(completeness: &mut Completeness, analysis: &Analysis) {
     }
 }
 
+/// [`certify`] for answers over a ruleset's closure without the bounds, which may miss
+/// rows (`completeness` says so): under an operator that can turn a missing row into a
+/// wrong one they are unsound too, from `source`. Its reflexive `owl:sameAs` part says
+/// nothing more of answers that are incomplete already.
+pub(crate) fn certify_closure(
+    completeness: &mut Completeness,
+    query: &Query,
+    source: &'static str,
+) {
+    if let Some(op) = negation(query)
+        && !completeness.complete
+    {
+        completeness.unsound(
+            source,
+            format!("the query uses {op} over answers that may be missing: a row may be wrong"),
+        );
+    }
+}
+
 fn plan_status_built(
     store: &StoreService,
     prepared: &PreparedQuery,
