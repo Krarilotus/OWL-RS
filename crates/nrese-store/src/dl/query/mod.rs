@@ -325,11 +325,18 @@ pub(crate) fn certify_closure(
     }
 }
 
-/// `x rdf:type owl:Thing` on the RL route, where L is the RL closure and nothing bounds
-/// it: the closure has it only for members of declared classes. Off that route U1 holds
-/// it and the bounds decide it.
-fn thing_on_the_rl_route(status: &mut Status, analysis: &Analysis, view: &View) {
-    if view.rules && analysis.universal == Some(THING) {
+/// `x rdf:type owl:Thing` where no bound holds it: on the RL route, where L is the RL
+/// closure, which has it only for members of declared classes; off it, for an `x` U1
+/// doesn't type ([`thing_covered`], read in `snapshot`, the bounds' own). Elsewhere the
+/// bounds decide it.
+fn thing_unbounded(
+    status: &mut Status,
+    analysis: &Analysis,
+    query: &Query,
+    view: &View,
+    snapshot: &Snapshot,
+) {
+    if analysis.universal == Some(THING) && (view.rules || !thing_covered(query, snapshot)) {
         status.add(format!("the query reads {THING}: {UNIVERSAL}"));
     }
 }
@@ -357,7 +364,7 @@ fn plan_status_built(
     if closed(analysis, &view, &snapshot) {
         let mut status = Status::complete();
         status.path("closed-predicates");
-        thing_on_the_rl_route(&mut status, analysis, &view);
+        thing_unbounded(&mut status, analysis, prepared.query(), &view, &snapshot);
         return status;
     }
     Status::sound_only(
@@ -456,7 +463,7 @@ fn decide_answers(
     }
     let (snapshot, view) = super::bounds::view(store);
     let mut status = Status::complete();
-    thing_on_the_rl_route(&mut status, analysis, &view);
+    thing_unbounded(&mut status, analysis, prepared.query(), &view, &snapshot);
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
     cancellation.check()?;
     match consistency {
