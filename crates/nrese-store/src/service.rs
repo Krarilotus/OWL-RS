@@ -910,14 +910,6 @@ impl StoreService {
     pub fn dl(&self) -> &crate::dl::Dl {
         &self.dl
     }
-
-    /// Why `owl2-dl` wouldn't decide the OWL 2 RL rules' violations in the current data
-    /// (one read of its asserted ontology), for a caller that runs the mode without its
-    /// pipeline (`nrese-server load`).
-    pub fn undecided_under_dl(&self) -> Option<crate::WhyUndecided> {
-        self.dl.undecided(&self.engine.snapshot())
-    }
-
     /// The `owl2-dl` mode's bounds at the latest revision (`crate::dl::bounds`): the
     /// upper bound U1 built afresh if it doesn't describe that revision.
     pub fn dl_bounds(&self) -> crate::dl::BoundsReport {
