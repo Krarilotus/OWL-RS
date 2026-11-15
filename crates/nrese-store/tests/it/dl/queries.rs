@@ -326,13 +326,13 @@ fn explain_and_plan_carry_the_status() {
 
 /// Term table for generated ontologies.
 #[derive(Default)]
-struct Table {
-    text: Vec<String>,
-    ids: std::collections::HashMap<String, u64>,
+pub(super) struct Table {
+    pub(super) text: Vec<String>,
+    pub(super) ids: std::collections::HashMap<String, u64>,
 }
 
 impl Table {
-    fn id(&mut self, text: String) -> u64 {
+    pub(super) fn id(&mut self, text: String) -> u64 {
         if let Some(&id) = self.ids.get(&text) {
             return id;
         }
