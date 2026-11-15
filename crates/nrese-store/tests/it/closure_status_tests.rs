@@ -744,16 +744,34 @@ fn owl2_rl_calls_no_answer_a_key_on_an_undeclared_property_misses_complete() {
     never_complete("");
 }
 
-/// The key's case, `:ssn` declared by `declaration`: no place calls `ASK { :b :p :x }`
-/// complete, with the rewriting on or not.
+/// A max cardinality in plain Turtle (`1`, an xsd:integer): at most one `:p` equates `:x`
+/// and `:y` (OWL 2 Direct Semantics), but the owl2-rl rules read only the mapping's
+/// spelling (`"1"^^xsd:nonNegativeInteger`). Its `false` must not be labelled complete at
+/// any place, as the key's.
+#[test]
+fn owl2_rl_calls_no_answer_a_plain_max_cardinality_misses_complete() {
+    no_place_complete(
+        ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+           owl:maxCardinality 1 ] . \
+         :p a owl:ObjectProperty . :c a :C ; :p :x , :y .",
+        "ASK { :x owl:sameAs :y }",
+    );
+}
+
+/// The key's case, `:ssn` declared by `declaration`: see [`no_place_complete`].
 fn never_complete(declaration: &str) {
     let data = format!(
         ":Person owl:hasKey ( :ssn ) . {declaration} \
          :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
          :b a :Person ; :ssn \"01\"^^xsd:integer ."
     );
-    let data = data.as_str();
-    let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :b :p :x }}"));
+    no_place_complete(&data, "ASK { :b :p :x }");
+}
+
+/// `data` under owl2-rl, and `read`, entailed but `false` over the closure: no place calls
+/// it complete, with the rewriting on or not.
+fn no_place_complete(data: &str, read: &str) {
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
     let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
