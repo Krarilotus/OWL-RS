@@ -27,7 +27,7 @@ come with. Each item says what to do instead, or "none known". What is in is on
 ## SPARQL
 
 - Update's `LOAD` is refused, and `LOAD SILENT` does nothing. Load data over the Graph Store
-  Protocol or with `nrese-server load` ([server setup](ops/server-setup.md)).
+  Protocol or with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
 - `SERVICE` calls only the endpoints `federation.allow` names
   ([configuration](ops/config-reference.md)).
 - `HAVING` may name a `SELECT` alias, an extension ([why](ops/http-api.md#sparql)). For
@@ -191,7 +191,7 @@ leave something out.
   commit.
 - A stop signal during start-up acts as a kill, and on Windows a service stop or
   `taskkill /F` ends the server without letting its requests finish. Acknowledged commits
-  are kept either way ([stopping](ops/server-setup.md#64-stopping)). On Windows, stop it
+  are kept either way ([stopping](ops/server-setup.md#stopping)). On Windows, stop it
   with ctrl-c in its console.
 - A write that fails or is refused can leave its new terms in the dictionary, and the next commit publishes them,
   at most what its own request added ([dictionary continuity](adr/0002-engine-storage-lsm-permutations.md#implementation-notes-2026-09-25-e2e4)). Under

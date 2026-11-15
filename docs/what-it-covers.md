@@ -55,7 +55,7 @@ instead. What is planned, and in which order, is in the [roadmap](ROADMAP.md).
 | Read [Notation3](https://w3c.github.io/N3/spec/) data, in the library | Only what RDF can hold; rules are read by the reasoner. Not offered over HTTP. W3C N3 group's parser tests, one known failure listed ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_n3)) |
 | RDF4J Binary RDF, versions 1 and 2 | Read in both versions, written as version 2; as a payload and a result format |
 | [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | W3C suite ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc)) |
-| Bulk loading, N-Triples and N-Quads on all cores ([server setup](ops/server-setup.md)); statements that don't parse are quarantined, not fatal (malformed XML or JSON and read errors still stop the load: [bulk loading](ops/server-setup.md#54-bulk-loading)) | Strict mode stops at the first error instead ([quarantine](design/quarantine.md)) |
+| Bulk loading, N-Triples and N-Quads on all cores ([loading data](ops/server-setup.md#loading-data)); statements that don't parse are quarantined, not fatal (malformed XML or JSON and read errors still stop the load: [bulk loading](ops/server-setup.md#loading-data)) | Strict mode stops at the first error instead ([quarantine](design/quarantine.md)) |
 
 ## Reasoning
 
@@ -131,7 +131,7 @@ can't be proven complete is then a 422 error naming the undecided candidates.
 | In memory or on disk: a checksummed write-ahead log and checkpoints; recovery cuts a torn tail and, unless configured otherwise, refuses to open on other damage | |
 | Atomic commits: a write is planned, validated (reasoning, consistency, SHACL) and committed as one revision; a request that times out commits nothing ([data flow](ARCHITECTURE.md#22-data-flow)) | One writer at a time |
 | Client transactions, over the RDF4J protocol or the engine API: reads see the transaction's own changes | Each read takes the latest commit; `SNAPSHOT` and `SERIALIZABLE` isolation are refused |
-| Backups: N-Quads exports with a checksum, image backups, point-in-time restore from the archived log ([server setup](ops/server-setup.md), [drills](ops/backup-restore-drills.md)) | |
+| Backups: N-Quads exports with a checksum, image backups, point-in-time restore from the archived log ([backups](ops/backups.md)) | |
 | Read replicas that follow a primary's log ([replication](ops/replication.md)) | No automatic failover; no partitioning across machines |
 | Several repositories per server, each with its own reasoning and rules | |
 
@@ -205,7 +205,7 @@ stays, and the store is quarantined. With reasoning off, nothing is checked
 | `/repositories/…` | The [RDF4J REST protocol](https://rdf4j.org/documentation/reference/rest-api/), version 12 (`GET /protocol`), for RDF4J's `HTTPRepository` and the tools built on it ([HTTP interface](ops/http-api.md#rdf4j-protocol)) |
 | `/api/v1/…` | One API for what the server does (the library-only parts, such as Notation3 data and resolving quarantined statements, have none yet), described as [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0) at `/api/v1/openapi.json` ([HTTP interface](ops/http-api.md#engine-api-apiv1)) |
 | `/console`, `/ops` | A browser console for queries, updates and graphs, and one for operators ([apps/nrese-console](../apps/nrese-console)) |
-| `nrese-server` | The server, and the commands `load`, `query`, `convert`, `backup`, `restore`, `prune-archive`, `check-config`, `config-schema` and `print-query` ([server setup](ops/server-setup.md)) |
+| `nrese-server` | The server, and the commands `load`, `query`, `convert`, `backup`, `restore`, `prune-archive`, `check-config`, `config-schema` and `print-query` ([commands](ops/server-setup.md#commands)) |
 | Console CLI | A small TypeScript command-line client of the same API ([getting started](dev/getting-started.md#frontend-cli)) |
 | Errors | Every HTTP error is a problem document ([RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)) with the request id the server's log also carries, with three exceptions ([status codes](ops/http-api.md#status-codes), [a worked example](ops/http-api.md#example-a-sparql-syntax-error)); a server that doesn't start says why on standard error ([startup errors](ops/server-setup.md#startup-errors)) |
 
