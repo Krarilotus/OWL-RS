@@ -15,21 +15,23 @@ Every SPARQL answer over HTTP carries a status. It says `complete` when nothing 
 wrong, `sound-only` when rows may be missing, `unsound` when rows may be wrong or missing, and
 `not-certified` when there is no assessment.
 
-Under OWL 2 QL, RL and DL, a write that is found to introduce an inconsistency is refused as a
-whole, and with the SHACL gate set to `enforce`, so is a write that introduces a SHACL violation.
-(By a write we mean a SPARQL update, a Graph Store write or a transaction's commit. A bulk load
-and the ontology file loaded at start-up skip these checks, and with reasoning on, the load
-command and the import endpoint recompute the inferences afterwards, with the rules' consistency
-checks.)
+Under OWL 2 QL, RL and DL, NRESE checks each write for consistency and refuses it as a whole
+when the check finds that it would make the data inconsistent. If you set the SHACL gate to
+`enforce`, it also refuses a write that introduces a SHACL violation. By a write we mean a SPARQL
+update, a Graph Store write or a transaction's commit. A bulk load and the ontology file loaded at
+start-up both skip these checks. After a bulk load through the load command or the import
+endpoint, the inferences are recomputed if reasoning is on, and the rules' consistency checks run
+with them.
 
 In the `owl2-dl` mode, NRESE classifies the ontology and proves query answers beyond what the
 rules derive, with OWL 2 DL engines of its own, a hypertableau and a consequence-based one. For
 anything the rules derived, you can ask why it holds and get its derivation from the asserted
 statements, rule by rule.
 
-Access rights and budgets can limit any answer. What NRESE doesn't do is listed in
-[Limits and deviations](docs/limits.md), and the [quick start](#quick-start) below gets a server
-running.
+What you are allowed to read and the server's limits on time and memory can limit any answer, so
+an answer may hold less than the data does. [Limits and deviations](docs/limits.md) describes
+those limits and what NRESE doesn't do. To try it, start with the [quick start](#quick-start)
+below.
 
 ## Architecture overview
 
