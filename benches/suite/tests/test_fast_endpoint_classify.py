@@ -29,7 +29,7 @@ CASE = dict(name="ep", data="none", metric="whole_ms", cap_gb=2, tool="endpoint-
 # The reference by hand in the DL kit's format (canonical.py): A below B, B below owl:Thing.
 REFERENCE = "\n".join(sorted([f"= {THING} {THING}", f"= {NOTHING} {NOTHING}", f"= {E}A {E}A", f"= {E}B {E}B",
                               f"< {E}A {E}B", f"< {E}B {THING}"])) + "\n"
-# engine-v2's answer to el-classify-irregular today, in its fields (the DL lead's note, 14 Nov 2026).
+# engine-v2's answer to el-classify-irregular under `dl.outside_profile = dl-part`, in its fields.
 REFUSED = {"engine": "tableau", "complete": False, "incomplete": ["axioms left out: an irregular role hierarchy"],
            "consistent": None, "subsumptions": [[f"{E}A", f"{E}B"]], "unsatisfiable": [], "equivalent_to_thing": []}
 
