@@ -1494,3 +1494,89 @@ fn a_retired_pipeline_refuses_writes() {
         2
     );
 }
+
+/// `:K owl:hasKey ( :k1 … :kn )`, and `:x` and `:y` in `:K` with the same value on every
+/// key property: prp-key (OWL 2 Profiles §4.3, table 5) makes them one individual, so
+/// `:x :name "Y"` holds through `:y`'s (eq-rep-s).
+fn long_key(n: usize) -> String {
+    let keys: Vec<String> = (1..=n).map(|i| format!("<{EX}k{i}>")).collect();
+    let mut data = format!(
+        "<{EX}K> <http://www.w3.org/2002/07/owl#hasKey> ( {} ) .",
+        keys.join(" ")
+    );
+    for x in ["x", "y"] {
+        data.push_str(&format!(" <{EX}{x}> a <{EX}K> ."));
+        for i in 1..=n {
+            data.push_str(&format!(" <{EX}{x}> <{EX}k{i}> <{EX}v{i}> ."));
+        }
+    }
+    data.push_str(&format!(" <{EX}y> <{EX}name> \"Y\" ."));
+    data
+}
+
+/// A key's rule has two atoms per property and two more, and a rule holds at most 256:
+/// a key of 127 properties is one rule, one of 128 is reported (`list-too-long`, prp-key)
+/// and not built, never a failed commit (docs/spec/reasoning-semantics.md, "Lists").
+#[test]
+fn a_key_past_the_rule_format_is_reported_and_not_built() {
+    for n in [127, 128] {
+        let owl = pipeline(ReasoningMode::Owl2Rl);
+        owl.apply(
+            insert(&long_key(n)),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap_or_else(|error| panic!("{n} properties: {error}"));
+        let equal = contains(&owl, &format!("<{EX}x> <{EX}name> \"Y\""));
+        let reported = owl
+            .last_reasoning_run()
+            .expect("run")
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "list-too-long" && d.rules == "prp-key");
+        assert_eq!((equal, reported), (n == 127, n == 128), "{n} properties");
+    }
+}
+
+/// A key that is reported and not built is a missing rule: an answer it would change
+/// isn't `complete` because of it. Under `owl2-rl`, where the QL rewriting can certify an
+/// answer (`ql_rewriting = "on"`).
+#[test]
+fn an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl() {
+    let store = Arc::new(
+        StoreService::new(nrese_store::StoreConfig {
+            ql_rewriting: nrese_store::QlRewritingMode::On,
+            ..in_memory_store_config()
+        })
+        .expect("store"),
+    );
+    let owl = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    unbuilt_key_status(&owl);
+}
+
+fn unbuilt_key_status(pipeline: &MutationPipeline) {
+    pipeline
+        .apply(
+            insert(&long_key(128)),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect("the key's data");
+    let answer = pipeline
+        .store()
+        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "ASK {{ <{EX}x> <{EX}name> \"Y\" }}"
+        )))
+        .expect("answered");
+    let payload = String::from_utf8(answer.payload).expect("utf8");
+    let status = answer.completeness.as_ref();
+    assert!(
+        payload.contains("true") || status.is_some_and(|c| !c.complete),
+        "{payload} with {status:?}"
+    );
+}
