@@ -446,4 +446,21 @@ mod tests {
             }
         }
     }
+
+    /// A rule's atoms are numbered by a byte: 256 premises are one rule, 257 a parse error.
+    #[test]
+    fn a_rule_past_256_premises_is_an_error() {
+        for n in [256, 257] {
+            let premises: Vec<String> = (1..=n).map(|i| format!("?x :a{i} ?y")).collect();
+            let text = format!(
+                "@prefix : <http://e/> .\n{{ {} }} => {{ ?x :b ?y }} .",
+                premises.join(" . ")
+            );
+            match (n, compiled(&text)) {
+                (256, Ok((program, _))) => assert_eq!(program.rules[0].body.len(), 256),
+                (257, Err(error)) => assert!(error.message.contains("atoms"), "{error}"),
+                (n, other) => panic!("{n} premises: {:?}", other.map(|(p, _)| p.rules.len())),
+            }
+        }
+    }
 }

@@ -152,6 +152,43 @@ async fn a_store_holding_such_a_key_starts_with_reasoning_on()
     Ok(())
 }
 
+/// `:C owl:intersectionOf ( :A1 … :An )` and an `:x` in every `:Ai` (Turtle, full IRIs).
+fn long_intersection(n: usize) -> String {
+    let members: Vec<String> = (1..=n).map(|i| format!("<{EX}A{i}>")).collect();
+    let mut data = format!(
+        "<{EX}C> <http://www.w3.org/2002/07/owl#intersectionOf> ( {} ) .\n",
+        members.join(" ")
+    );
+    for member in &members {
+        data.push_str(&format!("<{EX}x> a {member} .\n"));
+    }
+    data
+}
+
+/// An intersection longer than one rule may hold (one atom per member, numbered by a
+/// byte), through `load`: the load ends as a load of consistent data does, under
+/// `owl2-rl` and `owl2-dl`, never with a panic.
+#[test]
+fn load_takes_a_long_intersection() -> Result<(), Box<dyn std::error::Error>> {
+    let mut wrong = Vec::new();
+    for mode in ["owl2-rl", "owl2-dl"] {
+        for n in [256, 257] {
+            let dir = tempfile::tempdir()?;
+            let config = configure(dir.path(), &dir.path().join("data"))?;
+            let file = dir.path().join("intersection.ttl");
+            std::fs::write(&file, long_intersection(n))?;
+            let output = load(&config, &["--set", &format!("reasoner.mode={mode}")], &file)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let last: Vec<&str> = stderr.lines().rev().take(4).collect();
+                wrong.push(format!("{mode}, {n} members: {}: {last:?}", output.status));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
 /// A panic in the rebuild of the inferences (forced: `NRESE_TEST_PANIC_IN_REBUILD`, a
 /// debug build's), after `load` and at the start: the process ends with an error that
 /// names the store and how to start without reasoning.
