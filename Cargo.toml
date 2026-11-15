@@ -29,7 +29,7 @@ rust-version = "1.98"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Krarilotus/OWL-RS"
-version = "0.1.0"
+version = "1.5.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
