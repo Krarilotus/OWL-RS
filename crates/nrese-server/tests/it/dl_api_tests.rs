@@ -279,3 +279,145 @@ async fn an_undecided_dl_explanation_is_an_incomplete_answer()
     );
     Ok(())
 }
+
+/// `request`'s answer must be the documented refusal of exact answers (`docs/ops/http-api.md`,
+/// `dl-answers`): 422, the incomplete-answer problem under owl2-dl with its reasons. What
+/// came instead is in the failure: the HTTP status, NRESE-Completeness and the body.
+async fn refused(
+    app: &axum::Router,
+    label: &str,
+    request: Request<Body>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = app.clone().oneshot(request).await?;
+    let code = response.status();
+    let status = response.headers().get("nrese-completeness").cloned();
+    let body = body_text(response).await?;
+    let got = format!("{label}: got {code}, NRESE-Completeness {status:?}, body {body}");
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{got}");
+    let problem: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        problem["type"], "https://nrese.dev/problems/incomplete-answer",
+        "{got}"
+    );
+    assert_eq!(problem["status"], 422, "{got}");
+    assert_eq!(problem["regime"], "owl2-dl", "{got}");
+    assert!(
+        problem["reasons"].as_array().is_some_and(|r| !r.is_empty()),
+        "{got}"
+    );
+    Ok(())
+}
+
+/// Spec (`dl-answers=exact`, `docs/spec/reasoning-semantics.md`): under owl2-dl, exact answers
+/// that can't be proven complete are refused. A read inside a transaction with an addition
+/// pending is never proven complete (it reads the rules' closure of the pending state), so
+/// exact refuses it; without exact it answers with its honest status. With nothing pending
+/// the same read is answered as outside a transaction.
+#[tokio::test]
+async fn exact_refuses_a_read_with_changes_pending() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("union.ttl");
+    std::fs::write(&path, ONTOLOGY)?;
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(path),
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/repositories/nrese/transactions")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response.headers()["location"].to_str()?.to_owned();
+    let tx = &location[location.find("/repositories/").expect("a transaction path")..];
+    let in_tx = |extra: &str| {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("{tx}?action={extra}"))
+            .header("accept", "application/sparql-results+json")
+            .header("content-type", "text/turtle")
+    };
+    let query = format!(
+        "QUERY&{}",
+        serde_urlencoded::to_string([("query", "SELECT ?x { ?x a <http://example.com/D> }")])?
+    );
+    let exact = format!("{query}&dl-answers=exact");
+    // Nothing pending: answered as outside a transaction (`answers_carry_their_status`).
+    let (status, _) = answer(&app, in_tx(&exact).body(Body::empty())?).await?;
+    let status = status.unwrap_or_default();
+    assert!(
+        status.starts_with("complete; regime=owl2-dl"),
+        "nothing pending: {status}"
+    );
+    let response = app
+        .clone()
+        .oneshot(in_tx("ADD").body(Body::from(
+            "<http://example.com/z> a <http://example.com/B> .",
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (status, _) = answer(&app, in_tx(&query).body(Body::empty())?).await?;
+    let status = status.unwrap_or_default();
+    assert!(
+        status.starts_with("sound-only; regime=owl2-dl"),
+        "an addition pending, without exact: {status}"
+    );
+    refused(
+        &app,
+        "an addition pending, exact",
+        in_tx(&exact).body(Body::empty())?,
+    )
+    .await
+}
+
+/// Spec (`dl-answers=exact`): an inferred-only read (`onto:implicit`, in `FROM` or as
+/// `default-graph-uri`) reads the rules' closure without the DL bounds, so it is never
+/// proven complete (`inferred_only_reads_are_never_certified_complete`) and exact refuses it.
+/// The same query over the whole store is answered as before.
+#[tokio::test]
+async fn exact_refuses_an_inferred_only_read() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("union.ttl");
+    std::fs::write(&path, ONTOLOGY)?;
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(path),
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    const IMPLICIT: &str = "http://www.ontotext.com/implicit";
+    let plain = "SELECT ?x { ?x a <http://example.com/D> }";
+    let from = format!("SELECT ?x FROM <{IMPLICIT}> {{ ?x a <http://example.com/D> }}");
+    let by_param = format!(
+        "&{}",
+        serde_urlencoded::to_string([("default-graph-uri", IMPLICIT)])?
+    );
+    let (status, _) = answer(&app, get(&from, "")?).await?;
+    let status = status.unwrap_or_default();
+    assert!(
+        status.starts_with("sound-only; regime=owl2-dl"),
+        "inferred only, without exact: {status}"
+    );
+    let (status, _) = answer(&app, get(plain, "&dl-answers=exact")?).await?;
+    let status = status.unwrap_or_default();
+    assert!(
+        status.starts_with("complete; regime=owl2-dl"),
+        "the whole store, exact: {status}"
+    );
+    refused(
+        &app,
+        "FROM onto:implicit, exact",
+        get(&from, "&dl-answers=exact")?,
+    )
+    .await?;
+    refused(
+        &app,
+        "default-graph-uri onto:implicit, exact",
+        get(plain, &format!("{by_param}&dl-answers=exact"))?,
+    )
+    .await
+}
