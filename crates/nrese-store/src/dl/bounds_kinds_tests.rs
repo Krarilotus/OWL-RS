@@ -114,6 +114,23 @@ fn a_later_literal_of_an_undeclared_key_property_leaves_the_route() {
     assert_ne!(store.dl_bounds().last, "rules");
 }
 
+/// An undeclared property, data only by its one literal, with a datatype range; then that
+/// literal deleted: the range's property is then read as an object property, whose range
+/// can't be a datatype (a reserved name, not read), so the ontology leaves the route.
+#[test]
+fn deleting_the_literal_that_makes_a_property_data_valued_leaves_the_route() {
+    let (store, pipeline) = on_the_route(":p rdfs:range xsd:integer . :a :p 1 .");
+    let deleted = format!("{PREFIXES}DELETE DATA {{ :a :p 1 . }}");
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(deleted)),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect("the deletion is consistent");
+    assert_ne!(store.dl_bounds().last, "rules");
+}
+
 /// What keeps the short cut: an assertion with a known class, a known property of its
 /// object's kind, and plain individuals.
 #[test]
