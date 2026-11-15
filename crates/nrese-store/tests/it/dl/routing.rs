@@ -632,3 +632,75 @@ fn owl2_rl_answers_the_punning_and_annotation_reads_from_the_closure() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// `first` committed (in OWL 2 RL, nothing punned: the RL route), then `second`, which
+/// only asserts; each of `reads`, none entailed under the Direct Semantics, asked: an
+/// answer `true` not labelled `unsound` is wrong. The wrong ones, as lines; every answer
+/// is printed with the route.
+fn yeses_after_a_later_commit(first: &str, second: &str, reads: &[&str]) -> Vec<String> {
+    let dl = pipeline();
+    insert(&dl, first).expect("an RL ontology");
+    let before = dl.store().dl_bounds().last;
+    assert_eq!(before, "rules", "the first commit is in OWL 2 RL");
+    insert(&dl, second).expect("an assertion");
+    let route = dl.store().dl_bounds().last;
+    let mut wrong = Vec::new();
+    for read in reads {
+        let (rows, status) = query(&dl, read);
+        let line = format!(
+            "route {before} then {route}: {read} answers {rows:?}, status {}",
+            status.shared.as_str()
+        );
+        eprintln!("{line}");
+        if rows == ["true"] && status.shared.as_str() != "unsound" {
+            wrong.push(line);
+        }
+    }
+    wrong
+}
+
+/// Two property names, then an equality of them by a later commit: it makes them
+/// individuals too (punning), and equates the individuals, not the properties. So
+/// neither `:x :p :a` nor `:a owl:sameAs :b` (by `:p` being functional) is entailed.
+#[test]
+fn a_later_equality_of_property_names_does_not_equate_their_properties() {
+    let wrong = yeses_after_a_later_commit(
+        ":p a owl:ObjectProperty , owl:FunctionalProperty . :q a owl:ObjectProperty . \
+         :x :q :a , :b .",
+        ":p owl:sameAs :q .",
+        &PUNNED_READS[..2],
+    );
+    assert!(
+        wrong.is_empty(),
+        "wrong rows not labelled unsound: {wrong:#?}"
+    );
+}
+
+/// Two equal individuals, then a later commit that uses one as a class (punning): the
+/// class `:a` isn't the class `:b`, so `:x a :b` isn't entailed.
+#[test]
+fn a_later_class_use_of_an_equated_individual_does_not_equate_the_classes() {
+    let wrong = yeses_after_a_later_commit(
+        ":a a owl:NamedIndividual ; owl:sameAs :b . :b a owl:NamedIndividual .",
+        ":x a :a .",
+        &["ASK { :x a :b }"],
+    );
+    assert!(
+        wrong.is_empty(),
+        "wrong rows not labelled unsound: {wrong:#?}"
+    );
+}
+
+/// A class, then a later commit that makes it an individual too (punning): PR1 needs no
+/// punning, so the ontology leaves the RL route, as it does when committed at once.
+#[test]
+fn a_later_assertion_that_puns_a_class_leaves_the_rules_route() {
+    let dl = pipeline();
+    insert(&dl, ":Dog a owl:Class . :rex a :Dog .").expect("an RL ontology");
+    let before = dl.store().dl_bounds().last;
+    insert(&dl, ":Dog a :Species .").expect("an assertion");
+    let route = dl.store().dl_bounds().last;
+    eprintln!("route {before} then {route}");
+    assert_eq!(before, "rules", "the first commit is in OWL 2 RL");
+    assert_ne!(route, "rules", "a punning ontology stayed on the RL route");
+}
