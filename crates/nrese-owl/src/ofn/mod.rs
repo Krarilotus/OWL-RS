@@ -67,6 +67,7 @@ pub(super) struct Model {
     pub axioms: BTreeMap<Axiom, ()>,
     pub diagnostics: Vec<Diagnostic>,
     pub annotations: usize,
+    pub annotation_schema: Vec<Term>,
     pub uses: HashMap<Term, Uses>,
     pub rules: Vec<crate::rules::Rule>,
 }
@@ -114,7 +115,10 @@ impl<'a> FunctionalReader<'a> {
             model.diagnostics.push(Diagnostic::Rule { rule });
         }
         let axioms: Vec<Axiom> = model.axioms.into_keys().collect();
+        model.annotation_schema.sort_unstable();
+        model.annotation_schema.dedup();
         let mut ontology = Ontology {
+            annotation_schema: model.annotation_schema,
             classes: model.classes,
             ranges: model.ranges,
             sources: vec![Vec::new(); axioms.len()],
