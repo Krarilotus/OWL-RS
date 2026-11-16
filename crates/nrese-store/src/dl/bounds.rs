@@ -417,7 +417,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
                 if upper.classes().is_empty()
-                    && asserted().all(|t| upper.is_assertion(t) && !reserved_named(tx, t)) =>
+                    && asserted().all(|t| upper.is_assertion(t) && !reserved_named(tx, t))
+                    && !tx.deleted().any(|q| may_retype(tx, quad_triple(q))) =>
             {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
@@ -523,6 +524,27 @@ fn reserved_named(tx: &Transaction<'_>, [s, _, o]: Triple) -> bool {
         _ => false,
     };
     reserved(s) || reserved(o)
+}
+
+/// Whether deleting a statement may change its property's kind for the reader: a literal
+/// value of a property not declared a data property, which is one only while it has one
+/// (`nrese_owl::profile::Signature::declared_data`, as `Kinds::keep` reads it).
+pub(crate) fn may_retype(tx: &Transaction<'_>, [_, p, o]: Triple) -> bool {
+    let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let mut pattern = nrese_engine::QuadPattern::all();
+    (pattern.subject, pattern.predicate, pattern.object) = (
+        Some(TermId::from_raw(p)),
+        id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        id("http://www.w3.org/2002/07/owl#DatatypeProperty"),
+    );
+    let declared = || {
+        let found = || {
+            tx.base()
+                .quads_for_pattern_in(ReadModel::Asserted, &pattern)
+        };
+        pattern.predicate.is_some() && pattern.object.is_some() && found().next().is_some()
+    };
+    TermId::from_raw(o).kind().is_literal() && !declared()
 }
 
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
