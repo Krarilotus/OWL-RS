@@ -1655,6 +1655,45 @@ fn a_reopened_store_with_an_unbuilt_key_leaves_no_answer_complete() {
     );
 }
 
+/// A read inside a transaction whose pending operations delete a key's `owl:hasKey` fact finds
+/// no list left out in its own data, and its snapshot carries the committed revision's number.
+/// The transaction ends without a commit, so the committed revision is as it was: its key of
+/// 128 properties, past what one rule holds, is left out, and `:x :name "Y"` is entailed (the
+/// key makes `:x` and `:y` one; `:y :name "Y"`). A plain read of it after the transaction is
+/// therefore true or not `complete`, whatever the pending read found.
+#[test]
+fn a_pending_read_leaves_the_committed_revisions_mark() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let store = pipeline.store();
+    (pipeline.apply(
+        insert(&long_key(128)),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    let ask = format!("<{EX}x> <{EX}name> \"Y\"");
+    let prepared = (store.prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+        "ASK {{ {ask} }}"
+    ))))
+    .expect("prepared");
+    let delete = format!("DELETE WHERE {{ <{EX}K> <http://www.w3.org/2002/07/owl#hasKey> ?list }}");
+    let ops = vec![nrese_store::StatementOp::Update(SparqlUpdateRequest::new(
+        delete,
+    ))];
+    let mut pending = None;
+    store
+        .run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(ops),
+            &prepared,
+            &nrese_store::CancellationToken::new(),
+            &mut Vec::<u8>::new(),
+            |status| pending = status,
+        )
+        .expect("the pending read");
+    println!("pending read: {pending:?}");
+    left_out_answer(store, &ask);
+}
+
 /// `owl2-rl` with the QL rewriting on, over a store of `config`.
 fn ql_pipeline(config: nrese_store::StoreConfig) -> MutationPipeline {
     let config = nrese_store::StoreConfig {
