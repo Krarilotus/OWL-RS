@@ -681,8 +681,22 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
 /// a read off the pool waits for the build under way, one on a Rayon worker builds its
 /// own (U1-B).
 pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
+    view_until(store, None).expect("a read with no stop never gives up")
+}
+
+/// [`view`] for a request: given up (`None`) once `stop` fires, before it claims a build or
+/// while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until` says.
+/// The build runs on and is kept; one this read claimed runs to its end whatever its stop
+/// says, as others may wait for it (a classification waiter's way, `classification::cached`).
+pub(crate) fn view_until(
+    store: &StoreService,
+    stop: Option<&dyn Fn() -> bool>,
+) -> Option<(Snapshot, Arc<View>)> {
     let bounds = &store.dl().bounds;
     loop {
+        if stop.is_some_and(|stop| stop()) {
+            return None;
+        }
         let snapshot = store.engine().snapshot();
         let revision = snapshot.revision();
         let cached = || {
@@ -692,7 +706,7 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
                 .map(Arc::clone)
         };
         if let Some(view) = cached() {
-            return (snapshot, view);
+            return Some((snapshot, view));
         }
         let built = match bounds
             .views
@@ -703,7 +717,7 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
                 builder.finish(built.clone());
                 built
             }
-            Claim::Wait(flight) => match flight.wait() {
+            Claim::Wait(flight) => match flight.wait_until(stop)? {
                 Ok(built) => built,
                 Err(nrese_exec::cell::Busy) => read(store, &snapshot),
             },
@@ -711,7 +725,7 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
         // None: the bounds describe a later revision than the snapshot now, or the build
         // failed. Again, from the latest snapshot.
         if let Some(view) = built {
-            return (snapshot, view);
+            return Some((snapshot, view));
         }
     }
 }

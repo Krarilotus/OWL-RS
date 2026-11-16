@@ -47,9 +47,17 @@ pub struct ListVocabulary {
     all_disjoint_classes: u64,
     all_disjoint_properties: u64,
     all_different: u64,
+    /// The blank nodes' ids, when keys bind named individuals only.
+    named_keys: Option<(u64, u64)>,
 }
 
 impl ListVocabulary {
+    /// Keys that bind no individual whose id is in `blank_nodes` (`owl2-dl`).
+    pub fn named_keys(mut self, blank_nodes: Option<(u64, u64)>) -> Self {
+        self.named_keys = blank_nodes;
+        self
+    }
+
     pub fn new(vocabulary: &mut impl Vocabulary) -> Self {
         let mut rdf = |local: &str| vocabulary.iri(&format!("{RDF}{local}"));
         let (rdf_type, first, rest, nil) = (rdf("type"), rdf("first"), rdf("rest"), rdf("nil"));
@@ -71,6 +79,7 @@ impl ListVocabulary {
             all_disjoint_classes: vocabulary.iri(&format!("{OWL}AllDisjointClasses")),
             all_disjoint_properties: vocabulary.iri(&format!("{OWL}AllDisjointProperties")),
             all_different: vocabulary.iri(&format!("{OWL}AllDifferent")),
+            named_keys: None,
         }
     }
 
@@ -373,10 +382,15 @@ pub fn instantiate_with_premises(
                 body.push(Atom([x, c(p), v(i + 2)]));
                 body.push(Atom([y, c(p), v(i + 2)]));
             }
+            let mut guards = vec![Guard::NotEqual(x, y)];
+            // Under the Direct Semantics: no blank node as an instance or a value.
+            if let Some((low, high)) = voc.named_keys {
+                guards.extend((0..keys.len() + 2).map(|i| Guard::NotIn(v(i), low, high)));
+            }
             rules.push(rule(
                 "prp-key",
                 body,
-                vec![Guard::NotEqual(x, y)],
+                guards,
                 Head::Facts(vec![Atom([x, c(voc.same_as), y])]),
             ));
         },

@@ -55,6 +55,8 @@ mod graph_tests;
 #[cfg(test)]
 mod handover_tests;
 #[cfg(test)]
+mod id_set_tests;
+#[cfg(test)]
 mod join_order_tests;
 #[cfg(test)]
 mod lone_pattern_tests;
@@ -7445,11 +7447,14 @@ fn placed_in(expr: &Expression, patterns: &[TriplePattern]) -> bool {
     })
 }
 
-/// Sorted, disjoint id ranges for membership tests: single ids of one kind in a bitmap over
-/// their payloads, the few wider ranges (whole kinds) in a list.
+/// Sorted, disjoint id ranges for membership tests: ranges of at most 64 ids of one kind in
+/// a bitmap over their payloads, the wider ones in a sorted list searched by their ends.
+/// A string test's passing terms can merge into thousands of wide runs (3,114 of 737,454
+/// ranges for a broad prefix over input-order ids), so the list is never walked.
 struct IdSet {
     /// Per kind tag: a bitmap over payloads, if the kind has single ids.
     bits: Vec<Vec<u64>>,
+    /// Inclusive raw ranges, increasing and apart.
     wide: Vec<(u64, u64)>,
 }
 
@@ -7473,6 +7478,10 @@ impl IdSet {
                 bits[word] |= 1 << (payload % 64);
             }
         }
+        debug_assert!(
+            set.wide.windows(2).all(|w| w[0].1 < w[1].0),
+            "sorted, disjoint"
+        );
         set
     }
 
@@ -7483,7 +7492,9 @@ impl IdSet {
         let in_bits = self.bits[term.kind() as usize]
             .get((payload / 64) as usize)
             .is_some_and(|word| word & (1 << (payload % 64)) != 0);
-        in_bits || self.wide.iter().any(|&(low, high)| low <= id && id <= high)
+        // The first wide range not ending below `id` is the only one that can hold it.
+        let at = self.wide.partition_point(|&(_, high)| high < id);
+        in_bits || self.wide.get(at).is_some_and(|&(low, _)| low <= id)
     }
 }
 

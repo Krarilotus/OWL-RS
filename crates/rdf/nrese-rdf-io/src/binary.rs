@@ -133,7 +133,7 @@ impl<R: Read> BinaryParser<R> {
             column: 0,
             offset: self.offset,
         };
-        RdfSyntaxError::new(message, at..at).into()
+        RdfSyntaxError::new(message, at..at).without_lines().into()
     }
 
     /// The next `n` bytes, in a buffer that holds no more than the bytes that came.
