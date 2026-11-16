@@ -462,6 +462,24 @@ fn a_joined_read_gives_up(explain: bool) {
     seam::at(&store.dl().bounds, Point::View); // the counting hook, unused, goes
 }
 
+/// A read whose request has stopped before it asks for the view claims no build: it starts
+/// nothing nobody can stop (as a stopped classification request, `classification::cached`).
+/// Counted by builds: none reaches `Point::View`, none is under way, none is kept.
+#[test]
+fn a_stopped_read_starts_no_view_build() {
+    let (store, _pipeline) = pipeline();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    seam::set(&store.dl().bounds, Point::View, move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(view_until(&store, Some(&|| true)).is_none());
+    assert_eq!(builds.load(Ordering::SeqCst), 0, "views built");
+    assert!(store.dl().bounds.views.is_idle(), "a view build under way");
+    assert!(lock(&store.dl().bounds.view).is_none(), "a view kept");
+    seam::at(&store.dl().bounds, Point::View); // the counting hook, unused, goes
+}
+
 #[test]
 fn a_joined_query_gives_up_while_the_view_is_built() {
     a_joined_read_gives_up(false);
