@@ -100,7 +100,7 @@ fn the_result_cache_holds_no_more_heap_than_its_budget() {
                         write_results(&snapshot, query, &options, tsv, None, &mut written)
                             .unwrap()
                             .unwrap();
-                        slot.offer(written, std::time::Duration::from_millis(1));
+                        slot.offer(written, None, std::time::Duration::from_millis(1));
                     }
                 }
             }
@@ -169,7 +169,7 @@ fn equal_context_output_hits_stay_within_the_cache_budget() {
                 else {
                     panic!("each distinct context must start with a miss");
                 };
-                slot.offer(answer.clone(), std::time::Duration::from_millis(1));
+                slot.offer(answer.clone(), None, std::time::Duration::from_millis(1));
             }
             let admitted = cache.stats();
             assert_eq!(
@@ -179,7 +179,7 @@ fn equal_context_output_hits_stay_within_the_cache_budget() {
             if rehit {
                 for marker in *b"abcd" {
                     let context = String::from_utf8(vec![marker; 32 << 10]).unwrap();
-                    let CachedOutput::Hit(bytes) =
+                    let CachedOutput::Hit(bytes, _) =
                         cached_output(&snapshot, &query, &options, format, context.as_bytes())
                     else {
                         panic!("all four admitted answers must be hits");
