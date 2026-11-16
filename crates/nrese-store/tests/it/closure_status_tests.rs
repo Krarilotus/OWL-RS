@@ -1449,3 +1449,235 @@ fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
     }
     assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
 }
+
+/// An `owl2-dl` store loaded with `data` and an existential superclass, which is outside
+/// OWL 2 RL: off the RL route.
+fn owl2_dl_off_route(data: &str) -> StoreService {
+    owl2_dl(&format!(
+        "{data} :r a owl:ObjectProperty . :E rdfs:subClassOf \
+         [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :E ] ."
+    ))
+}
+
+/// The stores whose `complete` promises that no certain answer under the OWL 2 Direct
+/// Semantics is missing: `owl2-dl` on and off the RL route, `owl2-ql`, and `owl2-rl` with
+/// the QL rewriting on.
+type Promising = [(&'static str, fn(&str) -> StoreService); 4];
+const PROMISING: Promising = [
+    ("owl2-dl", owl2_dl),
+    ("owl2-dl off the RL route", owl2_dl_off_route),
+    ("owl2-ql", |d| {
+        closure(d, Ruleset::Owl2Ql, QlRewritingMode::Auto)
+    }),
+    ("owl2-rl rewriting on", |d| {
+        closure(d, Ruleset::Owl2Rl, QlRewritingMode::On)
+    }),
+];
+
+/// `:a`'s and `:b`'s value of `:age` is the integer 7, written `"07"` and `7`.
+const SEVEN: &str = ":age a owl:DatatypeProperty . :a :age \"07\"^^xsd:integer . :b :age 7 .";
+
+/// How many rows `rows` (SPARQL JSON results) binds `var` in.
+fn bound(rows: &str, var: &str) -> usize {
+    rows.matches(&format!("\"{var}\":{{")).count()
+}
+
+/// The shapes that compare data values by term: a join on one (over a declared and an
+/// undeclared property), and `DISTINCT`, `GROUP BY` and `COUNT(DISTINCT)` over one. Each
+/// `(shape, data, read, right)`, `right` holding of the rows OWL 2 gives by value over
+/// [`SEVEN`]: `:a` and `:b` share their value, which is one value.
+const SHAPES: [(&str, &str, &str, fn(&str) -> bool); 5] = [
+    (
+        "a join",
+        SEVEN,
+        "SELECT ?x ?y { ?x :age ?n . ?y :age ?n FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join over an undeclared property",
+        ":a :size \"07\"^^xsd:integer . :b :size 7 .",
+        "SELECT ?x ?y { ?x :size ?n . ?y :size ?n FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "DISTINCT",
+        SEVEN,
+        "SELECT DISTINCT ?n { ?x :age ?n }",
+        |rows| bound(rows, "n") == 1,
+    ),
+    (
+        "GROUP BY",
+        SEVEN,
+        "SELECT ?n (COUNT(?x) AS ?c) { ?x :age ?n } GROUP BY ?n",
+        |rows| bound(rows, "n") == 1,
+    ),
+    (
+        "COUNT(DISTINCT)",
+        SEVEN,
+        "SELECT (COUNT(DISTINCT ?n) AS ?c) { ?x :age ?n }",
+        |rows| rows.contains("\"value\":\"1\""),
+    ),
+];
+
+/// Under the OWL 2 Direct Semantics a literal denotes its value, so `"07"` and `7` (one
+/// `xsd:integer`) are one value; the store compares the terms as written. Spec: a join on a
+/// data value, and `DISTINCT`, `GROUP BY` or `COUNT(DISTINCT)` over one, read through a
+/// property that holds a value other than a plain or language-tagged string, isn't
+/// `complete` unless its rows are the ones OWL 2 gives by value, under each regime that
+/// promises `complete`, run and planned.
+#[test]
+fn no_answer_that_compares_data_values_by_term_is_complete_and_wrong() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (shape, data, read, right) in SHAPES {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {shape}: {rows} {status:?}");
+            if !right(&rows) && status.contains(&"complete") {
+                wrong.push(format!("{regime}, {shape}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The controls: a property that holds only IRIs, or only strings (one spelling per value),
+/// compares values by term as OWL 2 does, and so does a property beside another that holds a
+/// number. Spec: such a join, `DISTINCT` or `GROUP BY` keeps its rows and `complete`, run
+/// and planned, under each regime that promises it.
+#[test]
+fn comparing_iris_or_strings_by_term_leaves_an_answer_complete() {
+    let knows = ":knows a owl:ObjectProperty . :a :knows :c . :b :knows :c .";
+    let names = ":name a owl:DatatypeProperty . :a :name \"Rex\" . :b :name \"Rex\" , \"Max\"@en .";
+    let beside = ":name a owl:DatatypeProperty . :a :name \"Rex\" ; :age 7 . :b :name \"Rex\" .";
+    let pair = |rows: &str| rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
+    let cases: [(&str, &str, fn(&str) -> bool); 7] = [
+        (
+            knows,
+            "SELECT ?x ?y { ?x :knows ?z . ?y :knows ?z FILTER(?x != ?y) }",
+            pair,
+        ),
+        (knows, "SELECT DISTINCT ?z { ?x :knows ?z }", |r| {
+            bound(r, "z") == 1
+        }),
+        (
+            knows,
+            "SELECT ?z (COUNT(?x) AS ?c) { ?x :knows ?z } GROUP BY ?z",
+            |r| bound(r, "z") == 1,
+        ),
+        (
+            names,
+            "SELECT ?x ?y { ?x :name ?n . ?y :name ?n FILTER(?x != ?y) }",
+            pair,
+        ),
+        (names, "SELECT DISTINCT ?n { ?x :name ?n }", |r| {
+            bound(r, "n") == 2
+        }),
+        (
+            names,
+            "SELECT ?n (COUNT(?x) AS ?c) { ?x :name ?n } GROUP BY ?n",
+            |r| bound(r, "n") == 2,
+        ),
+        (beside, "SELECT DISTINCT ?n { ?x :name ?n }", |r| {
+            bound(r, "n") == 1
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (data, read, right) in cases {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            if !right(&rows) || status != ["complete"; 2] {
+                wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The controls under `owl2-ql` for properties no ontology declares: one that holds only
+/// IRIs and one that holds only strings. Spec: a join and a `DISTINCT` over either keep
+/// their rows and `complete`, run and planned.
+#[test]
+fn owl2_ql_keeps_complete_over_undeclared_properties_of_iris_or_strings() {
+    let store = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let pair = |rows: &str| rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
+    let cases: [(&str, &str, fn(&str) -> bool); 4] = [
+        (
+            ":a :q :c . :b :q :c .",
+            "SELECT ?x ?y { ?x :q ?z . ?y :q ?z FILTER(?x != ?y) }",
+            pair,
+        ),
+        (
+            ":a :q :c . :b :q :c .",
+            "SELECT DISTINCT ?z { ?x :q ?z }",
+            |r| bound(r, "z") == 1,
+        ),
+        (
+            ":a :s \"Rex\" . :b :s \"Rex\" .",
+            "SELECT ?x ?y { ?x :s ?n . ?y :s ?n FILTER(?x != ?y) }",
+            pair,
+        ),
+        (
+            ":a :s \"Rex\" . :b :s \"Rex\" .",
+            "SELECT DISTINCT ?n { ?x :s ?n }",
+            |r| bound(r, "n") == 1,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (data, read, right) in cases {
+        let (rows, status) = answer(&store(data), read);
+        eprintln!("{read}: {rows} {status:?}");
+        if !right(&rows) || status != ["complete"; 2] {
+            wrong.push(format!("{read}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A query prepared once and run after each commit: the property it reads holds only
+/// strings, then also `"07"` and `7` (the first values other than strings), then `7` alone,
+/// then strings again. Spec: its `DISTINCT` is `complete` exactly while the property holds
+/// only strings, run and planned: the status follows the snapshot read, not the one the
+/// query was prepared on.
+#[test]
+fn a_prepared_query_is_marked_by_what_its_property_holds_at_each_run() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":v a owl:DatatypeProperty . :x :v \"a\" . :y :v \"b\" .",
+    )
+    .expect("data");
+    let store = dl.store();
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}SELECT DISTINCT ?n {{ ?s :v ?n }}"));
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let status = |label: &str| -> [&'static str; 2] {
+        let mut run = None;
+        store
+            .run_query_reporting(&prepared, &CancellationToken::new(), Vec::new(), |s| {
+                run = s
+            })
+            .expect("ran");
+        let plan = store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("planned")
+            .completeness;
+        let name = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+        let status = [name(run), name(plan)];
+        eprintln!("{label}: {status:?}");
+        status
+    };
+    let mut seen = vec![("strings", status("strings"))];
+    crate::dl::update(&dl, "INSERT DATA { :z :v \"07\"^^xsd:integer . :w :v 7 }").expect("typed");
+    seen.push(("\"07\" and 7", status("\"07\" and 7")));
+    crate::dl::update(&dl, "DELETE DATA { :z :v \"07\"^^xsd:integer }").expect("one left");
+    seen.push(("7", status("7")));
+    crate::dl::update(&dl, "DELETE DATA { :w :v 7 }").expect("strings again");
+    seen.push(("strings again", status("strings again")));
+    let expected = ["complete", "sound-only", "sound-only", "complete"];
+    let wrong: Vec<_> = seen
+        .iter()
+        .zip(expected)
+        .filter(|((_, got), want)| got != &[*want; 2])
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
