@@ -39,10 +39,15 @@ impl ListsKept {
         (r.0, r.1) = if clean { (r.0, revision) } else { (1, 0) };
     }
 
-    pub(crate) fn left_out(&self, revision: u64, scan: impl FnOnce() -> bool) -> bool {
+    /// What the record holds of `revision`, if anything: never scanned, never written.
+    pub(crate) fn known(&self, revision: u64) -> Option<bool> {
         let r = *self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if (r.0..=r.1).contains(&revision) || r.2 == revision {
-            return r.2 == revision;
+        ((r.0..=r.1).contains(&revision) || r.2 == revision).then_some(r.2 == revision)
+    }
+
+    pub(crate) fn left_out(&self, revision: u64, scan: impl FnOnce() -> bool) -> bool {
+        if let Some(known) = self.known(revision) {
+            return known;
         }
         let found = scan();
         let mut r = self.0.lock().unwrap_or_else(|p| p.into_inner());
