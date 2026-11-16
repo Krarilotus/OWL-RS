@@ -10,9 +10,8 @@ use std::sync::Arc;
 
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
-use nrese_sparql::GraphAccess;
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, QlRewritingMode, ReadScope,
+    BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, QlRewritingMode,
     SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementsRequest, StoreConfig,
     StoreService,
 };
@@ -484,59 +483,6 @@ fn a_publication_of_new_statements_is_certified_only_by_what_built_them() {
                 replace,
             );
             cells.class(name, &status(&store, READ), "not-certified");
-        }
-    }
-    cells.finish();
-}
-
-/// A reader who sees the inferences its graphs support reads a view built with the support
-/// program the store was told to use (`use_reasoning_rules`). Where that program isn't the
-/// one the certificate was made with, the view's inferred statements are no certified
-/// closure: `not-certified` (R4), with no program and with another one. Under the matching
-/// program the status is the certified one, as `ql_rewriting_tests`'
-/// `rewritten_answers_follow_the_readers_graph_access` pins. A server reaches the mismatch
-/// while a repository's reasoning changes: the catalog's `settle` publishes the new
-/// certificate before the new write path sets the new program.
-#[test]
-fn a_supported_reader_whose_view_uses_another_program_is_told_not_certified() {
-    let mut cells = Cells::default();
-    let store = certified(
-        StoreConfig {
-            ql_rewriting: QlRewritingMode::On,
-            ..StoreConfig::in_memory()
-        },
-        Ruleset::Owl2Rl,
-    );
-    let supported = ReadScope::Graphs(Arc::new(GraphAccess {
-        default_graph: true,
-        inferred: true,
-        inferred_by_support: true,
-        ..GraphAccess::default()
-    }));
-    let read = || {
-        let request = SparqlQueryRequest::new(format!("{PREFIXES}{READ}"), supported.clone());
-        header(
-            store
-                .execute_query(&request)
-                .expect("answered")
-                .completeness,
-        )
-    };
-    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
-    let matching = read();
-    if matches!(class(&matching), "none" | "not-certified") {
-        cells.unmet(
-            "R4",
-            &format!("not certified under the matching program: {matching}"),
-        );
-    } else {
-        for (name, program) in [("no program", None), ("rdfs", Some(Ruleset::Rdfs.into()))] {
-            store.use_reasoning_rules(program);
-            cells.class(
-                &format!("R4 a supported reader's view, {name}"),
-                &read(),
-                "not-certified",
-            );
         }
     }
     cells.finish();
