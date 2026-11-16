@@ -1,111 +1,87 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 792 860" width="792" height="860" role="img" aria-labelledby="title desc">
-<!-- The light and dark variants of this drawing differ only in <style>. -->
-<title id="title">NRESE's layers</title>
-<desc id="desc">NRESE's parts by layer; each uses only parts below it, and parts side by side don't use each other. L5: apps/nrese-console, the browser UI and CLI, an npm package that uses the server over HTTP. The crates: L4: nrese-server. L3: nrese-store. L2: nrese-shacl above nrese-sparql and nrese-reasoner. L1: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 652" width="400" height="652" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">NRESE's crates by layer</title>
+<desc id="desc">Each crate uses only crates in rows below it, never one beside it; every name starts with nrese-. The console, apps/nrese-console, is an npm app, not a crate: it uses the server over HTTP. L4: nrese-server. L3: nrese-store. L2, query, reasoning, validation: nrese-shacl, above nrese-sparql and nrese-reasoner. L1, storage, execution and OWL: nrese-engine and nrese-dl, above nrese-vector, above nrese-exec and nrese-owl. L0, the RDF model and syntaxes, in crates/rdf/: nrese-rdf-io, nrese-sparql-syntax and nrese-sparql-results, above nrese-rdf, above nrese-json and nrese-xsd.</desc>
 <style>
   text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #E6EDF3; }
-  .panel { fill: #161B22; }
-  .t { font-size: 18px; font-weight: 600; }
-  .n { font-size: 16px; font-weight: 600; }
-  .d { font-size: 14px; fill: #9AA6B4; }
-  .lbl { font-size: 14px; fill: #9AA6B4; }
-  .r { font-size: 14px; }
-  .lvl { font-size: 22px; font-weight: 600; fill: #9AA6B4; }
-  .band { fill: #262D37; }
-  .boundary { fill: none; stroke: #5A6573; stroke-width: 1.2; stroke-dasharray: 6 5; }
-  .box { fill: #0D1117; stroke: #5A6573; stroke-width: 1.2; }
-  .chip { fill: #0D1117; stroke: #5A6573; stroke-width: 1; }
-  .client { fill: #E6EDF3; }
-  .client-t { fill: #0D1117; font-size: 16px; font-weight: 600; }
-  .commit { fill: #2A2340; stroke: #B69CF2; stroke-width: 2; }
-  .commit-chip { fill: #0D1117; stroke: #B69CF2; stroke-width: 1; }
-  .query { fill: #16302E; stroke: #4CC2B7; stroke-width: 2; }
-  .query-chip { fill: #0D1117; stroke: #4CC2B7; stroke-width: 1; }
-  .asserted { fill: #262D37; stroke: #5A6573; stroke-width: 1; }
-  .inferred { fill: #2A2340; stroke: #B69CF2; stroke-width: 1; }
-  .w-tell { fill: #B69CF2; font-weight: 600; font-size: 15px; }
-  .w-ask { fill: #4CC2B7; font-weight: 600; font-size: 15px; }
-  .w-refuse { fill: #F2747B; font-weight: 600; font-size: 15px; }
-  .a { fill: none; stroke-width: 1.6; }
-  .a-ink { stroke: #9AA6B4; }
-  .a-tell { stroke: #B69CF2; }
-  .a-ask { stroke: #4CC2B7; }
-  .a-refuse { stroke: #F2747B; stroke-dasharray: 5 4; }
-  .m-ink { fill: #9AA6B4; }
-  .m-tell { fill: #B69CF2; }
-  .m-ask { fill: #4CC2B7; }
-  .m-refuse { fill: #F2747B; }
+  .paper { fill: #0D1117; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #9198A1; }
+  .edge { font-size: 14px; font-style: italic; fill: #9198A1; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #0D1117; stroke: #6E7681; stroke-width: 1.25; }
+  .band { fill: #151B23; }
+  .chip { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .chip-on { fill: #E6EDF3; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #0D1117; }
+  .asserted { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .inferred { fill: #2B2111; stroke: #9E6A03; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #E3B341; }
+  .track { fill: #262C36; }
+  .frame { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #E6EDF3; stroke-width: 2; }
+  .seg-on { fill: #0D1117; stroke: #6E7681; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #FF8A80; }
+  .refused-text { fill: #FF8A80; font-weight: 600; }
+  .inferred-word { fill: #E3B341; font-weight: 600; }
+  .flow { fill: none; stroke: #9198A1; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #FF8A80; stroke-width: 1.4; }
 </style>
-<defs><marker id="h-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ink" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-tell" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-tell" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-ask" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ask" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-refuse" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-refuse" d="M0 0 L10 5 L0 10 z"/></marker></defs>
-<rect class="panel" x="0" y="0" width="792" height="860" rx="14"/>
-<rect class="band" x="20" y="20" width="772" height="80" rx="10"/>
-<text x="40" y="54" class="lvl">L5</text>
-<text x="40" y="74" class="d">clients</text>
-<rect class="chip" x="160" y="36" width="616" height="48" rx="6"/>
-<text x="174.0" y="57" class="n">apps/nrese-console</text>
-<text x="174.0" y="75" class="d">browser UI and CLI over HTTP; an npm package, not a crate</text>
-<rect class="band" x="20" y="110" width="772" height="80" rx="10"/>
-<text x="40" y="144" class="lvl">L4</text>
-<text x="40" y="164" class="d">transport</text>
-<rect class="chip" x="160" y="126" width="616" height="48" rx="6"/>
-<text x="174.0" y="147" class="n">nrese-server</text>
-<text x="174.0" y="165" class="d">HTTP, auth, policy</text>
-<rect class="band" x="20" y="200" width="772" height="80" rx="10"/>
-<text x="40" y="234" class="lvl">L3</text>
-<text x="40" y="254" class="d">application</text>
-<rect class="chip" x="160" y="216" width="616" height="48" rx="6"/>
-<text x="174.0" y="237" class="n">nrese-store</text>
-<text x="174.0" y="255" class="d">commits and their checks, the answers' status</text>
-<rect class="band" x="20" y="290" width="772" height="138" rx="10"/>
-<text x="40" y="324" class="lvl">L2</text>
-<text x="40" y="344" class="d">evaluation</text>
-<rect class="chip" x="160" y="306" width="616" height="48" rx="6"/>
-<text x="174.0" y="327" class="n">nrese-shacl</text>
-<text x="174.0" y="345" class="d">shape validation</text>
-<rect class="chip" x="160" y="364" width="301" height="48" rx="6"/>
-<text x="174.0" y="385" class="n">nrese-sparql</text>
-<text x="174.0" y="403" class="d">query and update</text>
-<rect class="chip" x="475" y="364" width="301" height="48" rx="6"/>
-<text x="489.0" y="385" class="n">nrese-reasoner</text>
-<text x="489.0" y="403" class="d">rules, consistency</text>
-<rect class="band" x="20" y="438" width="772" height="196" rx="10"/>
-<text x="40" y="472" class="lvl">L1</text>
-<text x="40" y="492" class="d">engines</text>
-<rect class="chip" x="160" y="454" width="301" height="48" rx="6"/>
-<text x="174.0" y="475" class="n">nrese-engine</text>
-<text x="174.0" y="493" class="d">quads, snapshots, log</text>
-<rect class="chip" x="475" y="454" width="301" height="48" rx="6"/>
-<text x="489.0" y="475" class="n">nrese-dl</text>
-<text x="489.0" y="493" class="d">the DL engines</text>
-<rect class="chip" x="160" y="512" width="616" height="48" rx="6"/>
-<text x="174.0" y="533" class="n">nrese-vector</text>
-<text x="174.0" y="551" class="d">vector indexes</text>
-<rect class="chip" x="160" y="570" width="301" height="48" rx="6"/>
-<text x="174.0" y="591" class="n">nrese-exec</text>
-<text x="174.0" y="609" class="d">joins, closures, budgets</text>
-<rect class="chip" x="475" y="570" width="301" height="48" rx="6"/>
-<text x="489.0" y="591" class="n">nrese-owl</text>
-<text x="489.0" y="609" class="d">OWL 2 model, normaliser</text>
-<rect class="band" x="20" y="644" width="772" height="196" rx="10"/>
-<text x="40" y="678" class="lvl">L0</text>
-<text x="40" y="698" class="d">RDF</text>
-<text x="40" y="716" class="d">crates/rdf/</text>
-<rect class="chip" x="160" y="660" width="196" height="48" rx="6"/>
-<text x="174.0" y="681" class="n">nrese-rdf-io</text>
-<text x="174.0" y="699" class="d">RDF syntaxes</text>
-<rect class="chip" x="370" y="660" width="196" height="48" rx="6"/>
-<text x="384.0" y="681" class="n">nrese-sparql-syntax</text>
-<text x="384.0" y="699" class="d">SPARQL syntax</text>
-<rect class="chip" x="580" y="660" width="196" height="48" rx="6"/>
-<text x="594.0" y="681" class="n">nrese-sparql-results</text>
-<text x="594.0" y="699" class="d">results formats</text>
-<rect class="chip" x="160" y="718" width="616" height="48" rx="6"/>
-<text x="174.0" y="739" class="n">nrese-rdf</text>
-<text x="174.0" y="757" class="d">the RDF model</text>
-<rect class="chip" x="160" y="776" width="301" height="48" rx="6"/>
-<text x="174.0" y="797" class="n">nrese-json</text>
-<text x="174.0" y="815" class="d">JSON</text>
-<rect class="chip" x="475" y="776" width="301" height="48" rx="6"/>
-<text x="489.0" y="797" class="n">nrese-xsd</text>
-<text x="489.0" y="815" class="d">XSD and OWL datatypes</text>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="652" rx="0"/>
+<text x="1" y="16" class="text">Each crate uses only crates in rows below it,</text>
+<text x="1" y="34" class="text">never one beside it. Every name starts with <tspan class="code">nrese-</tspan>.</text>
+<rect class="box" x="0" y="50" width="400" height="62" rx="6"/>
+<text x="16" y="76" class="name">Console</text>
+<text x="384" y="76" class="code" text-anchor="end">apps/nrese-console</text>
+<text x="16" y="98" class="text">an npm app, not a crate: it uses the server over HTTP</text>
+<rect class="band" x="0" y="124" width="400" height="48" rx="8"/>
+<text x="384" y="153" class="muted" text-anchor="end">L4</text>
+<rect class="chip" x="16" y="135" width="70.58" height="26" rx="4"/>
+<text x="51.29" y="152.5" class="code" text-anchor="middle">server</text>
+<rect class="band" x="0" y="180" width="400" height="48" rx="8"/>
+<text x="384" y="209" class="muted" text-anchor="end">L3</text>
+<rect class="chip" x="16" y="191" width="62.15" height="26" rx="4"/>
+<text x="47.075" y="208.5" class="code" text-anchor="middle">store</text>
+<rect class="band" x="0" y="236" width="400" height="112" rx="8"/>
+<text x="16" y="262" class="name">Query, reasoning, validation</text>
+<text x="384" y="262" class="muted" text-anchor="end">L2</text>
+<rect class="chip" x="16" y="276" width="62.15" height="26" rx="4"/>
+<text x="47.075" y="293.5" class="code" text-anchor="middle">shacl</text>
+<rect class="chip" x="16" y="308" width="70.58" height="26" rx="4"/>
+<text x="51.29" y="325.5" class="code" text-anchor="middle">sparql</text>
+<rect class="chip" x="94.58" y="308" width="87.44" height="26" rx="4"/>
+<text x="138.3" y="325.5" class="code" text-anchor="middle">reasoner</text>
+<rect class="band" x="0" y="356" width="400" height="144" rx="8"/>
+<text x="16" y="382" class="name">Storage, execution and OWL</text>
+<text x="384" y="382" class="muted" text-anchor="end">L1</text>
+<rect class="chip" x="16" y="396" width="70.58" height="26" rx="4"/>
+<text x="51.29" y="413.5" class="code" text-anchor="middle">engine</text>
+<rect class="chip" x="94.58" y="396" width="36.86" height="26" rx="4"/>
+<text x="113.01" y="413.5" class="code" text-anchor="middle">dl</text>
+<rect class="chip" x="16" y="428" width="70.58" height="26" rx="4"/>
+<text x="51.29" y="445.5" class="code" text-anchor="middle">vector</text>
+<rect class="chip" x="16" y="460" width="53.72" height="26" rx="4"/>
+<text x="42.86" y="477.5" class="code" text-anchor="middle">exec</text>
+<rect class="chip" x="77.72" y="460" width="45.29" height="26" rx="4"/>
+<text x="100.365" y="477.5" class="code" text-anchor="middle">owl</text>
+<rect class="band" x="0" y="508" width="400" height="144" rx="8"/>
+<text x="16" y="534" class="name">RDF model and syntaxes</text>
+<text x="354" y="534" class="code" text-anchor="end">crates/rdf/</text>
+<text x="384" y="534" class="muted" text-anchor="end">L0</text>
+<rect class="chip" x="16" y="548" width="70.58" height="26" rx="4"/>
+<text x="51.29" y="565.5" class="code" text-anchor="middle">rdf-io</text>
+<rect class="chip" x="94.58" y="548" width="129.59" height="26" rx="4"/>
+<text x="159.375" y="565.5" class="code" text-anchor="middle">sparql-syntax</text>
+<rect class="chip" x="232.17" y="548" width="138.02" height="26" rx="4"/>
+<text x="301.18" y="565.5" class="code" text-anchor="middle">sparql-results</text>
+<rect class="chip" x="16" y="580" width="45.29" height="26" rx="4"/>
+<text x="38.645" y="597.5" class="code" text-anchor="middle">rdf</text>
+<rect class="chip" x="16" y="612" width="53.72" height="26" rx="4"/>
+<text x="42.86" y="629.5" class="code" text-anchor="middle">json</text>
+<rect class="chip" x="77.72" y="612" width="45.29" height="26" rx="4"/>
+<text x="100.365" y="629.5" class="code" text-anchor="middle">xsd</text>
 </svg>

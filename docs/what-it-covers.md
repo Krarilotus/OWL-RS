@@ -64,25 +64,28 @@ Reasoning is chosen per repository with [`reasoner.mode`](ops/config-reference.m
 out and what its answers promise is in [the reasoning contract](spec/reasoning-semantics.md#modes), and
 the W3C tests of each profile are under [standards](#standards).
 
-| Mode | Follows |
-|---|---|
-| `disabled` (the default) | No reasoning |
-| `rdfs` | The [RDFS entailment rules](https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative) rdfs2, rdfs3, rdfs5, rdfs7, rdfs9 and rdfs11: domain, range, sub-class and sub-property |
-| `rdfs-full` | The RDFS entailment rules and axioms of [RDF 1.1 Semantics](https://www.w3.org/TR/rdf11-mt/), but the few the contract lists |
-| `rdfs-plus`, `owl-horst` | RDFS plus equality and inverse, symmetric, transitive and functional properties, and for `owl-horst` also `hasValue`, `someValuesFrom` and `allValuesFrom` |
-| `owl2-ql` | The [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) rules, and answers through existential axioms by query rewriting ([design](design/ql-rewriting.md)). A query with a dataset of its own doesn't get the rewriting, so its answers say `sound-only` |
-| `owl2-rl` | The [OWL 2 RL/RDF rules](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules) |
-| `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency, classification, realisation and the certain answers they can prove ([design](design/owl2-dl.md)) |
-| `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every other mode that reasons |
+| Mode | Follows | At the query |
+|---|---|---|
+| `disabled` (the default) | No reasoning | Nothing |
+| `rdfs` | The [RDFS entailment rules](https://www.w3.org/TR/rdf11-mt/#patterns-of-rdfs-entailment-informative) rdfs2, rdfs3, rdfs5, rdfs7, rdfs9 and rdfs11: domain, range, sub-class and sub-property | Nothing: the write stored the inferences |
+| `rdfs-full` | The RDFS entailment rules and axioms of [RDF 1.1 Semantics](https://www.w3.org/TR/rdf11-mt/), but the few the contract lists | Nothing |
+| `rdfs-plus`, `owl-horst` | RDFS plus equality and inverse, symmetric, transitive and functional properties, and for `owl-horst` also `hasValue`, `someValuesFrom` and `allValuesFrom` | Nothing |
+| `owl2-ql` | The [OWL 2 QL](https://www.w3.org/TR/owl2-profiles/#OWL_2_QL) rules | Answers through existential axioms, by rewriting the query ([design](design/ql-rewriting.md)). A query with a dataset of its own isn't rewritten, so its answers say `sound-only` |
+| `owl2-rl` | The [OWL 2 RL/RDF rules](https://www.w3.org/TR/owl2-profiles/#Reasoning_in_OWL_2_RL_and_RDF_Graphs_using_Rules) | Nothing, or the rewriting as under `owl2-ql` with [`reasoner.ql_rewriting`](ops/config-reference.md#reasoner.ql_rewriting) set to `on` |
+| `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency and the certain answers ([design](design/owl2-dl.md)) | Rows the rules leave open are tested by those engines, within the [`dl.*` budgets](ops/config-reference.md#reasoner) |
+| `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every other mode that reasons | Nothing |
+
+In every mode, the same engines answer the class hierarchy and realisation (`/classification`, `/realisation`).
 
 To choose: `rdfs` for class and property hierarchies with domains and ranges, `owl2-rl` for most
 OWL ontologies, where every inference is made at the write and a query only reads, and `owl2-dl`
 when the ontology says what rules can't follow, such as that every pet is a cat or a dog, and you
-want such answers proven. It can add the DL engines' work to a commit and to a query the rules
-don't settle, within the [`dl.*` budgets](ops/config-reference.md#reasoner).
+want such answers proven. It can add the engines' work to a commit, too.
 
 A commit that, with its inferences, breaks a consistency rule of the mode is refused, and the
-response names the rule and its premises, as far as the writer may read them
+response names the rule and its premises, as far as the writer may read them. In every mode
+this includes a literal outside the datatype a rule gives it: under `rdfs`, a string value of a
+property whose range is `xsd:integer`
 ([consistency](spec/reasoning-semantics.md#consistency)).
 
 Beside the modes:
@@ -147,7 +150,7 @@ becomes visible:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/commit-dark.svg">
-  <img src="img/commit-light.svg" width="604" alt="A write is planned under the single writer slot on a snapshot; a write that is invalid, not allowed or too big is refused there. When reasoning is on, the reasoner derives the inferences and checks consistency, with the DL engines under owl2-dl; an inconsistent write is refused. When the SHACL gate is on, the shapes validate what the change can affect; under enforce a violation refuses the write. A timeout before Publish refuses it too. A refused write commits nothing, and the response says why. Otherwise the asserted and inferred changes are published as one revision, logged first in on-disk mode, and every query that starts after sees all of it.">
+  <img src="img/commit-light.svg" width="480" alt="A write goes through four steps in order. Apply works out the change, and no query sees it yet; it is refused if not allowed or invalid. Reasoning, when it is on, updates the inferred statements; it is refused if found to make the data inconsistent. Under owl2-dl, a check that runs out of its own budget doesn't refuse; consistency is then unknown. SHACL, when it is on, checks the data the write can affect against your shapes; with enforce it is refused if it introduces a violation or a shape can't be checked. The request's deadline or memory stops the write up to here. Publish: the asserted and inferred changes become one revision, on disk saved before you get the answer. A refused write commits nothing; the response says why.">
 </picture>
 
 The two checks:
@@ -157,7 +160,9 @@ The two checks:
    they don't decide lets the commit through, with the status `unknown`.
 2. With the SHACL gate on, the shapes validate the focus nodes the change can affect, inferred
    statements included. Only what the commit introduces counts, so data that was invalid before
-   doesn't block it.
+   doesn't block it. With the gate on, either setting refuses a write while the stored shapes
+   can't be used. Whatever the setting, shapes written to the shapes graph are refused if they
+   don't compile.
 
 If a check refuses the write, or the request times out before publishing starts, nothing
 of the request is committed, neither an asserted statement nor an inference, and the response
