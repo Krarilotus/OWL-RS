@@ -87,6 +87,10 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    /// A classification or realisation request gave up waiting for the computation under
+    /// way for its revision, which runs on and is kept.
+    #[error("the classification request was cancelled while it waited")]
+    ClassificationCancelled,
     /// A quarantined statement that isn't there, isn't open or can't be admitted as asked
     /// ([`crate::quarantine`]).
     #[error("{0}")]
@@ -251,6 +255,7 @@ impl StoreError {
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
             | Self::Undecided(_)
+            | Self::ClassificationCancelled
             // Answered by the transport as what it is (the query is fine; its answers
             // can't be proven complete).
             | Self::Incomplete(_) => false,

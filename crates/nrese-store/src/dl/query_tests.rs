@@ -957,3 +957,83 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// A question naming an individual the data doesn't name is decided only where the
+/// ontology has no key. Where the ontology can't be read within its budget (nothing cached
+/// for the revision and the bounds' memory spent, between the decision and the status), it
+/// isn't known whether it has one, so the answer is `sound-only`; it is still given, evaluated
+/// afresh with the memory back (the cached one was `complete`'s). On the rules route, whose
+/// status reads no ontology otherwise. The control: the same read with the memory free, over
+/// an ontology without keys, is decided.
+#[test]
+fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_ontology_isnt_read() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(
+        StoreService::new(crate::StoreConfig {
+            total_query_memory_bytes: 64 << 20,
+            ..crate::StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    commit(
+        &pipeline,
+        "INSERT DATA { :A a owl:Class . :a a :A . :r a owl:ObjectProperty . :a :r :x . }",
+    );
+    assert_eq!(store.dl_bounds().last, "rules", "the rules route");
+    let prepared = store
+        .prepare_query(&crate::SparqlQueryRequest::all(format!(
+            "{MARK_PREFIXES}ASK {{ :b a :A }}"
+        )))
+        .unwrap();
+    // The run's answer and status. The status is told before the answers are evaluated, and
+    // `told` runs then: a status other than the cached answer's evaluates them afresh, so
+    // the memory the hook spent is given back there.
+    let run = |told: &dyn Fn()| {
+        let (mut status, mut out) = (None, Vec::new());
+        store
+            .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
+                status = s;
+                told();
+            })
+            .unwrap();
+        (String::from_utf8(out).unwrap(), status.expect("a status"))
+    };
+    let (answer, free) = run(&|| {});
+    assert!(
+        free.complete && answer.contains("false"),
+        "the control: {answer} {free:?}"
+    );
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let spent = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (cache, budget, held) = (
+        Arc::clone(&store),
+        Arc::clone(&kept),
+        std::rc::Rc::clone(&spent),
+    );
+    crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        drop(cache.dl().query_ontology.0.lock().unwrap().take());
+        let rest = budget.remaining();
+        budget.charge(rest).unwrap();
+        held.set(rest);
+    })));
+    let given = std::cell::Cell::new(0);
+    let (answer, refused) = run(&|| {
+        given.set(spent.take());
+        kept.release(given.get());
+    });
+    assert!(given.get() > 0, "the hook spent the bounds' memory");
+    assert!(
+        refused.sound && !refused.complete,
+        "with the ontology unread: {refused:?}"
+    );
+    assert!(
+        answer.contains("false"),
+        "the answer, evaluated afresh: {answer}"
+    );
+}
