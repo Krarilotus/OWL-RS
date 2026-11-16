@@ -304,6 +304,7 @@ pub fn instantiate_with_premises(
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
     let mut lists =
         |predicate: u64, name: &'static str, rules: &mut Vec<Rule>, make: &mut MakeRules| {
+            debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
             for (subject, head) in facts.pairs(predicate) {
                 let mut diagnose = |problem| {
                     let diagnostic = ListDiagnostic {
@@ -483,7 +484,10 @@ pub fn instantiate_with_premises(
         },
     );
     // cax-adc, eq-diff2, prp-adp: pairwise over `members`, by the type of the axiom node.
-    let typed = |node: u64, class: u64| facts.objects(node, ty).contains(&class);
+    let typed = |node: u64, class: u64| {
+        debug_assert!(voc.is_list_fact([node, ty, class]), "read, not a list fact");
+        facts.objects(node, ty).contains(&class)
+    };
     // The premise that makes two members of an AllDifferent axiom inconsistent: `a sameAs b`,
     // or, when the list names one individual twice, the axiom itself (`a sameAs a` holds by
     // eq-ref, which isn't materialised).
