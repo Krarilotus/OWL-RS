@@ -775,8 +775,14 @@ impl ProbeMode {
 }
 
 /// One view's probe answers, by mode ([`ProbeMode`]), then by probe.
+/// And the bytes they take, each counted as its key's length and [`PROBE_ENTRY`] bytes: at
+/// most [`PROBE_BYTES`], past which they are all dropped; an answer past it alone is never
+/// kept (docs/design/ql-rewriting.md §2).
 #[derive(Debug, Default)]
-pub(crate) struct Probes(HashMap<ProbeMode, HashMap<String, bool>>);
+pub(crate) struct Probes(HashMap<ProbeMode, HashMap<String, bool>>, usize);
+
+const PROBE_BYTES: usize = 4 << 20;
+const PROBE_ENTRY: usize = 48;
 
 /// [`Probes::all`]: each probe's answer, with its mode and its query, sorted.
 #[cfg(test)]
@@ -788,10 +794,19 @@ impl Probes {
     }
 
     fn insert(&mut self, mode: ProbeMode, key: &str, known: bool) {
-        self.0
-            .entry(mode)
-            .or_default()
-            .insert(key.to_owned(), known);
+        let bytes = key.len() + PROBE_ENTRY;
+        if bytes > PROBE_BYTES {
+            // Past the cap alone: not kept, so asked again when next needed.
+            return;
+        }
+        if self.1 + bytes > PROBE_BYTES {
+            // A dropped answer is asked again when next needed, never guessed.
+            *self = Self::default();
+        }
+        let kept = self.0.entry(mode).or_default();
+        if kept.insert(key.to_owned(), known).is_none() {
+            self.1 += bytes;
+        }
     }
 
     /// Every answer, with its mode.

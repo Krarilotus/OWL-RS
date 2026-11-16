@@ -81,6 +81,10 @@ pub struct Ontology {
     pub diagnostics: Vec<Diagnostic>,
     /// Annotation statements and the ontology header, read past.
     pub annotations: usize,
+    /// The annotation properties given a domain, a range or a super-property, read past
+    /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
+    /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
+    pub annotation_schema: Vec<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
     /// The literals, datatypes and facets of the data axioms, as the source gives them.
@@ -89,6 +93,12 @@ pub struct Ontology {
     pub anonymous: BTreeSet<Term>,
     /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
     pub rules: Vec<crate::rules::Rule>,
+    /// The first restriction whose max cardinality (qualified or not; the only ones the RL
+    /// rules read) isn't written as the RDF mapping writes it,
+    /// `"n"^^xsd:nonNegativeInteger` with `n` canonical (`1`, not `01`; Turtle's `1` is an
+    /// xsd:integer): read here by its value, but OWL 2 RL's rules (cls-maxc1/2,
+    /// cls-maxqc1-4) name the mapping's literal, so they don't read it.
+    pub noncanonical_cardinality: Option<Term>,
     /// The first data property with a maximum written with a data range (`owl:onDataRange`,
     /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
     /// an unqualified maximum.
@@ -363,6 +373,9 @@ struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
     declaration_kinds: [(Option<Term>, EntityKind); 8],
+    /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
+    /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
+    builtin_annotations: ([Option<Term>; 9], Option<Term>),
     terms: &'a dyn Terms,
     statements: &'a [Statement],
     /// Per subject: (predicate, object, graph).
@@ -387,6 +400,8 @@ struct Reader<'a> {
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<(Term, &'static str)>,
     annotations: usize,
+    noncanonical_cardinality: Option<Term>,
+    annotation_schema: Vec<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -416,6 +431,20 @@ pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
     ),
 ];
 
+/// The annotation properties OWL 2 builds in (Structural Specification §5.5): the reader
+/// reads a statement of one as an annotation, which gives its terms no kind.
+pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2000/01/rdf-schema#comment",
+    "http://www.w3.org/2000/01/rdf-schema#seeAlso",
+    "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
+    "http://www.w3.org/2002/07/owl#deprecated",
+    "http://www.w3.org/2002/07/owl#versionInfo",
+    "http://www.w3.org/2002/07/owl#priorVersion",
+    "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
+    "http://www.w3.org/2002/07/owl#incompatibleWith",
+];
+
 /// `Some(id) == Some(x)` without matching an absent term.
 fn is(id: Term, term: Option<Term>) -> bool {
     term == Some(id)
@@ -440,6 +469,10 @@ impl<'a> Reader<'a> {
         Self {
             v,
             declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
+            builtin_annotations: (
+                BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
+                terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
+            ),
             terms,
             statements,
             by_subject,
@@ -459,6 +492,8 @@ impl<'a> Reader<'a> {
             diagnostics: Vec::new(),
             reported: HashSet::new(),
             annotations: 0,
+            noncanonical_cardinality: None,
+            annotation_schema: Vec::new(),
         }
     }
 
@@ -835,15 +870,24 @@ impl<'a> Reader<'a> {
                     && self.says_data(node)));
         let number = |reader: &mut Self, predicate: Option<Term>| -> Option<Option<u32>> {
             let literal = reader.one(node, predicate)?;
-            let parsed = reader
-                .terms
-                .lexical(literal)
-                .and_then(|text| text.trim().parse::<u32>().ok());
+            let text = reader.terms.lexical(literal);
+            let parsed = text.as_deref().and_then(|t| t.trim().parse::<u32>().ok());
             if parsed.is_none() {
                 reader.report(Diagnostic::Malformed {
                     node,
                     what: "a cardinality that isn't a non-negative integer",
                 });
+            }
+            // The source may not give the datatype: then the lexical form alone decides.
+            let datatype = reader.terms.datatype(literal);
+            let mapped = parsed.is_some_and(|n| text == Some(n.to_string()))
+                && datatype
+                    .is_none_or(|d| d == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger");
+            // The rules read only a max cardinality: an exact or min one's spelling matters
+            // to none.
+            let max = [reader.v.owl_max_cardinality, reader.v.owl_max_qualified];
+            if max.contains(&predicate) && !mapped {
+                reader.noncanonical_cardinality.get_or_insert(node);
             }
             Some(parsed)
         };
@@ -1233,6 +1277,7 @@ impl<'a> Reader<'a> {
         } else if is(p, v.rdfs_sub_property_of) {
             if self.declared_as(s, EntityKind::AnnotationProperty) {
                 self.annotations += 1;
+                self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 self.add(Axiom::SubDataPropertyOf(s, o), triple);
             } else if let (Some(sub), Some(sup)) =
@@ -1287,6 +1332,7 @@ impl<'a> Reader<'a> {
             let domain = is(p, v.rdfs_domain);
             if self.declared_as(s, EntityKind::AnnotationProperty) {
                 self.annotations += 1;
+                self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 if domain {
                     if let Some(class) = self.class(o) {
@@ -1469,21 +1515,8 @@ impl<'a> Reader<'a> {
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
     fn is_builtin_annotation(&self, predicate: Term) -> bool {
-        const BUILT_IN: [&str; 9] = [
-            "http://www.w3.org/2000/01/rdf-schema#label",
-            "http://www.w3.org/2000/01/rdf-schema#comment",
-            "http://www.w3.org/2000/01/rdf-schema#seeAlso",
-            "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
-            "http://www.w3.org/2002/07/owl#deprecated",
-            "http://www.w3.org/2002/07/owl#versionInfo",
-            "http://www.w3.org/2002/07/owl#priorVersion",
-            "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
-            "http://www.w3.org/2002/07/owl#incompatibleWith",
-        ];
-        BUILT_IN
-            .iter()
-            .any(|iri| self.terms.iri(iri) == Some(predicate))
-            || self.terms.iri("http://www.w3.org/2002/07/owl#versionIRI") == Some(predicate)
+        let (builtin, version_iri) = &self.builtin_annotations;
+        builtin.contains(&Some(predicate)) || *version_iri == Some(predicate)
     }
 
     fn finish(mut self) -> Ontology {
@@ -1493,6 +1526,8 @@ impl<'a> Reader<'a> {
             axioms.push(axiom);
             sources.push(from);
         }
+        self.annotation_schema.sort_unstable();
+        self.annotation_schema.dedup();
         let mut ontology = Ontology {
             classes: self.classes,
             ranges: self.ranges,
@@ -1500,10 +1535,12 @@ impl<'a> Reader<'a> {
             sources,
             diagnostics: self.diagnostics,
             annotations: self.annotations,
+            annotation_schema: self.annotation_schema,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
             rules: Vec::new(),
+            noncanonical_cardinality: self.noncanonical_cardinality,
             qualified_data_max: self.qualified_data_max,
         };
         complete(&mut ontology, self.terms);

@@ -146,6 +146,7 @@ pub struct SerializedQueryResult {
     pub ql: Option<nrese_sparql::ql::QlReport>,
     /// Whether the answers are complete, where a reasoning path can leave some out (the
     /// status [`crate::StoreService::run_query_reporting`] reports; `not-certified` for
-    /// that reader where the rewriting ran).
+    /// that reader where the rewriting ran, and for any reader of some graphs under
+    /// `owl2-dl`).
     pub completeness: Option<nrese_sparql::Completeness>,
 }

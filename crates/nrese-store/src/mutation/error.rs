@@ -34,6 +34,10 @@ pub enum MutationError {
     Retired,
 }
 
+// Every write's result carries this error. Clippy's `result_large_err` stops the gate at 128
+// bytes, and a path is 8 bytes wider on Windows than on Linux: 96 holds on both, with room.
+const _: () = assert!(std::mem::size_of::<MutationError>() <= 96);
+
 /// Details of a gate rejection, shared by HTTP problem responses and operator diagnostics.
 /// A committer that may read only some graphs is told only what its own view shows
 /// (`super::evidence`, the one place that makes a rejection).
@@ -56,6 +60,9 @@ pub enum RejectKind {
     /// The data shown is inconsistent (an OWL 2 RL consistency rule, or OWL 2 DL): the
     /// whole data for a reader of every graph, else the committer's own graphs.
     Inconsistent,
+    /// Under `owl2-dl`, the OWL 2 RL rules find a clash in the whole data that OWL 2 DL may
+    /// read as consistent, and the store doesn't decide which (`crate::WhyUndecided`).
+    Undecided,
     /// The data shown has SHACL results the gate rejects for, as above.
     ShapesViolated,
     /// The committer's graphs show no reason by themselves: the same for every gate.

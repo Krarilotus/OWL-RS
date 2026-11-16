@@ -120,7 +120,8 @@ impl ImageManifest {
         match nrese_engine::image_revision(&self.file) {
             Some(_) => Ok(&self.file),
             None => Err(StoreError::Configuration(format!(
-                "the manifest names the image {:?}, not a checkpoint file name                  (checkpoint-<revision>.nck)",
+                "the manifest names the image {:?}, not a checkpoint file name \
+                 (checkpoint-<revision>.nck)",
                 self.file
             ))),
         }
@@ -245,6 +246,16 @@ pub fn place_image(
         return Err(StoreError::Configuration(format!(
             "{} holds a store: restore into an empty data directory",
             data_dir.display()
+        )));
+    }
+    // A store removed but for its reasoning certificate: kept, a start would trust it for the
+    // image's data.
+    let marker = data_dir.join(crate::service::REASONING_MARKER);
+    if marker.exists() {
+        return Err(StoreError::Configuration(format!(
+            "{} is a removed store's reasoning certificate: \
+             remove it, or restore into an empty data directory",
+            marker.display()
         )));
     }
     // Every new level durably named (review r1, R1-F2), as the placement owns it.

@@ -308,6 +308,76 @@ pub(super) fn negation(query: &Query) -> Option<&'static str> {
     found
 }
 
+/// The first value `query` matches against the data by its spelling, where it may be a
+/// typed literal: a literal that is no string (simple or language-tagged) at a pattern's or
+/// a path's end; or a variable at such an end, anywhere in the query, that `VALUES` binds to
+/// such a literal or a `BIND` (a projection's `(… AS ?v)` too) binds to anything but an IRI
+/// or a string constant, a computed value or a copy included. A number, a date or any
+/// other typed value has more than one spelling (`"2"`, `"+2"`, `"02"`). The store keeps
+/// each as written and matches by spelling, while the regime's answers go by value (SPARQL
+/// 1.1 Entailment §7.2). One walk; it allocates for the variables it meets, once per query
+/// ([`Reads`]).
+pub(super) fn typed_constant(query: &Query) -> Option<String> {
+    use nrese_sparql_syntax::{algebra::Expression, term::GroundTerm};
+    let typed = |l: &nrese_rdf::Literal| (!l.is_plain()).then(|| l.to_string());
+    let (mut found, mut bound, mut ends) = (None, Vec::new(), HashSet::new());
+    pattern_of(query).find(&mut |node| {
+        let mut end = |t: &TermPattern| match t {
+            TermPattern::Literal(l) => typed(l),
+            TermPattern::Variable(v) => {
+                ends.insert(v.as_str().to_owned());
+                None
+            }
+            _ => None,
+        };
+        let mut bind = |v: &Variable, what: Option<String>| {
+            bound.extend(what.map(|c| (v.as_str().to_owned(), c)));
+        };
+        found = match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => patterns
+                .iter()
+                .find_map(|t| end(&t.subject).or_else(|| end(&t.object))),
+            Node::Pattern(GraphPattern::Path {
+                subject, object, ..
+            }) => end(subject).or_else(|| end(object)),
+            Node::Pattern(GraphPattern::Values {
+                variables,
+                bindings,
+            }) => {
+                for row in bindings {
+                    for (v, value) in variables.iter().zip(row) {
+                        if let Some(GroundTerm::Literal(l)) = value {
+                            bind(v, typed(l));
+                        }
+                    }
+                }
+                None
+            }
+            Node::Pattern(GraphPattern::Extend { bindings, .. }) => {
+                for (v, value) in bindings {
+                    bind(
+                        v,
+                        match value {
+                            Expression::Literal(l) => typed(l),
+                            Expression::NamedNode(_) => None,
+                            _ => Some(format!("the value it computes for ?{}", v.as_str())),
+                        },
+                    );
+                }
+                None
+            }
+            _ => None,
+        };
+        found.is_some()
+    });
+    found.or_else(|| {
+        bound
+            .into_iter()
+            .find(|(v, _)| ends.contains(v))
+            .map(|(_, c)| c)
+    })
+}
+
 /// Whether `iri` is in a reserved namespace, rdf:, rdfs: or owl:, whose entailed statements
 /// no closure, rewriting or bound holds in full.
 fn reserved(iri: &str) -> bool {
@@ -318,6 +388,32 @@ fn reserved(iri: &str) -> bool {
     ]
     .iter()
     .any(|ns| iri.starts_with(ns))
+}
+
+/// The first IRI outside the [`reserved`] namespaces that `query` names as a pattern's
+/// subject or object and `held` says the data doesn't hold.
+pub(super) fn named_outside(query: &Query, held: impl Fn(&str) -> bool) -> Option<String> {
+    let mut found = None;
+    pattern_of(query).find(&mut |node| {
+        let ends = match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => patterns
+                .iter()
+                .flat_map(|t| [&t.subject, &t.object])
+                .collect(),
+            Node::Pattern(GraphPattern::Path {
+                subject, object, ..
+            }) => vec![subject, object],
+            _ => Vec::new(),
+        };
+        found = ends.into_iter().find_map(|end| match end {
+            TermPattern::NamedNode(n) if !reserved(n.as_str()) && !held(n.as_str()) => {
+                Some(n.as_str().to_owned())
+            }
+            _ => None,
+        });
+        found.is_some()
+    });
+    found
 }
 
 /// The first read of `query` that may miss entailed rows wherever it is answered (default

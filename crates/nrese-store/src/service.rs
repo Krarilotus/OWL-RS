@@ -7,6 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
+use crate::dl::query::Revision;
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -80,7 +81,7 @@ pub struct StoreService {
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
-const REASONING_MARKER: &str = "reasoning.state";
+pub(crate) const REASONING_MARKER: &str = "reasoning.state";
 
 /// A change of the reasoning certificate in progress
 /// ([`StoreService::certificate_epoch`]): made odd by its start, the epoch is even again when
@@ -212,6 +213,7 @@ impl StoreService {
                             .then_some(config.bulk_load_memory_bytes),
                         wal_archive: config.wal_archive,
                         wal_damage: config.wal_damage,
+                        forget_on_cut: Some(REASONING_MARKER),
                         ..defaults.durability
                     },
                     ..defaults
@@ -582,28 +584,26 @@ impl StoreService {
         let _transition = self.certificate_transition(writer);
         #[cfg(test)]
         hooks::run(&hooks::INSIDE_INVALIDATION);
+        // The marker first, the certificate in memory once it is gone: a removal that fails
+        // fails the write before it changes anything, and leaves the certificate whole (its QL
+        // rewriting and equality setting included) over the data it was computed for. Until
+        // the write publishes, that is the data readers see.
+        if self.marker.load(Ordering::Acquire)
+            && let Some(path) = self.marker_path()
+        {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            // Failed, the file may still be there, or its removal not durable: the next
+            // invalidation tries again (the review of 3 October 2026, A4).
+            crate::metadata::remove(&path).map_err(crate::error::StoreError::Io)?;
+        }
+        self.marker.store(false, Ordering::Release);
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
         *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        if !self.marker.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        if let Some(path) = self.marker_path() {
-            // The removal durable too (DUR-3): a marker back after a power loss would claim the
-            // inferred stack exact for reasoning it no longer reflects. Gone already (an
-            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
-            match crate::metadata::remove(&path) {
-                Ok(()) => {}
-                Err(error) => {
-                    // The file may still be there, or its removal not durable: the next
-                    // invalidation tries again (the review of 3 October 2026, A4).
-                    self.marker.store(true, Ordering::Release);
-                    return Err(crate::error::StoreError::Io(error));
-                }
-            }
-        }
         Ok(())
     }
 
@@ -784,7 +784,10 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
     ) -> StoreResult<nrese_engine::Snapshot> {
-        self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation))
+        let read = self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation));
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
+        read
     }
 
     /// [`Self::read_snapshot`] for a statement or graph read (RDF4J, the Graph Store): its
@@ -881,6 +884,14 @@ impl StoreService {
         // Under the writer slot, as every change of the certificate's QL schema.
         let tx = self.engine.transaction();
         self.dl.set_active(active, user_rules);
+        // A state with violations (read at open, or recorded before): whether `owl2-dl`
+        // decides them, derived under the mode now set (`ReasoningState::undecided`).
+        if let Some(mut state) = self.reasoning_state().filter(|s| s.violations > 0) {
+            state.undecided = active
+                .then(|| self.dl.undecided(&self.engine.snapshot()))
+                .flatten();
+            *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
+        }
         if active {
             // The bounds give the answers through existentials (see `note_ql`).
             *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
@@ -906,7 +917,6 @@ impl StoreService {
     pub fn dl(&self) -> &crate::dl::Dl {
         &self.dl
     }
-
     /// The `owl2-dl` mode's bounds at the latest revision (`crate::dl::bounds`): the
     /// upper bound U1 built afresh if it doesn't describe that revision.
     pub fn dl_bounds(&self) -> crate::dl::BoundsReport {
@@ -1061,11 +1071,12 @@ impl StoreService {
     /// OWL 2 QL rewriting's where it applies, else a ruleset closure's
     /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
     /// A reader of some graphs who sees every inference is told `not-certified` where the
-    /// rewriting ran: its assessment reads the schema of every graph. With the status,
-    /// `report` is handed the header text kept with the answer where the result cache
-    /// gives it (made by an earlier `report` for a request told the same status), and
-    /// returns the text it made for an answer written now (`None`: none), which the store
-    /// keeps with the answer where it offers that to the cache.
+    /// rewriting ran, and any reader of some graphs under `owl2-dl`: either assessment reads
+    /// the schema of every graph. With the status, `report` is handed the header text kept
+    /// with the answer where the result cache gives it (made by an earlier `report` for a
+    /// request told the same status), and returns the text it made for an answer written
+    /// now (`None`: none), which the store keeps with the answer where it offers that to
+    /// the cache.
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
@@ -1108,6 +1119,7 @@ impl StoreService {
         Option<nrese_sparql::ql::QlReport>,
     )> {
         let run = self.run_reporting_whole(prepared, cancellation, out, report);
+        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::Run, run, |_| {})
     }
 
@@ -1132,14 +1144,14 @@ impl StoreService {
             let detail =
                 match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
                     Outcome::Answers(answers, status, detail) => {
-                        report(Some(status), None);
+                        report(status_for_its_reader(prepared, Some(status), false), None);
                         crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                         detail
                     }
                     // Streamed over the snapshot the status was decided on (L's view where
                     // L adds memberships, kept per revision, whose identity is its own),
-                    // never a later revision's; or, for a status that holds whatever the
-                    // revision (sound only), over the latest.
+                    // never a later revision's; or, for a reader of some graphs, whose
+                    // status is withheld, over the latest.
                     Outcome::Stream(status, read, detail) => {
                         let snapshot = match read {
                             Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
@@ -1155,13 +1167,17 @@ impl StoreService {
                             cancellation,
                             &memory,
                             out,
-                            |_| (context, |kept| report(Some(status), kept)),
+                            |_| {
+                                let told = status_for_its_reader(prepared, Some(status), false);
+                                (context, move |kept| report(told, kept))
+                            },
                         )?;
                         detail
                     }
                 };
             return Ok((Some(detail), None));
         }
+        self.refuse_exact(prepared, || self.status_without_dl(prepared))?;
         let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
         let ql = run_query(
             &snapshot,
@@ -1171,7 +1187,7 @@ impl StoreService {
             &memory,
             out,
             |ql| {
-                let status = self.status_outside_dl(prepared, ql);
+                let status = self.status_outside_dl(prepared, ql, Revision::Committed(&snapshot));
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
                 let told = status_for_its_reader(prepared, status, ql.is_some());
@@ -1183,15 +1199,17 @@ impl StoreService {
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
     /// as it left the rewriting with what neither it nor the closure answers composed onto
-    /// it ([`crate::dl::query::certify_report`]); else [`Self::status_without_dl`].
+    /// it ([`crate::dl::query::certify_report`]); else [`Self::status_without_dl`], marked
+    /// for the data `at` the answers were read from.
     fn status_outside_dl(
         &self,
         prepared: &PreparedQuery,
         ql: Option<&nrese_sparql::ql::QlReport>,
+        at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
         match ql {
             Some(ql) => Some(ql.completeness.clone()),
-            None => self.status_without_dl(prepared),
+            None => self.status_without_dl_at(prepared, at),
         }
     }
 
@@ -1202,10 +1220,22 @@ impl StoreService {
     /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
     /// rules' closure without the bounds (`Self::dl_mode`): sound only, never complete
     /// (SYN-72 slice 2 r1 F1). Either is unsound where a missing row can make a returned
-    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]).
+    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]). As
+    /// `prepared`'s reader is told it (`status_for_its_reader`).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
+    ) -> Option<nrese_sparql::Completeness> {
+        let status =
+            self.status_without_dl_at(prepared, Revision::Committed(&self.engine.snapshot()));
+        status_for_its_reader(prepared, status, false)
+    }
+
+    /// [`Self::status_without_dl`] of a read of the data `at` (R1-F2, F3).
+    fn status_without_dl_at(
+        &self,
+        prepared: &PreparedQuery,
+        at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
         if prepared.read_model() == ReadModel::Asserted {
             return None;
@@ -1219,6 +1249,7 @@ impl StoreService {
                     .to_owned(),
             );
             crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
+            crate::dl::query::mark(self, prepared, at, &mut status);
             return Some(status);
         }
         let ruleset = self
@@ -1247,6 +1278,25 @@ impl StoreService {
     fn dl_mode(&self, prepared: &PreparedQuery) -> Option<crate::DlAnswers> {
         (self.dl.active() && prepared.read_model() == ReadModel::Materialised)
             .then(|| prepared.dl_answers().unwrap_or(self.config.dl.answers))
+    }
+
+    /// Exact answers asked for under `owl2-dl` on a read past the bounds (the inferred
+    /// statements alone, or a transaction's pending state), which isn't certified complete:
+    /// refused before it runs by the rule the bounds' path follows
+    /// ([`crate::dl::query::refuse_unless_complete`]), with the `status` the read would
+    /// carry, built only when exact answers are asked for.
+    fn refuse_exact(
+        &self,
+        prepared: &PreparedQuery,
+        status: impl FnOnce() -> Option<nrese_sparql::Completeness>,
+    ) -> StoreResult<()> {
+        let mode = prepared.dl_answers().unwrap_or(self.config.dl.answers);
+        if !self.dl.active() || mode != crate::DlAnswers::Exact {
+            return Ok(());
+        }
+        status().map_or(Ok(()), |status| {
+            crate::dl::query::refuse_unless_complete(mode, &status, Vec::new)
+        })
     }
 
     /// What every query gets from the store.
@@ -1298,13 +1348,9 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
-        let mut explanation = explain_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
-            prepared,
-            &self.settings,
-            cancellation,
-            &memory,
-        )?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let mut explanation =
+            explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         if let Some(mode) = self.dl_mode(prepared) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
@@ -1323,7 +1369,9 @@ impl StoreService {
                 refuted: detail.refuted,
             });
         } else {
-            explanation.completeness = self.status_outside_dl(prepared, explanation.ql.as_ref());
+            let at = Revision::Committed(&snapshot);
+            explanation.completeness =
+                self.status_outside_dl(prepared, explanation.ql.as_ref(), at);
         }
         Ok(explanation)
     }
@@ -1356,16 +1404,13 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        let mut planned = plan_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
-            prepared,
-            &self.settings,
-            cancellation,
-            &memory,
-        )?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let mut planned =
+            plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
+        let at = Revision::Committed(&snapshot);
         planned.completeness = match self.dl_mode(prepared) {
-            Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
-            None => self.status_outside_dl(prepared, planned.ql.as_ref()),
+            Some(_) => Some(crate::dl::query::plan_status(self, prepared, cancellation)?),
+            None => self.status_outside_dl(prepared, planned.ql.as_ref(), at),
         };
         Ok(planned)
     }
@@ -1563,7 +1608,37 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
+        // The status the answers carry, of the pending state `at` they are read from.
+        let status_of = |ql: Option<&nrese_sparql::ql::QlReport>, at: Revision<'_>| {
+            let mut status = match in_dl {
+                true => {
+                    let mut status =
+                        nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+                    status.incomplete(
+                        "dl",
+                        "a read inside a transaction: its pending operations aren't reasoned \
+                         over before the commit (the committed closure, no DL bounds)"
+                            .to_owned(),
+                    );
+                    crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
+                    crate::dl::query::mark(self, prepared, at, &mut status);
+                    Some(status)
+                }
+                false => self.status_outside_dl(prepared, ql, at),
+            };
+            if deletes && let Some(status) = &mut status {
+                status.unsound(
+                    "transaction",
+                    "the pending operations may delete statements whose inferences remain \
+                     until the commit"
+                        .to_owned(),
+                );
+            }
+            status
+        };
         let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
+            // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
+            self.refuse_exact(prepared, || status_of(None, Revision::Pending(snapshot)))?;
             run_query(
                 snapshot,
                 prepared,
@@ -1572,36 +1647,15 @@ impl StoreService {
                 &memory,
                 out,
                 |ql| {
-                    let mut status = match in_dl {
-                        true => {
-                            let mut status =
-                                nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-                            status.incomplete(
-                        "dl",
-                        "a read inside a transaction: its pending operations aren't reasoned \
-                         over before the commit (the committed closure, no DL bounds)"
-                            .to_owned(),
-                    );
-                            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-                            Some(status)
-                        }
-                        false => self.status_outside_dl(prepared, ql),
-                    };
-                    if deletes && let Some(status) = &mut status {
-                        status.unsound(
-                            "transaction",
-                            "the pending operations may delete statements whose inferences remain \
-                     until the commit"
-                                .to_owned(),
-                        );
-                    }
                     // A transaction's pending state: never answered from the cache.
+                    let status = status_of(ql, Revision::Pending(snapshot));
                     report(status_for_its_reader(prepared, status, ql.is_some()), None);
                     (Vec::new(), |_| None)
                 },
             )
             .map(|_| ())
         });
+        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
 
@@ -2186,6 +2240,10 @@ impl StoreService {
             reported.diagnostics_total,
             "materialisation skipped an ontology axiom",
         );
+        // Under `owl2-dl`, whether it decides the violations (`ReasoningState::undecided`).
+        let undecided = (violations > 0 && self.dl.active())
+            .then(|| self.dl.undecided(base))
+            .flatten();
         // The last word under the writer slot: a caller whose claim ended meanwhile (a
         // retired pipeline, a cancelled request) changes nothing.
         if stop() {
@@ -2209,16 +2267,22 @@ impl StoreService {
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(
             finished.writer(),
-            crate::ReasoningState::of_with(
-                rules,
-                self.config.hide_unnamed_classes,
-                self.config.equality_compact,
-                violations,
-            ),
+            crate::ReasoningState {
+                undecided,
+                ..crate::ReasoningState::of_with(
+                    rules,
+                    self.config.hide_unnamed_classes,
+                    self.config.equality_compact,
+                    violations,
+                )
+            },
         )
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
         drop(finished);
-        if violations > 0 {
+        if let Some(why) = undecided {
+            let text = why.text(violations);
+            tracing::error!(ruleset = %rules.name(), violations_at_least, "{text}; the store is in quarantine until it is repaired");
+        } else if violations > 0 {
             tracing::error!(
                 ruleset = %rules.name(),
                 violations,
@@ -2300,16 +2364,34 @@ fn read_model(infer: bool) -> crate::ReadModel {
 /// reader of some graphs who sees every inference (`inferred = "visible"`) is told
 /// `not-certified` wherever the OWL 2 QL rewriting ran: its assessment reads the schema of
 /// every graph. Whether the rewriting runs depends on the query and the configuration, not
-/// on the schema, so the token tells nothing of hidden data.
+/// on the schema, so the token tells nothing of hidden data. So is every reader of some
+/// graphs told it for a status under `owl2-dl` (R1-F1): whether OWL 2 DL reads the data
+/// otherwise than the rules is a question of every graph's axioms
+/// ([`crate::dl::query::mark`]), and the regime is the configuration's.
 fn status_for_its_reader(
     prepared: &PreparedQuery,
     status: Option<nrese_sparql::Completeness>,
     rewritten: bool,
 ) -> Option<nrese_sparql::Completeness> {
-    match rewritten && withholds_certification(prepared) {
+    let dl = status.as_ref().and_then(|s| s.regime) == Some(nrese_sparql::Regime::Owl2Dl);
+    match (rewritten && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
         true => Some(nrese_sparql::Completeness::not_certified()),
         false => status,
     }
+}
+
+/// An exact answer's refusal as its reader may be told it: its status through
+/// [`status_for_its_reader`], its unresolved candidates only where that is the status.
+fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) -> crate::StoreError {
+    let crate::StoreError::Incomplete(mut answer) = error else {
+        return error;
+    };
+    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false);
+    if let Some(told) = told.filter(|told| *told != answer.status) {
+        answer.status = told;
+        answer.unresolved.clear();
+    }
+    crate::StoreError::Incomplete(answer)
 }
 
 /// [`status_for_its_reader`] for an answer that carries the rewriting's report too, as an
@@ -2391,7 +2473,9 @@ pub(crate) mod hooks {
     pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
 
     thread_local! {
-        /// A bulk load has cleared the reasoning certificate and is about to load.
+        /// A bulk load holds the writer slot and is about to read its files.
+        pub(crate) static BEFORE_LOAD_READS: Hook = const { RefCell::new(None) };
+        /// A bulk load has cleared the reasoning certificate and is about to publish.
         pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
@@ -2407,6 +2491,9 @@ pub(crate) mod hooks {
         /// An invalidation of the certificate has begun its change of the epoch, and the old
         /// certificate is still in place.
         pub(crate) static INSIDE_INVALIDATION: Hook = const { RefCell::new(None) };
+        /// What a read reads is fixed and its status is still to come: an `owl2-dl` query has
+        /// decided its answers, or another read has taken its snapshot.
+        pub(crate) static AFTER_DECIDED: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
@@ -2504,7 +2591,8 @@ mod certificate_tests {
         (a, b)
     }
 
-    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its load.
+    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its
+    /// publication.
     /// Before the fix the load cleared the certificate before it took the writer slot: the
     /// rematerialisation then certified RDFS, and the load committed `C subClassOf D` under it.
     #[test]
@@ -2525,6 +2613,87 @@ mod certificate_tests {
         drop(store);
         let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
         stale(&store, "after a reopen", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A bulk load clears the certificate before it publishes, never after, and a load whose
+    /// clearing fails (the marker can't be removed) changes nothing: it publishes nothing, and
+    /// the certificate stays whole, the QL rewriting it switches on included, so every answer
+    /// stays, in the process and after a reopen. Published first, the load's data would be
+    /// served and on disk under the old marker; the rewriting dropped first, the existential's
+    /// answer would go while the marker still certifies the data.
+    #[test]
+    fn a_load_that_cannot_clear_the_certificate_publishes_nothing() {
+        const EX: &str = "http://example.com/";
+        let dir = tempfile::tempdir().unwrap();
+        // `:a :p ?o` holds only through the rewriting of the existential, which the
+        // certificate switches on.
+        let ontology = dir.path().join("ontology.ttl");
+        std::fs::write(
+            &ontology,
+            format!(
+                "@prefix : <{EX}> .\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+                 owl:someValuesFrom owl:Thing ] .\n:a a :A .\n"
+            ),
+        )
+        .unwrap();
+        let more = dir.path().join("more.nt");
+        std::fs::write(&more, format!("<{EX}b> <{EX}q> <{EX}c> .\n")).unwrap();
+        let store_dir = dir.path().join("store");
+        let config = || StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::on_disk(&store_dir)
+        };
+        let marker = || std::fs::read(store_dir.join(super::REASONING_MARKER)).ok();
+        let ask = |store: &StoreService, query: &str| {
+            let answer = store.execute_query_str(query).unwrap();
+            String::from_utf8_lossy(&answer.payload).contains("true")
+        };
+        let store = StoreService::new(config()).unwrap();
+        load(&store, &ontology);
+        store
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Ql)
+            .unwrap();
+        let existential = format!("ASK {{ <{EX}a> <{EX}p> ?o }}");
+        assert!(ask(&store, &existential), "the rewriting answers it");
+        let certified = (store.reasoning_state(), store.consistency(), marker());
+        assert!(certified.0.is_some() && certified.2.is_some(), "certified");
+        crate::metadata::tests::FAIL_REMOVE.set(true);
+        let failed = store.bulk_load(&crate::BulkLoadRequest {
+            files: vec![more],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        });
+        crate::metadata::tests::FAIL_REMOVE.set(false);
+        let mut wrong = Vec::new();
+        if failed.is_ok() {
+            wrong.push("the load succeeded without clearing the certificate".to_owned());
+        }
+        let mut unchanged = |store: &StoreService, when: &str| {
+            let seen = [
+                (ask(store, &existential), "the existential's answer"),
+                (
+                    !ask(store, &format!("ASK {{ <{EX}b> <{EX}q> <{EX}c> }}")),
+                    "nothing published",
+                ),
+                (
+                    (store.reasoning_state(), store.consistency(), marker()) == certified,
+                    "the certificate and its marker",
+                ),
+            ];
+            for (held, what) in seen {
+                if !held {
+                    wrong.push(format!("{when}: {what} changed"));
+                }
+            }
+        };
+        unchanged(&store, "in process");
+        drop(store);
+        let store = StoreService::new(config()).unwrap();
+        unchanged(&store, "after a reopen");
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
