@@ -2173,7 +2173,7 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
             false,
         ),
         (
-            false,
+            true,
             "an inferred triple term they see",
             format!("GRAPH :open {{ :says rdfs:subPropertyOf :claims . {term} }}"),
             "SELECT ?x ?t { ?x :claims ?t }",
