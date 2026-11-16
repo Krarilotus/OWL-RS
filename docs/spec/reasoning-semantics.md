@@ -65,6 +65,7 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 - Those, malformed (a node without `rdf:first`/`rdf:rest`) and cyclic lists are not instantiated, never truncated. Each one is reported as a typed diagnostic (`malformed-list`, `cyclic-list`, `list-too-long`, `too-many-list-variants`) with the axiom and node decoded:
   - full materialisations (load, startup) report all of them: in the log, and under `last_materialisation` in `/ops/api/diagnostics/reasoning`;
   - a commit reports those it introduced: in the log, and under `last_run`.
+- While a list axiom is left out, an answer that reads the inferences isn't `complete`: with the QL rewriting it says `sound-only`, with the reason, also inside a transaction and for a reader of some graphs (one with `inferred = "visible"` gets `not-certified`); without the rewriting every answer is `sound-only` anyway.
 
 #### Generalised triples
 
