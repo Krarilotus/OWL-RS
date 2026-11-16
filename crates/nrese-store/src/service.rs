@@ -2378,7 +2378,7 @@ impl StoreService {
             )
         };
         let reading = program.stored_equality();
-        let certificate = Some(self.certificate(state.clone(), None));
+        let certificate = (!self.config.replica).then(|| self.certificate(state.clone(), None));
         let finished = rematerialisation.finish_held(closure.inferred, reading, certificate)?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
