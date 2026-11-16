@@ -12,6 +12,7 @@ use super::vocabulary::LocalVocabulary;
 
 mod attempted;
 mod boundaries;
+mod equality_shapes;
 mod sources;
 mod stops;
 mod support_refusal;
