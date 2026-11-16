@@ -1,9 +1,9 @@
 //! The process's memory limit refuses reasoning under `reasoner.unnamed_classes = "skip"` with
 //! the store's typed refusal, the check of whether the rules make a declared class's members
 //! things (`nrese_reasoner::unnamed::members_are_things`) included: over the limit that check
-//! panicked (Sol's review of D16-773 row 1, r1 S2). A rematerialisation, and an entailment
-//! question, whose refutation compiles the program: the path a server meets first. A test
-//! binary of its own: the limit is process-wide.
+//! panicked (Sol's review of D16-773 row 1, r1 S2). A rematerialisation, an entailment
+//! question, whose refutation compiles the program, and a commit, whose pipeline keeps the
+//! program it compiled. A test binary of its own: the limit is process-wide.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -21,9 +21,16 @@ const DATA: &str = "PREFIX ex: <http://example.com/> \
     PREFIX owl: <http://www.w3.org/2002/07/owl#> \
     INSERT DATA { ex:p rdfs:range [ a owl:Class ; owl:unionOf ( ex:A ex:B ) ] . ex:s ex:p ex:x }";
 const THING: &str = "ASK { <http://example.com/x> a <http://www.w3.org/2002/07/owl#Thing> }";
+/// `ex:x` a member of a declared union class by `owl:allValuesFrom`: only the rewrite of its
+/// hidden membership makes it an `owl:Thing` (`rule_names_tests`' case (d)). Over [`DATA`],
+/// scm-rng1 and prp-rng make it one without the rewrite.
+const ALL_VALUES: &str = "PREFIX ex: <http://example.com/> \
+    PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+    INSERT DATA { ex:r owl:allValuesFrom [ a owl:Class ; owl:unionOf ( ex:A ex:B ) ] ; \
+    owl:onProperty ex:p . ex:s a ex:r . ex:s ex:p ex:x }";
 
 /// What a call came to: `panicked: …`, `Ok` or `Err(…)`.
-fn outcome<T>(done: &std::thread::Result<Result<T, StoreError>>) -> String {
+fn outcome<T, E: std::fmt::Debug>(done: &std::thread::Result<Result<T, E>>) -> String {
     match done {
         Err(panic) => {
             let text = panic.downcast_ref::<&str>().map(|s| (*s).to_owned());
@@ -130,5 +137,45 @@ fn over_the_memory_limit_skip_reasoning_is_refused_by_type_and_under_it_answers(
         refused(&done),
         typed,
     );
+
+    // A commit's pipeline keeps the program it compiled: one refused over the limit keeps
+    // none, and the next commit asks the rules again. The store's closure is current first,
+    // so the commit compiles in the pipeline, not in a rematerialisation before it. The
+    // commits are of `ALL_VALUES`, where the answer the compile keeps decides `ex:x`'s type.
+    let config = StoreConfig {
+        hide_unnamed_classes: true,
+        ..StoreConfig::in_memory()
+    };
+    let fresh = StoreService::new(config).expect("the store opens");
+    fresh
+        .rematerialise(Ruleset::Owl2Rl)
+        .expect("the empty closure");
+    assert!(fresh.reasoning_is_current(Ruleset::Owl2Rl));
+    let owl2_rl = ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl);
+    let reasoning = MutationPipeline::new(
+        Arc::new(fresh.clone()),
+        Arc::new(ReasonerService::new(owl2_rl)),
+    );
+    set_process_limit(1);
+    let done = catch_unwind(AssertUnwindSafe(|| {
+        reasoning.execute_update_str(ALL_VALUES)
+    }));
+    set_process_limit(0);
+    let got = outcome(&done);
+    let right = matches!(
+        done,
+        Ok(Err(nrese_store::MutationError::Store {
+            source: StoreError::ProcessMemoryLimit { .. },
+            ..
+        }))
+    );
+    check(&mut wrong, "commit at limit 1", &got, right, typed);
+    let done = catch_unwind(AssertUnwindSafe(|| {
+        reasoning.execute_update_str(ALL_VALUES)
+    }));
+    let ok = matches!(done, Ok(Ok(_)));
+    let thing = ok && holds(&fresh, THING);
+    let got = format!("Ok {ok}, ex:x a owl:Thing {thing}");
+    check(&mut wrong, "the next commit", &got, thing, "Ok, true");
     assert!(wrong.is_empty(), "wrong: {wrong:?}");
 }
