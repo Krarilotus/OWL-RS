@@ -289,6 +289,95 @@ fn a_key_binds_an_anonymous_individual_equal_to_a_named_one() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A key's property need not be simple: *OWL 2 Structural Specification* §11.2 (the
+/// restriction on simple roles) lists the axioms that may use only simple properties,
+/// "ObjectMinCardinality, ObjectMaxCardinality, ObjectExactCardinality, and ObjectHasSelf.
+/// FunctionalObjectProperty, InverseFunctionalObjectProperty, IrreflexiveObjectProperty,
+/// AsymmetricObjectProperty, and DisjointObjectProperties", and `HasKey` is not among them.
+/// So a key reads the values a property chain implies. `:x :p1 :b` and `:b :p2 :z` give
+/// `:x :p3 :z` by the chain `:p1 o :p2`; `:y :p3 :z` shares the value, so the key on `:C`
+/// makes `:x` and `:y` the same, and the answer is complete. HermiT answers "not entailed"
+/// here: the reference misses it, and the store must not be changed to agree. On the rules
+/// route and off it (with `OUTSIDE_RL`), in both equality modes.
+#[test]
+fn a_key_reads_a_value_a_property_chain_implies() {
+    let data = ":p1 a owl:ObjectProperty . :p2 a owl:ObjectProperty . \
+         :p3 a owl:ObjectProperty ; owl:propertyChainAxiom ( :p1 :p2 ) . \
+         :C a owl:Class ; owl:hasKey ( :p3 ) . \
+         :x a owl:NamedIndividual , :C ; :p1 :b . :b a owl:NamedIndividual ; :p2 :z . \
+         :y a owl:NamedIndividual , :C ; :p3 :z . :z a owl:NamedIndividual .";
+    let mut wrong = Vec::new();
+    for (more, rules) in [("", true), (OUTSIDE_RL, false)] {
+        for compact in [false, true] {
+            let dl = store(compact);
+            insert(&dl, &format!("{data} {more}")).expect("consistent");
+            let route = dl.store().dl_bounds().last;
+            let (rows, status) = query(&dl, "ASK { :x owl:sameAs :y }");
+            let line = format!(
+                "{more} / compact {compact}, route {route}: answers {rows:?}, complete {}",
+                status.is_complete()
+            );
+            eprintln!("{line}");
+            if rows != ["true"] || !status.is_complete() || (route == "rules") != rules {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A generated case, shrunk, in its two commits: the second is refused as inconsistent.
+/// `:C3` is at most one `:d1` value in `{ 1 }`, which no individual can exceed, so every
+/// individual is in `:C3`. `_:k7` is `:a1` (two values of the functional `:pk`), so the key
+/// on `:C3` over `:p3` makes `:a1` and `:a2` the same (both reach `:a3`). The second commit's
+/// chain `:p1 o :p2` with `:a0 :p1 :a1` and `:a1 :p2 :a3` (`:a2 :p2 :a3`, `:a2` being
+/// `:a1`) gives `:a0 :p3 :a3`, and the key makes `:a0` the same as `:a1`, against
+/// `:a1 owl:differentFrom :a0`. The key over the non-simple `:p3` is inside OWL 2 DL, as
+/// the row above says. HermiT and Openllet both call the case consistent until the chain's
+/// conclusion is asserted: the references miss it, and the store must not be changed to
+/// agree. The restriction on `:C3` is outside OWL 2 RL, so only the route off the rules
+/// reaches it; in both equality modes.
+#[test]
+fn a_key_over_a_chain_implied_value_refuses_an_inconsistent_write() {
+    let prefixes = "PREFIX f: <http://example.org/fuzz#> \
+         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
+    let first = "f:C0 rdf:type owl:Class . f:C1 rdf:type owl:Class . \
+         f:C2 rdf:type owl:Class . f:C3 rdf:type owl:Class . \
+         f:p0 rdf:type owl:ObjectProperty . f:p1 rdf:type owl:ObjectProperty . \
+         f:p2 rdf:type owl:ObjectProperty . f:p3 rdf:type owl:ObjectProperty . \
+         f:d0 rdf:type owl:DatatypeProperty . f:d1 rdf:type owl:DatatypeProperty . \
+         f:a0 rdf:type owl:NamedIndividual . f:a1 rdf:type owl:NamedIndividual . \
+         f:a2 rdf:type owl:NamedIndividual . f:a3 rdf:type owl:NamedIndividual . \
+         _:w120 rdf:type owl:Restriction . _:w120 owl:onProperty f:d1 . \
+         _:w122 rdf:first \"1\"^^xsd:integer . _:w122 rdf:rest rdf:nil . \
+         _:w123 rdf:type rdfs:Datatype . _:w123 owl:oneOf _:w122 . \
+         _:w120 owl:maxQualifiedCardinality \"1\"^^xsd:nonNegativeInteger . \
+         _:w120 owl:onDataRange _:w123 . _:w120 owl:equivalentClass f:C3 . \
+         f:a1 owl:differentFrom f:a0 . \
+         f:C3 owl:hasKey ( f:p3 ) . f:pk a owl:ObjectProperty , owl:FunctionalProperty . \
+         _:k7 a f:C3 ; f:p3 f:a3 . [] f:pk _:k7 , f:a1 . f:a2 a f:C3 ; f:p3 f:a3 .";
+    let second = "f:p3 owl:propertyChainAxiom ( f:p1 f:p2 ) . \
+         f:a0 f:p1 f:a1 . f:a1 f:p2 f:a2 . \
+         f:C2 owl:hasKey ( f:p2 ) . f:pk a owl:ObjectProperty , owl:FunctionalProperty . \
+         _:k8 a f:C2 ; f:p2 f:a3 . _:k9 a f:C1 . [] f:pk _:k8 , _:k9 . \
+         f:a2 a f:C2 ; f:p2 f:a3 .";
+    let mut wrong = Vec::new();
+    for compact in [false, true] {
+        let dl = store(compact);
+        let one = update(&dl, &format!("{prefixes}INSERT DATA {{ {first} }}"));
+        let route = dl.store().dl_bounds().last;
+        let two = update(&dl, &format!("{prefixes}INSERT DATA {{ {second} }}"));
+        let line = format!("compact {compact}: first {one:?}, route {route}; second {two:?}");
+        eprintln!("{line}");
+        let refused = matches!(&two, Err(nrese_store::MutationError::Rejected(r))
+            if r.kind == nrese_store::RejectKind::Inconsistent);
+        if one.is_err() || route == "rules" || !refused {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Under `owl2-rl` the key rule (prp-key, OWL 2 Profiles §4.3, Table 5) has no condition on
 /// the value: `_:z` binds `:a` and `:b`, and `:a a :D` holds. The named-only keys are
 /// `owl2-dl`'s; `owl2-rl`'s program keeps the fingerprint its stores were written with.
