@@ -423,19 +423,22 @@ pub(crate) fn protocol_dataset(
 /// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
 /// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
 /// (every path evaluates with the same options; the QL rewriting is in the algebra).
-pub(crate) fn run_query(
+/// With it, `report` returns `tell`, handed next, before any bytes, the status header kept
+/// with a cached answer (`None` where none is), which returns the header it made for an
+/// answer written now: made shared and kept with the answer only where that is offered.
+pub(crate) fn run_query<T: FnOnce(crate::service::StatusHeader) -> Option<String>>(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     out: impl Write,
-    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> Vec<u8>,
+    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> (Vec<u8>, T),
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
     crate::dl::query::certify_report(ql.as_mut().map(|r| &mut r.completeness), prepared.reads());
-    let context = report(ql.as_ref());
+    let (context, tell) = report(ql.as_ref());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
@@ -447,7 +450,8 @@ pub(crate) fn run_query(
         prepared.media_type(),
         &context,
     ) {
-        CachedOutput::Hit(bytes) => {
+        CachedOutput::Hit(bytes, header) => {
+            tell(header);
             cancellation.check()?;
             out.write_all(&bytes)?;
             cancellation.check()?;
@@ -456,6 +460,7 @@ pub(crate) fn run_query(
         CachedOutput::Miss(slot) => Some(slot),
         CachedOutput::Off => None,
     };
+    let header = tell(None);
     // The key above uses the original query/options. Execution consumes their prepared
     // algebra and must not run the semantic QL stage a second time.
     options.ql = None;
@@ -466,14 +471,16 @@ pub(crate) fn run_query(
     let mut tee = Tee {
         inner: out,
         copy: Some(Vec::new()),
-        limit: slot.limit(),
+        limit: slot
+            .limit()
+            .saturating_sub(header.as_ref().map_or(0, |h| h.len())),
     };
     // What the bytes save: this answer's evaluation, as far as the cache didn't answer
     // its parts, and its serialisation (written at the end, on every core, for JSON).
     let started = std::time::Instant::now();
     serialize(view, prepared, &query, &options, cancellation, &mut tee)?;
     if let Some(copy) = tee.copy {
-        slot.offer(copy, started.elapsed());
+        slot.offer(copy, header.map(Into::into), started.elapsed());
     }
     Ok(ql)
 }
