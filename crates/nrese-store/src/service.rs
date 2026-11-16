@@ -2238,7 +2238,10 @@ impl StoreService {
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
-    /// change of rules; commits keep it current afterwards.
+    /// change of rules; commits keep it current afterwards. Register `program` as well
+    /// ([`Self::use_reasoning_rules`]; the mutation pipeline registers its own): while the
+    /// rules in place aren't the ones the stack was made with, readers of some graphs who
+    /// see inferred statements are refused until the store is rematerialised.
     pub fn rematerialise(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
