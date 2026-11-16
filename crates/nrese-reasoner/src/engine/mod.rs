@@ -118,11 +118,12 @@ impl Program {
     }
 
     /// Whether one of `quads` (by `at`'s ids) can change what [`Self::leaves_out_a_list`]
-    /// reads ([`ListVocabulary::is_scan_input`]). If none can, a version that differs from its
+    /// reads: a list fact ([`ListVocabulary::is_list_fact`]); any, where `at`'s reads expand by
+    /// `owl:sameAs` classes (compact equality). If none can, a version that differs from its
     /// base by `quads` alone leaves out the lists its base does.
     pub fn touches_a_list(at: &Snapshot, mut quads: impl Iterator<Item = EncodedQuad>) -> bool {
         let lists = Self::list_vocabulary(at);
-        quads.any(|quad| lists.is_scan_input(triple(quad)))
+        at.equality_classes().is_some() || quads.any(|quad| lists.is_list_fact(triple(quad)))
     }
 
     /// The rules as the delta executor takes them.
