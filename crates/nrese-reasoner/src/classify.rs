@@ -2779,6 +2779,23 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    /// The RDF mapping's declarations (§3.1.2, Table 6) are of IRIs: a blank node typed an
+    /// annotation or a data property declares nothing, as the ontology reader reads it, so
+    /// its axioms are read as an inverse property's, which EL lacks: here a range, skipped
+    /// and reported, never left out unsaid.
+    #[test]
+    fn a_blank_nodes_property_typing_declares_nothing() {
+        for kind in ["AnnotationProperty", "OntologyProperty", "DatatypeProperty"] {
+            let (_, result) = run(&format!(
+                "_:i rdf:type owl:{kind}
+                 _:i owl:inverseOf ex:p
+                 _:i rdfs:range ex:C"
+            ));
+            let skipped = result.skipped.iter().any(|s| s.1 == "inverse property");
+            assert!(skipped, "{kind}: {:?}", result.skipped);
+        }
+    }
+
     /// A name declared `owl:DataRange` is a datatype, as one declared `rdfs:Datatype` is (the
     /// RDF mapping reads OWL 1's `owl:DataRange` as `rdfs:Datatype`): an equivalence between
     /// two of them is no class axiom, and is left out as a data range.
