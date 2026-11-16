@@ -2886,8 +2886,9 @@ mod tests {
     /// ontology reader reads as annotation schema, over generated property schemas: a
     /// statement of `rdfs:subPropertyOf`, `owl:equivalentProperty`, `rdfs:domain` or
     /// `rdfs:range` after a few declarations, over named, blank and built-in properties, adds
-    /// one to the reader's annotations exactly where the classifier reads nothing from it.
-    /// 3,000 seeded schemas.
+    /// one to the reader's annotations exactly where the classifier reads nothing from it, but
+    /// for a declared data property's domain or range, which is neither annotation schema nor
+    /// read. 3,000 seeded schemas; every mismatch is listed.
     #[test]
     fn the_classifier_passes_over_what_the_reader_reads_as_annotation_schema() {
         let terms = [
@@ -2918,6 +2919,8 @@ mod tests {
             seed ^= seed << 17;
             (seed % n as u64) as usize
         };
+        // Annotation schema or not by the reader, the data property's case; the mismatches.
+        let (mut counts, mut wrong) = ([0usize; 3], Vec::new());
         for round in 0..3_000 {
             let declarations: Vec<String> = (0..1 + pick(3))
                 .map(|_| format!("{} rdf:type owl:{}", terms[pick(6)], kinds[pick(5)]))
@@ -2932,11 +2935,21 @@ mod tests {
             let with = format!("{declarations}\n{s} {p} {o}");
             let reader = annotations(&with) == annotations(&declarations) + 1;
             let classifier = reads(&with) == reads(&declarations);
-            assert_eq!(
-                reader, classifier,
-                "round {round}, the reader's {reader}:\n{with}"
-            );
+            // A data property's domain or range is no annotation schema, and the classifier
+            // reads nothing from it either (no class but through a restriction).
+            let data = !s.starts_with("_:")
+                && !p.contains("Property")
+                && declarations.contains(&format!("{s} rdf:type owl:DatatypeProperty"));
+            counts[usize::from(reader) + 2 * usize::from(data && !reader)] += 1;
+            if reader != classifier && !(data && classifier) {
+                wrong.push(format!("round {round}, the reader's {reader}:\n{with}"));
+            }
         }
+        eprintln!(
+            "3,000 schemas: {} annotation schema, {} other, {} a data property's domain or range",
+            counts[1], counts[0], counts[2]
+        );
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// A name declared `owl:DataRange` is a datatype, as one declared `rdfs:Datatype` is (the
