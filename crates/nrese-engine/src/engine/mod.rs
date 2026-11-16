@@ -251,7 +251,7 @@ pub(crate) struct Version {
     /// representative`), so that the default graph is read expanded to every identity; `None`
     /// reads the stacks as stored. Part of what is installed: a stack and its reading are
     /// published together, and only the holder of the writer slot changes it (a commit,
-    /// [`Transaction::install_reading`], a rematerialisation's `finish_held`). No default:
+    /// [`Transaction::install`], a rematerialisation's `finish_held`). No default:
     /// each construction chooses; a layout-only change keeps its source's.
     pub(crate) reading: Option<TermId>,
     /// What its statements are: kept where only their layout changes (compaction, a
@@ -269,7 +269,16 @@ pub(crate) struct Version {
     /// What readers of its unpublished snapshots keep ([`OwnState`]): empty at every
     /// construction, never copied.
     pub(crate) own: snapshot::OwnSlots,
+    /// What the writer slot's holder vouched for this version ([`Certificate`]): copied only
+    /// where the statements stay the same; `None` everywhere else. Not persisted.
+    pub(crate) certificate: Option<Certificate>,
 }
+
+/// An object the engine never looks into, compares only by pointer, and copies only where
+/// the statements stay the same: what a store vouches for a version (its reasoning's
+/// certificate). Installed by the writer slot's holder ([`Transaction::install`],
+/// [`Transaction::vouch`], a rematerialisation's `finish_held`).
+pub type Certificate = Arc<dyn std::any::Any + Send + Sync>;
 
 /// The identity of a snapshot's asserted statements ([`Snapshot::asserted_identity`]
 /// (crate::Snapshot::asserted_identity)): two snapshots with the same one hold the same
@@ -329,6 +338,7 @@ impl Version {
             asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
             own: Default::default(),
+            certificate: None,
         }
     }
 
@@ -361,6 +371,7 @@ impl Version {
             asserted_content: self.asserted_content,
             canonical: Default::default(),
             own: Default::default(),
+            certificate: self.certificate.clone(),
         }
     }
 
@@ -379,6 +390,7 @@ impl Version {
             // A canonical view of the old runs would hold them: made afresh.
             canonical: Default::default(),
             own: Default::default(),
+            certificate: self.certificate.clone(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -608,14 +620,19 @@ impl Shared {
         )
     }
 
-    /// Installs the current version with `reading`, its statements and revision unchanged:
-    /// nothing is logged, checkpointed or stamped. The caller holds the writer slot
-    /// ([`Transaction::install_reading`], `Rematerialisation::finish_held`). Writing nothing is
-    /// right: a reading isn't stored, every open derives it again from the store's certificate.
-    fn install_reading(&self, reading: Option<TermId>) {
-        if self.versions.load().reading != reading {
+    /// Installs the current version with `reading` and `certificate`, its statements and
+    /// revision unchanged: nothing is logged, checkpointed or stamped. The caller holds the
+    /// writer slot ([`Transaction::install`], `Rematerialisation::finish_held`). Writing
+    /// nothing is right: neither is stored, every open derives them again from the store's
+    /// marker. Published where either differs: the reading by value, the certificate by
+    /// pointer.
+    fn install(&self, reading: Option<TermId>, certificate: Option<Certificate>) {
+        let current = self.versions.load();
+        let at = |c: &Option<Certificate>| c.as_ref().map(|c| Arc::as_ptr(c).cast::<()>());
+        if current.reading != reading || at(&current.certificate) != at(&certificate) {
             self.versions.publish(|current| Version {
                 reading,
+                certificate,
                 ..current.with_time(current.committed_micros)
             });
         }
@@ -706,6 +723,7 @@ impl Shared {
                     asserted_content: current.asserted_content,
                     canonical: Default::default(),
                     own: Default::default(),
+                    certificate: current.certificate.clone(),
                 }
             });
         }
@@ -1145,7 +1163,7 @@ impl Engine {
     }
 
     /// `owl:sameAs` if the installed version's reads expand equality classes (its reading,
-    /// [`Transaction::install_reading`]).
+    /// [`Transaction::install`]).
     pub fn equality(&self) -> Option<TermId> {
         self.inner.shared.versions.load().reading
     }

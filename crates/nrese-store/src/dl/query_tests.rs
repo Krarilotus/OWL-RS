@@ -960,7 +960,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         let pending = tx.pending_snapshot().unwrap();
         let reads = [
             ("committed", Revision::Committed(&snapshot), &snapshot),
-            ("pending", Revision::Pending(&pending), &pending),
+            ("pending", Revision::Pending(&pending, true), &pending),
         ];
         for (of, at, read) in reads {
             let Ok(whole) = read_ontology(&store, read) else {

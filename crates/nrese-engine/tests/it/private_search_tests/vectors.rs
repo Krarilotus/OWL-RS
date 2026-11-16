@@ -150,7 +150,7 @@ fn a_private_global_vector_search_within_the_readers_budget_answers() {
     }));
     tx.insert(label("rep", "[1, 0]", None).as_ref());
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let published = engine.snapshot();
     let mut private = engine
         .speculative_over(&published, Arc::new(nrese_exec::Budget::unlimited()))

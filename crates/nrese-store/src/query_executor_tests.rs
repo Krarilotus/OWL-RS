@@ -44,7 +44,20 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
     })
     .unwrap();
     let settings = store.query_settings().clone();
-    *settings.ql.write().unwrap() = Some(Arc::new(QlRewriting::new(Closure { lists: true })));
+    // The QL rewriting comes with the version's certificate.
+    let rl = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .expect("OWL 2 RL reasons");
+    let certificate = crate::service::Certificate {
+        state: crate::ReasoningState::of(&rl, 0),
+        ql: Some(Arc::new(QlRewriting::new(Closure { lists: true }))),
+        equality_closed: false,
+        dl: false,
+        user_rules: false,
+    };
+    engine
+        .transaction()
+        .install(None, Some(Arc::new(certificate)));
     (engine, prepared, settings)
 }
 
@@ -137,6 +150,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
     let text = std::str::from_utf8(&first).unwrap();
     assert!(text.contains("ann") && !text.contains("bob"));
     let options = query_options(
+        &snapshot,
         &prepared,
         &settings,
         &token,
@@ -321,6 +335,7 @@ fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_forma
                 &prepared,
                 &prepared.query,
                 &query_options(
+                    &snapshot,
                     &prepared,
                     &settings,
                     &token,

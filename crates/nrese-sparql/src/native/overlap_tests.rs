@@ -169,7 +169,7 @@ fn a_refused_expanding_read_gives_no_shared_values_count() {
         tx.insert(Quad::new(e(s), e(p), e("rep"), GraphName::DefaultGraph).as_ref());
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let snapshot = engine.snapshot();
     for shift in 10..=24 {
         let options = QueryOptions {
