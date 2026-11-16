@@ -46,7 +46,7 @@ const PARTIAL: &str = "partial";
 /// Quarantined statements a load report names (the first in its files' order).
 pub const EXAMPLES: usize = 5;
 /// The longest text kept of one statement; a longer one is kept truncated, and marked so.
-const MAX_TEXT: u64 = 1 << 20;
+const MAX_TEXT: u64 = nrese_rdf_io::MAX_STATEMENT_TEXT as u64;
 /// Quarantined statements logged one by one (the rest are only counted).
 const LOGGED: u64 = 20;
 
@@ -85,7 +85,8 @@ pub struct QuarantinedStatement {
     pub id: String,
     pub load: String,
     pub file: String,
-    /// Where it starts in the document, from 1; the column counts characters.
+    /// Where it starts in the document, from 1; the column counts characters. 0 where the
+    /// parser doesn't know it (RDF/XML, JSON-LD): `reason` then says what it knows.
     pub line: u64,
     pub column: u64,
     pub reason: String,
@@ -1014,13 +1015,18 @@ impl Collector<'_> {
                 (Some(text), length > MAX_TEXT, not_utf8)
             }
         };
+        let lines = error.knows_lines();
         let statement = QuarantinedStatement {
             id: format!("{}.{file}.{}", self.load, start.offset),
             load: self.load.clone(),
             file: source.path.display().to_string(),
-            line: start.line + 1,
-            column: start.column + 1,
-            reason: error.message().to_owned(),
+            line: if lines { start.line + 1 } else { 0 },
+            column: if lines { start.column + 1 } else { 0 },
+            reason: if lines {
+                error.message().to_owned()
+            } else {
+                error.to_string()
+            },
             format: source.format.file_extension().to_owned(),
             text,
             truncated,
@@ -1094,6 +1100,14 @@ impl Drop for Collector<'_> {
             && partial.exists()
         {
             let _ = fs::remove_file(partial);
+            // The directory too, if this load made it: only an empty one is removed.
+            // Resolutions need a stored statement, and a stop drops the collector under the
+            // load's writer slot, so nothing else writes into an empty one then. (After a
+            // failed `finish` the slot is gone: a load starting at once could lose its new
+            // directory before its first record, and stop.)
+            if let Some(dir) = partial.parent() {
+                let _ = fs::remove_dir(dir);
+            }
         }
     }
 }

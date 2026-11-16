@@ -404,6 +404,38 @@ ex:p a owl:DatatypeProperty . owl:topDataProperty rdfs:subPropertyOf ex:p .
     assert_eq!(n.unsupported.len(), 1);
 }
 
+/// OWL 2 RL's rules read only max cardinalities (cls-maxc1/2, cls-maxqc1-4), and only as
+/// the RDF mapping writes them: a max or max-qualified one spelled otherwise is marked
+/// (`Ontology::noncanonical_cardinality`, which the RL route and the rewriting's status read).
+/// The mapping's spelling isn't, and neither is an exact or min one, whose spelling no rule
+/// reads, so plain `owl:cardinality 1` gives no `CardinalitySpelling` hazard.
+#[test]
+fn only_a_max_cardinality_the_rules_dont_read_is_marked() {
+    for (restriction, marked) in [
+        ("owl:maxCardinality 1", true),
+        ("owl:maxCardinality \"01\"^^xsd:nonNegativeInteger", true),
+        ("owl:maxQualifiedCardinality 1 ; owl:onClass ex:D", true),
+        ("owl:maxCardinality \"1\"^^xsd:nonNegativeInteger", false),
+        ("owl:cardinality 1", false),
+        ("owl:minCardinality 1", false),
+    ] {
+        let mut table = Table::default();
+        let statements = load(
+            &mut table,
+            &format!(
+                "ex:p a owl:ObjectProperty . ex:D a owl:Class .
+                 ex:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ; {restriction} ] ."
+            ),
+        );
+        let ontology = read(&statements, &table);
+        assert_eq!(
+            ontology.noncanonical_cardinality.is_some(),
+            marked,
+            "{restriction}"
+        );
+    }
+}
+
 #[test]
 fn malformed_input_is_reported() {
     let mut table = Table::default();
@@ -631,6 +663,27 @@ fn statements_about_the_ontology_are_annotations() {
         ontology.diagnostics.is_empty(),
         "{:?}",
         ontology.diagnostics
+    );
+}
+
+/// The built-in annotation properties are known to each read by the terms it reads with:
+/// one the terms gain after an earlier read (`rdfs:comment`, which the first read's terms
+/// don't have) is an annotation property to the later read, as `rdfs:label` is to both.
+#[test]
+fn a_built_in_annotation_first_met_in_a_later_read_is_known() {
+    let mut table = Table::default();
+    let first = load(&mut table, r#"ex:a ex:p ex:b ; rdfs:label "a" ."#);
+    let before = read(&first, &table);
+    assert_eq!(before.annotations, 1, "{:?}", before.axioms);
+    let later = load(
+        &mut table,
+        r#"ex:a ex:p ex:b ; rdfs:label "a" ; rdfs:comment ex:c ."#,
+    );
+    let after = read(&later, &table);
+    assert_eq!(after.annotations, 2, "{:?}", after.axioms);
+    assert_eq!(
+        after.axioms, before.axioms,
+        "rdfs:comment read as a property"
     );
 }
 

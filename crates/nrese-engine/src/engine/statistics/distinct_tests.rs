@@ -402,3 +402,124 @@ fn a_merge_over_many_runs_counts_every_comparison() {
     assert_eq!(count, Some(Ok(1)));
     assert!(units >= 600, "asked {units} units for 600 comparisons");
 }
+
+/// - Spec: a published snapshot that asks again for a kept count gets it without counting the
+///   pattern's matches again (the gate's count is its own, and its identity reads it alike),
+///   and a stopped reader still gets no value.
+/// - Input: 3000 subjects of `p`, published; the estimate asked twice, then once more with a
+///   visitor that has stopped.
+/// - Expected: 3000 each time, the first ask visiting work and the second none; `Stopped` for
+///   the stopped visitor.
+#[test]
+fn the_same_snapshot_asks_again_without_counting() {
+    let engine = Engine::new(config()).unwrap();
+    commit(&engine, "p", 0..3000);
+    let snapshot = engine.snapshot();
+    let pattern = of(&snapshot, "p");
+    let ask = |visit: Visitor<'_>| {
+        snapshot.distinct_estimate_in(MODEL, &pattern, Permutation::Gpso, visit)
+    };
+    let mut answers = Vec::new();
+    let first = units_of(|visit| answers.push(ask(visit)));
+    let again = units_of(|visit| answers.push(ask(visit)));
+    assert_eq!(answers, [Ok(Some(3000)), Ok(Some(3000))]);
+    assert!(first > 0, "the first ask counts");
+    assert_eq!(again, 0, "the same snapshot counts nothing again");
+    assert_eq!(ask(&|_| false), Err(Stopped));
+}
+
+/// - Spec: a kept count serves the snapshot that counted it alone: after a commit the new
+///   snapshot's estimate follows its own matches, a drift past a quarter computes it anew, and
+///   snapshots alive at once, asked in turn, each get their own.
+/// - Input: 3000 subjects of `p` (snapshot `a`); a commit deleting subjects `0..500` (`b`,
+///   2500 matches, within a quarter of 3000); a commit adding subjects `3000..6000` (`c`, 5500
+///   matches, past it).
+/// - Expected: `a` 3000, `b` 2500 (the kept 3000 capped at its matches), `c` 5500 (computed
+///   anew: the kept 3000 would give 3000), asked in the order a, b, c, a, b, c, b, a.
+#[test]
+fn snapshots_alive_at_once_each_get_their_own() {
+    let engine = Engine::new(config()).unwrap();
+    commit(&engine, "p", 0..3000);
+    let a = engine.snapshot();
+    let mut tx = engine.transaction();
+    for i in 0..500 {
+        assert!(tx.remove(quad("p", i, "").as_ref()));
+    }
+    tx.commit().unwrap();
+    let b = engine.snapshot();
+    commit(&engine, "p", 3000..6000);
+    let c = engine.snapshot();
+    let ask = |snapshot: &Snapshot| {
+        let pattern = of(snapshot, "p");
+        snapshot.distinct_estimate_in(MODEL, &pattern, Permutation::Gpso, &|_| true)
+    };
+    let (a, b, c) = ((&a, 3000), (&b, 2500), (&c, 5500));
+    for (k, (snapshot, expected)) in [a, b, c, a, b, c, b, a].into_iter().enumerate() {
+        assert_eq!(ask(snapshot), Ok(Some(expected)), "ask {k}");
+    }
+}
+
+/// - Spec: a kept count is served by the asking snapshot's whole identity, not its revision: a
+///   transaction's pending state at the published revision, with fewer matches, gets its own
+///   estimate, and its ask records nothing over the published snapshot's (review r1, F2).
+/// - Input: 3000 subjects of `p`, published and asked once; a transaction removing subjects
+///   `0..1000`, its pending snapshot (the same revision, 2000 matches) asked; the published
+///   snapshot asked again.
+/// - Expected: 3000; 2000 for the pending snapshot (the kept 3000 would give 3000); 3000 again
+///   for the published snapshot, without counting.
+#[test]
+fn a_pending_snapshot_at_the_same_revision_gets_its_own() {
+    let engine = Engine::new(config()).unwrap();
+    commit(&engine, "p", 0..3000);
+    let published = engine.snapshot();
+    let ask = |snapshot: &Snapshot, visit: Visitor<'_>| {
+        let pattern = of(snapshot, "p");
+        snapshot.distinct_estimate_in(MODEL, &pattern, Permutation::Gpso, visit)
+    };
+    assert_eq!(ask(&published, &|_| true), Ok(Some(3000)));
+    let mut tx = engine.transaction();
+    for i in 0..1000 {
+        assert!(tx.remove(quad("p", i, "").as_ref()));
+    }
+    let pending = tx.pending_snapshot();
+    assert_eq!(pending.identity().revision, published.identity().revision);
+    assert_eq!(ask(&pending, &|_| true), Ok(Some(2000)));
+    let mut again = None;
+    let units = units_of(|visit| again = Some(ask(&published, visit)));
+    assert_eq!(again, Some(Ok(Some(3000))));
+    assert_eq!(
+        units, 0,
+        "the pending ask left the published snapshot's count in place"
+    );
+}
+
+/// - Spec: published snapshots of one revision that read differently share no kept count: one
+///   reading `owl:sameAs` classes gets its own estimate, not the one kept for the statements as
+///   stored (the identity serves a kept count, not the revision; review r1, F2).
+/// - Input: 3000 subjects of `p`; 1000 aliases, each inferred `owl:sameAs` one subject; the
+///   published snapshot as stored asked, then the same snapshot reading equality classes.
+/// - Expected: 3000 as stored; no estimate for the expanding read (its 4000 matches are past a
+///   quarter of the kept count's, and an expanded pattern's distinct values aren't walked).
+#[test]
+fn a_published_snapshot_reading_equality_classes_gets_its_own() {
+    let engine = Engine::new(config()).unwrap();
+    commit(&engine, "p", 0..3000);
+    let mut tx = engine.transaction();
+    let same_as = tx.intern(iri("sameAs").as_ref().into());
+    for i in 0..1000 {
+        let subject = tx.intern(iri(&format!("s{i}")).as_ref().into());
+        let alias = tx.intern(iri(&format!("alias{i}")).as_ref().into());
+        assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, subject)));
+    }
+    tx.commit().unwrap();
+    let stored = engine.snapshot();
+    let expanding = stored.with_equality(Some(same_as));
+    assert_eq!(stored.identity().revision, expanding.identity().revision);
+    let ask = |snapshot: &Snapshot| {
+        let pattern = of(snapshot, "p");
+        let model = ReadModel::Materialised;
+        snapshot.distinct_estimate_in(model, &pattern, Permutation::Gpso, &|_| true)
+    };
+    assert_eq!(ask(&stored), Ok(Some(3000)));
+    assert_eq!(ask(&expanding), Ok(None));
+}

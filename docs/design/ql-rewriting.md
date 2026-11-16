@@ -89,7 +89,10 @@ known through a source read; *ours* = measured or tested here).
 
 **Lifecycle.** Realised-witness results are scoped to the same snapshot identity. A
 failed or budget-skipped probe is not cached as a negative answer; a later request can
-retry it. Preparation, reporting and execution share the lifecycle in §1. Cancellation
+retry it. One view keeps at most 4 MiB of probe answers, each counted as its key's length
+and 48 bytes; an answer counted over 4 MiB on its own is not kept, any other that would
+pass the cap drops all of the view's answers first, and an answer not kept is asked again
+when a query needs it. Preparation, reporting and execution share the lifecycle in §1. Cancellation
 is checked at evaluator boundaries; schema scans and rewriting loops don't poll it.
 
 **The QL part of the TBox.** From every axiom, what OWL 2 QL can say (with three harmless
