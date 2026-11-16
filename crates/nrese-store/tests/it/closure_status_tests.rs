@@ -1621,3 +1621,28 @@ fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
     }
     assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
 }
+
+/// The rule sets read a property's domain, range and super-property whatever its typing
+/// (prp-dom, prp-rng, prp-spo1; rdfs2, rdfs3, rdfs7): one typed OWL 1's
+/// `owl:OntologyProperty`, which the OWL 2 mapping reads as an annotation property, has
+/// them in the `owl2-rl`, `owl2-ql` and `rdfs` closures, the rewriting on or off.
+#[test]
+fn the_rule_sets_read_an_ontology_propertys_schema() {
+    let data = ":note a owl:OntologyProperty ; rdfs:domain :C ; rdfs:range :D ; \
+                rdfs:subPropertyOf :q . :x :note :v .";
+    let mut wrong = Vec::new();
+    for (ruleset, ql) in [
+        (Ruleset::Owl2Rl, QlRewritingMode::Auto),
+        (Ruleset::Owl2Rl, QlRewritingMode::On),
+        (Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        (Ruleset::Owl2Ql, QlRewritingMode::Off),
+        (Ruleset::Rdfs, QlRewritingMode::Auto),
+    ] {
+        let store = closure(data, ruleset, ql);
+        let (text, status) = answer(&store, "ASK { :x a :C . :v a :D . :x :q :v }");
+        if !text.contains("true") {
+            wrong.push(format!("{} {ql:?}: {text} {status:?}", ruleset.name()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
