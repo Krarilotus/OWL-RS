@@ -84,15 +84,26 @@ fn holds(pipeline: &MutationPipeline, pattern: &str) -> bool {
 
 /// Under `reasoner.unnamed_classes = "skip"`, an unnamed union class nothing consumes keeps its
 /// memberships out of the store, and nothing else changes (`nrese_reasoner::unnamed`): a member
-/// is an `owl:Thing` exactly where the rules make it one. Three programs, the first two with no
-/// built-in part and the range rule, over `ex:p rdfs:range _:u`, `_:u` a declared union class,
-/// and `ex:s ex:p ex:x`:
+/// is an `owl:Thing` exactly where the rules make it one. Four cases, the first three over
+/// `ex:p rdfs:range _:u`, `_:u` a declared union class, and `ex:s ex:p ex:x`; the first two
+/// with no built-in part and the range rule:
 ///
 /// - (a) beside a symmetry rule over `ex:knows` named `scm-cls`: nothing makes `ex:x` an
 ///   `owl:Thing`;
 /// - (b) beside OWL 2 RL's scm-cls named `classes`, and cax-sco: `_:u rdfs:subClassOf
 ///   owl:Thing` and `ex:x a _:u`, so `ex:x a owl:Thing`;
-/// - (c) the built-in `owl2-rl` alone: its scm-cls and cax-sco, so `ex:x a owl:Thing`.
+/// - (c) the built-in `owl2-rl` alone: its scm-cls and cax-sco, so `ex:x a owl:Thing`; it
+///   also reaches that without the rewrite (scm-rng1 gives `ex:p rdfs:range owl:Thing`,
+///   prp-rng the membership);
+/// - (d) the built-in `owl2-rl` over `ex:r owl:allValuesFrom _:u ; owl:onProperty ex:p`,
+///   `ex:s a ex:r` and `ex:s ex:p ex:x`: cls-avf gives `ex:x a _:u`, scm-cls and cax-sco make
+///   it `ex:x a owl:Thing`, and only the rewrite keeps that once `ex:x a _:u` is hidden. No
+///   other OWL 2 RL rule reaches it: prp-dom, prp-rng, scm-dom1/2 and scm-rng1/2 need a domain
+///   or range, and there is none; cls-svf1/2 and cls-hv2 need a `someValuesFrom` or `hasValue`;
+///   cax-sco and cax-eqc1/2 type `ex:x` only from its classes, and its one class is `_:u`;
+///   eq-rep-s/o need an `owl:sameAs`, and nothing makes one (no functional, inverse functional
+///   or cardinality axiom); scm-avf1/2 relate `ex:r` only to itself; scm-uni and cls-uni put
+///   `ex:A` and `ex:B` under `_:u`, not `ex:x` in anything.
 #[test]
 fn hidden_memberships_become_things_as_the_rules_say_whatever_they_are_called() {
     let symmetry = "Id: scm-cls\n  x <ex:knows> y\n  ---\n  y <ex:knows> x\n\n";
@@ -112,33 +123,45 @@ Id: cax-sco
 
 ";
     let data = format!("{DATA} . ex:s ex:knows ex:t");
+    let all_values = "ex:r owl:allValuesFrom [ a owl:Class ; owl:unionOf ( ex:A ex:B ) ] ; \
+        owl:onProperty ex:p . ex:s a ex:r . ex:s ex:p ex:x";
     let cases = [
         (
             "(a) a symmetry rule named scm-cls",
             custom(&format!("{RANGE}{symmetry}")),
+            data.as_str(),
             false,
             "ex:t ex:knows ex:s",
         ),
         (
             "(b) OWL 2 RL's scm-cls named classes, and cax-sco",
             custom(&format!("{RANGE}{classes}")),
+            data.as_str(),
             true,
             "?u rdfs:subClassOf owl:Thing FILTER(isBlank(?u))",
         ),
         (
             "(c) the built-in owl2-rl",
             ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+            data.as_str(),
+            true,
+            "?u rdfs:subClassOf owl:Thing FILTER(isBlank(?u))",
+        ),
+        (
+            "(d) the built-in owl2-rl, the union by owl:allValuesFrom",
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+            all_values,
             true,
             "?u rdfs:subClassOf owl:Thing FILTER(isBlank(?u))",
         ),
     ];
     let mut wrong = Vec::new();
-    for (case, reasoner, thing, own) in cases {
+    for (case, reasoner, data, thing, own) in cases {
         let config = StoreConfig {
             hide_unnamed_classes: true,
             ..in_memory_store_config()
         };
-        let pipeline = store_with(config, reasoner, &data);
+        let pipeline = store_with(config, reasoner, data);
         let membership = (format!("{EX}x"), TYPE.to_owned(), THING.to_owned());
         let inferred = inferred_statements(pipeline.store()).expect("the inferred statements");
         let checks = [
