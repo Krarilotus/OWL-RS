@@ -2,7 +2,7 @@
 nodejs.org's build of the version scripts/lib/gate-tools.txt pins, taken only by its archive's sha256,
 unpacked under the host's cache through the cache's one entry maker (scripts/lib/suite-python.sh
 suite_python_entry: under its lock, made aside, moved in whole), never the host's own Node. Toolchains
-on hosts belong to the job (the owner, 2 Nov 2026), so no host capability is asked for.
+on hosts belong to the job, so no host capability is asked for.
 
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_gate_node.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.

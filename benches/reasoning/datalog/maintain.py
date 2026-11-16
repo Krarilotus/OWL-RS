@@ -8,8 +8,8 @@ added back, each a single SPARQL Update, timed from request to response.
 
 The paper ran RDFox single-threaded on Claros L and LE with equality off (the `*-noeq`
 variants), 30 samples of 1,000 facts, and reports the mean with its 95% confidence interval;
-its numbers are reported rows (../reported/rdfox.csv), never measured here (RDFox's licence
-was refused). NRESE is the only system: VLog, GLog, Soufflé and Nemo don't maintain a
+its numbers are reported rows (../reported/rdfox.csv), never measured here (we hold no licence
+for RDFox). NRESE is the only system: VLog, GLog, Soufflé and Nemo don't maintain a
 materialisation. Every change is undone, so the closure must have the base's size at the
 end, or the run is `wrong`.
 

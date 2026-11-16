@@ -108,7 +108,7 @@ class ContainerMemoryPeak(unittest.TestCase):
         self.assertIn("no /proc here", sampler.why)
 
     def test_a_sampler_that_breaks_mid_run_has_no_peak_and_says_why(self):
-        """Spec: the master's go of Wed 11 Nov, kind `unknown` instead of a quiet fallback. A reading of
+        """Spec: kind `unknown` instead of a quiet fallback. A reading of
         120 by hand, then a memory.stat the sampler can't parse (kernel `x`): the readings after the
         first are missing, so 120 is no peak; there is none, and why names the fault."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,7 +125,7 @@ class ContainerMemoryPeak(unittest.TestCase):
         self.assertIn("ValueError", sampler.why)
 
     def test_a_reading_that_fails_while_the_cgroup_stands_leaves_no_peak(self):
-        """Spec: no quiet fallback (the master's go, Wed 11 Nov). A reading of 120 by hand, then, while
+        """Spec: no quiet fallback. A reading of 120 by hand, then, while
         the cgroup's directory still stands (the container runs on), a memory.stat that is gone or reads
         without `anon`: the readings after the first are missing, so 120 is no peak."""
         for broken in ("gone", "no anon"):

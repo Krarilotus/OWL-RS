@@ -101,10 +101,10 @@ fn tsv(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
 /// written and offered.
 fn tsv_through_the_cache(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
     match cached_output(view, &parse(text), options, TSV, b"") {
-        CachedOutput::Hit(bytes) => bytes.to_vec(),
+        CachedOutput::Hit(bytes, _) => bytes.to_vec(),
         CachedOutput::Miss(slot) => {
             let written = tsv(view, text, options);
-            slot.offer(written.clone(), std::time::Duration::from_millis(1));
+            slot.offer(written.clone(), None, std::time::Duration::from_millis(1));
             written
         }
         CachedOutput::Off => tsv(view, text, options),

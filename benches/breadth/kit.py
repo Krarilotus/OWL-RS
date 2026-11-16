@@ -76,7 +76,7 @@ RETREAT = Path(os.environ.get("NRESE_RETREAT_FILE") or Path.home() / "owlrs" / "
 
 
 def wait_until_free():
-    """Waits while the host's owners use it (the office PC's guard writes RETREAT and stops
+    """Waits while the host's owners use it (the shared host's guard writes RETREAT and stops
     our containers then): no step starts during a retreat."""
     said = False
     while RETREAT.exists():

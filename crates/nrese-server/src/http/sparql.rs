@@ -106,12 +106,19 @@ pub async fn execute_query_in(
     // snapshot it reads before writing any answer, and the response starts after that.
     // Every reported status is sent, `complete` where no reasoning path can leave answers
     // out (the store's `None`), so a client never has to read an absent header as one;
-    // a run that reported nothing sends none (SYN-72).
-    type Reported = Option<Option<nrese_sparql::Completeness>>;
-    let status: std::sync::Arc<std::sync::Mutex<Reported>> = std::sync::Arc::default();
+    // a run that reported nothing sends none (SYN-72). Its text is kept with a cached
+    // answer and sent again with it: the same status for every request of its key.
+    use axum::http::HeaderValue;
+    let status: std::sync::Arc<std::sync::Mutex<Option<HeaderValue>>> = Default::default();
     let slot = std::sync::Arc::clone(&status);
-    let report = move |r: Option<nrese_sparql::Completeness>| {
-        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
+    let report = move |r: Option<nrese_sparql::Completeness>, kept: Option<std::sync::Arc<str>>| {
+        let r = told(r);
+        let made = kept.is_none().then(|| r.header());
+        let text = kept.as_deref().or(made.as_deref()).unwrap_or_default();
+        let value =
+            HeaderValue::from_str(text).unwrap_or_else(|_| HeaderValue::from_static(r.as_str()));
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+        made
     };
     let mut response = stream_blocking(
         Pace::Total(deadline),
@@ -130,13 +137,9 @@ pub async fn execute_query_in(
     )
     .await?;
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
-    if let Some(report) = reported.map(Option::unwrap_or_default) {
+    if let Some(value) = reported {
         let headers = response.headers_mut();
-        headers.insert(
-            COMPLETENESS,
-            axum::http::HeaderValue::from_str(&report.header())
-                .unwrap_or_else(|_| axum::http::HeaderValue::from_static(report.as_str())),
-        );
+        headers.insert(COMPLETENESS, value);
         // Readable by a console on another origin too (CORS hides other response headers),
         // so an incomplete answer never shows as a complete one there; appended, so what a
         // proxy exposes besides stays exposed.
@@ -152,31 +155,37 @@ pub async fn execute_query_in(
 /// ([`nrese_sparql::Completeness::header`]; docs/design/ql-rewriting.md §7).
 pub const COMPLETENESS: &str = "nrese-completeness";
 
-/// The JSON form of an answer's status (`null` where no reasoning path can leave answers
-/// out): the shared status ([`nrese_sparql::Completeness`]), the bounds' counts where
-/// known, and what decided it (`decided_by`, the DL bounds' paths).
+/// What a read with no status is told: `complete`, no reasoning path can leave its answers
+/// out (the store's `None`). The query's header, EXPLAIN and the plan all say it through
+/// here, so they never say different things of one read.
+fn told(status: Option<nrese_sparql::Completeness>) -> nrese_sparql::Completeness {
+    status.unwrap_or_default()
+}
+
+/// The JSON form of an answer's status, as the query's header tells it ([`told`]): the
+/// shared status ([`nrese_sparql::Completeness`]), the bounds' counts where known, and
+/// what decided it (`decided_by`, the DL bounds' paths).
 fn completeness_json(
     status: Option<&nrese_sparql::Completeness>,
     decided_by: &[&'static str],
 ) -> serde_json::Value {
-    status.map_or(serde_json::Value::Null, |c| {
-        serde_json::json!({
-            "status": c.as_str(),
-            "regime": c.regime.map(|r| r.as_str()),
-            "sound": c.sound,
-            "complete": c.complete,
-            "reasons": c
-                .reasons
-                .iter()
-                .map(|reason| serde_json::json!({"source": reason.source, "text": reason.text}))
-                .collect::<Vec<_>>(),
-            "bounds": c.bounds.map(|b| serde_json::json!({
-                "lower": b.lower,
-                "upper": b.upper,
-                "unresolved": b.unresolved,
-            })),
-            "decided_by": decided_by,
-        })
+    let c = told(status.cloned());
+    serde_json::json!({
+        "status": c.as_str(),
+        "regime": c.regime.map(|r| r.as_str()),
+        "sound": c.sound,
+        "complete": c.complete,
+        "reasons": c
+            .reasons
+            .iter()
+            .map(|reason| serde_json::json!({"source": reason.source, "text": reason.text}))
+            .collect::<Vec<_>>(),
+        "bounds": c.bounds.map(|b| serde_json::json!({
+            "lower": b.lower,
+            "upper": b.upper,
+            "unresolved": b.unresolved,
+        })),
+        "decided_by": decided_by,
     })
 }
 

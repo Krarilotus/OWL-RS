@@ -7,7 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
-use crate::dl::query::{Revision, answer, plan_status};
+use crate::dl::query::{Revision, answer, certify_closure, plan_status};
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -19,6 +19,10 @@ use crate::query::{SerializedQueryResult, SparqlQueryRequest};
 use crate::query_executor::{PreparedQuery, explain_prepared, plan_prepared, run_query};
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
+
+/// A status header's text as its transport sends it, kept with a cached answer
+/// ([`StoreService::run_query_reporting`]).
+pub type StatusHeader = Option<std::sync::Arc<str>>;
 
 /// The dataset and the operations on it. Reads run on an engine snapshot and never wait for
 /// writers. Writes go through [`MutationPipeline`](crate::MutationPipeline), which gates
@@ -802,11 +806,11 @@ impl StoreService {
     /// holds triple terms) announce it ([`PreparedQuery::announce_rdf12`]).
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
-        if prepared.uses_rdf12()
+        if PreparedQuery::uses_rdf12(prepared.query())
             || self
                 .engine
                 .snapshot()
-                .holds_triple_terms(prepared.read_model())
+                .holds_triple_terms(prepared.read_model(), |_| true)
         {
             prepared.announce_rdf12();
         }
@@ -987,8 +991,9 @@ impl StoreService {
         let mut payload = Vec::new();
         let mut completeness = None;
         let cancellation = CancellationToken::new();
-        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status| {
-            completeness = status
+        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status, _| {
+            completeness = status;
+            None
         })?;
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
@@ -1109,7 +1114,7 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
-        self.run_query_reporting(prepared, cancellation, out, |_| {})
+        self.run_query_reporting(prepared, cancellation, out, |_, _| None)
     }
 
     /// [`Self::run_query`], handing `report` whether the answers are complete, where a
@@ -1120,13 +1125,17 @@ impl StoreService {
     /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
     /// A reader of some graphs who sees every inference is told `not-certified` where the
     /// rewriting ran, and any reader of some graphs under `owl2-dl`: either assessment reads
-    /// the schema of every graph.
+    /// the schema of every graph. With the status, `report` is handed the header text kept
+    /// with the answer where the result cache gives it (made by an earlier `report` for a
+    /// request told the same status), and returns the text it made for an answer written
+    /// now (`None`: none), which the store keeps with the answer where it offers that to
+    /// the cache.
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         self.run_reporting(prepared, cancellation, out, report)
             .map(|_| ())
@@ -1143,7 +1152,10 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
         let mut status = None;
-        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
+        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s, _| {
+            status = s;
+            None
+        })?;
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
@@ -1154,7 +1166,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<(
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
@@ -1169,7 +1181,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<(
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
@@ -1187,7 +1199,7 @@ impl StoreService {
             use crate::dl::query::{Outcome, Read};
             let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
                 Outcome::Answers(answers, status, detail) => {
-                    report(status_for_its_reader(prepared, Some(status), false));
+                    report(status_for_its_reader(prepared, Some(status), false), None);
                     crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                     detail
                 }
@@ -1207,8 +1219,8 @@ impl StoreService {
                         &memory,
                         out,
                         |_| {
-                            report(status_for_its_reader(prepared, Some(status), false));
-                            context
+                            let told = status_for_its_reader(prepared, Some(status), false);
+                            (context, move |kept| report(told, kept))
                         },
                     )?;
                     detail
@@ -1231,9 +1243,9 @@ impl StoreService {
             |ql| {
                 let status = self.status_outside_dl(prepared, ql, at);
                 // The cache's context is the whole assessment, not what the reader is told.
-                let context = context_outside_dl(status.as_ref());
-                report(status_for_its_reader(prepared, status, ql.is_some()));
-                context
+                let context = context_outside_dl(status.as_ref(), ql.is_some());
+                let told = status_for_its_reader(prepared, status, ql.is_some());
+                (context, move |kept| report(told, kept))
             },
         )?;
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
@@ -1259,9 +1271,10 @@ impl StoreService {
     /// The one composition of a read's status (T3), on the snapshot `at` it read, after the
     /// status of its `route` (the closure's, the QL report's or the bounds'), each step only
     /// taking away. A read of a version no one vouched for, or of an unpublished one passed
-    /// as committed, is `not-certified`: `None` only where no reasoner is registered and the
-    /// inferred stack is empty. Pending operations aren't reasoned over before the commit,
-    /// and may delete what their inferences rest on. Under `owl2-dl` the question-only
+    /// as committed, is `not-certified`: `None` only where the version carries no
+    /// certificate, no reasoner is registered and the inferred stack is empty. Pending
+    /// operations aren't reasoned over before the commit, and may delete what their
+    /// inferences rest on. Under `owl2-dl` the question-only
     /// individuals ([`crate::dl::query::mark`]); then the negation rule again, over all that
     /// was taken away.
     pub(crate) fn assess(
@@ -1277,6 +1290,7 @@ impl StoreService {
         let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
             let bare = snapshot.len_in(ReadModel::Inferred) == 0 && !self.supports.has_rules();
+            let bare = bare && Certificate::of(snapshot).is_none();
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
         let mut status = route?;
@@ -1295,7 +1309,7 @@ impl StoreService {
         if matches!(at, Revision::Pending(..)) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
-            crate::dl::query::certify(&mut status, reads, "dl", decided);
+            crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
         }
         Some(status)
     }
@@ -1304,10 +1318,12 @@ impl StoreService {
     /// runs. `None` only where no reasoning path can leave answers out: asserted statements
     /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
     /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
-    /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
-    /// rules' closure without the bounds (`Self::dl_mode`): sound only, never complete
-    /// (SYN-72 slice 2 r1 F1). Either is unsound where a missing row can make a returned
-    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]). As
+    /// told its status here reads the rules' closure without the bounds: the inferred
+    /// statements alone (`onto:implicit`, `Self::dl_mode`; SYN-72 slice 2 r1 F1), or every
+    /// statement outside a transaction; sound only, never complete. A read of every
+    /// statement inside one lacks only its pending operations' reasoning (`Self::assess`).
+    /// Either is unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
+    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). As
     /// `prepared`'s reader is told it (`status_for_its_reader`).
     pub fn status_without_dl(
         &self,
@@ -1329,18 +1345,19 @@ impl StoreService {
         }
         let certificate = Certificate::of(at.snapshot())?;
         if certificate.dl {
-            // A read of every statement here is one inside a transaction: what it lacks is
-            // the pending operations' reasoning (`Self::assess`).
+            // A read of every statement inside a transaction lacks only the pending
+            // operations' reasoning (`Self::assess`); any other read, the DL bounds.
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-            if prepared.read_model() != ReadModel::Materialised {
+            let pending = matches!(at, Revision::Pending(..));
+            if prepared.read_model() != ReadModel::Materialised || !pending {
                 status.incomplete(
                     "dl",
-                    "a read of the inferred statements alone: the rules' closure, without the DL \
+                    "a read of the rules' closure alone, without the DL \
                      bounds; certain answers under OWL 2 DL may be missing"
                         .to_owned(),
                 );
             }
-            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
+            certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
             return Some(status);
         }
         let ruleset = certificate.state.ruleset.clone();
@@ -1354,7 +1371,7 @@ impl StoreService {
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
-        crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules");
+        certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
         Some(status)
     }
 
@@ -1528,7 +1545,7 @@ impl StoreService {
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            crate::dl::query::certify_closure(completeness, (&query, &reads), "ql");
+            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
         }
         Ok(printed)
     }
@@ -1664,7 +1681,7 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
-        self.run_query_pending_reporting(pending, prepared, cancellation, out, |_| {})
+        self.run_query_pending_reporting(pending, prepared, cancellation, out, |_, _| None)
     }
 
     /// [`Self::run_query_pending`], handing `report` the answers' status as
@@ -1679,7 +1696,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         if pending.ops.is_empty() {
             return self.run_query_reporting(prepared, cancellation, out, report);
@@ -1706,8 +1723,8 @@ impl StoreService {
                 |ql| {
                     // A transaction's pending state: never answered from the cache.
                     let status = self.status_outside_dl(prepared, ql, at);
-                    report(status_for_its_reader(prepared, status, ql.is_some()));
-                    Vec::new()
+                    report(status_for_its_reader(prepared, status, ql.is_some()), None);
+                    (Vec::new(), |_| None)
                 },
             )
             .map(|_| ())
@@ -2257,7 +2274,10 @@ impl StoreService {
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
-    /// change of rules; commits keep it current afterwards.
+    /// change of rules; commits keep it current afterwards. A store used as a library that
+    /// rematerialises with no reasoner registered (no pipeline) reads a later version
+    /// without inferred statements or certificate as one no reasoning can leave answers
+    /// out of: no status, not `not-certified`; a server registers its rules first.
     pub fn rematerialise(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
@@ -2526,12 +2546,13 @@ fn dl_context(mode: crate::DlAnswers, status: &nrese_sparql::Completeness) -> Ve
 }
 
 /// The result cache's context of an answer outside the DL bounds: its whole status, or
-/// none, each with a tag of its own.
-fn context_outside_dl(status: Option<&nrese_sparql::Completeness>) -> Vec<u8> {
+/// none, each with a tag of its own, after a byte for whether the QL rewriting ran (what
+/// a reader is told depends on it: [`status_for_its_reader`]).
+fn context_outside_dl(status: Option<&nrese_sparql::Completeness>, rewritten: bool) -> Vec<u8> {
     let Some(status) = status else {
-        return vec![b'N'];
+        return vec![u8::from(rewritten), b'N'];
     };
-    let mut context = vec![b'S'];
+    let mut context = vec![u8::from(rewritten), b'S'];
     status.write_cache_context(&mut context);
     context
 }
@@ -3290,13 +3311,16 @@ mod context_tests {
     use nrese_sparql::{Completeness, Regime};
 
     /// One status keys apart under `owl2-dl` and outside it, apart in each DL answers mode,
-    /// and apart from no status at all: a cached answer of one is never another's.
+    /// apart from no status at all, and apart where the QL rewriting ran and where it didn't:
+    /// a cached answer of one is never another's.
     #[test]
     fn the_cache_contexts_of_one_status_never_meet() {
         let status = Completeness::under(Regime::Owl2Dl);
         let contexts = [
-            context_outside_dl(None),
-            context_outside_dl(Some(&status)),
+            context_outside_dl(None, false),
+            context_outside_dl(None, true),
+            context_outside_dl(Some(&status), false),
+            context_outside_dl(Some(&status), true),
             dl_context(DlAnswers::CertainWhereComplete, &status),
             dl_context(DlAnswers::Sound, &status),
             dl_context(DlAnswers::Exact, &status),
