@@ -67,26 +67,30 @@ impl Budget {
 /// Why a model of `ontology` says nothing for the source: parts of the source weren't
 /// read (fatal diagnostics), so they may have no model. An inconsistency found stands.
 pub fn left_out(ontology: &Ontology) -> Option<String> {
-    let fatal: Vec<_> = ontology
-        .diagnostics
-        .iter()
-        .filter(|d| d.is_fatal())
-        .collect();
-    let first = fatal.first()?;
+    left_out_by(ontology, nrese_owl::Diagnostic::is_fatal)
+}
+
+/// [`left_out`]'s sentence, of the diagnostics `which` picks.
+pub(crate) fn left_out_by(
+    ontology: &Ontology,
+    which: fn(&nrese_owl::Diagnostic) -> bool,
+) -> Option<String> {
+    let found: Vec<_> = ontology.diagnostics.iter().filter(|d| which(d)).collect();
+    let first = found.first()?;
     Some(format!(
         "{} part(s) of the data aren't OWL 2 DL and were left out; first: {first:?}",
-        fatal.len()
+        found.len()
     ))
 }
 
 /// Whether `ontology` is consistent: the context core's Horn stage where it takes the
 /// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
-/// source was left out ([`left_out`]).
+/// source was left out ([`left_out`]), else `Unknown` says so; an inconsistency stands.
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
     let mut checked = check_read(ontology, budget);
     checked.elapsed = started.elapsed();
-    if checked.verdict == Verdict::Consistent
+    if checked.verdict != Verdict::Inconsistent
         && let Some(why) = left_out(ontology)
     {
         checked.verdict = Verdict::Unknown(why);

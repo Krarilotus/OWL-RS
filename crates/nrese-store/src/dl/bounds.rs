@@ -227,13 +227,7 @@ impl Kinds {
         if k.annotations.contains(&p) {
             return true;
         }
-        let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
-            Some(nrese_rdf::Term::NamedNode(n)) => {
-                nrese_owl::diagnostics::reserved_name(n.as_str())
-            }
-            _ => false,
-        };
-        if changes_schema(tx, triple) || k.names.contains(&s) || reserved(s) {
+        if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {
             return false;
         }
         let iri = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
@@ -245,7 +239,7 @@ impl Kinds {
                 && (!deleted || k.declared_data.contains(&p))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
-            !k.names.contains(&o) && !reserved(o) && (Some(p) == self.same_as || property)
+            !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
     }
 }
@@ -422,7 +416,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
-                if upper.classes().is_empty() && asserted().all(|t| upper.is_assertion(t)) =>
+                if upper.classes().is_empty()
+                    && asserted().all(|t| upper.is_assertion(t) && !reserved_named(tx, t)) =>
             {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
@@ -443,7 +438,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                         return Preparation {
                             base,
                             decided_by: "upper-bound",
-                            proves_consistency: upper.program.proves_consistency()
+                            proves_consistency: !upper.left_out
+                                && upper.program.proves_consistency()
                                 && upper.clashes_after(&change) == 0,
                             prepared: Prepared::Delta(Box::new(change)),
                             ontology: None,
@@ -518,6 +514,15 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         prepared: Prepared::Rebuilt(Box::new(upper)),
         ontology: Some(ontology),
     }
+}
+
+/// Whether a statement's subject or object is a reserved name, which the reader leaves out.
+fn reserved_named(tx: &Transaction<'_>, [s, _, o]: Triple) -> bool {
+    let reserved = |t| match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => nrese_owl::diagnostics::reserved_name(n.as_str()),
+        _ => false,
+    };
+    reserved(s) || reserved(o)
 }
 
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
