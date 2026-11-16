@@ -313,6 +313,15 @@ pub(crate) enum Revision<'a> {
     Pending(&'a Snapshot),
 }
 
+impl Revision<'_> {
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        match self {
+            Revision::Decided((snapshot, _)) => snapshot,
+            Revision::Committed(snapshot) | Revision::Pending(snapshot) => snapshot,
+        }
+    }
+}
+
 /// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
 /// ([`reads_differently`]) in the data `at` it was read from, never a later revision's (R1-F2,
 /// F3): composed last by both DL entry points, by a read of the inferred statements alone
@@ -332,10 +341,7 @@ pub(crate) fn mark(
     if let Some(reason) = reads_differently(store, at) {
         completeness.unsound("dl", reason);
     }
-    let snapshot = match at {
-        Revision::Decided((snapshot, _)) => snapshot,
-        Revision::Committed(snapshot) | Revision::Pending(snapshot) => snapshot,
-    };
+    let snapshot = at.snapshot();
     let held = |iri: &str| {
         let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
             return false;
