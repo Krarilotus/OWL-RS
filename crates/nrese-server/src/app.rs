@@ -20,12 +20,9 @@ pub fn build_app(state: AppState) -> Router {
         .max(limits.max_rdf_upload_bytes);
     let body_limit = largest.saturating_mul(3).saturating_add(64 * 1024);
     let metrics = axum::middleware::from_fn_with_state(state.clone(), track);
-    let proxies = axum::middleware::from_fn_with_state(state.clone(), untrusted_subjects);
-    let available =
-        axum::middleware::from_fn_with_state(state.clone(), default_repository_available);
+    let screened = axum::middleware::from_fn_with_state(state.clone(), screen);
     router(state)
-        .layer(available)
-        .layer(proxies)
+        .layer(screened)
         .layer(metrics)
         .layer(DefaultBodyLimit::max(body_limit))
         // Inside the request id, so each problem document carries it.
@@ -33,27 +30,6 @@ pub fn build_app(state: AppState) -> Router {
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
-}
-
-/// While the default repository can't serve (a failed change left it in no known state,
-/// [`nrese_store::StoreService::unavailable`]), requests that resolve to it get 503; those for
-/// other repositories, the server's health, readiness, metrics and version, the repository
-/// lists, the access API and the console go on. One atomic load a request otherwise.
-async fn default_repository_available(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if state.default_unavailable().is_some() && resolves_to_default(request.uri().path()) {
-        return crate::error::ApiError::unavailable(format!(
-            "repository '{}' {}; the server's other repositories serve",
-            crate::repositories::DEFAULT_REPOSITORY,
-            crate::state::UNAVAILABLE_UNTIL_RESTART
-        ))
-        .into_response();
-    }
-    next.run(request).await
 }
 
 /// Whether a request for `path` is the default repository's: not another repository's
@@ -88,14 +64,21 @@ fn resolves_to_default(path: &str) -> bool {
     true
 }
 
-/// In the `mtls` mode, drops the client certificate subject header from requests whose
-/// peer isn't one of the trusted proxies (or is unknown: a router served without peer
-/// addresses): only a proxy that terminated TLS may say who the client is.
-async fn untrusted_subjects(
+/// Every request before the router, in one layer (each layer costs a request its own
+/// allocations and state clones). First, in the `mtls` mode, drops the client certificate
+/// subject header from requests whose peer isn't one of the trusted proxies (or is unknown:
+/// a router served without peer addresses): only a proxy that terminated TLS may say who
+/// the client is. Then, while the default repository can't serve (a failed change left it
+/// in no known state, [`nrese_store::StoreService::unavailable`]), requests that resolve to
+/// it get 503; those for other repositories, the server's health, readiness, metrics and
+/// version, the repository lists, the access API and the console go on. One atomic load a
+/// request otherwise.
+async fn screen(
     axum::extract::State(state): axum::extract::State<AppState>,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if let crate::auth::AuthConfig::Mtls(config) = &state.policy().auth {
         let peer = request
             .extensions()
@@ -113,6 +96,14 @@ async fn untrusted_subjects(
                 "client certificate header from an untrusted peer dropped"
             );
         }
+    }
+    if state.default_unavailable().is_some() && resolves_to_default(request.uri().path()) {
+        return crate::error::ApiError::unavailable(format!(
+            "repository '{}' {}; the server's other repositories serve",
+            crate::repositories::DEFAULT_REPOSITORY,
+            crate::state::UNAVAILABLE_UNTIL_RESTART
+        ))
+        .into_response();
     }
     next.run(request).await
 }
