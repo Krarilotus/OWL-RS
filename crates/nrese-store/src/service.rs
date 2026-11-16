@@ -780,7 +780,10 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
     ) -> StoreResult<nrese_engine::Snapshot> {
-        self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation))
+        let read = self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation));
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
+        read
     }
 
     /// [`Self::read_snapshot`] for a statement or graph read (RDF4J, the Graph Store): its
@@ -2391,7 +2394,8 @@ pub(crate) mod hooks {
         /// An invalidation of the certificate has begun its change of the epoch, and the old
         /// certificate is still in place.
         pub(crate) static INSIDE_INVALIDATION: Hook = const { RefCell::new(None) };
-        /// An `owl2-dl` query has decided its answers and is about to compose their status.
+        /// What a read reads is fixed and its status is still to come: an `owl2-dl` query has
+        /// decided its answers, or another read has taken its snapshot.
         pub(crate) static AFTER_DECIDED: Hook = const { RefCell::new(None) };
     }
 
