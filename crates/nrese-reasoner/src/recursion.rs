@@ -54,17 +54,21 @@ fn node(atom: &Atom, rdf_type: u64, head: bool) -> Node {
 }
 
 /// Which rules of a ground program are non-recursive (by index into `rules`).
-/// `partners` gives the `owl:sameAs` partners of a term (other than itself): classes and
-/// properties with partners are linked to them (see the module docs). Its error ends the
+/// `same_as` is the `owl:sameAs` id the rules do equality over, if they do: then the
+/// replacement rules among them are the module's (see the module docs); every other rule,
+/// whatever its name, is counted as written. `partners` gives the `owl:sameAs` partners of
+/// a term (other than itself): classes and properties with partners are linked to them (see the module docs). Its error ends the
 /// answer: the keys it is asked about come from the grounded rules, one class pair per
 /// subclass edge, so they grow with the schema (fix check r2, R3-F1: a stopped read as "no
 /// partners" let it read every later key's).
 pub fn non_recursive<E>(
     rules: &[Rule],
     rdf_type: u64,
+    same_as: Option<u64>,
     partners: &dyn Fn(u64) -> Result<Vec<u64>, E>,
 ) -> Result<Vec<bool>, E> {
-    let counted = |rule: &Rule| !super::batch::is_replacement_rule(rule);
+    let counted =
+        |rule: &Rule| !same_as.is_some_and(|s| super::batch::is_replacement_rule(rule, s));
     let mut index: HashMap<Node, usize> = HashMap::new();
     let id = |n: Node, index: &mut HashMap<Node, usize>| {
         let next = index.len();
@@ -258,7 +262,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            non_recursive(&rules, ty, &no_partners),
+            non_recursive(&rules, ty, None, &no_partners),
             Ok(vec![true, true, false, false, true, false])
         );
         // C sameAs D: C and D are one component, so C ⊑ D is recursive.
@@ -270,7 +274,7 @@ mod tests {
             })
         };
         assert_eq!(
-            non_recursive(&rules[..2], ty, &same),
+            non_recursive(&rules[..2], ty, None, &same),
             Ok(vec![false, true]),
             "D ⊑ E stays non-recursive"
         );
@@ -290,7 +294,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            non_recursive(&rules, ty, &no_partners),
+            non_recursive(&rules, ty, None, &no_partners),
             Ok(vec![false, false, false])
         );
     }

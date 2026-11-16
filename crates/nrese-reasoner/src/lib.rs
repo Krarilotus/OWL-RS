@@ -28,6 +28,7 @@ pub mod classify;
 pub mod config;
 pub mod delta;
 pub mod engine;
+mod equality_rules;
 pub mod eval;
 pub mod explain;
 pub mod graph_sets;

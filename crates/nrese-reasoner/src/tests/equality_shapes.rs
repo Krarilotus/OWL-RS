@@ -21,7 +21,7 @@ fn every_built_in_ruleset_engages_equality_as_its_name_says() {
             .rules(&mut vocabulary)
             .expect("a built-in ruleset parses");
         assert_eq!(
-            representatives::same_as(&rules).is_some(),
+            representatives::same_as(&rules, vocabulary.iri(SAME_AS)).is_some(),
             RuleProgram::closes_equality(ruleset.name()),
             "{}",
             ruleset.name()
@@ -87,7 +87,7 @@ fn the_equality_rules_are_known_by_what_they_say() {
         let mut vocabulary = LocalVocabulary::default();
         let rules = parse_rules(&text, &mut vocabulary).expect("the rules parse");
         let same_as = vocabulary.iri(SAME_AS);
-        let got = representatives::same_as(&rules);
+        let got = representatives::same_as(&rules, same_as);
         let right = got == engages.then_some(same_as);
         println!(
             "CASE {case}: {} (equality over {got:?}, owl:sameAs is {same_as}, engages: {engages})",
