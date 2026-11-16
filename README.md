@@ -2,7 +2,10 @@
 
 NRESE is an RDF database with OWL reasoning, written in Rust. Its inferences are committed with
 the write they follow from and kept apart from what you stored, and every query answer carries a
-status that says whether rows may be missing.
+status that says whether rows may be missing. You get one server, built from source or as a Docker
+image: SPARQL 1.1, the Graph Store Protocol and RDF4J's protocol over HTTP, and a browser console.
+It takes one writer at a time, and the data must fit one machine: read replicas follow it, but
+nothing fails over or partitions the data ([limits](docs/limits.md)).
 
 Most work with data comes down to organising and standardising it, and an ontology is where
 that is written down. We wanted a store that follows the ontology itself, so that a write is
@@ -114,7 +117,9 @@ x-request-id: a20dd9b2-6f62-4d57-b234-5693005725f4
 transfer-encoding: chunked
 date: Sun, 15 Nov 2026 22:20:42 GMT
 
-{"head":{"vars":["x"]},"results":{"bindings":[{"x":{"type":"uri","value":"http://example.org/tom"}},{"x":{"type":"uri","value":"http://example.org/rex"}}]}}
+{"head":{"vars":["x"]},"results":{"bindings":[
+  {"x":{"type":"uri","value":"http://example.org/tom"}},
+  {"x":{"type":"uri","value":"http://example.org/rex"}}]}}
 ```
 
 Tom is an animal by a rule: the update's commit also stored `ex:tom a ex:Animal`. Rex is one
