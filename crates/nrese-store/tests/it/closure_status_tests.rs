@@ -1959,6 +1959,32 @@ fn a_paths_end_over_iris_stays_complete_beside_a_number() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A path that can match zero steps (`*`, `?`, or an alternative with one) pairs every term
+/// of the graph with itself, data values included, whatever its predicates hold: over
+/// [`SEVEN`], `?x :knows* ?y` binds `?x` and `?y` to `"07"` and to `7`, one value to OWL 2.
+/// Spec: a `DISTINCT` over either end doesn't return both or isn't `complete`, run and
+/// planned, under each regime that promises `complete`.
+#[test]
+fn a_zero_length_paths_ends_can_be_data_values() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let store = store(SEVEN);
+        for read in [
+            "SELECT DISTINCT ?x { ?x :knows* ?y }",
+            "SELECT DISTINCT ?x { ?x (:knows|:p?) ?y }",
+            "SELECT DISTINCT ?y { ?x :knows* ?y }",
+        ] {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            let both = rows.contains("\"value\":\"07\"") && rows.contains("\"value\":\"7\"");
+            if both && status.contains(&"complete") {
+                wrong.push(format!("{regime}, {read}: {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A reader of the default graph and `:open`, with the inferences their graphs support, and
 /// not of `:secret`, under `owl2-ql` and `owl2-rl` with the rewriting on: whether `:p` holds
 /// a number in `:secret` is hidden from them. Spec: their rows and their entire assessment
@@ -1970,6 +1996,8 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
 
     use nrese_sparql::{Completeness, GraphAccess};
     use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    use crate::support::Writes;
 
     let said = |c: Option<&Completeness>| {
         c.map_or("none".to_owned(), |c| {
