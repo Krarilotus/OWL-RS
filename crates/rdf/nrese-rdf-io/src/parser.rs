@@ -96,7 +96,10 @@ impl RdfParser {
     /// error is in, unless the XML isn't well-formed; JSON-LD skips an element of a
     /// top-level array (or of a top-level object's `@graph` array) that fails to expand,
     /// unless the JSON is malformed. N-Triples and N-Quads go on after a bad line anyway;
-    /// other formats stop at the first error. A read error always stops.
+    /// other formats stop at the first error. A read error always stops. An error the
+    /// document ends with says so ([`RdfParseError::ends_document`]), and where the input
+    /// ended inside a statement (the last line of N-Triples or N-Quads without its line end,
+    /// a Turtle or TriG statement that recovery finds no end of), that it may be cut off.
     pub fn recovering(mut self) -> Self {
         self.recover = true;
         self
@@ -457,11 +460,15 @@ impl<R: Read> QuadParser<'_, R> {
         if *done {
             return None;
         }
-        let step = next_quad(inner, default_graph, *without_named_graphs);
-        if let Some(Err(error)) = &step {
-            *done = matches!(error, RdfParseError::Io(_)) || !*recovers;
+        match next_quad(inner, default_graph, *without_named_graphs) {
+            // The error ends the document if the format or the parser goes no further: it
+            // says so, for a consumer that would otherwise skip it.
+            Some(Err(error)) => {
+                *done = error.ends_document() || !*recovers;
+                Some(Err(error.ending(*done, false)))
+            }
+            step => step,
         }
-        step
     }
 }
 
@@ -552,7 +559,7 @@ fn next_quad<'p, R: Read>(
                     match parser.parse(text, line, offset) {
                         Ok(None) => continue,
                         Ok(Some(_)) => unreachable!("a directive has no statement"),
-                        Err(error) => return Some(Err(lines.in_document(error.into()))),
+                        Err(error) => return Some(Err(lines.failed(error.into()))),
                     }
                 }
                 break (range, line, offset);
@@ -567,7 +574,7 @@ fn next_quad<'p, R: Read>(
                     },
                 ),
                 Ok(None) => unreachable!("parsed to a statement above"),
-                Err(error) => return Some(Err(lines.in_document(error.into()))),
+                Err(error) => return Some(Err(lines.failed(error.into()))),
             }
         }
     };
