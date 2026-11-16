@@ -1,7 +1,7 @@
 """A load case's `ready` series (fast.py READY, D16-606): the load plus the planner statistics
 build the load command runs before it returns, where the side reports one; the load alone where
 the side has no such step; compared against main only, never against a side whose perf lab leaves
-the build out (the orchestrator's decision, 14 Nov 2026).
+the build out.
 
     python -m unittest discover benches/suite/tests
 """

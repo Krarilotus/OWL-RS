@@ -69,10 +69,11 @@ fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
     let token = CancellationToken::new();
     let mut reported = false;
     let mut bytes = Vec::new();
-    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status| {
+    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status, _| {
         assert!(status.unwrap().complete);
         reported = true;
         token.cancel();
+        None
     });
     assert!(reported);
     assert!(matches!(
@@ -450,8 +451,9 @@ fn decided_then(
         .unwrap();
     let (mut out, mut status) = (Vec::new(), None);
     store
-        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
-            status = s
+        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s, _| {
+            status = s;
+            None
         })
         .unwrap();
     assert!(
@@ -538,7 +540,10 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
         let (mut answer, mut status) = (Vec::new(), None);
         match path {
             "run" => store
-                .run_query_reporting(&prepared, &cancel, &mut answer, |s| status = s)
+                .run_query_reporting(&prepared, &cancel, &mut answer, |s, _| {
+                    status = s;
+                    None
+                })
                 .unwrap(),
             "explain" => {
                 status = store
@@ -584,7 +589,7 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
             &prepared,
             &CancellationToken::new(),
             &mut Vec::new(),
-            |_| (),
+            |_, _| None,
         )
     };
     assert!(run().is_ok(), "the control: {:?}", run().map(|_| ()));
@@ -664,7 +669,10 @@ fn marks_and_passes(
         let (mut status, cancel) = (None, CancellationToken::new());
         let out = Vec::<u8>::new();
         match inside {
-            false => store.run_query_reporting(&prepared, &cancel, out, |s| status = s),
+            false => store.run_query_reporting(&prepared, &cancel, out, |s, _| {
+                status = s;
+                None
+            }),
             true => store.run_query_pending_reporting(
                 &StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(
                     update.clone(),
@@ -672,7 +680,10 @@ fn marks_and_passes(
                 &prepared,
                 &cancel,
                 out,
-                |s| status = s,
+                |s, _| {
+                    status = s;
+                    None
+                },
             ),
         }
         .unwrap();
@@ -812,7 +823,8 @@ impl Draw {
 /// What the store's indexes decide of the mark is what the whole ontology decides. Random
 /// stores under `owl2-dl`, with and without compact equality: declarations, schema
 /// statements and blank-node class expressions (whole or broken) on names, on blank nodes and
-/// on the built-in annotation property `rdfs:label`; property assertions with names and
+/// on the nine built-in annotation properties, as subjects and as super-properties; property
+/// assertions with names and
 /// literals (a property's kind flips with its use); `owl:sameAs`, asserted and through
 /// functional properties; over the default and two named graphs. Each is read committed and
 /// with random pending additions and deletions: the mark equals the whole ontology's, reason
@@ -836,6 +848,12 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         iri("http://www.w3.org/2004/02/skos/core#", "prefLabel"),
         rdfs("label"),
     ]);
+    // The other eight built-in annotation properties (rdfs:label is a name), as subjects and
+    // as objects (a property's super-property), never declared.
+    let builtins: Vec<NamedNode> = nrese_owl::BUILTIN_ANNOTATIONS[1..]
+        .iter()
+        .map(|i| NamedNode::new_unchecked(*i))
+        .collect();
     let blanks: Vec<BlankNode> = (0..4)
         .map(|i| BlankNode::new_unchecked(format!("x{i}")))
         .collect();
@@ -870,6 +888,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     ];
     let mut objects: Vec<Term> = names.iter().cloned().map(Term::from).collect();
     objects.extend(blanks.iter().cloned().map(Term::from));
+    objects.extend(builtins.iter().cloned().map(Term::from));
     objects.extend([
         Literal::new_simple_literal("l").into(),
         rdf("nil").into(),
@@ -882,8 +901,9 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         iri("urn:test:", "g2").into(),
     ];
     let statement = |r: &mut Draw| {
-        let subject: NamedOrBlankNode = match r.below(4) {
+        let subject: NamedOrBlankNode = match r.below(5) {
             0 => r.pick(&blanks).into(),
+            1 => r.pick(&builtins).into(),
             _ => r.pick(&names).into(),
         };
         let (predicate, object): (NamedNode, Term) = match r.below(6) {
@@ -1040,9 +1060,10 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
     let run = |told: &dyn Fn()| {
         let (mut status, mut out) = (None, Vec::new());
         store
-            .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
+            .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s, _| {
                 status = s;
                 told();
+                None
             })
             .unwrap();
         (String::from_utf8(out).unwrap(), status.expect("a status"))

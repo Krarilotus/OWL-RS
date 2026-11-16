@@ -1,4 +1,4 @@
-"""The perf bisect (scripts/bisect-perf.py; the owner, 14 Oct 2026, after a bisect that read one
+"""The perf bisect (scripts/bisect-perf.py; written 14 Oct 2026, after a bisect that read one
 revision's numbers into its neighbour's row and named the wrong merge): every revision measured
 itself, bit-identical runs of two revisions refused, the ends checked to separate, and both ends
 of the last step measured again before a first bad commit is named.

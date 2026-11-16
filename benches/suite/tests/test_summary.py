@@ -174,7 +174,7 @@ class LoadedInputs(unittest.TestCase):
         return path
 
     def test_suite_results_of_another_release_give_no_verdict(self):
-        """The orchestrator, 7 Nov 2026 (16:55): suite results are compared by their own path
+        """Suite results are compared by their own path
         (compare.main -> compare_pairs), which printed faster or slower across another release of a
         dataset. The same rule holds there: the /data files both runs read, the same bytes, or no
         verdict; without recorded hashes, another size is another input and the same size unknown."""
@@ -219,7 +219,7 @@ class LoadedInputs(unittest.TestCase):
                     self.assertNotIn(verdict, out.getvalue())
 
     def test_a_perf_lab_case_compares_on_the_same_bytes_and_is_refused_on_others(self):
-        """The orchestrator, 7 Nov 2026 (17:12): leads compare perf-lab runs (the `lab-*` cases, the
+        """Leads compare perf-lab runs (the `lab-*` cases, the
         perf lab through fast.py) for counts; their records say what they loaded like every case."""
         same = {"olympics.nt": "o" * 64}
         code, text = self.compare(self.report(100.0, same, case="lab-olympics"),
@@ -501,7 +501,7 @@ class LoadedInputs(unittest.TestCase):
             self.assertIn("faster", output(compare.main, [str(runs[0]), str(runs[1])]))
 
     def test_a_case_s_declared_input_missing_from_a_record_is_unknown(self):
-        """The orchestrator, 7 Nov 2026 (18:12): a declared input a record doesn't hash, or a hash for
+        """A declared input a record doesn't hash, or a hash for
         an input the case doesn't declare, is unknown, never none."""
         code, text = self.compare(self.report(100.0, {"lubm-10.nt": "x" * 64}),
                                   self.report(50.0, {"lubm-10.nt": "x" * 64}))  # univ-bench.nt unhashed

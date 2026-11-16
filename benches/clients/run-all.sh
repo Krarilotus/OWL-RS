@@ -4,7 +4,7 @@
 #            tooling, ResearchSpace and other RDF4J applications
 #   jena     Apache Jena's RDFConnection, result formats, the Graph Store Protocol
 #   rdflib   rdflib's SPARQLUpdateStore and Dataset, the Graph Store Protocol
-#   dmw      the Datamodel Workflow's export, questions, updates and validation
+#   dmw      a downstream client's export, questions, updates and validation
 #            (scripts/smoke-dmw-export.sh)
 #
 #   benches/clients/run-all.sh [path/to/nrese-server] [kit...]

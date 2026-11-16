@@ -402,7 +402,7 @@ fn a_joined_read_gives_up(explain: bool) {
             first_token.clone(),
         );
         std::thread::spawn(move || {
-            store.run_query_reporting(&prepared, &token, std::io::sink(), |_| {})
+            store.run_query_reporting(&prepared, &token, std::io::sink(), |_, _| None)
         })
     };
     holding
@@ -426,7 +426,7 @@ fn a_joined_read_gives_up(explain: bool) {
         std::thread::spawn(move || {
             let result = match explain {
                 true => store.plan_query(&prepared, &token).map(drop),
-                false => store.run_query_reporting(&prepared, &token, std::io::sink(), |_| {}),
+                false => store.run_query_reporting(&prepared, &token, std::io::sink(), |_, _| None),
             };
             let _ = answer.send((result, ended.load(Ordering::SeqCst)));
         });
