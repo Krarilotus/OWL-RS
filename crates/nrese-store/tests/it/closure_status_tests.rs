@@ -1486,10 +1486,12 @@ fn bound(rows: &str, var: &str) -> usize {
 }
 
 /// The shapes that compare data values by term: a join on one (over a declared and an
-/// undeclared property), and `DISTINCT`, `GROUP BY` and `COUNT(DISTINCT)` over one. Each
+/// undeclared property, on a blank node, written or made by a path's sequence, and at the
+/// start of a path with a reversed step under `+`), and `DISTINCT`, `GROUP BY` and
+/// `COUNT(DISTINCT)` over one (and `DISTINCT` and `GROUP BY` over an alias of one). Each
 /// `(shape, data, read, right)`, `right` holding of the rows OWL 2 gives by value over
 /// [`SEVEN`]: `:a` and `:b` share their value, which is one value.
-const SHAPES: [(&str, &str, &str, Right); 5] = [
+const SHAPES: [(&str, &str, &str, Right); 10] = [
     (
         "a join",
         SEVEN,
@@ -1500,6 +1502,24 @@ const SHAPES: [(&str, &str, &str, Right); 5] = [
         "a join over an undeclared property",
         ":a :size \"07\"^^xsd:integer . :b :size 7 .",
         "SELECT ?x ?y { ?x :size ?n . ?y :size ?n FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join on a blank node",
+        SEVEN,
+        "SELECT ?x ?y { ?x :age/^:age ?y FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join on a written blank node",
+        SEVEN,
+        "SELECT ?x ?y { ?x :age _:v . ?y :age _:v FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join at a reversed path's start",
+        SEVEN,
+        "SELECT ?x ?y { ?n (^:age)+ ?x . ?n (^:age)+ ?y FILTER(?x != ?y) }",
         |rows| rows.contains("example.com/a\""),
     ),
     (
@@ -1519,6 +1539,18 @@ const SHAPES: [(&str, &str, &str, Right); 5] = [
         SEVEN,
         "SELECT (COUNT(DISTINCT ?n) AS ?c) { ?x :age ?n }",
         |rows| rows.contains("\"value\":\"1\""),
+    ),
+    (
+        "DISTINCT over an alias",
+        SEVEN,
+        "SELECT DISTINCT (?n AS ?m) { ?x :age ?n }",
+        |rows| bound(rows, "m") == 1,
+    ),
+    (
+        "GROUP BY an alias",
+        SEVEN,
+        "SELECT ?g (COUNT(?x) AS ?c) { ?x :age ?n } GROUP BY (?n AS ?g)",
+        |rows| bound(rows, "g") == 1,
     ),
 ];
 
@@ -1738,14 +1770,14 @@ fn a_plain_string_asked_where_one_is_stored_stays_complete() {
 
 /// An aggregate over a data value compared by term gives a wrong number or wrong groups
 /// (`COUNT(DISTINCT)` counts `"07"` and `7` as two values; OWL 2 as one), not only missing
-/// rows. Spec: the `GROUP BY` and `COUNT(DISTINCT)` shapes of [`SHAPES`] are `unsound`, run
-/// and planned, under each regime that promises `complete`.
+/// rows. Spec: the `GROUP BY` (of a variable or an alias) and `COUNT(DISTINCT)` shapes of
+/// [`SHAPES`] are `unsound`, run and planned, under each regime that promises `complete`.
 #[test]
 fn an_aggregate_over_data_values_compared_by_term_is_unsound() {
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
         for (shape, data, read, _) in SHAPES {
-            if !matches!(shape, "GROUP BY" | "COUNT(DISTINCT)") {
+            if !matches!(shape, "GROUP BY" | "COUNT(DISTINCT)" | "GROUP BY an alias") {
                 continue;
             }
             let (rows, status) = answer(&store(data), read);
@@ -1767,7 +1799,8 @@ fn an_aggregate_over_data_values_compared_by_term_is_unsound() {
 fn a_string_beside_a_number_is_sound_only_though_no_row_is_missed() {
     let cases: [(&str, &str, Right); 2] = [
         (
-            ":name a owl:DatatypeProperty . :age a owl:DatatypeProperty .              :a :name \"7\" . :b :age 7 .",
+            ":name a owl:DatatypeProperty . :age a owl:DatatypeProperty . \
+             :a :name \"7\" . :b :age 7 .",
             "SELECT ?x ?y { ?x :name ?v . ?y :age ?v }",
             |rows| !rows.contains("example.com/"),
         ),
