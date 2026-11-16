@@ -2064,44 +2064,94 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// OWL 2 doesn't define triple terms, so its regimes can't say what a complete answer that
-/// uses one is: `<<( :s :age "07"^^xsd:integer )>>` is the stored `<<( :s :age 7 )>>` if the
-/// value counts and isn't if the spelling does, and a variable inside one joins by either.
-/// Spec: a query with a triple term, a typed or plain constant inside it, bound by `VALUES`,
-/// or with a variable inside it joined outside, isn't `complete`, run and planned, under each
-/// regime that promises `complete`.
+/// OWL 2 defines neither triple terms nor base directions (RDF 1.2), so its regimes can't say
+/// what a complete answer that uses one is: `<<( :s :age "07"^^xsd:integer )>>` is the stored
+/// `<<( :s :age 7 )>>` if the value counts and isn't if the spelling does (RDF 1.2 Semantics
+/// §5, §7.1), and a variable inside one joins by either. Spec: under each regime that promises
+/// `complete`, run and planned, no answer is `complete` to a query with a triple term (a typed
+/// or plain constant inside it, bound by `VALUES`, or a variable inside it joined outside) or
+/// a base-direction literal, over a store with no triple term; to a reader of everything over
+/// a store that holds one, reached only through a variable; or, under the regimes a
+/// restricted reader is served by, to a restricted reader whatever the store holds.
 #[test]
 fn no_query_with_a_triple_term_is_complete_under_owl_2() {
-    let data = ":age a owl:DatatypeProperty . :y :age \"07\"^^xsd:integer .
-        :a :says <<( :s :age 7 )>> . :b :says <<( :s :name \"Rex\" )>> .";
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::ReadScope;
+
+    let plain = ":age a owl:DatatypeProperty . :y :age \"07\"^^xsd:integer . :a :name \"Rex\" .";
+    let holds = ":a :says <<( :s :age 7 )>> . :b :says <<( :s :age \"07\"^^xsd:integer )>> .";
     let typed = "<<( :s :age \"07\"^^xsd:integer )>>";
     let cases = [
         (
+            plain,
             "a typed constant",
             format!("SELECT ?x {{ ?x :says {typed} }}"),
         ),
         (
+            plain,
             "a typed constant bound by VALUES",
             format!("SELECT ?x {{ VALUES ?t {{ {typed} }} ?x :says ?t }}"),
         ),
         (
+            plain,
             "a variable joined outside",
             "SELECT ?x ?y { ?x :says <<( :s :age ?n )>> . ?y :age ?n }".to_owned(),
         ),
         (
+            plain,
             "a plain string, which OWL 2 doesn't define inside a triple term either",
             "SELECT ?x { ?x :says <<( :s :name \"Rex\" )>> }".to_owned(),
+        ),
+        (
+            plain,
+            "a base-direction literal",
+            "SELECT ?x { ?x :name \"Rex\"@ar--rtl }".to_owned(),
+        ),
+        (
+            holds,
+            "a triple term reached through a variable",
+            "SELECT DISTINCT ?t { ?x :says ?t }".to_owned(),
         ),
     ];
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
-        let store = store(data);
-        for (case, read) in &cases {
-            let (rows, status) = answer(&store, read);
+        for (data, case, read) in &cases {
+            let (rows, status) = answer(&store(data), read);
             eprintln!("{regime}, {case}: {rows} {status:?}");
             if status.contains(&"complete") {
                 wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
             }
+        }
+    }
+    let scope = ReadScope::Graphs(Arc::new(GraphAccess {
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    for (regime, ruleset, ql) in [
+        ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
+    ] {
+        let store = closure(plain, ruleset, ql);
+        let request = SparqlQueryRequest::new(
+            format!("{PREFIXES}SELECT ?x ?n {{ ?x :name ?n }}"),
+            scope.clone(),
+        );
+        let result = store.execute_query(&request).expect("answered");
+        let prepared = store.prepare_query(&request).expect("prepared");
+        let planned = store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("planned");
+        let status =
+            [result.completeness, planned.completeness].map(|c| c.map_or("none", |c| c.as_str()));
+        let rows = String::from_utf8(result.payload).unwrap();
+        let case = "a restricted reader over a store with no triple term";
+        eprintln!("{regime}, {case}: {rows} {status:?}");
+        if status.contains(&"complete") {
+            wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
