@@ -2483,21 +2483,53 @@ mod certificate_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// A bulk load clears the certificate before it publishes, never after: one whose clearing
-    /// fails (the marker can't be removed) publishes nothing, so the certificate is never left
-    /// over the load's data, in the process or after a reopen. Published first, the load's
-    /// data would be served and on disk under the old marker.
+    /// A bulk load clears the certificate before it publishes, never after, and a load whose
+    /// clearing fails (the marker can't be removed) changes nothing: it publishes nothing, and
+    /// the certificate stays whole, the QL rewriting it switches on included, so every answer
+    /// stays, in the process and after a reopen. Published first, the load's data would be
+    /// served and on disk under the old marker; the rewriting dropped first, the existential's
+    /// answer would go while the marker still certifies the data.
     #[test]
     fn a_load_that_cannot_clear_the_certificate_publishes_nothing() {
+        const EX: &str = "http://example.com/";
         let dir = tempfile::tempdir().unwrap();
-        let (a, b) = files(dir.path());
+        // `:a :p ?o` holds only through the rewriting of the existential, which the
+        // certificate switches on.
+        let ontology = dir.path().join("ontology.ttl");
+        std::fs::write(
+            &ontology,
+            format!(
+                "@prefix : <{EX}> .\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+                 owl:someValuesFrom owl:Thing ] .\n:a a :A .\n"
+            ),
+        )
+        .unwrap();
+        let more = dir.path().join("more.nt");
+        std::fs::write(&more, format!("<{EX}b> <{EX}q> <{EX}c> .\n")).unwrap();
         let store_dir = dir.path().join("store");
-        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
-        load(&store, &a);
-        store.rematerialise(rdfs()).unwrap();
+        let config = || StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::on_disk(&store_dir)
+        };
+        let marker = || std::fs::read(store_dir.join(super::REASONING_MARKER)).ok();
+        let ask = |store: &StoreService, query: &str| {
+            let answer = store.execute_query_str(query).unwrap();
+            String::from_utf8_lossy(&answer.payload).contains("true")
+        };
+        let store = StoreService::new(config()).unwrap();
+        load(&store, &ontology);
+        store
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Ql)
+            .unwrap();
+        let existential = format!("ASK {{ <{EX}a> <{EX}p> ?o }}");
+        assert!(ask(&store, &existential), "the rewriting answers it");
+        let certified = (store.reasoning_state(), store.consistency(), marker());
+        assert!(certified.0.is_some() && certified.2.is_some(), "certified");
         crate::metadata::tests::FAIL_REMOVE.set(true);
         let failed = store.bulk_load(&crate::BulkLoadRequest {
-            files: vec![b],
+            files: vec![more],
             replace: false,
             graph: crate::GraphTarget::DefaultGraph,
             invalid: None,
@@ -2507,26 +2539,28 @@ mod certificate_tests {
         if failed.is_ok() {
             wrong.push("the load succeeded without clearing the certificate".to_owned());
         }
-        let mut certified_over_it = |store: &StoreService, when: &str| {
-            let answer = store
-                .execute_query_str(
-                    "ASK { <http://example.com/C> \
-                     <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> }",
-                )
-                .unwrap();
-            let published = String::from_utf8_lossy(&answer.payload).contains("true");
-            let current = store.reasoning_is_current(rdfs());
-            eprintln!("{when}: the load's data published {published}, RDFS current {current}");
-            if published && current {
-                wrong.push(format!(
-                    "{when}: the load's data published under the certificate"
-                ));
+        let mut unchanged = |store: &StoreService, when: &str| {
+            let seen = [
+                (ask(store, &existential), "the existential's answer"),
+                (
+                    !ask(store, &format!("ASK {{ <{EX}b> <{EX}q> <{EX}c> }}")),
+                    "nothing published",
+                ),
+                (
+                    (store.reasoning_state(), store.consistency(), marker()) == certified,
+                    "the certificate and its marker",
+                ),
+            ];
+            for (held, what) in seen {
+                if !held {
+                    wrong.push(format!("{when}: {what} changed"));
+                }
             }
         };
-        certified_over_it(&store, "in process");
+        unchanged(&store, "in process");
         drop(store);
-        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
-        certified_over_it(&store, "after a reopen");
+        let store = StoreService::new(config()).unwrap();
+        unchanged(&store, "after a reopen");
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
