@@ -4,7 +4,11 @@ pet, which is a cat or a dog, is an animal only through the union, which the OWL
 prove: both rows, and the answer is complete; reading asserted
 statements only (infer=false) finds none, with a complete answer; deleting the premises leaves
 no animal; a shape in the shapes graph makes the gate reject an unnamed
-cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes."""
+cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes.
+An upload is checked as an update is (docs/tutorial.md, "Your own data"): a Graph Store PUT
+of the default graph with an unnamed animal is refused (400, SHACL Reject) and leaves the
+default graph as it was; with a name it passes (204) and replaces the default graph; the
+shapes graph, a named graph, stays, so an unnamed animal is still refused."""
 
 [server]
 set = { "reasoner.mode" = "owl2-dl", "shacl.gate" = "enforce" }
@@ -108,3 +112,63 @@ headers = { Accept = "application/sparql-results+json" }
 status = 200
 rows = 1
 json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/felix" } }
+
+[[step]]
+name = "an upload of the default graph with an unnamed animal is refused"
+method = "PUT"
+path = "/dataset/data"
+params = { default = "" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.org/> .
+ex:oscar a ex:Animal .
+"""
+[step.expect]
+status = 400
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.title" = "SHACL Reject", "$.type" = "https://nrese.dev/problems/shacl-reject", "$.detail" = { contains = "focus node <http://example.org/oscar>" } }
+
+[[step]]
+name = "nothing of the refused upload remains: felix is still the one animal"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 1
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/felix" } }
+
+[[step]]
+name = "with a name the upload passes"
+method = "PUT"
+path = "/dataset/data"
+params = { default = "" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.org/> .
+ex:oscar a ex:Animal ; ex:name "Oscar" .
+"""
+[step.expect]
+status = 204
+
+[[step]]
+name = "the upload replaced the default graph: oscar is the one animal"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 1
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/oscar" } }
+
+[[step]]
+name = "the shape outlived the upload: an unnamed animal is still refused"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} INSERT DATA { ex:felix a ex:Animal }" }
+[step.expect]
+status = 400
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.title" = "SHACL Reject", "$.type" = "https://nrese.dev/problems/shacl-reject", "$.detail" = { contains = "focus node <http://example.org/felix>" } }
