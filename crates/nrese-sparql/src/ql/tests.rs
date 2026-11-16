@@ -1128,3 +1128,77 @@ fn the_reader_reads_the_mapping_vocabulary() {
     let facet = format!("{}minInclusive", nrese_owl::vocab::XSD);
     assert!(properties.contains(&facet.as_str()), "the facets are read");
 }
+
+/// What the probe answers kept for one view may hold (docs/design/ql-rewriting.md, the
+/// probes): 4 MiB, each answer counted as its key's length and 48 bytes.
+const PROBE_CAP: usize = 4 << 20;
+
+/// The bytes `answers` take as the cap counts them.
+fn probe_bytes(answers: &ProbeAnswers) -> usize {
+    answers.iter().map(|((_, key), _)| key.len() + 48).sum()
+}
+
+/// `ASK { :e{i} :worksFor ?y }`'s answer over `snapshot`.
+fn works_for(snapshot: &Snapshot, options: &QueryOptions, i: usize) -> bool {
+    let query = SparqlParser::new()
+        .parse_query(&format!("ASK {{ <{EX}e{i}> <{EX}worksFor> ?y }}"))
+        .unwrap();
+    let QueryResults::Boolean(answer) = evaluate_query(snapshot, &query, options).unwrap() else {
+        panic!("a boolean expected");
+    };
+    answer
+}
+
+/// A reader asking about more distinct individuals than the cap holds answers keeps, on one
+/// view, at most [`PROBE_CAP`] of probe answers: the store's published view and a version
+/// no commit published alike (they keep their probes apart). A question whose answer was
+/// dropped is asked again, and answered as before.
+#[test]
+fn the_probe_answers_kept_for_one_view_stay_within_their_cap() {
+    // About 260 bytes a probe as counted: 20,000 pass the cap by about a quarter.
+    const N: usize = 20_000;
+    let mut employees = String::new();
+    for i in 0..N {
+        employees.push_str(&format!(":e{i} a :Employee . "));
+    }
+    let engine = engine(&employees);
+    let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+    let options = sharing(&ql);
+    let published = engine.snapshot();
+    let mut tx = engine.transaction();
+    tx.insert(quad("x", &format!("{EX}knows"), "y").as_ref());
+    let pending = tx.pending_snapshot();
+    for (name, snapshot) in [("published", &published), ("unpublished", &pending)] {
+        let first = works_for(snapshot, &options, 0);
+        for i in 1..N {
+            works_for(snapshot, &options, i);
+        }
+        let kept = match snapshot.admission() {
+            nrese_engine::Admission::Shared(_) => vec![kept_probes(&ql).1],
+            nrese_engine::Admission::Own(own) => {
+                let mine = own.get::<QlOwn>().expect("the version keeps its probes");
+                let probes = mine.probes.lock().unwrap();
+                probes.values().map(Probes::all).collect()
+            }
+        };
+        for answers in &kept {
+            assert!(
+                probe_bytes(answers) <= PROBE_CAP,
+                "{name}: {} probe answers kept, {} bytes as counted, over {PROBE_CAP}",
+                answers.len(),
+                probe_bytes(answers)
+            );
+        }
+        let dropped = !kept
+            .iter()
+            .flatten()
+            .any(|((_, key), _)| key.contains(&format!("{EX}e0>")));
+        assert!(dropped, "{name}: the first question's answer is still kept");
+        assert!(first, "{name}: every employee works for something");
+        assert_eq!(
+            works_for(snapshot, &options, 0),
+            first,
+            "{name}: asked again"
+        );
+    }
+}
