@@ -599,7 +599,7 @@ fn plan_status_built(
     if let Some(why) = consistency {
         status.add(why);
     }
-    if store.dl().user_rules() {
+    if crate::service::Certificate::route(snapshot, store.dl()).1 {
         status.add(USER_RULES.to_owned());
     }
     if let Some(what) = unbounded(analysis) {
@@ -735,7 +735,7 @@ fn decide_answers(
     if let Some(why) = consistency_reason(consistency) {
         status.add(why);
     }
-    if store.dl().user_rules() {
+    if crate::service::Certificate::route(snapshot, store.dl()).1 {
         status.add(USER_RULES.to_owned());
     }
     if let Some(what) = unbounded(analysis) {
