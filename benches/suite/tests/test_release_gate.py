@@ -615,8 +615,8 @@ class Rounds(unittest.TestCase):
                     {k: v for k, v in MACHINE.items() if k != "fleet_host"}
             return out
         self.assertEqual(run_gate(ran_on("phuoc-yu"))["errors"], [])
-        moved = run_gate(ran_on("office-pc"))["errors"]
-        self.assertTrue(any("passes ran on office-pc, not on phuoc-yu" in e for e in moved), moved)
+        moved = run_gate(ran_on("shared-a"))["errors"]
+        self.assertTrue(any("passes ran on shared-a, not on phuoc-yu" in e for e in moved), moved)
         unsaid = run_gate(ran_on(None))["errors"]
         self.assertTrue(any("don't say which fleet host ran them" in e for e in unsaid), unsaid)
         # A report naming no host (a run outside a fleet job) holds them to none.
@@ -1031,7 +1031,7 @@ class Rounds(unittest.TestCase):
         and a file's `note` (lubm-100's make time) without a word."""
         from suitekit import datasets
         entry = {"file": "univ-bench.nt", "made_by": "bash benches/reasoning/prepare-lubm.sh 1", "bytes": 47781,
-                 "sha256": "2" * 64, "rdfc_sha256": "7" * 64, "note": "made in 8 s on khaleesi-wsl"}
+                 "sha256": "2" * 64, "rdfc_sha256": "7" * 64, "note": "made in 8 s on dev-a-wsl"}
         with tempfile.TemporaryDirectory() as root:
             (Path(root) / "benches").mkdir()
             datasets.save(Path(root), {"budget_gb": 300, "dataset": [entry]})
@@ -1221,13 +1221,13 @@ class Verdicts(unittest.TestCase):
 
     def test_cases_not_run_block_and_those_left_to_the_big_host_must_be_timed_there(self):
         self.assertFalse(run_gate(passes(), not_run={"bsbm-bi-100m": "its cap is 28 GB"})["passed"])
-        here = run_gate(passes(), elsewhere={"bsbm-bi-100m": "timed on khaleesi-wsl"})
+        here = run_gate(passes(), elsewhere={"bsbm-bi-100m": "timed on dev-a-wsl"})
         ok = {"passed": True, "errors": [], "guards": 81}
         w3c = {"passed": True, "errors": []}
         passed, text = gate_module.verdict([here], w3c, ok)
         self.assertFalse(passed)
         self.assertIn("NOT timed anywhere: bsbm-bi-100m", text)
-        big = {**here, "planned": ["bsbm-bi-100m"], "elsewhere": {}, "context": {**CONTEXT, "host": "khaleesi-wsl"}}
+        big = {**here, "planned": ["bsbm-bi-100m"], "elsewhere": {}, "context": {**CONTEXT, "host": "dev-a-wsl"}}
         self.assertTrue(gate_module.verdict([here, big], w3c, ok)[0])
 
     def test_a_series_the_candidate_lost_blocks(self):

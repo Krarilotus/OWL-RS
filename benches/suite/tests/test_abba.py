@@ -228,13 +228,13 @@ class Abba(unittest.TestCase):
         passes don't say which fleet host ran them."""
         read = []
         with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
-            code, text = self.verdict(self.round_(records(), name="moved", host="office-pc",
+            code, text = self.verdict(self.round_(records(), name="moved", host="shared-a",
                                                   ran_on=lambda p: "phuoc-yu"))
         self.assertEqual(code, abba.NO_VERDICT, text)
-        self.assertIn("passes ran on phuoc-yu, not on office-pc", text)
-        self.assertNotIn("office-pc", read)  # no floor is read for a round that has no verdict
+        self.assertIn("passes ran on phuoc-yu, not on shared-a", text)
+        self.assertNotIn("shared-a", read)  # no floor is read for a round that has no verdict
         code, text = self.verdict(self.round_(records(), name="part-moved",
-                                              ran_on=lambda p: "office-pc" if p["report"]["block"] == 6 else "phuoc-yu"))
+                                              ran_on=lambda p: "shared-a" if p["report"]["block"] == 6 else "phuoc-yu"))
         self.assertEqual(code, abba.NO_VERDICT, text)
         code, text = self.verdict(self.round_(records(), name="unsaid", ran_on=lambda p: None))
         self.assertEqual(code, abba.NO_VERDICT, text)
@@ -331,7 +331,7 @@ systems = []
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 8"), encoding="utf-8")
         eight = self.load()  # Sol r1: whole squares of A, A' and B
-        self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, self.repo.as_posix(), "office-pc")["abba-t-bbbbbbbb"]["steps"]), 9)
+        self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, self.repo.as_posix(), "shared-a")["abba-t-bbbbbbbb"]["steps"]), 9)
         # One whole square is the least a family may ask (a long, flat case needs no more), fewer
         # is refused: N11 found 6 hard-coded.
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 3"), encoding="utf-8")
@@ -340,19 +340,19 @@ systems = []
         with self.assertRaises(abba.Invalid):
             self.load()
         self.path.write_text(FAMILY, encoding="utf-8")
-        found = abba.jobs(self.family, B, self.repo.as_posix(), "office-pc")  # its sides resolve there too
+        found = abba.jobs(self.family, B, self.repo.as_posix(), "shared-a")  # its sides resolve there too
         timed = found["abba-t-bbbbbbbb"]
         first = timed["steps"][0]
         self.assertEqual((timed["requires"]["hosts"], timed["class"], ["check" if "check" in first[2] else "?", first[4]]),
-                         (["office-pc"], "exclusive", ["check", abba.ENV_FAMILY]))
+                         (["shared-a"], "exclusive", ["check", abba.ENV_FAMILY]))
         blocks = [s for s in timed["steps"] if "block" in s]
         self.assertEqual(len(blocks), 6)
         self.assertEqual(blocks[0][-3:], [f"a={A}", f"a2={A}", f"b={B}"])
         # A round its manifest says ran elsewhere takes that host's floor, not the family's.
         read = []
         with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
-            self.verdict(self.round_(records(), host="office-pc"))
-        self.assertEqual((timed["env"]["GATE_HOST"], read), ("office-pc", ["office-pc"]))
+            self.verdict(self.round_(records(), host="shared-a"))
+        self.assertEqual((timed["env"]["GATE_HOST"], read), ("shared-a", ["shared-a"]))
         self.assertIn("pin_reason", timed)
 
     def test_a_job_asks_for_what_making_its_data_takes(self):
@@ -557,7 +557,7 @@ systems = []
         def check(harness):
             with tempfile.TemporaryDirectory() as out:
                 inherited = {k: v for k, v in abba.os.environ.items() if k not in ("GATE_HOST", "NRESE_FAMILY")}
-                env = {**inherited, "FLEET_OUT": out, "FLEET_HOST": "office-pc", "ABBA_FAMILY": family}
+                env = {**inherited, "FLEET_OUT": out, "FLEET_HOST": "shared-a", "ABBA_FAMILY": family}
                 if harness:
                     env["ABBA_HARNESS"] = harness
                 else:
@@ -688,14 +688,14 @@ systems = []
         FLEET_HOST into the manifest (GATE_HOST, a pin, wins), and the report reads that host's floor."""
         with tempfile.TemporaryDirectory() as out:
             # The harness is a commit of this checkout: the job's check reads its registry (R1-F4).
-            env = {"FLEET_OUT": out, "FLEET_HOST": "office-pc", "ABBA_HARNESS": abba.git(ROOT, "rev-parse", "HEAD"),
+            env = {"FLEET_OUT": out, "FLEET_HOST": "shared-a", "ABBA_HARNESS": abba.git(ROOT, "rev-parse", "HEAD"),
                    "ABBA_FAMILY": FAMILY}
             inherited = {k: v for k, v in abba.os.environ.items() if k not in ("GATE_HOST", "NRESE_FAMILY")}
             done = abba.subprocess.run([sys.executable, "-B", str(ROOT / "benches/suite/abba.py"), "check", abba.ENV_FAMILY],
                                        env={**inherited, **env}, capture_output=True, text=True, cwd=ROOT)
             self.assertEqual(done.returncode, 0, done.stderr)
             manifest = json.loads((Path(out) / "abba-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual((manifest["host"], manifest["path"]), ("office-pc", abba.ENV_FAMILY))
+        self.assertEqual((manifest["host"], manifest["path"]), ("shared-a", abba.ENV_FAMILY))
 
 
 if __name__ == "__main__":
