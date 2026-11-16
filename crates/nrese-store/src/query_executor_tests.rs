@@ -305,15 +305,36 @@ fn collected_response_keeps_the_first_preparation_report() {
 
 #[test]
 fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_format() {
-    let (engine, _, settings) = fixture();
-    let mut tx = engine.transaction();
-    for quad in RdfParser::from_format(RdfFormat::Turtle)
-        .for_reader(b"<http://example.org/bob> a <http://example.org/Employee> .".as_slice())
-    {
-        tx.insert(quad.unwrap().as_ref());
-    }
-    tx.commit().unwrap();
-    let snapshot = engine.snapshot();
+    // Written as a server writes, through the pipeline, so the version read carries the
+    // certificate its QL rewriting comes with.
+    let store = Arc::new(
+        crate::StoreService::new(crate::StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..crate::StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(nrese_reasoner::ReasonerService::new(
+            nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+        )),
+    )
+    .apply(
+        crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+            "PREFIX : <http://example.org/>
+            PREFIX owl: <http://www.w3.org/2002/07/owl#>
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            INSERT DATA { :Employee rdfs:subClassOf [ a owl:Restriction ;
+                owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+                :ann a :Employee ; :worksFor :acme . :bob a :Employee . }",
+        )),
+        &crate::Requester::all(),
+        &crate::MutationTicket::new(),
+    )
+    .unwrap();
+    let settings = store.query_settings().clone();
+    let snapshot = store.engine().snapshot();
     for text in [
         "SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y } ORDER BY ?x",
         "ASK { <http://example.org/bob> <http://example.org/worksFor> ?y }",
