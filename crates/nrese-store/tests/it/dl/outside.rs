@@ -305,13 +305,12 @@ fn query(name: &'static str, spec: &str, r: &mut Rng) -> Query {
         let atom = (kind.chars().next().expect("a kind"), terms);
         if negated { &mut neg } else { &mut pos }.push(atom);
     }
-    let alone = None;
     Query {
         name,
         values,
         pos,
         neg,
-        alone,
+        alone: None,
     }
 }
 
@@ -1094,7 +1093,9 @@ fn planted_answers_are_judged_by_kind_and_label() {
     let command = r#"awk -W interactive -F'\t' '{ printf "c"; for (i = 3; i <= NF; i++)
         if ($i != "") printf "0"; print ""; fflush() }'"#;
     let mut nothing = Reference::new(command.to_owned(), Duration::from_secs(10));
-    let (case, none) = (generate(0), BTreeSet::new());
+    let (mut case, none) = (generate(0), BTreeSet::new());
+    let (t, mut r) = (case.queries.len(), Rng::new(0)); // a type query over a0..a3
+    case.queries.push(query("type", "T f:C0 x", &mut r));
     let mut verdict = |picked: &[usize], got: &Answers| {
         let v = case.verdicts(&none, picked, got, &mut nothing, "hermit");
         v[0].1.clone()
@@ -1113,6 +1114,13 @@ fn planted_answers_are_judged_by_kind_and_label() {
     for label in ["sound-only", "complete", "not-certified"] {
         assert_eq!(verdict(&inferred, &read(label)), "wrong", "{label}");
     }
+    // A wrong named row beside a blank node: the one judged, the other counted unchecked.
+    let (a, label, paths) = (|i: u64| n("a", i), "complete".to_owned(), String::new());
+    let rows = BTreeSet::from([vec![a(1)], vec!["?_:b0".to_owned()]]);
+    let got: Answers = Ok((vec![Ok(Answer { label, paths, rows })], String::new()));
+    let v = case.verdicts(&none, &[t], &got, &mut nothing, "hermit");
+    assert_eq!(v[0].1, "wrong", "{v:?}");
+    assert!(v[0].2.ends_with("unchecked 1"), "{v:?}");
     let plain: BTreeSet<usize> = (1..case.groups.len()).collect();
     let mut undecided = |why: &str| {
         let got = Err(("Undecided".to_owned(), why.to_owned(), String::new()));
@@ -1132,24 +1140,17 @@ fn planted_answers_are_judged_by_kind_and_label() {
     let c = generate(173); // three same-ask queries, two data-ask
     let names: BTreeSet<String> = (0..c.queries.len() + 2).map(|i| c.name(i)).collect();
     assert_eq!(names.len(), c.queries.len() + 2, "{names:?}");
-    // Answers to a type query over a0..a3, judged against what is planted as entailed.
-    let mut typed = generate(0);
-    typed.queries = vec![query("type", "T f:C0 x", &mut Rng::new(0))];
-    let a = |i: u64| n("a", i);
+    // Answers to the type query, judged against what is planted as entailed.
     let judge = |served: &[String], yes: &[String]| -> Verdict {
         let (label, paths) = ("complete".to_owned(), String::new());
         let rows = served.iter().map(|x| vec![x.clone()]).collect();
         let answer = Answer { label, paths, rows };
-        let rows = typed.rows(0, &answer, &(0..4).map(a).collect());
+        let rows = case.rows(t, &answer, &(0..4).map(a).collect());
         let e = rows.iter().map(|r| (r.1[0].clone(), yes.contains(&r.0[0])));
         let (class, detail, keys) = Case::judge(&answer, &rows, &e.collect(), "hermit");
         (0, class, detail, keys)
     };
     assert_eq!(judge(&[], &[a(0)]).1, "missing");
-    // A wrong named row beside a blank node: the one judged, the other counted unchecked.
-    let v = judge(&[a(1), "?_:b0".into()], &[]);
-    assert_eq!(v.1, "wrong", "{v:?}");
-    assert!(v.2.ends_with("unchecked 1"), "{v:?}");
     // Two references fail an answer alike only on a row in common.
     let missed = |yes: &[String]| judge(&[a(0)], yes);
     let (one, two) = (missed(&[a(0), a(1)]), missed(&[a(0), a(2)]));
