@@ -9,6 +9,8 @@
 //!   file ends inside a statement, with the line it starts on (strict Turtle and TriG don't
 //!   recover, so don't look for its end; the other formats' errors say what is open: an
 //!   element, a record, a string); a last statement without a line end still loads;
+//! - a Turtle or TriG string whose closing quote isn't within 1 MiB (a stray quote) stops the
+//!   load, naming its file and line; within it, one record and the load goes on;
 //! - a quarantined statement and an error show no position the parser doesn't know;
 //! - a format that goes on after a bad statement does so by default; `strict` stops;
 //! - a load that stops commits nothing and quarantines nothing.
@@ -29,6 +31,8 @@ const EX: &str = "http://example.com/";
 /// Statements in a document, one per subject: each is its own line, statement, node element
 /// or top-level node object, so a quarantined item stands for one statement.
 const N: usize = 40;
+/// Statements in `Case::StrayFar`'s document: more than 1 MiB after its stray quote.
+const FAR: usize = 20_000;
 
 const FORMATS: [RdfFormat; 8] = [
     NTriples, NQuads, Turtle, TriG, RdfXml, JsonLd, N3, BinaryRdf,
@@ -45,6 +49,11 @@ enum Case {
     /// Turtle and TriG: a bracket that never closes in the statement on this line, near the
     /// top, the rest well-formed. Recovery finds no end of it: the document ends inside it.
     Unclosed(usize),
+    /// Turtle and TriG, statements with IRI objects: statement 1 (line 2) a stray quote, no
+    /// quote after it. The search for its closing quote ends within the window: one record.
+    Stray,
+    /// The same, with more than the window after the quote: the load stops.
+    StrayFar,
     /// A directory where the file should be: a read error at the first read.
     Unreadable,
 }
@@ -163,7 +172,8 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
             vec![
                 (seen.committed == 0 && q == 0, "a stop commits and quarantines nothing"),
                 (!matches!(case, Case::Whole | Case::NoLastLineEnd), "a well-formed file loads"),
-                (strict || case != Case::BadStatement || !goes_on, "a format that goes on does"),
+                (strict || !matches!(case, Case::BadStatement | Case::Stray) || !goes_on, "a format that goes on does"),
+                (case != Case::StrayFar || says(file) && says("line 2, ") && !says("ends inside"), "a string not closed within the window names its file and line"),
                 (!cut || says(file), "a cut names the file"),
                 (!worded || says("ends inside a statement"), "a cut says the file ends inside one"),
                 (!cut || says("nothing was loaded"), "a cut says nothing was loaded"),
@@ -181,7 +191,8 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
             let said = seen.quarantined.iter().all(|s| !s.reason.contains("line ") && said(s));
             vec![
                 (!matches!(case, Case::Cut(_) | Case::Unclosed(_) | Case::Unreadable), "Ok: every byte read, none cut"),
-                (seen.committed + q == N as u64, "each statement committed or quarantined"),
+                (case != Case::StrayFar, "a string not closed within the window stops"),
+                (seen.committed + q == (if case == Case::StrayFar { FAR } else { N }) as u64, "each statement committed or quarantined"),
                 (without_text || texts, "quarantined with its text where the parser keeps it"),
                 (!without_text || unplaced, "quarantined at no position the parser doesn't know"),
                 (!without_text || said, "a record's reason says what is known, and no line"),
@@ -218,6 +229,13 @@ fn a_load_reads_each_file_to_its_end_or_stops() {
             let line = document[..at].iter().filter(|&&b| b == b'\n').count() + 1;
             let unclosed = replace_once(&document, br#""v1""#, br#"[ <http://example.com/q> "v1""#);
             cases.push((Case::Unclosed(line), unclosed));
+            for (case, n) in [(Case::Stray, N), (Case::StrayFar, FAR)] {
+                let statement = |k| match k {
+                    1 => format!("<{EX}s1> <{EX}p> \"stray .\n"),
+                    _ => format!("<{EX}s{k}> <{EX}p> <{EX}o{k}> .\n"),
+                };
+                cases.push((case, (0..n).map(statement).collect::<String>().into_bytes()));
+            }
         }
         for (i, (case, bytes)) in cases.into_iter().enumerate() {
             let name = format!("case{i}.{}", format.file_extension());
