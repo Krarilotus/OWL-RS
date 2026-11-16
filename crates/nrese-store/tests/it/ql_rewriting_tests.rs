@@ -38,7 +38,7 @@ const INDIVIDUALS: usize = 4;
 const MAX_EDGES: usize = 50_000;
 
 /// xorshift64*: deterministic cases without a dependency.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -48,11 +48,11 @@ impl Rng {
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 
-    fn chance(&mut self, percent: usize) -> bool {
+    pub(crate) fn chance(&mut self, percent: usize) -> bool {
         self.below(100) < percent
     }
 }

@@ -35,7 +35,8 @@ pub use clauses::{
 pub use diagnostics::Diagnostic;
 pub use functional::{iri_text, literal_text};
 pub use mapping::{
-    BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement, TermKind, Terms, read,
+    BUILTIN_ANNOTATIONS, BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement,
+    TermKind, Terms, read,
 };
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,

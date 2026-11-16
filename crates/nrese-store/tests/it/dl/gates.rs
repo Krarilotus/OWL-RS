@@ -131,12 +131,8 @@ fn dl_answers_derive_nothing_from_graphs_the_reader_cannot_read() {
         let (text, status) = read(&dl, reader(by_support), "SELECT ?x { ?x a :D }");
         // The only derivation of x a D runs through the secret schema.
         assert!(!text.contains("example.com/x"), "{text}");
-        assert!(!status.is_complete());
-        assert!(
-            status.reasons()[0].contains("part of the data"),
-            "{:?}",
-            status.reasons()
-        );
+        // Under owl2-dl a reader of some graphs is told no status: `not-certified`.
+        assert_eq!(status.shared.as_str(), "not-certified", "{status:?}");
     }
     // The RL closure follows the configured policy: supported hides a's F (its only
     // derivation uses the secret graph), visible shows it.
