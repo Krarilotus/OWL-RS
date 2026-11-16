@@ -1729,6 +1729,81 @@ fn a_commit_after_a_clean_read_records_its_key_left_out() {
     left_out_answer(pipeline.store(), &ask);
 }
 
+/// [`long_key`] of 128 properties, its `owl:hasKey` fact and list in `:secret`. A reader of
+/// the default graph only (inferences by support) reads the revision first; a reader of every
+/// graph then reads it too. Its key is left out, and `:x :name "Y"` entailed, so the second
+/// read is true or not `complete`, whatever the first reader's view found.
+#[test]
+fn a_restricted_read_leaves_a_hidden_keys_mark() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let key = long_key(128);
+    let (axiom, rest) = key.split_once(" .").expect("the key's axiom first");
+    let data = format!("GRAPH <{EX}secret> {{ {axiom} . }} {rest}");
+    (pipeline.apply(
+        insert(&data),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    let ask = format!("<{EX}x> <{EX}name> \"Y\"");
+    restricted_read(pipeline.store(), &ask);
+    left_out_answer(pipeline.store(), &ask);
+}
+
+/// The aliased key of [`a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete`],
+/// its `owl:sameAs` facts in `:secret`: the later commit leaves the key out through equality's
+/// `rdf:first` copies, derived through `:secret`. A reader of the default graph only
+/// (inferences by support) reads that revision first; a reader of every graph then reads it
+/// too: `:x :name "Z"` is entailed, so the second read is true or not `complete`.
+#[test]
+fn a_restricted_read_leaves_an_aliased_keys_mark() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let write = |data: &str| {
+        let ticket = MutationTicket::new();
+        (pipeline.apply(insert(data), &nrese_store::Requester::all(), &ticket)).expect("the data");
+    };
+    let mut first = long_key(7);
+    for i in 1..=7 {
+        first.push_str(&format!(
+            " GRAPH <{EX}secret> {{ <{EX}k{i}> <http://www.w3.org/2002/07/owl#sameAs> <{EX}j{i}> }} \
+             <{EX}j{i}> a <http://www.w3.org/2002/07/owl#ObjectProperty> ."
+        ));
+    }
+    write(&first);
+    let mut later = format!(
+        "<{EX}C> <http://www.w3.org/2002/07/owl#intersectionOf> ( <{EX}A1> <{EX}A2> ) . \
+         <{EX}z> a <{EX}K> . <{EX}z> <{EX}name> \"Z\" ."
+    );
+    for i in 1..=7 {
+        later.push_str(&format!(" <{EX}z> <{EX}k{i}> <{EX}v{i}> ."));
+    }
+    write(&later);
+    let ask = format!("<{EX}x> <{EX}name> \"Z\"");
+    restricted_read(pipeline.store(), &ask);
+    left_out_answer(pipeline.store(), &ask);
+}
+
+/// `ASK { ask }` by a reader of the default graph only, inferences by support (a view of its
+/// own over any store with a named graph), printed.
+fn restricted_read(store: &StoreService, ask: &str) {
+    let reader = nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }));
+    let answer = (store.execute_query(&nrese_store::SparqlQueryRequest::new(
+        format!("ASK {{ {ask} }}"),
+        reader,
+    )))
+    .expect("the restricted read answered");
+    let payload = String::from_utf8(answer.payload).expect("utf8");
+    println!(
+        "restricted read: {ask}: {payload} with {:?}",
+        answer.completeness
+    );
+}
+
 /// `owl2-rl` with the QL rewriting on, over a store of `config`.
 fn ql_pipeline(config: nrese_store::StoreConfig) -> MutationPipeline {
     let config = nrese_store::StoreConfig {
