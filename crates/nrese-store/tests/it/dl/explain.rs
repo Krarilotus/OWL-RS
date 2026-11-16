@@ -136,6 +136,97 @@ fn a_dl_explanation_stopped_before_its_first_test_is_undecided() {
     );
 }
 
+/// `w a D`'s explanation over `B ⊑ D`, `C ⊑ D` (default graph) and `data`, which asserts `w`
+/// a union of `B` and `C` in named graphs: per axiom, per graph (the default graph `None`,
+/// a named one by its last segment) the predicates of its triples by local name, sorted.
+fn graphs_explained(data: &str) -> Vec<Vec<(Option<String>, Vec<String>)>> {
+    let dl = pipeline();
+    let subclasses = ":B rdfs:subClassOf :D . :C rdfs:subClassOf :D .";
+    insert(&dl, &format!("{subclasses} {data}")).expect("data");
+    let (w, d) = (named("w"), named("D"));
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let statement: [TermRef<'_>; 3] = [
+        w.as_ref().into(),
+        rdf_type.as_ref().into(),
+        d.as_ref().into(),
+    ];
+    // Only a reader of every graph gets an explanation; a reader of some is refused.
+    let some = ReadScope::Graphs(Arc::new(GraphAccess {
+        default_graph: true,
+        inferred: true,
+        ..GraphAccess::default()
+    }));
+    let answer = dl.store().explain_dl(&some, statement);
+    assert!(
+        matches!(answer, Err(StoreError::Forbidden(Refusal::ReadAll(_)))),
+        "{answer:?}"
+    );
+    let local = |t: &str| {
+        let iri = t.trim_end_matches('>');
+        iri.rsplit(['/', '#']).next().unwrap_or(iri).to_owned()
+    };
+    let explained = dl
+        .store()
+        .explain_dl(&ReadScope::All, statement)
+        .expect("decided")
+        .expect("w a D holds under OWL 2 DL");
+    let mut axioms: Vec<_> = explained
+        .axioms
+        .iter()
+        .map(|a| {
+            let sources = a.sources.iter().map(|(graph, triples)| {
+                let mut predicates: Vec<String> = triples.iter().map(|t| local(&t[1])).collect();
+                predicates.sort();
+                (graph.as_deref().map(local), predicates)
+            });
+            sources.collect::<Vec<_>>()
+        })
+        .collect();
+    axioms.sort();
+    axioms
+}
+
+/// Spec (`ExplainedAxiom::sources`: per graph, the triples of the axiom's RDF form that
+/// graph asserts; the default graph first, then named graphs by IRI): every triple is listed
+/// under each graph that holds it and under no other.
+#[test]
+fn an_explanation_lists_each_triple_under_the_graph_that_holds_it() {
+    let g = |graph: Option<&str>, predicates: &[&str]| {
+        let predicates = predicates.iter().map(|p| (*p).to_owned()).collect();
+        (graph.map(str::to_owned), predicates)
+    };
+    let sub = vec![g(None, &["subClassOf"])];
+    let list = ["first", "first", "rest", "rest"];
+    let union = [&list[..], &["unionOf"]].concat();
+    let whole = [&list[..], &["type", "unionOf"]].concat();
+    // The class assertion's own triple in g1, the union it names in g2.
+    let split = vec![g(Some("g1"), &["type"]), g(Some("g2"), &union)];
+    // The same, and the class assertion's own triple in g4 as well (written first).
+    let twice = vec![
+        g(Some("g1"), &["type"]),
+        g(Some("g2"), &union),
+        g(Some("g4"), &["type"]),
+    ];
+    // All of the axiom in g1: one graph, every triple under it.
+    let plain = vec![g(Some("g1"), &whole)];
+    let cases = [
+        (
+            "GRAPH :g1 { :w a _:u } GRAPH :g2 { _:u owl:unionOf ( :B :C ) }",
+            split,
+        ),
+        (
+            "GRAPH :g4 { :w a _:u } GRAPH :g1 { :w a _:u } GRAPH :g2 { _:u owl:unionOf ( :B :C ) }",
+            twice,
+        ),
+        ("GRAPH :g1 { :w a _:u . _:u owl:unionOf ( :B :C ) }", plain),
+    ];
+    for (data, assertion) in cases {
+        let mut want = vec![assertion, sub.clone(), sub.clone()];
+        want.sort();
+        assert_eq!(graphs_explained(data), want, "{data}");
+    }
+}
+
 #[test]
 fn a_dl_rejection_names_the_axioms_with_no_model() {
     let dl = pipeline();
