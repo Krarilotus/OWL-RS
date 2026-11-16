@@ -1063,6 +1063,50 @@ fn a_store_recorded_empty_and_reopened_reads_its_first_equalities_expanded() {
     assert!(wrong.is_empty(), "wrong: {wrong:?}");
 }
 
+/// A compact store under a custom program, written with `owl:sameAs` before the facts and
+/// reopened, answers as its rules entail: with their own equality rules ([`programs`]'
+/// `Custom` and `Pie`), `b` is an Animal through `a owl:sameAs b`; with none, it isn't.
+/// `Custom`'s Notation3 rules aren't named as equality rules, so its store always holds
+/// every copy.
+#[test]
+fn a_compact_store_under_custom_rules_reopened_answers_as_they_entail() {
+    const NO_EQUALITY: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+";
+    let rules = nrese_reasoner::UserRules::n3("no-equality.n3", NO_EQUALITY).expect("rules");
+    let without = ReasonerConfig::for_mode(ReasoningMode::Custom)
+        .with_rules(Some(Arc::new(rules)))
+        .expect("rules");
+    let cases = programs()
+        .into_iter()
+        .filter(|(program, _)| program == "Custom" || program == "Pie")
+        .map(|(program, reasoner)| (program, reasoner, true))
+        .chain([("NoEquality".to_owned(), without, false)]);
+    let mut wrong = Vec::new();
+    for (program, reasoner, b_entailed) in cases {
+        let dir = tempfile::tempdir().expect("dir");
+        {
+            let written = equality_store(&reasoner, true, Some(dir.path()));
+            update(&written, "INSERT DATA { ex:a owl:sameAs ex:b }");
+            update(
+                &written,
+                "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog }",
+            );
+        }
+        let reopened = equality_store(&reasoner, true, Some(dir.path()));
+        let rows = answer(&reopened, "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x");
+        let right = rows.contains("http://example.com/a")
+            && rows.contains("http://example.com/b") == b_entailed;
+        let verdict = if right { "right" } else { "WRONG" };
+        println!("CASE {program}: {verdict} {rows} (b entailed: {b_entailed})");
+        if !right {
+            wrong.push(program);
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+}
+
 /// A read replica under `reasoner.equality = "compact"` following its primary's log answers
 /// through the `owl:sameAs` the primary's records bring, as the primary does. The primary
 /// commits the type through a subclass, then `owl:sameAs`. The replica starts from the
