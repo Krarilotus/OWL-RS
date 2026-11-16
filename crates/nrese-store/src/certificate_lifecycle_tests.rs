@@ -281,20 +281,14 @@ fn a_read_during_a_rebuild_is_told_what_was_true_of_its_version() {
             ),
         }
     }
-    // (iii): a version published by a write without reasoning.
-    let add = |store: &StoreService, data: &str| {
-        store
-            .apply_ungated(
-                &MutationCommand::Update(SparqlUpdateRequest::new(format!(
-                    "{PREFIXES}INSERT DATA {{ {data} }}"
-                ))),
-                &Requester::all(),
-            )
-            .expect("added");
+    // (iii): a version published by a write without reasoning: a commit of the pipeline
+    // with reasoning disabled.
+    let add = |store: &Arc<StoreService>, data: &str| {
+        commit(&pipeline(store, ReasoningMode::Disabled), data);
     };
     for kind in ["an addition", "a load"] {
         let dir = tempfile::tempdir().expect("dir");
-        let store = certified(dir.path());
+        let store = Arc::new(certified(dir.path()));
         if !owl2_rl(&status(&store, READ)) {
             cells.unmet(kind, "not certified under owl2-rl");
             continue;
