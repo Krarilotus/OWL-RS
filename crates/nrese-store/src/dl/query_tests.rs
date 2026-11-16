@@ -40,6 +40,7 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
     crate::query_executor::BOUND_EVALUATIONS.with(|n| n.set(0));
     let outcome = answer(
         &store,
+        &store.engine().snapshot(),
         &prepared,
         &CancellationToken::new(),
         &nrese_exec::Envelope::unlimited(),
@@ -300,6 +301,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         assert!(matches!(
             answer(
                 &store,
+                &store.engine().snapshot(),
                 &prepared,
                 &token,
                 &nrese_exec::Envelope::unlimited(),

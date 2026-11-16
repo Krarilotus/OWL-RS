@@ -291,15 +291,59 @@ impl Status {
 /// while it waited for another request's build of the bounds' view, which runs on and is kept.
 pub(crate) fn plan_status(
     store: &StoreService,
+    snapshot: &Snapshot,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
 ) -> StoreResult<Completeness> {
     let analysis = analyse(prepared.query());
-    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+    let decided = decided(store, snapshot, prepared, cancellation)?;
+    let completeness = match decided.as_ref() {
+        Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
+        Err(why) => Status::sound_only(*why).completeness,
+    };
+    Ok(composed(store, prepared, snapshot, &decided, completeness))
+}
+
+/// The bounds' view of `snapshot` its answers and their status are decided on (R1-F2), or
+/// why there is none ([`PART`], [`LATER`]). Never another snapshot's view.
+type Decided = Result<(Snapshot, Arc<View>), &'static str>;
+
+/// A reader of some graphs reads its own view of the snapshot, not the bounds'.
+const PART: &str = "the reader sees part of the data: answers are checked against the bounds \
+                    only for readers of every graph";
+
+/// An older revision whose bounds a later commit replaced reads its RL closure.
+const LATER: &str = "a later commit's bounds replaced this revision's while it was read: \
+                     answers over the RL closure, not checked against the bounds";
+
+/// [`Decided`] of `snapshot` for `prepared`.
+fn decided(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    prepared: &PreparedQuery,
+    cancellation: &CancellationToken,
+) -> StoreResult<Decided> {
+    if prepared.access().is_some() {
+        return Ok(Err(PART));
+    }
+    let view = super::bounds::view_until(store, snapshot, Some(&|| cancellation.is_cancelled()))
         .ok_or(crate::QueryEvaluationError::Cancelled)?;
-    let completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
-    let assessed = store.assess(prepared, Revision::Decided(&at), Some(completeness));
-    Ok(assessed.unwrap_or_else(Completeness::not_certified))
+    Ok(view.map(|view| (snapshot.clone(), view)).ok_or(LATER))
+}
+
+/// `status` composed once (`StoreService::assess`) on the data it was decided on: the
+/// bounds' view, else `snapshot`; before any exact refusal (N4, N5).
+fn composed(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    snapshot: &Snapshot,
+    decided: &Decided,
+    status: Completeness,
+) -> Completeness {
+    let committed = Revision::Committed(snapshot);
+    let at = decided.as_ref().map_or(committed, Revision::Decided);
+    let assessed = store.assess(prepared, at, Some(status));
+    assessed.unwrap_or_else(Completeness::not_certified)
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
@@ -591,7 +635,7 @@ fn plan_status_built(
     analysis: &Analysis,
     (snapshot, view): &(Snapshot, Arc<View>),
 ) -> Status {
-    if prepared.access().is_some() || prepared.has_dataset() {
+    if prepared.has_dataset() {
         return Status::sound_only(
             "the query reads part of the data: not checked against the bounds",
         );
@@ -642,6 +686,7 @@ fn plan_status_built(
 /// engines.
 pub(crate) fn answer(
     store: &StoreService,
+    snapshot: &Snapshot,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
@@ -650,15 +695,16 @@ pub(crate) fn answer(
     cancellation.check()?;
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither (R1-F2).
-    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
-        .ok_or(crate::QueryEvaluationError::Cancelled)?;
-    let mut outcome = decide_answers(store, prepared, &analysis, &at, cancellation, memory, mode)?;
+    let decided = decided(store, snapshot, prepared, cancellation)?;
+    let mut outcome = match decided.as_ref() {
+        Ok(at) => decide_answers(store, prepared, &analysis, at, cancellation, memory, mode)?,
+        Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),
+    };
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
     cancellation.check()?;
     let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &mut outcome;
-    let assessed = store.assess(prepared, Revision::Decided(&at), Some(status.clone()));
-    *status = assessed.unwrap_or_else(Completeness::not_certified);
+    *status = composed(store, prepared, snapshot, &decided, status.clone());
     refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
     Ok(outcome)
 }
@@ -700,10 +746,9 @@ pub(crate) enum Outcome {
 /// What a streamed answer reads: the revision its status was decided on, never a later
 /// one (a commit in between could add what only U1 finds).
 pub(crate) enum Read {
-    /// The store's latest snapshot as the reader sees it: for a reader of some graphs, whose
-    /// status under `owl2-dl` is withheld (`status_for_its_reader`), so no revision's.
-    Latest,
-    /// The snapshot the status was decided on, where L adds nothing to it (cacheable).
+    /// The snapshot the status was decided on, where L adds nothing to it (cacheable): for a
+    /// reader of some graphs (whose status under `owl2-dl` is withheld,
+    /// `status_for_its_reader`) its own view of it.
     At(Snapshot),
     /// L's view of that snapshot, with the memberships the taxonomy adds (uncached).
     Lower(Snapshot),
@@ -720,13 +765,6 @@ fn decide_answers(
 ) -> StoreResult<Outcome> {
     let deadline = Deadline::after(store.config().dl.timeout);
     let settings = store.query_settings();
-    if prepared.access().is_some() {
-        return Ok(Status::sound_only(
-            "the reader sees part of the data: answers are checked against the bounds only \
-             for readers of every graph",
-        )
-        .stream(Read::Latest));
-    }
     if prepared.has_dataset() {
         // Over the decided snapshot, every graph's for this reader: the status's (R1-F2).
         return Ok(Status::sound_only(
