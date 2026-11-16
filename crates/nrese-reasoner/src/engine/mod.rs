@@ -125,9 +125,10 @@ impl Program {
         let rules = program
             .rules(&mut constants)
             .expect("the built-in rulesets parse (tested), user rules are checked at startup");
-        let lists = program
-            .has_list_rules()
-            .then(|| ListVocabulary::new(&mut constants));
+        let lists = program.has_list_rules().then(|| {
+            let blank_nodes = program.named_keys.then(|| constants.blank_node_ids());
+            ListVocabulary::new(&mut constants).named_keys(blank_nodes.flatten())
+        });
         let schema = Schema::owl(&mut constants);
         let unnamed = UnnamedVocabulary::new(&mut constants);
         let things = rules.iter().any(|rule| rule.name == "scm-cls");
