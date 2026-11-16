@@ -44,7 +44,9 @@ const PREFIXES: &str = "@prefix f: <http://example.org/fuzz#> . \
 /// individuals), each in a case with probability 1/4. `{C1}`, `{C2}` are classes; `{S}` a
 /// simple property, `{Q}` one that isn't, `{P}` any but the chain's target p3 (a reference gap
 /// under a key); `{D}` a data property; `{A1}`, `{A2}` two individuals; `{V}` an integer, `{W}`
-/// it in another lexical form, `{X}` any in any form.
+/// it in another lexical form, `{X}` any in any form. Not drawn: a built-in annotation
+/// property (`rdfs:label` and the others, declared implicitly) with a domain, a range or a
+/// super-property, or as the super-property of another property; `annotation` declares its own.
 const TEMPLATES: &str = "
 lexical | {A1} {D} {W} . |
 cardinality | {C1} rdfs:subClassOf [ a owl:Restriction ; owl:onProperty {S} ; owl:maxCardinality 1 ] . f:a0 a {C1} ; {S} f:a1 , f:a2 . |

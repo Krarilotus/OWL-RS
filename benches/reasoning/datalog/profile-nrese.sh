@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A CPU profile of NRESE materialising one Datalog case: where the rule evaluation's time
 # goes (the attribution of a loss in the kit's comparison). perf samples `nrese-server load`
-# as a host process, on a host that allows profiling (hosts.toml: Phuoc-Yu). Times from a
+# as a host process, on a host that allows profiling (hosts.toml: the timed host). Times from a
 # profiled run are not comparable with the kit's: perf adds its own overhead.
 #
 #   profile-nrese.sh CASE FACTS OUT        e.g. cspa-httpd ~/…/cspa-httpd/facts.nt "$QUEUE_RESULTS"

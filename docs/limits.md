@@ -95,7 +95,14 @@ planned.
   ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). Any value
   the query computes counts, so a computed string or IRI matched against the data
   (`BIND(CONCAT(…) AS ?n)`, `BIND(IRI(…) AS ?s)`) gives `sound-only` too, though nothing
-  is missed.
+  is missed. The same holds where a query joins, deduplicates, groups or counts the values of
+  a property that holds numbers or dates (`unsound` under an aggregate): `"7"` and `"07"`
+  are two terms to the store. A reader of only some graphs gets it wherever the query
+  compares values, so their status says nothing about graphs they can't read. Compare values
+  in a `FILTER` instead. A query with a triple term or a base-direction literal, or whose
+  reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. For
+  triple terms, none known
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo`, make no new blank nodes, and hold at most 256 atoms in a rule's
   premises or conclusion (split a longer rule); with user rules no answer is claimed
