@@ -267,7 +267,8 @@ const HIDDEN: [&str; 3] = [
 ];
 
 /// What `reader` is told of `q`, one line per path: the run, the exact run, EXPLAIN, the
-/// plan, the inferred statements alone, a read with an addition pending. Each with the rows
+/// plan, the inferred statements alone, a read with an addition pending, and the store's
+/// public status of the inferred statements alone (`status_without_dl`). Each with the rows
 /// and the status, or the refusal.
 fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<String> {
     use nrese_store::{CancellationToken, DlAnswers, SparqlQueryRequest, StatementOp};
@@ -312,6 +313,7 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
         .plan_query(&prepare(q, None), &CancellationToken::new())
         .map(|p| p.completeness);
     let implicit = q.replacen('{', "FROM <http://www.ontotext.com/implicit> {", 1);
+    let without_dl = store.status_without_dl(&prepare(&implicit, None));
     vec![
         format!("run: {}", run(q, None)),
         format!("exact: {}", run(q, Some(DlAnswers::Exact))),
@@ -319,6 +321,7 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
         format!("plan: {planned:?}"),
         format!("inferred alone: {}", run(&implicit, None)),
         format!("pending: {pending}"),
+        format!("status without dl: {without_dl:?}"),
     ]
 }
 
