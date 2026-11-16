@@ -96,7 +96,10 @@ pub(super) fn in_transaction(
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("query");
     (String::from_utf8(out).expect("utf8"), status)

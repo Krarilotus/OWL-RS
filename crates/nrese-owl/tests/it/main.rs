@@ -711,6 +711,46 @@ fn the_built_in_annotation_properties_schema_is_annotations() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// OWL 1's `owl:OntologyProperty` typing declares an annotation property (*Mapping to RDF
+/// Graphs* §3.1.2, Table 6, which replaces it with `owl:AnnotationProperty`): its domain,
+/// range and sub-properties are annotation axioms (Table 16), as a declared annotation
+/// property's are, also where the name is typed an object property too: no axiom names it
+/// but its declarations.
+#[test]
+fn an_ontology_property_typing_declares_an_annotation_property() {
+    let note = "http://example.com/note";
+    let mut wrong = Vec::new();
+    for typing in [
+        "owl:OntologyProperty",
+        "owl:OntologyProperty, owl:ObjectProperty",
+    ] {
+        for form in [
+            "ex:note rdfs:domain ex:C . ex:x ex:note ex:v .",
+            "ex:note rdfs:range ex:C . ex:x ex:note ex:v .",
+            "ex:note rdfs:subPropertyOf ex:sup . ex:sup a owl:AnnotationProperty .",
+            "ex:p rdfs:subPropertyOf ex:note . ex:x ex:p ex:v .",
+        ] {
+            let data = format!("ex:note a {typing} . {form}");
+            let mut table = Table::default();
+            let statements = load(&mut table, &data);
+            let ontology = read(&statements, &table);
+            let lines = rendered(&ontology, &table);
+            // As the lines name it (`Table::name`).
+            let named = lines
+                .iter()
+                .filter(|l| l.contains("ex:note"))
+                .any(|l| !l.starts_with("Declaration("));
+            if ontology.annotation_schema != [table.iri(note).unwrap()] || named {
+                wrong.push(format!(
+                    "{data}: {:?}, {lines:?}",
+                    ontology.annotation_schema
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The built-in annotation properties are known to each read by the terms it reads with:
 /// one the terms gain after an earlier read (`rdfs:comment`, which the first read's terms
 /// don't have) is an annotation property to the later read, as `rdfs:label` is to both.
