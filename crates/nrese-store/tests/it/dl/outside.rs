@@ -63,6 +63,21 @@ different | {A1} owl:differentFrom {A2} . |
 chain | f:p3 owl:propertyChainAxiom ( f:p1 f:p2 ) . f:a0 f:p1 f:a1 . f:a1 f:p2 f:a2 . |
 ";
 
+/// Keys over anonymous individuals, one a line (name | Turtle as in [`TEMPLATES`] | the question
+/// the key answers, an atom of [`QUERIES`] over names | who judges it), each in a case with
+/// probability 1/4. `hermit`: HermiT alone; `both`: a control, where the references must agree.
+const KEYS: &str = "
+anon-object | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k1 . f:a2 a {C1} ; {P} _:k1 . | S f:a1 f:a2 | hermit
+anon-subject | {C1} owl:hasKey ( {D} ) . f:a1 a {C1} ; {D} {V} . _:k2 a {C1} , {C2} ; {D} {W} . | T {C2} f:a1 | hermit
+anon-value-class | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k3 . f:a2 a {C1} ; {P} _:k4 . _:k3 owl:sameAs _:k4 . | S f:a1 f:a2 | hermit
+named-value-class | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} f:a3 . f:a2 a {C1} ; {P} f:a0 . f:a3 owl:sameAs f:a0 . | S f:a1 f:a2 | both
+mixed-value-class | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k5 . f:a2 a {C1} ; {P} _:k6 . _:k5 owl:sameAs f:a3 . _:k6 owl:sameAs f:a3 . | S f:a1 f:a2 | both
+named-subject-class | {C1} owl:hasKey ( {P} ) . _:k7 a {C1} ; {P} f:a3 ; owl:sameAs f:a1 . f:a2 a {C1} ; {P} f:a3 . | S f:a1 f:a2 | both
+anon-subject-class | {C1} owl:hasKey ( {P} ) . _:k8 a {C1} ; {P} f:a3 ; owl:sameAs _:k9 . _:k9 a {C2} . f:a2 a {C1} ; {P} f:a3 . | T {C2} f:a2 | hermit
+named-two | {C1} owl:hasKey ( {P} {D} ) . f:a1 a {C1} ; {P} f:a3 ; {D} {V} . f:a2 a {C1} ; {P} f:a3 ; {D} {W} . | S f:a1 f:a2 | both
+anon-two | {C1} owl:hasKey ( {P} {D} ) . f:a1 a {C1} ; {P} _:k10 ; {D} {V} . f:a2 a {C1} ; {P} _:k10 ; {D} {W} . | S f:a1 f:a2 | hermit
+";
+
 /// The query shapes, one a line: a name, then atoms, `!` before the negated ones. An atom is
 /// its kind as `Entail` takes it (`T` a type, `P` an object and `D` a data property assertion,
 /// `S` sameAs, `E` and `F` an existential through either) and its terms: `C` a class, `p` a
@@ -115,6 +130,8 @@ struct Query {
     values: Vec<bool>,
     pos: Vec<Atom>,
     neg: Vec<Atom>,
+    /// A [`KEYS`] row's question: judged by HermiT alone (`true`) or a control (`false`).
+    alone: Option<bool>,
 }
 
 struct Case {
@@ -186,19 +203,44 @@ fn generate(seed: u64) -> Case {
             add(tag, turtle, names.collect());
         }
     }
-    let queries = queries(&mut r);
+    let mut queries = queries(&mut r);
     // One case in eight, by a draw of its own: `f:p3` as a chain of 260 fresh properties (C2).
     if Rng::new(!seed).one_in(8) {
         add("long-chain", long_chain(260), Vec::new());
     }
     // Drawn after the queries, so a seed keeps the ontology and queries of the runs before.
-    let commits = (0..groups.len())
+    let mut commits: Vec<usize> = (0..groups.len())
         .map(|g| (g > 0 && r.one_in(2)) as usize)
         .collect();
     let plain = |g: &Group| !["_:", "[", "("].iter().any(|b| g.turtle.contains(b));
     let deletable: Vec<usize> = (1..groups.len()).filter(|&g| plain(&groups[g])).collect();
     let deleted = (!deletable.is_empty() && r.one_in(2))
         .then(|| deletable[r.below(deletable.len() as u64) as usize]);
+    // [`KEYS`], from a stream of their own after every other draw, so a seed keeps its case.
+    let mut k = Rng::new(seed ^ 0x6b65_7973);
+    for line in KEYS.lines() {
+        let parts: Vec<&'static str> = line.split('|').map(str::trim).collect();
+        let [tag, template, question, by] = parts[..] else {
+            continue;
+        };
+        if k.one_in(4) {
+            let [turtle, question] = fill([template, question], &mut k);
+            let names = Vec::new();
+            groups.push(Group { tag, turtle, names });
+            commits.push(k.one_in(2) as usize);
+            let mut terms = question.split_whitespace();
+            let kind = terms.next().and_then(|t| t.chars().next()).expect("a kind");
+            let pos = vec![(kind, terms.map(|t| T::I(t.replace("f:", F))).collect())];
+            let (values, neg, alone) = (Vec::new(), Vec::new(), Some(by == "hermit"));
+            queries.push(Query {
+                name: tag,
+                values,
+                pos,
+                neg,
+                alone,
+            });
+        }
+    }
     Case {
         seed,
         shape,
@@ -266,6 +308,7 @@ fn queries(r: &mut Rng) -> Vec<Query> {
             values,
             pos,
             neg,
+            alone: None,
         });
     }
     out
@@ -837,7 +880,8 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let got = store(&case.commits(&none), &texts);
                     let hermit = case.verdicts(&none, &picked, &got, &mut reference, "hermit");
                     let twice = |c: &String| fails(c) || c.starts_with("declined");
-                    let openllet = match hermit.iter().any(|(_, c, _)| twice(c)) {
+                    let control = case.queries.iter().any(|q| q.alone == Some(false));
+                    let openllet = match control || hermit.iter().any(|(_, c, _)| twice(c)) {
                         true => case.verdicts(&none, &picked, &got, &mut reference, "openllet"),
                         false => Vec::new(),
                     };
@@ -845,23 +889,32 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let tags = tags.into_iter().collect::<Vec<_>>().join(",");
                     for (i, class, detail) in &hermit {
                         let second = openllet.iter().find(|(j, _, _)| j == i).map(|(_, c, _)| c);
+                        let alone = case.queries.get(*i).and_then(|q| q.alone);
                         let outcome = match (fails(class), second) {
+                            // A control's references must agree: else the premise below is wrong.
+                            (_, Some(c)) if alone == Some(false) && c != class => "control-split",
                             // A declined write: the class is HermiT's word, the outcome Openllet's.
                             (false, Some(c)) if class.starts_with("declined") => c.as_str(),
-                            (false, _) => "pass",
+                            (false, _) => ["pass", "pass-one"][(alone == Some(true)) as usize],
+                            // A key binds named individuals only: HermiT follows that, Openllet
+                            // reads a blank node as a named individual.
+                            (true, _) if alone == Some(true) => "FAIL-one",
                             (true, Some(c)) if c == class => "FAIL",
                             (true, _) => "set-aside",
                         };
                         let (shape, name) = (case.shape, case.name(*i));
-                        let row = format!("{seed}\t{shape}\t{tags}\t{name}");
-                        let row = format!("{row}\t{class}\t{outcome}\t{detail}");
+                        let row = format!("{seed}\t{shape}\t{tags}\t{name}\t{class}\t{outcome}");
+                        let second = second.map_or("not asked", |c| c.as_str());
+                        let row = format!("{row}\t{detail}; openllet: {second}");
                         writeln!(summary.lock().expect("summary"), "{row}").expect("summary.tsv");
                         // Written whole, to be read by hand: it shrinks against HermiT alone.
-                        if outcome == "set-aside" {
+                        if outcome == "set-aside" || outcome == "control-split" {
                             case.report(out, *i, &BTreeSet::new(), &mut reference);
                         }
-                        if outcome == "FAIL" {
+                        if outcome.starts_with("FAIL") || outcome == "control-split" {
                             failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if outcome.starts_with("FAIL") {
                             // Shrunk: 20 per verdict and query; written: 3 per template set left;
                             // every other failure listed in unwritten.tsv, with why.
                             let count = |key: String| {
