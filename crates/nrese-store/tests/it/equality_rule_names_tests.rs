@@ -144,3 +144,140 @@ fn a_users_rules_named_like_the_equality_rules_entail_what_they_say() {
 
     assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
 }
+
+fn apply(pipeline: &MutationPipeline, update: &str) {
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(update.to_owned())),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap_or_else(|error| panic!("{update}: {error}"));
+}
+
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
+
+/// OWL 2 RL's five equality rules and a subclass rule in Notation3, whose rules carry no
+/// equality rule's name. As ordinary rules they entail, over `a sameAs b`, `a a Dog`, `c a Dog`
+/// and `Dog subClassOf Animal`: `b` an Animal, `b sameAs a`, `a sameAs a` and `b sameAs b`; and
+/// nothing reflexive for `c` or `Dog`, which are the same as nothing (no `eq-ref`).
+const EQUALITY_N3: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+{ ?x owl:sameAs ?y } => { ?y owl:sameAs ?x } .
+{ ?x owl:sameAs ?y . ?y owl:sameAs ?z } => { ?x owl:sameAs ?z } .
+{ ?s owl:sameAs ?t . ?s ?p ?o } => { ?t ?p ?o } .
+{ ?p owl:sameAs ?q . ?s ?p ?o } => { ?s ?q ?o } .
+{ ?o owl:sameAs ?t . ?s ?p ?o } => { ?s ?p ?t } .
+";
+
+/// A program that holds the equality rules under other names answers as those rules entail as
+/// ordinary rules, under each `reasoner.equality` (representatives, compact, replicate), right
+/// after its commits and after a restart.
+#[test]
+fn equality_rules_under_other_names_answer_as_ordinary_rules_through_a_restart() {
+    let rules = Arc::new(UserRules::n3("equality.n3", EQUALITY_N3).expect("the rules parse"));
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
+        .with_rules(Some(rules))
+        .expect("custom rules");
+    let same = format!("<{OWL}sameAs>");
+    let expected: Vec<(String, bool)> = [
+        ("a", "a", "Dog", true),
+        ("b", "a", "Animal", true),
+        ("c", "a", "Animal", true),
+        ("b", same.as_str(), "a", true),
+        ("a", same.as_str(), "a", true),
+        ("b", same.as_str(), "b", true),
+        ("c", same.as_str(), "c", false),
+        ("Dog", same.as_str(), "Dog", false),
+        ("c", same.as_str(), "a", false),
+    ]
+    .iter()
+    .map(|&(s, p, o, holds)| (format!("<{EX}{s}> {p} <{EX}{o}>"), holds))
+    .collect();
+    let mut wrong = Vec::new();
+    for (equality, representatives, compact) in [
+        ("representatives", true, false),
+        ("compact", true, true),
+        ("replicate", false, false),
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let open = || {
+            let config = nrese_store::StoreConfig {
+                equality_by_representatives: representatives,
+                equality_compact: compact,
+                ..nrese_store::StoreConfig::on_disk(dir.path().join("store"))
+            };
+            MutationPipeline::new(
+                Arc::new(StoreService::new(config).expect("store")),
+                Arc::new(ReasonerService::new(reasoner.clone())),
+            )
+        };
+        {
+            let written = open();
+            apply(
+                &written,
+                &format!("INSERT DATA {{ <{EX}a> {same} <{EX}b> }}"),
+            );
+            apply(
+                &written,
+                &format!(
+                    "INSERT DATA {{ <{EX}a> a <{EX}Dog> . <{EX}c> a <{EX}Dog> . \
+                     <{EX}Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Animal> }}"
+                ),
+            );
+            let case = format!("{equality}, after the commits");
+            wrong.extend(ask_all(&case, &written, &expected));
+        }
+        let case = format!("{equality}, after a restart");
+        wrong.extend(ask_all(&case, &open(), &expected));
+    }
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
+
+/// A user's rule named `eq-rep-p` that copies `p` to `q`, beside a rule that copies `q` back
+/// to `p`: the two derive each other. Deleting the only asserted statement leaves neither: the
+/// program entails nothing from an empty store.
+const COPIES_NAMED_EQ_REP_P: &str = r#"
+Prefices
+{
+  ex : http://example.com/
+}
+
+Rules
+{
+Id: eq-rep-p
+  x <ex:p> y
+  ---------------
+  x <ex:q> y
+
+Id: back
+  x <ex:q> y
+  ---------------
+  x <ex:p> y
+}
+"#;
+
+/// A deletion maintained over a user's rule named `eq-rep-p` takes out what only that rule and
+/// its partner derived from the deleted statement.
+#[test]
+fn a_deletion_takes_out_what_a_rule_named_like_an_equality_rule_derived() {
+    let store = store_with(COPIES_NAMED_EQ_REP_P, &format!("<{EX}a> <{EX}p> <{EX}b> ."));
+    let (p, q) = (
+        format!("<{EX}a> <{EX}p> <{EX}b>"),
+        format!("<{EX}a> <{EX}q> <{EX}b>"),
+    );
+    let mut wrong = ask_all(
+        "before the deletion",
+        &store,
+        &[(p.clone(), true), (q.clone(), true)],
+    );
+    apply(&store, &format!("DELETE DATA {{ {p} }}"));
+    wrong.extend(ask_all(
+        "after the deletion",
+        &store,
+        &[(p, false), (q, false)],
+    ));
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
