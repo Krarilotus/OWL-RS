@@ -20,6 +20,10 @@ use crate::query_executor::{PreparedQuery, explain_prepared, plan_prepared, run_
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
+/// A status header's text as its transport sends it, kept with a cached answer
+/// ([`StoreService::run_query_reporting`]).
+pub type StatusHeader = Option<std::sync::Arc<str>>;
+
 /// The dataset and the operations on it. Reads run on an engine snapshot and never wait for
 /// writers. Writes go through [`MutationPipeline`](crate::MutationPipeline), which gates
 /// them (access, reasoning, consistency, SHACL); the store has no public write that
@@ -942,8 +946,9 @@ impl StoreService {
         let mut payload = Vec::new();
         let mut completeness = None;
         let cancellation = CancellationToken::new();
-        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status| {
-            completeness = status
+        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status, _| {
+            completeness = status;
+            None
         })?;
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
@@ -1064,7 +1069,7 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
-        self.run_query_reporting(prepared, cancellation, out, |_| {})
+        self.run_query_reporting(prepared, cancellation, out, |_, _| None)
     }
 
     /// [`Self::run_query`], handing `report` whether the answers are complete, where a
@@ -1075,13 +1080,17 @@ impl StoreService {
     /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
     /// A reader of some graphs who sees every inference is told `not-certified` where the
     /// rewriting ran, and any reader of some graphs under `owl2-dl`: either assessment reads
-    /// the schema of every graph.
+    /// the schema of every graph. With the status, `report` is handed the header text kept
+    /// with the answer where the result cache gives it (made by an earlier `report` for a
+    /// request told the same status), and returns the text it made for an answer written
+    /// now (`None`: none), which the store keeps with the answer where it offers that to
+    /// the cache.
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         self.run_reporting(prepared, cancellation, out, report)
             .map(|_| ())
@@ -1098,7 +1107,10 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
         let mut status = None;
-        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
+        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s, _| {
+            status = s;
+            None
+        })?;
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
@@ -1109,7 +1121,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<(
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
@@ -1124,7 +1136,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<(
         Option<crate::dl::DlDetail>,
         Option<nrese_sparql::ql::QlReport>,
@@ -1140,7 +1152,7 @@ impl StoreService {
             let detail =
                 match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
                     Outcome::Answers(answers, status, detail) => {
-                        report(status_for_its_reader(prepared, Some(status), false));
+                        report(status_for_its_reader(prepared, Some(status), false), None);
                         crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                         detail
                     }
@@ -1164,8 +1176,8 @@ impl StoreService {
                             &memory,
                             out,
                             |_| {
-                                report(status_for_its_reader(prepared, Some(status), false));
-                                context
+                                let told = status_for_its_reader(prepared, Some(status), false);
+                                (context, move |kept| report(told, kept))
                             },
                         )?;
                         detail
@@ -1185,9 +1197,9 @@ impl StoreService {
             |ql| {
                 let status = self.status_outside_dl(prepared, ql, Revision::Committed(&snapshot));
                 // The cache's context is the whole assessment, not what the reader is told.
-                let context = context_outside_dl(status.as_ref());
-                report(status_for_its_reader(prepared, status, ql.is_some()));
-                context
+                let context = context_outside_dl(status.as_ref(), ql.is_some());
+                let told = status_for_its_reader(prepared, status, ql.is_some());
+                (context, move |kept| report(told, kept))
             },
         )?;
         Ok((None, ql.filter(|_| !withholds_certification(prepared))))
@@ -1587,7 +1599,7 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
-        self.run_query_pending_reporting(pending, prepared, cancellation, out, |_| {})
+        self.run_query_pending_reporting(pending, prepared, cancellation, out, |_, _| None)
     }
 
     /// [`Self::run_query_pending`], handing `report` the answers' status as
@@ -1602,7 +1614,7 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+        report: impl FnOnce(Option<nrese_sparql::Completeness>, StatusHeader) -> Option<String>,
     ) -> StoreResult<()> {
         if pending.ops.is_empty() {
             return self.run_query_reporting(prepared, cancellation, out, report);
@@ -1658,8 +1670,8 @@ impl StoreService {
                 |ql| {
                     // A transaction's pending state: never answered from the cache.
                     let status = status_of(ql, Revision::Pending(snapshot));
-                    report(status_for_its_reader(prepared, status, ql.is_some()));
-                    Vec::new()
+                    report(status_for_its_reader(prepared, status, ql.is_some()), None);
+                    (Vec::new(), |_| None)
                 },
             )
             .map(|_| ())
@@ -2480,12 +2492,13 @@ fn dl_context(mode: crate::DlAnswers, status: &nrese_sparql::Completeness) -> Ve
 }
 
 /// The result cache's context of an answer outside the DL bounds: its whole status, or
-/// none, each with a tag of its own.
-fn context_outside_dl(status: Option<&nrese_sparql::Completeness>) -> Vec<u8> {
+/// none, each with a tag of its own, after a byte for whether the QL rewriting ran (what
+/// a reader is told depends on it: [`status_for_its_reader`]).
+fn context_outside_dl(status: Option<&nrese_sparql::Completeness>, rewritten: bool) -> Vec<u8> {
     let Some(status) = status else {
-        return vec![b'N'];
+        return vec![u8::from(rewritten), b'N'];
     };
-    let mut context = vec![b'S'];
+    let mut context = vec![u8::from(rewritten), b'S'];
     status.write_cache_context(&mut context);
     context
 }
@@ -3238,13 +3251,16 @@ mod context_tests {
     use nrese_sparql::{Completeness, Regime};
 
     /// One status keys apart under `owl2-dl` and outside it, apart in each DL answers mode,
-    /// and apart from no status at all: a cached answer of one is never another's.
+    /// apart from no status at all, and apart where the QL rewriting ran and where it didn't:
+    /// a cached answer of one is never another's.
     #[test]
     fn the_cache_contexts_of_one_status_never_meet() {
         let status = Completeness::under(Regime::Owl2Dl);
         let contexts = [
-            context_outside_dl(None),
-            context_outside_dl(Some(&status)),
+            context_outside_dl(None, false),
+            context_outside_dl(None, true),
+            context_outside_dl(Some(&status), false),
+            context_outside_dl(Some(&status), true),
             dl_context(DlAnswers::CertainWhereComplete, &status),
             dl_context(DlAnswers::Sound, &status),
             dl_context(DlAnswers::Exact, &status),

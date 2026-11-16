@@ -1693,7 +1693,10 @@ fn a_pending_read_leaves_the_committed_revisions_mark() {
             &prepared,
             &nrese_store::CancellationToken::new(),
             &mut Vec::<u8>::new(),
-            |status| pending = status,
+            |status, _| {
+                pending = status;
+                None
+            },
         )
         .expect("the pending read");
     println!("pending read: {pending:?}");
@@ -1806,7 +1809,10 @@ fn a_pending_key_left_out_leaves_the_pending_read_not_complete() {
             &prepared,
             &nrese_store::CancellationToken::new(),
             &mut answer,
-            |status| pending = status,
+            |status, _| {
+                pending = status;
+                None
+            },
         )
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
@@ -1957,7 +1963,10 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
             &prepared,
             &nrese_store::CancellationToken::new(),
             &mut answer,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
@@ -2096,7 +2105,10 @@ fn alias_of_has_key(
                 &prepared,
                 &nrese_store::CancellationToken::new(),
                 &mut answer,
-                |s| status = s,
+                |s, _| {
+                    status = s;
+                    None
+                },
             )
             .expect("the pending read");
         (String::from_utf8(answer).expect("utf8"), status)
@@ -2165,7 +2177,10 @@ fn pending_status(
             &prepared,
             &nrese_store::CancellationToken::new(),
             &mut Vec::<u8>::new(),
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("the pending read");
     println!("pending read with {update}: {status:?}");
