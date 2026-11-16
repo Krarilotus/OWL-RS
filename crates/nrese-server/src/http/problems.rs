@@ -5,9 +5,7 @@
 //! the response carries in `x-request-id` and the logs in the request span, so a client
 //! (the console, its CLI) can show it and an operator can find the request.
 
-use axum::extract::Request;
 use axum::http::{HeaderValue, Method, header};
-use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::{Map, Value};
 
@@ -17,21 +15,22 @@ use crate::error::{PROBLEM_JSON, Verbatim, kind, problem};
 /// status is reported.
 const MAX_BODY: usize = 64 * 1024;
 
-pub(crate) async fn problems(request: Request, next: Next) -> Response {
-    let id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let head = request.method() == Method::HEAD;
-    let response = next.run(request).await;
+/// A response mapped on its way out (`map_response`, outside the request id's propagation):
+/// an answer that isn't an error passes untouched, and an error reads the id its response
+/// carries, so no request pays for the id but the errors.
+pub(crate) async fn problems(method: Method, response: Response) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
-        || head
+        || method == Method::HEAD
         || response.extensions().get::<Verbatim>().is_some()
     {
         return response;
     }
+    let id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let (mut parts, body) = response.into_parts();
     let documented = parts
         .headers
@@ -79,15 +78,19 @@ fn framework(status: axum::http::StatusCode, text: &str) -> Map<String, Value> {
 mod tests {
     use axum::Router;
     use axum::body::Body;
-    use axum::http::StatusCode;
+    use axum::http::{Request, StatusCode};
     use axum::routing::get;
     use tower::util::ServiceExt;
+    use tower_http::request_id::PropagateRequestIdLayer;
 
     use super::*;
     use crate::error::ApiError;
 
+    /// As the server layers it ([`crate::app::build_app`]): outside the id's propagation.
     async fn answer(app: Router, method: Method, uri: &str) -> (StatusCode, String, Value) {
-        let app = app.layer(axum::middleware::from_fn(problems));
+        let app = app
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(axum::middleware::map_response(problems));
         let request = Request::builder()
             .method(method)
             .uri(uri)

@@ -307,33 +307,9 @@ fn encoding_widths_preserve_direct_output_and_caller_owned_writers() {
 /// 20,000 rows or the query's memory error, never the rows read before the refusal.
 #[test]
 fn a_refused_expanded_read_fails_the_query() {
-    use nrese_engine::EncodedTriple;
-    use nrese_rdf::{GraphName, NamedNode, Quad};
     use nrese_sparql::{QueryEvaluationError, QueryResults};
 
-    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
-    let engine = Engine::new(EngineConfig {
-        background_maintenance: false,
-        ..EngineConfig::default()
-    })
-    .unwrap();
-    let mut tx = engine.transaction();
-    let rep = tx.intern(node("rep").as_ref().into());
-    let same_as = tx.intern(node("sameAs").as_ref().into());
-    for i in 1..1_000 {
-        let alias = tx.intern(node(&format!("alias{i}")).as_ref().into());
-        tx.insert_inferred(EncodedTriple {
-            subject: alias,
-            predicate: same_as,
-            object: rep,
-        });
-    }
-    for i in 0..20 {
-        let object = node(&format!("o{i}"));
-        tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
-    }
-    tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    let engine = a_class_of_1000_over_20_statements();
     let snapshot = engine.snapshot();
     let query = SparqlParser::new()
         .parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }")
@@ -366,6 +342,100 @@ fn a_refused_expanded_read_fails_the_query() {
         answered > 0 && refused > 0,
         "{answered} answered, {refused} refused"
     );
+}
+
+/// The same refused read, delivered by the direct writer (`write_results`, the HTTP
+/// endpoint's SELECT path): at every limit from 1 KiB to 16 MiB the writer reports success
+/// only with all 20,000 rows written, and otherwise the query's memory error, never success
+/// with the rows read before the refusal.
+///
+/// What it holds: for this query the refusal is reported by the native evaluator's checks
+/// in `Context::holding` and, without that one, in `Context::reshaped`
+/// (`nrese-sparql/src/native/mod.rs`). With both removed, 1 KiB answers success with none
+/// of the rows.
+#[test]
+fn a_refused_expanded_read_written_directly_fails_the_query() {
+    use nrese_sparql::{QueryEvaluationError, WriteResultsError};
+
+    let engine = a_class_of_1000_over_20_statements();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }")
+        .unwrap();
+    let (mut answered, mut refused) = (0, 0);
+    for shift in 10..=24 {
+        let options = QueryOptions {
+            equality_early_expansion: true,
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(Some(1 << shift), None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let mut written = Vec::new();
+        let result = write_results(
+            &snapshot,
+            &query,
+            &options,
+            ResultsFormat::Tsv,
+            None,
+            &mut written,
+        )
+        .expect("a SELECT over a snapshot is written directly");
+        match result {
+            Ok(()) => {
+                // A header line, then one line per row.
+                let lines = written.iter().filter(|&&b| b == b'\n').count();
+                assert_eq!(
+                    lines.saturating_sub(1),
+                    20_000,
+                    "{} bytes: a partial answer",
+                    1 << shift
+                );
+                answered += 1;
+            }
+            Err(WriteResultsError::Evaluation(QueryEvaluationError::MemoryLimit(_))) => {
+                refused += 1
+            }
+            Err(other) => panic!("{} bytes: {other}", 1 << shift),
+        }
+    }
+    assert!(
+        answered > 0 && refused > 0,
+        "{answered} answered, {refused} refused"
+    );
+}
+
+/// A class of 1,000 identities (`urn:sameAs`, inferred) over `urn:rep`, which has 20
+/// statements on `urn:p`; equality by representatives on.
+fn a_class_of_1000_over_20_statements() -> Engine {
+    use nrese_engine::EncodedTriple;
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+
+    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(node("rep").as_ref().into());
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    for i in 1..1_000 {
+        let alias = tx.intern(node(&format!("alias{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    for i in 0..20 {
+        let object = node(&format!("o{i}"));
+        tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    engine
 }
 
 /// Equality classes expanded after a join (the default) fail as the query's memory error

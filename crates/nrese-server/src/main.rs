@@ -590,10 +590,10 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
             report.load.as_deref().unwrap_or_default()
         );
         for example in &report.examples {
-            eprintln!(
-                "  {} line {}: {}",
-                example.file, example.line, example.reason
-            );
+            match example.line {
+                0 => eprintln!("  {}: {}", example.file, example.reason),
+                line => eprintln!("  {} line {line}: {}", example.file, example.reason),
+            }
         }
     }
     Ok(())

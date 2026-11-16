@@ -33,7 +33,7 @@ fn switchable() -> bool {
 fn during_the_load(unseen: bool, then: impl FnOnce() + 'static) -> Arc<AtomicBool> {
     let seen = Arc::new(AtomicBool::new(unseen));
     let at_hook = Arc::clone(&seen);
-    hooks::AFTER_INVALIDATION.set(Some(Box::new(move || {
+    hooks::BEFORE_LOAD_READS.set(Some(Box::new(move || {
         at_hook.store(enabled(), Ordering::Relaxed);
         then();
     })));

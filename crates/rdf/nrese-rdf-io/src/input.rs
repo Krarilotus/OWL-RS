@@ -75,6 +75,8 @@ pub(crate) struct Lines<'a, R> {
     line_start: u64,
     /// Where the slice's next line starts.
     position: usize,
+    /// The line returned last has no terminator: the input ended inside it.
+    pub(crate) unterminated: bool,
 }
 
 const INITIAL_BUFFER: usize = 64 * 1024;
@@ -90,6 +92,7 @@ impl<'a> Lines<'a, io::Empty> {
             line: 0,
             line_start: offset,
             position: 0,
+            unterminated: false,
         }
     }
 }
@@ -111,6 +114,7 @@ impl<R: Read> Lines<'static, R> {
             line: 0,
             line_start: offset,
             position: 0,
+            unterminated: false,
         }
     }
 }
@@ -133,6 +137,13 @@ impl<'a, R: Read> Lines<'a, R> {
             },
             (error, _) => error,
         }
+    }
+
+    /// `error`, the line returned last failing, in the document ([`Self::in_document`]): a
+    /// statement or a directive alike. Without its terminator the input ended inside it, so
+    /// the error ends the document, which may be cut off.
+    pub(crate) fn failed(&self, error: RdfParseError) -> RdfParseError {
+        self.in_document(error).ending(self.unterminated, true)
     }
 
     /// The document's lines before these, counted at the first error and kept: counting
@@ -219,6 +230,7 @@ impl<R: Read> Lines<'_, R> {
         self.line_start = self.offset;
         self.offset += consumed as u64;
         self.line += 1;
+        self.unterminated = consumed == length;
         Ok(Some(from..from + length))
     }
 }
