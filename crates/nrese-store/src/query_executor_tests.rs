@@ -52,6 +52,8 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
         state: crate::ReasoningState::of(&rl, 0),
         ql: Some(Arc::new(QlRewriting::new(Closure { lists: true }))),
         equality_closed: false,
+        dl: false,
+        user_rules: false,
     };
     engine
         .transaction()
