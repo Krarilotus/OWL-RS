@@ -81,7 +81,8 @@ pub(crate) struct Guarded {
 /// r1 S1). Left as they are, so the built-in rulesets run as before:
 /// - rules whose one guard is `?a != ?b` and whose every conclusion is `?a owl:sameAs ?b`
 ///   (`prp-fp`, `prp-ifp`, `cls-maxc2`, `cls-maxqc3/4`, `prp-key`): with `?a` and `?b` in
-///   one class they would conclude what the class holds;
+///   one class they would conclude what the class holds; `owl2-dl`'s `prp-key` too, whose
+///   other guards keep blank nodes out ([`concludes_its_inequality_equal`]);
 /// - the long lists' rules ([`Guard::SameList`]): their index is built from the lists as
 ///   the run reads them, over representatives, so it names no other member of a class.
 ///
@@ -108,14 +109,28 @@ pub(crate) fn over_classes(
     guarded
 }
 
-/// Whether the rule's one guard is `?a != ?b` and each conclusion `?a owl:sameAs ?b`.
+/// Whether the rule's first guard is `?a != ?b`, every other one keeps blank nodes out
+/// (`owl2-dl`'s `prp-key`), and each conclusion is `?a owl:sameAs ?b`.
+///
+/// Keeping blank nodes out is exact on representatives as well: a class stands as its
+/// smallest id, and an id's kind sorts first, IRIs (1) before blank nodes (2)
+/// ([`TermKind`]). So a representative is a blank node exactly when its class holds no
+/// IRI, no named individual. A test pins both.
 fn concludes_its_inequality_equal(rule: &Rule, same_as: u64) -> bool {
-    let ([Guard::NotEqual(a, b)], Head::Facts(heads)) = (rule.guards.as_slice(), &rule.head) else {
+    let ([Guard::NotEqual(a, b), named @ ..], Head::Facts(heads)) =
+        (rule.guards.as_slice(), &rule.head)
+    else {
         return false;
     };
-    heads.iter().all(|&Atom([s, p, o])| {
-        p == Term::Const(same_as) && ((s, o) == (*a, *b) || (s, o) == (*b, *a))
-    })
+    let (low, high) = nrese_engine::TermId::kind_range(nrese_engine::TermKind::BlankNode);
+    let blank = (low.raw(), high.raw());
+    let named = named
+        .iter()
+        .all(|g| matches!(*g, Guard::NotIn(_, l, h) if (l, h) == blank));
+    named
+        && heads.iter().all(|&Atom([s, p, o])| {
+            p == Term::Const(same_as) && ((s, o) == (*a, *b) || (s, o) == (*b, *a))
+        })
 }
 
 /// Whether members of the classes of the guards' variables' values (a constant stands for
