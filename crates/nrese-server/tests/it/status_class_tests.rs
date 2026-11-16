@@ -123,8 +123,23 @@ impl Column {
         mode: ReasoningMode,
         replication: Option<ReplicationConfig>,
     ) -> TestResult<AppState> {
+        self.state_with(dir, mode, replication, None)
+    }
+
+    /// [`Self::state`], with `ontology` as the store's `ontology_path`.
+    fn state_with(
+        &self,
+        dir: &Path,
+        mode: ReasoningMode,
+        replication: Option<ReplicationConfig>,
+        ontology: Option<&Path>,
+    ) -> TestResult<AppState> {
+        let config = StoreConfig {
+            ontology_path: ontology.map(Path::to_path_buf),
+            ..self.config(dir)
+        };
         let state = AppState::new(
-            StoreService::new(self.config(dir))?,
+            StoreService::new(config)?,
             ReasonerService::new(reasoner(mode)?),
             PolicyConfig::default(),
             AiSuggestionService::disabled(),
@@ -348,15 +363,19 @@ async fn catch_up(primary: &str, replica: &AppState) -> TestResult<()> {
     Ok(())
 }
 
-/// A replica of the primary at `base`, configured as `column`, bootstrapped from its image.
-async fn replica(column: &Column, base: &str, keep: &mut Keep) -> TestResult<(AppState, PathBuf)> {
-    let dir = keep.dir()?;
-    let config = ReplicationConfig {
+fn following(base: &str) -> ReplicationConfig {
+    ReplicationConfig {
         mode: ReplicationMode::Replica,
         primary: Some(base.to_owned()),
         poll: Duration::from_millis(20),
         ..ReplicationConfig::default()
-    };
+    }
+}
+
+/// A replica of the primary at `base`, configured as `column`, bootstrapped from its image.
+async fn replica(column: &Column, base: &str, keep: &mut Keep) -> TestResult<(AppState, PathBuf)> {
+    let dir = keep.dir()?;
+    let config = following(base);
     replication::bootstrap(&config, &dir).await?;
     let state = column.state(&dir, column.mode, Some(config))?;
     Ok((state, dir))
@@ -706,6 +725,198 @@ async fn quarantine_cell(wrong: &mut Vec<String>, unmet: &mut Vec<String>) -> Te
     }
     drop((state, primary_state));
     keep.finish().await;
+    Ok(())
+}
+
+/// The two commits made without reasoning that a primary's log can carry: the ontology file
+/// its open preloads, and a commit with reasoning off. The second is a guard: a primary
+/// turned to reasoning off clears its inferred statements at its start, which writes a
+/// checkpoint and no record, so the replica's next request gets 410 Gone before the commit
+/// made without reasoning reaches it.
+const UNREASONED: [&str; 2] = ["ontology preload", "reasoning off"];
+
+/// Applies what the primary at `base` serves until it has no more or refuses (a 410 once
+/// the log no longer holds the next record); the refusal, if any.
+async fn follow_until_refused(base: &str, replica: &AppState) -> Option<String> {
+    let client = reqwest::Client::new();
+    loop {
+        match replication::pull_once(&client, base, replica).await {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(error) => return Some(error.to_string()),
+        }
+    }
+}
+
+/// What a store answers about `ex:x`, which the unreasoned commit gave `ex:C`: whether it
+/// holds that statement, and whether `ex:x a ex:D`, which `ex:C rdfs:subClassOf ex:D`
+/// entails, is answered and entailed as the reasoning certifies.
+async fn certified_answer(cell: &str, state: &AppState, wrong: &mut Vec<String>) -> TestResult<()> {
+    let (holds, _) = answered(state, "ASK { ex:x a ex:C }").await?;
+    if !holds.contains("\"boolean\":true") {
+        // Nothing to answer from: the store never got the statement.
+        eprintln!("DETAIL {cell}: the store doesn't hold ex:x a ex:C");
+        return Ok(());
+    }
+    let (rows, status) = answered(state, "ASK { ex:x a ex:D }").await?;
+    let complete = status.as_deref().is_some_and(|s| s.starts_with("complete"));
+    if !rows.contains("\"boolean\":true") && complete {
+        eprintln!("DETAIL {cell} | ask: {rows}, status {status:?}");
+        wrong.push(format!("{cell} | ask"));
+    }
+    let Some(program) = state.pipeline().reasoner().config().materialised_program() else {
+        return Ok(());
+    };
+    let ex = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"));
+    let conclusion = nrese_rdf::Triple::new(ex("x"), nrese_rdf::vocab::rdf::TYPE, ex("D"));
+    match state.store().entails(program, &[conclusion]) {
+        Ok(nrese_store::Entailment::NotEntailed) => {
+            eprintln!("DETAIL {cell} | entails: not entailed, status {status:?}");
+            wrong.push(format!("{cell} | entails"));
+        }
+        // Entailed, or refused: the inferred statements aren't certified.
+        Ok(_) | Err(_) => {}
+    }
+    Ok(())
+}
+
+/// A replica's certificate across a commit made without reasoning. The replica holds a
+/// certificate of its own, by `route`: its directory was started as a primary once, over
+/// the closure the records brought, and then as a replica again; or its image was placed
+/// beside a `reasoning.state` left in an otherwise empty directory. The primary then commits without
+/// reasoning (its ontology file preloaded at its open, or a commit with reasoning off), and
+/// the replica applies what its log serves. It must not answer `ex:x a ex:D`, which the
+/// commit's `ex:x a ex:C` entails, with `false` and `complete`, nor `entails` say no, while
+/// it runs and once its directory is reopened as a store.
+async fn certificate_cell(
+    kind: &str,
+    route: &str,
+    column: &Column,
+    wrong: &mut Vec<String>,
+    unmet: &mut Vec<String>,
+) -> TestResult<()> {
+    let mut keep = Keep::default();
+    let dir = keep.dir()?;
+    let base = format!("{kind} | {route} | {}", column.name);
+    let (replica_dir, served, revision) = {
+        let primary_state = column.state(&dir, column.mode, Some(primary()))?;
+        update(&primary_state, "ex:C rdfs:subClassOf ex:D .").await?;
+        let served = Served::start(&primary_state).await?;
+        let replica_dir = keep.dir()?;
+        if route == "leftover certificate" {
+            // A directory with no store but the primary's `reasoning.state`: the image is
+            // placed beside it.
+            std::fs::copy(
+                dir.join("reasoning.state"),
+                replica_dir.join("reasoning.state"),
+            )?;
+        }
+        let config = following(&served.base);
+        replication::bootstrap(&config, &replica_dir).await?;
+        let state = column.state(&replica_dir, column.mode, Some(config))?;
+        catch_up(&served.base, &state).await?;
+        let revision = state.store().current_revision();
+        (replica_dir, served, revision)
+    };
+    if route == "opened as a primary" {
+        // The replica's directory started once as a primary: its reasoning finds the
+        // closure the records brought, and certifies it.
+        drop(reopened(column, &replica_dir)?);
+    }
+    let state = column.state(&replica_dir, column.mode, Some(following(&served.base)))?;
+    let program = state.pipeline().reasoner().config().materialised_program();
+    if !program.is_some_and(|p| state.store().reasoning_is_current(p)) {
+        unmet.push(format!(
+            "certificate | {base}: the replica holds no certificate"
+        ));
+    }
+    if state.store().current_revision() != revision {
+        unmet.push(format!(
+            "certificate | {base}: the directory's start as a primary published a revision"
+        ));
+    }
+    served.end().await;
+    let primary_state = match kind {
+        "ontology preload" => {
+            let ontology = keep.dir()?.join("ontology.ttl");
+            std::fs::write(
+                &ontology,
+                "@prefix ex: <http://example.com/> .\nex:x a ex:C .\n",
+            )?;
+            let state = column.state_with(&dir, column.mode, Some(primary()), Some(&ontology))?;
+            start(&state)?;
+            state
+        }
+        "reasoning off" => {
+            let state = column.state(&dir, ReasoningMode::Disabled, Some(primary()))?;
+            start(&state)?;
+            update(&state, "ex:x a ex:C .").await?;
+            state
+        }
+        _ => return Err(format!("no kind {kind}").into()),
+    };
+    let served = Served::start(&primary_state).await?;
+    let refused = follow_until_refused(&served.base, &state).await;
+    eprintln!(
+        "DETAIL certificate | {base}: replica at {}, primary at {}, refused: {refused:?}",
+        state.store().current_revision(),
+        primary_state.store().current_revision()
+    );
+    keep.served.push(served);
+    certified_answer(
+        &format!("certificate | {base} | running replica"),
+        &state,
+        wrong,
+    )
+    .await?;
+    drop(state);
+    let state = reopened(column, &replica_dir)?;
+    certified_answer(
+        &format!("certificate | {base} | reopened as a store"),
+        &state,
+        wrong,
+    )
+    .await?;
+    drop((state, primary_state));
+    keep.finish().await;
+    Ok(())
+}
+
+/// [`certificate_cell`] for each unreasoned commit, under the regimes a certificate decides
+/// for: `owl2-rl`, and `owl2-dl`, whose certified program is OWL 2 RL's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_s_certificate_follows_the_records_it_applies() -> TestResult<()> {
+    let (mut wrong, mut errors, mut unmet) = (Vec::new(), Vec::new(), Vec::new());
+    for mode in [ReasoningMode::Owl2Rl, ReasoningMode::Owl2Dl] {
+        let column = Column::new(mode, Equality::Representatives, QlRewritingMode::Auto);
+        for kind in UNREASONED {
+            for route in ["opened as a primary", "leftover certificate"] {
+                let cell = certificate_cell(kind, route, &column, &mut wrong, &mut unmet);
+                let name = format!("certificate | {kind} | {route} | {}", column.name);
+                match tokio::time::timeout(Duration::from_secs(120), cell).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(format!("{name} | {error}")),
+                    Err(_) => errors.push(format!("{name} | timed out")),
+                }
+            }
+        }
+    }
+    for line in &wrong {
+        eprintln!("WRONG {line}");
+    }
+    for line in &errors {
+        eprintln!("ERROR {line}");
+    }
+    for line in &unmet {
+        eprintln!("UNMET {line}");
+    }
+    assert!(
+        wrong.is_empty() && errors.is_empty() && unmet.is_empty(),
+        "{} wrong cells, {} errors, {} unmet preconditions (the lines above)",
+        wrong.len(),
+        errors.len(),
+        unmet.len()
+    );
     Ok(())
 }
 
