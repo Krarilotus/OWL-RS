@@ -58,7 +58,7 @@ from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
-# RDFox isn't among them: its evaluation licence was refused (owner, 12 Oct 2026). Its
+# RDFox isn't among them: we hold no licence for it, so it runs nowhere here. Its
 # home turf runs NRESE against VLog and GLog on RDFox's own programs; RDFox's published
 # numbers are reported rows (benches/reasoning/reported), never measured.
 SYSTEMS = ("nrese", "souffle", "nemo", "vlog", "glog")

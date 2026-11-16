@@ -1,6 +1,6 @@
 //! Equality by representatives, read side (work package W4, stage B).
 //!
-//! With equality on ([`crate::Engine::set_equality`]), the default graph of the inferred
+//! With equality on (a version's reading), the default graph of the inferred
 //! stack holds the closure over one representative per `owl:sameAs` class (its smallest
 //! id) instead of every fact for every identity: a class of k identities saves up to k³
 //! copies of a fact. Each identity other than the representative is stored as
@@ -349,6 +349,8 @@ fn canonical_version(
         committed_micros: version.committed_micros,
         dictionary_len: version.dictionary_len,
         equality: Arc::new(EqualityCell::holding(same_as, Arc::clone(classes))),
+        // Built under `same_as`, for its reads alone.
+        reading: Some(same_as),
         content: version.content,
         // Its asserted stack renamed to representatives: not the stored ids.
         asserted_content: super::AssertedIdentity::fresh(),
@@ -1509,7 +1511,7 @@ mod tests {
             .as_ref(),
         );
         tx.commit().unwrap();
-        engine.set_equality(Some(same_as));
+        engine.transaction().install_reading(Some(same_as));
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {
@@ -1598,7 +1600,7 @@ mod tests {
         }
         tx.insert(quad(&names[subject], "p", "o").as_ref());
         tx.commit().unwrap();
-        engine.set_equality(Some(predicate));
+        engine.transaction().install_reading(Some(predicate));
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {
@@ -1801,7 +1803,7 @@ mod tests {
             tx.insert(statement("rep", "p", &format!("o{i}")).as_ref());
         }
         tx.commit().unwrap();
-        engine.set_equality(Some(same_as));
+        engine.transaction().install_reading(Some(same_as));
         let snapshot = engine.snapshot();
         let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
         let plain: Vec<_> = snapshot

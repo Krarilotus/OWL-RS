@@ -6,7 +6,7 @@ locating variables set; they take precedence over `git -C DIR`, so a test that r
 script that does (release-gate.sh's worktrees), acted on the commit being made (20 Oct 2026: two
 commits emptied and a branch moved by tests under the hook). A caller's configuration reaches a
 test repository too (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT: a core.hooksPath ran
-an outside hook in a test's own repository; Sol, 20 Oct 2026). And a test that read this
+an outside hook in a test's own repository). And a test that read this
 repository's history passed where the history was kept and failed where it wasn't (27 Oct 2026:
 commit ids from before a rewrite, on fleet hosts that had pruned them). So importing this module,
 once for the whole run, for the tests and every process they start:

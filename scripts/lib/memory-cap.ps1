@@ -9,7 +9,7 @@
 # The job outlives this script: a job lasts while a process is in it. LimitGB 0: no limit.
 #
 # The job is named after the process's identity, nrese-build-<pid>-<creation time>, and the name
-# printed. With -Registry it is also listed there (a file of that name), for the main PC's guard:
+# printed. With -Registry it is also listed there (a file of that name), for the development machine's guard:
 # it asks each listed job whether a process it stops is in it, and names those jobs in its notice,
 # so the build that started the process learns it was stopped (scripts/cargo-guarded.sh). A job's
 # processes stay in it whatever becomes of their parents (Git Bash's exec leaves none).
@@ -17,7 +17,7 @@
 # The work is a small program (below), compiled once into memory-cap-<hash>.exe in the temporary
 # directory's nrese-memory-cap, <hash> the first 12 hex digits of this file's SHA-256. This script
 # builds it if it isn't there and runs it; scripts/cargo-guarded.sh runs it directly when it is
-# (PowerShell's start and a compile took seconds at every build: Sol, 20 Oct 2026).
+# (PowerShell's start and a compile took seconds at every build).
 #
 #   memory-cap-<hash>.exe PID LIMIT_GB [REGISTRY]
 param(

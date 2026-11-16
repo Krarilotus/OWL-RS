@@ -443,6 +443,7 @@ fn own_version(
         committed_micros: seen.committed_micros,
         dictionary_len: end,
         equality: Default::default(),
+        reading: seen.reading,
         canonical: Default::default(),
         own: Default::default(),
     }

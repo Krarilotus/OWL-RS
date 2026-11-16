@@ -30,7 +30,7 @@ class Memory(unittest.TestCase):
 
 
     def test_an_unreadable_buddyinfo_is_no_reading_and_an_all_zero_one_is_0(self):
-        # Spec (Sol r1, 14 Nov 2026): a reading that couldn't be taken is absent, never 0.
+        # Spec: a reading that couldn't be taken is absent, never 0.
         zero = "Node 0, zone   Normal" + "      0" * 11 + "\n"
         for buddyinfo, expected in ((None, None), (zero, 0)):
             with self.subTest(buddyinfo=buddyinfo):
