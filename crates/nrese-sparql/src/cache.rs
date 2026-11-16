@@ -87,21 +87,39 @@ const ENTRY_OVERHEAD: usize = 768;
 const WAIT_CHECK: Duration = Duration::from_millis(10);
 
 /// A part's key: the snapshot it was computed on and its encoding (the context, then the
-/// algebra).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// algebra), and the hash of both, taken once when the key is made: the maps hash that
+/// number, not the encoding again at each lookup (a hit looked a key up three times).
+/// Keys are equal only with every field equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Key {
+    hash: u64,
     pub(crate) snapshot: SnapshotIdentity,
     pub(crate) part: Arc<[u8]>,
 }
 
+impl std::hash::Hash for Key {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
 impl Key {
+    pub(crate) fn new(snapshot: SnapshotIdentity, part: Arc<[u8]>) -> Self {
+        // Seeded per process, as the maps' own hashers are.
+        static KEYS: std::sync::LazyLock<std::hash::RandomState> =
+            std::sync::LazyLock::new(std::hash::RandomState::new);
+        let hash = std::hash::BuildHasher::hash_one(&*KEYS, (&snapshot, &*part));
+        Self {
+            hash,
+            snapshot,
+            part,
+        }
+    }
+
     /// The key `part` is admitted under: the identity of the admission's own snapshot. Every
     /// key the cache stores, claims or pins under is made here.
     fn admitted(admission: Admission<'_>, part: Arc<[u8]>) -> Self {
-        Self {
-            snapshot: of(admission).identity(),
-            part,
-        }
+        Self::new(of(admission).identity(), part)
     }
 }
 
@@ -1004,10 +1022,7 @@ mod tests {
 
     impl Probe {
         fn key(&self) -> Key {
-            Key {
-                snapshot: self.snapshot.identity(),
-                part: Arc::clone(&self.part),
-            }
+            Key::new(self.snapshot.identity(), Arc::clone(&self.part))
         }
 
         fn token(&self) -> Admission<'_> {
@@ -1034,6 +1049,59 @@ mod tests {
         Probe {
             snapshot: snapshot.clone(),
             part: part.as_bytes().into(),
+        }
+    }
+
+    /// A key hashes, as the maps hash it, by its whole contents, taken once when it is made:
+    /// keys that differ in one field of their snapshot's identity, or in one byte of their
+    /// encoding at any place, hash apart (a hash of a part of the key puts every key that
+    /// agrees on that part in one bucket of the maps), and keys made alike hash alike.
+    ///
+    /// - Input: a snapshot's identity and a 24-byte encoding; that key with each identity
+    ///   field changed alone, and with each byte of the encoding changed alone.
+    /// - Expected: the key made twice hashes the same; every other key's hash unseen before.
+    #[test]
+    fn a_keys_hash_is_of_its_snapshot_and_its_whole_encoding() {
+        use std::hash::BuildHasher;
+        let hashed = |snapshot, part: &[u8]| {
+            let maps = std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default();
+            maps.hash_one(Key::new(snapshot, part.into()))
+        };
+        let base = published(1).identity();
+        let part = *b"twenty-four bytes long..";
+        assert_eq!(hashed(base, &part), hashed(base, &part));
+        let snapshots = [
+            SnapshotIdentity {
+                revision: base.revision + 1,
+                ..base
+            },
+            SnapshotIdentity {
+                content: published(1).identity().content,
+                ..base
+            },
+            SnapshotIdentity {
+                equality: Some(nrese_engine::TermId::from_raw(7)),
+                ..base
+            },
+            SnapshotIdentity {
+                canonical: !base.canonical,
+                ..base
+            },
+        ];
+        assert!(snapshots.iter().all(|changed| *changed != base));
+        let mut seen = vec![hashed(base, &part)];
+        let mut changed: Vec<_> = snapshots.map(|s| hashed(s, &part)).into();
+        for at in 0..part.len() {
+            let mut bytes = part;
+            bytes[at] ^= 1;
+            changed.push(hashed(base, &bytes));
+        }
+        for (i, hash) in changed.into_iter().enumerate() {
+            assert!(
+                !seen.contains(&hash),
+                "change {i} hashes as a key already seen"
+            );
+            seen.push(hash);
         }
     }
 
