@@ -11,6 +11,7 @@ mod gates;
 mod identity;
 mod islands;
 mod keys;
+mod left_out;
 mod mode;
 mod outside;
 mod plans;
