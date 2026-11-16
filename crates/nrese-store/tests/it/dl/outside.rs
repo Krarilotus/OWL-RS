@@ -641,14 +641,15 @@ fn fails(class: &str) -> bool {
 }
 
 /// A verdict on a query or the write: its index, class, what each side gave, and the answer's
-/// keys (the rows expected, each wrong and each missing row; a write's is its class).
+/// keys (the rows expected, each wrong row, each missing row a `complete` answer lacks; a
+/// write's is `write`).
 type Verdict = (usize, String, String, BTreeSet<String>);
 
 /// A row's outcome from HermiT's verdict and Openllet's, if asked. A failure needs both to fail
-/// it alike on the same answer: the same expected rows or one wrong or missing row in common.
+/// it on the same answer: the same expected rows, or a counterexample in common.
 fn outcome(hermit: &Verdict, openllet: Option<&Verdict>, alone: Option<bool>) -> String {
     let (_, class, _, keys) = hermit;
-    let alike = |(_, c, _, k): &Verdict| c == class && !k.is_disjoint(keys);
+    let alike = |(_, c, _, k): &Verdict| fails(c) && !k.is_disjoint(keys);
     let out = match (fails(class), openllet) {
         // A control's references must agree: else the premise below is wrong. One giving
         // up while the other agrees with the store is listed apart.
@@ -859,7 +860,8 @@ impl Case {
         let entailed = match reference.ask(reasoner, turtle, &asked) {
             Reply::Answers(m) => m,
             Reply::Inconsistent => {
-                let complete = answers.iter().flatten().any(|a| a.label == "complete");
+                let certain = |a: &Answer| a.label == "complete" || a.label == "none";
+                let complete = answers.iter().flatten().any(certain);
                 let class = ["accepted-inconsistent", "wrong-acceptance"][complete as usize];
                 let detail = format!("store: accepted; {reasoner}: inconsistent");
                 return vec![(write, class.into(), detail, on_write)];
@@ -873,7 +875,8 @@ impl Case {
         let judged = picked.iter().zip(answers).zip(per);
         let judged = judged.map(|((&i, a), rows)| match a {
             Ok(a) => {
-                let (class, detail, keys) = Self::judge(a, &rows, &entailed, reasoner);
+                let inferred = i + 1 == write;
+                let (class, detail, keys) = Self::judge(a, inferred, &rows, &entailed, reasoner);
                 (i, class, detail, keys)
             }
             Err(why) => (i, "not-judged".into(), why.clone(), BTreeSet::new()),
@@ -881,10 +884,11 @@ impl Case {
         judged.collect()
     }
 
-    /// The class of the store's answer `a`, given its candidate rows and what `reasoner`
-    /// entails; what each side gave; and the answer's keys.
+    /// The class of the store's answer `a` (`inferred`: to the inferred read), given its
+    /// candidate rows and what `reasoner` entails; what each side gave; and the answer's keys.
     fn judge(
         a: &Answer,
+        inferred: bool,
         rows: &Rows,
         entailed: &BTreeMap<String, bool>,
         reasoner: &str,
@@ -894,9 +898,10 @@ impl Case {
             .iter()
             .filter(|(_, p, n)| all(p) && (n.is_empty() || !all(n)));
         let expected: BTreeSet<&Vec<String>> = holds.map(|(t, _, _)| t).collect();
-        // A row no question asks (a blank node, another literal, an inferred statement that
-        // isn't an OWL axiom over the case's names) is counted unchecked; every other is judged.
-        let asks = |r: &&Vec<String>| rows.iter().any(|(t, _, _)| t == *r);
+        // Unchecked: a row no question can ask (a blank node, another literal, an inferred
+        // statement no OWL axiom over the case's names). Any other is judged, filtered out or not.
+        let named = |r: &&Vec<String>| !inferred && r.iter().all(|x| !x.starts_with('?'));
+        let asks = |r: &&Vec<String>| named(r) || rows.iter().any(|(t, _, _)| t == *r);
         let (asked, unchecked): (Vec<_>, Vec<_>) = a.rows.iter().partition(asks);
         let wrong: Vec<_> = asked.iter().filter(|r| !expected.contains(*r)).collect();
         let missing: Vec<_> = expected.iter().filter(|r| !a.rows.contains(**r)).collect();
@@ -914,8 +919,11 @@ impl Case {
         detail += &format!(" {expected:?}");
         detail += &format!("; wrong {wrong:?}; missing {missing:?}");
         detail += &format!("; unchecked {}", unchecked.len());
+        // A missing row is a counterexample only under a label that promises every row.
+        let promised = a.label == "complete" || a.label == "none";
+        let missed = missing.iter().filter(|_| promised);
         let keys = wrong.iter().map(|r| format!("wrong {r:?}"));
-        let keys = keys.chain(missing.iter().map(|r| format!("missing {r:?}")));
+        let keys = keys.chain(missed.map(|r| format!("missing {r:?}")));
         let keys = keys.chain([format!("{expected:?}")]).collect();
         (class.into(), detail, keys)
     }
@@ -1094,8 +1102,9 @@ fn planted_answers_are_judged_by_kind_and_label() {
         if ($i != "") printf "0"; print ""; fflush() }'"#;
     let mut nothing = Reference::new(command.to_owned(), Duration::from_secs(10));
     let (mut case, none) = (generate(0), BTreeSet::new());
-    let (t, mut r) = (case.queries.len(), Rng::new(0)); // a type query over a0..a3
+    let (t, mut r) = (case.queries.len(), Rng::new(0)); // type and same, over a0..a3
     case.queries.push(query("type", "T f:C0 x", &mut r));
+    case.queries.push(query("same", "S x y", &mut r));
     let mut verdict = |picked: &[usize], got: &Answers| {
         let v = case.verdicts(&none, picked, got, &mut nothing, "hermit");
         v[0].1.clone()
@@ -1114,13 +1123,20 @@ fn planted_answers_are_judged_by_kind_and_label() {
     for label in ["sound-only", "complete", "not-certified"] {
         assert_eq!(verdict(&inferred, &read(label)), "wrong", "{label}");
     }
+    let a = |i: u64| n("a", i);
+    let mut served = |q: usize, rows: BTreeSet<Vec<String>>| {
+        let (label, paths) = ("complete".to_owned(), String::new());
+        let got = Ok((vec![Ok(Answer { label, paths, rows })], String::new()));
+        let mut v = case.verdicts(&none, &[q], &got, &mut nothing, "hermit");
+        v.remove(0)
+    };
     // A wrong named row beside a blank node: the one judged, the other counted unchecked.
-    let (a, label, paths) = (|i: u64| n("a", i), "complete".to_owned(), String::new());
-    let rows = BTreeSet::from([vec![a(1)], vec!["?_:b0".to_owned()]]);
-    let got: Answers = Ok((vec![Ok(Answer { label, paths, rows })], String::new()));
-    let v = case.verdicts(&none, &[t], &got, &mut nothing, "hermit");
-    assert_eq!(v[0].1, "wrong", "{v:?}");
-    assert!(v[0].2.ends_with("unchecked 1"), "{v:?}");
+    let v = served(t, BTreeSet::from([vec![a(1)], vec!["?_:b0".to_owned()]]));
+    assert_eq!(v.1, "wrong", "{v:?}");
+    assert!(v.2.ends_with("unchecked 1"), "{v:?}");
+    // A row the query's filter rules out, `?v0 != ?v1`, is wrong, not unchecked.
+    let v = served(t + 1, BTreeSet::from([vec![a(0), a(0)]]));
+    assert_eq!(v.1, "wrong", "{v:?}");
     let plain: BTreeSet<usize> = (1..case.groups.len()).collect();
     let mut undecided = |why: &str| {
         let got = Err(("Undecided".to_owned(), why.to_owned(), String::new()));
@@ -1147,16 +1163,18 @@ fn planted_answers_are_judged_by_kind_and_label() {
         let answer = Answer { label, paths, rows };
         let rows = case.rows(t, &answer, &(0..4).map(a).collect());
         let e = rows.iter().map(|r| (r.1[0].clone(), yes.contains(&r.0[0])));
-        let (class, detail, keys) = Case::judge(&answer, &rows, &e.collect(), "hermit");
+        let (class, detail, keys) = Case::judge(&answer, false, &rows, &e.collect(), "hermit");
         (0, class, detail, keys)
     };
     assert_eq!(judge(&[], &[a(0)]).1, "missing");
-    // Two references fail an answer alike only on a row in common.
+    // Two references fail an answer together only on a row in common, whatever their classes.
     let missed = |yes: &[String]| judge(&[a(0)], yes);
     let (one, two) = (missed(&[a(0), a(1)]), missed(&[a(0), a(2)]));
     assert_eq!(outcome(&one, Some(&two), None), "set-aside");
     let three = missed(&[a(0), a(1), a(2)]);
     assert_eq!(outcome(&one, Some(&three), None), "FAIL");
+    let wrong = judge(&[a(0)], &[a(1)]); // wrong a0, missing a1, as `one` misses it
+    assert_eq!(outcome(&wrong, Some(&one), None), "FAIL");
     let unjudged = (0, "not-judged".to_owned(), String::new(), BTreeSet::new());
     assert_eq!(outcome(&unjudged, None, None), "not-judged");
 }
@@ -1194,17 +1212,19 @@ fn planted_writes_lost() {
     assert_eq!(verdict(lost), "missing");
 }
 
-/// A long chain's clash the store accepted (planted: a `complete` answer over the chain of
-/// 260 properties and a negative assertion it contradicts) is a wrong acceptance.
+/// A long chain's clash the store accepted (planted: a `complete` or unlabelled answer over the
+/// chain of 260 properties and a negative assertion it contradicts) is a wrong acceptance.
 #[test]
 #[ignore = "needs the DL kit's reference reasoners: benches/reasoning/dl/outside.sh"]
 fn planted_long_chain_clash_accepted() {
     let clash = "f:p3 a owl:ObjectProperty . [] a owl:NegativePropertyAssertion ; \
         owl:sourceIndividual f:a0 ; owl:assertionProperty f:p3 ; owl:targetIndividual f:a1 .";
-    let (label, paths, rows) = ("complete".to_owned(), String::new(), BTreeSet::new());
     let state = format!("{} {clash}", long_chain(260));
-    let accepted = Ok((vec![Ok(Answer { label, paths, rows })], state));
     let (case, none) = (generate(0), BTreeSet::new());
-    let v = case.verdicts(&none, &[0], &accepted, &mut references(), "hermit");
-    assert_eq!(v[0].1, "wrong-acceptance", "{v:?}");
+    for label in ["complete", "none"] {
+        let (label, paths, rows) = (label.to_owned(), String::new(), BTreeSet::new());
+        let accepted = Ok((vec![Ok(Answer { label, paths, rows })], state.clone()));
+        let v = case.verdicts(&none, &[0], &accepted, &mut references(), "hermit");
+        assert_eq!(v[0].1, "wrong-acceptance", "{v:?}");
+    }
 }

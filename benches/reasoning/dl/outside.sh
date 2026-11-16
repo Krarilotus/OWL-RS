@@ -16,7 +16,7 @@ BIN=$(cargo test --locked --release -p nrese-store --test it --no-run --message-
 [ -x "$BIN" ] || { echo "no test binary" >&2; exit 4; }
 echo "test $(sha256sum "$BIN")" >> "$OUT/identity.txt"
 export NRESE_DL_OUT="$OUT" NRESE_DL_REFERENCE="exec docker run --rm -i --init \
-  --memory ${DL_OUTSIDE_MEMORY:-2g} --label ${DL_OUTSIDE_LABEL:-dl-outside=1} --entrypoint java \
+  --memory ${DL_OUTSIDE_MEMORY:-2g} --label ${DL_OUTSIDE_LABEL:-fleet.job=${FLEET_JOB:-none}} --entrypoint java \
   $TAG -Xmx1500m -cp /opt/dl-runner.jar nrese.dl.Entail 30"
 # First the check against its planted faults, the stand-in's and the references': one it
 # misses, or a planted test that didn't run, stops the run.
