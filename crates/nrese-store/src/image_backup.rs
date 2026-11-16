@@ -120,7 +120,8 @@ impl ImageManifest {
         match nrese_engine::image_revision(&self.file) {
             Some(_) => Ok(&self.file),
             None => Err(StoreError::Configuration(format!(
-                "the manifest names the image {:?}, not a checkpoint file name                  (checkpoint-<revision>.nck)",
+                "the manifest names the image {:?}, not a checkpoint file name \
+                 (checkpoint-<revision>.nck)",
                 self.file
             ))),
         }
