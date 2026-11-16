@@ -54,7 +54,8 @@ content-type: application/problem+json
 ```
 
 Its `detail` names `ex:felix` as the focus node and the `sh:minCount` constraint it fails. Three
-more headers are left out here, and the body, which comes as one line, is broken to fit the page.
+more headers are left out here, and the body, which comes as one line, is broken between its
+fields; the `detail` line is left whole.
 
 Nothing of the rejected commit remains, so the query still answers no rows. With a name, the
 commit passes:
@@ -67,16 +68,28 @@ curl http://localhost:8080/dataset/update --data-urlencode 'update=
 
 The query now answers `ex:felix`. [What a commit does](what-it-covers.md#what-a-commit-does)
 explains when each part of a commit becomes visible and what the checks see. The shape stays in
-the store, so to run the example again, [start over](#change-a-setting-start-over) first.
+the store, so to run the example again, [start over](#start-over) first.
+
+## Start over
+
+To begin again with an empty store, remove the container and its volume, and start the server
+as the quick start does:
+
+```bash
+docker rm -f nrese && docker volume rm nrese-data
+docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
+  -e NRESE_REASONING_MODE=owl2-dl -e NRESE_SHACL_GATE=enforce nrese
+until curl -sf http://localhost:8080/readyz; do sleep 1; done
+```
 
 ## Your own data
 
 Next, load your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
 server. The upload replaces the [default graph](glossary.md#graph) with your file, so the
-example's statements go. The SHACL gate checks an upload as it checks an update, and the shape
-stays in its own graph: if your file says something is an `ex:Animal` and gives it no `ex:name`,
-the upload is refused with a `400` that names it, and nothing of the file is stored. To load
-into an empty store, [start over](#change-a-setting-start-over) first.
+example's statements go. The SHACL gate checks an upload as it checks an update, and unless you
+started over, the example's shape is still there, in its own graph: if your file says something
+is an `ex:Animal` and gives it no `ex:name`, the upload is refused with a `400` that names it,
+and nothing of the file is stored.
 
 ```bash
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
@@ -122,7 +135,7 @@ curl http://localhost:8080/dataset/query --data-urlencode 'query=
   ORDER BY ?name'
 ```
 
-## Change a setting, start over
+## Change a setting
 
 Settings come from environment variables (or a file) when the server starts
 ([every setting](ops/config-reference.md)). To change one, recreate the container
@@ -153,9 +166,6 @@ curl -X PATCH -H 'Content-Type: application/json' --data '{"reasoning":"rdfs"}' 
 in the data directory, so it holds after a restart and wins over `NRESE_REASONING_MODE`.
 `{"reasoning":null}` goes back to the configured mode
 ([repositories](ops/http-api.md#engine-api-apiv1)).
-
-To start over with no data, run `docker rm -f nrese && docker volume rm nrese-data`, then
-`docker run` as in the [quick start](../README.md#quick-start).
 
 ## This example is a test
 
