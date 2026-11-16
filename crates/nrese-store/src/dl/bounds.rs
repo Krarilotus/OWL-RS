@@ -358,7 +358,7 @@ pub(crate) enum Prepared {
 /// consistency.
 pub(crate) struct Preparation {
     base: u64,
-    prepared: Prepared,
+    pub prepared: Prepared,
     /// U1 after the commit proves the data consistent (or, on the RL route, the RL
     /// rules do: [`Preparation::decided_by`]).
     pub proves_consistency: bool,

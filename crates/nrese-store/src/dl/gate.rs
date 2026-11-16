@@ -172,8 +172,7 @@ fn assertion_change(store: &StoreService, tx: &Transaction<'_>) -> Option<HashSe
     }
     let mut touched = HashSet::new();
     for quad in tx.deleted() {
-        let triple = super::bounds::quad_triple(quad);
-        if super::bounds::changes_schema(tx, triple) || super::bounds::may_retype(tx, triple) {
+        if super::bounds::changes_schema(tx, super::bounds::quad_triple(quad)) {
             return None;
         }
     }
@@ -201,7 +200,10 @@ fn check_with_budget(
     deadline: Deadline,
 ) -> Gate {
     let started = Instant::now();
-    let change = assertion_change(store, tx);
+    // Only where U1's delta found every property's kind kept is the schema the reading gives
+    // as it was, which both of `assertion_change`'s uses assume.
+    let delta = matches!(preparation.prepared, super::bounds::Prepared::Delta(_));
+    let change = delta.then(|| assertion_change(store, tx)).flatten();
     if change.as_ref().is_some_and(HashSet::is_empty) {
         return Gate {
             checked: Checked {
