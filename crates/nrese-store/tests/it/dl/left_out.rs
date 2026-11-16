@@ -282,7 +282,9 @@ fn without_the_consistency_check_a_left_out_axiom_is_still_told() {
 
 /// What a commit makes or ends is what the next read is told: each sequence read after
 /// every commit, expected `complete` before the axiom the reader leaves out, `unsound`
-/// with its reason while it is there, and `complete` again once it is gone. The changes
+/// with its reason while it is there (also after a commit of a plain assertion beside it,
+/// off the rules route a delta of U1, which then may not prove the store consistent), and
+/// `complete` again once it is gone. The changes
 /// are a reserved name first used, a list's last `rdf:rest` deleted, a restriction's filler
 /// deleted, an `owl:onProperty` added on an IRI, and a reserved name as an assertion's value
 /// (off the rules route an assertion over U1's kinds, which U1 takes as a delta), each
@@ -330,6 +332,7 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
             "ASK { :x a :C }",
         ),
     ];
+    let assertion = "INSERT DATA { :w a :D . }".to_owned();
     let mut wrong = Vec::new();
     for ((name, data, change, undo, read), extra) in sequences
         .iter()
@@ -340,6 +343,7 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
         for (step, update_text, left_out) in [
             ("before", None, false),
             ("changed", Some(change), true),
+            ("an assertion beside it", Some(&assertion), true),
             ("undone", Some(undo), false),
         ] {
             if let Some(text) = update_text {
