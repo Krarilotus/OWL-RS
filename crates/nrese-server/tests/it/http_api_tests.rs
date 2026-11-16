@@ -578,6 +578,66 @@ async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
     Ok(())
 }
 
+/// Under `owl2-dl`, a write whose rules clash OWL 2 DL may read as consistent (an
+/// annotation property's domain, disjoint with its subject's class) is refused as
+/// undecided, and a program tells it from an inconsistency by the problem's type and title,
+/// not by its sentence.
+#[tokio::test]
+async fn an_undecided_refusal_and_an_inconsistency_differ_in_their_problem_type()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    let ex = "http://example.com/";
+    let owl = "http://www.w3.org/2002/07/owl#";
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+    let undecided = format!(
+        "INSERT DATA {{ <{ex}note> a <{owl}AnnotationProperty> ; <{rdfs}domain> <{ex}C> .
+            <{ex}C> <{owl}disjointWith> <{ex}D> . <{ex}x> a <{ex}D> ; <{ex}note> \"v\" }}"
+    );
+    let inconsistent = format!(
+        "INSERT DATA {{ <{ex}A> <{owl}disjointWith> <{ex}B> . <{ex}y> a <{ex}A> , <{ex}B> }}"
+    );
+    let mut seen = Vec::new();
+    for write in [undecided, inconsistent] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dataset/update")
+                    .method(Method::POST)
+                    .header("content-type", "application/sparql-update")
+                    .body(Body::from(write))?,
+            )
+            .await?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let problem: serde_json::Value = serde_json::from_slice(&body)?;
+        eprintln!("{status} {} {}", problem["type"], problem["title"]);
+        seen.push((status, problem["type"].clone(), problem["title"].clone()));
+    }
+    let expected = [
+        (
+            "https://nrese.dev/problems/undecided-reject",
+            "Undecided Reject",
+        ),
+        (
+            "https://nrese.dev/problems/reasoner-reject",
+            "Reasoner Reject",
+        ),
+    ];
+    for ((status, kind, title), (want_kind, want_title)) in seen.iter().zip(expected) {
+        assert_eq!(*status, StatusCode::BAD_REQUEST, "{seen:?}");
+        assert_eq!(
+            (kind.as_str(), title.as_str()),
+            (Some(want_kind), Some(want_title)),
+            "{seen:?}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn graph_store_head_returns_content_type() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;
@@ -754,5 +814,58 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
+    Ok(())
+}
+
+/// Under owl2-rl, `:a` is `:Aged` through an existential on `:age`, undeclared and with a
+/// literal (OWL 2 Direct Semantics, DataSomeValuesFrom), but the rules lack dt-type2 for
+/// it: the header of the closure's `false` never says complete, with the rewriting on or
+/// not.
+#[tokio::test]
+async fn an_undeclared_data_existentials_answer_is_never_complete_in_its_header()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nrese_store::{QlRewritingMode, StoreConfig};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("aged.ttl");
+    std::fs::write(
+        &path,
+        "@prefix : <http://example.com/> . \
+         @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . \
+         :Aged a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom xsd:integer ] \
+           rdfs:subClassOf :Aged . \
+         :a :age 5 .",
+    )?;
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let app = crate::support::test_app_with_store_config(
+            StoreConfig {
+                ql_rewriting: ql,
+                ..StoreConfig::in_memory().with_ontology(path.clone())
+            },
+            PolicyConfig::default(),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        let request = Request::builder()
+            .uri("/dataset/query")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/sparql-results+json")
+            .body(Body::from(
+                "ASK { <http://example.com/a> a <http://example.com/Aged> }",
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response.headers()["nrese-completeness"]
+            .to_str()?
+            .to_owned();
+        let body = crate::support::body_text(response).await?;
+        eprintln!("rewriting {ql:?}: {body} with {header}");
+        assert!(
+            body.contains("false") && !header.starts_with("complete"),
+            "rewriting {ql:?}: {body} with {header}"
+        );
+    }
     Ok(())
 }

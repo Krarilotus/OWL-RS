@@ -100,11 +100,15 @@ impl StoreService {
         }
         #[cfg(test)]
         crate::service::hooks::run(&crate::service::hooks::AFTER_CERTIFIED);
-        if matches!(
-            self.consistency(),
-            crate::ConsistencyStatus::Inconsistent { .. }
-        ) {
-            return Ok(Entailment::InconsistentPremise);
+        match self.consistency() {
+            crate::ConsistencyStatus::Inconsistent { .. } => {
+                return Ok(Entailment::InconsistentPremise);
+            }
+            // Not known to entail everything: no answer.
+            crate::ConsistencyStatus::Undecided { violations, why } => {
+                return Err(StoreError::Undecided(why.text(violations)));
+            }
+            _ => {}
         }
         let split = split(conclusion);
         if !split.positive.is_empty() && !self.ask(&split.positive)? {
