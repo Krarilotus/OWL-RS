@@ -782,6 +782,17 @@ fn object_existential(classes: &str) -> String {
     )
 }
 
+/// What the four places (run, rewriting, plan, plan's rewriting) call an answer: `complete`
+/// everywhere with the rewriting on, or `sound-only`; the rewriting's reports are there with
+/// it on only.
+fn matrix(complete: bool, ql: QlRewritingMode) -> [&'static str; 4] {
+    match ql {
+        QlRewritingMode::On if complete => ["complete"; 4],
+        QlRewritingMode::On => ["sound-only"; 4],
+        _ => ["sound-only", "none", "sound-only", "none"],
+    }
+}
+
 /// An undeclared property's existential, read by its filler alone (the rewriting's schema
 /// reads no assertions). The rows are OWL 2 RL's data ranges (Profiles §4.2.4, grammar in
 /// §6.3: `DataRange := Datatype | DataIntersectionOf`): a datatype of RL (§4.2.1;
@@ -852,18 +863,12 @@ fn owl2_rl_reads_an_undeclared_existential_by_its_filler() {
             ":B",
         ),
     ];
-    // What the four places call an answer: the rewriting's reports are there with it on.
-    let expected = |answer: &str, ql| match ql {
-        QlRewritingMode::On if answer == "true" => ["complete"; 4],
-        QlRewritingMode::On => ["sound-only"; 4],
-        _ => ["sound-only", "none", "sound-only", "none"],
-    };
     let mut wrong = Vec::new();
     let mut check = |name: String, data: &str, read: &str, answer: &str| {
         eprintln!("{name}:");
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
             let (text, line, statuses, _) = places(data, read, ql);
-            if !text.contains(answer) || statuses != expected(answer, ql) {
+            if !text.contains(answer) || statuses != matrix(answer == "true", ql) {
                 wrong.push(format!("{name}: {line}"));
             }
         }
@@ -913,6 +918,15 @@ struct Fillers {
 }
 
 impl Fillers {
+    /// A fresh generator from [`SEED`].
+    fn new() -> Self {
+        Self {
+            random: Rng(SEED),
+            definitions: Vec::new(),
+            shared: Vec::new(),
+        }
+    }
+
     /// The node of `po` (its predicates and objects), in place or shared.
     fn node(&mut self, po: String) -> String {
         if !self.random.chance(40) {
@@ -971,6 +985,25 @@ impl Fillers {
         self.node(po)
     }
 
+    /// A data range of RL (Profiles §4.2.4) that holds every `xsd:int`: `xsd:int` or a
+    /// datatype above it, or an intersection of such; typed `rdfs:Datatype` or not.
+    fn rl_data(&mut self, depth: usize) -> String {
+        if let Some(name) = self.again() {
+            return name;
+        }
+        let typed = if self.random.chance(30) {
+            "a rdfs:Datatype ; "
+        } else {
+            ""
+        };
+        if self.random.below(if depth == 0 { 1 } else { 2 }) == 0 {
+            return ["xsd:int", "xsd:integer", "xsd:decimal"][self.random.below(3)].to_owned();
+        }
+        let operands: Vec<String> = (0..2).map(|_| self.rl_data(depth - 1)).collect();
+        let operands = operands.join(" ");
+        self.node(format!("{typed}owl:intersectionOf ( {operands} )"))
+    }
+
     /// A class expression of depth at most `depth` that `:x`, in `:B`, `:C` and `:D`, is in:
     /// one of them, an intersection of such, or a union of such with or without a complement
     /// of a named class beside them; typed `owl:Class` or not.
@@ -1000,40 +1033,49 @@ impl Fillers {
     }
 }
 
-/// [`owl2_rl_reads_an_undeclared_existential_by_its_filler`] over 200 generated data ranges
-/// ([`Fillers::data`]: every constructor the reader classifies, nested to depth three, with
-/// shared nodes named again): each says the undeclared `:age` is a data property, so no
-/// place calls the answer complete, and with the rewriting on it reports. Whether 5 is in a
-/// range is the data's; how the filler was read is the status's. The mirror, 200 generated
-/// class expressions `:x` is in ([`Fillers::classes`]): object ones, the rules derive `:a a
-/// :Social`, and with the rewriting on every place calls it complete. A wrong case prints
-/// its data.
+/// [`owl2_rl_reads_an_undeclared_existential_by_its_filler`] over generated fillers, a wrong
+/// case named by its half and index:
+/// - 200 data ranges ([`Fillers::data`]: every constructor the reader classifies, nested to
+///   depth three, with shared nodes named again). Each says the undeclared `:age` is a data
+///   property: the places say what the table's data rows say, whatever the answer.
+/// - Most of those are outside RL, where a class reading is `sound-only` too. So 200 of RL's
+///   own ([`Fillers::rl_data`]), each holding the `xsd:int` 5 by its build: `:a a :Aged` is
+///   entailed, and the closure's `false` is the table's, `sound-only`.
+/// - The mirror, 200 class expressions `:x` is in ([`Fillers::classes`]): object ones, the
+///   rules derive `:a a :Social`, `complete` in every place with the rewriting on. With a
+///   complement in them it is `sound-only`: RL has no complement in a subclass expression
+///   (Profiles §4.2.3, `subClassExpression`).
 #[test]
 fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
-    let mut fillers = Fillers {
-        random: Rng(SEED),
-        definitions: Vec::new(),
-        shared: Vec::new(),
-    };
     let mut wrong = Vec::new();
-    for _ in 0..200 {
+    let mut check = |name: String, data: &str, read: &str, answer: &str, complete: bool| {
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, statuses, _) = places(data, read, ql);
+            if !text.contains(answer) || statuses != matrix(complete, ql) {
+                wrong.push(format!("{name}: {data} / {line}"));
+            }
+        }
+    };
+    let (aged, social) = ("ASK { :a a :Aged }", "ASK { :a a :Social }");
+    let mut fillers = Fillers::new();
+    for i in 0..200 {
         let range = fillers.data(3);
         let data = format!("{} {}", fillers.take(), data_existential(&range));
-        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-            let (_, line, statuses, reported) = places(&data, "ASK { :a a :Aged }", ql);
-            if statuses.contains(&"complete") || (ql == QlRewritingMode::On && !reported) {
-                wrong.push(format!("{data} / {line}"));
-            }
-        }
+        check(format!("data {i}"), &data, aged, "", false);
         let classes = fillers.classes(3);
         let control = format!("{} {}", fillers.take(), object_existential(&classes));
-        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-            let (text, line, statuses, _) = places(&control, "ASK { :a a :Social }", ql);
-            if !text.contains("true") || (ql == QlRewritingMode::On && statuses != ["complete"; 4])
-            {
-                wrong.push(format!("{control} / {line}"));
-            }
-        }
+        let complete = !control.contains("owl:complementOf");
+        check(format!("control {i}"), &control, social, "true", complete);
+    }
+    let mut fillers = Fillers::new();
+    for i in 0..200 {
+        let range = fillers.rl_data(3);
+        let data = format!(
+            "{} {} :a :age \"5\"^^xsd:int .",
+            fillers.take(),
+            data_existential(&range)
+        );
+        check(format!("rl {i}"), &data, aged, "false", false);
     }
     assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
 }
