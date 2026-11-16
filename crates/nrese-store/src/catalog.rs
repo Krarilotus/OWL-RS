@@ -1313,6 +1313,164 @@ mod tests {
         );
     }
 
+    /// `a sameAs b . a a Dog . Dog subClassOf Animal`.
+    const SAME_DOG: &str = "INSERT DATA { <http://example.com/a> <http://www.w3.org/2002/07/owl#sameAs> \
+                            <http://example.com/b> . <http://example.com/a> a <http://example.com/Dog> . \
+                            <http://example.com/Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+                            <http://example.com/Animal> }";
+    const ANIMALS: &str = "SELECT ?x WHERE { ?x a <http://example.com/Animal> } ORDER BY ?x";
+
+    /// A store in `dir` under `reasoner.equality = "compact"`.
+    fn compact_store(dir: &std::path::Path) -> crate::StoreService {
+        crate::StoreService::new(crate::StoreConfig {
+            equality_by_representatives: true,
+            equality_compact: true,
+            ..crate::StoreConfig::on_disk(dir)
+        })
+        .unwrap()
+    }
+
+    fn commit(pipeline: &crate::MutationPipeline, update: &str) {
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(update)),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .expect("acknowledged");
+    }
+
+    fn animals(store: &crate::StoreService) -> String {
+        String::from_utf8(store.execute_query_str(ANIMALS).unwrap().payload).unwrap()
+    }
+
+    /// A change of reasoning that fails before the new inferences are published leaves the
+    /// repository with its old reasoning, answering as that reasoning does: from RDFS to
+    /// RDFS-Plus over an `owl:sameAs`, a compact store's RDFS answers, not RDFS-Plus's. The
+    /// publication fails where the log's new segment is made durable (a fault point).
+    #[test]
+    fn a_failed_change_of_reasoning_answers_as_the_old_reasoning() {
+        use super::{Catalog, DEFAULT_REPOSITORY, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(
+            compact_store(dir.path()),
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap();
+        let reasoning = |mode: &str| RepositorySettings {
+            reasoning: Some(mode.to_owned()),
+            ..RepositorySettings::default()
+        };
+        catalog
+            .change(DEFAULT_REPOSITORY, reasoning("rdfs"))
+            .unwrap();
+        let repository = catalog.get(DEFAULT_REPOSITORY).unwrap();
+        let pipeline = std::sync::Arc::clone(&*repository.pipeline.read());
+        // A record in the log's segment: the publication starts a new one.
+        commit(&pipeline, SAME_DOG);
+        let store = std::sync::Arc::clone(pipeline.store());
+        drop(pipeline);
+        let rdfs = animals(&store);
+        nrese_engine::fault_points::fail_dir_sync_of(Some((
+            &dir.path().join("wal"),
+            std::io::ErrorKind::Other,
+        )));
+        let changed = catalog.change(DEFAULT_REPOSITORY, reasoning("rdfs-plus"));
+        nrese_engine::fault_points::fail_dir_sync_of(None);
+        let mode = repository.pipeline.read().reasoner().mode_name();
+        let got = animals(&store);
+        println!(
+            "CASE a catalog repository: the change {} | reasoning {mode} | certificate {:?} | RDFS {rdfs} | now {got}",
+            changed
+                .as_ref()
+                .map_or_else(|e| format!("refused ({e})"), |()| "made".to_owned()),
+            store.reasoning_state().map(|state| state.ruleset),
+        );
+        assert!(changed.is_err(), "the change wasn't refused");
+        assert_eq!(mode, "rdfs", "the old reasoning isn't the repository's");
+        assert_eq!(got, rdfs, "the old reasoning's answers");
+    }
+
+    /// The same failure in a store whose reasoning is configured, not changed (the server's
+    /// one repository: its start and its rematerialise route recompute under the configured
+    /// rules): it keeps its old inferences under the configured rules, uncertified, and
+    /// answers only what those rules entail. A compact store reasoned under RDFS, then
+    /// rematerialised under RDFS-Plus.
+    #[test]
+    fn a_failed_rematerialisation_answers_only_what_the_configured_rules_entail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(compact_store(&dir.path().join("store")));
+        let pipeline = |mode| {
+            crate::MutationPipeline::new(
+                std::sync::Arc::clone(&store),
+                std::sync::Arc::new(nrese_reasoner::ReasonerService::new(
+                    nrese_reasoner::ReasonerConfig::for_mode(mode),
+                )),
+            )
+        };
+        commit(&pipeline(nrese_reasoner::ReasoningMode::Rdfs), SAME_DOG);
+        let configured = pipeline(nrese_reasoner::ReasoningMode::RdfsPlus);
+        let program = configured
+            .reasoner()
+            .config()
+            .materialised_program()
+            .unwrap();
+        // What the configured rules entail, from a store of its own.
+        let want = {
+            let dir = tempfile::tempdir().unwrap();
+            let own = std::sync::Arc::new(compact_store(dir.path()));
+            commit(
+                &crate::MutationPipeline::new(
+                    std::sync::Arc::clone(&own),
+                    std::sync::Arc::clone(configured.reasoner()),
+                ),
+                SAME_DOG,
+            );
+            animals(&own)
+        };
+        nrese_engine::fault_points::fail_dir_sync_of(Some((
+            &dir.path().join("store").join("wal"),
+            std::io::ErrorKind::Other,
+        )));
+        let rematerialised = store.rematerialise(&program);
+        nrese_engine::fault_points::fail_dir_sync_of(None);
+        let got = animals(&store);
+        let rows = |json: &str| {
+            json.match_indices("\"value\":\"")
+                .map(|(at, _)| {
+                    json[at + 9..]
+                        .split('"')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let extra: Vec<String> = rows(&got)
+            .into_iter()
+            .filter(|row| !rows(&want).contains(row))
+            .collect();
+        println!(
+            "CASE a single repository: the rematerialisation {} | certificate {:?} | RDFS-Plus {want} | now {got}",
+            rematerialised
+                .as_ref()
+                .map_or_else(|e| format!("refused ({e})"), |_| "made".to_owned()),
+            store.reasoning_state().map(|state| state.ruleset),
+        );
+        assert!(
+            rematerialised.is_err(),
+            "the rematerialisation wasn't refused"
+        );
+        assert!(
+            store.reasoning_state().is_none(),
+            "a certificate after the failure"
+        );
+        assert!(
+            extra.is_empty(),
+            "answers the configured rules don't entail: {extra:?}"
+        );
+    }
+
     #[test]
     fn repository_ids() {
         assert!(valid("bench"));
