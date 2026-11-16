@@ -17,7 +17,7 @@ reason, beside its runner.
 | [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/), [Graph Store Protocol](https://www.w3.org/TR/sparql11-http-rdf-update/), [Service Description](https://www.w3.org/TR/sparql11-service-description/) | Served at `/dataset/…` ([HTTP interface](ops/http-api.md)) | Our own ([protocol](../crates/nrese-server/tests/it/query_protocol_tests.rs), [Graph Store](../crates/nrese-server/tests/it/graph_store_api_tests.rs)) |
 | Results as [JSON](https://www.w3.org/TR/sparql11-results-json/), [XML](https://www.w3.org/TR/rdf-sparql-XMLres/), [CSV and TSV](https://www.w3.org/TR/sparql11-results-csv-tsv/) | Written, and read but for CSV | The SPARQL suites read JSON, XML and TSV and check the CSV writer, and [round trips](../crates/rdf/nrese-sparql-results/tests/round_trip_tests.rs) check the others |
 | [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | Read and written, RDF 1.1 and the RDF 1.2 drafts | RDF 1.1 and 1.2 syntax suites, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdf) |
-| [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Read and written, remote contexts not fetched | `toRdf`, `expand`, `fromRdf`, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_jsonld) |
+| [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Read and written, [remote contexts not fetched](limits.md#rdf-syntaxes) | `toRdf`, `expand`, `fromRdf`, [runner](../crates/rdf/nrese-rdf-io/tests/w3c_jsonld) |
 | [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) | RDFC-1.0 | [runner](../crates/rdf/nrese-rdf-io/tests/w3c_rdfc) |
 | [SPARQL 1.2](https://www.w3.org/TR/sparql12-query/) and [RDF 1.2](https://www.w3.org/TR/rdf12-concepts/) drafts | Triple terms and directional strings | 269 W3C tests, no known failure |
 | [RDF Schema 1.1](https://www.w3.org/TR/rdf11-schema/) | Its entailment rules, with the [few left out](spec/reasoning-semantics.md#modes) listed | No W3C suite run |
@@ -46,7 +46,7 @@ reason, beside its runner.
 | Capability | Limits and notes |
 |---|---|
 | Read and write [N-Triples](https://www.w3.org/TR/n-triples/), [N-Quads](https://www.w3.org/TR/n-quads/), [Turtle](https://www.w3.org/TR/turtle/), [TriG](https://www.w3.org/TR/trig/), [RDF/XML](https://www.w3.org/TR/rdf-syntax-grammar/) | In the W3C suites, each document is also read one byte at a time and written back |
-| Read and write [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | Remote contexts aren't fetched: a library caller supplies a document loader. The W3C tests for JSON-LD 1.0 processors only, and for generalised RDF, are not run |
+| Read and write [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/) | The W3C tests for JSON-LD 1.0 processors only, and for generalised RDF, are not run |
 | Read [Notation3](https://w3c.github.io/N3/spec/) data, in the library | Only what RDF can hold; rules are read by the reasoner. Not offered over HTTP. W3C N3 group's parser tests, one known failure listed ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_n3)) |
 | RDF4J Binary RDF, versions 1 and 2 | Read in both versions, written as version 2; as a payload and a result format |
 | [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | |

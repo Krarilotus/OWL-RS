@@ -8,16 +8,12 @@ This page is the one list of `nrese-server`'s settings, in the version it comes 
 
 Every setting has a key in the configuration file and an environment variable (the tables below, and the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of these.
 
-1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command; secrets (tokens, keys, passwords) are refused there, since a command line shows in the process list
+1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command; secrets (tokens, keys, passwords) are refused there, since a command line shows in the process list; the server never prints them
 2. the environment variable
 3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
 4. the built-in default
 
-These also hold.
-
-- Environment variables always override values loaded from `config.toml`.
-- If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
-- To return a setting to its default, remove it from the command line, the environment and the file, then restart. A repository's own value (scope `repo` below) is removed with `PATCH /api/v1/repositories/{id}` and `null` ([HTTP API](http-api.md#engine-api-apiv1)).
+To return a setting to its default, remove it from the command line, the environment and the file, then restart. A repository's own value (scope `repo` below) is removed with `PATCH /api/v1/repositories/{id}` and `null` ([HTTP API](http-api.md#engine-api-apiv1)).
 - The reasoner's profile comes from `reasoner.mode` and `reasoner.rules` alone (there is no `preset` or feature-override input); the server resolves them into one runtime profile before diagnostics, capabilities and the console see it. The other `reasoner.*` settings below tune it.
 
 ### Types and scopes
@@ -269,7 +265,7 @@ These settings set up read replicas ([replication.md](replication.md)), and both
 |---|---|---|---|---|---|
 | <a id="replication.mode"></a>`replication.mode` | `NRESE_REPLICATION_MODE` | choice: `off`, `primary`, `replica` | `off` | start | `primary`: serve the log and an image to administrators. `replica`: start from the primary's image when the data directory holds no store, follow its log, take no writes, don't reason |
 | <a id="replication.primary"></a>`replication.primary` | `NRESE_REPLICATION_PRIMARY` | text: a base URL | none | start | A replica's primary (`https://primary.example:8080`) |
-| <a id="replication.token"></a>`replication.token` | `NRESE_REPLICATION_TOKEN` | text, secret | none | start | The bearer token a replica presents to its primary (an administrator's); never printed, refused by `--set` |
+| <a id="replication.token"></a>`replication.token` | `NRESE_REPLICATION_TOKEN` | text, secret | none | start | The bearer token a replica presents to its primary (an administrator's) |
 | <a id="replication.poll"></a>`replication.poll` | `NRESE_REPLICATION_POLL_MS` | duration | `500ms` | start | How long a replica waits before asking again once caught up |
 | <a id="replication.batch_bytes"></a>`replication.batch_bytes` | `NRESE_REPLICATION_BATCH_BYTES` | size | `8MiB` | start | About how much log a replica asks for at once |
 | <a id="replication.round_timeout"></a>`replication.round_timeout` | `NRESE_REPLICATION_ROUND_TIMEOUT_MS` | limit (duration) | `5min` | start | The longest one round of following the primary's log may take, its answer whole; `0` or `unlimited`: no total limit |
@@ -300,7 +296,7 @@ To give the server's request work 2 GiB, set `budgets.total_query_memory = "2GiB
 | <a id="budgets.query_memory"></a>`budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | size or share | `4GiB` | start | One query's memory envelope: its intermediate and retained results and, under `owl2-dl`, its DL work (the exact services' compilation scratch and engines). A query whose evaluation needs more is answered `413`; DL candidates past it are left unresolved, the status says so (`422` under `dl.answers = exact`). `0` = unlimited |
 | <a id="budgets.total_query_memory"></a>`budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | size or share | `50%` of the machine's memory | start | Every running request's envelope across the catalog: queries, updates (their WHERE evaluation and `owl2-dl` commit gate), DL entailment checks and explanations. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
 | <a id="budgets.process_memory"></a>`budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | size or share | `75%` of the machine's memory (the container's limit where there is one) | start | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. `0` = unlimited. An operation is admitted by this limit less what the process holds, not by what the system has free at that moment: a container shared with other large users is the operator's to size. A size above the memory the process may use counts as that memory, where it can be read. The default is refused at startup where the memory the process may use can't be read, Linux before 3.15 among them (its kernel doesn't show which mount a file was opened on): set this there. On cgroup v2 a limit set above the container's cgroup namespace (Docker's `--cgroup-parent`, a Kubernetes pod without a limit of its own under a node's cap) isn't visible to it: set this there. Likewise on Windows only the job object the server runs in directly is visible, not an enclosing one: when a launcher or service wrapper caps a parent job, set this there. Queries count toward it too: one that finds no room left in it gets `503`. A checkpoint's working memory doesn't count toward it ([limits](../limits.md#memory-and-stopping)). |
-| <a id="budgets.huge_pages"></a>`budgets.huge_pages` | `NRESE_HUGE_PAGES` | choice: `on`, `off`, `bulk` | `on` | process | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. `bulk`: on while a bulk load or a materialisation runs, off otherwise (serving): their speed with serving's memory. See [server-setup.md](server-setup.md) §12.1 |
+| <a id="budgets.huge_pages"></a>`budgets.huge_pages` | `NRESE_HUGE_PAGES` | choice: `on`, `off`, `bulk` | `on` | process | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation took 26 % longer without them), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. `bulk`: on while a bulk load or a materialisation runs, off otherwise (serving): their speed with serving's memory. See [memory over time](server-setup.md#memory-over-time) |
 | <a id="budgets.reasoning_release"></a>`budgets.reasoning_release` | `NRESE_REASONING_RELEASE` | choice: `off`, `on` | `off` | process | Whether a materialisation gives back between its rounds, after the last one and before the inferred stack what the last round freed. `on`: a lower and steadier peak, as the allocator keeps a freed large block about a round's time (host A, LUBM 100: 2,074 → 1,776 MiB, 5.6 % more reasoning time; OWL2Bench RL-1: −25 % for 6.6 %; a small RDFS materialisation: −28 % for 14 %). `off`: the fastest materialisation. For a memory budget near its limit, or for peaks that must compare between runs |
 | <a id="budgets.bulk_load_memory"></a>`budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | size or share | `25%` of the machine's memory | start | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
 | <a id="budgets.query_timeout"></a>`budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | duration | `30s` | repo (as `query_timeout_ms`, not the default repository) | A query, until its last result is sent (`408`) |
@@ -381,7 +377,7 @@ A fixed limit comes before every authenticated request: a body of known length u
 
 ## Auth modes
 
-All authentication settings are scope start. Secrets are never printed and are refused by `--set`.
+All authentication settings are scope start.
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
@@ -470,7 +466,7 @@ service = true          # may call other endpoints with SERVICE (default false)
 
 ## AI query suggestions
 
-All AI settings are scope start. Secrets are never printed and are refused by `--set`.
+All AI settings are scope start.
 
 | Key | Env | Type | Default | Meaning |
 |---|---|---|---|---|
