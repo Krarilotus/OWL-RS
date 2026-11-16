@@ -2800,6 +2800,22 @@ mod tests {
         }
     }
 
+    /// A sub-property of an annotation property is an annotation axiom whatever its subject
+    /// (the RDF mapping's Table 16, as the ontology reader reads it): it says nothing about
+    /// classes, and nothing is skipped for it, a blank subject's included.
+    #[test]
+    fn a_sub_property_of_an_annotation_property_names_no_class() {
+        for kind in ["AnnotationProperty", "OntologyProperty", "DatatypeProperty"] {
+            let (_, result) = run(&format!(
+                "ex:A rdf:type owl:Class
+                 ex:ap rdf:type owl:AnnotationProperty
+                 _:x rdf:type owl:{kind}
+                 _:x rdfs:subPropertyOf ex:ap"
+            ));
+            assert!(result.skipped.is_empty(), "{kind}: {:?}", result.skipped);
+        }
+    }
+
     /// A name declared `owl:DataRange` is a datatype, as one declared `rdfs:Datatype` is (the
     /// RDF mapping reads OWL 1's `owl:DataRange` as `rdfs:Datatype`): an equivalence between
     /// two of them is no class axiom, and is left out as a data range.
