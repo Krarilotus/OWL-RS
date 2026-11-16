@@ -2343,7 +2343,9 @@ pub(crate) mod hooks {
     pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
 
     thread_local! {
-        /// A bulk load has cleared the reasoning certificate and is about to load.
+        /// A bulk load holds the writer slot and is about to read its files.
+        pub(crate) static BEFORE_LOAD_READS: Hook = const { RefCell::new(None) };
+        /// A bulk load has cleared the reasoning certificate and is about to publish.
         pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
@@ -2456,7 +2458,8 @@ mod certificate_tests {
         (a, b)
     }
 
-    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its load.
+    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its
+    /// publication.
     /// Before the fix the load cleared the certificate before it took the writer slot: the
     /// rematerialisation then certified RDFS, and the load committed `C subClassOf D` under it.
     #[test]
