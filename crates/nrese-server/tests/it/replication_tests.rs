@@ -326,6 +326,93 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Under `owl2-rl`, a replica gives its primary's status, over the data of its image and of
+/// a commit after it. A read of the inferred statements is `sound-only` on the primary
+/// (the rules' closure, not every certain answer under OWL 2 DL), so the replica's answer
+/// may not say `complete`. Every read is checked; the wrong ones are listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_gives_its_primarys_status_under_owl2_rl()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rl = || ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let config = |dir: &std::path::Path| StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::Off,
+        ..StoreConfig::on_disk(dir)
+    };
+    let primary_dir = tempfile::tempdir()?;
+    let primary_state = AppState::new(
+        StoreService::new(config(primary_dir.path()))?,
+        rl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(ReplicationConfig {
+        mode: ReplicationMode::Primary,
+        ..ReplicationConfig::default()
+    });
+    primary_state.mark_ready();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let primary_app = build_app(primary_state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, primary_app).await.expect("primary");
+    });
+    update(
+        &base,
+        "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog }",
+    )
+    .await;
+
+    let replica_dir = tempfile::tempdir()?;
+    let replication = ReplicationConfig {
+        mode: ReplicationMode::Replica,
+        primary: Some(base.clone()),
+        poll: std::time::Duration::from_millis(20),
+        ..ReplicationConfig::default()
+    };
+    replication::bootstrap(&replication, replica_dir.path()).await?;
+    let replica_state = AppState::new(
+        StoreService::new(config(replica_dir.path()))?,
+        rl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(replication);
+    replica_state.mark_ready();
+    update(&base, "INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal }").await;
+    catch_up(&base, &replica_state).await;
+    let (replica_app, primary_app) = (
+        build_app(replica_state.clone()),
+        build_app(primary_state.clone()),
+    );
+    let inferred = format!("{PREFIXES}ASK {{ ex:rex a ex:Animal }}");
+    let (_, status) = answered(primary_app.clone(), &inferred).await?;
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("sound-only; regime=owl2-rl")),
+        "the primary's status of an inferred read: {status:?}"
+    );
+    let mut wrong = Vec::new();
+    for query in [
+        "ASK { ex:Dog ?p ex:Animal }",
+        "ASK { ex:Dog rdfs:subClassOf ex:Animal }",
+        "ASK { ex:rex a ex:Animal }",
+    ] {
+        let query = format!("{PREFIXES}{query}");
+        let want = answered(primary_app.clone(), &query).await?;
+        let got = answered(replica_app.clone(), &query).await?;
+        if got != want {
+            wrong.push(format!(
+                "{query}: the primary {want:?}, the replica {got:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
 /// A replica's data directory, made by its bootstrap, is durably named (sol-loop round 3 on
 /// DUR-3 review r1, S1): into `sealed/a`, where `sealed` exists but can't be opened (mode
 /// 0o311), so its sync, which must name `a`, fails, the bootstrap must refuse. Before the fix it
