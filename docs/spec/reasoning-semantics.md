@@ -7,7 +7,6 @@ entailment), the [OWL 2 Profiles](https://www.w3.org/TR/owl2-profiles/) (OWL 2 Q
 with its RDF rules), the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) and
 [RDF-Based Semantics](https://www.w3.org/TR/owl2-rdf-based-semantics/), and, for what a query
 answers under them, [SPARQL 1.1 Entailment Regimes](https://www.w3.org/TR/sparql11-entailment/).
-This page says where NRESE follows them and where it stops.
 
 ## Modes
 

@@ -45,8 +45,8 @@ revision and the statement count ([HTTP interface](http-api.md#engine-api-apiv1)
 `POST /api/v1/repositories/{id}/restore` replaces the repository's statements with the export's,
 as one commit, and derives the inferences again. It checks the checksum first and answers `400`,
 changing nothing, when it doesn't match. Like any write, it passes the target's checks, so a
-target that reasons or validates may refuse it with `400`, changing nothing. Over HTTP an export of at most about 384 MiB restores
-(3 × `budgets.upload_size` + 64 KiB, held whole while it is parsed). A larger one restores offline
+target that reasons or validates may refuse it with `400`, changing nothing. Over HTTP an export of at most about 384 MiB by default restores, held whole while it is
+parsed (the server's body limit: [`budgets.upload_size`](config-reference.md#budgets.upload_size)). A larger one restores offline
 with `nrese-server load --replace export.nq`, which doesn't check the checksum, so check it
 first, as in the drill's first step.
 
@@ -118,7 +118,7 @@ From an image (`backups/<seconds>/` of the data directory, or a copy elsewhere):
 
 ## A complete drill
 
-A drill proves that a backup restores. This one is small enough to run against the
+This drill is small enough to run against the
 [quick start](../../README.md#quick-start)'s server on port 8080. It restores that server's
 export into a second, empty server on port 8081 and compares the two. The commands are for Linux
 (GNU `head`).

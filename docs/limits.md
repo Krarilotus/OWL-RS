@@ -1,7 +1,7 @@
 # Limits and deviations
 
 Where NRESE stops, and where it departs from a standard on purpose, in the commit these pages
-come with. Where there is something to do instead, the item says so. What is in is on
+come with. What is in is on
 [features and standards](what-it-covers.md).
 
 ## Choose another system when

@@ -9,8 +9,7 @@ Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
 NRESE is an RDF database with reasoning built in, run as one server that uses every core of its
 machine. What it does is in [features and standards](what-it-covers.md), and the
 [README's picture](../README.md#how-it-fits-together) shows the parts a write and a query pass
-through. This page is for changing it: who owns what, which way dependencies point, and where a
-problem is fixed.
+through.
 
 Correctness and speed are measured with the harness in `benches/nrese-bench-harness` and the
 benchmark kits in [`benches/`](../benches/README.md).
