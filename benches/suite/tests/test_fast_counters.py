@@ -156,7 +156,7 @@ class FastComparison(unittest.TestCase):
         self.assertEqual(fast.case_manifest([case])["cache_modes"], {"cache": ["warm", "cold"]})
 
     def test_a_shacl_case_counts_its_report_s_values_and_paths(self):
-        """SHACL lead, 8 Nov 2026 (shacl-lubm-computed): the specified answer has 40,944 sh:value and
+        """The specified answer has 40,944 sh:value and
         20,472 sh:resultPath (SHACL 1.0 §5.3.2), which perf_lab doesn't count; its --shacl-report
         writes the report as N-Triples. A case with --shapes asks for it, counts them as
         shacl.values and shacl.paths, so a check can pin them, and leaves no report behind."""
@@ -476,13 +476,13 @@ class FastComparison(unittest.TestCase):
 
     def test_runs_across_a_host_configuration_change_are_refused_unless_flagged(self):
         # A host registry of the test's own: hosts.toml's epochs are operational records.
-        registry = {"host": {"phuoc-yu": {"hostname": "Phuoc-Yu", "config": [{"since": "2026-10-09"},
+        registry = {"host": {"timed-a": {"hostname": "Timed-A", "config": [{"since": "2026-10-09"},
                                                                              {"since": "2026-10-12T13:00"}]}}}
         self.enterContext(patch.object(fast.hosts, "load", return_value=registry))
 
         def on(started, governor=None):
             data = report(1)
-            data["machine"] = {"host": "Phuoc-Yu", **({"governor": governor} if governor else {})}
+            data["machine"] = {"host": "Timed-A", **({"governor": governor} if governor else {})}
             data["started"] = started
             return data
         before, after = on("2026-10-12T10:51:30"), on("2026-10-12T14:00:00")
@@ -588,7 +588,7 @@ class FastPageCache(unittest.TestCase):
 
 class AbBase(unittest.TestCase):
     """An A/B's base side: off its case's route is a measured run there (`--off-route-ok`),
-    a failed run never is (sparql-memory-ab-phuoc-2: every base pass failed in 0.0 s, the
+    a failed run never is (a SPARQL memory A/B: every base pass failed in 0.0 s, the
     job finished done)."""
 
     def test_off_route_is_measured_on_the_base_only(self):

@@ -3,7 +3,7 @@
 k = 10, one kind in ten) through a perf_lab binary in variants, each variant's recall@10
 against its truth and its time: the filtered search (the case), the same with a wider beam
 and exact, and the unfiltered search as the graph's own recall. For a host without Docker,
-where fast.py doesn't run (Phuoc-Yu).
+where fast.py doesn't run (the timed host).
 
     knn_filtered.py PERF_LAB DATA.nt EXPECT.json OUT [--runs 20] [perf_lab args...]
 

@@ -15,7 +15,7 @@ spec = importlib.util.spec_from_file_location(
 fast = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fast)
 
-# rl-lubm100 in the 11 Oct 2026 A/B on office-pc (157931a and a57e11c): the container's peak,
+# rl-lubm100 in the 11 Oct 2026 A/B on the shared host (157931a and a57e11c): the container's peak,
 # and the perf lab's peak (the last phase's) and phase peaks. The container's held what the
 # host had not cached of the 2.3 GB input; the process's peak is the reasoning phase's.
 AB = [(4700, 1332, {"load": 1789, "reason": 2023, "queries": 1332}),
