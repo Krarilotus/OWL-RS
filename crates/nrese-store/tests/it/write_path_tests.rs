@@ -257,6 +257,7 @@ fn no_public_method_commits_outside_the_pipeline() {
         // Unit tests.
         "nrese-store/src/dl/classification.rs",
         "nrese-store/src/dl/bounds_memory_tests.rs",
+        "nrese-store/src/dl/lower_tests.rs",
         // Data no pipeline commit wrote: U1's first build is a read's (its lock tests).
         "nrese-store/src/dl/bounds_lock_tests.rs",
         // ... and its cold build beside the query-ontology cache (N1).
