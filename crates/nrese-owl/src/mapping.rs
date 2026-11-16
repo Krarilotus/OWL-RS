@@ -776,15 +776,16 @@ impl<'a> Reader<'a> {
         let Some(filler) = filler.or_else(|| first(self, self.v.owl_all_values_from)) else {
             return false;
         };
-        self.is_data_range(filler, &mut HashSet::new())
+        self.is_data_range(filler, &mut HashMap::new())
     }
 
     /// Whether `term` is a data range by its own statements: a datatype (declared, or of
     /// OWL 2's datatype map, whose names no class may take), or a blank node typed
     /// `rdfs:Datatype` (`owl:DataRange` in OWL 1), restricting a datatype, a datatype's
     /// complement, an enumeration of literals, or an intersection or union of data ranges.
-    /// A mix with classes, an empty list or a cycle (`seen`) is no evidence: read as before.
-    fn is_data_range(&mut self, term: Term, seen: &mut HashSet<Term>) -> bool {
+    /// A mix with classes, an empty list or a cycle is no evidence: read as before. `seen`
+    /// holds each operator node's answer, `false` while on the path (a shared one is read once).
+    fn is_data_range(&mut self, term: Term, seen: &mut HashMap<Term, bool>) -> bool {
         let v = self.v;
         match self.kind(term) {
             TermKind::Iri => {
@@ -793,7 +794,7 @@ impl<'a> Reader<'a> {
                         .iter()
                         .any(|&iri| self.terms.iri(iri) == Some(term))
             }
-            TermKind::Blank if seen.insert(term) => {
+            TermKind::Blank => {
                 let first = |reader: &Self, p| reader.objects(term, p).first().copied();
                 if self.has_type(term, v.rdfs_datatype)
                     || self.has_type(term, v.owl_data_range)
@@ -807,12 +808,19 @@ impl<'a> Reader<'a> {
                     return !members.is_empty()
                         && members.iter().all(|&m| self.kind(m) == TermKind::Literal);
                 }
+                if let Some(&data) = seen.get(&term) {
+                    return data;
+                }
+                seen.insert(term, false);
                 let operands =
                     first(self, v.owl_intersection_of).or_else(|| first(self, v.owl_union_of));
                 let members = operands
                     .and_then(|list| self.list(list))
                     .unwrap_or_default();
-                !members.is_empty() && members.iter().all(|&m| self.is_data_range(m, seen))
+                let data =
+                    !members.is_empty() && members.iter().all(|&m| self.is_data_range(m, seen));
+                seen.insert(term, data);
+                data
             }
             _ => false,
         }
