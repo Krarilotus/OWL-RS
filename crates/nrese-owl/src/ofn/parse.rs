@@ -448,6 +448,9 @@ impl<'t, 'm> Parser<'t, 'm> {
                 let r = if self.at_close() {
                     self.r(DataRange::Literal)
                 } else {
+                    if keyword == "DataMaxCardinality" {
+                        self.model.qualified_data_max.get_or_insert(p);
+                    }
                     self.range()?
                 };
                 match keyword {

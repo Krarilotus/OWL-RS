@@ -29,7 +29,7 @@ fn rules(text: &str) -> Arc<UserRules> {
     Arc::new(UserRules::n3("family.n3", text).expect("the rules compile"))
 }
 
-fn pipeline(mode: ReasoningMode, text: &str) -> MutationPipeline {
+pub(crate) fn pipeline(mode: ReasoningMode, text: &str) -> MutationPipeline {
     let store = StoreService::new(in_memory_store_config()).expect("store");
     let config = ReasonerConfig::for_mode(mode)
         .with_rules(Some(rules(text)))

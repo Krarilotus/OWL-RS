@@ -12,7 +12,7 @@
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
 mod aggregate;
-mod cache_key;
+pub(crate) mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
 mod calendar;

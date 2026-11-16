@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::native::cache_key::Encoder;
+
 /// A query's completeness. The default: sound and complete, nothing to say.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Completeness {
@@ -40,8 +42,7 @@ pub struct Outside {
     pub not_guaranteed: &'static str,
 }
 
-// The store's output cache keys on this form: an assessment prints as it did before
-// `certification_withheld` and `outside`.
+// For logs; the store's output cache keys on [`Completeness::write_cache_context`].
 impl fmt::Debug for Completeness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("Completeness");
@@ -169,6 +170,65 @@ impl Completeness {
         }
     }
 
+    /// Writes every field to `out` with the result cache's own key writers
+    /// (`native::cache_key::Encoder`): a byte per bool and tag, a count before a list, a
+    /// presence byte before an option, each text as its length and its bytes. Injective, so
+    /// two statuses share bytes exactly when they are equal.
+    pub fn write_cache_context(&self, out: &mut Vec<u8>) {
+        let Self {
+            sound,
+            complete,
+            certification_withheld,
+            reasons,
+            bounds,
+            regime,
+            outside,
+        } = self;
+        let mut e = Encoder::default();
+        e.bytes = std::mem::take(out);
+        for flag in [*sound, *complete, *certification_withheld] {
+            e.tag(u8::from(flag));
+        }
+        e.number(reasons.len() as u64);
+        for Reason { source, text: said } in reasons {
+            e.text(source);
+            e.text(said);
+        }
+        e.tag(u8::from(bounds.is_some()));
+        if let Some(Bounds {
+            lower,
+            upper,
+            unresolved,
+        }) = bounds
+        {
+            for n in [*lower, *upper, *unresolved] {
+                e.number(n);
+            }
+        }
+        e.tag(match regime {
+            None => 0,
+            Some(Regime::Owl2Ql) => 1,
+            Some(Regime::Owl2Rl) => 2,
+            Some(Regime::Owl2Dl) => 3,
+            Some(Regime::Rdfs) => 4,
+            Some(Regime::Custom) => 5,
+        });
+        e.tag(u8::from(outside.is_some()));
+        if let Some(Outside {
+            what,
+            by,
+            guaranteed,
+            not_guaranteed,
+        }) = outside
+        {
+            e.number(what.len() as u64);
+            for t in what.iter().chain([by, guaranteed, not_guaranteed]) {
+                e.text(t);
+            }
+        }
+        *out = e.bytes;
+    }
+
     /// `complete`, `sound-only`, `unsound` or `not-certified`.
     pub fn as_str(&self) -> &'static str {
         if self.certification_withheld {
@@ -271,22 +331,165 @@ impl Completeness {
 /// `text` in quotes, ASCII only (as [`Completeness::header`] says).
 fn quoted(out: &mut String, text: &str) {
     out.push('"');
-    for c in text.chars() {
+    // Runs of plain ASCII are copied at once; the character after each is escaped.
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if (c.is_ascii_graphic() || c == ' ') && c != '"' && c != '\\' {
+            continue;
+        }
+        out.push_str(&text[start..i]);
+        start = i + c.len_utf8();
         match c {
             '"' | '\\' => {
                 out.push('\\');
                 out.push(c);
             }
-            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
             c => out.extend(c.escape_unicode()),
         }
     }
+    out.push_str(&text[start..]);
     out.push('"');
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The result cache tells statuses apart by [`Completeness::write_cache_context`]: a
+    /// change to any one field, or to one reason's text alone, gives other bytes. The
+    /// status is built field by field, so a field added later fails to compile here until
+    /// it has its own change below.
+    #[test]
+    fn every_field_of_a_status_changes_its_cache_context() {
+        let reason = |text: &str| Reason {
+            source: "ql",
+            text: text.to_owned(),
+        };
+        let base = Completeness {
+            sound: true,
+            complete: false,
+            certification_withheld: false,
+            reasons: vec![reason("a"), reason("b")],
+            bounds: Some(Bounds {
+                lower: 1,
+                upper: 2,
+                unresolved: 1,
+            }),
+            regime: Some(Regime::Owl2Ql),
+            outside: Some(Outside {
+                what: vec!["x"],
+                by: "el",
+                guaranteed: "g",
+                not_guaranteed: "n",
+            }),
+        };
+        let changed: [fn(&mut Completeness); 19] = [
+            |c| c.sound = false,
+            |c| c.complete = true,
+            |c| c.certification_withheld = true,
+            |c| c.reasons[1].text = "c".to_owned(),
+            |c| c.reasons[0].source = "dl",
+            |c| c.reasons.swap(0, 1),
+            |c| {
+                c.reasons.pop();
+            },
+            |c| c.bounds = None,
+            |c| c.bounds.as_mut().unwrap().lower = 0,
+            |c| c.bounds.as_mut().unwrap().upper = 3,
+            |c| c.bounds.as_mut().unwrap().unresolved = 0,
+            |c| c.regime = Some(Regime::Owl2Rl),
+            |c| c.regime = None,
+            |c| c.outside = None,
+            |c| c.outside.as_mut().unwrap().what.push("y"),
+            |c| c.outside.as_mut().unwrap().what[0] = "z",
+            |c| c.outside.as_mut().unwrap().by = "dl",
+            |c| c.outside.as_mut().unwrap().guaranteed = "h",
+            |c| c.outside.as_mut().unwrap().not_guaranteed = "m",
+        ];
+        let bytes = |c: &Completeness| {
+            let mut out = Vec::new();
+            c.write_cache_context(&mut out);
+            out
+        };
+        let mut seen = vec![bytes(&base)];
+        for (i, change) in changed.iter().enumerate() {
+            let mut c = base.clone();
+            change(&mut c);
+            let b = bytes(&c);
+            assert!(!seen.contains(&b), "change {i} gives bytes already seen");
+            seen.push(b);
+        }
+        // Equal statuses, equal bytes.
+        assert_eq!(bytes(&base), bytes(&base.clone()));
+    }
+
+    /// The header's quoting writes, for any text, what quoting it one character at a time
+    /// writes (`by_char`, the reference): over a fixed seed's strings that mix plain runs with
+    /// every character it escapes, at the start, at the end and back to back, non-ASCII ones,
+    /// and the empty string.
+    #[test]
+    fn quoting_writes_what_quoting_by_character_writes() {
+        fn by_char(out: &mut String, text: &str) {
+            out.push('"');
+            for c in text.chars() {
+                match c {
+                    '"' | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+                    c => out.extend(c.escape_unicode()),
+                }
+            }
+            out.push('"');
+        }
+        let pieces = [
+            "",
+            "a",
+            "plain run, of: <text>",
+            " ",
+            "~",
+            "\"",
+            "\\",
+            "\t",
+            "\n",
+            "\r",
+            "\0",
+            "\u{1f}",
+            "\u{7f}",
+            "é",
+            "→",
+            "😀",
+            "ql: ",
+            "\"\\\"",
+        ];
+        let mut texts: Vec<String> = pieces.iter().map(|p| (*p).to_owned()).collect();
+        for p in &pieces[4..] {
+            texts.push(format!("{p}a{p}"));
+            texts.push(format!("a{p}{p}a"));
+        }
+        let mut seed: u64 = 0x5eed_1116;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let n = next() % 9;
+            texts.push(
+                (0..n)
+                    .map(|_| pieces[(next() % pieces.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for text in &texts {
+            let (mut written, mut reference) = (String::new(), String::new());
+            quoted(&mut written, text);
+            by_char(&mut reference, text);
+            assert_eq!(written, reference, "{text:?}");
+        }
+    }
 
     #[test]
     fn headers_say_the_status_and_its_reasons_in_ascii() {
