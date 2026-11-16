@@ -35,7 +35,7 @@ rm -rf -- "$out/gate.json" "$out/check.log"
 attempt="${FLEET_JOB:-none}:${FLEET_STEP:-0}:${EPOCHREALTIME/[.,]/}:$$"
 echo "$attempt" > "$out/attempt"
 export PATH="$cache/bin:$HOME/.cargo/bin:$PATH"
-# Nothing here may reach a Docker daemon (the shared host's volumes and images are its colleagues').
+# Nothing here may reach a Docker daemon (the shared host's volumes and images belong to others).
 export DOCKER_HOST=unix:///nonexistent/owlrs-gate-has-no-docker.sock
 infra() { echo "gate-job: $*" >&2; exit 3; }
 # A tool's run, its output shown only when it fails.
