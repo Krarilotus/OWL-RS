@@ -130,6 +130,8 @@ impl<'a> FunctionalReader<'a> {
             data: Default::default(),
             anonymous: BTreeSet::new(),
             rules: model.rules,
+            // Functional syntax writes a cardinality as a number: no spelling to mark.
+            noncanonical_cardinality: None,
             qualified_data_max: model.qualified_data_max,
         };
         crate::mapping::complete(&mut ontology, terms);

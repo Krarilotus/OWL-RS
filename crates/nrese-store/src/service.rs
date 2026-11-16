@@ -1166,6 +1166,7 @@ impl StoreService {
                 };
             return Ok((Some(detail), None));
         }
+        self.refuse_exact(prepared, || self.status_without_dl(prepared))?;
         let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
         let ql = run_query(
             &snapshot,
@@ -1266,6 +1267,25 @@ impl StoreService {
     fn dl_mode(&self, prepared: &PreparedQuery) -> Option<crate::DlAnswers> {
         (self.dl.active() && prepared.read_model() == ReadModel::Materialised)
             .then(|| prepared.dl_answers().unwrap_or(self.config.dl.answers))
+    }
+
+    /// Exact answers asked for under `owl2-dl` on a read past the bounds (the inferred
+    /// statements alone, or a transaction's pending state), which isn't certified complete:
+    /// refused before it runs by the rule the bounds' path follows
+    /// ([`crate::dl::query::refuse_unless_complete`]), with the `status` the read would
+    /// carry, built only when exact answers are asked for.
+    fn refuse_exact(
+        &self,
+        prepared: &PreparedQuery,
+        status: impl FnOnce() -> Option<nrese_sparql::Completeness>,
+    ) -> StoreResult<()> {
+        let mode = prepared.dl_answers().unwrap_or(self.config.dl.answers);
+        if !self.dl.active() || mode != crate::DlAnswers::Exact {
+            return Ok(());
+        }
+        status().map_or(Ok(()), |status| {
+            crate::dl::query::refuse_unless_complete(mode, &status, Vec::new)
+        })
     }
 
     /// What every query gets from the store.
@@ -1577,7 +1597,35 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
+        // The status the answers carry, of the pending state `at` they are read from.
+        let status_of = |ql: Option<&nrese_sparql::ql::QlReport>, at: Revision<'_>| {
+            let mut status = match in_dl {
+                true => {
+                    let mut status =
+                        nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+                    status.incomplete(
+                        "dl",
+                        "a read inside a transaction: its pending operations aren't reasoned                          over before the commit (the committed closure, no DL bounds)"
+                            .to_owned(),
+                    );
+                    crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
+                    crate::dl::query::mark(self, prepared, at, &mut status);
+                    Some(status)
+                }
+                false => self.status_outside_dl(prepared, ql, at),
+            };
+            if deletes && let Some(status) = &mut status {
+                status.unsound(
+                    "transaction",
+                    "the pending operations may delete statements whose inferences remain                      until the commit"
+                        .to_owned(),
+                );
+            }
+            status
+        };
         let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
+            // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
+            self.refuse_exact(prepared, || status_of(None, Revision::Pending(snapshot)))?;
             run_query(
                 snapshot,
                 prepared,
@@ -1586,38 +1634,15 @@ impl StoreService {
                 &memory,
                 out,
                 |ql| {
-                    let mut status = match in_dl {
-                        true => {
-                            let mut status =
-                                nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-                            status.incomplete(
-                        "dl",
-                        "a read inside a transaction: its pending operations aren't reasoned \
-                         over before the commit (the committed closure, no DL bounds)"
-                            .to_owned(),
-                    );
-                            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-                            let at = Revision::Pending(snapshot);
-                            crate::dl::query::mark(self, prepared, at, &mut status);
-                            Some(status)
-                        }
-                        false => self.status_outside_dl(prepared, ql, Revision::Pending(snapshot)),
-                    };
-                    if deletes && let Some(status) = &mut status {
-                        status.unsound(
-                            "transaction",
-                            "the pending operations may delete statements whose inferences remain \
-                     until the commit"
-                                .to_owned(),
-                        );
-                    }
                     // A transaction's pending state: never answered from the cache.
+                    let status = status_of(ql, Revision::Pending(snapshot));
                     report(status_for_its_reader(prepared, status, ql.is_some()));
                     Vec::new()
                 },
             )
             .map(|_| ())
         });
+        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
 

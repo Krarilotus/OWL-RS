@@ -433,13 +433,18 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
 const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocabulary that \
                       no closure, rewriting or bound holds in full";
 
+/// Why a constant [`typed_constant`] names may miss rows.
+const SPELLING: &str = "a stored value written another way doesn't match it, though OWL 2 \
+                        entails the row by its value";
+
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
-/// entailed. A read [`denied`] names misses rows; and where rows may be missing, an
-/// operator under which a missing row can make a returned one wrong ([`negation`]) makes
-/// the answers unsound. Each from `source`.
+/// entailed. A read [`denied`] names misses rows, and under `owl2-dl` and `owl2-ql` so does
+/// a typed constant ([`typed_constant`]); and where rows may be missing, an operator under
+/// which a missing row can make a returned one wrong ([`negation`]) makes the answers
+/// unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -466,6 +471,8 @@ pub(crate) struct Reads {
     denied: [std::sync::OnceLock<Option<String>>; 2],
     /// [`negation`]'s.
     negation: std::sync::OnceLock<Option<String>>,
+    /// [`typed_constant`]'s.
+    constant: std::sync::OnceLock<Option<String>>,
 }
 
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
@@ -484,6 +491,14 @@ fn certify(
     });
     if let Some(reason) = read {
         completeness.incomplete(source, reason.clone());
+    }
+    if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)) {
+        let constant = reads.constant.get_or_init(|| {
+            typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}"))
+        });
+        if let Some(reason) = constant {
+            completeness.incomplete(source, reason.clone());
+        }
     }
     if completeness.complete {
         return;
@@ -575,21 +590,27 @@ pub(crate) fn answer(
             mark(store, prepared, Revision::Decided(&at), status);
         }
     }
-    let status = match &outcome {
-        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
-    };
+    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;
+    refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
+    Ok(outcome)
+}
+
+/// The one rule of exact answers: under [`DlAnswers::Exact`] an answer whose `status` isn't
+/// complete is refused, with that status and the candidates left `unresolved`. Both the
+/// bounds' path ([`answer`]) and the reads past the bounds, before they run
+/// (`StoreService::refuse_exact`), ask it.
+pub(crate) fn refuse_unless_complete(
+    mode: DlAnswers,
+    status: &Completeness,
+    unresolved: impl FnOnce() -> Vec<String>,
+) -> StoreResult<()> {
     if mode == DlAnswers::Exact && !status.complete {
-        let unresolved = match &outcome {
-            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => {
-                detail.unresolved.clone()
-            }
-        };
         return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
             status: status.clone(),
-            unresolved,
+            unresolved: unresolved(),
         })));
     }
-    Ok(outcome)
+    Ok(())
 }
 
 #[cfg(test)]
