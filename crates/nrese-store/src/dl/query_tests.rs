@@ -2,10 +2,11 @@ use super::*;
 use nrese_dl::limits::Deadline;
 
 fn lower_true_store() -> Arc<StoreService> {
-    lower_true_store_with(crate::StoreConfig::in_memory())
+    lower_true_store_with(crate::StoreConfig::in_memory(), "")
 }
 
-fn lower_true_store_with(config: crate::StoreConfig) -> Arc<StoreService> {
+/// [`lower_true_store`] under `config`, `data` committed with it.
+fn lower_true_store_with(config: crate::StoreConfig, data: &str) -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
@@ -19,10 +20,10 @@ fn lower_true_store_with(config: crate::StoreConfig) -> Arc<StoreService> {
     );
     pipeline
         .apply(
-            MutationCommand::Update(SparqlUpdateRequest::new(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
                 "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
-         INSERT DATA { :a a [ owl:unionOf ( :B :C ) ] . :b a :B . }",
-            )),
+         INSERT DATA {{ :a a [ owl:unionOf ( :B :C ) ] . :b a :B . {data} }}"
+            ))),
             &Requester::all(),
             &MutationTicket::new(),
         )
@@ -562,13 +563,17 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
 /// revision and the bounds' memory spent, between the decision and the status): whether
 /// OWL 2 DL reads the data otherwise than the rules isn't known, so the answers are
 /// `unsound` with that reason, and an exact read is refused. The control: the same exact
-/// read with the memory free is answered.
+/// read with the memory free is answered. The store holds a term equal to another, so the
+/// status needs the ontology: its indexes alone don't decide the mark ([`by_index`]).
 #[test]
 fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
-    let store = lower_true_store_with(crate::StoreConfig {
-        total_query_memory_bytes: 64 << 20,
-        ..crate::StoreConfig::in_memory()
-    });
+    let store = lower_true_store_with(
+        crate::StoreConfig {
+            total_query_memory_bytes: 64 << 20,
+            ..crate::StoreConfig::in_memory()
+        },
+        ":b owl:sameAs :d .",
+    );
     let mut request = crate::SparqlQueryRequest::all("ASK { ?x a <urn:test:B> }");
     request.dl_answers = Some(crate::DlAnswers::Exact);
     let prepared = store.prepare_query(&request).unwrap();
@@ -628,12 +633,13 @@ const OFF_ROUTE: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :t
 
 /// `ASK { :tib a :Pet }` over a store under `owl2-dl` (with `config`) with [`OFF_ROUTE`] and
 /// `data` committed, read committed and then inside a transaction adding `pending`: for each
-/// read, the mark's reasons and how often its mark went to the whole ontology.
+/// read, the mark's reasons and how often its mark went to the whole ontology; then the mark
+/// the whole committed ontology gives ([`by_ontology`]).
 fn marks_and_passes(
     config: crate::StoreConfig,
     data: &str,
     pending: &str,
-) -> Vec<(Vec<String>, usize)> {
+) -> (Vec<(Vec<String>, usize)>, Option<String>) {
     use crate::{SparqlUpdateRequest, StatementOp, StatementsRequest};
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
     let store = Arc::new(StoreService::new(config).unwrap());
@@ -677,7 +683,9 @@ fn marks_and_passes(
             .collect();
         reads.push((marks, ONTOLOGY_PASSES.get()));
     }
-    reads
+    let snapshot = store.engine().snapshot();
+    let whole = read_ontology(&store, &snapshot).expect("the ontology");
+    (reads, by_ontology(&snapshot, whole.value()))
 }
 
 /// A read off the rules route of a store with neither an annotation-property axiom nor an
@@ -685,7 +693,7 @@ fn marks_and_passes(
 /// the whole ontology: the store's indexes show there is neither.
 #[test]
 fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology() {
-    let reads = marks_and_passes(
+    let (reads, _) = marks_and_passes(
         crate::StoreConfig::in_memory(),
         ":tib :owner :ann . :ann rdfs:label \"Ann\" .",
         ":rex a :Pet .",
@@ -699,27 +707,60 @@ fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology(
 
 const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 
-/// A store with a common vocabulary loaded has an annotation-property axiom: SKOS declares
-/// its labels annotation properties under `rdfs:label`. A read off the rules route is told the
-/// mark naming the property, committed and inside a transaction, and its mark takes it from
-/// the store's indexes, without going to the whole ontology.
+/// A store with an annotation-property axiom of each kind (a domain, a range, a
+/// super-property: SKOS declares its labels annotation properties under `rdfs:label`), or
+/// with two annotation properties that have axioms, and no term equal to another. A read off
+/// the rules route is told the mark the whole ontology gives, naming the property, committed
+/// and inside a transaction, and its mark takes it from the store's indexes, without going
+/// to the whole ontology. A blank node declared an annotation property names none: the store
+/// is told no mark.
 #[test]
 fn an_annotation_property_axiom_marks_the_read_without_the_ontology() {
-    let reads = marks_and_passes(
-        crate::StoreConfig::in_memory(),
-        &format!(
-            "{PREF_LABEL} a owl:AnnotationProperty ; rdfs:subPropertyOf rdfs:label . \
-             :tib {PREF_LABEL} \"Tib\" ."
+    let property = |p: &str| format!("{p} a owl:AnnotationProperty ; ");
+    let stores: [(&str, String, &[&str]); 5] = [
+        (
+            "domain only",
+            property(":d") + "rdfs:domain :Pet .",
+            &["<urn:test:d>"],
         ),
-        ":rex a :Pet .",
-    );
-    let named = format!("{PREF_LABEL} has annotation-property axioms");
-    let right = |(marks, passes): &(Vec<String>, usize)| {
-        *passes == 0 && marks.len() == 1 && marks[0].starts_with(&named)
-    };
+        (
+            "range only",
+            property(":r") + "rdfs:range :Pet .",
+            &["<urn:test:r>"],
+        ),
+        (
+            "sub-property only",
+            property(PREF_LABEL)
+                + &format!("rdfs:subPropertyOf rdfs:label . :tib {PREF_LABEL} \"Tib\" ."),
+            &[PREF_LABEL],
+        ),
+        (
+            "two properties",
+            property(":m") + "rdfs:domain :Pet . " + &property(":n") + "rdfs:range :Pet .",
+            &["<urn:test:m>", "<urn:test:n>"],
+        ),
+        ("a blank node", property("[]") + "rdfs:domain :Pet .", &[]),
+    ];
+    let mut wrong = Vec::new();
+    for (store, data, names) in stores {
+        let (reads, whole) =
+            marks_and_passes(crate::StoreConfig::in_memory(), &data, ":rex a :Pet .");
+        eprintln!("{store}: [committed, pending] {reads:?}, the whole ontology {whole:?}");
+        let named = |w: &String| {
+            let name = |n: &&str| w.starts_with(&format!("{n} has annotation-property axioms"));
+            names.iter().any(name)
+        };
+        let told: Vec<String> = whole.iter().cloned().collect();
+        let right = whole.as_ref().map_or(names.is_empty(), named)
+            && reads.len() == 2
+            && reads.iter().all(|read| *read == (told.clone(), 0));
+        if !right {
+            wrong.push(store);
+        }
+    }
     assert!(
-        reads.len() == 2 && reads.iter().all(right),
-        "[committed, pending]: (the mark's reasons, passes over the whole ontology): {reads:#?}"
+        wrong.is_empty(),
+        "wrong: {wrong:?}; each store's (the mark's reasons, passes over the whole ontology) above"
     );
 }
 
@@ -733,7 +774,7 @@ fn a_punned_name_equal_to_another_is_marked_by_one_pass_over_the_ontology() {
         equality_compact: true,
         ..crate::StoreConfig::in_memory()
     };
-    let reads = marks_and_passes(
+    let (reads, _) = marks_and_passes(
         config,
         ":Dog a owl:Class , :Species ; owl:sameAs :Canis . :rex a :Dog .",
         ":fido a :Dog .",
