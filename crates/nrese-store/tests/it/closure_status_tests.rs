@@ -1684,3 +1684,41 @@ fn a_prepared_query_is_marked_by_what_its_property_holds_at_each_run() {
         .collect();
     assert!(wrong.is_empty(), "{wrong:?}");
 }
+
+/// `"Rex"` stored as a type derived from `xsd:string` and as a plain string: the types share
+/// xsd:string's value space, so OWL 2 takes `"Rex"^^xsd:token` and `"Rex"` as one value.
+const DERIVED: [&str; 2] = [
+    ":s a owl:DatatypeProperty . :a :s \"Rex\"^^xsd:token .",
+    ":s a owl:DatatypeProperty . :a :s \"Rex\"^^xsd:normalizedString .",
+];
+
+/// The store matches the plain string as written and misses `:a`'s value spelled with a
+/// derived string type. Spec: a query naming `"Rex"` over [`DERIVED`] finds `:a` or isn't
+/// `complete`, run and planned, under each regime that promises `complete`.
+#[test]
+fn a_plain_string_misses_no_derived_string_type_and_says_complete() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let cases = DERIVED.map(|data| (data, "SELECT ?x { ?x :s \"Rex\" }", &["a"][..]));
+        for missed in misses_and_says_complete(store, &cases) {
+            wrong.push(format!("{regime}: {missed}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control: a plain string stored and asked is one term. Spec: the query finds `:a`
+/// and stays `complete`, run and planned, under each regime that promises it.
+#[test]
+fn a_plain_string_asked_where_one_is_stored_stays_complete() {
+    let data = ":s a owl:DatatypeProperty . :a :s \"Rex\" .";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let (rows, status) = answer(&store(data), "SELECT ?x { ?x :s \"Rex\" }");
+        eprintln!("{regime}: {rows} {status:?}");
+        if !rows.contains("example.com/a\"") || status != ["complete"; 2] {
+            wrong.push(format!("{regime}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
