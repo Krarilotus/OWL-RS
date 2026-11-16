@@ -97,20 +97,9 @@ impl Diagnostic {
     /// *OWL 2 Structural Specification* §11.2 keeps anonymous individuals out of OWL 2 DL in
     /// more places: in a nominal or `hasValue` (flagged here) and, unflagged, in
     /// `SameIndividual`, `DifferentIndividuals` or a negative assertion, and in assertions
-    /// whose anonymous individuals don't form its forest. These restrictions keep OWL 2 DL
-    /// decidable and its anonymous individuals eliminable. The Direct Semantics still reads
-    /// every OWL 2 ontology (§2.3.7–2.4), and the answers on it are read as follows:
-    /// 1. An anonymous individual is existential (§2.4). Held as a constant, every model of
-    ///    the ontology gives one of it and back. So consistency, and every conclusion that
-    ///    doesn't name it, stay as they are, whatever axiom it occurs in.
-    /// 2. Only keys use NAMED (§2.3.5). A blank node held as a constant is named exactly
-    ///    when it is equal to a named individual, so a key binds it only through that one.
-    /// 3. A blank node is an individual that exists without a name, and a key binds only
-    ///    what a name denotes. Reading each blank node as a fresh IRI would bind keys the
-    ///    semantics doesn't. That the rules, with keys over classes that hold an IRI, lose
-    ///    no certain answer on such input is our argument. It has no source to cite;
-    ///    HermiT's verdict on two anonymous values equal through a functional property is
-    ///    its witness.
+    /// whose anonymous individuals don't form its forest. None of them is fatal: why the
+    /// answers on such input stay those of the Direct Semantics, and what witnesses it, is in
+    /// docs/design/owl2-dl.md §16 ("Anonymous individuals where §11.2 keeps them out").
     pub fn is_fatal(&self) -> bool {
         !matches!(
             self,
