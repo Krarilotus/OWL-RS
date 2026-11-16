@@ -1,7 +1,7 @@
 # Reported numbers: contenders that don't run here
 
-RDFox's evaluation licence was refused, so RDFox runs nowhere in the
-suite, now or later. What its authors published stands beside our measurements as
+We hold no licence for RDFox, so it runs nowhere in the
+suite. What its authors published stands beside our measurements as
 reported rows: the suite's result schema ([../../suite/suitekit/schema.py](../../suite/suitekit/schema.py)),
 `runtime = reported`, the paper's hardware in `host`, its year in `date`, and the source, table and
 setup in `note`. They are never measured, never summed into a run's results, and never

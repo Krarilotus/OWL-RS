@@ -28,7 +28,7 @@ python benches/suite/measurement_queue.py submit benches/reasoning/jobs/qualify-
   unchanged on this branch since), SHA-256 in `~/nrese-reasoning-suite/bin/16c3bfb/SHA256SUMS`
   on the host.
 
-- RDFox runs nowhere: its evaluation licence was refused. Its home
+- RDFox runs nowhere: we hold no licence for it. Its home
   turf is NRESE against VLog and GLog on RDFox's own programs, at the setups RDFox's papers
   report, beside the papers' numbers as reported rows ([../reported](../reported/README.md)).
 - `profile-cspa` (the timed host, where profiling is allowed): perf over NRESE's CSPA
