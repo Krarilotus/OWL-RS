@@ -225,7 +225,7 @@ class JobNamespaces(unittest.TestCase):
     def test_python_and_shell_name_alike(self):
         # Master r3 B1: shell launch labels and Python labels share exact fleet ownership.
         with tempfile.TemporaryDirectory() as tmp:
-            for job in ("", "Consol-SCC@office"):
+            for job in ("", "Consol-SCC@shared"):
                 done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"; '
                                        'printf "\\n"; ns_run_args case "$1" suite; printf "%s\\n" "${NS_ARGS[@]}"',
                                        "-", Path(tmp).as_posix()], env={**os.environ, "FLEET_JOB": job},

@@ -26,13 +26,13 @@ spec.loader.exec_module(queue)
 
 AT = datetime.datetime(2026, 10, 12, 22, 30)
 REGISTRY = {"host": {
-    "office-pc": {"roles": ["measure"], "has": ["docker"], "queue": {"dir": "~/q", "windows": ["21:00-06:00"]}},
-    "khaleesi": {"roles": ["measure"], "has": []},
+    "shared-a": {"roles": ["measure"], "has": ["docker"], "queue": {"dir": "~/q", "windows": ["21:00-06:00"]}},
+    "dev-a": {"roles": ["measure"], "has": []},
 }}
 
 
 def job(**changes):
-    return {"id": "j", "group": "sparql", "host": "office-pc", "checkout": "suite/sparql",
+    return {"id": "j", "group": "sparql", "host": "shared-a", "checkout": "suite/sparql",
             "commands": [["python3", "benches/fast/fast.py", "compete", "--cases", "c"]], "needs": ["docker"],
             **changes}
 
@@ -81,7 +81,7 @@ class Windows(unittest.TestCase):
 class Admission(unittest.TestCase):
     def test_what_keeps_a_job_out(self):
         self.assertEqual(queue.job_problems(job(), REGISTRY), [])
-        for changes, words in [({"host": "draco"}, "not in hosts.toml"), ({"host": "khaleesi"}, "no queue"),
+        for changes, words in [({"host": "cluster-a"}, "not in hosts.toml"), ({"host": "dev-a"}, "no queue"),
                                ({"needs": ["java"]}, "lacks java"), ({"window": "now"}, "quiet or any"),
                                ({"commands": [["python3", "benches/suite/suite.py", "run", "--systems", "qlever"]]},
                                 "captures its answers first")]:
@@ -91,8 +91,8 @@ class Admission(unittest.TestCase):
 
 class Hosts(unittest.TestCase):
     def test_a_host_without_timing_takes_counts_and_preparation_only(self):
-        registry = {"host": {"gamergrill": {"roles": ["prepare"], "has": [], "queue": {"dir": "~/q", "timing": False}}}}
-        timed = job(host="gamergrill", needs=[])
+        registry = {"host": {"checks-a": {"roles": ["prepare"], "has": [], "queue": {"dir": "~/q", "timing": False}}}}
+        timed = job(host="checks-a", needs=[])
         self.assertTrue(any("no timed job" in p for p in queue.job_problems(timed, registry)))
         self.assertEqual(queue.job_problems({**timed, "window": "any"}, registry), [])
 
@@ -275,9 +275,9 @@ class Fairness(unittest.TestCase):
             self.assertEqual(q.next(settings, AT, lambda: False, last_group="sparql")[1]["id"], "dl-ore")
 
     def test_long_jobs_are_split_and_day_long_ones_go_elsewhere(self):
-        registry = {"host": {"phuoc-yu": {"roles": ["measure"], "has": [], "queue": {
+        registry = {"host": {"timed-a": {"roles": ["measure"], "has": [], "queue": {
             "dir": "~/q", "chunk_min": 30, "max_job_min": 240}}}}
-        one = job(host="phuoc-yu", needs=[], est_min=120)
+        one = job(host="timed-a", needs=[], est_min=120)
         self.assertTrue(any("split it" in p for p in queue.job_problems(one, registry)))
         four = {**one, "commands": one["commands"] * 4}
         self.assertEqual(queue.job_problems(four, registry), [])
