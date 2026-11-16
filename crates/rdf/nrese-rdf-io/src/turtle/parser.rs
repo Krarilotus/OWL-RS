@@ -25,7 +25,9 @@ use nrese_rdf::{
     QuadRef, TermRef, TripleRef,
 };
 
-use super::lexer::{Brackets, Kind, Lexed, Malformed, Token, characters, lex, malformed, pair};
+use super::lexer::{
+    Brackets, Kind, Lexed, Malformed, Token, characters, lex, malformed, pair, space,
+};
 use super::split::Cut;
 use crate::blank::BlankNodes;
 use crate::error::{
@@ -531,7 +533,13 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 token.start
             }
             Err(error @ RdfParseError::Io(_)) => return Err(error),
-            Err(_) => self.input.position,
+            // The token that fails to lex: what is before it consumed the same way.
+            Err(_) => {
+                let data = &self.input.data()[self.input.position..];
+                let gap = space(data, self.input.eof()).unwrap_or(0);
+                self.input.consume(gap);
+                self.input.position
+            }
         };
         Ok(Start {
             offset: self.input.base + at as u64,

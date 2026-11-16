@@ -437,7 +437,7 @@ pub(crate) fn characters(bytes: &[u8]) -> u64 {
 /// Where the next token starts: past whitespace and comments. `None` if a comment may
 /// still go on (more input may come).
 #[inline(always)]
-fn space(input: &[u8], eof: bool) -> Option<usize> {
+pub(crate) fn space(input: &[u8], eof: bool) -> Option<usize> {
     let len = input.len();
     let mut i = 0;
     loop {
