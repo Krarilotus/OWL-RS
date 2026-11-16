@@ -47,6 +47,7 @@
 use std::time::{Duration, Instant};
 
 use hashbrown::{HashMap, HashSet};
+use nrese_owl::mapping::AnnotationProperties;
 use nrese_owl::{DECLARATION_KINDS, EntityKind};
 use nrese_xsd::owl::Datatype;
 
@@ -246,6 +247,7 @@ struct Names {
     /// What an `rdf:type` object declares its subject as: nrese-owl's table, so that a
     /// declaration is read as the mapping reads it.
     declarations: TermTable<EntityKind>,
+    annotation_properties: AnnotationProperties,
 }
 
 impl Names {
@@ -287,6 +289,7 @@ impl Names {
                 .iter()
                 .map(|&(class, kind)| (iri(class), kind))
                 .collect(),
+            annotation_properties: AnnotationProperties::new(&mut |text| Some(iri(text))),
         };
         // Every predicate of the mapping's class expressions and data ranges (OWL 2 Mapping to
         // RDF Graphs, Tables 1 to 3): the constructors a node has one of, their fields, and
@@ -611,7 +614,7 @@ struct Graph<'a> {
     data_properties: HashSet<u64>,
     /// The declared annotation properties, whose domains, ranges and sub-properties say
     /// nothing about classes.
-    annotation_properties: HashSet<u64>,
+    annotation_properties: AnnotationProperties,
     /// The blank nodes no class expression of EL can be read from, whatever uses them, and
     /// why: those declared datatypes, a data range, and those whose predicates of the
     /// mapping's class expressions say something EL lacks, decided once per node.
@@ -627,21 +630,19 @@ impl<'a> Graph<'a> {
             by_subject: HashMap::new(),
             names,
             data_properties: HashSet::new(),
-            annotation_properties: HashSet::new(),
+            annotation_properties: names.annotation_properties.clone(),
             refused: HashMap::new(),
             datatypes: std::iter::empty().collect(),
         };
         let mut declared = Vec::new();
         for &[s, p, o] in triples {
             graph.by_subject.entry(s).or_default().push((p, o));
+            graph.annotation_properties.read([s, p, o], named(s));
             // A property's declaration is of an IRI (the RDF mapping's Table 6), as the
             // ontology reader reads it: a blank node so typed declares nothing.
             match names.declared(p, o) {
                 Some(EntityKind::Datatype) => declared.push(s),
                 Some(EntityKind::DataProperty) if named(s) => graph.data_properties.extend([s]),
-                Some(EntityKind::AnnotationProperty) if named(s) => {
-                    graph.annotation_properties.extend([s])
-                }
                 _ => {}
             }
         }
@@ -1014,9 +1015,9 @@ fn build(
                 PropertyAxiom::Sub { equivalent: false }
                 | PropertyAxiom::Domain
                 | PropertyAxiom::Range,
-            ) if graph.annotation_properties.contains(&s) => {}
+            ) if graph.annotation_properties.contains(s) => {}
             Disposition::Property(PropertyAxiom::Sub { equivalent: false })
-                if graph.annotation_properties.contains(&o) => {}
+                if graph.annotation_properties.contains(o) => {}
             Disposition::Property(axiom) => match names.roles(axiom, [s, p, o], named) {
                 Err(kind) => skipped.push((p, kind)),
                 Ok(PropertyAxiom::Sub { equivalent }) => {
