@@ -2,7 +2,7 @@
 hooks a calling git names (isolation.py). 20 Oct 2026: under the commit hook, tests that ran git
 emptied two commits and moved a branch of the repository being committed to; a caller's
 configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT) set core.hooksPath and ran
-an outside hook in a test's own repository (Sol).
+an outside hook in a test's own repository.
 
 A test's own setup runs git under the suite's policy too; only the process under test starts from
 a caller's environment (isolation.inherit(git={})). PR #57 r1 R1: the setup here built its git
@@ -112,7 +112,7 @@ class Isolation(unittest.TestCase):
         self.assertEqual(found, [], "SPEC one git policy: only isolation.py strips or lists git's variables")
 
     def test_a_fixture_copies_ns_sh_only_with_its_lock(self):
-        """Orchestrator, 8 Nov 2026: three fixtures copied scripts/lib/ns.sh by hand, two of them
+        """Three fixtures copied scripts/lib/ns.sh by hand, two of them
         without suitekit/lock.py, which ns.sh locks with where there is no flock (Git Bash); #153's
         Windows gate failed on one. No fixture's list of files to copy (a module's constant) names
         ns.sh itself: it takes isolation.NS_SH; and a checkout of ns.sh without its lock is refused.

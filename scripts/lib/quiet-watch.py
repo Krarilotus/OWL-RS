@@ -47,7 +47,7 @@ HEAVY_CORES = 0.2
 DISTURBED_SHARE = 0.10
 TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 # Never stopped, even when owned: what keeps the host and the queue running, and a desktop
-# session's compositor (phuoc-yu's console: gnome-shell stopped would freeze its display).
+# session's compositor (the timed host's console: gnome-shell stopped would freeze its display).
 SPARED = ("guard.sh", "sshd", "systemd", "queue.py", "quiet-watch.py", "dbus-daemon",
           "gnome-shell", "Xwayland", "gnome-session", "gdm")
 ROOT = Path(__file__).resolve().parents[2]
@@ -149,7 +149,7 @@ class Owner:
     """Whose work the slot may suspend: its fleet job (FLEET_JOB), the step's slice (FLEET_SLICE)
     and the job namespace its containers carry (nrese.ns). A slot with neither a job nor a slice
     (a manual run) owns nothing, containers included: its namespace would be the checkout's,
-    which every manual run from it shares (Sol, 20 Oct 2026)."""
+    which every manual run from it shares."""
 
     def __init__(self, environ=os.environ, namespace: str | None = None):
         self.job = environ.get("FLEET_JOB", "")
@@ -233,8 +233,7 @@ def journal(frozen: Path, line: str):
 
 def rewrite(frozen: Path, lines: list[str]):
     """Replaces the journal with `lines` whole or not at all: a synced temporary file renamed over
-    it, then the directory synced. Truncating it in place lost the records of a crash midway
-    (Sol, 20 Oct 2026)."""
+    it, then the directory synced. Truncating it in place lost the records of a crash midway."""
     temporary = frozen.with_name(f"{frozen.name}.{os.getpid()}.new")
     try:
         with open(temporary, "w", encoding="utf-8") as f:
@@ -263,7 +262,7 @@ def suspend(pid: int, frozen: Path, boot: str, recorded: set[int], owner: Owner,
     ownership are read while the handle holds it, the handle's process is then proven alive (so
     those reads were of it: a live process keeps its pid), the journal line (pid, start time,
     boot) is written once, and the signal goes through the handle, never to a pid that may since
-    name another process (Sol, 20 Oct 2026). No pidfd (an older kernel or Python), or a boot
+    name another process. No pidfd (an older kernel or Python), or a boot
     that can't be read (the record would name no boot): not stopped."""
     if not known(boot):
         return False
@@ -290,7 +289,7 @@ def resume(state: Path) -> list[str]:
     """Continues and unpauses what STATE/frozen records; a process only if it is still the one
     recorded (same start time, same boot). A line is settled only when its process is continued,
     or proven gone (no such pid, another start time, another boot), or its container unpaused or
-    gone; one that couldn't be inspected or signalled is not (Sol, 20 Oct 2026: an EPERM on
+    gone; one that couldn't be inspected or signalled is not (an EPERM on
     SIGCONT dropped the record of a process left stopped). The unsettled lines stay in the file
     (it goes when none remain); they are returned."""
     path = state / "frozen"
@@ -334,7 +333,7 @@ def resume(state: Path) -> list[str]:
             try:
                 done = subprocess.run(["docker", "unpause", what], capture_output=True, text=True, timeout=DOCKER_S)
             except (OSError, subprocess.TimeoutExpired):
-                left.append(line)  # no answer (Sol, 20 Oct 2026: a wedged Docker held the lock forever)
+                left.append(line)  # no answer (a wedged Docker held the lock forever)
                 continue
             gone_or_running = done.returncode == 0 or "No such container" in done.stderr or "not paused" in done.stderr
             if not gone_or_running:

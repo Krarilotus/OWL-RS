@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Bisects a slowdown or a memory growth over a branch's first-parent commits, measuring every
-revision itself (the owner, 14 Oct 2026, after a bisect that named the wrong merge: one revision's
+revision itself (14 Oct 2026, after a bisect that named the wrong merge: one revision's
 row carried its neighbour's numbers, read from the wrong report).
 
     python scripts/bisect-perf.py --good REV --bad REV --out DIR --metric PATH \\

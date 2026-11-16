@@ -65,8 +65,8 @@ class Standings(unittest.TestCase):
         entry = {"case": "c", "semantics": "plain", "system": "qlever", "home_turf": "qlever", "answers": "ok",
                  "timed": "2/2", "verdict": "win", "time": {"ratio": 0.25, "ci": [0.2, 0.3]}}
         records = [
-            {"id": "old", "started": "2026-10-01", "host": "office-pc", "commit": "a", "versus": [{**entry, "verdict": "loss"}]},
-            {"id": "new", "started": "2026-10-10", "host": "office-pc", "commit": "b", "versus": [entry],
+            {"id": "old", "started": "2026-10-01", "host": "shared-a", "commit": "a", "versus": [{**entry, "verdict": "loss"}]},
+            {"id": "new", "started": "2026-10-10", "host": "shared-a", "commit": "b", "versus": [entry],
              "pairs": [{"system": "graphdb", "outcome": "restricted"}]},
         ]
         systems = {"nrese": {}, "qlever": {"publish": "free"}, "graphdb": {"publish": "permission"}, "jena": {}}

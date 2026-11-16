@@ -1,4 +1,4 @@
-"""The kits under fleet (the owner, 14 Oct 2026, after a whole-host OOM on Office: a scope and a
+"""The kits under fleet (after a whole-host OOM on the shared host, 14 Oct 2026: a scope and a
 container beside the jobs, counted nowhere): a scope the suite or the fast suite starts goes into
 the step's slice (FLEET_SLICE) and is ended with its task, nothing in it outliving the command;
 a container is capped within what the job declared (the slice's limit), never uncapped.
