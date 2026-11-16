@@ -105,6 +105,22 @@ fn certified(config: StoreConfig, ruleset: Ruleset) -> StoreService {
     store
 }
 
+/// [`certified`] under OWL 2 RL as a server opens a store: its pipeline's reasoner
+/// registers the rules before the data comes. A library store that rematerialises with no
+/// rules registered reads a version without inferred statements as no reasoning at all.
+fn served(config: StoreConfig) -> Arc<StoreService> {
+    let store = Arc::new(StoreService::new(config).expect("store"));
+    let _pipeline = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    load(&store, DATA, false);
+    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+    store
+}
+
 /// The status header of `query` (over [`PREFIXES`]).
 fn status(store: &StoreService, query: &str) -> String {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{query}"));
@@ -477,7 +493,7 @@ fn a_publication_of_new_statements_is_certified_only_by_what_built_them() {
         ("a load adding to it", false),
     ] {
         let dir = tempfile::tempdir().expect("dir");
-        let store = on_disk(dir.path());
+        let store = served(StoreConfig::on_disk(dir.path().join("store")));
         if owl2_rl(&mut cells, name, &store) {
             load(
                 &store,

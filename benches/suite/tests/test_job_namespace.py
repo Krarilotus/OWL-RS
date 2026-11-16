@@ -225,7 +225,7 @@ class JobNamespaces(unittest.TestCase):
     def test_python_and_shell_name_alike(self):
         # Master r3 B1: shell launch labels and Python labels share exact fleet ownership.
         with tempfile.TemporaryDirectory() as tmp:
-            for job in ("", "Consol-SCC@office"):
+            for job in ("", "Consol-SCC@shared"):
                 done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"; '
                                        'printf "\\n"; ns_run_args case "$1" suite; printf "%s\\n" "${NS_ARGS[@]}"',
                                        "-", Path(tmp).as_posix()], env={**os.environ, "FLEET_JOB": job},
@@ -313,7 +313,7 @@ class GateBuilds(unittest.TestCase):
         isolation.repo(self.checkout, 1)
 
     def test_a_build_used_between_the_sweeps_look_and_its_delete_stays(self):
-        """Sol, 20 Oct 2026: the sweep found a build old, a gate then stamped it, and the sweep
+        """The sweep found a build old, a gate then stamped it, and the sweep
         deleted it anyway. Use and removal share the lock; the sweep checks again under it."""
         script = r'''
 . scripts/lib/gate-publish.sh
@@ -342,7 +342,7 @@ bin_of HEAD; [ -e "$dir" ] || echo gone
         self.assertEqual(done.stdout.split()[3], "gone")
 
     def test_a_portable_and_an_x86_64_v3_build_have_different_identities(self):
-        """Sol, 20 Oct 2026: the identity hashed RUSTFLAGS as given; cargo-guarded.sh adds the CPU
+        """The identity hashed RUSTFLAGS as given; cargo-guarded.sh adds the CPU
         choice (NRESE_TARGET_CPU), so a portable build's identity was an x86-64-v3 build's."""
         if shutil.which("rustc") is None:
             self.skipTest("no rustc")
@@ -361,7 +361,7 @@ NRESE_TARGET_CPU=x86-64-v3 build_identity HEAD | grep '^rustflags'
 @unittest.skipUnless(BASH, "needs bash")
 class Coverage(unittest.TestCase):
     def test_two_jobs_perf_lab_runs_of_one_label_keep_their_own_stores(self):
-        """Sol, 20 Oct 2026: scripts/office/perflab.sh's store-LABEL was every job's: job b's run
+        """scripts/office/perflab.sh's store-LABEL was every job's: job b's run
         removed job a's store."""
         # A fake perf lab, wherever the script looks for it: job a's first run marks its store and
         # waits while job b runs the same label start to end, then says whether its store is there.
@@ -390,7 +390,7 @@ cat "$HOME/result"
         self.assertEqual(done.stdout.strip(), "a", done.stderr)
 
     def test_a_jobs_network_is_labelled_cleaned_with_it_and_swept_after_it(self):
-        """Sol, 20 Oct 2026: prepare-npd-data.sh's network had no labels: an aborted job left it."""
+        """prepare-npd-data.sh's network had no labels: an aborted job left it."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             _, shell_side = fake_docker(tmp)
@@ -414,7 +414,7 @@ FLEET_JOB=mine ns_clean "$1" "" all
             self.assertEqual((done.returncode, state(tmp)["networks"]), (0, {}), done.stderr)
 
     def test_shared_dataset_preparation_runs_one_at_a_time(self):
-        """Sol, 20 Oct 2026: prepare-datasets.sh's staging ($name.parts, .part files) was every
+        """prepare-datasets.sh's staging ($name.parts, .part files) was every
         job's: a second preparer removed the first's and published an incomplete file."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -500,7 +500,7 @@ FLEET_JOB=mine ns_clean "$1" "" all
 @unittest.skipUnless(BASH, "needs bash")
 class Timing(unittest.TestCase):
     def test_images_are_pinned_at_the_start_or_the_job_stops(self):
-        """Sol, 20 Oct 2026: a tag that couldn't be resolved was run by its tag, and a later
+        """A tag that couldn't be resolved was run by its tag, and a later
         resolution could pin another image within one comparison."""
         import json
         from suitekit.runtime import DockerRuntime, Spec
@@ -558,7 +558,7 @@ ns_locked_python "$1/a.lock" long
                          done.stderr)
 
     def test_a_holder_killed_mid_hold_leaves_the_lock_free_at_once(self):
-        """Sol, 20 Oct 2026: the lock directory's pid was the parent's, and Python never took over
+        """The lock directory's pid was the parent's, and Python never took over
         a dead holder's: a crash blocked every later preparation. An OS lock goes with its holder."""
         import signal
         suite = (ROOT / "benches" / "suite").as_posix()
@@ -594,7 +594,7 @@ ns_locked_python "$1/a.lock" long
 
 @unittest.skipUnless(BASH, "needs bash")
 class PinSets(unittest.TestCase):
-    """Sol, 20 Oct 2026: the reasoning scorecard pinned Jena's image for one of its four Jena
+    """The reasoning scorecard pinned Jena's image for one of its four Jena
     systems, so the others failed after the rest had timed; the pins and the runs were two lists."""
 
     def test_every_system_a_scorecard_can_run_has_its_image_pinned(self):
@@ -621,7 +621,7 @@ pin_set oracle jena-unknown >/dev/null 2>&1 || echo refused
         self.assertTrue(loaders and loaders <= table, (loaders, table))
 
     def test_the_calibration_container_runs_its_pinned_image(self):
-        """Sol, 20 Oct 2026: the manifest timed a no-op container of alpine:latest by its tag."""
+        """The manifest timed a no-op container of alpine:latest by its tag."""
         import json
         from suitekit import manifest
         with tempfile.TemporaryDirectory() as tmp:

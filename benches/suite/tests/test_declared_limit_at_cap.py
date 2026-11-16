@@ -31,7 +31,7 @@ from suitekit import compare  # noqa: E402
 CASE = "sparqloscope-dblp"
 CAP_GB = 28  # the case's cap: its scope's MemoryMax=28672M
 CAP = 28672 << 20
-# The candidate's timed-out pass in the third cut's timed part on khaleesi-wsl (pass-3-cand.json):
+# The candidate's timed-out pass in the third cut's timed part on the development machine's WSL VM (pass-3-cand.json):
 # its scope's anon + kernel peak, 2.8 MiB under the cap; and the share of time all its tasks stalled
 # on memory while held there (the dblp note, cand-1 at 721 s).
 AT_THE_CAP, HELD_STALL = 30061797376, 85.0
