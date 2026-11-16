@@ -441,16 +441,17 @@ pub(crate) struct Reads {
     constant: std::sync::OnceLock<Option<String>>,
     /// [`compared_values`]'.
     compared: std::sync::OnceLock<Vec<(String, Vec<Option<String>>)>>,
-    /// Whether the reader's view is restricted: [`certify`] then takes every property to hold
-    /// values other than strings, so the status doesn't follow what hidden graphs hold.
-    restricted: bool,
+    /// The reader's graphs, where their view is restricted: [`certify`] then takes every
+    /// property to hold values other than strings, so the status doesn't follow what hidden
+    /// graphs hold, and reads triple terms in their graphs alone.
+    access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl Reads {
-    /// Nothing found yet, for a reader whose view is restricted or not.
-    pub(crate) fn new(restricted: bool) -> Self {
+    /// Nothing found yet, for a reader of every graph (`None`) or of `access`.
+    pub(crate) fn new(access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>) -> Self {
         Self {
-            restricted,
+            access,
             ..Self::default()
         }
     }
@@ -478,8 +479,16 @@ fn certify(
         let why = "the query uses a triple term or a base direction, which OWL 2 doesn't define";
         completeness.incomplete(source, why.to_owned());
     }
-    if reads.restricted || snapshot.is_none_or(|s| s.holds_triple_terms(ReadModel::Materialised)) {
-        let why = "the data read may hold a triple term, which OWL 2 doesn't define";
+    // The graphs the reader reads: the test the evaluation restricts their dataset by. The
+    // inferred statements live in the default graph.
+    let access = reads.access.as_deref();
+    if snapshot.is_none_or(|s| {
+        let read = |g| access.is_none_or(|a| a.allows_id(s, g));
+        s.holds_triple_terms(ReadModel::Asserted, read)
+            || (access.is_none_or(|a| a.inferred)
+                && s.holds_triple_terms(ReadModel::Inferred, read))
+    }) {
+        let why = "the data read holds a triple term, which OWL 2 doesn't define";
         completeness.incomplete(source, why.to_owned());
     }
     if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)) {
@@ -490,7 +499,7 @@ fn certify(
             completeness.incomplete(source, reason.clone());
         }
     }
-    let snapshot = snapshot.filter(|_| !reads.restricted);
+    let snapshot = snapshot.filter(|_| access.is_none());
     let typed = |predicate: &Option<String>| {
         snapshot.is_none_or(|s| match predicate {
             Some(p) => s
