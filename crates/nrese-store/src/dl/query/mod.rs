@@ -287,14 +287,20 @@ impl Status {
 }
 
 /// What can be said before running `prepared`: complete where every predicate it reads
-/// is closed; otherwise the bounds decide when it runs.
-pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
+/// is closed; otherwise the bounds decide when it runs. `Cancelled` where the request stopped
+/// while it waited for another request's build of the bounds' view, which runs on and is kept.
+pub(crate) fn plan_status(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    cancellation: &CancellationToken,
+) -> StoreResult<Completeness> {
     let analysis = analyse(prepared.query());
-    let at = super::bounds::view(store);
+    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+        .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
     certify(&mut completeness, prepared.reads(), "dl", true);
     mark(store, prepared, Revision::Decided(&at), &mut completeness);
-    completeness
+    Ok(completeness)
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
@@ -557,7 +563,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither (R1-F2).
-    let at = super::bounds::view(store);
+    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+        .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut outcome = decide_answers(store, prepared, &analysis, &at, cancellation, memory, mode)?;
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
