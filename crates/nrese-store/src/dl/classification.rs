@@ -148,8 +148,8 @@ pub(crate) fn realisation(
 /// The cached result at `revision`, else the computation under way for it, else
 /// `compute`'s, kept if `complete`. A request that finds a computation under way waits for
 /// it (`dl/bounds.rs`'s way) and gets its result if complete; where it ends incomplete or
-/// panics, or the request is on a Rayon worker (which must not wait for it), the request
-/// computes its own. Publishing never lets an older in-flight request evict a newer
+/// panics, the request claims again (one replacement, the others waiting for it), and on a
+/// Rayon worker (which must not wait for it) it computes its own. Publishing never lets an older in-flight request evict a newer
 /// revision; same-revision races keep the first complete result. No solver runs locked.
 /// `None`: `stop` fired while the request waited; the computation goes on and is kept.
 fn cached<T>(
@@ -170,19 +170,25 @@ fn cached<T>(
         result
     };
     let kept = || latest(slot, revision).map(Some);
-    match slot.building.claim(revision, Kind::Opaque, kept) {
-        Claim::Build(builder) => {
-            let result = own();
-            if complete(&result) {
-                builder.finish(Some(Arc::clone(&result)));
-            }
-            Some(result)
+    loop {
+        if stop() {
+            return None;
         }
-        Claim::Wait(build) => match build.wait_until(stop) {
-            Some(Ok(Some(result))) => Some(result),
-            Some(Ok(None) | Err(Busy)) => Some(own()),
-            None => None,
-        },
+        match slot.building.claim(revision, Kind::Opaque, kept) {
+            Claim::Build(builder) => {
+                let result = own();
+                if complete(&result) {
+                    builder.finish(Some(Arc::clone(&result)));
+                }
+                return Some(result);
+            }
+            Claim::Wait(build) => match build.wait_until(Some(stop)) {
+                Some(Ok(Some(result))) => return Some(result),
+                Some(Ok(None)) => {} // nothing shared: claim again, one replacement for all
+                Some(Err(Busy)) => return Some(own()),
+                None => return None,
+            },
+        }
     }
 }
 
