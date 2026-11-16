@@ -9,10 +9,11 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::auth::{AuthConfig, JwtBearerConfig};
 use nrese_server::policy::PolicyConfig;
+use nrese_store::StoreConfig;
 use serde::Serialize;
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_settings};
+use crate::support::{body_text, test_app_with_settings, test_app_with_store_config};
 
 const EX: &str = "http://example.com/";
 
@@ -58,10 +59,23 @@ fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    test_app_with_settings(policy_config(policy)?, ReasonerConfig::for_mode(mode))
+}
+
+/// [`app_with`] over a store configured as `store`.
+fn app_with_store(
+    policy: &str,
+    store: StoreConfig,
+) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Rdfs);
+    test_app_with_store_config(store, policy_config(policy)?, reasoner)
+}
+
+fn policy_config(policy: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
-    let policy = PolicyConfig {
+    Ok(PolicyConfig {
         auth: AuthConfig::BearerJwt(JwtBearerConfig {
             shared_secret: "test-secret".to_owned(),
             issuer: None,
@@ -72,8 +86,7 @@ fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std
         }),
         access: Some(Arc::new(nrese_server::access::load(&path)?)),
         ..PolicyConfig::default()
-    };
-    test_app_with_settings(policy, ReasonerConfig::for_mode(mode))
+    })
 }
 
 async fn send(
@@ -118,6 +131,34 @@ async fn update(
     )
     .await?;
     Ok(status)
+}
+
+/// The status and body of `query` sent by a requester with `roles` (`POST /dataset/query`).
+async fn sparql_query(
+    app: &axum::Router,
+    roles: &[&str],
+    query: &str,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error>> {
+    send(
+        app,
+        roles,
+        Method::POST,
+        "/dataset/query",
+        Some("application/sparql-query"),
+        query,
+    )
+    .await
+}
+
+/// The value of the line of `/metrics` that starts with `name`, read as the admin.
+async fn metric(app: &axum::Router, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let (status, text) = send(app, &["nrese.admin"], Method::GET, "/metrics", None, "").await?;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(name))
+        .ok_or_else(|| format!("no {name} in /metrics"))?;
+    Ok(line.rsplit(' ').next().unwrap_or_default().parse()?)
 }
 
 /// The values of `?x` in the query's solutions, sorted.
@@ -833,15 +874,69 @@ default_graph = "read"
 
 /// Whether a query's results announce RDF 1.2 (the media type's `version`, JSON's
 /// `version` member, `VERSION "1.2"` first in a graph result) tells a reader nothing of a
-/// graph it can't read: a triple term only there is announced as none at all; one in a
-/// graph it reads is, as its results may then hold it.
+/// graph it can't read: a triple term only there, or derived only from there, is announced
+/// as none at all; one the reader sees is, as its results may then hold it. The media type
+/// and the body always say the same.
 #[tokio::test]
 async fn the_rdf12_announcement_tells_nothing_of_a_graph_the_reader_cannot_read()
 -> Result<(), Box<dyn std::error::Error>> {
-    let term = format!("<{EX}s> <{EX}says> <<( <{EX}x> <{EX}y> <{EX}z> )>>");
+    let term = format!("<<( <{EX}x> <{EX}y> <{EX}z> )>>");
+    let says = format!("<{EX}s> <{EX}says> {term}");
+    let claims = format!("<{EX}s> <{EX}claims> {term}");
+    let schema =
+        format!("<{EX}says> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <{EX}claims>");
+    let secret = |data: &str| format!("GRAPH <{EX}g/secret> {{ {data} }}");
+    let open = |data: &str| format!("GRAPH <{EX}g/pub/1> {{ {data} }}");
+    let readers = [
+        (
+            "a reader who sees no inference",
+            "hidden",
+            [
+                ("no term", String::new()),
+                ("one only in a graph it can't read", secret(&says)),
+                ("one in a graph it reads", open(&says)),
+            ],
+            ["none", "none", "1.2"],
+        ),
+        (
+            "a reader of what its graphs support",
+            "supported",
+            [
+                ("no term", String::new()),
+                (
+                    "one derived only from a graph it can't read",
+                    format!("{} {}", secret(&says), open(&schema)),
+                ),
+                (
+                    "one in a graph it reads",
+                    open(&format!("{says} . {schema}")),
+                ),
+            ],
+            ["none", "none", "1.2"],
+        ),
+        (
+            "a reader of every inference",
+            "visible",
+            [
+                ("no term", String::new()),
+                (
+                    "one asserted only in a graph it can't read and derived",
+                    format!(
+                        "{} {}",
+                        secret(&format!("{says} . {claims}")),
+                        open(&schema)
+                    ),
+                ),
+                (
+                    "one in a graph it reads",
+                    open(&format!("{says} . {schema}")),
+                ),
+            ],
+            ["none", "1.2", "1.2"],
+        ),
+    ];
     let (json, member) = ("application/sparql-results+json", "\"version\":\"1.2\"");
-    let mut wrong = Vec::new();
-    for (form, query, accept, marker) in [
+    let forms = [
         ("SELECT", "SELECT * WHERE { ?s ?p ?o }", json, member),
         ("ASK", "ASK { ?s ?p ?o }", json, member),
         (
@@ -850,66 +945,131 @@ async fn the_rdf12_announcement_tells_nothing_of_a_graph_the_reader_cannot_read(
             "text/turtle",
             "VERSION \"1.2\"\n",
         ),
-    ] {
-        let mut told = Vec::new();
-        for graph in [None, Some("g/secret"), Some("g/pub/1")] {
-            let app = app()?;
-            let data = graph.map_or(String::new(), |graph| {
-                format!("GRAPH <{EX}{graph}> {{ {term} }}")
-            });
-            let insert = format!(
-                "INSERT DATA {{ GRAPH <{EX}g/pub/1> {{ <{EX}a> <{EX}p> <{EX}b> }} {data} }}"
-            );
-            assert_eq!(
-                update(&app, &["nrese.admin"], &insert).await?,
-                StatusCode::NO_CONTENT
-            );
-            // Not `send`: it drops the headers.
-            let request = Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header(
-                    "authorization",
-                    format!("Bearer {}", token(&["nrese.read", "analyst"])),
-                )
-                .header("accept", accept)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(query))?;
-            let response = app.oneshot(request).await?;
-            assert_eq!(response.status(), StatusCode::OK, "{form}");
-            let media_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_owned();
-            let body = body_text(response).await?;
-            let in_body = if form == "CONSTRUCT" {
-                body.starts_with(marker)
-            } else {
-                body.contains(marker)
-            };
-            told.push(match (media_type.contains("version=1.2"), in_body) {
-                (false, false) => "none".to_owned(),
-                (true, true) => "1.2".to_owned(),
-                (in_type, in_body) => format!("media type {in_type}, body {in_body}"),
-            });
-        }
-        let got = told.join(" / ");
-        let want = "none / none / 1.2";
-        let cell = format!(
-            "the {form}'s announcement, no term / one only in a graph it can't read / one in a graph it reads"
+    ];
+    let mut wrong = Vec::new();
+    for (reader, inferred, variants, want) in &readers {
+        let policy = POLICY.replace(
+            "inferred = \"hidden\"",
+            &format!("inferred = \"{inferred}\""),
         );
-        if got == want {
-            println!("CASE {cell}: right {got}");
-        } else {
-            println!("CASE {cell}: WRONG {got}, want {want}");
-            wrong.push(form);
+        for (form, query, accept, marker) in forms {
+            let mut told = Vec::new();
+            for (_, data) in variants {
+                let app = app_with(&policy)?;
+                let insert = format!(
+                    "INSERT DATA {{ GRAPH <{EX}g/pub/1> {{ <{EX}a> <{EX}p> <{EX}b> }} {data} }}"
+                );
+                assert_eq!(
+                    update(&app, &["nrese.admin"], &insert).await?,
+                    StatusCode::NO_CONTENT
+                );
+                // Not `send`: it drops the headers.
+                let request = Request::builder()
+                    .uri("/dataset/query")
+                    .method(Method::POST)
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", token(&["nrese.read", "analyst"])),
+                    )
+                    .header("accept", accept)
+                    .header("content-type", "application/sparql-query")
+                    .body(Body::from(query))?;
+                let response = app.oneshot(request).await?;
+                assert_eq!(response.status(), StatusCode::OK, "{form} to {reader}");
+                let header = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("version=1.2"));
+                let body = body_text(response).await?;
+                let body = if form == "CONSTRUCT" {
+                    body.starts_with(marker)
+                } else {
+                    body.contains(marker)
+                };
+                let version = |announced: bool| if announced { "1.2" } else { "none" };
+                told.push(format!("header {} body {}", version(header), version(body)));
+            }
+            let got = told.join(" / ");
+            let want = want.map(|v| format!("header {v} body {v}")).join(" / ");
+            let names = variants.each_ref().map(|(name, _)| *name).join(" / ");
+            let cell = format!("the {form}'s announcement to {reader}, {names}");
+            if got == want {
+                println!("CASE {cell}: right {got}");
+            } else {
+                println!("CASE {cell}: WRONG {got}, want {want}");
+                wrong.push(format!("{form} to {reader}"));
+            }
         }
     }
-    assert!(
-        wrong.is_empty(),
-        "announced from a graph the reader can't read: {wrong:?}"
+    assert!(wrong.is_empty(), "the announcement told wrong: {wrong:?}");
+    Ok(())
+}
+
+/// A view a reader of some graphs reads through, refused for memory, reaches it as the
+/// server's 503 for its query memory, while a reader of every graph, who reads no view, is
+/// answered under the same budget. The budget is just above what the admin's query took on
+/// the same data (one query credit, 64 KiB, more); no view built says the refusal was the
+/// view's, not the evaluation's.
+#[tokio::test]
+async fn a_readers_view_refused_for_memory_is_the_servers_503()
+-> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 20_000;
+    let policy = POLICY.replace("inferred = \"hidden\"", "inferred = \"supported\"");
+    let facts: String = (0..N)
+        .map(|i| format!("<{EX}s{i}> <{EX}says> <{EX}o{i}> . "))
+        .collect();
+    let insert = format!(
+        "INSERT DATA {{ GRAPH <{EX}g/secret> {{ {facts} }} GRAPH <{EX}g/pub/1> {{
+           <{EX}says> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <{EX}claims> }} }}"
     );
+    let (admin, reader) = (&["nrese.admin"][..], &["nrese.read", "analyst"][..]);
+    let app_at = |bytes: usize| {
+        app_with_store(
+            &policy,
+            StoreConfig {
+                total_query_memory_bytes: bytes,
+                ..StoreConfig::default()
+            },
+        )
+    };
+    let ask = "ASK { ?s ?p ?o }";
+    let mut peaks = Vec::new();
+    for roles in [admin, reader] {
+        let app = app_at(1 << 30)?;
+        assert_eq!(update(&app, admin, &insert).await?, StatusCode::NO_CONTENT);
+        let (status, text) = sparql_query(&app, roles, ask).await?;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        peaks.push(metric(&app, "nrese_query_memory_peak_bytes").await?);
+    }
+    let budget = peaks[0] + (64 << 10);
+    let app = app_at(usize::try_from(budget)?)?;
+    assert_eq!(update(&app, admin, &insert).await?, StatusCode::NO_CONTENT);
+    let built = "nrese_support_views_total{how=\"built\"}";
+    let before = metric(&app, built).await?;
+    let (status, text) = sparql_query(&app, reader, ask).await?;
+    let views = metric(&app, built).await? - before;
+    let sentence = match text.contains("the server's query memory is in use") {
+        true => "the server's query memory is in use",
+        false => "no sentence",
+    };
+    let (admin_status, _) = sparql_query(&app, admin, ask).await?;
+    let got = format!(
+        "{} {sentence}, views built {views} / {}",
+        status.as_u16(),
+        admin_status.as_u16()
+    );
+    let want = "503 the server's query memory is in use, views built 0 / 200";
+    let calibrated = peaks[1] > budget;
+    let cell = "the reader / an admin under a budget its view doesn't fit";
+    if got == want && calibrated {
+        println!("CASE {cell}: right {got}");
+    } else {
+        println!(
+            "CASE {cell}: WRONG {got}, want {want} (peaks: admin {}, reader {}, budget {budget})",
+            peaks[0], peaks[1]
+        );
+    }
+    assert!(got == want && calibrated, "{got}: {text}");
     Ok(())
 }
