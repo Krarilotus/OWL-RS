@@ -73,18 +73,17 @@ the store, so to run the example again, [start over](#change-a-setting-start-ove
 
 Next, load your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
 server. The upload replaces the [default graph](glossary.md#graph) with your file, so the
-example's statements go. The shape stays, in its own graph, so whatever your file makes an
-`ex:Animal` needs an `ex:name` too, or the upload is refused as Felix was. To load into an empty
-store, [start over](#change-a-setting-start-over) first.
+example's statements go. To load into an empty store, [start over](#change-a-setting-start-over)
+first.
 
 ```bash
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
 ```
 
-When the upload passes, curl prints nothing (the answer is `204 No Content`); when it is refused,
-it prints the reason. Other syntaxes take their media type as `Content-Type`. A `PUT` takes at
-most 128 MiB ([`budgets.upload_size`](ops/config-reference.md#budgets.upload_size)); larger files
-load offline with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
+It answers `204 No Content`, so curl prints nothing. Other syntaxes take their media type as
+`Content-Type`. A `PUT` takes at most 128 MiB
+([`budgets.upload_size`](ops/config-reference.md#budgets.upload_size)); larger files load offline
+with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
 
 Count the statements you stored:
 
