@@ -871,8 +871,8 @@ impl<'e> Rematerialisation<'e> {
     /// what describes the published inferences (a store's reasoning certificate) is recorded
     /// before any other write can change the data they were computed over. The new stack is
     /// installed with `reading` ([`Version::reading`]), in one install: a reader reads the old
-    /// stack in its reading or the new one in this. A stack that doesn't change still takes
-    /// `reading`, without a new revision (`Shared::install_reading`). A failure
+    /// stack in its reading or the new one in this. A stack whose stored rows don't change
+    /// still takes `reading`, without a new revision (`Shared::install_reading`). A failure
     /// installs nothing.
     pub fn finish_held(
         self,
@@ -897,7 +897,9 @@ impl<'e> Rematerialisation<'e> {
             .collect();
         quads.par_sort_unstable();
         quads.dedup();
+        // The stored rows: rows that only read alike (compact and expanded) still change.
         let mut old: Vec<EncodedQuad> = base
+            .stored()
             .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
             .collect();
         old.par_sort_unstable();
