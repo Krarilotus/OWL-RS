@@ -775,3 +775,54 @@ async fn a_state_takes_its_role_in_replication_from_its_store_s_open() -> TestRe
     assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }
+
+/// Spec: a replica's reasoned reads say `not-certified` whatever reasons on its store. Over a
+/// directory holding [`ANIMALS`], opened as a replica and built into a replica's state, with an
+/// unreachable primary and before any batch: its reasoned read of [`ANIMAL_QUERY`] says
+/// `not-certified` (the precondition), and after its store is rematerialised for `rdfs` from
+/// the library (`StoreService::rematerialise`) it still says `not-certified`, and its
+/// consistency is `Unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_rematerialised_from_the_library_says_not_certified() -> TestResult<()> {
+    let rdfs = ReasonerConfig::for_mode(ReasoningMode::Rdfs)
+        .materialised_program()
+        .expect("RDFS reasons");
+    let dir = tempfile::tempdir()?;
+    {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path()))?;
+        nrese_store::MutationPipeline::new(
+            std::sync::Arc::new(store),
+            std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Rdfs,
+            ))),
+        )
+        .execute_update(&nrese_store::SparqlUpdateRequest::new(format!(
+            "{PREFIXES}{ANIMALS}"
+        )))?;
+    }
+    let state = server(
+        StoreService::new(as_replica(StoreConfig::on_disk(dir.path())))?,
+        ReasoningMode::Rdfs,
+        replica_of("http://127.0.0.1:9"),
+    );
+    let (_, before) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    assert_eq!(
+        before.as_deref(),
+        Some("not-certified"),
+        "the precondition: the replica's read before"
+    );
+    state.store().rematerialise(&rdfs)?;
+    let (rows, status) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    let consistency = state.store().consistency();
+    let right = status.as_deref() == Some("not-certified")
+        && consistency == nrese_store::ConsistencyStatus::Unknown;
+    println!(
+        "CASE a replica rematerialised from the library: {} {status:?} {consistency:?} {rows}",
+        if right { "right" } else { "WRONG" }
+    );
+    assert!(
+        right,
+        "the rematerialised replica answers: {status:?} {consistency:?}"
+    );
+    Ok(())
+}
