@@ -1572,6 +1572,30 @@ fn an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl() {
     assert!(wrong.is_empty(), "{wrong:?}");
 }
 
+/// The aliased key built by a first commit is left out by a later one that adds any list fact:
+/// that commit grounds the lists again over the stored closure, which holds equality's copies
+/// of the key's cells (`rdf:first` to each alias), so the key's list has 2^7 member sequences,
+/// past 64 (`too-many-list-variants`). The later commit's key match (`:z` with `:x`'s values)
+/// is then not concluded: `:x :name "Z"` is entailed, so the answer is true or not `complete`.
+#[test]
+fn a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let write = |data: &str| {
+        let ticket = MutationTicket::new();
+        (pipeline.apply(insert(data), &nrese_store::Requester::all(), &ticket)).expect("the data");
+    };
+    write(&aliased_key(7));
+    let mut later = format!(
+        "<{EX}C> <http://www.w3.org/2002/07/owl#intersectionOf> ( <{EX}A1> <{EX}A2> ) . \
+         <{EX}z> a <{EX}K> . <{EX}z> <{EX}name> \"Z\" ."
+    );
+    for i in 1..=7 {
+        later.push_str(&format!(" <{EX}z> <{EX}k{i}> <{EX}v{i}> ."));
+    }
+    write(&later);
+    left_out_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
+}
+
 /// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built: equality by
 /// representatives, the default, reads each cell of its list as one member, not 2^7 member
 /// sequences. Its answer is true and `complete`.
