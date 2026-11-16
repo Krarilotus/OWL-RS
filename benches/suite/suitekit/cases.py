@@ -40,6 +40,34 @@ COMPARATOR_SEMANTICS = {"plain", "closure", "rewritten", "rdfs", "rdfs-plus", "o
                         "custom", "el", "dl", "shacl", "text", "geosparql", "federation", "vector"}
 TOOLS = {"perf_lab", "tableau", "classify-el", "classify-horn", "endpoint-classify"}
 OUTCOMES = {"ok", "memory-limit", "gave-up", "timeout", "unsupported", "wrong"}
+
+# A run held at its memory cap until its time limit stopped at that cap: with no swap the kernel can
+# postpone the OOM kill for many minutes while it reclaims and faults back the binary's own pages
+# (D16-563, sparqloscope-dblp at 28 GiB: one binary killed at 46 s once and at 1,237 s once; held
+# 1 to 3 MiB under the cap, all tasks stalled on memory 54 to 86 % of the time, no user code running).
+# Held, read when the time limit came (fast.py scope_at_timeout): the scope's anon + kernel memory
+# within AT_THE_CAP of its cap, so nothing but a few file pages fits beside it, and its tasks all
+# stalled on memory at least AT_THE_CAP_STALL % of the last 10 s (PSI `full avg10`), so the cap
+# is what holds it, not a slow run that happens to sit near it.
+AT_THE_CAP = 0.01
+AT_THE_CAP_STALL = 10.0
+
+
+def held_at_cap(record: dict) -> bool:
+    """The run's scope was held at its memory cap when its time limit came. No reading (a Docker or
+    Windows run, a scope that couldn't be read then, an older record) is not held."""
+    end = record.get("at_timeout") or {}
+    used, cap, stall = end.get("anon_kernel_bytes"), end.get("max_bytes"), end.get("memory_full_avg10")
+    return (bool(used and cap) and stall is not None and cap - used <= AT_THE_CAP * cap
+            and stall >= AT_THE_CAP_STALL)
+
+
+def as_declared(record: dict) -> bool:
+    """The run ended as its case declares (`outcome`): that status; or, for a declared memory limit,
+    its time limit with its scope held at the cap (held_at_cap()). The one match of a run against its
+    declaration (fast.py, release_gate.py, compare.py); the record keeps its own status."""
+    status, wanted = record.get("status"), record.get("expected_outcome", "ok")
+    return status == wanted or (wanted == "memory-limit" and status == "timeout" and held_at_cap(record))
 LEVELS = {"focused", "full"}
 NEEDS = {"docker", "java", "apptainer"}
 SCENARIOS = {"native", "matched", "frontier"}
