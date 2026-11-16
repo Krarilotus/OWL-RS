@@ -397,9 +397,8 @@ What changes on purpose:
   for something. `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the
   earlier answers. Under `owl2-rl` nothing changes.
 - The N-Quads export's checksum moves from a leading header to the end, since the export streams
-  (in constant memory, at any store size). It closes the export as the comment
-  `# nrese-sha256 <hex>` and follows it as the trailer `x-nrese-checksum-sha256` (HTTP/1.1
-  clients ask for trailers with `TE: trailers`). A restore checks the comment where present. The
+  ([N-Quads exports](backups.md#n-quads-exports)); over HTTP it follows as the trailer
+  `x-nrese-checksum-sha256` (HTTP/1.1 clients ask for trailers with `TE: trailers`). The
   Graph Store's `GET` and the export stream too, and their timeout
   (`budgets.graph_read_timeout`) bounds the first piece and each stall, not the whole transfer.
 - A new repository's id can't start or end with `.` or be a Windows device name (`CON`, `NUL`,

@@ -19,11 +19,8 @@ data must still fit one machine; partitioning across machines is a later step.
     own log too, so a replica restarts where it stopped.
   - A replica takes no writes (its write surfaces are off, as in the read-only posture) and
     doesn't reason: the records carry the inferences.
-  - Every exchange with the primary ends: a log answer must begin within 30 s, an image
-    within `replication.image_timeout` (an hour unless set: the primary prepares it
-    first), and every body keep coming (30 s at most between pieces; an image streams as
-    long as it comes); a log round takes `replication.round_timeout` at most (5 minutes
-    unless set; `0` or `unlimited` for no total limit). A log answer must say how many records it carries
+  - Every exchange with the primary has
+    [deadlines](config-reference.md#replication). A log answer must say how many records it carries
     and up to which revision; one that doesn't, or whose records don't reach that revision,
     is an error. Errors are retried with a growing pause and shown in the status.
 - **Both** need an on-disk store.
