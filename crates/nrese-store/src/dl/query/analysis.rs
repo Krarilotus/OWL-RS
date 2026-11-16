@@ -379,44 +379,56 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
 }
 
 /// The data values `query` compares by term: each variable (or blank node, which a path's
-/// sequence makes) at the object end of two or more patterns or paths (or a path's start,
-/// where it has a reversed step), or of one and bound by `VALUES` or `BIND` (a join), or at
-/// one that `DISTINCT` or `REDUCED` returns, `GROUP BY` groups or a `DISTINCT` aggregate
-/// reads (or an alias `(?n AS ?m)` of one under `DISTINCT` or `GROUP BY`, which the walk
-/// meets first); and each string constant at an object end (a stored `"Rex"^^xsd:token` is
-/// `"Rex"` to OWL 2). What it is, and the predicates of its ends (`None`: a variable
-/// predicate or a path, any). The store compares terms, the regime values; whether a value
-/// read there has another spelling is the data's ([`certify`] asks the snapshot read, so a
-/// variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One walk, once per query
-/// ([`Reads`]).
+/// sequence makes) at the object end of two or more patterns or paths (or at the start of a
+/// path that can match zero steps), or of one and bound by `VALUES` or `BIND` (a join), or
+/// at one that a `DISTINCT` or `REDUCED` returns by its own projection, `GROUP BY` groups or
+/// a `DISTINCT` aggregate reads (or an alias `(?n AS ?m)` of one under `DISTINCT` or `GROUP
+/// BY`, which the walk meets first); the nodes inside and at the start of a path with a
+/// reversed step; and each string constant at an object end (a stored `"Rex"^^xsd:token` is
+/// `"Rex"` to OWL 2). What it is, and the predicates it is read through: a pattern's, or a
+/// path's own (`None`, any: a variable predicate, a negated set, or a path that can match
+/// zero steps, whose ends are every term of the graph). The store compares terms, the regime
+/// values; whether a value read there has another spelling is the data's ([`certify`] asks
+/// the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One
+/// walk, once per query ([`Reads`]). Every operator and term form is named in its matches,
+/// so a new one doesn't compile until it is said whether it compares terms.
 pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>)> {
     use nrese_sparql_syntax::algebra::{AggregateExpression::*, Expression};
     let (mut ends, mut grouped, mut bound) =
         (HashMap::<_, Vec<_>>::new(), HashSet::new(), HashSet::new());
-    let (mut distinct, mut all, mut strings) = (false, false, Vec::new());
+    let (mut distinct, mut all, mut marks) = (false, false, Vec::new());
+    let mut deduped = HashSet::new();
     pattern_of(query).find(&mut |node| {
-        let mut end = |t: &TermPattern, p: Option<String>| match t {
+        let mut end = |t: &TermPattern, p: Vec<Option<String>>| match t {
             TermPattern::Variable(v) => ends.entry(v.as_str().to_owned()).or_default().push(p),
             TermPattern::BlankNode(b) => ends.entry(b.to_string()).or_default().push(p),
-            TermPattern::Literal(l) if l.is_plain() => {
-                strings.push((format!("the string {l}"), vec![p]))
-            }
-            _ => {}
+            TermPattern::Literal(l) if l.is_plain() => marks.push((format!("the string {l}"), p)),
+            // A name, a typed constant ([`typed_constant`]'s) or a quoted triple: no value
+            // compared here.
+            TermPattern::NamedNode(_) | TermPattern::Literal(_) | TermPattern::Triple(_) => {}
         };
         match node {
             Node::Pattern(GraphPattern::Bgp { patterns }) => {
                 patterns
                     .iter()
-                    .for_each(|t| end(&t.object, pattern_reads(t).0));
+                    .for_each(|t| end(&t.object, vec![pattern_reads(t).0]));
             }
             Node::Pattern(GraphPattern::Path {
                 subject,
                 path,
                 object,
             }) => {
-                end(object, None);
+                let mut reads = Vec::new();
+                path_reads(path, &mut reads);
+                let mut through: Vec<_> = reads.into_iter().map(|(p, _)| p).collect();
+                if zero(path) {
+                    through = vec![None];
+                    end(subject, through.clone());
+                }
+                end(object, through.clone());
                 if reversed(path) {
-                    end(subject, None);
+                    let what = "a node inside or at the start of a path with a reversed step";
+                    marks.push((what.to_owned(), through));
                 }
             }
             Node::Pattern(GraphPattern::Values { variables, .. }) => {
@@ -424,15 +436,20 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
             }
             Node::Pattern(GraphPattern::Extend { bindings, .. }) => {
                 for (v, e) in bindings.iter().map(|(v, e)| (v.as_str(), e)) {
-                    let alias = distinct || grouped.contains(v);
+                    let alias = distinct || deduped.contains(v) || grouped.contains(v);
                     if alias && let Expression::Variable(n) = e {
                         grouped.insert(n.as_str().to_owned());
                     }
                     bound.insert(v.to_owned());
                 }
             }
-            Node::Pattern(GraphPattern::Distinct { .. } | GraphPattern::Reduced { .. }) => {
-                distinct = true;
+            Node::Pattern(GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner }) => {
+                // What it returns: its projection; every end where no projection is under it.
+                if let GraphPattern::Project { variables, .. } = &**inner {
+                    deduped.extend(variables.iter().map(|v| v.as_str().to_owned()));
+                } else {
+                    distinct = true;
+                }
             }
             Node::Pattern(GraphPattern::Group {
                 variables,
@@ -446,37 +463,69 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
                         FunctionCall { expr, distinct, .. } if *distinct => {
                             variables_of(expr, &mut grouped)
                         }
-                        _ => {}
+                        // Over every value as it comes: no two compared.
+                        FunctionCall { .. } => {}
                     }
                 }
             }
-            _ => {}
+            // These compare terms only at the ends recorded above (a join, LATERAL, OPTIONAL,
+            // MINUS: on shared variables), by value (FILTER, `=`, IN, a left join's condition,
+            // ORDER BY; `sameTerm` by term, as it means to), or not at all (UNION, GRAPH, a
+            // projection, which DISTINCT reads above, a slice; SERVICE's are the remote's).
+            Node::Pattern(
+                GraphPattern::Join { .. }
+                | GraphPattern::LeftJoin { .. }
+                | GraphPattern::Lateral { .. }
+                | GraphPattern::Filter { .. }
+                | GraphPattern::Union { .. }
+                | GraphPattern::Graph { .. }
+                | GraphPattern::Minus { .. }
+                | GraphPattern::OrderBy { .. }
+                | GraphPattern::Project { .. }
+                | GraphPattern::Slice { .. }
+                | GraphPattern::Service { .. },
+            )
+            | Node::Expression(_) => {}
         }
         false
     });
-    let shown = answer_variables(query);
     let mut compared: Vec<_> = ends
         .into_iter()
         .filter_map(|(v, through)| {
             let what = if through.len() > 1 || bound.contains(&v) {
                 "a join on"
-            } else if distinct && shown.as_ref().is_none_or(|s| s.contains(&v)) {
+            } else if distinct || deduped.contains(&v) {
                 "DISTINCT over"
             } else if all || grouped.contains(&v) {
                 "GROUP BY or DISTINCT over"
             } else {
                 return None;
             };
-            Some((format!("{what} ?{v}"), through))
+            Some((format!("{what} ?{v}"), through.concat()))
         })
         .collect();
-    compared.extend(strings);
+    compared.extend(marks);
     compared.sort();
     compared
 }
 
+/// Whether `path` can match zero steps (`*`, `?`, a sequence of such, an alternative with
+/// one): it then pairs every term of the graph with itself, data values included, whatever
+/// its predicates hold.
+fn zero(path: &PropertyPathExpression) -> bool {
+    use PropertyPathExpression as P;
+    match path {
+        P::ZeroOrMore(_) | P::ZeroOrOne(_) => true,
+        P::NamedNode(_) | P::NegatedPropertySet(_) => false,
+        P::Reverse(p) | P::OneOrMore(p) => zero(p),
+        P::Sequence(paths) => paths.iter().all(zero),
+        P::Alternative(paths) => paths.iter().any(zero),
+    }
+}
+
 /// Whether `path` has a reversed step (`^p`, `!(^p)`) anywhere, under `*`, `+`, `?`, `|` or
-/// `/`: its start can then be a data value, as its end can.
+/// `/`: a node inside it or its start can then be a data value, as its end can (a node is
+/// one only before a reversed step: a forward step starts at a subject).
 fn reversed(path: &PropertyPathExpression) -> bool {
     use PropertyPathExpression as P;
     match path {

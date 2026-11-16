@@ -203,7 +203,7 @@ impl PreparedQuery {
             rdf12: false,
             dl_answers: request.dl_answers,
             on_evaluation: None,
-            reads: Default::default(),
+            reads: crate::dl::query::Reads::new(request.scope.access().is_some()),
         })
     }
 
