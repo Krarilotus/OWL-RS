@@ -27,7 +27,7 @@ use nrese_dl::limits::{Deadline, Limit};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nrese_engine::{ReadModel, Snapshot, TermId};
+use nrese_engine::{QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, ClassExpr, ExprId, Literal, ObjProp, Ontology};
 use nrese_rdf::{NamedNodeRef, Term};
 use nrese_sparql::CancellationToken;
@@ -299,7 +299,7 @@ pub(crate) fn plan_status(
         .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
     certify(&mut completeness, prepared.reads(), "dl", true, Some(&at.0));
-    mark(store, Revision::Decided(&at), &mut completeness);
+    mark(store, prepared, Revision::Decided(&at), &mut completeness);
     Ok(completeness)
 }
 
@@ -326,50 +326,155 @@ impl Revision<'_> {
 /// (`StoreService::status_without_dl`) and by a read inside a transaction with operations
 /// pending (`StoreService::run_query_pending_reporting`). It reads every graph, and a reader
 /// of some graphs is told no status under `owl2-dl` (`status_for_its_reader`); the ontology
-/// it reads is the asserted statements', which a reader's view leaves as they are.
-pub(crate) fn mark(store: &StoreService, at: Revision<'_>, completeness: &mut Completeness) {
+/// it reads is the asserted statements', which a reader's view leaves as they are. And
+/// at most sound-only where `prepared` names an individual the data doesn't and the
+/// ontology `at` has keys, or wasn't read within its budget: whether a key reaches an
+/// individual named only in a query is unsettled (the Direct Semantics' NAMED).
+pub(crate) fn mark(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    at: Revision<'_>,
+    completeness: &mut Completeness,
+) {
     if let Some(reason) = reads_differently(store, at) {
         completeness.unsound("dl", reason);
     }
+    let snapshot = match at {
+        Revision::Decided((snapshot, _)) => snapshot,
+        Revision::Committed(snapshot) | Revision::Pending(snapshot) => snapshot,
+    };
+    let held = |iri: &str| {
+        let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
+            return false;
+        };
+        let (mut by_subject, mut by_object) = (QuadPattern::all(), QuadPattern::all());
+        (by_subject.subject, by_object.object) = (Some(t), Some(t));
+        let any = |p| {
+            snapshot
+                .quads_for_pattern_in(ReadModel::Materialised, p)
+                .next()
+        };
+        any(&by_subject).or_else(|| any(&by_object)).is_some()
+    };
+    let read = match at {
+        Revision::Pending(_) => read_ontology,
+        _ => ontology_at,
+    };
+    if completeness.complete
+        && let Some(iri) = named_outside(prepared.query(), held)
+        && read(store, snapshot).ok().is_none_or(|o| {
+            o.value()
+                .axioms
+                .iter()
+                .any(|a| matches!(a, Axiom::HasKey(..)))
+        })
+    {
+        completeness.incomplete(
+            "dl",
+            format!(
+                "the query names <{iri}>, which the data doesn't, and the ontology has keys \
+                 (or wasn't read within its budget): whether OWL 2 DL's keys reach an \
+                 individual named only in a query is unsettled, so an answer may be missing"
+            ),
+        );
+    }
 }
+
+const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
+                    answers are read from their closure; use the owl2-rl mode, whose \
+                    promise is the rules' reading";
 
 /// Why L may hold what OWL 2 DL doesn't entail, where it may: theorem PR1 of OWL 2
 /// Profiles, by which L's statements are entailed, needs no annotation-property axioms
 /// (OWL 2 DL gives them no meaning for the terms annotated; the rules use them) and no
 /// punning, of which only an equality reaching a class or property name reads otherwise
 /// (OWL 2 DL equates the individuals only; the rules the names too). Off the RL route only,
-/// which both leave (`routed_to_rules` needs neither): one read of the ontology `at`
-/// ([`ontology_at`], a pending one's of its own), whose refusal leaves it unknown.
+/// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
+/// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
+/// its own), whose refusal leaves it unknown.
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
-                        answers are read from their closure; use the owl2-rl mode, whose \
-                        promise is the rules' reading";
-    let (snapshot, ontology) = match at {
+    let (snapshot, pending) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, _)) => (snapshot, ontology_at(store, snapshot)),
-        Revision::Committed(snapshot) => (snapshot, ontology_at(store, snapshot)),
-        Revision::Pending(snapshot) => (snapshot, read_ontology(store, snapshot)),
+        Revision::Decided((snapshot, _)) => (snapshot, false),
+        Revision::Committed(snapshot) => (snapshot, false),
+        Revision::Pending(snapshot) => (snapshot, true),
     };
-    let Ok(ontology) = ontology else {
+    if let Some(decided) = by_index(snapshot) {
+        return decided;
+    }
+    #[cfg(test)]
+    cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
+    let read = if pending { read_ontology } else { ontology_at };
+    let Ok(ontology) = read(store, snapshot) else {
         return Some(format!(
             "whether OWL 2 DL reads the ontology otherwise than the OWL 2 RL rules isn't known \
              ({}): {ONLY}",
             source::refused("the revision")
         ));
     };
+    by_ontology(snapshot, ontology.value())
+}
+
+/// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
+/// with the reason or with none, `None` where only the ontology decides. Annotation-property
+/// axioms exactly, by the reader's rule: an IRI declared an annotation property, as the
+/// subject of `rdfs:domain`, `rdfs:range` or `rdfs:subPropertyOf` (the smallest named). A
+/// pun needs a term equal to another: without one there is none; with one, the ontology
+/// decides.
+fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
+    use nrese_owl::vocab::{OWL, RDFS};
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let quads = |model, subject, predicate, object| {
+        let mut pattern = QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) = (subject, predicate, object);
+        snapshot.quads_for_pattern_in(model, &pattern)
+    };
+    let (ty, annotation) = (id(RDF_TYPE), id(&format!("{OWL}AnnotationProperty")));
+    let declared = |s: TermId| match (s.kind(), ty, annotation) {
+        (nrese_engine::TermKind::Iri, Some(t), Some(a)) => {
+            quads(ReadModel::Asserted, Some(s), Some(t), Some(a))
+                .next()
+                .is_some()
+        }
+        _ => false,
+    };
+    let schema = ["domain", "range", "subPropertyOf"].map(|l| id(&format!("{RDFS}{l}")));
+    let axioms = schema
+        .into_iter()
+        .flatten()
+        .flat_map(|p| quads(ReadModel::Asserted, None, Some(p), None));
+    if let Some(property) = axioms.map(|q| q.subject).filter(|&s| declared(s)).min() {
+        return Some(Some(annotation_reason(snapshot, property.raw())));
+    }
+    let Some(same_as) = id(OWL_SAME_AS) else {
+        return Some(None);
+    };
+    let equal =
+        quads(ReadModel::Materialised, None, Some(same_as), None).any(|q| q.object != q.subject);
+    (!equal).then_some(None)
+}
+
+/// [`reads_differently`]'s reason where `property` has annotation-property axioms.
+fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
+    let name = snapshot.decode(TermId::from_raw(property));
+    let name = name.map_or_else(|| format!("term {property}"), |term| term.to_string());
+    format!(
+        "{name} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
+         it annotates: {ONLY}, or remove them"
+    )
+}
+
+/// [`reads_differently`] of `snapshot`'s whole `ontology`.
+fn by_ontology(snapshot: &Snapshot, ontology: &Ontology) -> Option<String> {
     let name = |t: u64| {
         let term = snapshot.decode(TermId::from_raw(t));
         term.map_or_else(|| format!("term {t}"), |term| term.to_string())
     };
-    if let Some(&property) = ontology.value().annotation_schema.first() {
-        return Some(format!(
-            "{} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
-             it annotates: {ONLY}, or remove them",
-            name(property)
-        ));
+    if let Some(&property) = ontology.annotation_schema.first() {
+        return Some(annotation_reason(snapshot, property));
     }
     let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_SAME_AS).into())?;
-    let equated = nrese_owl::profile::punned(ontology.value())
+    let equated = nrese_owl::profile::punned(ontology)
         .into_iter()
         .find(|&t| {
             let equal = nrese_engine::QuadPattern {
@@ -603,7 +708,7 @@ pub(crate) fn answer(
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
             certify(status, prepared.reads(), "dl", true, Some(&at.0));
-            mark(store, Revision::Decided(&at), status);
+            mark(store, prepared, Revision::Decided(&at), status);
         }
     }
     let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;

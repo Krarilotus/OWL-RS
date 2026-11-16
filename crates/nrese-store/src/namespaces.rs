@@ -44,7 +44,8 @@ impl Namespaces {
         let read = |path: &PathBuf| -> StoreResult<Option<NamespaceMap>> {
             let refused = |error: &dyn std::fmt::Display| {
                 StoreError::Configuration(format!(
-                    "{}: {error}; the store's namespace prefixes can't be read. Repair or                      remove the file (without it the store starts with {}), then start again",
+                    "{}: {error}; the store's namespace prefixes can't be read. Repair or \
+                     remove the file (without it the store starts with {}), then start again",
                     path.display(),
                     match path.ends_with(FILE) {
                         true => format!("those of {BEFORE} if it is there, else the standard four"),
