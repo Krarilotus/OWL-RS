@@ -171,3 +171,22 @@ fn memberships_by_scan_equal_the_point_reads() {
         assert_eq!(scanned, expected, "{name}");
     }
 }
+
+/// The member lists are charged as they grow (SYN-61): on a chain, where the output needs no
+/// room, a budget with none refuses the memberships at the first member read.
+#[test]
+fn member_lists_past_the_budget_refuse_the_memberships() {
+    let store = store_with(
+        StoreConfig::in_memory(),
+        ":C0 rdfs:subClassOf :C1 . :a a :C0 .",
+    );
+    let (snapshot, rdf_type, scanned, _) = both(&store);
+    let c0 = typed(&snapshot, rdf_type, None, id(&snapshot, "C0"));
+    assert!(scanned.is_empty() && !c0.is_empty(), "{scanned:?}, {c0:?}");
+    let unlimited = Arc::new(nrese_exec::Budget::unlimited());
+    let ontology = super::super::source::read_snapshot(&snapshot, unlimited).unwrap();
+    let taxonomy = tbox_taxonomy(&store, &ontology);
+    let none = Arc::new(nrese_exec::Budget::new(0));
+    assert!(memberships(&snapshot, &taxonomy, rdf_type, &none).is_err());
+    assert!(none.refused());
+}
