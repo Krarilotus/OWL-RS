@@ -245,6 +245,24 @@ fn an_individual_whose_data_was_deleted_is_not_decided_complete_under_a_key() {
     );
 }
 
+/// A name the question gives at a property path's end, not in a triple, is named only in
+/// the question as well: under the keys, a `false` about it may not say `complete`.
+#[test]
+fn an_individual_named_only_at_a_path_end_is_not_decided_complete_under_a_key() {
+    let dl = pipeline();
+    insert(&dl, KEYS).expect("the keys");
+    let mut wrong = Vec::new();
+    for read in ["ASK { :b owl:sameAs+ :a }", "ASK { :b (a|owl:sameAs) :A }"] {
+        let (rows, status) = query(&dl, read);
+        let line = format!("{read}: {rows:?}, status {}", status.shared.as_str());
+        eprintln!("{line} ({:?})", status.reasons());
+        if rows == ["false"] && status.is_complete() {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "false labelled complete: {wrong:#?}");
+}
+
 /// Where no key can reach a name the question alone gives, the read is decided as before:
 /// under the keys, a question about an individual the data names (`:a a :A`, true); and
 /// without keys, one about an individual named only in the question (`:b a :A`, false: no
